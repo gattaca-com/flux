@@ -1,0 +1,20 @@
+[package]
+edition.workspace = true
+name = "flux-network"
+rust-version.workspace = true
+version = "0.0.7"
+
+[features]
+wincode = ["dep:wincode"]
+
+[dependencies]
+flux-communication.workspace = true
+flux-timing.workspace = true
+flux-utils.workspace = true
+mio.workspace = true
+tracing.workspace = true
+wincode = { workspace = true, optional = true }
+
+[dev-dependencies]
+wincode-derive = "*"
+wincode = "*"

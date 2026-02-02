@@ -1,0 +1,25 @@
+[package]
+name = "flux-timing"
+version = "0.0.14"
+edition.workspace = true
+rust-version.workspace = true
+publish = ["nexus"]
+
+[dependencies]
+tracing.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+chrono.workspace = true
+quanta.workspace = true
+governor.workspace = true
+humantime.workspace = true
+bitcode.workspace = true
+serde_json.workspace = true
+type-hash-derive.workspace = true
+type-hash.workspace = true
+wincode = { workspace = true, optional = true }
+wincode-derive = { workspace = true, optional = true }
+
+[features]
+default = []
+wincode = ["dep:wincode", "dep:wincode-derive"]

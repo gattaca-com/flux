@@ -1,0 +1,16 @@
+[package]
+name = "flux-communication"
+version = "0.0.25"
+edition.workspace = true
+rust-version.workspace = true
+publish = ["nexus"]
+
+[dependencies]
+flux-timing.workspace = true
+flux-utils.workspace = true
+
+directories.workspace = true
+once_cell.workspace = true
+shared_memory.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,21 @@
+[package]
+edition.workspace = true
+name = "flux-timekeeper"
+rust-version.workspace = true
+version = "0.0.29"
+
+[dependencies]
+flux.workspace = true
+
+ratatui.workspace = true
+bitflags.workspace = true
+crossterm.workspace = true
+serde.workspace = true
+strum.workspace = true
+auto_impl.workspace = true
+indexmap.workspace = true
+signal-hook.workspace = true
+
+[[bin]]
+name = "timekeeper"
+path = "bin/timekeeper.rs"

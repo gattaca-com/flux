@@ -1,0 +1,37 @@
+[package]
+name = "flux"
+version = "0.0.35"
+edition.workspace = true
+rust-version.workspace = true
+publish = ["nexus"]
+
+[dependencies]
+flux-communication.workspace = true
+flux-timing.workspace = true
+flux-utils.workspace = true
+flux-network.workspace = true
+spine-derive.workspace = true
+type-hash.workspace = true
+type-hash-derive.workspace = true
+
+bitcode.workspace = true
+core_affinity.workspace = true
+libc.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+signal-hook.workspace = true
+tinyvec.workspace = true
+tracing.workspace = true
+zstd.workspace = true
+wincode = { workspace = true, optional = true }
+wincode-derive = { workspace = true, optional = true }
+
+[features]
+default = []
+wincode = [
+    "dep:wincode",
+    "dep:wincode-derive",
+    "flux-utils/wincode",
+    "flux-timing/wincode",
+    "flux-network/wincode",
+]

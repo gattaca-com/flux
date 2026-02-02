@@ -1,0 +1,13 @@
+[package]
+name = "type-hash-derive"
+version = "0.0.4"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate = "3"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

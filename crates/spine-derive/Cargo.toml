@@ -1,0 +1,15 @@
+[package]
+name = "spine-derive"
+version = "0.0.8"
+description = "Attribute macro that auto-generates the boilerplate impls for Spine queues."
+edition.workspace = true
+rust-version.workspace = true
+publish = ["nexus"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1"
+proc-macro2 = "1"
+syn = { version = "2.0.101", features = ["full"] } 

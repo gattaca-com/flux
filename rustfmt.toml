@@ -1,0 +1,10 @@
+reorder_imports = true
+imports_granularity = "Crate"
+use_small_heuristics = "Max"
+wrap_comments = true
+binop_separator = "Back"
+trailing_comma = "Vertical"
+trailing_semicolon = false
+use_field_init_shorthand = true
+group_imports = "StdExternalCrate"
+overflow_delimited_expr = true
