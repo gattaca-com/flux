@@ -3,7 +3,6 @@ name = "flux-timing"
 version = "0.0.14"
 edition.workspace = true
 rust-version.workspace = true
-publish = ["nexus"]
 
 [dependencies]
 tracing.workspace = true

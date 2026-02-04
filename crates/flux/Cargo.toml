@@ -3,7 +3,6 @@ name = "flux"
 version = "0.0.35"
 edition.workspace = true
 rust-version.workspace = true
-publish = ["nexus"]
 
 [dependencies]
 flux-communication.workspace = true

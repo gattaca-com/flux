@@ -3,7 +3,6 @@ name = "flux-communication"
 version = "0.0.25"
 edition.workspace = true
 rust-version.workspace = true
-publish = ["nexus"]
 
 [dependencies]
 flux-timing.workspace = true

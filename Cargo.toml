@@ -18,16 +18,16 @@ rust-version = "1.91.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-flux = { path = "crates/flux", version = "0.0.35", registry = "nexus" }
-flux-communication = { path = "crates/flux-communication", version = "0.0.25", registry = "nexus" }
-flux-timing = { path = "crates/flux-timing", version = "0.0.14", registry = "nexus" }
-flux-utils = { path = "crates/flux-utils", version = "0.0.22", registry = "nexus" }
-flux-network = { path = "crates/flux-network", version = "0.0.7", registry = "nexus" }
-spine-derive = { path = "crates/spine-derive", version = "0.0.8", registry = "nexus" }
-flux-overseer = { path = "crates/flux-overseer", version = "0.0.11", registry = "nexus" }
-flux-timekeeper = { path = "crates/flux-timekeeper", version = "0.0.29", registry = "nexus" }
-type-hash = {path = "crates/type-hash", version = "0.0.1", registry = "nexus"}
-type-hash-derive = {path = "crates/type-hash-derive", version = "0.0.4", registry = "nexus"}
+flux = { path = "crates/flux", version = "0.0.35" }
+flux-communication = { path = "crates/flux-communication", version = "0.0.25" }
+flux-timing = { path = "crates/flux-timing", version = "0.0.14" }
+flux-utils = { path = "crates/flux-utils", version = "0.0.22" }
+flux-network = { path = "crates/flux-network", version = "0.0.7" }
+spine-derive = { path = "crates/spine-derive", version = "0.0.8" }
+flux-overseer = { path = "crates/flux-overseer", version = "0.0.11" }
+flux-timekeeper = { path = "crates/flux-timekeeper", version = "0.0.29" }
+type-hash = { path = "crates/type-hash", version = "0.0.1" }
+type-hash-derive = { path = "crates/type-hash-derive", version = "0.0.4" }
 
 
 auto_impl = "1.2.0"

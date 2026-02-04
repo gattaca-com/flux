@@ -3,6 +3,5 @@ name = "type-hash"
 version = "0.0.1"
 edition = "2021"
 rust-version.workspace = true
-publish = ["nexus"]
 
 [dependencies]
