@@ -218,9 +218,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             field_for_new.ident.as_ref().expect("named field required for new method");
         let field_ty_for_new = &field_for_new.ty;
 
+        //TODO: @gd this is so cursed
         if field_ident_for_new == "tile_info" {
             new_method_initializers_for_new_fn.push(quote! {
-                #field_ident_for_new: ::flux::communication::ShmemData::open_or_init(
+                #field_ident_for_new: ::flux::communication::ShmemData::open_or_init_with_base_dir(
+                    &base_dir,
                     &format!("{}{}", #app_name_tokens, path_suffix),
                     || Default::default(),
                 ).expect("couldn't open or init tile info shmem")
@@ -234,7 +236,8 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None => quote! { 2usize.pow(15) },
                 };
                 new_method_initializers_for_new_fn.push(quote! {
-                    #field_ident_for_new: ::flux::communication::shmem_queue(
+                    #field_ident_for_new: ::flux::communication::shmem_queue_with_base_dir(
+                        &base_dir,
                         &format!("{}{}", #app_name_tokens, path_suffix),
                         #size_arg_for_new,
                         ::flux::communication::queue::QueueType::MPMC
@@ -252,8 +255,12 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let generated_new_method_token_stream = quote! {
         pub fn new(path_suffix: Option<&str>) -> Self {
+            Self::new_with_base_dir(::flux::utils::directories::local_share_dir(), path_suffix)
+        }
+        pub fn new_with_base_dir<D: AsRef<std::path::Path>>(base_dir: D, path_suffix: Option<&str>) -> Self {
             let path_suffix = path_suffix.unwrap_or(&"");
             Self {
+                base_dir: base_dir.as_ref().to_path_buf(),
                 #new_method_initializers_for_new_fn
             }
         }
@@ -275,7 +282,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let ty = &f.ty;
                 quote! { #(#attrs)* #vis #ident #colon_token #ty }
             });
-            quote! { { #(#iter),* } }
+            quote! { {
+                #(#iter),*,
+                base_dir: std::path::PathBuf
+            } }
         }
         syn::Fields::Unnamed(fields_unnamed) => {
             let iter = fields_unnamed.unnamed.iter().map(|f| {
@@ -284,9 +294,9 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let ty = &f.ty;
                 quote! { #(#attrs)* #vis #ty }
             });
-            quote! { ( #(#iter),* ); }
+            quote! { ( #(#iter),*, std::path::PathBuf ); }
         }
-        syn::Fields::Unit => quote! { ; },
+        syn::Fields::Unit => quote! { {base_dir: std::path::PathBuf}},
     };
 
     let reconstructed_input_struct = quote! {

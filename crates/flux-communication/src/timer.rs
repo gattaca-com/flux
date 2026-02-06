@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, sync::Mutex};
+use std::{collections::HashMap, fmt::Display, path::Path, sync::Mutex};
 
 use flux_timing::{Duration, Instant, InternalMessage, Nanos};
 use once_cell::sync::Lazy;
@@ -60,7 +60,7 @@ pub struct Timer {
 }
 
 impl Timer {
-    pub fn new<A: AsRef<str>, S: Display>(app_name: A, name: S) -> Self {
+    pub fn new<A: AsRef<Path>, S: Display>(app_name: A, name: S) -> Self {
         let dirstr = shmem_dir_queues_string(&app_name);
         let _ = std::fs::create_dir_all(&dirstr);
 

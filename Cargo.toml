@@ -18,8 +18,8 @@ rust-version = "1.91.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-flux = { path = "crates/flux", version = "0.0.35" }
-flux-communication = { path = "crates/flux-communication", version = "0.0.25" }
+flux = { path = "crates/flux", version = "0.0.36" }
+flux-communication = { path = "crates/flux-communication", version = "0.0.26" }
 flux-timing = { path = "crates/flux-timing", version = "0.0.14" }
 flux-utils = { path = "crates/flux-utils", version = "0.0.22" }
 flux-network = { path = "crates/flux-network", version = "0.0.7" }

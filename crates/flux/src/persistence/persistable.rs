@@ -5,7 +5,7 @@ use std::{
 };
 
 use flux_timing::InternalMessage;
-use flux_utils::directories::data_dir;
+use flux_utils::directories::{data_dir_with_base, local_share_dir};
 use serde::Serialize;
 use tracing::error;
 
@@ -16,11 +16,25 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
         "".to_string()
     }
 
-    fn persist_dir<S: AsRef<str>>(app_name: S) -> PathBuf {
-        data_dir(app_name).join(Self::PERSIST_DIR)
+    fn persist_dir<S: AsRef<Path>>(app_name: S) -> PathBuf {
+        Self::persist_dir_with_base_dir(local_share_dir(), app_name)
     }
 
-    fn persist<S: AsRef<str>>(
+    fn persist_dir_with_base_dir<D: AsRef<Path>, S: AsRef<Path>>(base_dir: D, app_name: S) -> PathBuf {
+        data_dir_with_base(base_dir, app_name).join(Self::PERSIST_DIR)
+    }
+
+    fn persist<S: AsRef<Path>>(
+        app_name: S,
+        vals: &[Self],
+        compression_level: Option<i32>,
+        filename: Option<String>,
+    ) {
+        Self::persist_in_base_dir(local_share_dir(), app_name, vals, compression_level, filename);
+    }
+
+    fn persist_in_base_dir<D: AsRef<Path>, S: AsRef<Path>>(
+        base_dir: D,
         app_name: S,
         vals: &[Self],
         compression_level: Option<i32>,
@@ -29,7 +43,7 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
         let Some(mut file) = vals.first().map(|v| v.filename()) else {
             return;
         };
-        let dir = Self::persist_dir(app_name);
+        let dir = Self::persist_dir_with_base_dir(base_dir, app_name);
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!("Not saving data because couldn't create persist dir ({:?}): {e}", dir);
             return;
@@ -43,11 +57,15 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
         write(file, vals, compression_level.unwrap_or(5));
     }
 
-    fn load<S: AsRef<str>, P: AsRef<Path>>(app_name: S, filename: P) -> Option<Vec<Self>> {
+    fn load<S: AsRef<Path>, P: AsRef<Path>>(app_name: S, filename: P) -> Option<Vec<Self>> {
         read(Self::persist_dir(app_name).join(filename.as_ref()).with_added_extension("bin"))
     }
 
-    fn load_all<S: AsRef<str>>(app_name: S) -> Option<Vec<Self>> {
+    fn load_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, P: AsRef<Path>>(base_dir: D, app_name: S, filename: P) -> Option<Vec<Self>> {
+        read(Self::persist_dir_with_base_dir(base_dir, app_name).join(filename.as_ref()).with_added_extension("bin"))
+    }
+
+    fn load_all<S: AsRef<Path>>(app_name: S) -> Option<Vec<Self>> {
         let mut out = vec![];
         let mut paths = std::fs::read_dir(Self::persist_dir(app_name))
             .ok()?
@@ -65,7 +83,7 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
         Some(out)
     }
 
-    fn load_from<S: AsRef<str>>(app_name: S, start_t: SystemTime) -> Option<Vec<Self>> {
+    fn load_from<S: AsRef<Path>>(app_name: S, start_t: SystemTime) -> Option<Vec<Self>> {
         let mut out = vec![];
         let mut paths = std::fs::read_dir(Self::persist_dir(app_name))
             .ok()?

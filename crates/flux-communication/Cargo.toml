@@ -1,6 +1,6 @@
 [package]
 name = "flux-communication"
-version = "0.0.25"
+version = "0.0.26"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0 AND MIT"
