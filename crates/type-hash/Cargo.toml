@@ -3,5 +3,8 @@ name = "type-hash"
 version = "0.0.1"
 edition = "2021"
 rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+keywords = ["low-latency", "performance", "communication"]
+repository = "https://github.com/gattaca-com/flux"
 
 [dependencies]
