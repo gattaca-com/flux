@@ -3,6 +3,9 @@ name = "flux-utils"
 version = "0.0.22"
 edition.workspace = true
 rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+keywords = ["low-latency", "performance", "communication"]
+repository = "https://github.com/gattaca-com/flux"
 
 [dependencies]
 flux-timing.workspace = true

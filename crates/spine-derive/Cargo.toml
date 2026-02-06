@@ -4,6 +4,9 @@ version = "0.0.8"
 description = "Attribute macro that auto-generates the boilerplate impls for Spine queues."
 edition.workspace = true
 rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+keywords = ["low-latency", "performance", "communication"]
+repository = "https://github.com/gattaca-com/flux"
 
 [lib]
 proc-macro = true

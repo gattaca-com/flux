@@ -3,6 +3,9 @@ edition.workspace = true
 name = "flux-timekeeper"
 rust-version.workspace = true
 version = "0.0.29"
+license = "Apache-2.0 AND MIT"
+keywords = ["low-latency", "performance", "communication"]
+repository = "https://github.com/gattaca-com/flux"
 
 [dependencies]
 flux.workspace = true
