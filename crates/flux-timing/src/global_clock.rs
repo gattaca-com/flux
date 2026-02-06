@@ -68,7 +68,9 @@ pub fn global_clock_not_mocked() -> &'static Clock {
     GLOBAL_CLOCK_NON_MOCKED.get_or_init(Clock::new)
 }
 
+pub(super) const MULTIPLIER: u64 = 100_000_000;
+
 #[inline]
-pub(super) fn nanos_for_100() -> u64 {
-    *GLOBAL_NANOS_FOR_100.get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, 100))
+pub(super) fn nanos_for_multiplier() -> u64 {
+    *GLOBAL_NANOS_FOR_100.get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, MULTIPLIER))
 }

@@ -5,7 +5,7 @@ use type_hash_derive::TypeHash;
 
 use crate::{
     Nanos,
-    global_clock::{global_clock_not_mocked, nanos_for_100},
+    global_clock::{MULTIPLIER, global_clock_not_mocked, nanos_for_multiplier},
 };
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, TypeHash)]
@@ -39,7 +39,7 @@ impl Duration {
 
     #[inline]
     pub fn from_secs(s: u64) -> Self {
-        Self(s * 100_000_000_000 / nanos_for_100())
+        Self(s * 1_000_000_000 * MULTIPLIER / nanos_for_multiplier())
     }
 
     #[inline]
@@ -49,41 +49,47 @@ impl Duration {
 
     #[inline]
     pub fn from_secs_f64(s: f64) -> Self {
-        Self::from_secs((s * 1_000_000_000.0).round() as u64)
+        Self::from_nanos((s * 1_000_000_000.0).round() as u64)
     }
 
     #[inline]
     pub fn from_millis(s: u64) -> Self {
-        Self(s * 100_000_000 / nanos_for_100())
+        Self(s * 1_000_000 * MULTIPLIER / nanos_for_multiplier())
     }
 
     #[inline]
     pub fn from_micros(s: u64) -> Self {
-        Self(s * 100_000 / nanos_for_100())
+        Self(s * 1_000 * MULTIPLIER / nanos_for_multiplier())
     }
 
     #[inline]
     pub fn from_nanos(s: u64) -> Self {
-        Self(s * 100 / nanos_for_100())
+        Self(s * MULTIPLIER / nanos_for_multiplier())
     }
 
     #[inline]
     pub fn as_secs(&self) -> f64 {
-        (self.0 * nanos_for_100()) as f64 / 100_000_000_000.0
+        (self.0 * nanos_for_multiplier()) as f64 / 1_000_000_000.0 / MULTIPLIER as f64
     }
 
     #[inline]
     pub fn as_millis(&self) -> f64 {
-        (self.0 * nanos_for_100()) as f64 / 100_000_000.0
+        (self.0 * nanos_for_multiplier()) as f64 / 1_000_000.0 / MULTIPLIER as f64
     }
 
     #[inline]
     pub fn as_micros(&self) -> f64 {
-        (self.0 * nanos_for_100()) as f64 / 100_000.0
+        (self.0 * nanos_for_multiplier()) as f64 / 1000.0 / MULTIPLIER as f64
     }
 
+    #[inline]
     pub fn as_micros_u128(&self) -> u128 {
-        (self.0 * nanos_for_100()) as u128 / 100_000
+        (self.0 * nanos_for_multiplier()) as u128 / 1000 / MULTIPLIER as u128
+    }
+
+    #[inline]
+    pub fn as_nanos(&self) -> f64 {
+        (self.0 * nanos_for_multiplier()) as f64 / MULTIPLIER as f64
     }
 }
 
@@ -357,14 +363,14 @@ impl From<Duration> for std::time::Duration {
 impl From<std::time::Duration> for Duration {
     #[inline]
     fn from(value: std::time::Duration) -> Self {
-        Self((value.as_nanos() * 100 / nanos_for_100() as u128) as u64)
+        Self((value.as_nanos() * 100 / nanos_for_multiplier() as u128) as u64)
     }
 }
 
 impl From<Nanos> for Duration {
     #[inline]
     fn from(value: Nanos) -> Self {
-        Self(value.0 * 100 / nanos_for_100())
+        Self(value.0 * 100 / nanos_for_multiplier())
     }
 }
 
