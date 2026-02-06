@@ -363,14 +363,14 @@ impl From<Duration> for std::time::Duration {
 impl From<std::time::Duration> for Duration {
     #[inline]
     fn from(value: std::time::Duration) -> Self {
-        Self((value.as_nanos() * 100 / nanos_for_multiplier() as u128) as u64)
+        Self((value.as_nanos() * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
     }
 }
 
 impl From<Nanos> for Duration {
     #[inline]
     fn from(value: Nanos) -> Self {
-        Self(value.0 * 100 / nanos_for_multiplier())
+        Self(value.0 * MULTIPLIER / nanos_for_multiplier())
     }
 }
 
