@@ -354,6 +354,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 self.tile_info.register_tile(name)
             }
 
+            fn new_in_base_dir(base_dir: impl AsRef<std::path::Path>) -> Self {
+                Self::new_with_base_dir(base_dir, None)
+            }
+
             fn app_name() -> &'static str {
                 #app_name_tokens
             }

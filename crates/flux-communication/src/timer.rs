@@ -1,12 +1,10 @@
 use std::{collections::HashMap, fmt::Display, path::Path, sync::Mutex};
 
 use flux_timing::{Duration, Instant, InternalMessage, Nanos};
+use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
 use once_cell::sync::Lazy;
 
-use crate::{
-    queue::{Producer, Queue, QueueType},
-    shmem_dir_queues_string,
-};
+use crate::queue::{Producer, Queue, QueueType};
 
 /// A single timing interval measured on one machine.
 ///
@@ -61,7 +59,15 @@ pub struct Timer {
 
 impl Timer {
     pub fn new<A: AsRef<Path>, S: Display>(app_name: A, name: S) -> Self {
-        let dirstr = shmem_dir_queues_string(&app_name);
+        Self::new_with_base_dir(local_share_dir(), app_name, name)
+    }
+
+    pub fn new_with_base_dir<D: AsRef<Path>, A: AsRef<Path>, S: Display>(
+        base_dir: D,
+        app_name: A,
+        name: S,
+    ) -> Self {
+        let dirstr = shmem_dir_queues_with_base(base_dir, app_name).to_string_lossy().to_string();
         let _ = std::fs::create_dir_all(&dirstr);
 
         let file = format!("{dirstr}/timing-{name}");

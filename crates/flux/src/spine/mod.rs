@@ -2,6 +2,8 @@ mod adapter;
 mod consumer;
 mod scoped;
 
+use std::path::Path;
+
 pub use adapter::SpineAdapter;
 pub use consumer::SpineConsumer;
 use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
@@ -50,6 +52,7 @@ pub trait FluxSpine: Sized + Send {
 
     fn attach_consumers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Consumers;
     fn attach_producers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Producers;
+    fn new_in_base_dir(base_dir: impl AsRef<Path>) -> Self;
 
     fn register_tile(&mut self, name: TileName) -> u16;
     fn app_name() -> &'static str;
