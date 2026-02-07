@@ -18,8 +18,8 @@ impl TrackingTimestamp {
         Self { ingestion_t: IngestionTime::now(), publish_delta: PublishDelta::new(id) }
     }
 
-    /// Note: this should not really be needed if Tiles are used properly throughout the system.
-    /// It's purely here due to legacy reasons. 
+    /// Note: this should not really be needed if Tiles are used properly
+    /// throughout the system. It's purely here due to legacy reasons.
     #[inline]
     pub fn new_without_tile() -> Self {
         Self { ingestion_t: IngestionTime::now(), publish_delta: PublishDelta::new(u16::MAX) }

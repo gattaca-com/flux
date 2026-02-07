@@ -15,7 +15,7 @@ pub const TIMESTAMP_FORMAT_UTC: &str = "%Y-%m-%d_%H:%M_utc";
 pub struct PersistingQueueTile<T: Persistable> {
     pending_data: Vec<InternalMessage<T>>,
     last_persist_time: Nanos,
-    base_dir: PathBuf
+    base_dir: PathBuf,
 }
 
 impl<T: Persistable> PersistingQueueTile<T> {
@@ -23,7 +23,11 @@ impl<T: Persistable> PersistingQueueTile<T> {
         Self::new_with_base_dir(local_share_dir())
     }
     pub fn new_with_base_dir<D: AsRef<Path>>(base_dir: D) -> Self {
-        Self { pending_data: Vec::new(), last_persist_time: Nanos::now(), base_dir: base_dir.as_ref().to_path_buf() }
+        Self {
+            pending_data: Vec::new(),
+            last_persist_time: Nanos::now(),
+            base_dir: base_dir.as_ref().to_path_buf(),
+        }
     }
 
     fn handle_persisting(&mut self, now: Nanos, app_name: &'static str) {

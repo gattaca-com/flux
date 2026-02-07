@@ -20,7 +20,10 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
         Self::persist_dir_with_base_dir(local_share_dir(), app_name)
     }
 
-    fn persist_dir_with_base_dir<D: AsRef<Path>, S: AsRef<Path>>(base_dir: D, app_name: S) -> PathBuf {
+    fn persist_dir_with_base_dir<D: AsRef<Path>, S: AsRef<Path>>(
+        base_dir: D,
+        app_name: S,
+    ) -> PathBuf {
         data_dir_with_base(base_dir, app_name).join(Self::PERSIST_DIR)
     }
 
@@ -61,8 +64,16 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
         read(Self::persist_dir(app_name).join(filename.as_ref()).with_added_extension("bin"))
     }
 
-    fn load_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, P: AsRef<Path>>(base_dir: D, app_name: S, filename: P) -> Option<Vec<Self>> {
-        read(Self::persist_dir_with_base_dir(base_dir, app_name).join(filename.as_ref()).with_added_extension("bin"))
+    fn load_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, P: AsRef<Path>>(
+        base_dir: D,
+        app_name: S,
+        filename: P,
+    ) -> Option<Vec<Self>> {
+        read(
+            Self::persist_dir_with_base_dir(base_dir, app_name)
+                .join(filename.as_ref())
+                .with_added_extension("bin"),
+        )
     }
 
     fn load_all<S: AsRef<Path>>(app_name: S) -> Option<Vec<Self>> {

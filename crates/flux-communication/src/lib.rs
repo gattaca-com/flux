@@ -9,7 +9,10 @@ use std::path::Path;
 
 pub use array::SeqlockArray;
 pub use error::{EmptyError, QueueError, ReadError};
-use flux_utils::{directories::{local_share_dir, shmem_dir_queues, shmem_dir_queues_with_base}, short_typename};
+use flux_utils::{
+    directories::{local_share_dir, shmem_dir_queues, shmem_dir_queues_with_base},
+    short_typename,
+};
 pub use seqlock::Seqlock;
 pub use shmem_data::ShmemData;
 pub use timer::{Timer, TimingMessage};
