@@ -79,7 +79,7 @@ impl Add<Nanos> for Instant {
     type Output = Instant;
 
     fn add(self, rhs: Nanos) -> Self::Output {
-        Instant(self.0 + rhs.0 * MULTIPLIER / nanos_for_multiplier())
+        Instant(self.0 + (rhs.0 as u128 * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
     }
 }
 
@@ -87,7 +87,7 @@ impl Sub<Nanos> for Instant {
     type Output = Instant;
 
     fn sub(self, rhs: Nanos) -> Self::Output {
-        Instant(self.0.saturating_sub(rhs.0 * MULTIPLIER / nanos_for_multiplier()))
+        Instant(self.0.saturating_sub((rhs.0 as u128 * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64))
     }
 }
 

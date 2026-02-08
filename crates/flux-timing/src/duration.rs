@@ -39,7 +39,7 @@ impl Duration {
 
     #[inline]
     pub fn from_secs(s: u64) -> Self {
-        Self(s * 1_000_000_000 * MULTIPLIER / nanos_for_multiplier())
+        Self((s as u128 * 1_000_000_000 * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
     }
 
     #[inline]
@@ -54,17 +54,17 @@ impl Duration {
 
     #[inline]
     pub fn from_millis(s: u64) -> Self {
-        Self(s * 1_000_000 * MULTIPLIER / nanos_for_multiplier())
+        Self((s as u128 * 1_000_000 * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
     }
 
     #[inline]
     pub fn from_micros(s: u64) -> Self {
-        Self(s * 1_000 * MULTIPLIER / nanos_for_multiplier())
+        Self((s as u128 * 1_000 * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
     }
 
     #[inline]
     pub fn from_nanos(s: u64) -> Self {
-        Self(s * MULTIPLIER / nanos_for_multiplier())
+        Self((s as u128 * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
     }
 
     #[inline]
@@ -370,7 +370,7 @@ impl From<std::time::Duration> for Duration {
 impl From<Nanos> for Duration {
     #[inline]
     fn from(value: Nanos) -> Self {
-        Self(value.0 * MULTIPLIER / nanos_for_multiplier())
+        Self((value.0 as u128 * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
     }
 }
 

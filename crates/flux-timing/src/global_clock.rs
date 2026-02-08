@@ -41,7 +41,7 @@ impl GovernorClock for OurClockForNanos {
     }
 }
 
-static GLOBAL_NANOS_FOR_100: OnceCell<u64> = OnceCell::new();
+static GLOBAL_NANOS_FOR_MULTIPLIER: OnceCell<u64> = OnceCell::new();
 // might be mocked
 static GLOBAL_CLOCK: OnceCell<OurClockForNanos> = OnceCell::new();
 // never mocked
@@ -72,5 +72,6 @@ pub(super) const MULTIPLIER: u64 = 100_000_000;
 
 #[inline]
 pub(super) fn nanos_for_multiplier() -> u64 {
-    *GLOBAL_NANOS_FOR_100.get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, MULTIPLIER))
+    *GLOBAL_NANOS_FOR_MULTIPLIER
+        .get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, MULTIPLIER))
 }
