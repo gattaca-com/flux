@@ -184,7 +184,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             producer_fields
                 .push(quote! { pub #field_ident : ::flux::spine::SpineProducer<#inner_ty> });
             consumer_init.push(quote! {
-                            #field_ident : ::flux::spine::SpineConsumer::attach::<#struct_ident, _>(tile, spine.#field_ident)
+                            #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(&spine.base_dir, tile, spine.#field_ident)
                         });
             producer_init.push(quote! { #field_ident : ::flux::communication::queue::Producer::from(spine.#field_ident) });
 
