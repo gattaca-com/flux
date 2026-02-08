@@ -98,6 +98,7 @@ enum RxState {
 ///     connection as dead and rebuild the state
 pub struct TcpStream {
     stream: mio::net::TcpStream,
+    peer_addr: SocketAddr,
 
     rx_state: RxState,
     rx_buf: Vec<u8>,
@@ -131,6 +132,7 @@ impl TcpStream {
         telemetry: TcpTelemetry,
     ) -> io::Result<Self> {
         stream.set_nodelay(true)?;
+        let peer_addr = stream.peer_addr()?;
 
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
@@ -141,6 +143,7 @@ impl TcpStream {
 
         Ok(Self {
             stream,
+            peer_addr,
             rx_state: RxState::ReadingHeader { buf: [0; FRAME_HEADER_SIZE], have: 0 },
             rx_buf: vec![0; RX_BUF_SIZE],
             send_buf: vec![0; Self::SEND_BUF_SIZE],
@@ -421,11 +424,9 @@ impl TcpStream {
 
     pub fn close(&mut self, registry: &Registry) -> SocketAddr {
         debug!("terminating connection");
-        let addr =
-            self.stream.peer_addr().expect("couldn't get the peer addr somehow for a tcp stream");
         let _ = registry.deregister(&mut self.stream);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
-        addr
+        self.peer_addr
     }
 }
 
