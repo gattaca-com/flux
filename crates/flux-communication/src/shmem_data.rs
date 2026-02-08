@@ -1,10 +1,14 @@
 use std::{
     borrow::Borrow,
     ops::{Deref, DerefMut},
+    path::Path,
     ptr::NonNull,
 };
 
-use flux_utils::{directories::shmem_dir_data, short_typename};
+use flux_utils::{
+    directories::{local_share_dir, shmem_dir_data_with_base},
+    short_typename,
+};
 use shared_memory::{Shmem, ShmemError};
 
 #[repr(C)]
@@ -23,8 +27,17 @@ impl<T> ShmemData<T> {
         app_name: &str,
         init_f: impl FnOnce() -> T,
     ) -> Result<ShmemData<T>, ShmemError> {
+        Self::open_or_init_with_base_dir(local_share_dir(), app_name, init_f)
+    }
+
+    pub fn open_or_init_with_base_dir<D: AsRef<Path>, A: AsRef<Path>>(
+        dir: D,
+        app_name: A,
+        init_f: impl FnOnce() -> T,
+    ) -> Result<ShmemData<T>, ShmemError> {
         use shared_memory::{ShmemConf, ShmemError};
-        let shmem_file = shmem_dir_data(app_name).join(short_typename::<T>().as_str());
+        let shmem_file =
+            shmem_dir_data_with_base(&dir, &app_name).join(short_typename::<T>().as_str());
         std::fs::create_dir_all(
             shmem_file
                 .parent()
@@ -42,9 +55,18 @@ impl<T> ShmemData<T> {
                 Ok(Self { inner })
             }
             Err(ShmemError::LinkExists) => {
-                let shmem = ShmemConf::new().flink(&shmem_file).open().unwrap_or_else(|_| {
-                    panic!("couldn't open shmem file {}", shmem_file.display())
-                });
+                let Ok(shmem) = ShmemConf::new().flink(&shmem_file).open() else {
+                    if shmem_file.exists() {
+                        tracing::warn!(
+                            "couldn't open shmem file {}, recreating and retrying",
+                            shmem_file.display()
+                        );
+                        std::fs::remove_file(shmem_file)
+                            .expect("couldn't remove shmem file for TileInfo");
+                        return Self::open_or_init_with_base_dir(dir, app_name, init_f);
+                    }
+                    panic!("couldn't open shmem file {}", shmem_file.display());
+                };
 
                 let inner = Self::shmem_ptr(shmem);
 

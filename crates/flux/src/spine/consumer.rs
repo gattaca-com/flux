@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
 use flux_utils::short_typename;
@@ -186,12 +186,13 @@ impl<T: 'static + Copy> SpineConsumer<T> {
 
 impl<T: 'static + Copy> SpineConsumer<T> {
     #[inline]
-    pub fn attach<S, Tl>(tile: &Tl, queue: SpineQueue<T>) -> Self
+    pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineQueue<T>) -> Self
     where
+        D: AsRef<Path>,
         S: FluxSpine,
         Tl: Tile<S>,
     {
-        let timer = Timer::new(S::app_name(), format!("{}-{}", tile.name(), short_typename::<T>()));
+        let timer = Timer::new_with_base_dir(base_dir, S::app_name(), format!("{}-{}", tile.name(), short_typename::<T>()));
         Self { timer, inner: queue::Consumer::from(queue) }
     }
 }

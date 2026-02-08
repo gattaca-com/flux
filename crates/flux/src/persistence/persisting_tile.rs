@@ -1,4 +1,7 @@
+use std::path::{Path, PathBuf};
+
 use flux_timing::{InternalMessage, Nanos};
+use flux_utils::directories::local_share_dir;
 
 use crate::{
     persistence::Persistable,
@@ -12,18 +15,27 @@ pub const TIMESTAMP_FORMAT_UTC: &str = "%Y-%m-%d_%H:%M_utc";
 pub struct PersistingQueueTile<T: Persistable> {
     pending_data: Vec<InternalMessage<T>>,
     last_persist_time: Nanos,
+    base_dir: PathBuf,
 }
 
 impl<T: Persistable> PersistingQueueTile<T> {
     pub fn new() -> Self {
-        Self { pending_data: Vec::new(), last_persist_time: Nanos::now() }
+        Self::new_with_base_dir(local_share_dir())
+    }
+    pub fn new_with_base_dir<D: AsRef<Path>>(base_dir: D) -> Self {
+        Self {
+            pending_data: Vec::new(),
+            last_persist_time: Nanos::now(),
+            base_dir: base_dir.as_ref().to_path_buf(),
+        }
     }
 
     fn handle_persisting(&mut self, now: Nanos, app_name: &'static str) {
         if !self.pending_data.is_empty() {
             let current_minute =
                 self.pending_data[0].publish_t().round_to_interval(PERSIST_INTERVAL);
-            InternalMessage::<T>::persist(
+            InternalMessage::<T>::persist_in_base_dir(
+                &self.base_dir,
                 app_name,
                 &self.pending_data,
                 Some(9),

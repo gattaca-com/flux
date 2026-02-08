@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, path::Path};
 
 use flux_communication::shmem_dir_queues_string;
 use flux_timing::{IngestionTime, Instant, Nanos};
@@ -75,7 +75,7 @@ pub struct TileMetrics {
 }
 
 impl TileMetrics {
-    pub fn new<A: AsRef<str>, S: Display>(app_name: A, tile_name: S) -> Self {
+    pub fn new<A: AsRef<Path>, S: Display>(app_name: A, tile_name: S) -> Self {
         let dirstr = shmem_dir_queues_string(&app_name);
         let _ = std::fs::create_dir_all(&dirstr);
 
