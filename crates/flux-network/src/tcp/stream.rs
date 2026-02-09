@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    io::{self, Read, Write},
+    io::{self, IoSlice, Read, Write},
     net::SocketAddr,
 };
 
@@ -100,7 +100,7 @@ pub struct TcpStream {
 
     rx_state: RxState,
     rx_buf: Vec<u8>,
-
+    header_buf: [u8; FRAME_HEADER_SIZE],
     send_buf: Vec<u8>,
     /// Filled when send would block.
     /// First entry will either be a full message or the current partially
@@ -144,6 +144,7 @@ impl TcpStream {
             peer_addr,
             rx_state: RxState::ReadingHeader { buf: [0; FRAME_HEADER_SIZE], have: 0 },
             rx_buf: vec![0; RX_BUF_SIZE],
+            header_buf: [0; FRAME_HEADER_SIZE],
             send_buf: vec![0; Self::SEND_BUF_SIZE],
             send_backlog: VecDeque::with_capacity(64),
             writable_armed: false,
@@ -190,27 +191,40 @@ impl TcpStream {
     #[inline]
     pub fn write_or_enqueue_with<F>(&mut self, registry: &Registry, serialise: F) -> ConnState
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
-        let len = self.serialise_frame(serialise);
+        self.serialise_frame(serialise);
+
+        let len = self.send_buf.len();
 
         if !self.send_backlog.is_empty() {
+            self.enqueue_back(registry, self.header_buf.to_vec());
             let data = self.alloc_vec(0, len);
             return self.enqueue_back(registry, data);
         }
 
         let frame = &self.send_buf[..len];
-        match self.stream.write(frame) {
+        match self.stream.write_vectored(&[IoSlice::new(&self.header_buf.as_slice()), IoSlice::new(frame)]) {
             Ok(0) => {
                 warn!("tcp: stream failed to write, disconnecting");
                 ConnState::Disconnected
             }
-            Ok(n) if n == len => ConnState::Alive,
+            Ok(n) if n == len + FRAME_HEADER_SIZE => {
+                ConnState::Alive
+            },
+
+            Ok(n) if n < FRAME_HEADER_SIZE => {
+                let data = self.alloc_vec(0, len);
+                self.enqueue_front(registry, data);
+                let header_data = self.header_buf[n..FRAME_HEADER_SIZE].to_vec();
+                self.enqueue_front(registry, header_data)
+            }
             Ok(n) => {
-                let data = self.alloc_vec(n, len);
+                let data = self.alloc_vec(n.saturating_sub(FRAME_HEADER_SIZE), len);
                 self.enqueue_front(registry, data)
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.enqueue_back(registry, self.header_buf.to_vec());
                 let data = self.alloc_vec(0, len);
                 self.enqueue_back(registry, data)
             }
@@ -241,7 +255,7 @@ impl TcpStream {
     /// returns connstate and whether it should be deregistered from writable
     #[inline]
     fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
-        while let Some(front) = self.send_backlog.front_mut()        {
+        while let Some(front) = self.send_backlog.front_mut() {
             match self.stream.write(front) {
                 Ok(0) => return ConnState::Disconnected,
 
@@ -406,25 +420,17 @@ impl TcpStream {
     /// payload size even when the buffer is too small (and skip the actual
     /// write in that case) so the retry can succeed.
     #[inline(always)]
-    fn serialise_frame<F>(&mut self, serialise: F) -> usize
+    fn serialise_frame<F>(&mut self, serialise: F)
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
-        let payload_len = serialise(&mut self.send_buf[FRAME_HEADER_SIZE..]);
-        let needed = FRAME_HEADER_SIZE + payload_len;
-
-        if needed > self.send_buf.len() {
-            debug!(buf_len = self.send_buf.len(), need_len = needed, "tcp: send buffer resized");
-            self.send_buf.resize(needed, 0);
-            serialise(&mut self.send_buf[FRAME_HEADER_SIZE..]);
-        }
-
+        self.send_buf.clear();
+        serialise(&mut self.send_buf);
         // write frame header
-        self.send_buf[..LEN_HEADER_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
-        self.send_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
+        self.header_buf[..LEN_HEADER_SIZE].copy_from_slice(&(self.send_buf.len() as u32).to_le_bytes());
+        self.header_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
             .copy_from_slice(&Nanos::now().0.to_le_bytes());
-
-        needed
+        
     }
 
     pub fn close(&mut self, registry: &Registry) -> SocketAddr {

@@ -87,7 +87,7 @@ impl ConnectionManager {
         let (token, stream) = self.conns.swap_remove(index);
         match stream {
             ConnectionVariant::Outbound(mut tcp_connection) => {
-                let addr = tcp_connection.close(self.poll.registry()); 
+                let addr = tcp_connection.close(self.poll.registry());
                 self.to_be_reconnected.push((token, addr));
             }
             ConnectionVariant::Inbound(mut tcp_connection) => {
@@ -108,7 +108,7 @@ impl ConnectionManager {
     #[inline]
     fn broadcast<F>(&mut self, serialise: &F)
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
         let mut i = self.conns.len();
         while i != 0 {
@@ -130,7 +130,7 @@ impl ConnectionManager {
     #[inline]
     fn write_or_enqueue_with<F>(&mut self, serialise: F, where_to: SendBehavior)
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
         match where_to {
             SendBehavior::Broadcast => self.broadcast(&serialise),
@@ -225,9 +225,8 @@ impl ConnectionManager {
                 continue;
             };
             if let Some(msg) = &self.on_connect_msg &&
-                stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut [u8]| {
-                    buf[..msg.len()].copy_from_slice(msg);
-                    msg.len()
+                stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+                    buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
             {
                 warn!(addr = ?addr, "on_connect_msg send failed");
@@ -293,9 +292,8 @@ impl ConnectionManager {
                         if let Some(msg) = &self.on_connect_msg &&
                             conn.write_or_enqueue_with(
                                 self.poll.registry(),
-                                |buf: &mut [u8]| {
-                                    buf[..msg.len()].copy_from_slice(msg);
-                                    msg.len()
+                                |buf: &mut Vec<u8>| {
+                                    buf.extend_from_slice(msg);
                                 },
                             ) == ConnState::Disconnected
                         {
@@ -429,7 +427,7 @@ impl TcpConnector {
     #[inline]
     pub fn write_or_enqueue_with<F>(&mut self, where_to: SendBehavior, serialise: F)
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
         self.conn_mgr.write_or_enqueue_with(serialise, where_to);
     }
