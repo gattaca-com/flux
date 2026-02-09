@@ -18,12 +18,12 @@ rust-version = "1.91.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-flux = { path = "crates/flux", version = "0.0.36" }
+flux = { path = "crates/flux", version = "0.0.37" }
 flux-communication = { path = "crates/flux-communication", version = "0.0.26" }
-flux-timing = { path = "crates/flux-timing", version = "0.0.14" }
+flux-timing = { path = "crates/flux-timing", version = "0.0.15" }
 flux-utils = { path = "crates/flux-utils", version = "0.0.22" }
-flux-network = { path = "crates/flux-network", version = "0.0.7" }
-spine-derive = { path = "crates/spine-derive", version = "0.0.8" }
+flux-network = { path = "crates/flux-network", version = "0.0.8" }
+spine-derive = { path = "crates/spine-derive", version = "0.0.9" }
 flux-overseer = { path = "crates/flux-overseer", version = "0.0.11" }
 flux-timekeeper = { path = "crates/flux-timekeeper", version = "0.0.29" }
 type-hash = { path = "crates/type-hash", version = "0.0.1" }

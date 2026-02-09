@@ -2,7 +2,7 @@
 edition.workspace = true
 name = "flux-network"
 rust-version.workspace = true
-version = "0.0.7"
+version = "0.0.8"
 license = "Apache-2.0 AND MIT"
 keywords = ["low-latency", "performance", "communication"]
 repository = "https://github.com/gattaca-com/flux"

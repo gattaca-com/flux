@@ -91,7 +91,7 @@ impl ConnectionManager {
                 self.to_be_reconnected.push((token, addr));
             }
             ConnectionVariant::Inbound(mut tcp_connection) => {
-                tcp_connection.close(self.poll.registry());
+                let _ = tcp_connection.close(self.poll.registry());
             }
             ConnectionVariant::Listener(mut tcp_listener) => {
                 let _ = self.poll.registry().deregister(&mut tcp_listener);
@@ -108,7 +108,7 @@ impl ConnectionManager {
     #[inline]
     fn broadcast<F>(&mut self, serialise: &F)
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
         let mut i = self.conns.len();
         while i != 0 {
@@ -130,7 +130,7 @@ impl ConnectionManager {
     #[inline]
     fn write_or_enqueue_with<F>(&mut self, serialise: F, where_to: SendBehavior)
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
         match where_to {
             SendBehavior::Broadcast => self.broadcast(&serialise),
@@ -225,9 +225,8 @@ impl ConnectionManager {
                 continue;
             };
             if let Some(msg) = &self.on_connect_msg &&
-                stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut [u8]| {
-                    buf[..msg.len()].copy_from_slice(msg);
-                    msg.len()
+                stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+                    buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
             {
                 warn!(addr = ?addr, "on_connect_msg send failed");
@@ -293,9 +292,8 @@ impl ConnectionManager {
                         if let Some(msg) = &self.on_connect_msg &&
                             conn.write_or_enqueue_with(
                                 self.poll.registry(),
-                                |buf: &mut [u8]| {
-                                    buf[..msg.len()].copy_from_slice(msg);
-                                    msg.len()
+                                |buf: &mut Vec<u8>| {
+                                    buf.extend_from_slice(msg);
                                 },
                             ) == ConnState::Disconnected
                         {
@@ -393,6 +391,7 @@ impl TcpConnector {
     /// 3) for each event:
     ///    - accepts inbound streams and calls `on_accept`
     ///    - reads/parses inbound/outbound streams and calls `on_msg_recv`
+    /// 4) returns a bool whether anything happened/any events were received
     ///
     /// # Callbacks
     /// - `on_accept` receives a [`ConnectionEvent`] containing the listener
@@ -400,7 +399,7 @@ impl TcpConnector {
     /// - `on_msg_recv` receives the stream token, a borrowed payload slice, and
     ///   a timestamp.
     #[inline]
-    pub fn poll_with<A, F>(&mut self, mut on_accept: A, mut on_msg_recv: F)
+    pub fn poll_with<A, F>(&mut self, mut on_accept: A, mut on_msg_recv: F) -> bool
     where
         A: for<'a> FnMut(ConnectionEvent),
         F: for<'a> FnMut(Token, &'a [u8], Nanos),
@@ -408,12 +407,15 @@ impl TcpConnector {
         self.conn_mgr.maybe_reconnect();
         if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
-            return;
+            return false;
         }
 
+        let mut o = false;
         for e in self.events.iter() {
+            o = true;
             self.conn_mgr.handle_event(e, &mut on_accept, &mut on_msg_recv);
         }
+        o
     }
 
     /// Writes immediately or enqueues bytes for later sending.
@@ -425,7 +427,7 @@ impl TcpConnector {
     #[inline]
     pub fn write_or_enqueue_with<F>(&mut self, where_to: SendBehavior, serialise: F)
     where
-        F: Fn(&mut [u8]) -> usize,
+        F: Fn(&mut Vec<u8>),
     {
         self.conn_mgr.write_or_enqueue_with(serialise, where_to);
     }
