@@ -43,8 +43,6 @@ const LEN_HEADER_SIZE: usize = core::mem::size_of::<u32>();
 /// kernel or enqueued in backlog.
 const TS_HEADER_SIZE: usize = core::mem::size_of::<Nanos>();
 const FRAME_HEADER_SIZE: usize = LEN_HEADER_SIZE + TS_HEADER_SIZE;
-/// Cap bytes per tick to avoid starving reads.
-const MAX_WRITE_BYTES_PER_TICK: usize = 64 * 1024;
 // TODO: might need to tweak these
 const RX_BUF_SIZE: usize = 32 * 1024;
 
@@ -243,15 +241,11 @@ impl TcpStream {
     /// returns connstate and whether it should be deregistered from writable
     #[inline]
     fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
-        let mut written = 0;
-        while let Some(front) = self.send_backlog.front_mut() &&
-            written < MAX_WRITE_BYTES_PER_TICK
-        {
+        while let Some(front) = self.send_backlog.front_mut()        {
             match self.stream.write(front) {
                 Ok(0) => return ConnState::Disconnected,
 
                 Ok(n) => {
-                    written += n;
                     if n == front.len() {
                         self.send_backlog.pop_front();
                     } else {
