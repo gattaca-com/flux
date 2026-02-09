@@ -393,6 +393,7 @@ impl TcpConnector {
     /// 3) for each event:
     ///    - accepts inbound streams and calls `on_accept`
     ///    - reads/parses inbound/outbound streams and calls `on_msg_recv`
+    /// 4) returns a bool whether anything happened/any events were received
     ///
     /// # Callbacks
     /// - `on_accept` receives a [`ConnectionEvent`] containing the listener
@@ -400,7 +401,7 @@ impl TcpConnector {
     /// - `on_msg_recv` receives the stream token, a borrowed payload slice, and
     ///   a timestamp.
     #[inline]
-    pub fn poll_with<A, F>(&mut self, mut on_accept: A, mut on_msg_recv: F)
+    pub fn poll_with<A, F>(&mut self, mut on_accept: A, mut on_msg_recv: F) -> bool
     where
         A: for<'a> FnMut(ConnectionEvent),
         F: for<'a> FnMut(Token, &'a [u8], Nanos),
@@ -408,12 +409,15 @@ impl TcpConnector {
         self.conn_mgr.maybe_reconnect();
         if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
-            return;
+            return false;
         }
 
+        let mut o = false;
         for e in self.events.iter() {
+            o = true;
             self.conn_mgr.handle_event(e, &mut on_accept, &mut on_msg_recv);
         }
+        o
     }
 
     /// Writes immediately or enqueues bytes for later sending.
