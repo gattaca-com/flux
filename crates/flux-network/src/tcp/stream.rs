@@ -413,12 +413,6 @@ impl TcpStream {
     }
 
     /// Serialise payload into send buffer and prepend frame header.
-    /// Returns total frame length (header + payload).
-    ///
-    /// If the payload exceeds the current buffer, `send_buf` is grown and the
-    /// closure is called a second time.  The closure MUST return the required
-    /// payload size even when the buffer is too small (and skip the actual
-    /// write in that case) so the retry can succeed.
     #[inline(always)]
     fn serialise_frame<F>(&mut self, serialise: F)
     where
