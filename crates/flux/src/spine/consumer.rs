@@ -192,7 +192,11 @@ impl<T: 'static + Copy> SpineConsumer<T> {
         S: FluxSpine,
         Tl: Tile<S>,
     {
-        let timer = Timer::new_with_base_dir(base_dir, S::app_name(), format!("{}-{}", tile.name(), short_typename::<T>()));
+        let timer = Timer::new_with_base_dir(
+            base_dir,
+            S::app_name(),
+            format!("{}-{}", tile.name(), short_typename::<T>()),
+        );
         Self { timer, inner: queue::Consumer::from(queue) }
     }
 }

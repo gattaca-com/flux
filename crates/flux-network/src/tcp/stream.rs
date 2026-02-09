@@ -403,26 +403,36 @@ impl TcpStream {
 
     /// Serialise payload into send buffer and prepend frame header.
     /// Returns total frame length (header + payload).
+    ///
+    /// If the payload exceeds the current buffer, `send_buf` is grown and the
+    /// closure is called a second time.  The closure MUST return the required
+    /// payload size even when the buffer is too small (and skip the actual
+    /// write in that case) so the retry can succeed.
     #[inline(always)]
     fn serialise_frame<F>(&mut self, serialise: F) -> usize
     where
         F: Fn(&mut [u8]) -> usize,
     {
-        let payload_buf = &mut self.send_buf[FRAME_HEADER_SIZE..];
-        let payload_len = serialise(payload_buf);
+        let payload_len = serialise(&mut self.send_buf[FRAME_HEADER_SIZE..]);
+        let needed = FRAME_HEADER_SIZE + payload_len;
+
+        if needed > self.send_buf.len() {
+            debug!(buf_len = self.send_buf.len(), need_len = needed, "tcp: send buffer resized");
+            self.send_buf.resize(needed, 0);
+            serialise(&mut self.send_buf[FRAME_HEADER_SIZE..]);
+        }
 
         // write frame header
-        let tx_buf = &mut self.send_buf[..];
-        tx_buf[..LEN_HEADER_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
-        tx_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].copy_from_slice(&Nanos::now().0.to_le_bytes());
+        self.send_buf[..LEN_HEADER_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        self.send_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
+            .copy_from_slice(&Nanos::now().0.to_le_bytes());
 
-        FRAME_HEADER_SIZE + payload_len
+        needed
     }
 
-    pub fn close(&mut self, registry: &Registry) -> SocketAddr {
+    pub fn close(&mut self, registry: &Registry) -> Option<SocketAddr> {
         debug!("terminating connection");
-        let addr =
-            self.stream.peer_addr().expect("couldn't get the peer addr somehow for a tcp stream");
+        let addr = self.stream.peer_addr().ok();
         let _ = registry.deregister(&mut self.stream);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         addr
