@@ -399,7 +399,6 @@ impl TcpConnector {
     /// - `on_msg_recv` receives the stream token, a borrowed payload slice, and
     ///   a timestamp.
     #[inline]
-    #[must_use]
     pub fn poll_with<A, F>(&mut self, mut on_accept: A, mut on_msg_recv: F) -> bool
     where
         A: for<'a> FnMut(ConnectionEvent),
