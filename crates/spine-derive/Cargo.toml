@@ -1,6 +1,6 @@
 [package]
 name = "spine-derive"
-version = "0.0.8"
+version = "0.0.9"
 description = "Attribute macro that auto-generates the boilerplate impls for Spine queues."
 edition.workspace = true
 rust-version.workspace = true
