@@ -5,7 +5,7 @@ use type_hash_derive::TypeHash;
 
 use crate::{
     Nanos,
-    global_clock::{MULTIPLIER, global_clock_not_mocked, nanos_for_multiplier},
+    global_clock::{global_clock_not_mocked, ticks_per_micro, ticks_per_milli, ticks_per_sec},
 };
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, TypeHash)]
@@ -37,11 +37,13 @@ impl Duration {
         Self(self.0.saturating_add(rhs.0))
     }
 
+    /// Overflows at ~182 years.
     #[inline]
     pub fn from_secs(s: u64) -> Self {
-        Self(s * 1_000_000_000 * MULTIPLIER / nanos_for_multiplier())
+        Self(s * ticks_per_sec())
     }
 
+    /// Overflows at ~182 years.
     #[inline]
     pub fn from_mins(s: u64) -> Self {
         Self::from_secs(s * 60)
@@ -52,44 +54,47 @@ impl Duration {
         Self::from_nanos((s * 1_000_000_000.0).round() as u64)
     }
 
+    /// Overflows at ~182 years.
     #[inline]
     pub fn from_millis(s: u64) -> Self {
-        Self(s * 1_000_000 * MULTIPLIER / nanos_for_multiplier())
+        Self(s * ticks_per_milli())
     }
 
+    /// Overflows at ~66 days.
     #[inline]
     pub fn from_micros(s: u64) -> Self {
-        Self(s * 1_000 * MULTIPLIER / nanos_for_multiplier())
+        Self(s * ticks_per_milli() / 1_000)
     }
 
+    /// Overflows at ~66 days.
     #[inline]
     pub fn from_nanos(s: u64) -> Self {
-        Self(s * MULTIPLIER / nanos_for_multiplier())
+        Self(s * ticks_per_micro() / 1000)
     }
 
     #[inline]
     pub fn as_secs(&self) -> f64 {
-        (self.0 * nanos_for_multiplier()) as f64 / 1_000_000_000.0 / MULTIPLIER as f64
+        self.0 as f64 / ticks_per_sec() as f64
     }
 
     #[inline]
     pub fn as_millis(&self) -> f64 {
-        (self.0 * nanos_for_multiplier()) as f64 / 1_000_000.0 / MULTIPLIER as f64
+        self.0 as f64 / ticks_per_milli() as f64
     }
 
     #[inline]
     pub fn as_micros(&self) -> f64 {
-        (self.0 * nanos_for_multiplier()) as f64 / 1000.0 / MULTIPLIER as f64
+        self.0 as f64 * 1_000.0 / ticks_per_milli() as f64
     }
 
     #[inline]
     pub fn as_micros_u128(&self) -> u128 {
-        (self.0 * nanos_for_multiplier()) as u128 / 1000 / MULTIPLIER as u128
+        (self.0 / ticks_per_micro()) as u128
     }
 
     #[inline]
     pub fn as_nanos(&self) -> f64 {
-        (self.0 * nanos_for_multiplier()) as f64 / MULTIPLIER as f64
+        self.0 as f64 * 1000.0 / ticks_per_micro() as f64
     }
 }
 
@@ -363,14 +368,15 @@ impl From<Duration> for std::time::Duration {
 impl From<std::time::Duration> for Duration {
     #[inline]
     fn from(value: std::time::Duration) -> Self {
-        Self((value.as_nanos() * MULTIPLIER as u128 / nanos_for_multiplier() as u128) as u64)
+        Self::from_secs(value.as_secs()) + Self::from_nanos(value.subsec_nanos() as u64)
     }
 }
 
 impl From<Nanos> for Duration {
+    /// Overflows at ~66 days.
     #[inline]
     fn from(value: Nanos) -> Self {
-        Self(value.0 * MULTIPLIER / nanos_for_multiplier())
+        Self(value.0 * ticks_per_micro() / 1000)
     }
 }
 
@@ -401,5 +407,75 @@ impl Mul<i32> for Duration {
     #[inline]
     fn mul(self, rhs: i32) -> Self {
         Self(self.0 * rhs as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn to_ns(d: Duration) -> u128 {
+        std::time::Duration::from(d).as_nanos()
+    }
+
+    /// Assert drift < 500ppm of expected, minimum 10ns absolute.
+    /// from_nanos path uses ticks_per_micro (~3200) so truncation can reach ~200ppm.
+    fn check(ours: Duration, expected: std::time::Duration) {
+        let actual_ns = to_ns(ours);
+        let expected_ns = expected.as_nanos();
+        let diff = (actual_ns as i128 - expected_ns as i128).unsigned_abs();
+        let max_err = (expected_ns / 2_000).max(10); // 500ppm or 10ns
+        assert!(
+            diff <= max_err,
+            "drift {diff}ns > {max_err}ns (500ppm): actual={actual_ns}ns expected={expected_ns}ns"
+        );
+    }
+
+    #[test]
+    fn from_secs_matches_std() {
+        for s in [0, 1, 5, 60, 3600, 86400, 604800] {
+            check(Duration::from_secs(s), std::time::Duration::from_secs(s));
+        }
+    }
+
+    #[test]
+    fn from_millis_matches_std() {
+        for ms in [0, 1, 10, 100, 500, 1_000, 30_000, 60_000] {
+            check(Duration::from_millis(ms), std::time::Duration::from_millis(ms));
+        }
+    }
+
+    #[test]
+    fn from_micros_matches_std() {
+        for us in [0, 1, 10, 100, 500, 1_000, 10_000, 500_000, 1_000_000] {
+            check(Duration::from_micros(us), std::time::Duration::from_micros(us));
+        }
+    }
+
+    #[test]
+    fn from_nanos_matches_std() {
+        for ns in [0, 1, 100, 1_000, 10_000, 100_000, 1_000_000, 1_000_000_000] {
+            check(Duration::from_nanos(ns), std::time::Duration::from_nanos(ns));
+        }
+    }
+
+    #[test]
+    fn from_std_roundtrip() {
+        for std_dur in [
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_micros(500),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::new(1, 500_000),
+        ] {
+            let ours: Duration = std_dur.into();
+            check(ours, std_dur);
+        }
+    }
+
+    #[test]
+    fn from_secs_f64_matches_std() {
+        for s in [0.001, 0.5, 1.0, 1.5, 60.0] {
+            check(Duration::from_secs_f64(s), std::time::Duration::from_secs_f64(s));
+        }
     }
 }

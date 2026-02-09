@@ -5,7 +5,7 @@ use type_hash_derive::TypeHash;
 
 use crate::{
     Duration, Nanos,
-    global_clock::{MULTIPLIER, global_clock_not_mocked, nanos_for_multiplier},
+    global_clock::{global_clock_not_mocked, ticks_per_micro},
 };
 
 // Socket is in the top 2 bits, rdtscp counter in lower 62
@@ -79,7 +79,7 @@ impl Add<Nanos> for Instant {
     type Output = Instant;
 
     fn add(self, rhs: Nanos) -> Self::Output {
-        Instant(self.0 + rhs.0 * MULTIPLIER / nanos_for_multiplier())
+        Instant(self.0 + rhs.0 * ticks_per_micro() / 1000)
     }
 }
 
@@ -87,7 +87,7 @@ impl Sub<Nanos> for Instant {
     type Output = Instant;
 
     fn sub(self, rhs: Nanos) -> Self::Output {
-        Instant(self.0.saturating_sub(rhs.0 * MULTIPLIER / nanos_for_multiplier()))
+        Instant(self.0.saturating_sub(rhs.0 * ticks_per_micro() / 1000))
     }
 }
 

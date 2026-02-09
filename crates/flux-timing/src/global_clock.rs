@@ -41,7 +41,7 @@ impl GovernorClock for OurClockForNanos {
     }
 }
 
-static GLOBAL_NANOS_FOR_100: OnceCell<u64> = OnceCell::new();
+static GLOBAL_NANOS_FOR_MULTIPLIER: OnceCell<u64> = OnceCell::new();
 // might be mocked
 static GLOBAL_CLOCK: OnceCell<OurClockForNanos> = OnceCell::new();
 // never mocked
@@ -68,9 +68,32 @@ pub fn global_clock_not_mocked() -> &'static Clock {
     GLOBAL_CLOCK_NON_MOCKED.get_or_init(Clock::new)
 }
 
-pub(super) const MULTIPLIER: u64 = 100_000_000;
+const MULTIPLIER: u64 = 100_000_000;
 
+fn nanos_for_multiplier() -> u64 {
+    *GLOBAL_NANOS_FOR_MULTIPLIER
+        .get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, MULTIPLIER))
+}
+
+static TICKS_PER_SEC: OnceCell<u64> = OnceCell::new();
+static TICKS_PER_MILLI: OnceCell<u64> = OnceCell::new();
+static TICKS_PER_MICRO: OnceCell<u64> = OnceCell::new();
+
+/// Overflow: s * ticks_per_sec() wraps at ~182 years.
 #[inline]
-pub(super) fn nanos_for_multiplier() -> u64 {
-    *GLOBAL_NANOS_FOR_100.get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, MULTIPLIER))
+pub(super) fn ticks_per_sec() -> u64 {
+    *TICKS_PER_SEC.get_or_init(|| 1_000_000_000 * MULTIPLIER / nanos_for_multiplier())
+}
+
+/// Overflow: ms * ticks_per_milli() wraps at ~182 years.
+#[inline]
+pub(super) fn ticks_per_milli() -> u64 {
+    *TICKS_PER_MILLI.get_or_init(|| 1_000_000 * MULTIPLIER / nanos_for_multiplier())
+}
+
+/// Overflow: us * ticks_per_micro() wraps at ~182 years.
+/// For nanos: ns * ticks_per_micro() / 1000 wraps at ~66 days.
+#[inline]
+pub(super) fn ticks_per_micro() -> u64 {
+    *TICKS_PER_MICRO.get_or_init(|| 1_000 * MULTIPLIER / nanos_for_multiplier())
 }
