@@ -87,9 +87,8 @@ impl ConnectionManager {
         let (token, stream) = self.conns.swap_remove(index);
         match stream {
             ConnectionVariant::Outbound(mut tcp_connection) => {
-                if let Some(addr) = tcp_connection.close(self.poll.registry()) {
-                    self.to_be_reconnected.push((token, addr));
-                }
+                let addr = tcp_connection.close(self.poll.registry()); 
+                self.to_be_reconnected.push((token, addr));
             }
             ConnectionVariant::Inbound(mut tcp_connection) => {
                 let _ = tcp_connection.close(self.poll.registry());

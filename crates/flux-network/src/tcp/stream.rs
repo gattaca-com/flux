@@ -427,7 +427,7 @@ impl TcpStream {
         needed
     }
 
-    pub fn close(&mut self, registry: &Registry) -> Option<SocketAddr> {
+    pub fn close(&mut self, registry: &Registry) -> SocketAddr {
         debug!("terminating connection");
         let _ = registry.deregister(&mut self.stream);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
