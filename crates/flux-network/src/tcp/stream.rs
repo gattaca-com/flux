@@ -118,19 +118,13 @@ pub struct TcpStream {
 impl TcpStream {
     pub const SEND_BUF_SIZE: usize = 32 * 1024;
 
-    #[allow(clippy::needless_pass_by_value)]
     #[inline(never)]
-    pub fn from_stream(stream: mio::net::TcpStream) -> io::Result<Self> {
-        Self::from_stream_with_telemetry(stream, TcpTelemetry::Disabled)
-    }
-
-    #[inline(never)]
-    pub fn from_stream_with_telemetry(
+    pub(crate) fn from_stream_with_telemetry(
         stream: mio::net::TcpStream,
+        peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
     ) -> io::Result<Self> {
         stream.set_nodelay(true)?;
-        let peer_addr = stream.peer_addr()?;
 
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,

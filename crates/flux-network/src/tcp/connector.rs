@@ -217,10 +217,10 @@ impl ConnectionManager {
                 error!("couldn't register tcp stream for {addr} with registry: {e}");
                 continue;
             };
-            let Ok(mut stream) = TcpStream::from_stream_with_telemetry(stream, self.telemetry)
-                .inspect_err(|e| {
-                    error!("couldn't construct tcpconnection for {addr} with registry: {e}")
-                })
+            let Ok(mut stream) =
+                TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry).inspect_err(
+                    |e| error!("couldn't construct tcpconnection for {addr} with registry: {e}"),
+                )
             else {
                 continue;
             };
@@ -284,7 +284,7 @@ impl ConnectionManager {
                             continue;
                         };
                         let Ok(mut conn) =
-                            TcpStream::from_stream_with_telemetry(stream, self.telemetry)
+                            TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry)
                         else {
                             continue;
                         };
