@@ -368,11 +368,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             #generated_new_method_token_stream // Use the correctly generated new method
 
             #[::flux::tracing::instrument(skip_all, fields(system = "Spine"))]
-            pub fn start<F>(mut self, on_panic: Option<Box<dyn Fn(&::std::panic::PanicHookInfo<'_>) + Sync + Send>>, f: F)
+            pub fn start<F>(mut self, on_panic: Option<Box<dyn Fn(&::std::panic::PanicHookInfo<'_>) + Sync + Send>>, custom_signal_handler: Option<::std::time::Duration>, f: F)
             where F: FnOnce(&mut ::flux::spine::ScopedSpine<'_, '_, #struct_ident>),
             {
                 std::thread::scope(|s| {
-                    let mut scoped = ::flux::spine::ScopedSpine::new(&mut self, s, on_panic);
+                    let mut scoped = ::flux::spine::ScopedSpine::new(&mut self, s, on_panic, custom_signal_handler);
                     f(&mut scoped);
 
                     ::flux::core_affinity::set_for_current(*::flux::core_affinity::get_core_ids().unwrap().last().unwrap());
@@ -383,12 +383,12 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[::flux::tracing::instrument(skip_all, fields(system = "Spine"))]
-            pub fn start_no_persist<F>(mut self, on_panic: Option<Box<dyn Fn(&::std::panic::PanicHookInfo<'_>) + Sync + Send>>, f: F)
+            pub fn start_no_persist<F>(mut self, on_panic: Option<Box<dyn Fn(&::std::panic::PanicHookInfo<'_>) + Sync + Send>>, custom_signal_handler: Option<::std::time::Duration>, f: F)
             where
                 F: FnOnce(&mut ::flux::spine::ScopedSpine<'_, '_, #struct_ident>),
             {
                 std::thread::scope(|s| {
-                    let mut scoped = ::flux::spine::ScopedSpine::new(&mut self, s, on_panic);
+                    let mut scoped = ::flux::spine::ScopedSpine::new(&mut self, s, on_panic, custom_signal_handler);
                     f(&mut scoped);
                 })
             }

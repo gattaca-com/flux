@@ -419,7 +419,8 @@ mod tests {
     }
 
     /// Assert drift < 500ppm of expected, minimum 10ns absolute.
-    /// from_nanos path uses ticks_per_micro (~3200) so truncation can reach ~200ppm.
+    /// from_nanos path uses ticks_per_micro (~3200) so truncation can reach
+    /// ~200ppm.
     fn check(ours: Duration, expected: std::time::Duration) {
         let actual_ns = to_ns(ours);
         let expected_ns = expected.as_nanos();
