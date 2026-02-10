@@ -183,9 +183,6 @@ impl TcpStream {
     /// allocates a new vec and stores frame in the backlog to be flushed at
     /// the next writable event.
     ///
-    /// See (or use) `wincode_ser_into_slice` for help with what to use for the
-    /// `serialise` closure,.
-    ///
     /// TODO: avoid allocation by queueing offsets into `self.send_buf` instead
     /// of Vec<u8>.
     #[inline]
@@ -204,14 +201,15 @@ impl TcpStream {
         }
 
         let frame = &self.send_buf[..len];
-        match self.stream.write_vectored(&[IoSlice::new(&self.header_buf.as_slice()), IoSlice::new(frame)]) {
+        match self
+            .stream
+            .write_vectored(&[IoSlice::new(self.header_buf.as_slice()), IoSlice::new(frame)])
+        {
             Ok(0) => {
                 warn!("tcp: stream failed to write, disconnecting");
                 ConnState::Disconnected
             }
-            Ok(n) if n == len + FRAME_HEADER_SIZE => {
-                ConnState::Alive
-            },
+            Ok(n) if n == len + FRAME_HEADER_SIZE => ConnState::Alive,
 
             Ok(n) if n < FRAME_HEADER_SIZE => {
                 let data = self.alloc_vec(0, len);
@@ -421,10 +419,10 @@ impl TcpStream {
         self.send_buf.clear();
         serialise(&mut self.send_buf);
         // write frame header
-        self.header_buf[..LEN_HEADER_SIZE].copy_from_slice(&(self.send_buf.len() as u32).to_le_bytes());
+        self.header_buf[..LEN_HEADER_SIZE]
+            .copy_from_slice(&(self.send_buf.len() as u32).to_le_bytes());
         self.header_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
             .copy_from_slice(&Nanos::now().0.to_le_bytes());
-        
     }
 
     pub fn close(&mut self, registry: &Registry) -> SocketAddr {

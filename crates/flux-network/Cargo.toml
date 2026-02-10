@@ -7,9 +7,6 @@ license = "Apache-2.0 AND MIT"
 keywords = ["low-latency", "performance", "communication"]
 repository = "https://github.com/gattaca-com/flux"
 
-[features]
-wincode = ["dep:wincode"]
-
 [dependencies]
 flux-communication.workspace = true
 flux-timing.workspace = true
