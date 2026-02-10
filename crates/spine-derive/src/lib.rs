@@ -199,7 +199,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     Some(::flux::timing::Duration::from_millis(10)),
                                 );
                                 ::flux::tile::attach_tile(
-                                    ::flux::persistence::PersistingQueueTile::<#inner_ty>::new_with_base_dir(&spine.base_dir),
+                                    ::flux::persistence::PersistingQueueTile::<#inner_ty>::new_with_base_dir(&scoped.spine.base_dir),
                                     &mut scoped,
                                     cfg,
                                 );
