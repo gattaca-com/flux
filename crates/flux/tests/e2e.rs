@@ -75,7 +75,7 @@ fn end_to_end_send_receive_and_exit() {
     let want = 42u64;
 
     std::thread::scope(|scope| {
-        let mut scoped = flux::spine::ScopedSpine::new(&mut spine, scope, None);
+        let mut scoped = flux::spine::ScopedSpine::new(&mut spine, scope, None, None);
 
         attach_tile(
             ProducerTile { val: want },

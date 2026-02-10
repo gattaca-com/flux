@@ -22,14 +22,12 @@ pub struct ScopedSpine<'a, 'b: 'a, S> {
 // Note: this is unecassary if every thread in a process runs as a tile.
 // We just have this here in case the process runs some threads as
 // non-tiles
-fn spawn_signal_handler_fallback(stop_flag: Arc<AtomicUsize>) {
+fn spawn_signal_handler_fallback(stop_flag: Arc<AtomicUsize>, grace: Duration) {
     thread::spawn(move || {
         loop {
             let sig = stop_flag.load(Ordering::Relaxed);
             if sig != 0 {
-                // give tiles time to exit
-                thread::sleep(Duration::from_millis(500));
-
+                thread::sleep(grace);
                 let _ = signal_hook::low_level::emulate_default_handler(sig as libc::c_int);
             }
             thread::sleep(Duration::from_secs(1));
@@ -53,11 +51,14 @@ fn setup_panic_hook(
 }
 
 impl<'a, 'b: 'a, S> ScopedSpine<'a, 'b, S> {
+    /// Pass through `Some` `custom_signal_handler` if you want a custom signal handler.
+    /// Field is equal to the grace (sleep) time it will give to Tile teardown before shutting down the process. 
     #[allow(clippy::type_complexity)]
     pub fn new(
         spine: &'b mut S,
         scope: &'a thread::Scope<'a, 'b>,
         on_panic: Option<Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send>>,
+        custom_signal_handler: Option<Duration>,
     ) -> Self {
         let stop_flag = Arc::new(AtomicUsize::new(0));
         const SIGTERM_U: usize = SIGTERM as usize;
@@ -71,7 +72,9 @@ impl<'a, 'b: 'a, S> ScopedSpine<'a, 'b, S> {
             .expect("register SIGQUIT");
 
         setup_panic_hook(Arc::clone(&stop_flag), on_panic);
-        spawn_signal_handler_fallback(Arc::clone(&stop_flag));
+        if let Some(grace) = custom_signal_handler {
+            spawn_signal_handler_fallback(Arc::clone(&stop_flag), grace);
+        }
 
         Self { spine, scope, stop_flag }
     }
