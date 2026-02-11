@@ -427,6 +427,29 @@ impl TcpStream {
     }
 }
 
+/// Set kernel SO_SNDBUF and SO_RCVBUF on a mio TcpStream.
+pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let size = size as libc::c_int;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &size as *const _ as *const libc::c_void,
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void,
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// Format: local_port-remote_ip:remote_port (e.g. "8080-192.168.1.1:9000")
 fn stream_label(stream: &mio::net::TcpStream) -> String {
     let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);

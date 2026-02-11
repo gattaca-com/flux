@@ -5,7 +5,7 @@ use flux_utils::safe_panic;
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
-use crate::tcp::{ConnState, TcpStream, TcpTelemetry};
+use crate::tcp::{ConnState, TcpStream, TcpTelemetry, stream::set_socket_buf_size};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -53,6 +53,7 @@ struct ConnectionManager {
     reconnector: Repeater,
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
+    socket_buf_size: Option<usize>,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, SocketAddr)>,
@@ -65,6 +66,7 @@ impl Default for ConnectionManager {
             reconnector: Repeater::every(Duration::from_secs(2)),
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
+            socket_buf_size: None,
             to_be_reconnected: Vec::with_capacity(5),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
@@ -204,6 +206,9 @@ impl ConnectionManager {
             else {
                 continue;
             };
+            if let Some(size) = self.socket_buf_size {
+                set_socket_buf_size(&stream, size);
+            }
             let Ok(err) =
                 stream.take_error().inspect_err(|e| error!("couldn't take error on stream: {e}"))
             else {
@@ -275,6 +280,9 @@ impl ConnectionManager {
                 ConnectionVariant::Listener(tcp_listener) => {
                     if let Ok((mut stream, addr)) = tcp_listener.accept() {
                         tracing::info!(?addr, "client connected");
+                        if let Some(size) = self.socket_buf_size {
+                            set_socket_buf_size(&stream, size);
+                        }
                         let token = Token(self.next_token);
                         if let Err(e) =
                             self.poll.registry().register(&mut stream, token, Interest::READABLE)
@@ -380,6 +388,12 @@ impl TcpConnector {
     /// Sets telemetry config for all streams created by this connector.
     pub fn with_telemetry(mut self, telemetry: TcpTelemetry) -> Self {
         self.conn_mgr.telemetry = telemetry;
+        self
+    }
+
+    /// Sets kernel SO_SNDBUF and SO_RCVBUF on all sockets (outbound and accepted).
+    pub fn with_socket_buf_size(mut self, size: usize) -> Self {
+        self.conn_mgr.socket_buf_size = Some(size);
         self
     }
 
