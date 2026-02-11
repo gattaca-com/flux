@@ -51,8 +51,9 @@ fn setup_panic_hook(
 }
 
 impl<'a, 'b: 'a, S> ScopedSpine<'a, 'b, S> {
-    /// Pass through `Some` `custom_signal_handler` if you want a custom signal handler.
-    /// Field is equal to the grace (sleep) time it will give to Tile teardown before shutting down the process. 
+    /// Pass through `Some` `custom_signal_handler` if you want a custom signal
+    /// handler. Field is equal to the grace (sleep) time it will give to
+    /// Tile teardown before shutting down the process.
     #[allow(clippy::type_complexity)]
     pub fn new(
         spine: &'b mut S,

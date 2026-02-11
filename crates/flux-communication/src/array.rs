@@ -23,9 +23,7 @@ impl ArrayHeader {
     pub fn open_shared<S: AsRef<Path>>(path: S) -> Result<&'static mut Self, ShmemError> {
         let path = path.as_ref();
         let _ = std::fs::create_dir_all(path);
-        let shmem = ShmemConf::new()
-            .flink(path)
-            .open()?;
+        let shmem = ShmemConf::new().flink(path).open()?;
         let ptr = shmem.as_ptr();
         std::mem::forget(shmem);
         Ok(Self::from_ptr(ptr))
@@ -156,11 +154,14 @@ impl<T: Copy> InnerSeqlockArray<T> {
                 let v = match Self::open_shared(shmem_flink.as_ref()) {
                     Ok(v) => v,
                     Err(e) if shmem_flink.as_ref().exists() => {
-                        tracing::warn!("There was an error opening {:?}, removing and recreating: {e}", shmem_flink.as_ref());
+                        tracing::warn!(
+                            "There was an error opening {:?}, removing and recreating: {e}",
+                            shmem_flink.as_ref()
+                        );
                         let _ = std::fs::remove_file(shmem_flink.as_ref());
                         return Self::create_or_open_shared(shmem_flink, len);
-                    },
-                    Err(e) => return Err(e)
+                    }
+                    Err(e) => return Err(e),
                 };
                 if unsafe { (*v).header.bufsize } < len { Err(QueueError::TooSmall) } else { Ok(v) }
             }
