@@ -1,6 +1,6 @@
 use std::{alloc::Layout, borrow::Borrow, ops::Deref, path::Path};
 
-use shared_memory::ShmemConf;
+use shared_memory::{ShmemConf, ShmemError};
 
 use crate::{
     Seqlock,
@@ -20,16 +20,15 @@ impl ArrayHeader {
         unsafe { &mut *(ptr as *mut Self) }
     }
 
-    pub fn open_shared<S: AsRef<Path>>(path: S) -> &'static mut Self {
+    pub fn open_shared<S: AsRef<Path>>(path: S) -> Result<&'static mut Self, ShmemError> {
         let path = path.as_ref();
         let _ = std::fs::create_dir_all(path);
         let shmem = ShmemConf::new()
             .flink(path)
-            .open()
-            .unwrap_or_else(|err| panic!("couldn't open shmem file {}. Err {err}", path.display()));
+            .open()?;
         let ptr = shmem.as_ptr();
         std::mem::forget(shmem);
-        Self::from_ptr(ptr)
+        Ok(Self::from_ptr(ptr))
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -154,7 +153,15 @@ impl<T: Copy> InnerSeqlockArray<T> {
                 Ok(Self::from_uninitialized_ptr(ptr, len))
             }
             Err(ShmemError::LinkExists) => {
-                let v = Self::open_shared(shmem_flink.as_ref())?;
+                let v = match Self::open_shared(shmem_flink.as_ref()) {
+                    Ok(v) => v,
+                    Err(e) if shmem_flink.as_ref().exists() => {
+                        tracing::warn!("There was an error opening {:?}, removing and recreating: {e}", shmem_flink.as_ref());
+                        let _ = std::fs::remove_file(shmem_flink.as_ref());
+                        return Self::create_or_open_shared(shmem_flink, len);
+                    },
+                    Err(e) => return Err(e)
+                };
                 if unsafe { (*v).header.bufsize } < len { Err(QueueError::TooSmall) } else { Ok(v) }
             }
             Err(e) => Err(e.into()),
@@ -166,7 +173,7 @@ impl<T: Copy> InnerSeqlockArray<T> {
         if !path.exists() {
             return Err(QueueError::NonExistingFile);
         }
-        let header = ArrayHeader::open_shared(shmem_file.as_ref());
+        let header = ArrayHeader::open_shared(shmem_file.as_ref())?;
         if !header.is_initialized() {
             return Err(QueueError::UnInitialized);
         }
