@@ -129,7 +129,10 @@ impl TcpStream {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
             TcpTelemetry::Enabled { app_name } => {
-                Some(TcpTimers::new(app_name, &stream_label(&stream)))
+                let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+                let peer = peer_addr.to_string();
+                let steam_label = format!("{local_port}-{peer}");
+                Some(TcpTimers::new(app_name, &steam_label))
             }
         };
 
@@ -448,11 +451,4 @@ pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
             core::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
-}
-
-/// Format: local_port-remote_ip:remote_port (e.g. "8080-192.168.1.1:9000")
-fn stream_label(stream: &mio::net::TcpStream) -> String {
-    let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
-    format!("{local_port}-{peer}")
 }
