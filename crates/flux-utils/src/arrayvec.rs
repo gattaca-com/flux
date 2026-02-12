@@ -447,6 +447,13 @@ impl<const N: usize> core::fmt::Debug for ArrayStr<N> {
     }
 }
 
+impl<const N: usize> core::hash::Hash for ArrayStr<N> {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.buf.hash(state);
+    }
+}
+
 mod serde_impl {
     use core::fmt;
 
@@ -603,6 +610,37 @@ mod wincode_impl {
 
             dst.write(arr);
             Ok(())
+        }
+    }
+
+    impl<const N: usize> wincode::SchemaWrite for super::ArrayStr<N> {
+        type Src = Self;
+
+        #[inline]
+        fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
+            <ArrayVec<u8, N> as wincode::SchemaWrite>::size_of(&src.buf)
+        }
+
+        #[inline]
+        fn write(
+            writer: &mut impl wincode::io::Writer,
+            src: &Self::Src,
+        ) -> wincode::WriteResult<()> {
+            <ArrayVec<u8, N> as wincode::SchemaWrite>::write(writer, &src.buf)
+        }
+    }
+
+    impl<'de, const N: usize> wincode::SchemaRead<'de> for super::ArrayStr<N> {
+        type Dst = Self;
+
+        fn read(
+            reader: &mut impl wincode::io::Reader<'de>,
+            dst: &mut MaybeUninit<Self::Dst>,
+        ) -> wincode::ReadResult<()> {
+            let buf_dst = unsafe {
+                &mut *(dst as *mut MaybeUninit<Self::Dst>).cast::<MaybeUninit<ArrayVec<u8, N>>>()
+            };
+            <ArrayVec<u8, N> as wincode::SchemaRead>::read(reader, buf_dst)
         }
     }
 }
