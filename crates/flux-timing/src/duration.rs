@@ -78,13 +78,28 @@ impl Duration {
     }
 
     #[inline]
+    pub fn as_secs_u64(&self) -> u64 {
+        self.0 / ticks_per_sec()
+    }
+
+    #[inline]
     pub fn as_millis(&self) -> f64 {
         self.0 as f64 / ticks_per_milli() as f64
     }
 
     #[inline]
+    pub fn as_millis_u64(&self) -> u64 {
+        self.0 / ticks_per_milli()
+    }
+
+    #[inline]
     pub fn as_micros(&self) -> f64 {
         self.0 as f64 * 1_000.0 / ticks_per_milli() as f64
+    }
+
+    #[inline]
+    pub fn as_micros_u64(&self) -> u64 {
+        self.0 / ticks_per_micro()
     }
 
     #[inline]
