@@ -92,6 +92,11 @@ impl Nanos {
     }
 
     #[inline]
+    pub fn as_secs_u64(&self) -> u64 {
+        self.0 / 1_000_000_000
+    }
+
+    #[inline]
     pub fn as_millis(&self) -> f64 {
         self.0 as f64 / 1_000_000.0
     }
@@ -104,6 +109,11 @@ impl Nanos {
     #[inline]
     pub fn as_micros(&self) -> f64 {
         self.0 as f64 / 1_000.0
+    }
+
+    #[inline]
+    pub fn as_micros_u64(&self) -> u64 {
+        self.0 / 1_000
     }
 
     #[inline]
