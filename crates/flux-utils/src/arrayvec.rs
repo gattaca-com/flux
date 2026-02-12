@@ -450,7 +450,7 @@ impl<const N: usize> core::fmt::Debug for ArrayStr<N> {
 impl<const N: usize> core::hash::Hash for ArrayStr<N> {
     #[inline]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
+        self.buf.hash(state);
     }
 }
 
