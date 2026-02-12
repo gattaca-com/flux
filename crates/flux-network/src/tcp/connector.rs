@@ -391,7 +391,8 @@ impl TcpConnector {
         self
     }
 
-    /// Sets kernel SO_SNDBUF and SO_RCVBUF on all sockets (outbound and accepted).
+    /// Sets kernel SO_SNDBUF and SO_RCVBUF on all sockets (outbound and
+    /// accepted).
     pub fn with_socket_buf_size(mut self, size: usize) -> Self {
         self.conn_mgr.socket_buf_size = Some(size);
         self
