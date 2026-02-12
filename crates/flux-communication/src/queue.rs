@@ -326,7 +326,7 @@ impl<T: Copy> InnerQueue<T> {
         }
     }
 
-    fn open_shared<S: AsRef<Path>>(shmem_file: S) -> Result<*const Self, QueueError> {
+    fn open_shared<S: AsRef<Path>>(shmem_file: &S) -> Result<*const Self, QueueError> {
         if !shmem_file.as_ref().exists() {
             return Err(QueueError::NonExistingFile);
         }
@@ -375,8 +375,8 @@ impl<T: Copy> Queue<T> {
 
     pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
         Self {
-            inner: InnerQueue::open_shared(shmem_file)
-                .expect("Couldn't open shared queue, was it initialized?"),
+            inner: InnerQueue::open_shared(&shmem_file)
+                .expect(&format!("Couldn't open shared queue at {:?}, was it initialized?", shmem_file.as_ref())),
         }
     }
 }
