@@ -28,23 +28,20 @@ pub enum ConnectionVariant {
     Listener(TcpListener),
 }
 
-/// Metadata describing a newly accepted inbound TCP connection.
-///
-/// Emitted via the `on_accept` callback passed to [`TcpConnector::poll_with`].
-/// This event allows the caller to:
-/// - identify **which listener** accepted the connection
-/// - obtain the **token of the newly created inbound stream**
-/// - inspect the peer socket address
-///
-/// The `incoming_stream` token can be used to:
-/// - distinguish messages in the `on_msg_recv` callback
-/// - send data back to this specific peer via
-///   [`TcpConnector::write_or_enqueue_with`] using `SendBehavior::Single`.
-#[derive(Clone, Copy, Debug)]
-pub struct ConnectionEvent {
-    pub listener: Token,
-    pub incoming_stream: Token,
-    pub peer_addr: SocketAddr,
+/// Event emitted by [`TcpConnector::poll_with`] for each notable IO occurrence.
+pub enum PollEvent<'a> {
+    /// A new inbound connection was accepted from a listener.
+    ///
+    /// - `listener`: token of the listening socket that accepted
+    /// - `stream`: token assigned to the new inbound stream
+    /// - `peer_addr`: remote address
+    ///
+    /// Use the `stream` token with [`SendBehavior::Single`] to write back.
+    Accept { listener: Token, stream: Token, peer_addr: SocketAddr },
+    /// A connection was closed (by the remote or due to an IO error).
+    Disconnect { token: Token },
+    /// A complete framed message was received.
+    Message { token: Token, payload: &'a [u8], send_ts: Nanos },
 }
 
 struct ConnectionManager {
@@ -255,10 +252,9 @@ impl ConnectionManager {
     }
 
     #[inline]
-    fn handle_event<A, F>(&mut self, e: &Event, mut on_accept: A, mut on_msg_recv: F)
+    fn handle_event<F>(&mut self, e: &Event, handler: &mut F)
     where
-        A: for<'a> FnMut(ConnectionEvent),
-        F: for<'a> FnMut(Token, &'a [u8], Nanos),
+        F: for<'a> FnMut(PollEvent<'a>),
     {
         let event_token = e.token();
         let Some(stream_id) = self.conns.iter().position(|(t, _)| t == &event_token) else {
@@ -270,9 +266,15 @@ impl ConnectionManager {
             match &mut self.conns[stream_id].1 {
                 ConnectionVariant::Outbound(tcp_connection) |
                 ConnectionVariant::Inbound(tcp_connection) => {
-                    if tcp_connection.poll_with(self.poll.registry(), e, &mut on_msg_recv) ==
-                        ConnState::Disconnected
+                    if tcp_connection.poll_with(
+                        self.poll.registry(),
+                        e,
+                        &mut |token, payload, send_ts| {
+                            handler(PollEvent::Message { token, payload, send_ts });
+                        },
+                    ) == ConnState::Disconnected
                     {
+                        handler(PollEvent::Disconnect { token: event_token });
                         self.disconnect_at_index(stream_id);
                     }
                     return;
@@ -307,9 +309,9 @@ impl ConnectionManager {
                         {
                             continue;
                         }
-                        on_accept(ConnectionEvent {
+                        handler(PollEvent::Accept {
                             listener: event_token,
-                            incoming_stream: token,
+                            stream: token,
                             peer_addr: addr,
                         });
                         self.conns.push((token, ConnectionVariant::Inbound(conn)));
@@ -398,26 +400,18 @@ impl TcpConnector {
         self
     }
 
-    /// Polls sockets once (non-blocking) and dispatches events to callbacks.
+    /// Polls sockets once (non-blocking) and dispatches events via
+    /// [`PollEvent`].
     ///
     /// This call:
     /// 1) attempts outbound reconnects if the interval fired
     /// 2) polls `mio` with a zero timeout
-    /// 3) for each event:
-    ///    - accepts inbound streams and calls `on_accept`
-    ///    - reads/parses inbound/outbound streams and calls `on_msg_recv`
-    /// 4) returns a bool whether anything happened/any events were received
-    ///
-    /// # Callbacks
-    /// - `on_accept` receives a [`ConnectionEvent`] containing the listener
-    ///   token and the new inbound stream token.
-    /// - `on_msg_recv` receives the stream token, a borrowed payload slice, and
-    ///   a timestamp.
+    /// 3) for each event calls `handler` with the appropriate [`PollEvent`]
+    /// 4) returns whether any IO events were processed
     #[inline]
-    pub fn poll_with<A, F>(&mut self, mut on_accept: A, mut on_msg_recv: F) -> bool
+    pub fn poll_with<F>(&mut self, mut handler: F) -> bool
     where
-        A: for<'a> FnMut(ConnectionEvent),
-        F: for<'a> FnMut(Token, &'a [u8], Nanos),
+        F: for<'a> FnMut(PollEvent<'a>),
     {
         self.conn_mgr.maybe_reconnect();
         if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
@@ -428,7 +422,7 @@ impl TcpConnector {
         let mut o = false;
         for e in self.events.iter() {
             o = true;
-            self.conn_mgr.handle_event(e, &mut on_accept, &mut on_msg_recv);
+            self.conn_mgr.handle_event(e, &mut handler);
         }
         o
     }
