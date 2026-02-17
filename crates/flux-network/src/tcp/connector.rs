@@ -30,7 +30,7 @@ pub enum ConnectionVariant {
 
 /// Event emitted by [`TcpConnector::poll_with`] for each notable IO occurrence.
 pub enum PollEvent<'a> {
-    /// A new inbound connection was accepted from a listener.
+    /// A new connection was accepted from a listener.
     ///
     /// - `listener`: token of the listening socket that accepted
     /// - `stream`: token assigned to the new inbound stream
@@ -54,6 +54,8 @@ struct ConnectionManager {
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, SocketAddr)>,
+    // Outbound connections that completed during maybe_reconnect, drained in poll_with.
+    newly_connected: Vec<(Token, SocketAddr)>,
     next_token: usize,
 }
 impl Default for ConnectionManager {
@@ -64,7 +66,8 @@ impl Default for ConnectionManager {
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
-            to_be_reconnected: Vec::with_capacity(5),
+            to_be_reconnected: Vec::with_capacity(10),
+            newly_connected: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
         }
@@ -234,7 +237,8 @@ impl ConnectionManager {
                 warn!(addr = ?addr, "on_connect_msg send failed");
                 return;
             }
-            self.to_be_reconnected.swap_remove(i);
+
+            self.newly_connected.push(self.to_be_reconnected.swap_remove(i));
             self.conns.push((token, ConnectionVariant::Outbound(stream)));
             debug!(?addr, "connected");
         }
@@ -414,6 +418,9 @@ impl TcpConnector {
         F: for<'a> FnMut(PollEvent<'a>),
     {
         self.conn_mgr.maybe_reconnect();
+        for (token, peer_addr) in self.conn_mgr.newly_connected.drain(..) {
+            handler(PollEvent::Accept { listener: token, stream: token, peer_addr });
+        }
         if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
             return false;

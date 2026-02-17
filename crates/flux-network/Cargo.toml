@@ -17,5 +17,5 @@ tracing.workspace = true
 wincode = { workspace = true, optional = true }
 
 [dev-dependencies]
-wincode-derive = "*"
-wincode = "*"
+wincode-derive = { workspace = true }
+wincode = { workspace = true }
