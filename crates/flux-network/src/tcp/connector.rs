@@ -38,6 +38,8 @@ pub enum PollEvent<'a> {
     ///
     /// Use the `stream` token with [`SendBehavior::Single`] to write back.
     Accept { listener: Token, stream: Token, peer_addr: SocketAddr },
+    /// Succuessfully reconnected to an outbound stream.
+    Reconnect { token: Token },
     /// A connection was closed (by the remote or due to an IO error).
     Disconnect { token: Token },
     /// A complete framed message was received.
@@ -55,7 +57,7 @@ struct ConnectionManager {
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, SocketAddr)>,
     // Outbound connections that completed during maybe_reconnect, drained in poll_with.
-    newly_connected: Vec<(Token, SocketAddr)>,
+    reconnected_to: Vec<Token>,
     next_token: usize,
 }
 impl Default for ConnectionManager {
@@ -67,7 +69,7 @@ impl Default for ConnectionManager {
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
             to_be_reconnected: Vec::with_capacity(10),
-            newly_connected: Vec::with_capacity(10),
+            reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
         }
@@ -161,10 +163,7 @@ impl ConnectionManager {
 
     fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
-        self.to_be_reconnected.push((o, addr));
-        self.reconnector.force_fire();
-        self.maybe_reconnect();
-        if self.conns.iter().any(|(t, _)| t == &o) {
+        if self.try_connect(o, addr) {
             self.next_token += 1;
             Some(o)
         } else {
@@ -201,47 +200,59 @@ impl ConnectionManager {
         while i != 0 {
             i -= 1;
             let (token, addr) = self.to_be_reconnected[i];
-            let Ok(mut stream) = mio::net::TcpStream::connect(addr)
-                .inspect_err(|e| warn!("couldn't connect to {addr}: {e}"))
-            else {
-                continue;
-            };
-            if let Some(size) = self.socket_buf_size {
-                set_socket_buf_size(&stream, size);
+            if self.try_connect(token, addr) {
+                self.to_be_reconnected.swap_remove(i);
+                self.reconnected_to.push(token);
             }
-            let Ok(err) =
-                stream.take_error().inspect_err(|e| error!("couldn't take error on stream: {e}"))
-            else {
-                continue;
-            };
-            if let Some(err) = err {
-                warn!("got error while connecting to {addr}: {err}");
-                continue;
-            }
-            if let Err(e) = self.poll.registry().register(&mut stream, token, Interest::READABLE) {
-                error!("couldn't register tcp stream for {addr} with registry: {e}");
-                continue;
-            };
-            let Ok(mut stream) =
-                TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry).inspect_err(
-                    |e| error!("couldn't construct tcpconnection for {addr} with registry: {e}"),
-                )
-            else {
-                continue;
-            };
-            if let Some(msg) = &self.on_connect_msg &&
-                stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
-                    buf.extend_from_slice(msg);
-                }) == ConnState::Disconnected
-            {
-                warn!(addr = ?addr, "on_connect_msg send failed");
-                return;
-            }
-
-            self.newly_connected.push(self.to_be_reconnected.swap_remove(i));
-            self.conns.push((token, ConnectionVariant::Outbound(stream)));
-            debug!(?addr, "connected");
         }
+    }
+
+    fn try_connect(&mut self, token: Token, addr: SocketAddr) -> bool {
+        let Ok(mut stream) = mio::net::TcpStream::connect(addr)
+            .inspect_err(|e| warn!("couldn't connect to {addr}: {e}"))
+        else {
+            return false;
+        };
+
+        if let Some(size) = self.socket_buf_size {
+            set_socket_buf_size(&stream, size);
+        }
+        let Ok(err) =
+            stream.take_error().inspect_err(|e| error!("couldn't take error on stream: {e}"))
+        else {
+            return false;
+        };
+        if let Some(err) = err {
+            warn!("got error while connecting to {addr}: {err}");
+            return false;
+        }
+
+        if let Err(e) = self.poll.registry().register(&mut stream, token, Interest::READABLE) {
+            error!("couldn't register tcp stream for {addr} with registry: {e}");
+            return false;
+        };
+
+        let Ok(mut stream) = TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry)
+            .inspect_err(|e| {
+                error!("couldn't construct tcpconnection for {addr} with registry: {e}")
+            })
+        else {
+            return false;
+        };
+
+        if let Some(msg) = &self.on_connect_msg &&
+            stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+                buf.extend_from_slice(msg);
+            }) == ConnState::Disconnected
+        {
+            warn!(addr = ?addr, "on_connect_msg send failed");
+            return false;
+        }
+
+        self.conns.push((token, ConnectionVariant::Outbound(stream)));
+        debug!(?addr, "connected");
+
+        true
     }
 
     #[inline]
@@ -418,8 +429,8 @@ impl TcpConnector {
         F: for<'a> FnMut(PollEvent<'a>),
     {
         self.conn_mgr.maybe_reconnect();
-        for (token, peer_addr) in self.conn_mgr.newly_connected.drain(..) {
-            handler(PollEvent::Accept { listener: token, stream: token, peer_addr });
+        for token in self.conn_mgr.reconnected_to.drain(..) {
+            handler(PollEvent::Reconnect { token });
         }
         if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
