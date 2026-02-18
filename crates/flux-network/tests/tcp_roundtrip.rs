@@ -104,13 +104,13 @@ fn tcp_client_before_server() {
 
         assert!(conn.connect(bind_addr).is_none());
 
-        // Poll until reconnect fires Accept.
+        // Poll until we receive Reconnect.
         let mut tok = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while tok.is_none() {
             assert!(std::time::Instant::now() < deadline, "timed out waiting for reconnect");
             conn.poll_with(|event| {
-                if let PollEvent::Accept { stream, .. } = event {
+                if let PollEvent::Reconnect { stream, .. } = event {
                     tok = Some(stream);
                 }
             });

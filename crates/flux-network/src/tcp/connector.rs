@@ -38,6 +38,8 @@ pub enum PollEvent<'a> {
     ///
     /// Use the `stream` token with [`SendBehavior::Single`] to write back.
     Accept { listener: Token, stream: Token, peer_addr: SocketAddr },
+    /// An outbound stream that we reconnected to successfully
+    Reconnect { listener: Token, stream: Token, peer_addr: SocketAddr },
     /// A connection was closed (by the remote or due to an IO error).
     Disconnect { token: Token },
     /// A complete framed message was received.
@@ -419,7 +421,7 @@ impl TcpConnector {
     {
         self.conn_mgr.maybe_reconnect();
         for (token, peer_addr) in self.conn_mgr.newly_connected.drain(..) {
-            handler(PollEvent::Accept { listener: token, stream: token, peer_addr });
+            handler(PollEvent::Reconnect { listener: token, stream: token, peer_addr });
         }
         if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
