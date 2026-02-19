@@ -55,7 +55,7 @@ struct ConnectionManager {
     socket_buf_size: Option<usize>,
 
     // Always only outbound/client side connection streams
-    to_be_reconnected: Vec<(Token, SocketAddr)>,
+    to_be_reconnected: Vec<(Token, ConnectionVariant)>,
     // Outbound connections that completed during maybe_reconnect, drained in poll_with.
     reconnected_to: Vec<Token>,
     next_token: usize,
@@ -91,11 +91,11 @@ impl ConnectionManager {
         let (token, stream) = self.conns.swap_remove(index);
         match stream {
             ConnectionVariant::Outbound(mut tcp_connection) => {
-                let addr = tcp_connection.close(self.poll.registry());
-                self.to_be_reconnected.push((token, addr));
+                tcp_connection.close(self.poll.registry());
+                self.to_be_reconnected.push((token, ConnectionVariant::Outbound(tcp_connection)));
             }
             ConnectionVariant::Inbound(mut tcp_connection) => {
-                let _ = tcp_connection.close(self.poll.registry());
+                tcp_connection.close(self.poll.registry());
             }
             ConnectionVariant::Listener(mut tcp_listener) => {
                 let _ = self.poll.registry().deregister(&mut tcp_listener);
@@ -163,7 +163,19 @@ impl ConnectionManager {
 
     fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
-        if self.try_connect(o, addr) {
+        if let Some(stream) = self.try_connect(o, addr) {
+            let mut tcp_stream =
+                TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry);
+            if let Some(msg) = &self.on_connect_msg {
+                if tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+                    buf.extend_from_slice(msg);
+                }) == ConnState::Disconnected
+                {
+                    warn!(?addr, "on_connect_msg send failed");
+                    return None;
+                }
+            }
+            self.conns.push((o, ConnectionVariant::Outbound(tcp_stream)));
             self.next_token += 1;
             Some(o)
         } else {
@@ -196,60 +208,71 @@ impl ConnectionManager {
         }
 
         let mut i = self.to_be_reconnected.len();
-
         while i != 0 {
             i -= 1;
-            let (token, addr) = self.to_be_reconnected[i];
-            if self.try_connect(token, addr) {
-                self.to_be_reconnected.swap_remove(i);
+            let (token, mut stream) = self.to_be_reconnected.swap_remove(i);
+            if self.try_reconnect(token, &mut stream) {
+                self.conns.push((token, stream));
                 self.reconnected_to.push(token);
+            } else {
+                self.to_be_reconnected.push((token, stream))
             }
         }
     }
 
-    fn try_connect(&mut self, token: Token, addr: SocketAddr) -> bool {
-        let Ok(mut stream) = mio::net::TcpStream::connect(addr)
+    fn try_connect(&self, token: Token, addr: SocketAddr) -> Option<mio::net::TcpStream> {
+        let Ok(mut new_stream) = mio::net::TcpStream::connect(addr)
             .inspect_err(|e| warn!("couldn't connect to {addr}: {e}"))
         else {
-            return false;
+            return None;
         };
 
         if let Some(size) = self.socket_buf_size {
-            set_socket_buf_size(&stream, size);
+            set_socket_buf_size(&new_stream, size);
         }
         let Ok(err) =
-            stream.take_error().inspect_err(|e| error!("couldn't take error on stream: {e}"))
+            new_stream.take_error().inspect_err(|e| error!("couldn't take error on stream: {e}"))
         else {
-            return false;
+            return None;
         };
         if let Some(err) = err {
             warn!("got error while connecting to {addr}: {err}");
-            return false;
+            return None;
         }
 
-        if let Err(e) = self.poll.registry().register(&mut stream, token, Interest::READABLE) {
+        if let Err(e) = self.poll.registry().register(&mut new_stream, token, Interest::READABLE) {
             error!("couldn't register tcp stream for {addr} with registry: {e}");
-            return false;
+            return None;
         };
-
-        let Ok(mut stream) = TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry)
+        new_stream
+            .set_nodelay(true)
             .inspect_err(|e| {
-                error!("couldn't construct tcpconnection for {addr} with registry: {e}")
+                error!("couldn't setup nodelay for tcp stream for {addr}: {e}");
             })
-        else {
+            .ok()?;
+        Some(new_stream)
+    }
+
+    fn try_reconnect(&self, token: Token, stream: &mut ConnectionVariant) -> bool {
+        let ConnectionVariant::Outbound(stream) = stream else {
+            panic!("Can only try to connect a Outbound connection");
+        };
+        let addr = stream.peer();
+
+        let Some(new_stream) = self.try_connect(token, addr) else {
             return false;
         };
 
-        if let Some(msg) = &self.on_connect_msg &&
-            stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
-                buf.extend_from_slice(msg);
-            }) == ConnState::Disconnected
+        if stream.reset_with_new_stream(
+            self.poll.registry(),
+            new_stream,
+            self.on_connect_msg.as_ref(),
+        ) == ConnState::Disconnected
         {
             warn!(addr = ?addr, "on_connect_msg send failed");
             return false;
         }
 
-        self.conns.push((token, ConnectionVariant::Outbound(stream)));
         debug!(?addr, "connected");
 
         true
@@ -308,11 +331,12 @@ impl ConnectionManager {
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                             continue;
                         };
-                        let Ok(mut conn) =
-                            TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry)
-                        else {
+                        if let Err(e) = stream.set_nodelay(true) {
+                            error!("couldn't set nodelay on stream to {addr}: {e}");
                             continue;
-                        };
+                        }
+                        let mut conn =
+                            TcpStream::from_stream_with_telemetry(stream, addr, self.telemetry);
 
                         if let Some(msg) = &self.on_connect_msg &&
                             conn.write_or_enqueue_with(
