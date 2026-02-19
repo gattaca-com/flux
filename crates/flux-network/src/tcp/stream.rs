@@ -166,6 +166,7 @@ impl TcpStream {
         self.rx_state = Default::default();
         self.rx_buf.clear();
         self.send_buf.clear();
+        self.send_cursor = 0;
         self.header_buf.fill(0);
         self.stream = stream;
         if !self.send_backlog.is_empty() {
