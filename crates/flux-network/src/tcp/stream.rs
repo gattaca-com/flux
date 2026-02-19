@@ -69,6 +69,11 @@ enum RxState {
     /// Reading the payload of `msg_len` bytes.
     ReadingPayload { msg_len: usize, offset: usize, send_ts: Nanos },
 }
+impl Default for RxState {
+    fn default() -> Self {
+        Self::ReadingHeader { buf: [0; FRAME_HEADER_SIZE], have: 0 }
+    }
+}
 
 /// Single mio-backed TCP connection.
 ///
@@ -106,6 +111,9 @@ pub struct TcpStream {
     /// First entry will either be a full message or the current partially
     /// written head.
     send_backlog: VecDeque<Vec<u8>>,
+    /// We don't pop until the full message is written,
+    /// so we use this cursor to know what slice to write
+    send_cursor: usize,
 
     /// True if WRITABLE interest is currently registered in `poll`.
     /// Invariant: `writable_armed == !send_q.is_empty()`
@@ -123,9 +131,7 @@ impl TcpStream {
         stream: mio::net::TcpStream,
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
-    ) -> io::Result<Self> {
-        stream.set_nodelay(true)?;
-
+    ) -> Self {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
             TcpTelemetry::Enabled { app_name } => {
@@ -136,17 +142,45 @@ impl TcpStream {
             }
         };
 
-        Ok(Self {
+        Self {
             stream,
             peer_addr,
-            rx_state: RxState::ReadingHeader { buf: [0; FRAME_HEADER_SIZE], have: 0 },
+            rx_state: Default::default(),
             rx_buf: vec![0; RX_BUF_SIZE],
             header_buf: [0; FRAME_HEADER_SIZE],
             send_buf: vec![0; Self::SEND_BUF_SIZE],
             send_backlog: VecDeque::with_capacity(64),
+            send_cursor: 0,
             writable_armed: false,
             timers,
-        })
+        }
+    }
+
+    #[inline]
+    pub fn reset_with_new_stream(
+        &mut self,
+        registry: &Registry,
+        stream: mio::net::TcpStream,
+        on_connect_msg: Option<&Vec<u8>>,
+    ) -> ConnState {
+        self.rx_state = Default::default();
+        self.rx_buf.clear();
+        self.send_buf.clear();
+        self.header_buf.fill(0);
+        self.stream = stream;
+        if !self.send_backlog.is_empty() {
+            self.writable_armed = false;
+            if let Some(message) = on_connect_msg {
+                self.serialise_frame(|bytes| bytes.extend_from_slice(message));
+                let data = self.alloc_vec(0);
+                return self.enqueue_front(registry, data);
+            }
+            self.arm_writable(registry)
+        } else if let Some(message) = on_connect_msg {
+            self.write_or_enqueue_with(registry, |bytes| bytes.extend_from_slice(message))
+        } else {
+            ConnState::Alive
+        }
     }
 
     /// Poll socket and calls `on_msg` for every fully assembled frame.
@@ -189,38 +223,26 @@ impl TcpStream {
     {
         self.serialise_frame(serialise);
 
-        let len = self.send_buf.len();
-
         if !self.send_backlog.is_empty() {
-            self.enqueue_back(registry, self.header_buf.to_vec());
-            let data = self.alloc_vec(0, len);
+            let data = self.alloc_vec(0);
             return self.enqueue_back(registry, data);
         }
 
-        let frame = &self.send_buf[..len];
-        match self
-            .stream
-            .write_vectored(&[IoSlice::new(self.header_buf.as_slice()), IoSlice::new(frame)])
-        {
+        match self.stream.write_vectored(&[
+            IoSlice::new(self.header_buf.as_slice()),
+            IoSlice::new(&self.send_buf),
+        ]) {
             Ok(0) => {
                 warn!("tcp: stream failed to write, disconnecting");
                 ConnState::Disconnected
             }
-            Ok(n) if n == len + FRAME_HEADER_SIZE => ConnState::Alive,
-
-            Ok(n) if n < FRAME_HEADER_SIZE => {
-                let data = self.alloc_vec(0, len);
-                self.enqueue_front(registry, data);
-                let header_data = self.header_buf[n..FRAME_HEADER_SIZE].to_vec();
-                self.enqueue_front(registry, header_data)
-            }
+            Ok(n) if n == self.send_buf.len() + FRAME_HEADER_SIZE => ConnState::Alive,
             Ok(n) => {
-                let data = self.alloc_vec(n.saturating_sub(FRAME_HEADER_SIZE), len);
-                self.enqueue_front(registry, data)
+                let data = self.alloc_vec(n);
+                self.enqueue_back(registry, data)
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.enqueue_back(registry, self.header_buf.to_vec());
-                let data = self.alloc_vec(0, len);
+                let data = self.alloc_vec(0);
                 self.enqueue_back(registry, data)
             }
             Err(err) => {
@@ -233,15 +255,26 @@ impl TcpStream {
     /// Allocate send_buf[start..end] to vec. Times the alloc if telemetry
     /// enabled.
     #[inline]
-    fn alloc_vec(&mut self, start: usize, end: usize) -> Vec<u8> {
+    fn alloc_vec(&mut self, written: usize) -> Vec<u8> {
         match &mut self.timers {
             Some(timers) => {
                 let t0 = Nanos::now();
-                let v = self.send_buf[start..end].to_vec();
+                let mut v = Vec::with_capacity(
+                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
+                );
+                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
+                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
                 timers.alloc.emit_latency_from_nanos(t0, Nanos::now());
                 v
             }
-            None => self.send_buf[start..end].to_vec(),
+            None => {
+                let mut v = Vec::with_capacity(
+                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
+                );
+                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
+                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
+                v
+            }
         }
     }
 
@@ -250,15 +283,15 @@ impl TcpStream {
     /// returns connstate and whether it should be deregistered from writable
     #[inline]
     fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
-        while let Some(front) = self.send_backlog.front_mut() {
-            match self.stream.write(front) {
+        while let Some(front) = self.send_backlog.front() {
+            match self.stream.write(&front[self.send_cursor..]) {
                 Ok(0) => return ConnState::Disconnected,
 
                 Ok(n) => {
-                    if n == front.len() {
+                    self.send_cursor += n;
+                    if self.send_cursor == front.len() {
                         self.send_backlog.pop_front();
-                    } else {
-                        front.drain(..n);
+                        self.send_cursor = 0
                     }
                 }
 
@@ -422,10 +455,13 @@ impl TcpStream {
             .copy_from_slice(&Nanos::now().0.to_le_bytes());
     }
 
-    pub fn close(&mut self, registry: &Registry) -> SocketAddr {
+    pub fn close(&mut self, registry: &Registry) {
         debug!("terminating connection");
         let _ = registry.deregister(&mut self.stream);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub(crate) fn peer(&self) -> SocketAddr {
         self.peer_addr
     }
 }
