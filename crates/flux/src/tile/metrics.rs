@@ -1,12 +1,27 @@
 use std::{fmt::Display, path::Path};
 
 use flux_communication::shmem_dir_queues_string;
-use flux_timing::{IngestionTime, Instant, Nanos};
+use flux_timing::{Duration, IngestionTime, Instant, Nanos, Repeater};
 
 use crate::communication::queue::{Producer, Queue, QueueType};
 
 const QUEUE_SIZE: usize = 4096;
 const SAMPLE_WINDOW: u32 = 1024;
+
+#[derive(Clone, Copy, Default, Debug)]
+#[repr(C)]
+#[cfg_attr(feature = "wincode", derive(wincode_derive::SchemaRead, wincode_derive::SchemaWrite))]
+pub struct TileRusage {
+    pub user_micros: u64,
+    pub system_micros: u64,
+    pub max_rss: i64,
+    pub minor_page_faults: i64,
+    pub major_page_faults: i64,
+    pub block_inputs: i64,
+    pub block_outputs: i64,
+    pub voluntary_ctx_switches: i64,
+    pub involuntary_ctx_switches: i64,
+}
 
 /// Aggregated loop metrics over a sampling window
 #[derive(Clone, Copy, Default, Debug)]
@@ -21,6 +36,7 @@ pub struct TileSample {
     pub busy_sum: u64,
     pub busy_count: u32,
     pub loop_count: u32,
+    pub rusage: Option<TileRusage>,
 }
 
 impl TileSample {
@@ -32,6 +48,7 @@ impl TileSample {
         self.busy_sum = 0;
         self.busy_count = 0;
         self.loop_count = 0;
+        self.rusage = None;
     }
 
     #[inline]
@@ -72,6 +89,7 @@ pub struct TileMetrics {
     latest_begin: Instant,
     sample: TileSample,
     producer: Producer<TileSample>,
+    rusage_repeater: Repeater,
 }
 
 impl TileMetrics {
@@ -86,6 +104,7 @@ impl TileMetrics {
             latest_begin: Instant::default(),
             sample: TileSample { busy_min: u64::MAX, ..Default::default() },
             producer: Producer::from(queue),
+            rusage_repeater: Repeater::every(Duration::from_secs(1)),
         }
     }
 
@@ -123,8 +142,55 @@ impl TileMetrics {
 
     #[inline]
     fn emit_and_reset(&mut self) {
+        if self.rusage_repeater.fired() {
+            self.sample.rusage = read_rusage();
+        }
         self.sample.window_end = Nanos::now();
         self.producer.produce(&self.sample);
         self.sample.reset();
     }
+}
+
+#[cfg(unix)]
+fn read_rusage() -> Option<TileRusage> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let who = libc::RUSAGE_THREAD;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let who = libc::RUSAGE_SELF;
+
+    let rc = unsafe { libc::getrusage(who, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+
+    let usage = unsafe { usage.assume_init() };
+    Some(TileRusage {
+        user_micros: timeval_to_micros(usage.ru_utime),
+        system_micros: timeval_to_micros(usage.ru_stime),
+        max_rss: usage.ru_maxrss as i64,
+        minor_page_faults: usage.ru_minflt as i64,
+        major_page_faults: usage.ru_majflt as i64,
+        block_inputs: usage.ru_inblock as i64,
+        block_outputs: usage.ru_oublock as i64,
+        voluntary_ctx_switches: usage.ru_nvcsw as i64,
+        involuntary_ctx_switches: usage.ru_nivcsw as i64,
+    })
+}
+
+#[cfg(not(unix))]
+fn read_rusage() -> Option<TileRusage> {
+    None
+}
+
+#[cfg(unix)]
+#[inline]
+fn timeval_to_micros(tv: libc::timeval) -> u64 {
+    let secs = i128::from(tv.tv_sec);
+    let micros = i128::from(tv.tv_usec);
+    if secs < 0 || micros < 0 {
+        return 0;
+    }
+
+    secs.saturating_mul(1_000_000).saturating_add(micros).try_into().unwrap_or(u64::MAX)
 }
