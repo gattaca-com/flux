@@ -2,6 +2,7 @@ use core::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
 };
+use type_hash::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};
 use std::ops::{Index, IndexMut, RangeFull};
 
 /// Creates an [`ArrayVec`] with the given elements.
@@ -452,6 +453,17 @@ impl<const N: usize> core::hash::Hash for ArrayStr<N> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.buf.hash(state);
     }
+}
+
+impl<T: TypeHash + Copy, const N: usize> TypeHash for ArrayVec<T, N> {
+    const TYPE_HASH: u64 = {
+        let mut h = 0xcbf29ce484222325u64;
+        h = fnv1a64_str(h, "ArrayVec");
+        h = hash_u64(h, T::TYPE_HASH);
+        h = hash_u64(h, N as u64);
+        h = hash_layout_of::<ArrayVec<T, N>>(h);
+        h
+    };
 }
 
 mod serde_impl {

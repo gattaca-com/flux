@@ -7,4 +7,8 @@ license = "Apache-2.0 AND MIT"
 keywords = ["low-latency", "performance", "communication"]
 repository = "https://github.com/gattaca-com/flux"
 
+[features]
+default = ["std"]
+std = []
+
 [dependencies]

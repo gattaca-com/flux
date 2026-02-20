@@ -144,7 +144,7 @@ fn derive_for_enum(
                         // overridden foreign/canonical
                         push_where_pred(
                             &mut where_clause.cloned(),
-                            syn::parse_quote!(#ty: ::core::marker::Copy + ::core::marker::Sized),
+                            syn::parse_quote!(#ty: ::core::marker::Sized),
                         );
                         steps.push(quote! {
                             h = #th::fnv1a64_str(h, #idx_str);
@@ -192,7 +192,7 @@ fn derive_for_enum(
                     if let Some(lit) = override_lit {
                         push_where_pred(
                             &mut where_clause.cloned(),
-                            syn::parse_quote!(#ty: ::core::marker::Copy + ::core::marker::Sized),
+                            syn::parse_quote!(#ty: ::core::marker::Sized),
                         );
                         steps.push(quote! {
                             h = #th::fnv1a64_str(h, #f_name);
