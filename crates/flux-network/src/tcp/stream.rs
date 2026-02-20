@@ -9,8 +9,6 @@ use flux_timing::Nanos;
 use mio::{Interest, Registry, Token, event::Event};
 use tracing::{debug, warn};
 
-use crate::tcp::STREAM;
-
 /// Controls emission of network latency and alloc telemetry.
 ///
 /// Has no effect on framing or message delivery.
@@ -102,6 +100,7 @@ impl Default for RxState {
 pub struct TcpStream {
     stream: mio::net::TcpStream,
     peer_addr: SocketAddr,
+    token: Token,
 
     rx_state: RxState,
     rx_buf: Vec<u8>,
@@ -129,6 +128,7 @@ impl TcpStream {
     #[inline(never)]
     pub(crate) fn from_stream_with_telemetry(
         stream: mio::net::TcpStream,
+        token: Token,
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
     ) -> Self {
@@ -145,6 +145,7 @@ impl TcpStream {
         Self {
             stream,
             peer_addr,
+            token,
             rx_state: Default::default(),
             rx_buf: vec![0; RX_BUF_SIZE],
             header_buf: [0; FRAME_HEADER_SIZE],
@@ -307,7 +308,8 @@ impl TcpStream {
 
         // Drop WRITABLE interest only when fully drained
         if self.send_backlog.is_empty() && self.writable_armed {
-            if let Err(err) = registry.reregister(&mut self.stream, STREAM, Interest::READABLE) {
+            if let Err(err) = registry.reregister(&mut self.stream, self.token, Interest::READABLE)
+            {
                 debug!(?err, "tcp: reregister drop writable");
                 return ConnState::Disconnected;
             }
@@ -430,7 +432,7 @@ impl TcpStream {
         if !self.writable_armed {
             if let Err(err) = registry.reregister(
                 &mut self.stream,
-                STREAM,
+                self.token,
                 Interest::READABLE | Interest::WRITABLE,
             ) {
                 debug!(?err, "tcp: poll reregister");
