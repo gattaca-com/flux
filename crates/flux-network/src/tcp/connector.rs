@@ -476,24 +476,18 @@ impl TcpConnector {
         for token in self.conn_mgr.reconnected_to.drain(..) {
             handler(PollEvent::Reconnect { token });
         }
-        let mut o = false;
-        loop {
-            if let Err(e) =
-                self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO))
-            {
-                safe_panic!("got error polling {e}");
-                return false;
-            }
-            if self.events.is_empty() {
-                self.conn_mgr.flush_backlogs();
-                return o;
-            }
-
-            for e in self.events.iter() {
-                o = true;
-                self.conn_mgr.handle_event(e, &mut handler);
-            }
+        if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
+            safe_panic!("got error polling {e}");
+            return false;
         }
+        let mut o = false;
+
+        for e in self.events.iter() {
+            o = true;
+            self.conn_mgr.handle_event(e, &mut handler);
+        }
+        self.conn_mgr.flush_backlogs();
+        o
     }
 
     /// Writes immediately or enqueues bytes for later sending.

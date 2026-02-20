@@ -2,8 +2,9 @@ use core::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
 };
-use type_hash::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};
 use std::ops::{Index, IndexMut, RangeFull};
+
+use type_hash::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};
 
 /// Creates an [`ArrayVec`] with the given elements.
 ///
