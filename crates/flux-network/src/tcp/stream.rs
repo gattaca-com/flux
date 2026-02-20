@@ -226,8 +226,14 @@ impl TcpStream {
         self.serialise_frame(serialise);
 
         if !self.send_backlog.is_empty() {
-            let data = self.alloc_vec(0);
-            return self.enqueue_back(registry, data);
+            if self.drain_backlog(registry) == ConnState::Disconnected {
+                return ConnState::Disconnected;
+            }
+            if !self.send_backlog.is_empty() {
+                let data = self.alloc_vec(0);
+                return self.enqueue_back(registry, data);
+            }
+            // backlog drained, fall through to direct write
         }
 
         match self.stream.write_vectored(&[
@@ -280,11 +286,16 @@ impl TcpStream {
         }
     }
 
+    #[inline]
+    pub(crate) fn has_backlog(&self) -> bool {
+        !self.send_backlog.is_empty()
+    }
+
     /// Flush queued data until kernel blocks, queue empty or we've written the
     /// max bytes per iter.
     /// returns connstate and whether it should be deregistered from writable
     #[inline]
-    fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
+    pub(crate) fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
         while let Some(front) = self.send_backlog.front() {
             match self.stream.write(&front[self.send_cursor..]) {
                 Ok(0) => return ConnState::Disconnected,

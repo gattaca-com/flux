@@ -161,6 +161,22 @@ impl ConnectionManager {
         }
     }
 
+    fn flush_backlogs(&mut self) {
+        let mut i = self.conns.len();
+        while i != 0 {
+            i -= 1;
+            let stream = match &mut self.conns[i].1 {
+                ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
+                ConnectionVariant::Listener(_) => continue,
+            };
+            if stream.has_backlog() &&
+                stream.drain_backlog(self.poll.registry()) == ConnState::Disconnected
+            {
+                self.disconnect_at_index(i);
+            }
+        }
+    }
+
     fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
         if let Some(stream) = self.try_connect(o, addr) {
@@ -460,17 +476,24 @@ impl TcpConnector {
         for token in self.conn_mgr.reconnected_to.drain(..) {
             handler(PollEvent::Reconnect { token });
         }
-        if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
-            safe_panic!("got error polling {e}");
-            return false;
-        }
-
         let mut o = false;
-        for e in self.events.iter() {
-            o = true;
-            self.conn_mgr.handle_event(e, &mut handler);
+        loop {
+            if let Err(e) =
+                self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO))
+            {
+                safe_panic!("got error polling {e}");
+                return false;
+            }
+            if self.events.is_empty() {
+                self.conn_mgr.flush_backlogs();
+                return o;
+            }
+
+            for e in self.events.iter() {
+                o = true;
+                self.conn_mgr.handle_event(e, &mut handler);
+            }
         }
-        o
     }
 
     /// Writes immediately or enqueues bytes for later sending.

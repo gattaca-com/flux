@@ -69,7 +69,8 @@ fn queued_messages_flush_on_second_connection_after_backpressure() {
     let slow_token = conn.connect(slow_addr).expect("failed to connect to slow collector");
     assert_ne!(fast_token, slow_token);
 
-    // Fill the 2nd socket while the receiver is paused, forcing queue/backpressure path.
+    // Fill the 2nd socket while the receiver is paused, forcing queue/backpressure
+    // path.
     let big = vec![7_u8; 8 * 1024 * 1024];
     send_payload(&mut conn, slow_token, &big);
 
