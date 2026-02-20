@@ -1,11 +1,12 @@
 #![no_std]
 
+#[cfg(feature = "std")]
+extern crate std;
+
 use core::mem;
 
 /// A trait for a "stable-ish" type fingerprint you control.
-/// We provide impls for intrinsic primitive types that are Copy + Sized.
-/// You can also implement this for your own types.
-pub trait TypeHash: Copy + Sized {
+pub trait TypeHash {
     const TYPE_HASH: u64;
 }
 
@@ -45,8 +46,8 @@ pub const fn hash_layout_of<T>(seed: u64) -> u64 {
     h
 }
 
-/// --- Intrinsic primitive impls (Copy + Sized) ---
-/// We intentionally assign fixed constants (not derived from type_name).
+/// --- Primitive impls ---
+/// Fixed constants; not derived from type_name to keep them stable.
 macro_rules! impl_primitive_type_hash {
     ($($t:ty => $id:expr),* $(,)?) => {
         $(
@@ -73,10 +74,7 @@ impl_primitive_type_hash! {
     f64     => 0x21,
 }
 
-/// Arrays: Copy + Sized only (this requires T: Copy, and arrays are Copy if T
-/// is).
 impl<T: TypeHash, const N: usize> TypeHash for [T; N] {
-    // Mix element hash + N + layout
     const TYPE_HASH: u64 = {
         let mut h = 0xcbf29ce484222325u64;
         h = fnv1a64_str(h, "[T;N]");
@@ -87,8 +85,6 @@ impl<T: TypeHash, const N: usize> TypeHash for [T; N] {
     };
 }
 
-/// Maybe you want Option<T> when T: Copy.
-/// (Option<T> is Copy if T: Copy)
 impl<T: TypeHash> TypeHash for Option<T> {
     const TYPE_HASH: u64 = {
         let mut h = 0xcbf29ce484222325u64;
@@ -97,4 +93,37 @@ impl<T: TypeHash> TypeHash for Option<T> {
         h = hash_layout_of::<Option<T>>(h);
         h
     };
+}
+
+impl TypeHash for &[u8] {
+    const TYPE_HASH: u64 = {
+        let mut h = 0xcbf29ce484222325u64;
+        h = fnv1a64_str(h, "&[u8]");
+        h = hash_layout_of::<&[u8]>(h);
+        h
+    };
+}
+
+#[cfg(feature = "std")]
+mod std_impls {
+    use super::*;
+
+    impl TypeHash for std::string::String {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf29ce484222325u64;
+            h = fnv1a64_str(h, "String");
+            h = hash_layout_of::<std::string::String>(h);
+            h
+        };
+    }
+
+    impl<T: TypeHash> TypeHash for std::vec::Vec<T> {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf29ce484222325u64;
+            h = fnv1a64_str(h, "Vec");
+            h = hash_u64(h, T::TYPE_HASH);
+            h = hash_layout_of::<std::vec::Vec<T>>(h);
+            h
+        };
+    }
 }

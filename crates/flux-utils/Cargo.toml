@@ -9,6 +9,7 @@ repository = "https://github.com/gattaca-com/flux"
 
 [dependencies]
 flux-timing.workspace = true
+type-hash.workspace = true
 
 core_affinity.workspace = true
 directories.workspace = true
