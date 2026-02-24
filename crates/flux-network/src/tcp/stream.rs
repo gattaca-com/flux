@@ -224,6 +224,9 @@ impl TcpStream {
         F: Fn(&mut Vec<u8>),
     {
         self.serialise_frame(serialise);
+        if self.send_buf.is_empty() {
+            return ConnState::Alive;
+        }
 
         if !self.send_backlog.is_empty() {
             if self.drain_backlog(registry) == ConnState::Disconnected {
@@ -359,9 +362,15 @@ impl TcpStream {
                                     let send_ts = Nanos(u64::from_le_bytes(
                                         buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
                                     ));
-
-                                    self.rx_state =
-                                        RxState::ReadingPayload { msg_len, offset: 0, send_ts };
+                                    if msg_len == 0 {
+                                        self.rx_state = RxState::ReadingHeader {
+                                            buf: [0; FRAME_HEADER_SIZE],
+                                            have: 0,
+                                        };
+                                    } else {
+                                        self.rx_state =
+                                            RxState::ReadingPayload { msg_len, offset: 0, send_ts };
+                                    }
                                 }
                             }
 
