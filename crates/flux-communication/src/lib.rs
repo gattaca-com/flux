@@ -22,6 +22,15 @@ pub fn shmem_dir_queues_string<S: AsRef<Path>>(app_name: S) -> String {
     queues_dir.to_string_lossy().to_string()
 }
 
+pub fn shmem_dir_queues_string_with_base<D: AsRef<Path>, S: AsRef<Path>>(
+    base_dir: D,
+    app_name: S,
+) -> String {
+    shmem_dir_queues_with_base(base_dir, app_name)
+        .to_string_lossy()
+        .to_string()
+}
+
 pub fn shmem_queue<S: AsRef<Path>, T: Copy>(
     app_name: S,
     len: usize,

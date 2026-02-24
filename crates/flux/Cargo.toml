@@ -28,6 +28,9 @@ zstd.workspace = true
 wincode = { workspace = true, optional = true }
 wincode-derive = { workspace = true, optional = true }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 default = []
 wincode = [

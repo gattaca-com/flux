@@ -56,6 +56,7 @@ pub trait FluxSpine: Sized + Send {
 
     fn register_tile(&mut self, name: TileName) -> u16;
     fn app_name() -> &'static str;
+    fn base_dir(&self) -> &Path;
 
     /// Removes all files related to a given spine. Does not clear the shared
     /// memory itself. CAUTION: this includes data files.

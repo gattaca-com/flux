@@ -76,8 +76,15 @@ where
     let mut adapter =
         SpineAdapter::connect_tile_with_stop_flag(&tile, spine.spine, stop_flag.clone());
 
-    let mut metrics =
-        if config.metrics { Some(TileMetrics::new(S::app_name(), tile.name())) } else { None };
+    let mut metrics = if config.metrics {
+        Some(TileMetrics::new_with_base_dir(
+            spine.spine.base_dir(),
+            S::app_name(),
+            tile.name(),
+        ))
+    } else {
+        None
+    };
 
     spine.scope.spawn(move || {
         let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
