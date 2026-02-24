@@ -55,17 +55,14 @@ impl<T> ShmemData<T> {
                 Ok(Self { inner })
             }
             Err(ShmemError::LinkExists) => {
-                let Ok(shmem) = ShmemConf::new().flink(&shmem_file).open() else {
-                    if shmem_file.exists() {
-                        tracing::warn!(
-                            "couldn't open shmem file {}, recreating and retrying",
-                            shmem_file.display()
-                        );
-                        std::fs::remove_file(shmem_file)
-                            .expect("couldn't remove shmem file for TileInfo");
-                        return Self::open_or_init_with_base_dir(dir, app_name, init_f);
-                    }
-                    panic!("couldn't open shmem file {}", shmem_file.display());
+                let Ok(shmem) = ShmemConf::new().flink(&shmem_file).open().inspect_err(|e| {
+                    tracing::warn!(
+                        "couldn't open shmem file {}, removing and retrying: {e}",
+                        shmem_file.display()
+                    );
+                }) else {
+                    let _ = std::fs::remove_file(&shmem_file);
+                    return Self::open_or_init_with_base_dir(dir, app_name, init_f);
                 };
 
                 let inner = Self::shmem_ptr(shmem);

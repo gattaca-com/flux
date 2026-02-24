@@ -361,6 +361,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn app_name() -> &'static str {
                 #app_name_tokens
             }
+
+            fn base_dir(&self) -> &std::path::Path {
+                &self.base_dir
+            }
         }
 
         // start() method with only the necessary PersistingQueues
