@@ -12,6 +12,7 @@ use flux::{
 use flux_timing::Duration;
 use flux_utils::directories::{shmem_dir_data_with_base, shmem_dir_queues_with_base};
 use serde::{Deserialize, Serialize};
+use shared_memory::ShmemConf;
 use spine_derive::from_spine;
 
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
@@ -40,8 +41,6 @@ struct TestSpine {
     pub qb: SpineQueue<MsgB>,
 }
 
-// ── Tiles ────────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, Default)]
 struct Writer;
 
@@ -69,9 +68,15 @@ impl Tile<TestSpine> for Reader {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+fn cleanup_shmem(root: &std::path::Path) {
+    for flink in all_files_under(root) {
+        if let Ok(mut shmem) = ShmemConf::new().flink(&flink).open() {
+            shmem.set_owner(true);
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
 
-/// Recursively collect every file under `root`.
 fn all_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if !root.exists() {
@@ -89,11 +94,9 @@ fn all_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 /// Creates a spine with a custom temp `base_dir`, attaches two tiles
 /// (writer + reader), runs until the reader receives a message, then
-/// asserts that **every** shared-memory file was created inside the
+/// asserts that every shared-memory file was created inside the
 /// specified `base_dir` and nowhere else.
 #[test]
 fn all_shmem_files_reside_in_base_dir() {
@@ -119,22 +122,17 @@ fn all_shmem_files_reside_in_base_dir() {
         );
     });
 
-    // Verify the message arrived (sanity check that the spine worked).
     assert_eq!(got.load(Ordering::Relaxed), 42, "reader should have received the value");
 
-    // ── Assert all shmem files are inside base_dir ───────────────────────
     let files = all_files_under(base);
     assert!(!files.is_empty(), "expected at least one shmem file inside {}", base.display());
 
-    // Queues dir should exist and contain the queue + timing + metrics files.
     let queues_dir = shmem_dir_queues_with_base(base, "spine-test-app");
     assert!(queues_dir.is_dir(), "queues dir should exist: {}", queues_dir.display());
 
-    // Data dir should exist and contain the TileInfo shmem.
     let data_dir = shmem_dir_data_with_base(base, "spine-test-app");
     assert!(data_dir.is_dir(), "data dir should exist: {}", data_dir.display());
 
-    // Check that TileInfo shmem file exists.
     let tile_info_file = data_dir.join("TileInfo");
     assert!(
         tile_info_file.exists(),
@@ -142,7 +140,6 @@ fn all_shmem_files_reside_in_base_dir() {
         tile_info_file.display()
     );
 
-    // Check that message queue files exist.
     let queue_files: Vec<_> = files
         .iter()
         .filter(|p| {
@@ -157,7 +154,6 @@ fn all_shmem_files_reside_in_base_dir() {
         queue_files
     );
 
-    // Check that timing/latency files exist (one pair per consumer attachment).
     let timing_files: Vec<_> = files
         .iter()
         .filter(|p| {
@@ -176,7 +172,6 @@ fn all_shmem_files_reside_in_base_dir() {
         .collect();
     assert!(!latency_files.is_empty(), "expected latency shmem files, found none");
 
-    // Check that tile-metrics files exist (the previously broken path).
     let metrics_files: Vec<_> = files
         .iter()
         .filter(|p| {
@@ -186,11 +181,9 @@ fn all_shmem_files_reside_in_base_dir() {
         .collect();
     assert!(
         !metrics_files.is_empty(),
-        "expected tilemetrics shmem files inside base_dir, found none. \
-         This was the original bug: TileMetrics were created in local_share_dir instead."
+        "expected tilemetrics shmem files inside base_dir, found none"
     );
 
-    // Finally, assert every file is strictly under base.
     for f in &files {
         assert!(
             f.starts_with(base),
@@ -200,6 +193,5 @@ fn all_shmem_files_reside_in_base_dir() {
         );
     }
 
-    // Clean up.
-    let _ = std::fs::remove_dir_all(base);
+    cleanup_shmem(base);
 }

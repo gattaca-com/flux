@@ -1,6 +1,6 @@
 use std::{fmt::Display, path::Path};
 
-use flux_communication::{shmem_dir_queues_string, shmem_dir_queues_string_with_base};
+use flux_communication::shmem_dir_queues_string_with_base;
 use flux_timing::{IngestionTime, Instant, Nanos};
 
 use crate::communication::queue::{Producer, Queue, QueueType};
@@ -75,21 +75,7 @@ pub struct TileMetrics {
 }
 
 impl TileMetrics {
-    pub fn new<A: AsRef<Path>, S: Display>(app_name: A, tile_name: S) -> Self {
-        let dirstr = shmem_dir_queues_string(&app_name);
-        let _ = std::fs::create_dir_all(&dirstr);
-
-        let file = format!("{dirstr}/tilemetrics-{tile_name}");
-        let queue = Queue::create_or_open_shared(file, QUEUE_SIZE, QueueType::SPMC);
-
-        Self {
-            latest_begin: Instant::default(),
-            sample: TileSample { busy_min: u64::MAX, ..Default::default() },
-            producer: Producer::from(queue),
-        }
-    }
-
-    pub fn new_with_base_dir<D: AsRef<Path>, A: AsRef<Path>, S: Display>(
+    pub fn new<D: AsRef<Path>, A: AsRef<Path>, S: Display>(
         base_dir: D,
         app_name: A,
         tile_name: S,
