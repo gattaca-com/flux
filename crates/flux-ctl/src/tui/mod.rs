@@ -27,10 +27,9 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    // If help popup is visible, any key closes it.
+                    // If help popup is visible, close it but let the key through.
                     if app.show_help {
                         app.show_help = false;
-                        continue;
                     }
 
                     // If any cleanup confirmation is pending, handle it first.
