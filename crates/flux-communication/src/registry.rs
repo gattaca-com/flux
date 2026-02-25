@@ -9,6 +9,11 @@ pub const MAX_REGISTRY_ENTRIES: usize = 512;
 pub const MAX_PIDS_PER_ENTRY: usize = 256;
 pub const REGISTRY_FLINK_NAME: &str = "flux/_shmem_registry";
 
+/// Magic bytes: "FLXR" in little-endian.
+const REGISTRY_MAGIC: u32 = u32::from_le_bytes(*b"FLXR");
+/// Bump this when the layout of ShmemRegistry/ShmemEntry changes.
+const REGISTRY_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ShmemKind {
@@ -190,8 +195,11 @@ impl ShmemEntry {
 /// Stored at `<base_dir>/flux/_shmem_registry`.
 ///
 /// Uses `ShmemConf` directly (not `ShmemData`) to avoid circular registration.
+/// The first 8 bytes are `magic` + `version` to detect layout mismatches.
 #[repr(C)]
 pub struct ShmemRegistry {
+    pub magic: AtomicU32,
+    pub version: AtomicU32,
     pub count: AtomicU32,
     pub _pad: u32,
     pub entries: [ShmemEntry; MAX_REGISTRY_ENTRIES],
@@ -217,14 +225,54 @@ impl ShmemRegistry {
             Ok(shmem) => {
                 let ptr = shmem.as_ptr() as *mut Self;
                 std::mem::forget(shmem);
-                // Shmem is zero-initialized, count starts at 0
-                unsafe { &*ptr }
+                let reg = unsafe { &*ptr };
+                // Fresh shmem is zero-initialized. Stamp magic + version.
+                reg.magic.store(REGISTRY_MAGIC, Ordering::Relaxed);
+                reg.version.store(REGISTRY_VERSION, Ordering::Relaxed);
+                reg
             }
             Err(ShmemError::LinkExists) => match ShmemConf::new().flink(&registry_path).open() {
                 Ok(shmem) => {
                     let ptr = shmem.as_ptr() as *const Self;
+
+                    // Version check: if magic/version don't match, the shmem
+                    // has an incompatible layout. Destroy and recreate.
+                    let magic = unsafe { &*(ptr as *const AtomicU32) };
+                    if magic.load(Ordering::Relaxed) != REGISTRY_MAGIC
+                        || shmem.len() < std::mem::size_of::<Self>()
+                    {
+                        eprintln!(
+                            "flux: registry version mismatch at {}, recreating",
+                            registry_path.display()
+                        );
+                        // set_owner so /dev/shm/ backing is unlinked on drop
+                        let mut shmem = shmem;
+                        shmem.set_owner(true);
+                        drop(shmem);
+                        let _ = std::fs::remove_file(&registry_path);
+                        return Self::open_or_create(base_dir);
+                    }
+
+                    // Check version (magic matched, safe to read version field)
+                    let reg = unsafe { &*ptr };
+                    if reg.version.load(Ordering::Relaxed) != REGISTRY_VERSION {
+                        eprintln!(
+                            "flux: registry version {} != expected {}, recreating",
+                            reg.version.load(Ordering::Relaxed),
+                            REGISTRY_VERSION,
+                        );
+                        // Re-open to get owned handle for cleanup
+                        let shmem =
+                            ShmemConf::new().flink(&registry_path).open().unwrap();
+                        let mut shmem = shmem;
+                        shmem.set_owner(true);
+                        drop(shmem);
+                        let _ = std::fs::remove_file(&registry_path);
+                        return Self::open_or_create(base_dir);
+                    }
+
                     std::mem::forget(shmem);
-                    unsafe { &*ptr }
+                    reg
                 }
                 Err(_) => {
                     let _ = std::fs::remove_file(&registry_path);
@@ -235,12 +283,24 @@ impl ShmemRegistry {
         }
     }
 
-    /// Open existing registry read-only. Returns None if not found.
+    /// Open existing registry read-only. Returns None if not found or version mismatch.
     pub fn open(registry_path: &Path) -> Option<&'static Self> {
         let shmem = ShmemConf::new().flink(registry_path).open().ok()?;
+
+        // Validate magic + size before interpreting the memory
+        if shmem.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
         let ptr = shmem.as_ptr() as *const Self;
+        let reg = unsafe { &*ptr };
+        if reg.magic.load(Ordering::Relaxed) != REGISTRY_MAGIC
+            || reg.version.load(Ordering::Relaxed) != REGISTRY_VERSION
+        {
+            return None;
+        }
+
         std::mem::forget(shmem);
-        Some(unsafe { &*ptr })
+        Some(reg)
     }
 
     /// Register a shmem entry, or attach this PID to an existing entry with
