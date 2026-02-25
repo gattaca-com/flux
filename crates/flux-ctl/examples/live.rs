@@ -136,8 +136,8 @@ fn run_primary(flags: Flags) {
 
     if !flags.reattach {
         let registry = ShmemRegistry::open_or_create(&base_dir);
-        registry.cleanup_app("market-data");
-        registry.cleanup_app("order-engine");
+        for e in registry.cleanup_app("market-data") { eprintln!("warning: {e}"); }
+        for e in registry.cleanup_app("order-engine") { eprintln!("warning: {e}"); }
     }
 
     let quote_q: Queue<Quote> =
@@ -314,9 +314,9 @@ fn run_primary(flags: Flags) {
     } else {
         println!("Cleaning up shmem...");
         let registry = ShmemRegistry::open_or_create(&base_dir);
-        registry.cleanup_app("market-data");
-        registry.cleanup_app("order-engine");
-        registry.cleanup_app("poison-demo");
+        for e in registry.cleanup_app("market-data") { eprintln!("warning: {e}"); }
+        for e in registry.cleanup_app("order-engine") { eprintln!("warning: {e}"); }
+        for e in registry.cleanup_app("poison-demo") { eprintln!("warning: {e}"); }
         println!("Done.");
     }
 }

@@ -203,6 +203,10 @@ pub struct ShmemRegistry {
 }
 
 impl ShmemRegistry {
+    /// Maximum number of retry attempts when the registry is corrupt or
+    /// stale before giving up. Prevents infinite recursion / stack overflow.
+    const MAX_OPEN_ATTEMPTS: u32 = 3;
+
     pub fn open_or_create(base_dir: &Path) -> &'static Self {
         let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
         std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap_or_else(|e| {
@@ -212,62 +216,76 @@ impl ShmemRegistry {
             )
         });
 
-        match ShmemConf::new()
-            .size(std::mem::size_of::<Self>())
-            .flink(&registry_path)
-            .create()
-        {
-            Ok(shmem) => {
-                let ptr = shmem.as_ptr() as *mut Self;
-                std::mem::forget(shmem);
-                let reg = unsafe { &*ptr };
-                reg.magic.store(REGISTRY_MAGIC, Ordering::Relaxed);
-                reg.version.store(REGISTRY_VERSION, Ordering::Relaxed);
-                reg
-            }
-            Err(ShmemError::LinkExists) => match ShmemConf::new().flink(&registry_path).open() {
+        for attempt in 0..Self::MAX_OPEN_ATTEMPTS {
+            match ShmemConf::new()
+                .size(std::mem::size_of::<Self>())
+                .flink(&registry_path)
+                .create()
+            {
                 Ok(shmem) => {
-                    let ptr = shmem.as_ptr() as *const Self;
-                    let magic = unsafe { &*(ptr as *const AtomicU32) };
-                    if magic.load(Ordering::Relaxed) != REGISTRY_MAGIC
-                        || shmem.len() < std::mem::size_of::<Self>()
-                    {
-                        eprintln!(
-                            "flux: registry version mismatch at {}, recreating",
-                            registry_path.display()
-                        );
-                        let mut shmem = shmem;
-                        shmem.set_owner(true);
-                        drop(shmem);
-                        let _ = std::fs::remove_file(&registry_path);
-                        return Self::open_or_create(base_dir);
-                    }
-
-                    let reg = unsafe { &*ptr };
-                    if reg.version.load(Ordering::Relaxed) != REGISTRY_VERSION {
-                        eprintln!(
-                            "flux: registry version {} != expected {}, recreating",
-                            reg.version.load(Ordering::Relaxed),
-                            REGISTRY_VERSION,
-                        );
-                        let shmem = ShmemConf::new().flink(&registry_path).open().unwrap();
-                        let mut shmem = shmem;
-                        shmem.set_owner(true);
-                        drop(shmem);
-                        let _ = std::fs::remove_file(&registry_path);
-                        return Self::open_or_create(base_dir);
-                    }
-
+                    let ptr = shmem.as_ptr() as *mut Self;
                     std::mem::forget(shmem);
-                    reg
+                    let reg = unsafe { &*ptr };
+                    reg.magic.store(REGISTRY_MAGIC, Ordering::Relaxed);
+                    reg.version.store(REGISTRY_VERSION, Ordering::Relaxed);
+                    return reg;
                 }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&registry_path);
-                    Self::open_or_create(base_dir)
+                Err(ShmemError::LinkExists) => {
+                    match ShmemConf::new().flink(&registry_path).open() {
+                        Ok(shmem) => {
+                            let ptr = shmem.as_ptr() as *const Self;
+                            let magic = unsafe { &*(ptr as *const AtomicU32) };
+                            if magic.load(Ordering::Relaxed) != REGISTRY_MAGIC
+                                || shmem.len() < std::mem::size_of::<Self>()
+                            {
+                                eprintln!(
+                                    "flux: registry magic/size mismatch at {} (attempt {}/{}), recreating",
+                                    registry_path.display(),
+                                    attempt + 1,
+                                    Self::MAX_OPEN_ATTEMPTS,
+                                );
+                                let mut shmem = shmem;
+                                shmem.set_owner(true);
+                                drop(shmem);
+                                let _ = std::fs::remove_file(&registry_path);
+                                continue;
+                            }
+
+                            let reg = unsafe { &*ptr };
+                            if reg.version.load(Ordering::Relaxed) != REGISTRY_VERSION {
+                                eprintln!(
+                                    "flux: registry version {} != expected {} (attempt {}/{}), recreating",
+                                    reg.version.load(Ordering::Relaxed),
+                                    REGISTRY_VERSION,
+                                    attempt + 1,
+                                    Self::MAX_OPEN_ATTEMPTS,
+                                );
+                                // Reuse the already-opened shmem (don't open a second time).
+                                let mut shmem = shmem;
+                                shmem.set_owner(true);
+                                drop(shmem);
+                                let _ = std::fs::remove_file(&registry_path);
+                                continue;
+                            }
+
+                            std::mem::forget(shmem);
+                            return reg;
+                        }
+                        Err(_) => {
+                            let _ = std::fs::remove_file(&registry_path);
+                            continue;
+                        }
+                    }
                 }
-            },
-            Err(e) => panic!("failed to create shmem registry: {e}"),
+                Err(e) => panic!("failed to create shmem registry: {e}"),
+            }
         }
+
+        panic!(
+            "flux: failed to open or create shmem registry at {} after {} attempts",
+            registry_path.display(),
+            Self::MAX_OPEN_ATTEMPTS,
+        );
     }
 
     pub fn open(registry_path: &Path) -> Option<&'static Self> {
@@ -378,20 +396,28 @@ impl ShmemRegistry {
         total
     }
 
-    pub fn cleanup_app(&self, app_name: &str) {
+    pub fn cleanup_app(&self, app_name: &str) -> Vec<String> {
+        let mut errors = Vec::new();
         for entry in self.entries() {
             if entry.app_name.as_str() == app_name {
-                cleanup_flink(Path::new(entry.flink.as_str()));
+                if let Err(e) = cleanup_flink(Path::new(entry.flink.as_str())) {
+                    errors.push(e);
+                }
             }
         }
+        errors
     }
 
-    pub fn cleanup_all(&self) {
+    pub fn cleanup_all(&self) -> Vec<String> {
+        let mut errors = Vec::new();
         for entry in self.entries() {
             if !entry.is_empty() {
-                cleanup_flink(Path::new(entry.flink.as_str()));
+                if let Err(e) = cleanup_flink(Path::new(entry.flink.as_str())) {
+                    errors.push(e);
+                }
             }
         }
+        errors
     }
 
     /// Nuclear option: clean all registered entries, walk the filesystem for
@@ -399,7 +425,9 @@ impl ShmemRegistry {
     pub fn destroy(base_dir: &Path) {
         let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
         if let Some(registry) = Self::open(&registry_path) {
-            registry.cleanup_all();
+            for e in registry.cleanup_all() {
+                eprintln!("warning: {e}");
+            }
         }
         cleanup_shmem(base_dir);
     }
@@ -540,18 +568,29 @@ fn read_array_meta(shmem: &Shmem) -> (usize, usize) {
 // ─── Free functions ─────────────────────────────────────────────────────────
 
 /// Unlink the shmem backing for a flink, then remove the flink file.
-/// Safe to call on already-removed paths.
-pub fn cleanup_flink(flink_path: &Path) {
+///
+/// Returns `Ok(())` on success. Returns `Err` with a description if the
+/// flink file could not be removed (failure to open the shmem backing is
+/// not considered an error — the backing may already be gone).
+pub fn cleanup_flink(flink_path: &Path) -> Result<(), String> {
     if let Ok(mut shmem) = ShmemConf::new().flink(flink_path).open() {
         shmem.set_owner(true);
     }
-    let _ = std::fs::remove_file(flink_path);
+    std::fs::remove_file(flink_path).map_err(|e| {
+        // NotFound is fine — the file was already removed.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return String::new();
+        }
+        format!("failed to remove {}: {e}", flink_path.display())
+    }).or_else(|e| if e.is_empty() { Ok(()) } else { Err(e) })
 }
 
 /// Walk a directory tree, unlink all shmem backing files, then remove the tree.
 pub fn cleanup_shmem(root: &Path) {
     for flink in all_flinks_under(root) {
-        cleanup_flink(&flink);
+        if let Err(e) = cleanup_flink(&flink) {
+            eprintln!("warning: {e}");
+        }
     }
     let _ = std::fs::remove_dir_all(root);
 }

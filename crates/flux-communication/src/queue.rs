@@ -751,7 +751,7 @@ mod test {
             }
 
             assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
-            crate::registry::cleanup_flink(path);
+            let _ = crate::registry::cleanup_flink(path);
         }
     }
 }

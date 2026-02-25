@@ -272,8 +272,10 @@ pub fn clean(
         );
         if force {
             let flink_path = Path::new(entry.flink.as_str());
-            cleanup_flink(flink_path);
-            println!("    ✓ cleaned {}", flink_path.display());
+            match cleanup_flink(flink_path) {
+                Ok(()) => println!("    ✓ cleaned {}", flink_path.display()),
+                Err(e) => eprintln!("    ✗ {e}"),
+            }
         }
     }
 
@@ -413,10 +415,14 @@ pub fn flink_reachable(flink: &str) -> bool {
     if flink.is_empty() {
         return false;
     }
-    if !Path::new(flink).exists() {
-        return false;
-    }
-    ShmemConf::new().flink(flink).open().is_ok()
+    // Check that the flink file exists and is non-empty.  The shared_memory
+    // crate writes the OS ID into the flink file, so a valid (reachable) flink
+    // is always non-empty.  Previously this called `ShmemConf::open()` which
+    // leaked the mmap on success (the returned `Shmem` was dropped without
+    // being the owner, so the mapping was never unmapped).
+    std::fs::metadata(flink)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// An entry is visible if it has live processes or its backing shmem still exists.

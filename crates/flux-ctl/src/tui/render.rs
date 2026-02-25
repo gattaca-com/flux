@@ -357,11 +357,10 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect) {
 
 fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
     let dead_count: usize = app
-        .groups
-        .iter()
-        .flat_map(|g| &g.segments)
-        .filter(|s| !s.alive)
-        .count();
+        .pending_cleanup_flinks
+        .as_ref()
+        .map(|f| f.len())
+        .unwrap_or(0);
 
     let lines = vec![
         Line::from(""),
