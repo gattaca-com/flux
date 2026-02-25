@@ -138,12 +138,13 @@ impl App {
 
     fn refresh_detail_pids(&mut self) {
         if let View::Detail(ref mut detail) = self.view {
-            if let Some(seg) = self
+            let seg = self
                 .groups
                 .get(detail.group_idx)
-                .and_then(|g| g.segments.get(detail.segment_idx))
-            {
-                detail.pids = discovery::pids_info(&seg.entry);
+                .and_then(|g| g.segments.get(detail.segment_idx));
+            match seg {
+                Some(s) => detail.pids = discovery::pids_info(&s.entry),
+                None => self.view = View::List,
             }
         }
     }
