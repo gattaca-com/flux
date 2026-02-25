@@ -7,11 +7,11 @@
 //! Then observe in another terminal:
 //!   cargo run -p flux-ctl -- watch
 //!
-//! The demo registers two "apps" (market-data, order-engine) with multiple
-//! queues and data segments, then writes messages at varying rates so you
-//! can watch the write counters tick up live in the TUI.
+//! Flags:
+//!   --no-cleanup   Leave shmem segments intact on exit
+//!   --reattach     Reattach to existing segments from a previous run
 //!
-//! Press Ctrl-C to stop. Shmem is cleaned up on exit.
+//! Press Ctrl-C to stop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,8 +22,6 @@ use flux_communication::queue::{Producer, Queue, QueueType};
 use flux_communication::registry::ShmemRegistry;
 use flux_communication::{shmem_queue_with_base_dir, ShmemData};
 use flux_utils::directories::local_share_dir;
-
-// ─── Message types ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(C)]
@@ -70,13 +68,24 @@ struct EngineState {
     errors: u64,
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+struct Flags {
+    no_cleanup: bool,
+    reattach: bool,
+}
+
+fn parse_flags() -> Flags {
+    let args: Vec<String> = std::env::args().collect();
+    Flags {
+        no_cleanup: args.iter().any(|a| a == "--no-cleanup"),
+        reattach: args.iter().any(|a| a == "--reattach"),
+    }
+}
 
 fn main() {
+    let flags = parse_flags();
     let base_dir = local_share_dir();
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Ctrl-C handler
     {
         let stop = stop.clone();
         ctrlc::set_handler(move || {
@@ -84,6 +93,17 @@ fn main() {
         })
         .expect("set Ctrl-C handler");
     }
+
+    let mode = if flags.reattach {
+        "reattach"
+    } else {
+        "new session"
+    };
+    let cleanup = if flags.no_cleanup {
+        "no cleanup"
+    } else {
+        "cleanup on exit"
+    };
 
     println!("╔══════════════════════════════════════════════════╗");
     println!("║  flux-ctl live demo                              ║");
@@ -94,9 +114,18 @@ fn main() {
     println!("║    cargo run -p flux-ctl -- watch                ║");
     println!("║                                                  ║");
     println!("║  Press Ctrl-C to stop.                           ║");
-    println!("╚══════════════════════════════════════════════════╝\n");
+    println!("╚══════════════════════════════════════════════════╝");
+    println!("  mode: {mode}, {cleanup}\n");
 
-    // ── App 1: market-data ──────────────────────────────────────────────
+    // shmem_queue_with_base_dir and ShmemData::open_or_init both use
+    // open-or-create semantics, so they naturally reattach to existing
+    // segments when --reattach is used. For a fresh start, clean first.
+    if !flags.reattach {
+        let registry = ShmemRegistry::open_or_create(&base_dir);
+        registry.cleanup_app("market-data");
+        registry.cleanup_app("order-engine");
+    }
+
     let quote_q: Queue<Quote> =
         shmem_queue_with_base_dir(&base_dir, "market-data", 4096, QueueType::SPMC);
     let trade_q: Queue<Trade> =
@@ -105,17 +134,14 @@ fn main() {
         ShmemData::open_or_init_with_base_dir(&base_dir, "market-data", RiskMetrics::default)
             .unwrap();
 
-    // ── App 2: order-engine ─────────────────────────────────────────────
     let order_q: Queue<OrderEvent> =
         shmem_queue_with_base_dir(&base_dir, "order-engine", 2048, QueueType::MPMC);
     let _state: ShmemData<EngineState> =
         ShmemData::open_or_init_with_base_dir(&base_dir, "order-engine", EngineState::default)
             .unwrap();
 
-    // ── Producer threads ────────────────────────────────────────────────
     let mut handles = Vec::new();
 
-    // Quotes: fast — ~1000 msgs/sec
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
@@ -136,7 +162,6 @@ fn main() {
         }));
     }
 
-    // Trades: medium — ~100 msgs/sec
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
@@ -156,7 +181,6 @@ fn main() {
         }));
     }
 
-    // Orders: slow — ~10 msgs/sec
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
@@ -167,7 +191,7 @@ fn main() {
                     order_id: 10000 + id,
                     filled_qty: (id % 100) as u32,
                     remaining: (100 - id % 100) as u32,
-                    status: if id % 5 == 0 { 2 } else { 1 }, // 2=filled, 1=partial
+                    status: if id % 5 == 0 { 2 } else { 1 },
                 });
                 id += 1;
                 thread::sleep(Duration::from_millis(100));
@@ -176,7 +200,6 @@ fn main() {
         }));
     }
 
-    // Wait for Ctrl-C
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
     }
@@ -186,10 +209,13 @@ fn main() {
         h.join().unwrap();
     }
 
-    // Clean up all shmem
-    println!("Cleaning up shmem...");
-    let registry = ShmemRegistry::open_or_create(&base_dir);
-    registry.cleanup_app("market-data");
-    registry.cleanup_app("order-engine");
-    println!("Done.");
+    if flags.no_cleanup {
+        println!("Skipping cleanup (--no-cleanup). Segments remain in shared memory.");
+    } else {
+        println!("Cleaning up shmem...");
+        let registry = ShmemRegistry::open_or_create(&base_dir);
+        registry.cleanup_app("market-data");
+        registry.cleanup_app("order-engine");
+        println!("Done.");
+    }
 }
