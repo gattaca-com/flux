@@ -236,22 +236,24 @@ fn run_primary(flags: Flags) {
         let base_dir2 = base_dir.clone();
         let stop2 = stop.clone();
         thread::spawn(move || {
-            for _ in 0..30 {
-                if stop2.load(Ordering::Relaxed) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
             println!("\n  💉 --poison: creating poison-demo queue...");
             let q: Queue<Trade> =
                 shmem_queue_with_base_dir(&base_dir2, "poison-demo", 64, QueueType::SPMC);
             let mut p = Producer::from(q);
 
-            // Write 10 real messages so the queue looks active
-            for i in 0..10 {
-                p.produce(&Trade { price: 100 + i, quantity: 1, _pad: 0, trade_id: i });
+            // Write real messages at ~100 msgs/sec for 2 seconds so the
+            // queue shows up healthy and active in the TUI before we poison it
+            let start = std::time::Instant::now();
+            let mut n = 0u64;
+            while start.elapsed() < Duration::from_secs(2) {
+                if stop2.load(Ordering::Relaxed) {
+                    return;
+                }
+                p.produce(&Trade { price: 100 + n, quantity: 1, _pad: 0, trade_id: n });
+                n += 1;
+                thread::sleep(Duration::from_millis(10));
             }
-            println!("  💉 wrote 10 messages, now poisoning the next slot...");
+            println!("  💉 wrote {n} messages over 2s, now poisoning the next slot...");
 
             // The queue's write count is now 10. The next slot to be written
             // is at index (count & mask). We open the raw shmem and do exactly
