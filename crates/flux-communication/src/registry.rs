@@ -9,9 +9,7 @@ pub const MAX_REGISTRY_ENTRIES: usize = 512;
 pub const MAX_PIDS_PER_ENTRY: usize = 256;
 pub const REGISTRY_FLINK_NAME: &str = "flux/_shmem_registry";
 
-/// Magic bytes: "FLXR" in little-endian.
 const REGISTRY_MAGIC: u32 = u32::from_le_bytes(*b"FLXR");
-/// Bump this when the layout of ShmemRegistry/ShmemEntry changes.
 const REGISTRY_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,39 +38,34 @@ impl std::fmt::Display for ShmemKind {
     }
 }
 
-/// Fixed-size set of PIDs that can be atomically attached/detached.
-/// Slot value 0 means empty. All operations are lock-free via CAS.
+/// Fixed-size set of PIDs. Slot value 0 = empty. All operations are lock-free CAS.
 #[repr(C)]
 pub struct PidSet {
     pids: [AtomicU32; MAX_PIDS_PER_ENTRY],
 }
 
 impl PidSet {
-    /// Attach a PID. Returns `true` if added (or already present), `false` if full.
     pub fn attach(&self, pid: u32) -> bool {
         debug_assert!(pid != 0, "PID 0 is reserved as the empty sentinel");
         for slot in &self.pids {
             let cur = slot.load(Ordering::Relaxed);
             if cur == pid {
-                return true; // already attached
+                return true;
             }
             if cur == 0 {
-                // Try to claim this empty slot
                 match slot.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed) {
                     Ok(_) => return true,
-                    Err(actual) if actual == pid => return true, // raced, same pid won
-                    Err(_) => continue,                         // someone else took it
+                    Err(actual) if actual == pid => return true,
+                    Err(_) => continue,
                 }
             }
         }
-        false // full
+        false
     }
 
-    /// Detach a PID. Returns `true` if it was present and removed.
     pub fn detach(&self, pid: u32) -> bool {
         for slot in &self.pids {
             if slot.load(Ordering::Relaxed) == pid {
-                // CAS to avoid removing a slot that was recycled
                 if slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                     return true;
                 }
@@ -81,7 +74,6 @@ impl PidSet {
         false
     }
 
-    /// Return all non-zero PIDs currently attached.
     pub fn active_pids(&self) -> Vec<u32> {
         self.pids
             .iter()
@@ -90,22 +82,19 @@ impl PidSet {
             .collect()
     }
 
-    /// The PID in the first slot (the original creator). 0 if empty.
     pub fn creator_pid(&self) -> u32 {
         self.pids[0].load(Ordering::Relaxed)
     }
 
-    /// Number of attached PIDs.
     pub fn count(&self) -> usize {
         self.pids.iter().filter(|s| s.load(Ordering::Relaxed) != 0).count()
     }
 
-    /// Check if any attached PID is still alive.
     pub fn any_alive(&self) -> bool {
         self.active_pids().iter().any(|&pid| is_pid_alive(pid))
     }
 
-    /// Remove all dead PIDs from the set. Returns the number removed.
+    /// CAS-zero all slots holding PIDs that are no longer running.
     pub fn sweep_dead(&self) -> usize {
         let mut removed = 0;
         for slot in &self.pids {
@@ -120,8 +109,6 @@ impl PidSet {
     }
 }
 
-// PidSet is !Clone because of AtomicU32. Provide a manual byte-wise copy
-// for the `ShmemEntry` copy path.
 impl Clone for PidSet {
     fn clone(&self) -> Self {
         let mut pids = [const { AtomicU32::new(0) }; MAX_PIDS_PER_ENTRY];
@@ -140,7 +127,6 @@ impl Default for PidSet {
     }
 }
 
-/// Check if a PID is alive (Linux: /proc/<pid> exists).
 pub fn is_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
@@ -159,7 +145,6 @@ pub struct ShmemEntry {
     pub created_at_nanos: u64,
 }
 
-// Manual Clone — PidSet doesn't derive Copy due to AtomicU32.
 impl Clone for ShmemEntry {
     fn clone(&self) -> Self {
         Self {
@@ -199,17 +184,15 @@ impl ShmemEntry {
         self.kind == ShmemKind::Unknown
     }
 
-    /// Convenience: the creator PID (first slot in the PidSet).
     pub fn creator_pid(&self) -> u32 {
         self.pids.creator_pid()
     }
 }
 
-/// Global shared memory registry. ONE per base_dir, shared across all apps.
-/// Stored at `<base_dir>/flux/_shmem_registry`.
+/// Global shared memory registry. One per `base_dir`, shared across all apps.
+/// Flink: `<base_dir>/flux/_shmem_registry`.
 ///
 /// Uses `ShmemConf` directly (not `ShmemData`) to avoid circular registration.
-/// The first 8 bytes are `magic` + `version` to detect layout mismatches.
 #[repr(C)]
 pub struct ShmemRegistry {
     pub magic: AtomicU32,
@@ -220,8 +203,6 @@ pub struct ShmemRegistry {
 }
 
 impl ShmemRegistry {
-    /// Open or create the global registry.
-    /// Flink: `<base_dir>/flux/_shmem_registry`
     pub fn open_or_create(base_dir: &Path) -> &'static Self {
         let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
         std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap_or_else(|e| {
@@ -240,7 +221,6 @@ impl ShmemRegistry {
                 let ptr = shmem.as_ptr() as *mut Self;
                 std::mem::forget(shmem);
                 let reg = unsafe { &*ptr };
-                // Fresh shmem is zero-initialized. Stamp magic + version.
                 reg.magic.store(REGISTRY_MAGIC, Ordering::Relaxed);
                 reg.version.store(REGISTRY_VERSION, Ordering::Relaxed);
                 reg
@@ -248,9 +228,6 @@ impl ShmemRegistry {
             Err(ShmemError::LinkExists) => match ShmemConf::new().flink(&registry_path).open() {
                 Ok(shmem) => {
                     let ptr = shmem.as_ptr() as *const Self;
-
-                    // Version check: if magic/version don't match, the shmem
-                    // has an incompatible layout. Destroy and recreate.
                     let magic = unsafe { &*(ptr as *const AtomicU32) };
                     if magic.load(Ordering::Relaxed) != REGISTRY_MAGIC
                         || shmem.len() < std::mem::size_of::<Self>()
@@ -259,7 +236,6 @@ impl ShmemRegistry {
                             "flux: registry version mismatch at {}, recreating",
                             registry_path.display()
                         );
-                        // set_owner so /dev/shm/ backing is unlinked on drop
                         let mut shmem = shmem;
                         shmem.set_owner(true);
                         drop(shmem);
@@ -267,7 +243,6 @@ impl ShmemRegistry {
                         return Self::open_or_create(base_dir);
                     }
 
-                    // Check version (magic matched, safe to read version field)
                     let reg = unsafe { &*ptr };
                     if reg.version.load(Ordering::Relaxed) != REGISTRY_VERSION {
                         eprintln!(
@@ -275,9 +250,7 @@ impl ShmemRegistry {
                             reg.version.load(Ordering::Relaxed),
                             REGISTRY_VERSION,
                         );
-                        // Re-open to get owned handle for cleanup
-                        let shmem =
-                            ShmemConf::new().flink(&registry_path).open().unwrap();
+                        let shmem = ShmemConf::new().flink(&registry_path).open().unwrap();
                         let mut shmem = shmem;
                         shmem.set_owner(true);
                         drop(shmem);
@@ -297,11 +270,8 @@ impl ShmemRegistry {
         }
     }
 
-    /// Open existing registry read-only. Returns None if not found or version mismatch.
     pub fn open(registry_path: &Path) -> Option<&'static Self> {
         let shmem = ShmemConf::new().flink(registry_path).open().ok()?;
-
-        // Validate magic + size before interpreting the memory
         if shmem.len() < std::mem::size_of::<Self>() {
             return None;
         }
@@ -312,19 +282,16 @@ impl ShmemRegistry {
         {
             return None;
         }
-
         std::mem::forget(shmem);
         Some(reg)
     }
 
-    /// Register a shmem entry, or attach this PID to an existing entry with
-    /// the same flink. Returns the slot index, or None if the registry is full.
+    /// Register a new entry or attach this PID to an existing entry with the
+    /// same flink. Sweeps dead PIDs on reattach. Returns the slot index.
     pub fn register(&self, entry: ShmemEntry) -> Option<u32> {
         let pid = entry.pids.creator_pid();
         let flink = entry.flink;
 
-        // Check if an entry with this flink already exists — if so, reap dead
-        // PIDs and attach.
         let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
         for i in 0..count {
             let existing = &self.entries[i as usize];
@@ -335,15 +302,12 @@ impl ShmemRegistry {
             }
         }
 
-        // New entry — claim a slot.
         let idx = self.count.fetch_add(1, Ordering::AcqRel);
         if idx as usize >= MAX_REGISTRY_ENTRIES {
             self.count.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
         unsafe {
-            // Compute the slot pointer directly from the base of self, avoiding
-            // casting &T to *mut T (which is UB in Rust 2024).
             let base = self as *const Self as *mut u8;
             let offset = std::mem::offset_of!(Self, entries)
                 + idx as usize * std::mem::size_of::<ShmemEntry>();
@@ -354,13 +318,10 @@ impl ShmemRegistry {
         Some(idx)
     }
 
-    /// Attach the current process to an existing entry identified by flink.
-    /// Returns `true` if found and attached, `false` if no such flink exists.
     pub fn attach(&self, flink: &str) -> bool {
         self.attach_pid(flink, std::process::id())
     }
 
-    /// Attach a specific PID to an existing entry identified by flink.
     pub fn attach_pid(&self, flink: &str, pid: u32) -> bool {
         let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
         for i in 0..count {
@@ -372,7 +333,6 @@ impl ShmemRegistry {
         false
     }
 
-    /// Detach a PID from an entry identified by flink.
     pub fn detach_pid(&self, flink: &str, pid: u32) -> bool {
         let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
         for i in 0..count {
@@ -384,7 +344,6 @@ impl ShmemRegistry {
         false
     }
 
-    /// Read all registered entries.
     pub fn entries(&self) -> &[ShmemEntry] {
         let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
         &self.entries[..count as usize]
@@ -394,7 +353,6 @@ impl ShmemRegistry {
         self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32)
     }
 
-    /// Sweep dead PIDs from all entries. Returns total number of dead PIDs removed.
     pub fn sweep_dead_pids(&self) -> usize {
         let mut total = 0;
         for entry in self.entries() {
@@ -405,9 +363,6 @@ impl ShmemRegistry {
         total
     }
 
-    /// Clean up shmem backing files for all entries matching the given app name.
-    /// Opens each flink, sets `owner(true)` to unlink the `/dev/shm/` backing,
-    /// then removes the flink file.
     pub fn cleanup_app(&self, app_name: &str) {
         for entry in self.entries() {
             if entry.app_name.as_str() == app_name {
@@ -416,7 +371,6 @@ impl ShmemRegistry {
         }
     }
 
-    /// Clean up shmem backing files for ALL registered entries.
     pub fn cleanup_all(&self) {
         for entry in self.entries() {
             if !entry.is_empty() {
@@ -426,39 +380,28 @@ impl ShmemRegistry {
     }
 
     /// Nuclear option: clean all registered entries, walk the filesystem for
-    /// any unregistered shmem, clean the registry's own backing, remove dir tree.
-    ///
-    /// `base_dir` is the same directory passed to `open_or_create`.
-    /// **Warning**: removes the entire directory tree under `base_dir`.
+    /// any unregistered shmem, then remove the entire directory tree.
     pub fn destroy(base_dir: &Path) {
         let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
-
-        // Clean registered entries first (catches shmem whose flinks live
-        // outside base_dir, e.g. in /dev/shm/).
         if let Some(registry) = Self::open(&registry_path) {
             registry.cleanup_all();
         }
-
-        // Walk filesystem to catch any unregistered shmem (e.g. timing queues
-        // created by tiles via direct Queue::create_or_open_shared calls).
         cleanup_shmem(base_dir);
     }
 }
 
 // ─── Free functions ─────────────────────────────────────────────────────────
 
-/// Unlink the `/dev/shm/` backing file for a single flink, then remove the
-/// flink itself. Safe to call on already-removed or non-existent paths.
+/// Unlink the shmem backing for a flink, then remove the flink file.
+/// Safe to call on already-removed paths.
 pub fn cleanup_flink(flink_path: &Path) {
     if let Ok(mut shmem) = ShmemConf::new().flink(flink_path).open() {
         shmem.set_owner(true);
-        // shmem drops here → unlinks /dev/shm/ backing file
     }
     let _ = std::fs::remove_file(flink_path);
 }
 
-/// Walk a directory tree, unlink all shmem backing files found via flinks,
-/// then remove the entire directory tree.
+/// Walk a directory tree, unlink all shmem backing files, then remove the tree.
 pub fn cleanup_shmem(root: &Path) {
     for flink in all_flinks_under(root) {
         cleanup_flink(&flink);
@@ -492,14 +435,12 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
-/// Create a `PidSet` with the current process as the first (creator) PID.
 fn pid_set_self() -> PidSet {
     let set = PidSet::default();
     set.attach(std::process::id());
     set
 }
 
-/// Helper to build a ShmemEntry for a queue.
 pub fn queue_entry(
     app_name: &str,
     type_name: &str,
@@ -521,7 +462,6 @@ pub fn queue_entry(
     }
 }
 
-/// Helper to build a ShmemEntry for data.
 pub fn data_entry(
     app_name: &str,
     type_name: &str,

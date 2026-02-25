@@ -11,7 +11,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         View::Detail(_) => render_detail(frame, app),
     }
 
-    // Help popup overlays everything
     if app.show_help {
         render_help_popup(frame, frame.area());
     }
@@ -31,18 +30,15 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    // Title
     let title = Paragraph::new(" flux-ctl — Shared Memory Monitor ")
         .style(Style::default().fg(Color::Cyan).bold())
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, chunks[0]);
 
-    // Header
     let header = Row::new(vec!["Name", "Kind", "Details", "PIDs", "Status"])
         .style(Style::default().fg(Color::Cyan).bold())
         .bottom_margin(1);
 
-    // Build rows
     let mut rows = Vec::new();
     for group in &app.groups {
         let icon = if group.expanded { "▼" } else { "▶" };
@@ -117,7 +113,6 @@ fn render_list(frame: &mut Frame, app: &mut App) {
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
 
-    // Status bar
     render_status_bar(frame, app, chunks[2]);
 }
 
@@ -129,14 +124,13 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // title
-            Constraint::Length(12), // segment info
-            Constraint::Min(4),    // PID table
-            Constraint::Length(1), // status bar
+            Constraint::Length(3),
+            Constraint::Length(12),
+            Constraint::Min(4),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    // Title bar
     let seg = app.detail_segment();
     let title_text = seg
         .map(|s| format!(" {} — {} ", s.entry.app_name.as_str(), s.entry.type_name.as_str()))
@@ -146,20 +140,16 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, chunks[0]);
 
-    // Segment info panel
     if let Some(seg) = seg.cloned() {
         render_segment_info(frame, &seg, chunks[1]);
     }
 
-    // PID table
     if let View::Detail(ref detail) = app.view {
         render_pid_table(frame, detail, chunks[2]);
     }
 
-    // Status bar
     render_status_bar(frame, app, chunks[3]);
 
-    // Cleanup confirmation overlay
     if let View::Detail(ref detail) = app.view {
         if detail.confirm_cleanup {
             render_confirm_popup(frame, area);
@@ -209,7 +199,6 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         ]),
     ];
 
-    // Queue-specific stats
     if seg.entry.kind == ShmemKind::Queue {
         if let Some(writes) = seg.queue_writes {
             lines.push(Line::from(vec![
@@ -224,15 +213,10 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         .title(" Segment Info ")
         .title_alignment(Alignment::Left)
         .border_style(Style::default().fg(Color::DarkGray));
-    let para = Paragraph::new(lines).block(block);
-    frame.render_widget(para, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_pid_table(
-    frame: &mut Frame,
-    detail: &super::app::DetailState,
-    area: Rect,
-) {
+fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: Rect) {
     let header = Row::new(vec!["PID", "Status", "Process", "Command"])
         .style(Style::default().fg(Color::Cyan).bold())
         .bottom_margin(1);
@@ -241,11 +225,7 @@ fn render_pid_table(
         .pids
         .iter()
         .map(|p| {
-            let status_str = if p.alive {
-                "alive".to_string()
-            } else {
-                "dead".to_string()
-            };
+            let status_str = if p.alive { "alive" } else { "dead" };
             let status_style = if p.alive {
                 Style::default().fg(Color::Green)
             } else {
@@ -260,25 +240,16 @@ fn render_pid_table(
 
             Row::new(vec![
                 Cell::from(format!("{}", p.pid)),
-                Cell::from(Span::styled(status_str, status_style)),
+                Cell::from(Span::styled(status_str.to_string(), status_style)),
                 Cell::from(name.to_string()),
                 Cell::from(cmd),
             ])
         })
         .collect();
 
-    let empty_msg = if rows.is_empty() {
-        "  No PIDs attached"
-    } else {
-        ""
-    };
-
     let n_alive = detail.pids.iter().filter(|p| p.alive).count();
     let n_dead = detail.pids.iter().filter(|p| !p.alive).count();
-    let title = format!(
-        " Attached Processes ({} alive, {} dead) ",
-        n_alive, n_dead
-    );
+    let title = format!(" Attached Processes ({} alive, {} dead) ", n_alive, n_dead);
 
     let widths = [
         Constraint::Length(10),
@@ -293,8 +264,10 @@ fn render_pid_table(
             .title(title)
             .title_alignment(Alignment::Left)
             .border_style(Style::default().fg(Color::DarkGray));
-        let para = Paragraph::new(empty_msg).block(block);
-        frame.render_widget(para, area);
+        frame.render_widget(
+            Paragraph::new("  No PIDs attached").block(block),
+            area,
+        );
     } else {
         let table = Table::new(rows, widths)
             .header(header)
@@ -332,19 +305,18 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect) {
         Line::from(""),
     ];
 
-    let popup_height = lines.len() as u16 + 2;
-    let popup_width = 50;
-    let popup_area = centered_rect(popup_width, popup_height, area);
-
+    let popup_area = centered_rect(50, lines.len() as u16 + 2, area);
     frame.render_widget(Clear, popup_area);
-    let popup = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red))
-            .title(" ⚠ Confirm Cleanup ")
-            .title_alignment(Alignment::Center),
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" ⚠ Confirm Cleanup ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup_area,
     );
-    frame.render_widget(popup, popup_area);
 }
 
 // ─── Status bar ─────────────────────────────────────────────────────────────
@@ -356,10 +328,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         match &app.view {
             View::List => " ↑↓ navigate  Enter open  ? help  q quit".into(),
             View::Detail(detail) => {
-                let alive = app
-                    .detail_segment()
-                    .map(|s| s.alive)
-                    .unwrap_or(true);
+                let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
                 if detail.confirm_cleanup {
                     " Enter confirm cleanup  Esc cancel".into()
                 } else if !alive {
@@ -376,8 +345,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let status = Paragraph::new(text).style(style);
-    frame.render_widget(status, area);
+    frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -428,24 +396,20 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         )),
     ];
 
-    let popup_height = lines.len() as u16 + 2;
-    let popup_width = 46;
-
-    let popup_area = centered_rect(popup_width, popup_height, area);
-
+    let popup_area = centered_rect(46, lines.len() as u16 + 2, area);
     frame.render_widget(Clear, popup_area);
-
-    let popup = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" Help ")
-            .title_alignment(Alignment::Center),
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Help ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup_area,
     );
-    frame.render_widget(popup, popup_area);
 }
 
-/// Return a centered `Rect` of fixed `width` × `height` within `area`.
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;

@@ -22,6 +22,7 @@ clap.workspace = true
 crossterm.workspace = true
 humantime = "2"
 ratatui.workspace = true
+shared_memory.workspace = true
 
 [dev-dependencies]
 ctrlc.workspace = true

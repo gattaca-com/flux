@@ -21,27 +21,18 @@ pub struct AppGroup {
     pub expanded: bool,
 }
 
-/// Which view is currently active.
 #[derive(Clone, Debug)]
 pub enum View {
-    /// Main list of app groups + segments.
     List,
-    /// Detail view for a specific segment.
     Detail(DetailState),
 }
 
-/// State for the detail view.
 #[derive(Clone, Debug)]
 pub struct DetailState {
-    /// Index into `App::groups`.
     pub group_idx: usize,
-    /// Index into `AppGroup::segments`.
     pub segment_idx: usize,
-    /// Per-PID info (refreshed along with the rest).
     pub pids: Vec<discovery::PidInfo>,
-    /// Selected row in the PID table (for scrolling).
     pub selected_pid: usize,
-    /// Whether a confirm-cleanup prompt is visible.
     pub confirm_cleanup: bool,
 }
 
@@ -54,9 +45,10 @@ pub struct App {
     pub last_refresh: Instant,
     pub show_help: bool,
     pub view: View,
-    /// Ephemeral status message shown in the status bar.
     pub status_msg: Option<(String, Instant)>,
 }
+
+const STATUS_MSG_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl App {
     pub fn new(base_dir: &Path, app_filter: Option<&str>) -> Self {
@@ -75,7 +67,6 @@ impl App {
         app
     }
 
-    /// Construct an App directly from pre-built groups (for testing).
     pub fn with_groups(groups: Vec<AppGroup>) -> Self {
         let mut app = Self {
             groups,
@@ -109,6 +100,7 @@ impl App {
             let segments: Vec<SegmentInfo> = entries
                 .iter()
                 .filter(|e| e.app_name.as_str() == name)
+                .filter(|e| discovery::entry_visible(e))
                 .map(|e| {
                     let alive = e.pids.any_alive();
                     let pid_count = e.pids.count();
@@ -122,6 +114,9 @@ impl App {
                     SegmentInfo { entry: e.clone(), alive, pid_count, queue_writes }
                 })
                 .collect();
+            if segments.is_empty() {
+                continue;
+            }
             self.groups.push(AppGroup { name, segments, expanded: true });
         }
 
@@ -141,7 +136,6 @@ impl App {
         }
     }
 
-    /// Refresh the PID info for the detail view (if active).
     fn refresh_detail_pids(&mut self) {
         if let View::Detail(ref mut detail) = self.view {
             if let Some(seg) = self
@@ -155,13 +149,11 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        // Expire status messages after 3 seconds
-        if let Some((_, created)) = &self.status_msg {
-            if created.elapsed() >= std::time::Duration::from_secs(3) {
+        if let Some((_, ts)) = &self.status_msg {
+            if ts.elapsed() >= STATUS_MSG_DURATION {
                 self.status_msg = None;
             }
         }
-
         if self.last_refresh.elapsed() >= std::time::Duration::from_secs(1) {
             self.refresh();
         }
@@ -171,8 +163,7 @@ impl App {
         match &mut self.view {
             View::List => {
                 if self.total_rows > 0 {
-                    self.selected =
-                        (self.selected + 1).min(self.total_rows.saturating_sub(1));
+                    self.selected = (self.selected + 1).min(self.total_rows.saturating_sub(1));
                 }
             }
             View::Detail(detail) => {
@@ -199,15 +190,12 @@ impl App {
         self.show_help = !self.show_help;
     }
 
-    /// Called on Enter key.
     pub fn enter(&mut self) {
         match &self.view {
             View::List => {
-                // Figure out what the cursor is pointing at.
                 let mut row = 0;
                 for (gi, group) in self.groups.iter_mut().enumerate() {
                     if row == self.selected {
-                        // Cursor is on a group header → toggle expand.
                         group.expanded = !group.expanded;
                         self.recount_rows();
                         return;
@@ -216,7 +204,6 @@ impl App {
                     if group.expanded {
                         for si in 0..group.segments.len() {
                             if row == self.selected {
-                                // Cursor is on a segment → open detail view.
                                 let pids =
                                     discovery::pids_info(&group.segments[si].entry);
                                 self.view = View::Detail(DetailState {
@@ -233,19 +220,17 @@ impl App {
                     }
                 }
             }
-            View::Detail(_) => {} // Enter does nothing in detail view
+            View::Detail(_) => {}
         }
     }
 
-    /// Go back from detail to list.
     pub fn back(&mut self) {
         if let View::Detail(_) = &self.view {
             self.view = View::List;
         }
     }
 
-    /// Request cleanup of the currently-viewed segment.
-    /// First call shows a confirmation prompt, second call executes.
+    /// First call shows confirmation, second call executes cleanup.
     pub fn request_cleanup(&mut self) {
         let View::Detail(ref mut detail) = self.view else { return };
 
@@ -258,7 +243,6 @@ impl App {
             None => return,
         };
 
-        // Only allow cleanup if no PIDs are alive.
         if seg.alive {
             self.status_msg =
                 Some(("Cannot clean: segment still has live processes".into(), Instant::now()));
@@ -266,11 +250,9 @@ impl App {
         }
 
         if detail.confirm_cleanup {
-            // Second press → actually clean up.
             let flink = seg.entry.flink.as_str().to_string();
             cleanup_flink(Path::new(&flink));
-            self.status_msg =
-                Some((format!("Cleaned up {}", flink), Instant::now()));
+            self.status_msg = Some((format!("Cleaned up {}", flink), Instant::now()));
             detail.confirm_cleanup = false;
             self.view = View::List;
             self.refresh();
@@ -279,14 +261,12 @@ impl App {
         }
     }
 
-    /// Cancel the cleanup confirmation prompt.
     pub fn cancel_cleanup(&mut self) {
         if let View::Detail(ref mut detail) = self.view {
             detail.confirm_cleanup = false;
         }
     }
 
-    /// Get the segment info for the current detail view, if any.
     pub fn detail_segment(&self) -> Option<&SegmentInfo> {
         if let View::Detail(ref detail) = self.view {
             self.groups
@@ -297,7 +277,6 @@ impl App {
         }
     }
 
-    // Keep the old method name working for the expand/collapse test.
     pub fn toggle_expand(&mut self) {
         self.enter();
     }

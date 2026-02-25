@@ -5,21 +5,17 @@ use flux_communication::queue::QueueHeader;
 use flux_communication::registry::{
     REGISTRY_FLINK_NAME, ShmemEntry, ShmemKind, ShmemRegistry, cleanup_flink,
 };
+use shared_memory::ShmemConf;
 
-/// Information about a running (or dead) process.
 #[derive(Clone, Debug)]
 pub struct PidInfo {
     pub pid: u32,
     pub alive: bool,
-    /// Process name from /proc/<pid>/comm (empty if dead or unreadable).
     pub name: String,
-    /// Full command line from /proc/<pid>/cmdline (empty if dead or unreadable).
     pub cmdline: String,
-    /// Process start time as a human-readable string (empty if unavailable).
     pub start_time: String,
 }
 
-/// Gather info for a single PID.
 pub fn pid_info(pid: u32) -> PidInfo {
     let alive = is_pid_alive(pid);
     if !alive {
@@ -47,49 +43,16 @@ pub fn pid_info(pid: u32) -> PidInfo {
         })
         .unwrap_or_default();
 
-    // Approximate start time from /proc/<pid>/stat field 22 (starttime in
-    // clock ticks since boot).
     let start_time = read_start_time(pid).unwrap_or_default();
 
     PidInfo { pid, alive, name, cmdline, start_time }
 }
 
-/// Gather PidInfo for all active PIDs in an entry.
 pub fn pids_info(entry: &ShmemEntry) -> Vec<PidInfo> {
     entry.pids.active_pids().iter().map(|&pid| pid_info(pid)).collect()
 }
 
-/// Try to read the process start time from /proc/<pid>/stat and convert to
-/// a human-readable timestamp.
-fn read_start_time(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The comm field is wrapped in parens and may contain spaces/parens,
-    // so find the last ')' and parse fields after it.
-    let after_comm = stat.rsplit_once(')')?.1;
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    // Field index 0 after ')' is state, field 19 is starttime (0-based from
-    // after comm; that's field 21 in the full stat, 0-indexed).
-    let starttime_ticks: u64 = fields.get(19)?.parse().ok()?;
-    let ticks_per_sec = ticks_per_second();
-
-    // Read system boot time from /proc/stat
-    let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let btime_line = proc_stat.lines().find(|l| l.starts_with("btime "))?;
-    let btime_secs: u64 = btime_line.split_whitespace().nth(1)?.parse().ok()?;
-
-    let start_secs = btime_secs + starttime_ticks / ticks_per_sec;
-    let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(start_secs);
-    let datetime = humantime::format_rfc3339_seconds(start);
-    Some(datetime.to_string())
-}
-
-fn ticks_per_second() -> u64 {
-    // sysconf(_SC_CLK_TCK) is typically 100 on Linux
-    100
-}
-
-/// Open the global registry at `<base_dir>/flux/_shmem_registry`.
-/// Sweeps dead PIDs from all entries on open.
+/// Open the global registry, sweeping dead PIDs on open.
 pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {
     let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
     let reg = ShmemRegistry::open(&registry_path)?;
@@ -97,10 +60,8 @@ pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {
     Some(reg)
 }
 
-// Re-export for convenience (used by tests and TUI)
 pub use flux_communication::registry::is_pid_alive;
 
-/// Get unique sorted app names from registry entries
 pub fn app_names(registry: &ShmemRegistry) -> Vec<String> {
     let mut names: Vec<String> = registry
         .entries()
@@ -122,9 +83,9 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
         return Ok(());
     };
 
-    let entries = registry.entries();
+    let entries: Vec<&ShmemEntry> = registry.entries().iter().filter(|e| entry_visible(e)).collect();
     if entries.is_empty() {
-        println!("Registry is empty (0 segments registered)");
+        println!("No active segments found");
         return Ok(());
     }
 
@@ -132,8 +93,11 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
     println!("Found {} segments across {} apps\n", entries.len(), apps.len());
 
     for app in &apps {
-        let app_entries: Vec<&ShmemEntry> =
+        let app_entries: Vec<&&ShmemEntry> =
             entries.iter().filter(|e| e.app_name.as_str() == app).collect();
+        if app_entries.is_empty() {
+            continue;
+        }
         println!("📦 {} ({} segments)", app, app_entries.len());
         for entry in &app_entries {
             let alive = entry.pids.any_alive();
@@ -181,7 +145,7 @@ pub fn inspect(
     };
 
     for entry in registry.entries() {
-        if entry.is_empty() {
+        if !entry_visible(entry) {
             continue;
         }
         if let Some(app) = app_filter {
@@ -257,7 +221,7 @@ pub fn clean(
                 continue;
             }
         }
-        if !entry.pids.any_alive() {
+        if !entry.pids.any_alive() && flink_reachable(entry.flink.as_str()) {
             stale.push(entry);
         }
     }
@@ -289,7 +253,29 @@ pub fn clean(
     Ok(())
 }
 
-/// Format the PID(s) attached to an entry for display.
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+pub fn flink_reachable(flink: &str) -> bool {
+    if flink.is_empty() {
+        return false;
+    }
+    if !Path::new(flink).exists() {
+        return false;
+    }
+    ShmemConf::new().flink(flink).open().is_ok()
+}
+
+/// An entry is visible if it has live processes or its backing shmem still exists.
+pub fn entry_visible(entry: &ShmemEntry) -> bool {
+    if entry.is_empty() {
+        return false;
+    }
+    if entry.pids.any_alive() {
+        return true;
+    }
+    flink_reachable(entry.flink.as_str())
+}
+
 fn format_pids(entry: &ShmemEntry) -> String {
     let active = entry.pids.active_pids();
     match active.len() {
@@ -300,4 +286,21 @@ fn format_pids(entry: &ShmemEntry) -> String {
             format!("pids({n})=[{}]", list.join(","))
         }
     }
+}
+
+fn read_start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // Field 19 after comm = starttime (field 21 in full stat, 0-indexed)
+    let starttime_ticks: u64 = fields.get(19)?.parse().ok()?;
+    let ticks_per_sec: u64 = 100; // sysconf(_SC_CLK_TCK), typically 100 on Linux
+
+    let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime_line = proc_stat.lines().find(|l| l.starts_with("btime "))?;
+    let btime_secs: u64 = btime_line.split_whitespace().nth(1)?.parse().ok()?;
+
+    let start_secs = btime_secs + starttime_ticks / ticks_per_sec;
+    let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(start_secs);
+    Some(humantime::format_rfc3339_seconds(ts).to_string())
 }
