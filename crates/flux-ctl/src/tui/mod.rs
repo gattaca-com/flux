@@ -12,6 +12,8 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
+use app::View;
+
 pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -25,20 +27,43 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if app.show_help {
-                                app.show_help = false;
-                            } else {
-                                break;
+                    // If help popup is visible, any key closes it.
+                    if app.show_help {
+                        app.show_help = false;
+                        continue;
+                    }
+
+                    // If cleanup confirmation is shown, handle it first.
+                    if let View::Detail(ref detail) = app.view {
+                        if detail.confirm_cleanup {
+                            match key.code {
+                                KeyCode::Char('c') => app.request_cleanup(),
+                                _ => app.cancel_cleanup(),
                             }
+                            continue;
                         }
-                        KeyCode::Char('?') => app.toggle_help(),
-                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                        KeyCode::Down | KeyCode::Char('j') => app.next(),
-                        KeyCode::Enter => app.toggle_expand(),
-                        KeyCode::Char('r') => app.refresh(),
-                        _ => {}
+                    }
+
+                    match &app.view {
+                        View::List => match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('?') => app.toggle_help(),
+                            KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                            KeyCode::Down | KeyCode::Char('j') => app.next(),
+                            KeyCode::Enter => app.enter(),
+                            KeyCode::Char('r') => app.refresh(),
+                            _ => {}
+                        },
+                        View::Detail(_) => match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Esc | KeyCode::Backspace => app.back(),
+                            KeyCode::Char('?') => app.toggle_help(),
+                            KeyCode::Char('c') => app.request_cleanup(),
+                            KeyCode::Char('r') => app.refresh(),
+                            KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                            KeyCode::Down | KeyCode::Char('j') => app.next(),
+                            _ => {}
+                        },
                     }
                 }
             }

@@ -6,6 +6,88 @@ use flux_communication::registry::{
     REGISTRY_FLINK_NAME, ShmemEntry, ShmemKind, ShmemRegistry, cleanup_flink,
 };
 
+/// Information about a running (or dead) process.
+#[derive(Clone, Debug)]
+pub struct PidInfo {
+    pub pid: u32,
+    pub alive: bool,
+    /// Process name from /proc/<pid>/comm (empty if dead or unreadable).
+    pub name: String,
+    /// Full command line from /proc/<pid>/cmdline (empty if dead or unreadable).
+    pub cmdline: String,
+    /// Process start time as a human-readable string (empty if unavailable).
+    pub start_time: String,
+}
+
+/// Gather info for a single PID.
+pub fn pid_info(pid: u32) -> PidInfo {
+    let alive = is_pid_alive(pid);
+    if !alive {
+        return PidInfo {
+            pid,
+            alive: false,
+            name: String::new(),
+            cmdline: String::new(),
+            start_time: String::new(),
+        };
+    }
+
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            bytes
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+
+    // Approximate start time from /proc/<pid>/stat field 22 (starttime in
+    // clock ticks since boot).
+    let start_time = read_start_time(pid).unwrap_or_default();
+
+    PidInfo { pid, alive, name, cmdline, start_time }
+}
+
+/// Gather PidInfo for all active PIDs in an entry.
+pub fn pids_info(entry: &ShmemEntry) -> Vec<PidInfo> {
+    entry.pids.active_pids().iter().map(|&pid| pid_info(pid)).collect()
+}
+
+/// Try to read the process start time from /proc/<pid>/stat and convert to
+/// a human-readable timestamp.
+fn read_start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field is wrapped in parens and may contain spaces/parens,
+    // so find the last ')' and parse fields after it.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // Field index 0 after ')' is state, field 19 is starttime (0-based from
+    // after comm; that's field 21 in the full stat, 0-indexed).
+    let starttime_ticks: u64 = fields.get(19)?.parse().ok()?;
+    let ticks_per_sec = ticks_per_second();
+
+    // Read system boot time from /proc/stat
+    let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime_line = proc_stat.lines().find(|l| l.starts_with("btime "))?;
+    let btime_secs: u64 = btime_line.split_whitespace().nth(1)?.parse().ok()?;
+
+    let start_secs = btime_secs + starttime_ticks / ticks_per_sec;
+    let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(start_secs);
+    let datetime = humantime::format_rfc3339_seconds(start);
+    Some(datetime.to_string())
+}
+
+fn ticks_per_second() -> u64 {
+    // sysconf(_SC_CLK_TCK) is typically 100 on Linux
+    100
+}
+
 /// Open the global registry at `<base_dir>/flux/_shmem_registry`.
 /// Sweeps dead PIDs from all entries on open.
 pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {

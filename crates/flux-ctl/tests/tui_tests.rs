@@ -2,7 +2,7 @@ use flux_communication::registry::{
     ShmemRegistry, REGISTRY_FLINK_NAME, data_entry, queue_entry,
 };
 use flux_ctl::discovery;
-use flux_ctl::tui::app::{App, AppGroup, SegmentInfo};
+use flux_ctl::tui::app::{App, AppGroup, SegmentInfo, View};
 use flux_ctl::tui::render;
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
@@ -57,7 +57,7 @@ fn help_hint_visible_by_default() {
     let buf = render_to_buffer(&mut app, 80, 20);
     let text = buffer_text(&buf);
     assert!(
-        text.contains("Press ? for help"),
+        text.contains("? help"),
         "help hint should appear in status bar:\n{text}"
     );
 }
@@ -537,4 +537,264 @@ fn register_reattach_sweeps_dead() {
     registry.register(queue_entry("app", "Msg", "/dev/shm/test_rsweep", 8, 16));
     assert_eq!(registry.entry_count(), 1, "should still be 1 entry");
     assert_eq!(entry.pids.count(), 1, "dead PIDs should have been swept");
+}
+
+// ─── Detail view tests ──────────────────────────────────────────────────────
+
+#[test]
+fn enter_on_segment_opens_detail() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_esd", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(42),
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    // Row 0 = app header, Row 1 = segment
+    app.selected = 1;
+    app.enter();
+
+    assert!(
+        matches!(app.view, View::Detail(_)),
+        "should switch to detail view"
+    );
+}
+
+#[test]
+fn detail_view_renders_segment_info() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_dvr", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(42),
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+
+    assert!(text.contains("Quote"), "type name:\n{text}");
+    assert!(text.contains("myapp"), "app name:\n{text}");
+    assert!(text.contains("Queue"), "kind:\n{text}");
+    assert!(text.contains("24 bytes"), "elem size:\n{text}");
+    assert!(text.contains("64"), "capacity:\n{text}");
+    assert!(text.contains("Flink"), "flink label:\n{text}");
+    assert!(
+        text.contains("Attached Processes"),
+        "PID table header:\n{text}"
+    );
+}
+
+#[test]
+fn detail_view_shows_pid_info() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_dvp", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+
+    // Our own PID should be shown and marked alive
+    let our_pid = std::process::id().to_string();
+    assert!(text.contains(&our_pid), "our PID should show:\n{text}");
+    assert!(text.contains("alive"), "should show alive:\n{text}");
+}
+
+#[test]
+fn detail_view_back_returns_to_list() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_dvb", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+    assert!(matches!(app.view, View::Detail(_)));
+
+    app.back();
+    assert!(matches!(app.view, View::List));
+}
+
+#[test]
+fn detail_cleanup_blocked_for_alive() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_dcb", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    // Trying to clean a live segment should be blocked
+    app.request_cleanup();
+    assert!(
+        app.status_msg.is_some(),
+        "should show error message for live segment"
+    );
+    if let View::Detail(ref d) = app.view {
+        assert!(!d.confirm_cleanup, "should not show confirm for live segment");
+    }
+}
+
+#[test]
+fn detail_cleanup_shows_confirm_for_dead() {
+    let dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_dcc", 64);
+    dead_entry.pids.detach(std::process::id());
+    dead_entry.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead_entry,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    // First press: should show confirm prompt
+    app.request_cleanup();
+    if let View::Detail(ref d) = app.view {
+        assert!(d.confirm_cleanup, "should show confirm prompt");
+    } else {
+        panic!("should still be in detail view");
+    }
+
+    // Render and check confirm popup appears
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("Clean up this segment"),
+        "confirm popup should appear:\n{text}"
+    );
+}
+
+#[test]
+fn detail_cancel_cleanup_hides_confirm() {
+    let dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_dch", 64);
+    dead_entry.pids.detach(std::process::id());
+    dead_entry.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead_entry,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    app.request_cleanup(); // show confirm
+    app.cancel_cleanup();  // cancel
+
+    if let View::Detail(ref d) = app.view {
+        assert!(!d.confirm_cleanup, "confirm should be cancelled");
+    }
+}
+
+#[test]
+fn detail_status_bar_shows_cleanup_hint_for_dead() {
+    let dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_dsh", 64);
+    dead_entry.pids.detach(std::process::id());
+    dead_entry.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead_entry,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+
+    // Status bar should hint about cleanup for dead segments
+    assert!(
+        text.contains("c clean"),
+        "status bar should show cleanup hint for dead segment:\n{text}"
+    );
+}
+
+#[test]
+fn enter_on_app_header_still_toggles() {
+    let entry = queue_entry("myapp", "Msg", "/dev/shm/test_eoah", 8, 16);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 0; // app header row
+    app.enter();
+
+    // Should toggle collapse, not enter detail
+    assert!(matches!(app.view, View::List));
+    assert!(!app.groups[0].expanded);
 }
