@@ -11,7 +11,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         View::Detail(_) => render_detail(frame, app),
     }
 
-    // Confirm popups (work in both views)
     if app.confirm_cleanup_all {
         render_confirm_all_popup(frame, app, frame.area());
     } else {
