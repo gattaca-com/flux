@@ -42,7 +42,11 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    let title = Paragraph::new(" flux-ctl — Shared Memory Monitor ")
+    let title_text = format!(
+        " flux-ctl — Shared Memory Monitor  [sort: {}] ",
+        app.sort_mode.label()
+    );
+    let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Cyan).bold())
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, chunks[0]);
@@ -148,7 +152,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(12),
+            Constraint::Length(13),
             Constraint::Min(4),
             Constraint::Length(1),
         ])
@@ -219,6 +223,14 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         Line::from(vec![
             Span::styled("  Flink:      ", Style::default().fg(Color::DarkGray)),
             Span::raw(seg.entry.flink.as_str().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Backing:    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(
+                crate::discovery::backing_file_size(seg.entry.flink.as_str())
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "unavailable".into()),
+            ),
         ]),
     ];
 
@@ -405,35 +417,44 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     let has_any_dead = app.groups.iter().any(|g| g.segments.iter().any(|s| !s.alive));
 
-    let text = if app.confirm_cleanup_all || confirming_single {
+    let text = if app.filter_mode {
+        format!(" / {}█", app.filter_text)
+    } else if app.confirm_cleanup_all || confirming_single {
         " Enter confirm  Esc cancel".into()
     } else if let Some((ref msg, _)) = app.status_msg {
         msg.clone()
     } else {
+        let filter_hint = if !app.filter_text.is_empty() {
+            format!("  [filter: {}]", app.filter_text)
+        } else {
+            String::new()
+        };
         match &app.view {
             View::List => {
                 let on_dead_seg = matches!(
                     app.selected_item(),
                     Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
                 );
-                match (on_dead_seg, has_any_dead) {
-                    (true, _) => " ↑↓ navigate  Enter open  d destroy  D destroy all  ? help  q quit".into(),
-                    (false, true) => " ↑↓ navigate  Enter open  D destroy all  ? help  q quit".into(),
-                    _ => " ↑↓ navigate  Enter open  ? help  q quit".into(),
-                }
+                let base = match (on_dead_seg, has_any_dead) {
+                    (true, _) => " ↑↓ navigate  Enter open  d destroy  D destroy all  / filter  s sort  ? help  q quit",
+                    (false, true) => " ↑↓ navigate  Enter open  D destroy all  / filter  s sort  ? help  q quit",
+                    _ => " ↑↓ navigate  Enter open  / filter  s sort  ? help  q quit",
+                };
+                format!("{}{}", base, filter_hint)
             }
             View::Detail(_) => {
                 let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
-                match (!alive, has_any_dead) {
-                    (true, _) => " Esc back  d destroy  D destroy all  ? help  q quit".into(),
-                    (false, true) => " Esc back  D destroy all  ? help  q quit".into(),
-                    _ => " Esc back  ? help  q quit".into(),
-                }
+                let base = match (!alive, has_any_dead) {
+                    (true, _) => " Esc back  d destroy  D destroy all  ? help  q quit",
+                    (false, true) => " Esc back  D destroy all  ? help  q quit",
+                    _ => " Esc back  ? help  q quit",
+                };
+                base.into()
             }
         }
     };
 
-    let style = if app.status_msg.is_some() {
+    let style = if app.filter_mode || app.status_msg.is_some() {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -451,39 +472,63 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  ↑ / k    ", Style::default().fg(Color::Yellow)),
+            Span::styled("  ↑ / k      ", Style::default().fg(Color::Yellow)),
             Span::raw("Move up"),
         ]),
         Line::from(vec![
-            Span::styled("  ↓ / j    ", Style::default().fg(Color::Yellow)),
+            Span::styled("  ↓ / j      ", Style::default().fg(Color::Yellow)),
             Span::raw("Move down"),
         ]),
         Line::from(vec![
-            Span::styled("  Enter    ", Style::default().fg(Color::Yellow)),
+            Span::styled("  Home       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Jump to first"),
+        ]),
+        Line::from(vec![
+            Span::styled("  End        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Jump to last"),
+        ]),
+        Line::from(vec![
+            Span::styled("  PgUp       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Page up (10 rows)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  PgDn       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Page down (10 rows)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter      ", Style::default().fg(Color::Yellow)),
             Span::raw("Open segment / toggle app group"),
         ]),
         Line::from(vec![
-            Span::styled("  Esc      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Back / close popup / quit"),
+            Span::styled("  Esc        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Back / clear filter / quit"),
         ]),
         Line::from(vec![
-            Span::styled("  d        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  /          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Filter segments by name"),
+        ]),
+        Line::from(vec![
+            Span::styled("  s          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Cycle sort (name → kind → status)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  d          ", Style::default().fg(Color::Yellow)),
             Span::raw("Destroy dead segment"),
         ]),
         Line::from(vec![
-            Span::styled("  D        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  D          ", Style::default().fg(Color::Yellow)),
             Span::raw("Destroy all dead segments"),
         ]),
         Line::from(vec![
-            Span::styled("  r        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  r          ", Style::default().fg(Color::Yellow)),
             Span::raw("Force refresh"),
         ]),
         Line::from(vec![
-            Span::styled("  ?        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  ?          ", Style::default().fg(Color::Yellow)),
             Span::raw("Toggle this help"),
         ]),
         Line::from(vec![
-            Span::styled("  q        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  q          ", Style::default().fg(Color::Yellow)),
             Span::raw("Quit"),
         ]),
         Line::from(""),
@@ -493,7 +538,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         )),
     ];
 
-    let popup_area = centered_rect(46, lines.len() as u16 + 2, area);
+    let popup_area = centered_rect(52, lines.len() as u16 + 2, area);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -511,6 +556,21 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

@@ -5,8 +5,12 @@
 //! entries with queue stats, poison detection, and per-PID process info, and
 //! exposes helpers for cleanup and liveness checks.
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crossterm::style::Stylize;
+use serde::Serialize;
 
 use flux_communication::array::ArrayHeader;
 use flux_communication::queue::QueueHeader;
@@ -113,6 +117,7 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
         return Ok(());
     }
 
+    let color = std::io::stdout().is_terminal();
     let apps = app_names(registry);
     println!("Found {} segments across {} apps\n", entries.len(), apps.len());
 
@@ -134,7 +139,7 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
                 "💀"
             };
             let pids = format_pids(entry);
-            println!(
+            let status_text = format!(
                 "  {} {:14} {:>24}  elem={}B  cap={}  {}",
                 status,
                 entry.kind,
@@ -143,6 +148,17 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
                 entry.capacity,
                 pids,
             );
+            if color {
+                if poison.is_some() {
+                    println!("{}", status_text.yellow());
+                } else if alive {
+                    println!("{}", status_text.green());
+                } else {
+                    println!("{}", status_text.red());
+                }
+            } else {
+                println!("{status_text}");
+            }
             if let Some(ref pi) = poison {
                 println!(
                     "    ☠ POISONED: {}/{} slots (first at slot {})",
@@ -169,6 +185,152 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
         println!();
     }
     Ok(())
+}
+
+// ─── JSON output ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SegmentJson {
+    app: String,
+    kind: String,
+    type_name: String,
+    elem_size: usize,
+    capacity: usize,
+    flink: String,
+    pids: Vec<u32>,
+    alive: bool,
+    poisoned: bool,
+}
+
+impl SegmentJson {
+    fn from_entry(entry: &ShmemEntry) -> Self {
+        let alive = entry.pids.any_alive();
+        let poisoned = check_poison(entry).is_some();
+        Self {
+            app: entry.app_name.as_str().to_string(),
+            kind: format!("{}", entry.kind),
+            type_name: entry.type_name.as_str().to_string(),
+            elem_size: entry.elem_size,
+            capacity: entry.capacity,
+            flink: entry.flink.as_str().to_string(),
+            pids: entry.pids.active_pids(),
+            alive,
+            poisoned,
+        }
+    }
+}
+
+pub fn list_json(base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(registry) = open_registry(base_dir) else {
+        println!("[]");
+        return Ok(());
+    };
+
+    let segments: Vec<SegmentJson> = registry
+        .entries()
+        .iter()
+        .filter(|e| entry_visible(e))
+        .map(SegmentJson::from_entry)
+        .collect();
+
+    println!("{}", serde_json::to_string_pretty(&segments)?);
+    Ok(())
+}
+
+// ─── Stats ──────────────────────────────────────────────────────────────────
+
+pub fn stats(base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(registry) = open_registry(base_dir) else {
+        println!("No registry found");
+        return Ok(());
+    };
+
+    let entries: Vec<&ShmemEntry> = registry.entries().iter().filter(|e| entry_visible(e)).collect();
+    let apps = app_names(registry);
+
+    let total = entries.len();
+    let alive = entries.iter().filter(|e| e.pids.any_alive()).count();
+    let dead = total - alive;
+    let poisoned = entries.iter().filter(|e| check_poison(e).is_some()).count();
+
+    let mut queues = 0usize;
+    let mut arrays = 0usize;
+    let mut data = 0usize;
+    let mut unknown = 0usize;
+    let mut total_capacity: u64 = 0;
+    let mut total_elem_bytes: u64 = 0;
+
+    for entry in &entries {
+        match entry.kind {
+            ShmemKind::Queue => queues += 1,
+            ShmemKind::SeqlockArray => arrays += 1,
+            ShmemKind::Data => data += 1,
+            ShmemKind::Unknown => unknown += 1,
+        }
+        total_capacity += entry.capacity as u64;
+        total_elem_bytes += (entry.elem_size as u64) * (entry.capacity as u64);
+    }
+
+    let color = std::io::stdout().is_terminal();
+
+    let title = "flux shmem stats";
+    if color {
+        println!("{}", title.bold().underlined());
+    } else {
+        println!("{title}");
+    }
+    println!();
+
+    println!("  Apps:             {}", apps.len());
+    println!("  Total segments:   {total}");
+
+    if color {
+        println!("  Alive:            {}", format!("{alive}").green());
+        println!("  Dead:             {}", format!("{dead}").red());
+        if poisoned > 0 {
+            println!("  Poisoned:         {}", format!("{poisoned}").yellow());
+        } else {
+            println!("  Poisoned:         {poisoned}");
+        }
+    } else {
+        println!("  Alive:            {alive}");
+        println!("  Dead:             {dead}");
+        println!("  Poisoned:         {poisoned}");
+    }
+
+    println!();
+    println!("  By kind:");
+    println!("    Queue:          {queues}");
+    println!("    SeqlockArray:   {arrays}");
+    println!("    Data:           {data}");
+    if unknown > 0 {
+        println!("    Unknown:        {unknown}");
+    }
+
+    println!();
+    println!("  Total slots:      {total_capacity}");
+    println!(
+        "  Estimated memory: {}",
+        format_bytes(total_elem_bytes)
+    );
+
+    Ok(())
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 pub fn inspect(
@@ -286,7 +448,12 @@ pub fn clean(
         }
     }
 
-    if !force {
+    if force {
+        let compacted = registry.compact();
+        if compacted > 0 {
+            println!("  Compacted registry: removed {compacted} empty slots");
+        }
+    } else {
         println!("\nDry run. Use --force to actually remove flink files.");
     }
     Ok(())
@@ -424,6 +591,21 @@ fn scan_seqlock_slots(buf_base: *mut u8, n_slots: usize, elsize: usize) -> Optio
     } else {
         None
     }
+}
+
+// ─── Backing file size ──────────────────────────────────────────────────────
+
+/// Return the size (in bytes) of the shared memory backing file.
+///
+/// Opens the shmem read-only via its flink and returns `Shmem::len()`.
+/// Returns `None` if the shmem cannot be opened. The shmem is deliberately
+/// leaked (via `mem::forget`) to avoid unmapping memory that other processes
+/// may still be using.
+pub fn backing_file_size(flink: &str) -> Option<u64> {
+    let shmem = ShmemConf::new().flink(flink).open().ok()?;
+    let size = shmem.len() as u64;
+    std::mem::forget(shmem);
+    Some(size)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

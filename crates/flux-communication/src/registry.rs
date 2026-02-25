@@ -219,6 +219,18 @@ impl ShmemEntry {
     }
 }
 
+/// Snapshot of registry statistics produced by [`ShmemRegistry::stats()`].
+#[derive(Debug, Clone, Default)]
+pub struct RegistryStats {
+    pub total: usize,
+    pub empty: usize,
+    /// Entry counts indexed by `ShmemKind as u8`.
+    pub by_kind: [usize; 4],
+    pub total_pids: usize,
+    pub alive: usize,
+    pub dead: usize,
+}
+
 /// Global shared memory registry. One per `base_dir`, shared across all apps.
 /// Flink: `<base_dir>/flux/_shmem_registry`.
 ///
@@ -419,6 +431,92 @@ impl ShmemRegistry {
 
     pub fn entry_count(&self) -> u32 {
         self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32)
+    }
+
+    /// Return a reference to the entry at `idx`, or `None` if out of bounds.
+    pub fn entry_by_index(&self, idx: u32) -> Option<&ShmemEntry> {
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+        if idx < count {
+            Some(&self.entries[idx as usize])
+        } else {
+            None
+        }
+    }
+
+    /// Remove empty (kind == Unknown) entries by sliding non-empty entries
+    /// toward the front and updating the count.
+    ///
+    /// # Safety contract
+    ///
+    /// This is **not** safe to call concurrently with [`register()`]. It is
+    /// intended for offline maintenance (e.g. after a `clean --force`).
+    pub fn compact(&self) -> usize {
+        let old_count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+        let mut write_idx: u32 = 0;
+
+        for read_idx in 0..old_count {
+            if !self.entries[read_idx as usize].is_empty() {
+                if write_idx != read_idx {
+                    // Clone the entry and write it to the compacted position
+                    // using volatile writes, matching the pattern in register().
+                    let entry = self.entries[read_idx as usize].clone();
+                    unsafe {
+                        let base = self as *const Self as *mut u8;
+                        let offset = std::mem::offset_of!(Self, entries)
+                            + write_idx as usize * std::mem::size_of::<ShmemEntry>();
+                        let slot = base.add(offset) as *mut ShmemEntry;
+                        std::ptr::write_volatile(slot, entry);
+                    }
+                    fence(Ordering::Release);
+
+                    // Zero out the old slot to mark it empty.
+                    unsafe {
+                        let base = self as *const Self as *mut u8;
+                        let offset = std::mem::offset_of!(Self, entries)
+                            + read_idx as usize * std::mem::size_of::<ShmemEntry>();
+                        let slot = base.add(offset) as *mut ShmemEntry;
+                        std::ptr::write_volatile(slot, ShmemEntry::default());
+                    }
+                    fence(Ordering::Release);
+                }
+                write_idx += 1;
+            }
+        }
+
+        self.count.store(write_idx, Ordering::Release);
+        (old_count - write_idx) as usize
+    }
+
+    /// Compute statistics about the current registry contents.
+    ///
+    /// Returns a [`RegistryStats`] snapshot.
+    pub fn stats(&self) -> RegistryStats {
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32) as usize;
+        let mut stats = RegistryStats { total: count, ..Default::default() };
+
+        for i in 0..count {
+            let entry = &self.entries[i];
+            if entry.is_empty() {
+                stats.empty += 1;
+                continue;
+            }
+
+            let kind_idx = entry.kind as u8 as usize;
+            if kind_idx < stats.by_kind.len() {
+                stats.by_kind[kind_idx] += 1;
+            }
+
+            let pid_count = entry.pids.count();
+            stats.total_pids += pid_count;
+
+            if entry.pids.any_alive() {
+                stats.alive += 1;
+            } else {
+                stats.dead += 1;
+            }
+        }
+
+        stats
     }
 
     pub fn sweep_dead_pids(&self) -> usize {

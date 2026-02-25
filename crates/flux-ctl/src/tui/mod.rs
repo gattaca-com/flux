@@ -21,6 +21,32 @@ fn handle_key(app: &mut app::App, key: KeyEvent) -> bool {
 
     if app.show_help {
         app.show_help = false;
+        return false;
+    }
+
+    // ── Filter mode: capture typed characters ──────────────────────────
+    if app.filter_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.filter_mode = false;
+                app.filter_text.clear();
+                app.refresh();
+            }
+            KeyCode::Enter => {
+                app.filter_mode = false;
+                // keep filter_text active
+            }
+            KeyCode::Backspace => {
+                app.filter_text.pop();
+                app.refresh();
+            }
+            KeyCode::Char(c) => {
+                app.filter_text.push(c);
+                app.refresh();
+            }
+            _ => {}
+        }
+        return false;
     }
 
     let confirming = match &app.view {
@@ -43,14 +69,29 @@ fn handle_key(app: &mut app::App, key: KeyEvent) -> bool {
 
     match &app.view {
         View::List => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if !app.filter_text.is_empty() {
+                    app.filter_text.clear();
+                    app.refresh();
+                } else {
+                    return true;
+                }
+            }
             KeyCode::Char('?') => app.toggle_help(),
             KeyCode::Up | KeyCode::Char('k') => app.previous(),
             KeyCode::Down | KeyCode::Char('j') => app.next(),
+            KeyCode::Home => app.home(),
+            KeyCode::End => app.end(),
+            KeyCode::PageUp => app.page_up(),
+            KeyCode::PageDown => app.page_down(),
             KeyCode::Enter => app.enter(),
             KeyCode::Char('d') => app.request_cleanup(),
             KeyCode::Char('D') => app.request_cleanup_all(),
             KeyCode::Char('r') => app.refresh(),
+            KeyCode::Char('/') => {
+                app.filter_mode = true;
+            }
+            KeyCode::Char('s') => app.toggle_sort(),
             _ => {}
         },
         View::Detail(_) => match key.code {
@@ -62,6 +103,10 @@ fn handle_key(app: &mut app::App, key: KeyEvent) -> bool {
             KeyCode::Char('r') => app.refresh(),
             KeyCode::Up | KeyCode::Char('k') => app.previous(),
             KeyCode::Down | KeyCode::Char('j') => app.next(),
+            KeyCode::Home => app.home(),
+            KeyCode::End => app.end(),
+            KeyCode::PageUp => app.page_up(),
+            KeyCode::PageDown => app.page_down(),
             _ => {}
         },
     }

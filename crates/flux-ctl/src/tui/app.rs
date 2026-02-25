@@ -8,6 +8,31 @@ use flux_communication::registry::{ShmemEntry, ShmemKind, cleanup_flink};
 
 use crate::discovery;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortMode {
+    Name,
+    Kind,
+    Status,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Kind,
+            SortMode::Kind => SortMode::Status,
+            SortMode::Status => SortMode::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "name",
+            SortMode::Kind => "kind",
+            SortMode::Status => "status",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SegmentInfo {
     pub entry: ShmemEntry,
@@ -58,6 +83,12 @@ pub struct App {
     pub confirm_cleanup_all: bool,
     /// Dead flinks captured on the first press of "cleanup all", used on confirm.
     pub pending_cleanup_flinks: Option<Vec<String>>,
+    /// Whether the interactive filter input is active.
+    pub filter_mode: bool,
+    /// Current filter text typed by the user.
+    pub filter_text: String,
+    /// Current sort order for segments within each group.
+    pub sort_mode: SortMode,
 }
 
 fn status_msg_duration() -> Duration {
@@ -83,6 +114,9 @@ impl App {
             confirm_cleanup: false,
             confirm_cleanup_all: false,
             pending_cleanup_flinks: None,
+            filter_mode: false,
+            filter_text: String::new(),
+            sort_mode: SortMode::Name,
         };
         app.refresh();
         app
@@ -102,6 +136,9 @@ impl App {
             confirm_cleanup: false,
             confirm_cleanup_all: false,
             pending_cleanup_flinks: None,
+            filter_mode: false,
+            filter_text: String::new(),
+            sort_mode: SortMode::Name,
         };
         app.recount_rows();
         app
@@ -121,10 +158,17 @@ impl App {
             {
                 continue;
             }
+            let filter_lower = self.filter_text.to_lowercase();
             let segments: Vec<SegmentInfo> = entries
                 .iter()
                 .filter(|e| e.app_name.as_str() == name)
                 .filter(|e| discovery::entry_visible(e))
+                .filter(|e| {
+                    filter_lower.is_empty()
+                        || e.type_name.as_str().to_lowercase().contains(&filter_lower)
+                        || e.app_name.as_str().to_lowercase().contains(&filter_lower)
+                        || format!("{}", e.kind).to_lowercase().contains(&filter_lower)
+                })
                 .map(|e| {
                     let alive = e.pids.any_alive();
                     let pid_count = e.pids.count();
@@ -143,6 +187,38 @@ impl App {
                 continue;
             }
             self.groups.push(AppGroup { name, segments, expanded: true });
+        }
+
+        // Sort segments within each group according to the current sort mode.
+        let sort_mode = self.sort_mode;
+        for group in &mut self.groups {
+            match sort_mode {
+                SortMode::Name => {
+                    group.segments.sort_by(|a, b| {
+                        a.entry.type_name.as_str().cmp(b.entry.type_name.as_str())
+                    });
+                }
+                SortMode::Kind => {
+                    group.segments.sort_by(|a, b| {
+                        format!("{}", a.entry.kind).cmp(&format!("{}", b.entry.kind))
+                    });
+                }
+                SortMode::Status => {
+                    group.segments.sort_by(|a, b| {
+                        // alive first, then dead, then poisoned
+                        fn rank(s: &SegmentInfo) -> u8 {
+                            if s.poison.is_some() {
+                                2
+                            } else if s.alive {
+                                0
+                            } else {
+                                1
+                            }
+                        }
+                        rank(a).cmp(&rank(b))
+                    });
+                }
+            }
         }
 
         self.recount_rows();
@@ -210,6 +286,60 @@ impl App {
                 detail.selected_pid = detail.selected_pid.saturating_sub(1);
             }
         }
+    }
+
+    pub fn home(&mut self) {
+        match &mut self.view {
+            View::List => self.selected = 0,
+            View::Detail(detail) => detail.selected_pid = 0,
+        }
+    }
+
+    pub fn end(&mut self) {
+        match &mut self.view {
+            View::List => {
+                if self.total_rows > 0 {
+                    self.selected = self.total_rows - 1;
+                }
+            }
+            View::Detail(detail) => {
+                if !detail.pids.is_empty() {
+                    detail.selected_pid = detail.pids.len() - 1;
+                }
+            }
+        }
+    }
+
+    pub fn page_up(&mut self) {
+        match &mut self.view {
+            View::List => {
+                self.selected = self.selected.saturating_sub(10);
+            }
+            View::Detail(detail) => {
+                detail.selected_pid = detail.selected_pid.saturating_sub(10);
+            }
+        }
+    }
+
+    pub fn page_down(&mut self) {
+        match &mut self.view {
+            View::List => {
+                if self.total_rows > 0 {
+                    self.selected = (self.selected + 10).min(self.total_rows.saturating_sub(1));
+                }
+            }
+            View::Detail(detail) => {
+                if !detail.pids.is_empty() {
+                    detail.selected_pid =
+                        (detail.selected_pid + 10).min(detail.pids.len().saturating_sub(1));
+                }
+            }
+        }
+    }
+
+    pub fn toggle_sort(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.refresh();
     }
 
     pub fn toggle_help(&mut self) {

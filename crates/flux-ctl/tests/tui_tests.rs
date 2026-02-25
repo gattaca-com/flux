@@ -1,8 +1,8 @@
 use flux_communication::registry::{
-    ShmemRegistry, REGISTRY_FLINK_NAME, data_entry, queue_entry,
+    ShmemKind, ShmemRegistry, REGISTRY_FLINK_NAME, data_entry, queue_entry,
 };
 use flux_ctl::discovery;
-use flux_ctl::tui::app::{App, AppGroup, SegmentInfo, View};
+use flux_ctl::tui::app::{App, AppGroup, SegmentInfo, SortMode, View};
 use flux_ctl::tui::render;
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use shared_memory::ShmemConf;
@@ -1252,4 +1252,359 @@ fn populate_cooldown_skips_repeated_scans() {
     // Cleanup
     cleanup_raw_shmem(base, "coolapp", "data", "CoolData");
     ShmemRegistry::destroy(base);
+}
+
+// ─── Phase 6: New tests for filter, sort, navigation, stress, compact, entry_by_index ──
+
+#[test]
+fn filter_narrows_visible_segments() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("myapp", "Quote", "/dev/shm/test_fn_q", 24, 64));
+    registry.register(queue_entry("myapp", "Trade", "/dev/shm/test_fn_t", 24, 64));
+    registry.register(data_entry("myapp", "Order", "/dev/shm/test_fn_o", 128));
+
+    // No filter: all three segments should appear
+    let mut app = App::new(base, None);
+    assert_eq!(app.groups.len(), 1);
+    assert_eq!(app.groups[0].segments.len(), 3);
+
+    // Set filter_text and refresh — only "Quote" should survive
+    app.filter_text = "quo".into();
+    app.refresh();
+    assert_eq!(app.groups.len(), 1, "app group should still exist");
+    assert_eq!(
+        app.groups[0].segments.len(),
+        1,
+        "only matching segment should remain"
+    );
+    assert_eq!(app.groups[0].segments[0].entry.type_name.as_str(), "Quote");
+
+    // Filter that matches nothing: groups should be empty
+    app.filter_text = "nonexistent".into();
+    app.refresh();
+    assert_eq!(app.groups.len(), 0, "no groups when filter matches nothing");
+
+    // Empty filter restores all segments
+    app.filter_text.clear();
+    app.refresh();
+    assert_eq!(app.groups[0].segments.len(), 3);
+}
+
+#[test]
+fn sort_mode_cycles_through_all_variants() {
+    // Verify the enum cycling: Name → Kind → Status → Name
+    assert_eq!(SortMode::Name.next(), SortMode::Kind);
+    assert_eq!(SortMode::Kind.next(), SortMode::Status);
+    assert_eq!(SortMode::Status.next(), SortMode::Name);
+
+    // Verify labels
+    assert_eq!(SortMode::Name.label(), "name");
+    assert_eq!(SortMode::Kind.label(), "kind");
+    assert_eq!(SortMode::Status.label(), "status");
+
+    // Verify toggle_sort() on a synthetic App updates sort_mode
+    // (refresh() will be a no-op since base_dir is empty)
+    let mut app = App::with_groups(vec![]);
+    assert_eq!(app.sort_mode, SortMode::Name);
+    app.sort_mode = app.sort_mode.next();
+    assert_eq!(app.sort_mode, SortMode::Kind);
+    app.sort_mode = app.sort_mode.next();
+    assert_eq!(app.sort_mode, SortMode::Status);
+    app.sort_mode = app.sort_mode.next();
+    assert_eq!(app.sort_mode, SortMode::Name);
+}
+
+#[test]
+fn home_end_navigation() {
+    let groups = vec![
+        AppGroup {
+            name: "a".into(),
+            segments: vec![
+                SegmentInfo {
+                    entry: queue_entry("a", "S1", "/dev/shm/he1", 8, 16),
+                    alive: true,
+                    pid_count: 1,
+                    queue_writes: None,
+                    poison: None,
+                },
+                SegmentInfo {
+                    entry: queue_entry("a", "S2", "/dev/shm/he2", 8, 16),
+                    alive: true,
+                    pid_count: 1,
+                    queue_writes: None,
+                    poison: None,
+                },
+            ],
+            expanded: true,
+        },
+        AppGroup {
+            name: "b".into(),
+            segments: vec![SegmentInfo {
+                entry: data_entry("b", "S3", "/dev/shm/he3", 64),
+                alive: true,
+                pid_count: 1,
+                queue_writes: None,
+                poison: None,
+            }],
+            expanded: true,
+        },
+    ];
+
+    let mut app = App::with_groups(groups);
+    // total_rows = 2 headers + 3 segments = 5
+    assert_eq!(app.total_rows, 5);
+    assert_eq!(app.selected, 0);
+
+    // End → last row
+    app.end();
+    assert_eq!(app.selected, 4);
+
+    // Home → first row
+    app.home();
+    assert_eq!(app.selected, 0);
+
+    // End on empty app is safe
+    let mut empty = App::with_groups(vec![]);
+    empty.end();
+    assert_eq!(empty.selected, 0);
+    empty.home();
+    assert_eq!(empty.selected, 0);
+}
+
+#[test]
+fn page_up_page_down_navigation() {
+    // Build 25 expanded groups with 1 segment each → 50 total rows
+    let groups: Vec<AppGroup> = (0..25)
+        .map(|i| AppGroup {
+            name: format!("app{i:02}"),
+            segments: vec![SegmentInfo {
+                entry: queue_entry(
+                    &format!("app{i:02}"),
+                    &format!("Seg{i:02}"),
+                    &format!("/dev/shm/test_pp_{i}"),
+                    8,
+                    16,
+                ),
+                alive: true,
+                pid_count: 1,
+                queue_writes: None,
+                poison: None,
+            }],
+            expanded: true,
+        })
+        .collect();
+
+    let mut app = App::with_groups(groups);
+    assert_eq!(app.total_rows, 50); // 25 headers + 25 segments
+    assert_eq!(app.selected, 0);
+
+    // PageDown jumps by 10
+    app.page_down();
+    assert_eq!(app.selected, 10);
+
+    app.page_down();
+    assert_eq!(app.selected, 20);
+
+    // PageUp jumps back by 10
+    app.page_up();
+    assert_eq!(app.selected, 10);
+
+    app.page_up();
+    assert_eq!(app.selected, 0);
+
+    // PageUp at 0 stays at 0 (no underflow)
+    app.page_up();
+    assert_eq!(app.selected, 0);
+
+    // Jump to end, then PageDown should clamp
+    app.end();
+    assert_eq!(app.selected, 49);
+    app.page_down();
+    assert_eq!(app.selected, 49);
+}
+
+#[test]
+fn stress_test_many_entries() {
+    // 50 groups × 5 segments each = 300 total rows (50 headers + 250 segments)
+    let groups: Vec<AppGroup> = (0..50)
+        .map(|gi| AppGroup {
+            name: format!("app{gi:03}"),
+            segments: (0..5)
+                .map(|si| SegmentInfo {
+                    entry: queue_entry(
+                        &format!("app{gi:03}"),
+                        &format!("Seg{si}"),
+                        &format!("/dev/shm/test_stress_{gi}_{si}"),
+                        8,
+                        16,
+                    ),
+                    alive: true,
+                    pid_count: 1,
+                    queue_writes: Some((gi * 5 + si) as usize),
+                    poison: None,
+                })
+                .collect(),
+            expanded: true,
+        })
+        .collect();
+
+    let mut app = App::with_groups(groups);
+    assert_eq!(app.total_rows, 300);
+
+    // End navigates to last row
+    app.end();
+    assert_eq!(app.selected, 299);
+
+    // Home navigates back to first
+    app.home();
+    assert_eq!(app.selected, 0);
+
+    // Render should not panic even with many rows
+    let buf = render_to_buffer(&mut app, 120, 40);
+    let text = buffer_text(&buf);
+    assert!(text.contains("app000"), "first app should render:\n{text}");
+
+    // Navigate to end and render
+    app.end();
+    let buf = render_to_buffer(&mut app, 120, 40);
+    let _text = buffer_text(&buf);
+    // Just verify no panic — the last group may or may not be visible
+    // depending on scroll, but it should not crash.
+}
+
+#[test]
+fn registry_compact_removes_empty_slots() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("a", "First", "/dev/shm/test_compact_1", 8, 16));
+    registry.register(queue_entry("b", "Middle", "/dev/shm/test_compact_2", 8, 16));
+    registry.register(queue_entry("c", "Last", "/dev/shm/test_compact_3", 8, 16));
+
+    assert_eq!(registry.entry_count(), 3);
+
+    // Corrupt the middle entry by setting its kind to ShmemKind::Unknown (value 0).
+    // ShmemEntry is repr(C, align(64)) and `kind` (ShmemKind, repr(u8)) is the first field.
+    // We use addr_of! on the entries slice element to avoid going through &mut.
+    let entries = registry.entries();
+    let kind_ptr = std::ptr::addr_of!(entries[1].kind) as *mut u8;
+    unsafe {
+        kind_ptr.write_volatile(ShmemKind::Unknown as u8);
+    }
+    // Sanity check: the middle entry should now appear empty.
+    assert!(entries[1].is_empty(), "middle entry should be marked empty");
+
+    // Compact should remove the empty slot and shift entries.
+    let removed = registry.compact();
+    assert_eq!(removed, 1, "one empty entry should have been removed");
+    assert_eq!(registry.entry_count(), 2);
+
+    // Verify remaining entries are the first and last.
+    let entries = registry.entries();
+    assert_eq!(entries[0].type_name.as_str(), "First");
+    assert_eq!(entries[1].type_name.as_str(), "Last");
+}
+
+#[test]
+fn registry_entry_by_index_bounds_check() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("x", "A", "/dev/shm/test_ebi_a", 8, 16));
+    registry.register(data_entry("x", "B", "/dev/shm/test_ebi_b", 64));
+
+    assert_eq!(registry.entry_count(), 2);
+
+    // Valid indices
+    let e0 = registry.entry_by_index(0);
+    assert!(e0.is_some(), "index 0 should return Some");
+    assert_eq!(e0.unwrap().type_name.as_str(), "A");
+
+    let e1 = registry.entry_by_index(1);
+    assert!(e1.is_some(), "index 1 should return Some");
+    assert_eq!(e1.unwrap().type_name.as_str(), "B");
+
+    // Out-of-bounds indices
+    assert!(
+        registry.entry_by_index(2).is_none(),
+        "index 2 should be None"
+    );
+    assert!(
+        registry.entry_by_index(u32::MAX).is_none(),
+        "u32::MAX should be None"
+    );
+
+    // After compacting (no-op here since no empty), bounds still hold
+    let removed = registry.compact();
+    assert_eq!(removed, 0);
+    assert!(registry.entry_by_index(0).is_some());
+    assert!(registry.entry_by_index(2).is_none());
+}
+
+#[test]
+fn filter_mode_input_and_clear() {
+    // Test that filter_mode, filter_text state management works correctly.
+    let mut app = App::with_groups(vec![
+        AppGroup {
+            name: "testapp".into(),
+            segments: vec![
+                SegmentInfo {
+                    entry: queue_entry("testapp", "Alpha", "/dev/shm/test_fm_a", 8, 16),
+                    alive: true,
+                    pid_count: 1,
+                    queue_writes: None,
+                    poison: None,
+                },
+                SegmentInfo {
+                    entry: data_entry("testapp", "Beta", "/dev/shm/test_fm_b", 64),
+                    alive: true,
+                    pid_count: 1,
+                    queue_writes: None,
+                    poison: None,
+                },
+            ],
+            expanded: true,
+        },
+    ]);
+
+    // Initially: no filter
+    assert!(!app.filter_mode);
+    assert!(app.filter_text.is_empty());
+    assert_eq!(app.sort_mode, SortMode::Name);
+
+    // Activate filter mode
+    app.filter_mode = true;
+    assert!(app.filter_mode);
+
+    // Type characters
+    app.filter_text.push('a');
+    app.filter_text.push('l');
+    assert_eq!(app.filter_text, "al");
+
+    // Backspace
+    app.filter_text.pop();
+    assert_eq!(app.filter_text, "a");
+
+    // Clear filter via Esc (simulated)
+    app.filter_mode = false;
+    app.filter_text.clear();
+    assert!(!app.filter_mode);
+    assert!(app.filter_text.is_empty());
+
+    // Render should still work fine after filter manipulations
+    let buf = render_to_buffer(&mut app, 100, 15);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("Alpha"),
+        "Alpha should be visible after clearing filter:\n{text}"
+    );
+    assert!(
+        text.contains("Beta"),
+        "Beta should be visible after clearing filter:\n{text}"
+    );
 }

@@ -23,6 +23,8 @@ clap.workspace = true
 crossterm.workspace = true
 humantime = "2"
 ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 shared_memory.workspace = true
 
 [dev-dependencies]
