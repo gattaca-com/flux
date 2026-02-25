@@ -12,10 +12,8 @@ pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {
     ShmemRegistry::open(&registry_path)
 }
 
-/// Check if a PID is alive (Linux)
-pub fn is_pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
+// Re-export for convenience (used by tests and TUI)
+pub use flux_communication::registry::is_pid_alive;
 
 /// Get unique sorted app names from registry entries
 pub fn app_names(registry: &ShmemRegistry) -> Vec<String> {
@@ -53,16 +51,17 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
             entries.iter().filter(|e| e.app_name.as_str() == app).collect();
         println!("📦 {} ({} segments)", app, app_entries.len());
         for entry in &app_entries {
-            let alive = is_pid_alive(entry.pid);
+            let alive = entry.pids.any_alive();
             let status = if alive { "🟢" } else { "💀" };
+            let pids = format_pids(entry);
             println!(
-                "  {} {:14} {:>24}  elem={}B  cap={}  pid={}",
+                "  {} {:14} {:>24}  elem={}B  cap={}  {}",
                 status,
                 entry.kind,
                 entry.type_name.as_str(),
                 entry.elem_size,
                 entry.capacity,
-                entry.pid,
+                pids,
             );
             if verbose {
                 println!("    flink: {}", entry.flink.as_str());
@@ -111,15 +110,24 @@ pub fn inspect(
             }
         }
 
-        let alive = is_pid_alive(entry.pid);
+        let alive = entry.pids.any_alive();
         println!("─── {} ───", entry.type_name.as_str());
         println!("  App:       {}", entry.app_name.as_str());
         println!("  Kind:      {}", entry.kind);
-        println!(
-            "  PID:       {} {}",
-            entry.pid,
-            if alive { "(alive)" } else { "(dead)" }
-        );
+        let active = entry.pids.active_pids();
+        if active.len() == 1 {
+            println!(
+                "  PID:       {} {}",
+                active[0],
+                if alive { "(alive)" } else { "(dead)" }
+            );
+        } else {
+            println!("  PIDs:      {} attached", active.len());
+            for &pid in &active {
+                let s = if is_pid_alive(pid) { "alive" } else { "dead" };
+                println!("             {} ({})", pid, s);
+            }
+        }
         println!("  Elem size: {} bytes", entry.elem_size);
         println!("  Capacity:  {}", entry.capacity);
         println!("  Flink:     {}", entry.flink.as_str());
@@ -164,7 +172,7 @@ pub fn clean(
                 continue;
             }
         }
-        if !is_pid_alive(entry.pid) {
+        if !entry.pids.any_alive() {
             stale.push(entry);
         }
     }
@@ -176,11 +184,12 @@ pub fn clean(
 
     println!("Found {} stale segments:", stale.len());
     for entry in &stale {
+        let pids = format_pids(entry);
         println!(
-            "  💀 {} {} (pid={})",
+            "  💀 {} {} ({})",
             entry.app_name.as_str(),
             entry.type_name.as_str(),
-            entry.pid
+            pids,
         );
         if force {
             let flink_path = Path::new(entry.flink.as_str());
@@ -193,4 +202,17 @@ pub fn clean(
         println!("\nDry run. Use --force to actually remove flink files.");
     }
     Ok(())
+}
+
+/// Format the PID(s) attached to an entry for display.
+fn format_pids(entry: &ShmemEntry) -> String {
+    let active = entry.pids.active_pids();
+    match active.len() {
+        0 => "pid=none".into(),
+        1 => format!("pid={}", active[0]),
+        n => {
+            let list: Vec<String> = active.iter().map(|p| p.to_string()).collect();
+            format!("pids({n})=[{}]", list.join(","))
+        }
+    }
 }

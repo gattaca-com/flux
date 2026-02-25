@@ -7,7 +7,7 @@ use flux::{
     communication::ShmemData,
     communication::registry::ShmemRegistry,
     persistence::Persistable,
-    spine::{FluxSpine, SpineAdapter, SpineQueue},
+    spine::{SpineAdapter, SpineQueue},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
 use flux_timing::Duration;

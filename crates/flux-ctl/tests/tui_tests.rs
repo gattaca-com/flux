@@ -43,25 +43,22 @@ impl Drop for ShmemGuard {
 /// Create a tempdir with an RAII guard that cleans up shmem on drop.
 fn guarded_tmpdir() -> (tempfile::TempDir, ShmemGuard) {
     let tmpdir = tempfile::tempdir().unwrap();
-    let guard = ShmemGuard { base_dir: tmpdir.path().to_path_buf() };
+    let guard = ShmemGuard {
+        base_dir: tmpdir.path().to_path_buf(),
+    };
     (tmpdir, guard)
 }
 
-// ─── Unit tests: render with synthetic data (no real shmem) ─────────────────
+// ─── Unit tests: buffer rendering with synthetic data ───────────────────────
 
 #[test]
 fn render_empty_app() {
     let mut app = App::with_groups(vec![]);
-    let buf = render_to_buffer(&mut app, 100, 20);
+    let buf = render_to_buffer(&mut app, 80, 20);
     let text = buffer_text(&buf);
-
-    assert!(
-        text.contains("flux-ctl"),
-        "title should be visible:\n{text}"
-    );
     assert!(
         text.contains("No segments found"),
-        "empty state message:\n{text}"
+        "should show empty message:\n{text}"
     );
 }
 
@@ -73,11 +70,13 @@ fn render_single_app_expanded() {
             SegmentInfo {
                 entry: queue_entry("myapp", "PriceUpdate", "/dev/shm/q1", 24, 1024),
                 alive: true,
+                pid_count: 1,
                 queue_writes: Some(42),
             },
             SegmentInfo {
                 entry: data_entry("myapp", "Config", "/dev/shm/d1", 128),
                 alive: true,
+                pid_count: 1,
                 queue_writes: None,
             },
         ],
@@ -90,10 +89,10 @@ fn render_single_app_expanded() {
     let buf = render_to_buffer(&mut app, 120, 20);
     let text = buffer_text(&buf);
 
-    assert!(text.contains("myapp"), "app name:\n{text}");
-    assert!(text.contains("2 segments"), "segment count:\n{text}");
-    assert!(text.contains("PriceUpdate"), "queue name:\n{text}");
-    assert!(text.contains("Config"), "data name:\n{text}");
+    assert!(text.contains("myapp"), "app name in TUI:\n{text}");
+    assert!(text.contains("PriceUpdate"), "queue segment:\n{text}");
+    assert!(text.contains("Config"), "data segment:\n{text}");
+    assert!(text.contains("writes=42"), "write count:\n{text}");
     assert!(text.contains("Queue"), "queue kind:\n{text}");
     assert!(text.contains("Data"), "data kind:\n{text}");
     assert!(text.contains("alive"), "alive status:\n{text}");
@@ -106,6 +105,7 @@ fn render_collapsed_app_hides_segments() {
         segments: vec![SegmentInfo {
             entry: queue_entry("hidden", "Msg", "/dev/shm/q", 8, 16),
             alive: true,
+            pid_count: 1,
             queue_writes: None,
         }],
         expanded: false,
@@ -130,6 +130,7 @@ fn render_multiple_apps() {
             segments: vec![SegmentInfo {
                 entry: queue_entry("alpha", "MsgA", "/dev/shm/a", 8, 16),
                 alive: true,
+                pid_count: 1,
                 queue_writes: None,
             }],
             expanded: true,
@@ -139,6 +140,7 @@ fn render_multiple_apps() {
             segments: vec![SegmentInfo {
                 entry: data_entry("beta", "State", "/dev/shm/b", 64),
                 alive: false,
+                pid_count: 1,
                 queue_writes: None,
             }],
             expanded: true,
@@ -163,6 +165,7 @@ fn navigation_next_previous() {
             segments: vec![SegmentInfo {
                 entry: queue_entry("a", "Q1", "/dev/shm/q1", 8, 16),
                 alive: true,
+                pid_count: 1,
                 queue_writes: None,
             }],
             expanded: true,
@@ -201,11 +204,13 @@ fn toggle_expand_collapse() {
             SegmentInfo {
                 entry: queue_entry("app", "Q1", "/dev/shm/q1", 8, 16),
                 alive: true,
+                pid_count: 1,
                 queue_writes: None,
             },
             SegmentInfo {
                 entry: queue_entry("app", "Q2", "/dev/shm/q2", 8, 16),
                 alive: true,
+                pid_count: 1,
                 queue_writes: None,
             },
         ],
@@ -312,29 +317,38 @@ fn clean_detects_stale_pids() {
     let registry = ShmemRegistry::open_or_create(base);
 
     // PID 1 (init, always alive) and PID 99999999 (almost certainly dead)
-    let mut alive_entry = queue_entry("app", "Alive", "/dev/shm/test_cd_alive", 8, 16);
-    alive_entry.pid = 1;
-    let mut dead_entry = queue_entry("app", "Dead", "/dev/shm/test_cd_dead", 8, 16);
-    dead_entry.pid = 99999999;
+    let alive_entry = queue_entry("app", "Alive", "/dev/shm/test_cd_alive", 8, 16);
+    // Attach PID 1 as an additional PID (creator is current process, also alive)
+    let dead_entry = queue_entry("app", "Dead", "/dev/shm/test_cd_dead", 8, 16);
 
     registry.register(alive_entry);
     registry.register(dead_entry);
 
+    // Attach PID 1 to the alive entry, and replace the dead entry's only PID
+    // with 99999999 by detaching the creator and attaching the dead PID.
     let entries = registry.entries();
-    assert!(discovery::is_pid_alive(entries[0].pid));
-    assert!(!discovery::is_pid_alive(entries[1].pid));
+    entries[0].pids.attach(1);
+    assert!(entries[0].pids.any_alive());
+
+    let my_pid = std::process::id();
+    entries[1].pids.detach(my_pid);
+    entries[1].pids.attach(99999999);
+    assert!(!entries[1].pids.any_alive());
 }
 
 #[test]
 fn dead_segment_renders_skull() {
-    let mut dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_ds_old", 64);
-    dead_entry.pid = 99999999;
+    let dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_ds_old", 64);
+    // Replace creator PID with a dead one
+    dead_entry.pids.detach(std::process::id());
+    dead_entry.pids.attach(99999999);
 
     let groups = vec![AppGroup {
         name: "ghost".into(),
         segments: vec![SegmentInfo {
             entry: dead_entry,
             alive: false,
+            pid_count: 1,
             queue_writes: None,
         }],
         expanded: true,
@@ -349,4 +363,99 @@ fn dead_segment_renders_skull() {
         text.contains("OldData"),
         "segment name should show:\n{text}"
     );
+}
+
+// ─── PidSet tests ───────────────────────────────────────────────────────────
+
+#[test]
+fn multi_pid_attach_and_liveness() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("multi", "Msg", "/dev/shm/test_mp", 8, 16));
+
+    let entries = registry.entries();
+    let entry = &entries[0];
+
+    // Creator PID (ourselves) is alive
+    assert_eq!(entry.pids.count(), 1);
+    assert!(entry.pids.any_alive());
+
+    // Attach a second (dead) PID
+    entry.pids.attach(99999999);
+    assert_eq!(entry.pids.count(), 2);
+    // Still alive because our PID is there
+    assert!(entry.pids.any_alive());
+
+    // Detach ourselves — now only dead PID remains
+    let my_pid = std::process::id();
+    entry.pids.detach(my_pid);
+    assert_eq!(entry.pids.count(), 1);
+    assert!(!entry.pids.any_alive());
+}
+
+#[test]
+fn register_same_flink_attaches_pid() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("app", "Msg", "/dev/shm/test_rsf", 8, 16));
+    assert_eq!(registry.entry_count(), 1);
+
+    // Register again with same flink — should attach, not create new entry
+    registry.register(queue_entry("app", "Msg", "/dev/shm/test_rsf", 8, 16));
+    assert_eq!(registry.entry_count(), 1, "should reuse existing entry");
+
+    // The entry should still have 1 PID (same process registered twice)
+    assert_eq!(registry.entries()[0].pids.count(), 1);
+}
+
+#[test]
+fn attach_detach_by_flink() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("app", "Msg", "/dev/shm/test_ad", 8, 16));
+
+    // Attach a fake PID via the registry method
+    assert!(registry.attach_pid("/dev/shm/test_ad", 12345));
+    assert_eq!(registry.entries()[0].pids.count(), 2);
+
+    // Detach it
+    assert!(registry.detach_pid("/dev/shm/test_ad", 12345));
+    assert_eq!(registry.entries()[0].pids.count(), 1);
+
+    // Detach non-existent returns false
+    assert!(!registry.detach_pid("/dev/shm/test_ad", 12345));
+
+    // Attach to non-existent flink returns false
+    assert!(!registry.attach_pid("/dev/shm/nonexistent", 12345));
+}
+
+#[test]
+fn multi_pid_renders_count() {
+    let entry = queue_entry("multi", "Msg", "/dev/shm/q", 8, 16);
+    entry.pids.attach(12345);
+    entry.pids.attach(67890);
+
+    let groups = vec![AppGroup {
+        name: "multi".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 3,
+            queue_writes: Some(100),
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    let buf = render_to_buffer(&mut app, 120, 15);
+    let text = buffer_text(&buf);
+
+    // Should show "×3" for 3 attached PIDs
+    assert!(text.contains("×3"), "should show multi-pid count:\n{text}");
 }

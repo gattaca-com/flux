@@ -6,6 +6,7 @@ use flux_utils::ArrayStr;
 use shared_memory::{ShmemConf, ShmemError};
 
 pub const MAX_REGISTRY_ENTRIES: usize = 512;
+pub const MAX_PIDS_PER_ENTRY: usize = 256;
 pub const REGISTRY_FLINK_NAME: &str = "flux/_shmem_registry";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,12 +35,102 @@ impl std::fmt::Display for ShmemKind {
     }
 }
 
-#[derive(Clone, Copy)]
+/// Fixed-size set of PIDs that can be atomically attached/detached.
+/// Slot value 0 means empty. All operations are lock-free via CAS.
+#[repr(C)]
+pub struct PidSet {
+    pids: [AtomicU32; MAX_PIDS_PER_ENTRY],
+}
+
+impl PidSet {
+    /// Attach a PID. Returns `true` if added (or already present), `false` if full.
+    pub fn attach(&self, pid: u32) -> bool {
+        debug_assert!(pid != 0, "PID 0 is reserved as the empty sentinel");
+        for slot in &self.pids {
+            let cur = slot.load(Ordering::Relaxed);
+            if cur == pid {
+                return true; // already attached
+            }
+            if cur == 0 {
+                // Try to claim this empty slot
+                match slot.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed) {
+                    Ok(_) => return true,
+                    Err(actual) if actual == pid => return true, // raced, same pid won
+                    Err(_) => continue,                         // someone else took it
+                }
+            }
+        }
+        false // full
+    }
+
+    /// Detach a PID. Returns `true` if it was present and removed.
+    pub fn detach(&self, pid: u32) -> bool {
+        for slot in &self.pids {
+            if slot.load(Ordering::Relaxed) == pid {
+                // CAS to avoid removing a slot that was recycled
+                if slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Return all non-zero PIDs currently attached.
+    pub fn active_pids(&self) -> Vec<u32> {
+        self.pids
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .filter(|&p| p != 0)
+            .collect()
+    }
+
+    /// The PID in the first slot (the original creator). 0 if empty.
+    pub fn creator_pid(&self) -> u32 {
+        self.pids[0].load(Ordering::Relaxed)
+    }
+
+    /// Number of attached PIDs.
+    pub fn count(&self) -> usize {
+        self.pids.iter().filter(|s| s.load(Ordering::Relaxed) != 0).count()
+    }
+
+    /// Check if any attached PID is still alive.
+    pub fn any_alive(&self) -> bool {
+        self.active_pids().iter().any(|&pid| is_pid_alive(pid))
+    }
+}
+
+// PidSet is !Clone because of AtomicU32. Provide a manual byte-wise copy
+// for the `ShmemEntry` copy path.
+impl Clone for PidSet {
+    fn clone(&self) -> Self {
+        let mut pids = [const { AtomicU32::new(0) }; MAX_PIDS_PER_ENTRY];
+        for (dst, src) in pids.iter_mut().zip(self.pids.iter()) {
+            *dst = AtomicU32::new(src.load(Ordering::Relaxed));
+        }
+        Self { pids }
+    }
+}
+
+impl Default for PidSet {
+    fn default() -> Self {
+        Self {
+            pids: [const { AtomicU32::new(0) }; MAX_PIDS_PER_ENTRY],
+        }
+    }
+}
+
+/// Check if a PID is alive (Linux: /proc/<pid> exists).
+pub fn is_pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
 #[repr(C)]
 pub struct ShmemEntry {
     pub kind: ShmemKind,
     pub _pad0: [u8; 3],
-    pub pid: u32,
+    pub pids: PidSet,
     pub app_name: ArrayStr<64>,
     pub type_name: ArrayStr<64>,
     pub flink: ArrayStr<256>,
@@ -49,12 +140,30 @@ pub struct ShmemEntry {
     pub created_at_nanos: u64,
 }
 
+// Manual Clone — PidSet doesn't derive Copy due to AtomicU32.
+impl Clone for ShmemEntry {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind,
+            _pad0: self._pad0,
+            pids: self.pids.clone(),
+            app_name: self.app_name,
+            type_name: self.type_name,
+            flink: self.flink,
+            type_hash: self.type_hash,
+            elem_size: self.elem_size,
+            capacity: self.capacity,
+            created_at_nanos: self.created_at_nanos,
+        }
+    }
+}
+
 impl Default for ShmemEntry {
     fn default() -> Self {
         Self {
             kind: ShmemKind::Unknown,
             _pad0: [0; 3],
-            pid: 0,
+            pids: PidSet::default(),
             app_name: ArrayStr::new(),
             type_name: ArrayStr::new(),
             flink: ArrayStr::new(),
@@ -69,6 +178,11 @@ impl Default for ShmemEntry {
 impl ShmemEntry {
     pub fn is_empty(&self) -> bool {
         self.kind == ShmemKind::Unknown
+    }
+
+    /// Convenience: the creator PID (first slot in the PidSet).
+    pub fn creator_pid(&self) -> u32 {
+        self.pids.creator_pid()
     }
 }
 
@@ -129,8 +243,23 @@ impl ShmemRegistry {
         Some(unsafe { &*ptr })
     }
 
-    /// Register a new shmem entry. Returns slot index or None if full.
+    /// Register a shmem entry, or attach this PID to an existing entry with
+    /// the same flink. Returns the slot index, or None if the registry is full.
     pub fn register(&self, entry: ShmemEntry) -> Option<u32> {
+        let pid = entry.pids.creator_pid();
+        let flink = entry.flink;
+
+        // Check if an entry with this flink already exists — if so, just attach.
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+        for i in 0..count {
+            let existing = &self.entries[i as usize];
+            if existing.flink.as_str() == flink.as_str() && !existing.is_empty() {
+                existing.pids.attach(pid);
+                return Some(i);
+            }
+        }
+
+        // New entry — claim a slot.
         let idx = self.count.fetch_add(1, Ordering::AcqRel);
         if idx as usize >= MAX_REGISTRY_ENTRIES {
             self.count.fetch_sub(1, Ordering::Relaxed);
@@ -147,6 +276,36 @@ impl ShmemRegistry {
         }
         fence(Ordering::Release);
         Some(idx)
+    }
+
+    /// Attach the current process to an existing entry identified by flink.
+    /// Returns `true` if found and attached, `false` if no such flink exists.
+    pub fn attach(&self, flink: &str) -> bool {
+        self.attach_pid(flink, std::process::id())
+    }
+
+    /// Attach a specific PID to an existing entry identified by flink.
+    pub fn attach_pid(&self, flink: &str, pid: u32) -> bool {
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+        for i in 0..count {
+            let existing = &self.entries[i as usize];
+            if existing.flink.as_str() == flink && !existing.is_empty() {
+                return existing.pids.attach(pid);
+            }
+        }
+        false
+    }
+
+    /// Detach a PID from an entry identified by flink.
+    pub fn detach_pid(&self, flink: &str, pid: u32) -> bool {
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+        for i in 0..count {
+            let existing = &self.entries[i as usize];
+            if existing.flink.as_str() == flink && !existing.is_empty() {
+                return existing.pids.detach(pid);
+            }
+        }
+        false
     }
 
     /// Read all registered entries.
@@ -246,6 +405,13 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+/// Create a `PidSet` with the current process as the first (creator) PID.
+fn pid_set_self() -> PidSet {
+    let set = PidSet::default();
+    set.attach(std::process::id());
+    set
+}
+
 /// Helper to build a ShmemEntry for a queue.
 pub fn queue_entry(
     app_name: &str,
@@ -257,7 +423,7 @@ pub fn queue_entry(
     ShmemEntry {
         kind: ShmemKind::Queue,
         _pad0: [0; 3],
-        pid: std::process::id(),
+        pids: pid_set_self(),
         app_name: ArrayStr::from_str_truncate(app_name),
         type_name: ArrayStr::from_str_truncate(type_name),
         flink: ArrayStr::from_str_truncate(flink),
@@ -278,7 +444,7 @@ pub fn data_entry(
     ShmemEntry {
         kind: ShmemKind::Data,
         _pad0: [0; 3],
-        pid: std::process::id(),
+        pids: pid_set_self(),
         app_name: ArrayStr::from_str_truncate(app_name),
         type_name: ArrayStr::from_str_truncate(type_name),
         flink: ArrayStr::from_str_truncate(flink),

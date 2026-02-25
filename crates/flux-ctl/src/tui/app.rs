@@ -11,6 +11,7 @@ use crate::discovery;
 pub struct SegmentInfo {
     pub entry: ShmemEntry,
     pub alive: bool,
+    pub pid_count: usize,
     pub queue_writes: Option<usize>,
 }
 
@@ -75,7 +76,8 @@ impl App {
                 .iter()
                 .filter(|e| e.app_name.as_str() == name)
                 .map(|e| {
-                    let alive = discovery::is_pid_alive(e.pid);
+                    let alive = e.pids.any_alive();
+                    let pid_count = e.pids.count();
                     let queue_writes = if e.kind == ShmemKind::Queue {
                         QueueHeader::open_shared(e.flink.as_str())
                             .ok()
@@ -83,7 +85,7 @@ impl App {
                     } else {
                         None
                     };
-                    SegmentInfo { entry: *e, alive, queue_writes }
+                    SegmentInfo { entry: e.clone(), alive, pid_count, queue_writes }
                 })
                 .collect();
             self.groups.push(AppGroup { name, segments, expanded: true });

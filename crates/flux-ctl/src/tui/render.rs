@@ -24,7 +24,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(title, chunks[0]);
 
     // Header
-    let header = Row::new(vec!["Name", "Kind", "Details", "PID", "Status"])
+    let header = Row::new(vec!["Name", "Kind", "Details", "PIDs", "Status"])
         .style(Style::default().fg(Color::Cyan).bold())
         .bottom_margin(1);
 
@@ -65,11 +65,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     }
                     _ => format!("size={}B", seg.entry.elem_size),
                 };
+                let pid_display = if seg.pid_count <= 1 {
+                    format!("{}", seg.entry.creator_pid())
+                } else {
+                    format!("{} (×{})", seg.entry.creator_pid(), seg.pid_count)
+                };
                 rows.push(Row::new(vec![
                     Cell::from(format!("  {}", seg.entry.type_name.as_str())),
                     Cell::from(kind),
                     Cell::from(details),
-                    Cell::from(format!("{}", seg.entry.pid)),
+                    Cell::from(pid_display),
                     Cell::from(status.to_string()),
                 ]));
             }

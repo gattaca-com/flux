@@ -80,14 +80,16 @@ fn main() {
         registry.entry_count()
     );
     for entry in registry.entries() {
+        let pids = entry.pids.active_pids();
+        let pid_str = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
         println!(
-            "  {} {:>14} {:>16}  elem={}B  cap={}  pid={}",
+            "  {} {:>14} {:>16}  elem={}B  cap={}  pids=[{}]",
             entry.kind,
             entry.app_name.as_str(),
             entry.type_name.as_str(),
             entry.elem_size,
             entry.capacity,
-            entry.pid,
+            pid_str,
         );
     }
 
