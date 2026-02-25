@@ -222,13 +222,13 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         ]),
     ];
 
-    if seg.entry.kind == ShmemKind::Queue {
-        if let Some(writes) = seg.queue_writes {
-            lines.push(Line::from(vec![
-                Span::styled("  Writes:     ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}", writes)),
-            ]));
-        }
+    if seg.entry.kind == ShmemKind::Queue
+        && let Some(writes) = seg.queue_writes
+    {
+        lines.push(Line::from(vec![
+            Span::styled("  Writes:     ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}", writes)),
+        ]));
     }
 
     if let Some(ref poison) = seg.poison {

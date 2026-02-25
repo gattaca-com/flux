@@ -185,15 +185,15 @@ pub fn inspect(
         if !entry_visible(entry) {
             continue;
         }
-        if let Some(app) = app_filter {
-            if entry.app_name.as_str() != app {
-                continue;
-            }
+        if let Some(app) = app_filter
+            && entry.app_name.as_str() != app
+        {
+            continue;
         }
-        if let Some(seg) = segment_filter {
-            if !entry.type_name.as_str().contains(seg) {
-                continue;
-            }
+        if let Some(seg) = segment_filter
+            && !entry.type_name.as_str().contains(seg)
+        {
+            continue;
         }
 
         let alive = entry.pids.any_alive();
@@ -219,19 +219,19 @@ pub fn inspect(
         println!("  Flink:     {}", entry.flink.as_str());
         println!("  Type hash: 0x{:016x}", entry.type_hash);
 
-        if entry.kind == ShmemKind::Queue {
-            if let Ok(header) = QueueHeader::open_shared(entry.flink.as_str()) {
-                println!("  Queue type:   {:?}", header.queue_type);
-                println!(
-                    "  Total writes: {}",
-                    header.count.load(Ordering::Relaxed)
-                );
-                println!(
-                    "  Mask:         {} (capacity={})",
-                    header.mask,
-                    header.mask + 1
-                );
-            }
+        if entry.kind == ShmemKind::Queue
+            && let Ok(header) = QueueHeader::open_shared(entry.flink.as_str())
+        {
+            println!("  Queue type:   {:?}", header.queue_type);
+            println!(
+                "  Total writes: {}",
+                header.count.load(Ordering::Relaxed)
+            );
+            println!(
+                "  Mask:         {} (capacity={})",
+                header.mask,
+                header.mask + 1
+            );
         }
         println!();
     }
@@ -253,10 +253,10 @@ pub fn clean(
         if entry.is_empty() {
             continue;
         }
-        if let Some(app) = app_filter {
-            if entry.app_name.as_str() != app {
-                continue;
-            }
+        if let Some(app) = app_filter
+            && entry.app_name.as_str() != app
+        {
+            continue;
         }
         if !entry.pids.any_alive() && flink_reachable(entry.flink.as_str()) {
             stale.push(entry);
@@ -324,6 +324,11 @@ fn check_queue_poison(flink: &str) -> Option<PoisonInfo> {
     let base = shmem.as_ptr();
     let shmem_len = shmem.len();
 
+    if shmem_len < std::mem::size_of::<QueueHeader>() {
+        std::mem::forget(shmem);
+        return None;
+    }
+
     let header = unsafe { &*(base as *const QueueHeader) };
     if !header.is_initialized() || header.elsize == 0 {
         std::mem::forget(shmem);
@@ -350,6 +355,11 @@ fn check_array_poison(flink: &str) -> Option<PoisonInfo> {
     let shmem = ShmemConf::new().flink(flink).open().ok()?;
     let base = shmem.as_ptr();
     let shmem_len = shmem.len();
+
+    if shmem_len < std::mem::size_of::<ArrayHeader>() {
+        std::mem::forget(shmem);
+        return None;
+    }
 
     let header = unsafe { &*(base as *const ArrayHeader) };
     if !header.is_initialized() || header.elsize == 0 {

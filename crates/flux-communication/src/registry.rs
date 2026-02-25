@@ -12,19 +12,14 @@ pub const REGISTRY_FLINK_NAME: &str = "flux/_shmem_registry";
 const REGISTRY_MAGIC: u32 = u32::from_le_bytes(*b"FLXR");
 const REGISTRY_VERSION: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum ShmemKind {
+    #[default]
     Unknown = 0,
     Queue = 1,
     Data = 2,
     SeqlockArray = 3,
-}
-
-impl Default for ShmemKind {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl std::fmt::Display for ShmemKind {
@@ -72,10 +67,10 @@ impl PidSet {
     /// Remove `pid` from this set. Returns `true` if found and removed.
     pub fn detach(&self, pid: u32) -> bool {
         for slot in &self.pids {
-            if slot.load(Ordering::Relaxed) == pid {
-                if slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                    return true;
-                }
+            if slot.load(Ordering::Relaxed) == pid
+                && slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+            {
+                return true;
             }
         }
         false
@@ -110,10 +105,10 @@ impl PidSet {
         let mut removed = 0;
         for slot in &self.pids {
             let pid = slot.load(Ordering::Relaxed);
-            if pid != 0 && !is_pid_alive(pid) {
-                if slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                    removed += 1;
-                }
+            if pid != 0 && !is_pid_alive(pid)
+                && slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+            {
+                removed += 1;
             }
         }
         removed
@@ -261,10 +256,13 @@ impl ShmemRegistry {
             {
                 Ok(shmem) => {
                     let ptr = shmem.as_ptr() as *mut Self;
-                    std::mem::forget(shmem);
+                    // Store magic + version BEFORE forget so that concurrent
+                    // openers (via LinkExists → open) see valid header data.
+                    // Release on version acts as the "commit" flag.
                     let reg = unsafe { &*ptr };
                     reg.magic.store(REGISTRY_MAGIC, Ordering::Relaxed);
-                    reg.version.store(REGISTRY_VERSION, Ordering::Relaxed);
+                    reg.version.store(REGISTRY_VERSION, Ordering::Release);
+                    std::mem::forget(shmem);
                     return reg;
                 }
                 Err(ShmemError::LinkExists) => {
@@ -272,7 +270,7 @@ impl ShmemRegistry {
                         Ok(shmem) => {
                             let ptr = shmem.as_ptr() as *const Self;
                             let magic = unsafe { &*(ptr as *const AtomicU32) };
-                            if magic.load(Ordering::Relaxed) != REGISTRY_MAGIC
+                            if magic.load(Ordering::Acquire) != REGISTRY_MAGIC
                                 || shmem.len() < std::mem::size_of::<Self>()
                             {
                                 eprintln!(
@@ -289,10 +287,10 @@ impl ShmemRegistry {
                             }
 
                             let reg = unsafe { &*ptr };
-                            if reg.version.load(Ordering::Relaxed) != REGISTRY_VERSION {
+                            if reg.version.load(Ordering::Acquire) != REGISTRY_VERSION {
                                 eprintln!(
                                     "flux: registry version {} != expected {} (attempt {}/{}), recreating",
-                                    reg.version.load(Ordering::Relaxed),
+                                    reg.version.load(Ordering::Acquire),
                                     REGISTRY_VERSION,
                                     attempt + 1,
                                     Self::MAX_OPEN_ATTEMPTS,
@@ -332,8 +330,8 @@ impl ShmemRegistry {
         }
         let ptr = shmem.as_ptr() as *const Self;
         let reg = unsafe { &*ptr };
-        if reg.magic.load(Ordering::Relaxed) != REGISTRY_MAGIC
-            || reg.version.load(Ordering::Relaxed) != REGISTRY_VERSION
+        if reg.magic.load(Ordering::Acquire) != REGISTRY_MAGIC
+            || reg.version.load(Ordering::Acquire) != REGISTRY_VERSION
         {
             return None;
         }
@@ -436,10 +434,10 @@ impl ShmemRegistry {
     pub fn cleanup_app(&self, app_name: &str) -> Vec<String> {
         let mut errors = Vec::new();
         for entry in self.entries() {
-            if entry.app_name.as_str() == app_name {
-                if let Err(e) = cleanup_flink(Path::new(entry.flink.as_str())) {
-                    errors.push(e);
-                }
+            if entry.app_name.as_str() == app_name
+                && let Err(e) = cleanup_flink(Path::new(entry.flink.as_str()))
+            {
+                errors.push(e);
             }
         }
         errors
@@ -448,10 +446,10 @@ impl ShmemRegistry {
     pub fn cleanup_all(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for entry in self.entries() {
-            if !entry.is_empty() {
-                if let Err(e) = cleanup_flink(Path::new(entry.flink.as_str())) {
-                    errors.push(e);
-                }
+            if !entry.is_empty()
+                && let Err(e) = cleanup_flink(Path::new(entry.flink.as_str()))
+            {
+                errors.push(e);
             }
         }
         errors

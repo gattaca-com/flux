@@ -116,10 +116,10 @@ impl App {
         let app_names = discovery::app_names(registry);
 
         for name in app_names {
-            if let Some(ref filter) = self.app_filter {
-                if &name != filter {
-                    continue;
-                }
+            if let Some(ref filter) = self.app_filter
+                && &name != filter
+            {
+                continue;
             }
             let segments: Vec<SegmentInfo> = entries
                 .iter()
@@ -128,14 +128,14 @@ impl App {
                 .map(|e| {
                     let alive = e.pids.any_alive();
                     let pid_count = e.pids.count();
-                    let queue_writes = if e.kind == ShmemKind::Queue {
+                    let queue_writes = if alive && e.kind == ShmemKind::Queue {
                         QueueHeader::open_shared(e.flink.as_str())
                             .ok()
                             .map(|h| h.count.load(Ordering::Relaxed))
                     } else {
                         None
                     };
-                    let poison = discovery::check_poison(e);
+                    let poison = if alive { discovery::check_poison(e) } else { None };
                     SegmentInfo { entry: e.clone(), alive, pid_count, queue_writes, poison }
                 })
                 .collect();
@@ -175,10 +175,10 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        if let Some((_, ts)) = &self.status_msg {
-            if ts.elapsed() >= status_msg_duration() {
-                self.status_msg = None;
-            }
+        if let Some((_, ts)) = &self.status_msg
+            && ts.elapsed() >= status_msg_duration()
+        {
+            self.status_msg = None;
         }
         if self.last_refresh.elapsed() >= refresh_interval() {
             self.refresh();
