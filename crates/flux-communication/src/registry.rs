@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use flux_utils::ArrayStr;
 use shared_memory::{ShmemConf, ShmemError};
 
-pub const MAX_REGISTRY_ENTRIES: usize = 512;
+pub const MAX_REGISTRY_ENTRIES: usize = 4096;
 pub const MAX_PIDS_PER_ENTRY: usize = 256;
 pub const REGISTRY_FLINK_NAME: &str = "flux/_shmem_registry";
 
