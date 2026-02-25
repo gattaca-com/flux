@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::time::SystemTime;
 
 use flux_utils::ArrayStr;
-use shared_memory::{ShmemConf, ShmemError};
+use shared_memory::{Shmem, ShmemConf, ShmemError};
 
 pub const MAX_REGISTRY_ENTRIES: usize = 4096;
 pub const MAX_PIDS_PER_ENTRY: usize = 256;
@@ -403,6 +403,138 @@ impl ShmemRegistry {
         }
         cleanup_shmem(base_dir);
     }
+
+    /// Find an entry by flink path. Returns the slot index if found.
+    pub fn find_by_flink(&self, flink: &str) -> Option<u32> {
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+        for i in 0..count {
+            let entry = &self.entries[i as usize];
+            if entry.flink.as_str() == flink && !entry.is_empty() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Scan the filesystem under `base_dir` for pre-existing shared memory
+    /// flinks and register any that are not yet in the registry. Removes
+    /// stale flinks whose backing shared memory no longer exists.
+    pub fn populate_from_fs(&self, base_dir: &Path) -> PopulateResult {
+        let mut result = PopulateResult::default();
+
+        let Ok(dir_entries) = std::fs::read_dir(base_dir) else {
+            return result;
+        };
+
+        for dir_entry in dir_entries.flatten() {
+            let app_dir = dir_entry.path();
+            if !app_dir.is_dir() {
+                continue;
+            }
+            let app_name = dir_entry.file_name().to_string_lossy().to_string();
+            let shmem_dir = app_dir.join("shmem");
+            if !shmem_dir.is_dir() {
+                continue;
+            }
+
+            for (subdir, kind) in &[
+                ("queues", ShmemKind::Queue),
+                ("data", ShmemKind::Data),
+                ("arrays", ShmemKind::SeqlockArray),
+            ] {
+                let type_dir = shmem_dir.join(subdir);
+                if !type_dir.is_dir() {
+                    continue;
+                }
+                let Ok(flink_entries) = std::fs::read_dir(&type_dir) else {
+                    continue;
+                };
+                for flink_entry in flink_entries.flatten() {
+                    let flink_path = flink_entry.path();
+                    if !flink_path.is_file() {
+                        continue;
+                    }
+
+                    let flink_str = flink_path.to_string_lossy();
+                    let type_name = flink_entry.file_name().to_string_lossy().to_string();
+
+                    // Already registered — skip.
+                    if self.find_by_flink(&flink_str).is_some() {
+                        result.already_known += 1;
+                        continue;
+                    }
+
+                    // Try to open — failure means stale flink, remove it.
+                    let shmem = match ShmemConf::new().flink(&flink_path).open() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            let _ = std::fs::remove_file(&flink_path);
+                            result.stale_removed += 1;
+                            continue;
+                        }
+                    };
+
+                    let (elem_size, capacity) = match kind {
+                        ShmemKind::Queue => read_queue_meta(&shmem),
+                        ShmemKind::SeqlockArray => read_array_meta(&shmem),
+                        ShmemKind::Data => (shmem.len(), 1),
+                        _ => (0, 0),
+                    };
+                    drop(shmem); // unmap without unlinking (not owner)
+
+                    let entry = ShmemEntry {
+                        kind: *kind,
+                        _pad0: [0; 3],
+                        pids: pid_set_self(),
+                        app_name: ArrayStr::from_str_truncate(&app_name),
+                        type_name: ArrayStr::from_str_truncate(&type_name),
+                        flink: ArrayStr::from_str_truncate(&flink_str),
+                        type_hash: 0,
+                        elem_size,
+                        capacity,
+                        created_at_nanos: now_nanos(),
+                    };
+
+                    self.register(entry);
+                    result.registered += 1;
+                }
+            }
+        }
+
+        result
+    }
+}
+
+/// Result of [`ShmemRegistry::populate_from_fs`].
+#[derive(Debug, Default)]
+pub struct PopulateResult {
+    pub registered: usize,
+    pub stale_removed: usize,
+    pub already_known: usize,
+}
+
+fn read_queue_meta(shmem: &Shmem) -> (usize, usize) {
+    use crate::queue::QueueHeader;
+    if shmem.len() < std::mem::size_of::<QueueHeader>() {
+        return (0, 0);
+    }
+    let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        return (0, 0);
+    }
+    (header.elsize, header.mask + 1)
+}
+
+fn read_array_meta(shmem: &Shmem) -> (usize, usize) {
+    use crate::array::ArrayHeader;
+    if shmem.len() < std::mem::size_of::<ArrayHeader>() {
+        return (0, 0);
+    }
+    let header = unsafe { &*(shmem.as_ptr() as *const ArrayHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        return (0, 0);
+    }
+    (header.elsize, header.bufsize)
 }
 
 // ─── Free functions ─────────────────────────────────────────────────────────

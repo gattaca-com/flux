@@ -16,7 +16,7 @@ use flux_utils::{
     },
     short_typename,
 };
-pub use registry::{ShmemEntry, ShmemKind, ShmemRegistry};
+pub use registry::{PopulateResult, ShmemEntry, ShmemKind, ShmemRegistry};
 pub use seqlock::Seqlock;
 pub use shmem_data::ShmemData;
 pub use timer::{Timer, TimingMessage};

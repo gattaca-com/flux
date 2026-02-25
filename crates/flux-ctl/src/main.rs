@@ -37,6 +37,9 @@ enum Commands {
         /// App name filter
         app: Option<String>,
     },
+    /// Scan filesystem for pre-existing shmem, register missing entries,
+    /// and remove stale flinks
+    Scan,
     /// Clean stale segments (dead PIDs)
     Clean {
         /// Actually remove (default: dry-run)
@@ -61,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery::inspect(&base_dir, app.as_deref(), segment.as_deref())
         }
         Commands::Watch { app } => tui::run(&base_dir, app.as_deref()),
+        Commands::Scan => discovery::scan(&base_dir),
         Commands::Clean { force, app } => discovery::clean(&base_dir, app.as_deref(), force),
     }
 }

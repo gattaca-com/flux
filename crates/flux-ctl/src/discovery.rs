@@ -53,12 +53,28 @@ pub fn pids_info(entry: &ShmemEntry) -> Vec<PidInfo> {
     entry.pids.active_pids().iter().map(|&pid| pid_info(pid)).collect()
 }
 
-/// Open the global registry, sweeping dead PIDs on open.
+/// Open the global registry, sweeping dead PIDs and populating from the
+/// filesystem (so pre-existing shmem created before the registry is visible).
+/// Stale flinks whose backing shmem no longer exists are removed.
 pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {
     let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
     let reg = ShmemRegistry::open(&registry_path)?;
     reg.sweep_dead_pids();
+    reg.populate_from_fs(base_dir);
     Some(reg)
+}
+
+/// Create the registry if needed, then scan the filesystem for pre-existing
+/// shmem and register any missing entries. Stale flinks are removed.
+pub fn scan(base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let reg = ShmemRegistry::open_or_create(base_dir);
+    reg.sweep_dead_pids();
+    let result = reg.populate_from_fs(base_dir);
+    println!("Scanned {}", base_dir.display());
+    println!("  Registered:     {}", result.registered);
+    println!("  Already known:  {}", result.already_known);
+    println!("  Stale removed:  {}", result.stale_removed);
+    Ok(())
 }
 
 pub use flux_communication::registry::is_pid_alive;
