@@ -10,6 +10,10 @@ struct Cli {
     #[arg(long, global = true)]
     base_dir: Option<PathBuf>,
 
+    /// Clean up all dead/stale shmem segments and exit
+    #[arg(long)]
+    clean: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -46,6 +50,10 @@ enum Commands {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let base_dir = cli.base_dir.unwrap_or_else(flux_utils::directories::local_share_dir);
+
+    if cli.clean {
+        return discovery::clean(&base_dir, None, true);
+    }
 
     match cli.command.unwrap_or(Commands::Watch { app: None }) {
         Commands::List { verbose } => discovery::list_all(&base_dir, verbose),
