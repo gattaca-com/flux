@@ -292,6 +292,7 @@ impl ShmemRegistry {
         let pid = entry.pids.creator_pid();
         let flink = entry.flink;
 
+        // Fast path: check existing entries for a matching flink.
         let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
         for i in 0..count {
             let existing = &self.entries[i as usize];
@@ -302,11 +303,25 @@ impl ShmemRegistry {
             }
         }
 
+        // Claim a slot.
         let idx = self.count.fetch_add(1, Ordering::AcqRel);
         if idx as usize >= MAX_REGISTRY_ENTRIES {
             self.count.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
+
+        // Re-scan entries 0..idx for a duplicate flink that another process
+        // may have registered between our scan above and the fetch_add.
+        for i in 0..idx {
+            let existing = &self.entries[i as usize];
+            if existing.flink.as_str() == flink.as_str() && !existing.is_empty() {
+                existing.pids.sweep_dead();
+                existing.pids.attach(pid);
+                // Abandon our claimed slot by leaving it as zeroed/Unknown.
+                return Some(i);
+            }
+        }
+
         unsafe {
             let base = self as *const Self as *mut u8;
             let offset = std::mem::offset_of!(Self, entries)

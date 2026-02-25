@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+
+use flux_timing::{Duration, Instant};
 
 use flux_communication::queue::QueueHeader;
 use flux_communication::registry::{ShmemEntry, ShmemKind, cleanup_flink};
@@ -57,7 +58,13 @@ pub struct App {
     pub confirm_cleanup_all: bool,
 }
 
-const STATUS_MSG_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
+fn status_msg_duration() -> Duration {
+    Duration::from_secs(3)
+}
+
+fn refresh_interval() -> Duration {
+    Duration::from_secs(1)
+}
 
 impl App {
     pub fn new(base_dir: &Path, app_filter: Option<&str>) -> Self {
@@ -165,11 +172,11 @@ impl App {
 
     pub fn tick(&mut self) {
         if let Some((_, ts)) = &self.status_msg {
-            if ts.elapsed() >= STATUS_MSG_DURATION {
+            if ts.elapsed() >= status_msg_duration() {
                 self.status_msg = None;
             }
         }
-        if self.last_refresh.elapsed() >= std::time::Duration::from_secs(1) {
+        if self.last_refresh.elapsed() >= refresh_interval() {
             self.refresh();
         }
     }

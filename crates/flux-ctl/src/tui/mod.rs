@@ -3,7 +3,6 @@ pub mod render;
 
 use std::io::stdout;
 use std::path::Path;
-use std::time::Duration;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -24,7 +23,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
     loop {
         terminal.draw(|frame| render::render(frame, &mut app))?;
 
-        if event::poll(Duration::from_millis(250))? {
+        if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     if app.show_help {

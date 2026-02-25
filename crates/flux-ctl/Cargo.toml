@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 flux-communication.workspace = true
+flux-timing.workspace = true
 flux-utils.workspace = true
 
 clap.workspace = true

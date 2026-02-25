@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use flux_communication::array::ArrayHeader;
 use flux_communication::queue::QueueHeader;
@@ -349,34 +348,39 @@ fn check_array_poison(flink: &str) -> Option<PoisonInfo> {
 
 /// Walk `n_slots` seqlock slots starting at `buf_base` with stride `elsize`,
 /// reading the `AtomicU64` version at offset 0 of each slot.
+///
+/// Two snapshot reads separated by a yield — if a slot's version is odd in
+/// both reads it's stuck (poisoned). Transient odd values from in-flight
+/// writes resolve between snapshots. This avoids blocking the TUI thread.
 fn scan_seqlock_slots(buf_base: *mut u8, n_slots: usize, elsize: usize) -> Option<PoisonInfo> {
-    const MAX_CHECK_TIME: Duration = Duration::from_micros(10);
-
-    let mut first_slot = None;
-    let mut n_poisoned = 0;
-
+    // First pass: collect slots with odd versions.
+    let mut odd_slots: Vec<usize> = Vec::new();
     for i in 0..n_slots {
         let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
         let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
-
-        if v & 1 == 0 {
-            continue;
+        if v & 1 != 0 {
+            odd_slots.push(i);
         }
+    }
 
-        let start = Instant::now();
-        loop {
-            let v2 = unsafe { &*version_ptr }.load(Ordering::Acquire);
-            if v2 & 1 == 0 {
-                break;
+    if odd_slots.is_empty() {
+        return None;
+    }
+
+    // Yield to let any in-flight writes complete.
+    std::thread::yield_now();
+
+    // Second pass: re-check only the odd slots.
+    let mut first_slot = None;
+    let mut n_poisoned = 0;
+    for &i in &odd_slots {
+        let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
+        let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
+        if v & 1 != 0 {
+            n_poisoned += 1;
+            if first_slot.is_none() {
+                first_slot = Some(i);
             }
-            if start.elapsed() > MAX_CHECK_TIME {
-                n_poisoned += 1;
-                if first_slot.is_none() {
-                    first_slot = Some(i);
-                }
-                break;
-            }
-            std::hint::spin_loop();
         }
     }
 
