@@ -1,4 +1,4 @@
-mod array;
+pub mod array;
 mod error;
 pub mod queue;
 pub mod registry;

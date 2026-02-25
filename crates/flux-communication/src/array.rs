@@ -10,9 +10,9 @@ use crate::{
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct ArrayHeader {
-    elsize: usize,
-    bufsize: usize,
-    is_initialized: u8,
+    pub elsize: usize,
+    pub bufsize: usize,
+    pub is_initialized: u8,
 }
 
 impl ArrayHeader {

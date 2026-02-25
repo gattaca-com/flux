@@ -1,6 +1,8 @@
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use flux_communication::array::ArrayHeader;
 use flux_communication::queue::QueueHeader;
 use flux_communication::registry::{
     REGISTRY_FLINK_NAME, ShmemEntry, ShmemKind, ShmemRegistry, cleanup_flink,
@@ -101,7 +103,14 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
         println!("📦 {} ({} segments)", app, app_entries.len());
         for entry in &app_entries {
             let alive = entry.pids.any_alive();
-            let status = if alive { "🟢" } else { "💀" };
+            let poison = check_poison(entry);
+            let status = if poison.is_some() {
+                "☠"
+            } else if alive {
+                "🟢"
+            } else {
+                "💀"
+            };
             let pids = format_pids(entry);
             println!(
                 "  {} {:14} {:>24}  elem={}B  cap={}  {}",
@@ -112,6 +121,12 @@ pub fn list_all(base_dir: &Path, verbose: bool) -> Result<(), Box<dyn std::error
                 entry.capacity,
                 pids,
             );
+            if let Some(ref pi) = poison {
+                println!(
+                    "    ☠ POISONED: {}/{} slots (first at slot {})",
+                    pi.n_poisoned, pi.total_slots, pi.first_slot,
+                );
+            }
             if verbose {
                 println!("    flink: {}", entry.flink.as_str());
                 if entry.kind == ShmemKind::Queue {
@@ -251,6 +266,125 @@ pub fn clean(
         println!("\nDry run. Use --force to actually remove flink files.");
     }
     Ok(())
+}
+
+// ─── Poison detection ───────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct PoisonInfo {
+    pub n_poisoned: usize,
+    pub first_slot: usize,
+    pub total_slots: usize,
+}
+
+/// Scan a segment's seqlock buffer for poisoned slots.
+///
+/// Works for both `Queue` and `SeqlockArray` — both use the same pattern:
+/// a `repr(C, align(64))` header followed by `Seqlock<T>` slots where the
+/// first 8 bytes of each slot are the `AtomicU64` version.
+///
+/// A slot is poisoned when its version is odd (write-in-progress) and stays
+/// odd for >10µs, meaning the writer crashed mid-write.
+pub fn check_poison(entry: &ShmemEntry) -> Option<PoisonInfo> {
+    match entry.kind {
+        ShmemKind::Queue => check_queue_poison(entry.flink.as_str()),
+        ShmemKind::SeqlockArray => check_array_poison(entry.flink.as_str()),
+        _ => None,
+    }
+}
+
+fn check_queue_poison(flink: &str) -> Option<PoisonInfo> {
+    const HEADER_SIZE: usize = 64; // QueueHeader is repr(C, align(64))
+
+    let shmem = ShmemConf::new().flink(flink).open().ok()?;
+    let base = shmem.as_ptr();
+    let shmem_len = shmem.len();
+
+    let header = unsafe { &*(base as *const QueueHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        std::mem::forget(shmem);
+        return None;
+    }
+
+    let n_slots = header.mask + 1;
+    let elsize = header.elsize;
+
+    if HEADER_SIZE + n_slots * elsize > shmem_len {
+        std::mem::forget(shmem);
+        return None;
+    }
+
+    let buf_base = unsafe { base.add(HEADER_SIZE) };
+    let result = scan_seqlock_slots(buf_base, n_slots, elsize);
+    std::mem::forget(shmem);
+    result
+}
+
+fn check_array_poison(flink: &str) -> Option<PoisonInfo> {
+    const HEADER_SIZE: usize = 64; // ArrayHeader is repr(C, align(64))
+
+    let shmem = ShmemConf::new().flink(flink).open().ok()?;
+    let base = shmem.as_ptr();
+    let shmem_len = shmem.len();
+
+    let header = unsafe { &*(base as *const ArrayHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        std::mem::forget(shmem);
+        return None;
+    }
+
+    let n_slots = header.bufsize;
+    let elsize = header.elsize;
+
+    if HEADER_SIZE + n_slots * elsize > shmem_len {
+        std::mem::forget(shmem);
+        return None;
+    }
+
+    let buf_base = unsafe { base.add(HEADER_SIZE) };
+    let result = scan_seqlock_slots(buf_base, n_slots, elsize);
+    std::mem::forget(shmem);
+    result
+}
+
+/// Walk `n_slots` seqlock slots starting at `buf_base` with stride `elsize`,
+/// reading the `AtomicU64` version at offset 0 of each slot.
+fn scan_seqlock_slots(buf_base: *mut u8, n_slots: usize, elsize: usize) -> Option<PoisonInfo> {
+    const MAX_CHECK_TIME: Duration = Duration::from_micros(10);
+
+    let mut first_slot = None;
+    let mut n_poisoned = 0;
+
+    for i in 0..n_slots {
+        let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
+        let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
+
+        if v & 1 == 0 {
+            continue;
+        }
+
+        let start = Instant::now();
+        loop {
+            let v2 = unsafe { &*version_ptr }.load(Ordering::Acquire);
+            if v2 & 1 == 0 {
+                break;
+            }
+            if start.elapsed() > MAX_CHECK_TIME {
+                n_poisoned += 1;
+                if first_slot.is_none() {
+                    first_slot = Some(i);
+                }
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    if n_poisoned > 0 {
+        Some(PoisonInfo { n_poisoned, first_slot: first_slot.unwrap(), total_slots: n_slots })
+    } else {
+        None
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

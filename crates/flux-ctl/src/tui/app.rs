@@ -13,6 +13,7 @@ pub struct SegmentInfo {
     pub alive: bool,
     pub pid_count: usize,
     pub queue_writes: Option<usize>,
+    pub poison: Option<discovery::PoisonInfo>,
 }
 
 pub struct AppGroup {
@@ -120,7 +121,8 @@ impl App {
                     } else {
                         None
                     };
-                    SegmentInfo { entry: e.clone(), alive, pid_count, queue_writes }
+                    let poison = discovery::check_poison(e);
+                    SegmentInfo { entry: e.clone(), alive, pid_count, queue_writes, poison }
                 })
                 .collect();
             if segments.is_empty() {

@@ -69,7 +69,13 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
         if group.expanded {
             for seg in &group.segments {
-                let status = if seg.alive { "🟢 alive" } else { "💀 dead" };
+                let status = if seg.poison.is_some() {
+                    "☠ poisoned"
+                } else if seg.alive {
+                    "🟢 alive"
+                } else {
+                    "💀 dead"
+                };
                 let kind = format!("{}", seg.entry.kind);
                 let details = match seg.entry.kind {
                     ShmemKind::Queue => {
@@ -89,12 +95,17 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                 } else {
                     format!("{} (×{})", seg.entry.creator_pid(), seg.pid_count)
                 };
+                let status_style = if seg.poison.is_some() {
+                    Style::default().fg(Color::Red).bold()
+                } else {
+                    Style::default()
+                };
                 rows.push(Row::new(vec![
                     Cell::from(format!("  {}", seg.entry.type_name.as_str())),
                     Cell::from(kind),
                     Cell::from(details),
                     Cell::from(pid_display),
-                    Cell::from(status.to_string()),
+                    Cell::from(Span::styled(status.to_string(), status_style)),
                 ]));
             }
         }
@@ -161,7 +172,13 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: Rect) {
-    let status = if seg.alive { "🟢 alive" } else { "💀 dead" };
+    let status = if seg.poison.is_some() {
+        "☠ poisoned"
+    } else if seg.alive {
+        "🟢 alive"
+    } else {
+        "💀 dead"
+    };
 
     let created = if seg.entry.created_at_nanos > 0 {
         let secs = seg.entry.created_at_nanos / 1_000_000_000;
@@ -209,6 +226,19 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
                 Span::raw(format!("{}", writes)),
             ]));
         }
+    }
+
+    if let Some(ref poison) = seg.poison {
+        lines.push(Line::from(vec![
+            Span::styled("  ☠ Poison:   ", Style::default().fg(Color::Red).bold()),
+            Span::styled(
+                format!(
+                    "{}/{} slots poisoned (first at slot {})",
+                    poison.n_poisoned, poison.total_slots, poison.first_slot
+                ),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
     }
 
     let block = Block::default()

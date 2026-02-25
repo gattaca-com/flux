@@ -101,13 +101,13 @@ fn render_single_app_expanded() {
                 entry: queue_entry("myapp", "PriceUpdate", "/dev/shm/q1", 24, 1024),
                 alive: true,
                 pid_count: 1,
-                queue_writes: Some(42),
+                queue_writes: Some(42), poison: None,
             },
             SegmentInfo {
                 entry: data_entry("myapp", "Config", "/dev/shm/d1", 128),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None,
+                queue_writes: None, poison: None,
             },
         ],
         expanded: true,
@@ -136,7 +136,7 @@ fn render_collapsed_app_hides_segments() {
             entry: queue_entry("hidden", "Msg", "/dev/shm/q", 8, 16),
             alive: true,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: false,
     }];
@@ -161,7 +161,7 @@ fn render_multiple_apps() {
                 entry: queue_entry("alpha", "MsgA", "/dev/shm/a", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None,
+                queue_writes: None, poison: None,
             }],
             expanded: true,
         },
@@ -171,7 +171,7 @@ fn render_multiple_apps() {
                 entry: data_entry("beta", "State", "/dev/shm/b", 64),
                 alive: false,
                 pid_count: 1,
-                queue_writes: None,
+                queue_writes: None, poison: None,
             }],
             expanded: true,
         },
@@ -196,7 +196,7 @@ fn navigation_next_previous() {
                 entry: queue_entry("a", "Q1", "/dev/shm/q1", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None,
+                queue_writes: None, poison: None,
             }],
             expanded: true,
         },
@@ -235,13 +235,13 @@ fn toggle_expand_collapse() {
                 entry: queue_entry("app", "Q1", "/dev/shm/q1", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None,
+                queue_writes: None, poison: None,
             },
             SegmentInfo {
                 entry: queue_entry("app", "Q2", "/dev/shm/q2", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None,
+                queue_writes: None, poison: None,
             },
         ],
         expanded: true,
@@ -379,7 +379,7 @@ fn dead_segment_renders_skull() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -477,7 +477,7 @@ fn multi_pid_renders_count() {
             entry,
             alive: true,
             pid_count: 3,
-            queue_writes: Some(100),
+            queue_writes: Some(100), poison: None,
         }],
         expanded: true,
     }];
@@ -550,7 +550,7 @@ fn enter_on_segment_opens_detail() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: Some(42),
+            queue_writes: Some(42), poison: None,
         }],
         expanded: true,
     }];
@@ -575,7 +575,7 @@ fn detail_view_renders_segment_info() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: Some(42),
+            queue_writes: Some(42), poison: None,
         }],
         expanded: true,
     }];
@@ -608,7 +608,7 @@ fn detail_view_shows_pid_info() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -635,7 +635,7 @@ fn detail_view_back_returns_to_list() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -658,7 +658,7 @@ fn detail_cleanup_blocked_for_alive() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -690,7 +690,7 @@ fn detail_cleanup_shows_confirm_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -728,7 +728,7 @@ fn detail_cancel_cleanup_hides_confirm() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -757,7 +757,7 @@ fn detail_status_bar_shows_cleanup_hint_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -785,7 +785,7 @@ fn enter_on_app_header_still_toggles() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -810,7 +810,7 @@ fn list_cleanup_blocked_for_alive_segment() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -832,7 +832,7 @@ fn list_cleanup_blocked_on_app_header() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -857,7 +857,7 @@ fn list_cleanup_shows_confirm_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -885,7 +885,7 @@ fn list_cancel_cleanup_hides_confirm() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -911,7 +911,7 @@ fn list_status_bar_shows_cleanup_hint_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None,
+            queue_writes: None, poison: None,
         }],
         expanded: true,
     }];
@@ -926,4 +926,85 @@ fn list_status_bar_shows_cleanup_hint_for_dead() {
         text.contains("d destroy"),
         "status bar should show destroy hint:\n{text}"
     );
+}
+
+// ─── Poison detection tests ─────────────────────────────────────────────────
+
+#[test]
+fn poisoned_segment_renders_skull_crossbones() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_poison_render", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(100),
+            poison: Some(discovery::PoisonInfo {
+                n_poisoned: 2,
+                first_slot: 5,
+                total_slots: 64,
+            }),
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    let buf = render_to_buffer(&mut app, 120, 15);
+    let text = buffer_text(&buf);
+    assert!(text.contains("poisoned"), "list should show poisoned status:\n{text}");
+}
+
+#[test]
+fn poisoned_detail_view_shows_poison_info() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_poison_detail", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(100),
+            poison: Some(discovery::PoisonInfo {
+                n_poisoned: 3,
+                first_slot: 7,
+                total_slots: 64,
+            }),
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+
+    assert!(text.contains("poisoned"), "detail status should show poisoned:\n{text}");
+    assert!(text.contains("3/64"), "should show n_poisoned/total:\n{text}");
+    assert!(text.contains("slot 7"), "should show first slot:\n{text}");
+}
+
+#[test]
+fn healthy_segment_has_no_poison() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/test_no_poison", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(42),
+            poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    let buf = render_to_buffer(&mut app, 120, 15);
+    let text = buffer_text(&buf);
+
+    assert!(!text.contains("poisoned"), "healthy segment should not show poisoned:\n{text}");
+    assert!(text.contains("alive"), "should show alive:\n{text}");
 }
