@@ -5,6 +5,8 @@ use flux_ctl::discovery;
 use flux_ctl::tui::app::{App, AppGroup, SegmentInfo, View};
 use flux_ctl::tui::render;
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+use shared_memory::ShmemConf;
+use std::path::Path;
 
 /// Helper: render an App into a TestBackend buffer and return the buffer.
 fn render_to_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
@@ -1128,4 +1130,126 @@ fn status_bar_shows_destroy_all_hint() {
         text.contains("D destroy all"),
         "status bar should show D hint when dead segments exist:\n{text}"
     );
+}
+
+// ─── populate_from_fs / scan tests ──────────────────────────────────────────
+
+/// Helper: create a real shmem segment via ShmemConf (bypassing the registry)
+/// and place the flink under `base_dir/<app>/shmem/<subdir>/<name>`.
+fn create_raw_shmem(base_dir: &Path, app: &str, subdir: &str, name: &str, size: usize) {
+    let flink_dir = base_dir.join(app).join("shmem").join(subdir);
+    std::fs::create_dir_all(&flink_dir).unwrap();
+    let flink_path = flink_dir.join(name);
+    let mut shmem = ShmemConf::new()
+        .size(size)
+        .flink(&flink_path)
+        .create()
+        .unwrap();
+    // Disown so drop doesn't unlink the backing file.
+    shmem.set_owner(false);
+    drop(shmem);
+}
+
+/// Helper: clean up a raw shmem segment created by `create_raw_shmem`.
+fn cleanup_raw_shmem(base_dir: &Path, app: &str, subdir: &str, name: &str) {
+    let flink_path = base_dir.join(app).join("shmem").join(subdir).join(name);
+    if let Ok(mut shmem) = ShmemConf::new().flink(&flink_path).open() {
+        shmem.set_owner(true);
+        // drop unlinks the backing
+    }
+    let _ = std::fs::remove_file(&flink_path);
+}
+
+#[test]
+fn populate_from_fs_discovers_preexisting_shmem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+
+    // Create raw shmem segments (no registry involvement)
+    create_raw_shmem(base, "testapp", "data", "MyStruct", 256);
+
+    // Create and populate the registry
+    let reg = ShmemRegistry::open_or_create(base);
+    // Reset cooldown so populate actually runs
+    reg.last_populated_nanos
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let result = reg.populate_from_fs(base);
+
+    assert_eq!(result.registered, 1, "should discover 1 pre-existing segment");
+    assert_eq!(result.stale_removed, 0);
+
+    // Verify the entry is in the registry
+    let entries = reg.entries();
+    let found = entries.iter().any(|e| {
+        e.app_name.as_str() == "testapp" && e.type_name.as_str() == "MyStruct"
+    });
+    assert!(found, "pre-existing segment should appear in registry entries");
+
+    // Second call should skip (already known)
+    reg.last_populated_nanos
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let result2 = reg.populate_from_fs(base);
+    assert_eq!(result2.already_known, 1);
+    assert_eq!(result2.registered, 0);
+
+    // Cleanup
+    cleanup_raw_shmem(base, "testapp", "data", "MyStruct");
+    ShmemRegistry::destroy(base);
+}
+
+#[test]
+fn populate_from_fs_removes_stale_flinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+
+    // Create a stale flink (file exists but no backing shmem)
+    let flink_dir = base.join("staleapp").join("shmem").join("queues");
+    std::fs::create_dir_all(&flink_dir).unwrap();
+    let stale_flink = flink_dir.join("GhostQueue");
+    std::fs::write(&stale_flink, "bogus_os_id").unwrap();
+
+    let reg = ShmemRegistry::open_or_create(base);
+    reg.last_populated_nanos
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let result = reg.populate_from_fs(base);
+
+    assert_eq!(result.stale_removed, 1, "should remove the stale flink");
+    assert!(!stale_flink.exists(), "stale flink file should be deleted");
+
+    ShmemRegistry::destroy(base);
+}
+
+#[test]
+fn scan_on_empty_base_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+
+    // scan() should succeed on an empty directory
+    let result = discovery::scan(base);
+    assert!(result.is_ok(), "scan on empty dir should not error");
+
+    ShmemRegistry::destroy(base);
+}
+
+#[test]
+fn populate_cooldown_skips_repeated_scans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+
+    create_raw_shmem(base, "coolapp", "data", "CoolData", 128);
+
+    let reg = ShmemRegistry::open_or_create(base);
+    // First scan
+    let r1 = reg.populate_from_fs(base);
+    assert_eq!(r1.registered, 1);
+
+    // Immediate second scan — should be skipped due to cooldown
+    let r2 = reg.populate_from_fs(base);
+    assert_eq!(r2.registered, 0);
+    assert_eq!(r2.already_known, 0); // didn't even run the scan
+    assert_eq!(r2.stale_removed, 0);
+
+    // Cleanup
+    cleanup_raw_shmem(base, "coolapp", "data", "CoolData");
+    ShmemRegistry::destroy(base);
 }

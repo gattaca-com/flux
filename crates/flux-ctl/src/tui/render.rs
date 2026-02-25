@@ -521,3 +521,40 @@ fn truncate_str(s: &str, max: usize) -> String {
         format!("{truncated}…")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_str_ascii() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "hell…");
+        assert_eq!(truncate_str("", 5), "");
+        assert_eq!(truncate_str("abc", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_str_multibyte_utf8() {
+        // CJK characters (3 bytes each)
+        let cjk = "你好世界测试";
+        assert_eq!(truncate_str(cjk, 6), cjk);
+        assert_eq!(truncate_str(cjk, 4), "你好世…");
+
+        // Emoji (4 bytes each)
+        let emoji = "🔥🚀💥🎉🌍";
+        assert_eq!(truncate_str(emoji, 5), emoji);
+        assert_eq!(truncate_str(emoji, 3), "🔥🚀…");
+
+        // Mixed ASCII + multi-byte
+        let mixed = "café résumé";
+        assert_eq!(truncate_str(mixed, 5), "café…");
+    }
+
+    #[test]
+    fn truncate_str_edge_cases() {
+        assert_eq!(truncate_str("a", 1), "a");
+        assert_eq!(truncate_str("ab", 1), "…");
+        assert_eq!(truncate_str("abc", 0), "…");
+    }
+}
