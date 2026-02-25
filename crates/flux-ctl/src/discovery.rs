@@ -1,3 +1,10 @@
+//! Discovery and inspection of shared memory segments via the global registry.
+//!
+//! Provides the backing logic for all `flux-ctl` CLI commands (`list`, `inspect`,
+//! `clean`, `scan`) and the TUI data model. Opens the [`ShmemRegistry`], enriches
+//! entries with queue stats, poison detection, and per-PID process info, and
+//! exposes helpers for cleanup and liveness checks.
+
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 

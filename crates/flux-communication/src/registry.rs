@@ -38,13 +38,19 @@ impl std::fmt::Display for ShmemKind {
     }
 }
 
-/// Fixed-size set of PIDs. Slot value 0 = empty. All operations are lock-free CAS.
+/// Fixed-size set of PIDs attached to a shared memory entry.
+///
+/// Slot value `0` = empty (sentinel). All operations are lock-free via CAS.
+/// Capacity: [`MAX_PIDS_PER_ENTRY`] (256) PIDs per entry. Slot 0 holds the
+/// creator PID by convention.
 #[repr(C)]
 pub struct PidSet {
     pids: [AtomicU32; MAX_PIDS_PER_ENTRY],
 }
 
 impl PidSet {
+    /// Attach `pid` to this set. Returns `true` if the PID was inserted or
+    /// was already present. Returns `false` only if all slots are occupied.
     pub fn attach(&self, pid: u32) -> bool {
         debug_assert!(pid != 0, "PID 0 is reserved as the empty sentinel");
         for slot in &self.pids {
@@ -63,6 +69,7 @@ impl PidSet {
         false
     }
 
+    /// Remove `pid` from this set. Returns `true` if found and removed.
     pub fn detach(&self, pid: u32) -> bool {
         for slot in &self.pids {
             if slot.load(Ordering::Relaxed) == pid {
@@ -74,6 +81,7 @@ impl PidSet {
         false
     }
 
+    /// Return all non-zero PIDs currently in the set.
     pub fn active_pids(&self) -> Vec<u32> {
         self.pids
             .iter()
@@ -82,14 +90,17 @@ impl PidSet {
             .collect()
     }
 
+    /// The PID that first created this entry (slot 0).
     pub fn creator_pid(&self) -> u32 {
         self.pids[0].load(Ordering::Relaxed)
     }
 
+    /// Number of non-zero PIDs currently in the set.
     pub fn count(&self) -> usize {
         self.pids.iter().filter(|s| s.load(Ordering::Relaxed) != 0).count()
     }
 
+    /// `true` if at least one PID in this set corresponds to a running process.
     pub fn any_alive(&self) -> bool {
         self.active_pids().iter().any(|&pid| is_pid_alive(pid))
     }
@@ -131,17 +142,34 @@ pub fn is_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// A single shared memory segment descriptor in the global registry.
+///
+/// Each entry records the segment kind, the owning application, the type
+/// stored in the segment, the flink path used to open it, and a set of
+/// PIDs that have this segment mapped.
+///
+/// Layout is `repr(C, align(64))` with a compile-time size assertion to
+/// detect ABI drift. Bump [`REGISTRY_VERSION`] if the layout changes.
 #[repr(C, align(64))]
 pub struct ShmemEntry {
+    /// What kind of shared memory segment this is.
     pub kind: ShmemKind,
     pub _pad0: [u8; 3],
+    /// PIDs that have this segment mapped (lock-free CAS set).
     pub pids: PidSet,
+    /// Name of the application that owns this segment (e.g. `"market-data"`).
     pub app_name: ArrayStr<64>,
+    /// Short type name of the element stored (e.g. `"Quote"`).
     pub type_name: ArrayStr<64>,
+    /// Absolute path to the flink file for `ShmemConf::flink()`.
     pub flink: ArrayStr<256>,
+    /// Reserved for future type-hash validation (currently 0).
     pub type_hash: u64,
+    /// Size in bytes of a single element.
     pub elem_size: usize,
+    /// Number of slots (queues/arrays) or 1 (data).
     pub capacity: usize,
+    /// Timestamp of first registration (nanos since Unix epoch).
     pub created_at_nanos: u64,
 }
 
@@ -558,8 +586,11 @@ impl ShmemRegistry {
 /// Result of [`ShmemRegistry::populate_from_fs`].
 #[derive(Debug, Default)]
 pub struct PopulateResult {
+    /// Number of new entries registered during this scan.
     pub registered: usize,
+    /// Number of stale flink files removed (backing shmem gone).
     pub stale_removed: usize,
+    /// Number of flinks that were already in the registry.
     pub already_known: usize,
 }
 
