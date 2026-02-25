@@ -1,0 +1,27 @@
+[package]
+name = "flux-ctl"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+repository = "https://github.com/gattaca-com/flux"
+
+[lib]
+name = "flux_ctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flux-ctl"
+path = "src/main.rs"
+
+[dependencies]
+flux-communication.workspace = true
+flux-utils.workspace = true
+
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+
+[dev-dependencies]
+ctrlc.workspace = true
+tempfile.workspace = true

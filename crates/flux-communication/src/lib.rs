@@ -1,6 +1,7 @@
 mod array;
 mod error;
 pub mod queue;
+pub mod registry;
 mod seqlock;
 mod shmem_data;
 pub mod timer;
@@ -13,6 +14,7 @@ use flux_utils::{
     directories::{local_share_dir, shmem_dir_queues, shmem_dir_queues_with_base},
     short_typename,
 };
+pub use registry::{ShmemEntry, ShmemKind, ShmemRegistry};
 pub use seqlock::Seqlock;
 pub use shmem_data::ShmemData;
 pub use timer::{Timer, TimingMessage};
@@ -46,9 +48,19 @@ pub fn shmem_queue_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy>(
     typ: queue::QueueType,
 ) -> queue::Queue<T> {
     let queue_name = short_typename::<T>();
-    queue::Queue::create_or_open_shared(
-        shmem_dir_queues_with_base(base_dir, app_name).join(queue_name.as_str()),
+    let flink_path =
+        shmem_dir_queues_with_base(&base_dir, &app_name).join(queue_name.as_str());
+    let queue = queue::Queue::create_or_open_shared(&flink_path, len, typ);
+
+    // Auto-register in global shmem registry
+    let reg = registry::ShmemRegistry::open_or_create(base_dir.as_ref());
+    reg.register(registry::queue_entry(
+        &app_name.as_ref().to_string_lossy(),
+        queue_name.as_str(),
+        &flink_path.to_string_lossy(),
+        std::mem::size_of::<T>(),
         len,
-        typ,
-    )
+    ));
+
+    queue
 }

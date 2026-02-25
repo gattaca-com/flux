@@ -26,15 +26,15 @@ pub enum QueueType {
 
 #[derive(Debug)]
 #[repr(C, align(64))]
-struct QueueHeader {
-    queue_type: QueueType, // 1
-    is_initialized: u8,    // 2
-    _pad1: [u8; 6],        // 8
-    elsize: usize,         // 16
-    mask: usize,           // 24
-    count: AtomicUsize,    /* 32 */
+pub struct QueueHeader {
+    pub queue_type: QueueType, // 1
+    is_initialized: u8,        // 2
+    _pad1: [u8; 6],            // 8
+    pub elsize: usize,         // 16
+    pub mask: usize,           // 24
+    pub count: AtomicUsize,    /* 32 */
 
-                           /* add queue hash mismatch */
+                               /* add queue hash mismatch */
 }
 #[allow(dead_code)]
 impl QueueHeader {
@@ -751,7 +751,7 @@ mod test {
             }
 
             assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
-            let _ = std::fs::remove_file(path);
+            crate::registry::cleanup_flink(path);
         }
     }
 }
