@@ -33,15 +33,17 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
                         continue;
                     }
 
-                    // If cleanup confirmation is shown, handle it first.
-                    if let View::Detail(ref detail) = app.view {
-                        if detail.confirm_cleanup {
-                            match key.code {
-                                KeyCode::Enter => app.request_cleanup(),
-                                _ => app.cancel_cleanup(),
-                            }
-                            continue;
+                    // If any cleanup confirmation is pending, handle it first.
+                    let confirming = match &app.view {
+                        View::List => app.confirm_cleanup,
+                        View::Detail(d) => d.confirm_cleanup,
+                    };
+                    if confirming {
+                        match key.code {
+                            KeyCode::Enter => app.request_cleanup(),
+                            _ => app.cancel_cleanup(),
                         }
+                        continue;
                     }
 
                     match &app.view {
@@ -51,6 +53,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
                             KeyCode::Up | KeyCode::Char('k') => app.previous(),
                             KeyCode::Down | KeyCode::Char('j') => app.next(),
                             KeyCode::Enter => app.enter(),
+                            KeyCode::Char('c') => app.request_cleanup(),
                             KeyCode::Char('r') => app.refresh(),
                             _ => {}
                         },

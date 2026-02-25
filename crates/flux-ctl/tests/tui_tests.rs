@@ -798,3 +798,132 @@ fn enter_on_app_header_still_toggles() {
     assert!(matches!(app.view, View::List));
     assert!(!app.groups[0].expanded);
 }
+
+// ─── List-view cleanup tests ────────────────────────────────────────────────
+
+#[test]
+fn list_cleanup_blocked_for_alive_segment() {
+    let entry = queue_entry("myapp", "Msg", "/dev/shm/test_lcba", 8, 16);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1; // segment row
+    app.request_cleanup();
+
+    assert!(!app.confirm_cleanup, "should not confirm for live segment");
+    assert!(app.status_msg.is_some(), "should show error message");
+}
+
+#[test]
+fn list_cleanup_blocked_on_app_header() {
+    let entry = queue_entry("myapp", "Msg", "/dev/shm/test_lcbh", 8, 16);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 0; // app header row
+    app.request_cleanup();
+
+    assert!(!app.confirm_cleanup);
+    assert!(app.status_msg.is_some(), "should say 'select a segment'");
+}
+
+#[test]
+fn list_cleanup_shows_confirm_for_dead() {
+    let dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_lcsc", 64);
+    dead_entry.pids.detach(std::process::id());
+    dead_entry.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead_entry,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.request_cleanup();
+
+    assert!(app.confirm_cleanup, "first press should show confirm");
+
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+    assert!(text.contains("Clean up this segment"), "confirm popup:\n{text}");
+}
+
+#[test]
+fn list_cancel_cleanup_hides_confirm() {
+    let dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_lcch", 64);
+    dead_entry.pids.detach(std::process::id());
+    dead_entry.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead_entry,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.request_cleanup();
+    assert!(app.confirm_cleanup);
+
+    app.cancel_cleanup();
+    assert!(!app.confirm_cleanup);
+}
+
+#[test]
+fn list_status_bar_shows_cleanup_hint_for_dead() {
+    let dead_entry = data_entry("ghost", "OldData", "/dev/shm/test_lsbh", 64);
+    dead_entry.pids.detach(std::process::id());
+    dead_entry.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead_entry,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1; // dead segment row
+
+    let buf = render_to_buffer(&mut app, 120, 15);
+    let text = buffer_text(&buf);
+
+    assert!(
+        text.contains("c clean"),
+        "status bar should show cleanup hint:\n{text}"
+    );
+}

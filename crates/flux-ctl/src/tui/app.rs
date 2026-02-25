@@ -36,6 +36,12 @@ pub struct DetailState {
     pub confirm_cleanup: bool,
 }
 
+/// What the cursor is pointing at in the list view.
+pub enum SelectedItem<'a> {
+    AppHeader(usize),
+    Segment(usize, usize, &'a SegmentInfo),
+}
+
 pub struct App {
     pub groups: Vec<AppGroup>,
     pub selected: usize,
@@ -46,6 +52,7 @@ pub struct App {
     pub show_help: bool,
     pub view: View,
     pub status_msg: Option<(String, Instant)>,
+    pub confirm_cleanup: bool,
 }
 
 const STATUS_MSG_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
@@ -62,6 +69,7 @@ impl App {
             show_help: false,
             view: View::List,
             status_msg: None,
+            confirm_cleanup: false,
         };
         app.refresh();
         app
@@ -78,6 +86,7 @@ impl App {
             show_help: false,
             view: View::List,
             status_msg: None,
+            confirm_cleanup: false,
         };
         app.recount_rows();
         app
@@ -231,8 +240,60 @@ impl App {
         }
     }
 
-    /// First call shows confirmation, second call executes cleanup.
+    pub fn selected_item(&self) -> Option<SelectedItem<'_>> {
+        let mut row = 0;
+        for (gi, group) in self.groups.iter().enumerate() {
+            if row == self.selected {
+                return Some(SelectedItem::AppHeader(gi));
+            }
+            row += 1;
+            if group.expanded {
+                for (si, seg) in group.segments.iter().enumerate() {
+                    if row == self.selected {
+                        return Some(SelectedItem::Segment(gi, si, seg));
+                    }
+                    row += 1;
+                }
+            }
+        }
+        None
+    }
+
     pub fn request_cleanup(&mut self) {
+        match &self.view {
+            View::List => self.request_cleanup_list(),
+            View::Detail(_) => self.request_cleanup_detail(),
+        }
+    }
+
+    fn request_cleanup_list(&mut self) {
+        let (alive, flink) = match self.selected_item() {
+            Some(SelectedItem::Segment(_, _, seg)) => {
+                (seg.alive, seg.entry.flink.as_str().to_string())
+            }
+            _ => {
+                self.status_msg = Some(("Select a segment first".into(), Instant::now()));
+                return;
+            }
+        };
+
+        if alive {
+            self.status_msg =
+                Some(("Cannot clean: segment still has live processes".into(), Instant::now()));
+            return;
+        }
+
+        if self.confirm_cleanup {
+            cleanup_flink(Path::new(&flink));
+            self.status_msg = Some((format!("Cleaned up {}", flink), Instant::now()));
+            self.confirm_cleanup = false;
+            self.refresh();
+        } else {
+            self.confirm_cleanup = true;
+        }
+    }
+
+    fn request_cleanup_detail(&mut self) {
         let View::Detail(ref mut detail) = self.view else { return };
 
         let seg = match self
@@ -263,6 +324,7 @@ impl App {
     }
 
     pub fn cancel_cleanup(&mut self) {
+        self.confirm_cleanup = false;
         if let View::Detail(ref mut detail) = self.view {
             detail.confirm_cleanup = false;
         }

@@ -3,12 +3,21 @@ use ratatui::widgets::*;
 
 use flux_communication::registry::ShmemKind;
 
-use super::app::{App, View};
+use super::app::{App, SelectedItem, View};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.view {
         View::List => render_list(frame, app),
         View::Detail(_) => render_detail(frame, app),
+    }
+
+    // Confirm popup (works in both views)
+    let confirming = match &app.view {
+        View::List => app.confirm_cleanup,
+        View::Detail(d) => d.confirm_cleanup,
+    };
+    if confirming {
+        render_confirm_popup(frame, frame.area());
     }
 
     if app.show_help {
@@ -149,12 +158,6 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     }
 
     render_status_bar(frame, app, chunks[3]);
-
-    if let View::Detail(ref detail) = app.view {
-        if detail.confirm_cleanup {
-            render_confirm_popup(frame, area);
-        }
-    }
 }
 
 fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: Rect) {
@@ -322,16 +325,31 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect) {
 // ─── Status bar ─────────────────────────────────────────────────────────────
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if let Some((ref msg, _)) = app.status_msg {
+    let confirming = match &app.view {
+        View::List => app.confirm_cleanup,
+        View::Detail(d) => d.confirm_cleanup,
+    };
+
+    let text = if confirming {
+        " Enter confirm cleanup  Esc cancel".into()
+    } else if let Some((ref msg, _)) = app.status_msg {
         msg.clone()
     } else {
         match &app.view {
-            View::List => " ↑↓ navigate  Enter open  ? help  q quit".into(),
-            View::Detail(detail) => {
+            View::List => {
+                let on_dead_seg = matches!(
+                    app.selected_item(),
+                    Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
+                );
+                if on_dead_seg {
+                    " ↑↓ navigate  Enter open  c clean up  ? help  q quit".into()
+                } else {
+                    " ↑↓ navigate  Enter open  ? help  q quit".into()
+                }
+            }
+            View::Detail(_) => {
                 let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
-                if detail.confirm_cleanup {
-                    " Enter confirm cleanup  Esc cancel".into()
-                } else if !alive {
+                if !alive {
                     " Esc back  c clean up  ? help  q quit".into()
                 } else {
                     " Esc back  ? help  q quit".into()
