@@ -37,7 +37,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
                     if let View::Detail(ref detail) = app.view {
                         if detail.confirm_cleanup {
                             match key.code {
-                                KeyCode::Char('c') => app.request_cleanup(),
+                                KeyCode::Enter => app.request_cleanup(),
                                 _ => app.cancel_cleanup(),
                             }
                             continue;

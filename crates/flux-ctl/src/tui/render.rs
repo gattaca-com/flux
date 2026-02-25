@@ -324,7 +324,7 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect) {
         Line::from("  file and remove the flink."),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  c ", Style::default().fg(Color::Red).bold()),
+            Span::styled("  Enter ", Style::default().fg(Color::Red).bold()),
             Span::raw("Confirm  "),
             Span::styled("  Esc ", Style::default().fg(Color::DarkGray).bold()),
             Span::raw("Cancel"),
@@ -361,7 +361,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     .map(|s| s.alive)
                     .unwrap_or(true);
                 if detail.confirm_cleanup {
-                    " c confirm cleanup  Esc cancel".into()
+                    " Enter confirm cleanup  Esc cancel".into()
                 } else if !alive {
                     " Esc back  c clean up  ? help  q quit".into()
                 } else {
