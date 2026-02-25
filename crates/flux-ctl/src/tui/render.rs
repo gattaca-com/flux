@@ -11,13 +11,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         View::Detail(_) => render_detail(frame, app),
     }
 
-    // Confirm popup (works in both views)
-    let confirming = match &app.view {
-        View::List => app.confirm_cleanup,
-        View::Detail(d) => d.confirm_cleanup,
-    };
-    if confirming {
-        render_confirm_popup(frame, frame.area());
+    // Confirm popups (work in both views)
+    if app.confirm_cleanup_all {
+        render_confirm_all_popup(frame, app, frame.area());
+    } else {
+        let confirming = match &app.view {
+            View::List => app.confirm_cleanup,
+            View::Detail(d) => d.confirm_cleanup,
+        };
+        if confirming {
+            render_confirm_popup(frame, frame.area());
+        }
     }
 
     if app.show_help {
@@ -352,16 +356,59 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect) {
     );
 }
 
+fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let dead_count: usize = app
+        .groups
+        .iter()
+        .flat_map(|g| &g.segments)
+        .filter(|s| !s.alive)
+        .count();
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Destroy all {dead_count} stale segments?"),
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(""),
+        Line::from("  This will unlink every dead segment's shared"),
+        Line::from("  memory backing file and remove its flink."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter ", Style::default().fg(Color::Red).bold()),
+            Span::raw("Confirm  "),
+            Span::styled("  Esc ", Style::default().fg(Color::DarkGray).bold()),
+            Span::raw("Cancel"),
+        ]),
+        Line::from(""),
+    ];
+
+    let popup_area = centered_rect(52, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" ⚠ Confirm Destroy All ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup_area,
+    );
+}
+
 // ─── Status bar ─────────────────────────────────────────────────────────────
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let confirming = match &app.view {
+    let confirming_single = match &app.view {
         View::List => app.confirm_cleanup,
         View::Detail(d) => d.confirm_cleanup,
     };
 
-    let text = if confirming {
-        " Enter confirm cleanup  Esc cancel".into()
+    let has_any_dead = app.groups.iter().any(|g| g.segments.iter().any(|s| !s.alive));
+
+    let text = if app.confirm_cleanup_all || confirming_single {
+        " Enter confirm  Esc cancel".into()
     } else if let Some((ref msg, _)) = app.status_msg {
         msg.clone()
     } else {
@@ -371,18 +418,18 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     app.selected_item(),
                     Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
                 );
-                if on_dead_seg {
-                    " ↑↓ navigate  Enter open  d destroy  ? help  q quit".into()
-                } else {
-                    " ↑↓ navigate  Enter open  ? help  q quit".into()
+                match (on_dead_seg, has_any_dead) {
+                    (true, _) => " ↑↓ navigate  Enter open  d destroy  D destroy all  ? help  q quit".into(),
+                    (false, true) => " ↑↓ navigate  Enter open  D destroy all  ? help  q quit".into(),
+                    _ => " ↑↓ navigate  Enter open  ? help  q quit".into(),
                 }
             }
             View::Detail(_) => {
                 let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
-                if !alive {
-                    " Esc back  d destroy  ? help  q quit".into()
-                } else {
-                    " Esc back  ? help  q quit".into()
+                match (!alive, has_any_dead) {
+                    (true, _) => " Esc back  d destroy  D destroy all  ? help  q quit".into(),
+                    (false, true) => " Esc back  D destroy all  ? help  q quit".into(),
+                    _ => " Esc back  ? help  q quit".into(),
                 }
             }
         }
@@ -424,6 +471,10 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  d        ", Style::default().fg(Color::Yellow)),
             Span::raw("Destroy dead segment"),
+        ]),
+        Line::from(vec![
+            Span::styled("  D        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Destroy all dead segments"),
         ]),
         Line::from(vec![
             Span::styled("  r        ", Style::default().fg(Color::Yellow)),

@@ -54,6 +54,7 @@ pub struct App {
     pub view: View,
     pub status_msg: Option<(String, Instant)>,
     pub confirm_cleanup: bool,
+    pub confirm_cleanup_all: bool,
 }
 
 const STATUS_MSG_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
@@ -71,6 +72,7 @@ impl App {
             view: View::List,
             status_msg: None,
             confirm_cleanup: false,
+            confirm_cleanup_all: false,
         };
         app.refresh();
         app
@@ -88,6 +90,7 @@ impl App {
             view: View::List,
             status_msg: None,
             confirm_cleanup: false,
+            confirm_cleanup_all: false,
         };
         app.recount_rows();
         app
@@ -325,8 +328,37 @@ impl App {
         }
     }
 
+    pub fn request_cleanup_all(&mut self) {
+        let dead_flinks: Vec<String> = self
+            .groups
+            .iter()
+            .flat_map(|g| &g.segments)
+            .filter(|s| !s.alive)
+            .map(|s| s.entry.flink.as_str().to_string())
+            .collect();
+
+        if dead_flinks.is_empty() {
+            self.status_msg = Some(("No stale segments to clean".into(), Instant::now()));
+            return;
+        }
+
+        if self.confirm_cleanup_all {
+            let n = dead_flinks.len();
+            for flink in &dead_flinks {
+                cleanup_flink(Path::new(flink));
+            }
+            self.status_msg = Some((format!("Cleaned up {n} stale segments"), Instant::now()));
+            self.confirm_cleanup_all = false;
+            self.view = View::List;
+            self.refresh();
+        } else {
+            self.confirm_cleanup_all = true;
+        }
+    }
+
     pub fn cancel_cleanup(&mut self) {
         self.confirm_cleanup = false;
+        self.confirm_cleanup_all = false;
         if let View::Detail(ref mut detail) = self.view {
             detail.confirm_cleanup = false;
         }

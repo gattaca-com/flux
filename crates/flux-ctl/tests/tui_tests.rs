@@ -1008,3 +1008,124 @@ fn healthy_segment_has_no_poison() {
     assert!(!text.contains("poisoned"), "healthy segment should not show poisoned:\n{text}");
     assert!(text.contains("alive"), "should show alive:\n{text}");
 }
+
+// ─── Destroy-all tests ──────────────────────────────────────────────────────
+
+#[test]
+fn destroy_all_shows_confirm_when_dead_exist() {
+    let dead = data_entry("ghost", "Old", "/dev/shm/test_da_confirm", 64);
+    dead.pids.detach(std::process::id());
+    dead.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+            poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.request_cleanup_all();
+    assert!(app.confirm_cleanup_all);
+
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+    assert!(text.contains("Destroy all"), "confirm popup:\n{text}");
+    assert!(text.contains("1 stale"), "should show count:\n{text}");
+}
+
+#[test]
+fn destroy_all_noop_when_all_alive() {
+    let entry = queue_entry("myapp", "Msg", "/dev/shm/test_da_alive", 8, 16);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: None,
+            poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.request_cleanup_all();
+    assert!(!app.confirm_cleanup_all);
+    assert!(app.status_msg.is_some(), "should say no stale segments");
+}
+
+#[test]
+fn destroy_all_cancel_hides_confirm() {
+    let dead = data_entry("ghost", "Old", "/dev/shm/test_da_cancel", 64);
+    dead.pids.detach(std::process::id());
+    dead.pids.attach(99999999);
+
+    let groups = vec![AppGroup {
+        name: "ghost".into(),
+        segments: vec![SegmentInfo {
+            entry: dead,
+            alive: false,
+            pid_count: 1,
+            queue_writes: None,
+            poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.request_cleanup_all();
+    assert!(app.confirm_cleanup_all);
+    app.cancel_cleanup();
+    assert!(!app.confirm_cleanup_all);
+}
+
+#[test]
+fn status_bar_shows_destroy_all_hint() {
+    let dead = data_entry("ghost", "Old", "/dev/shm/test_da_hint", 64);
+    dead.pids.detach(std::process::id());
+    dead.pids.attach(99999999);
+
+    let alive_entry = queue_entry("myapp", "Msg", "/dev/shm/test_da_hint2", 8, 16);
+
+    let groups = vec![
+        AppGroup {
+            name: "ghost".into(),
+            segments: vec![SegmentInfo {
+                entry: dead,
+                alive: false,
+                pid_count: 1,
+                queue_writes: None,
+                poison: None,
+            }],
+            expanded: true,
+        },
+        AppGroup {
+            name: "myapp".into(),
+            segments: vec![SegmentInfo {
+                entry: alive_entry,
+                alive: true,
+                pid_count: 1,
+                queue_writes: None,
+                poison: None,
+            }],
+            expanded: true,
+        },
+    ];
+
+    // Cursor on alive segment — should still show "D destroy all" since dead exist
+    let mut app = App::with_groups(groups);
+    app.selected = 3; // myapp > Msg (alive)
+
+    let buf = render_to_buffer(&mut app, 120, 15);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("D destroy all"),
+        "status bar should show D hint when dead segments exist:\n{text}"
+    );
+}

@@ -35,12 +35,18 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
 
                     // If any cleanup confirmation is pending, handle it first.
                     let confirming = match &app.view {
-                        View::List => app.confirm_cleanup,
+                        View::List => app.confirm_cleanup || app.confirm_cleanup_all,
                         View::Detail(d) => d.confirm_cleanup,
                     };
                     if confirming {
                         match key.code {
-                            KeyCode::Enter => app.request_cleanup(),
+                            KeyCode::Enter => {
+                                if app.confirm_cleanup_all {
+                                    app.request_cleanup_all();
+                                } else {
+                                    app.request_cleanup();
+                                }
+                            }
                             _ => app.cancel_cleanup(),
                         }
                         continue;
@@ -54,6 +60,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
                             KeyCode::Down | KeyCode::Char('j') => app.next(),
                             KeyCode::Enter => app.enter(),
                             KeyCode::Char('d') => app.request_cleanup(),
+                            KeyCode::Char('D') => app.request_cleanup_all(),
                             KeyCode::Char('r') => app.refresh(),
                             _ => {}
                         },
@@ -62,6 +69,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
                             KeyCode::Esc | KeyCode::Backspace => app.back(),
                             KeyCode::Char('?') => app.toggle_help(),
                             KeyCode::Char('d') => app.request_cleanup(),
+                            KeyCode::Char('D') => app.request_cleanup_all(),
                             KeyCode::Char('r') => app.refresh(),
                             KeyCode::Up | KeyCode::Char('k') => app.previous(),
                             KeyCode::Down | KeyCode::Char('j') => app.next(),
