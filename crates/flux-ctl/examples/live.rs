@@ -86,14 +86,14 @@ fn main() {
     }
 
     println!("╔══════════════════════════════════════════════════╗");
-    println!("║  flux-ctl live demo                             ║");
-    println!("║                                                 ║");
-    println!("║  Simulating two apps writing shmem queues.      ║");
-    println!("║  Open another terminal and run:                 ║");
-    println!("║                                                 ║");
-    println!("║    cargo run -p flux-ctl -- watch               ║");
-    println!("║                                                 ║");
-    println!("║  Press Ctrl-C to stop.                          ║");
+    println!("║  flux-ctl live demo                              ║");
+    println!("║                                                  ║");
+    println!("║  Simulating two apps writing shmem queues.       ║");
+    println!("║  Open another terminal and run:                  ║");
+    println!("║                                                  ║");
+    println!("║    cargo run -p flux-ctl -- watch                ║");
+    println!("║                                                  ║");
+    println!("║  Press Ctrl-C to stop.                           ║");
     println!("╚══════════════════════════════════════════════════╝\n");
 
     // ── App 1: market-data ──────────────────────────────────────────────
