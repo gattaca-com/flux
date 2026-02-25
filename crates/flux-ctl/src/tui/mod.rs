@@ -25,19 +25,20 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if app.show_help {
-                        // Any key dismisses help
-                        app.show_help = false;
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
-                            KeyCode::Char('?') => app.toggle_help(),
-                            KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                            KeyCode::Down | KeyCode::Char('j') => app.next(),
-                            KeyCode::Enter => app.toggle_expand(),
-                            KeyCode::Char('r') => app.refresh(),
-                            _ => {}
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if app.show_help {
+                                app.show_help = false;
+                            } else {
+                                break;
+                            }
                         }
+                        KeyCode::Char('?') => app.toggle_help(),
+                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                        KeyCode::Down | KeyCode::Char('j') => app.next(),
+                        KeyCode::Enter => app.toggle_expand(),
+                        KeyCode::Char('r') => app.refresh(),
+                        _ => {}
                     }
                 }
             }
