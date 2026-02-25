@@ -53,7 +53,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
                             KeyCode::Up | KeyCode::Char('k') => app.previous(),
                             KeyCode::Down | KeyCode::Char('j') => app.next(),
                             KeyCode::Enter => app.enter(),
-                            KeyCode::Char('c') => app.request_cleanup(),
+                            KeyCode::Char('d') => app.request_cleanup(),
                             KeyCode::Char('r') => app.refresh(),
                             _ => {}
                         },
@@ -61,7 +61,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
                             KeyCode::Char('q') => break,
                             KeyCode::Esc | KeyCode::Backspace => app.back(),
                             KeyCode::Char('?') => app.toggle_help(),
-                            KeyCode::Char('c') => app.request_cleanup(),
+                            KeyCode::Char('d') => app.request_cleanup(),
                             KeyCode::Char('r') => app.refresh(),
                             KeyCode::Up | KeyCode::Char('k') => app.previous(),
                             KeyCode::Down | KeyCode::Char('j') => app.next(),

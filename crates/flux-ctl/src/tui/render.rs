@@ -342,7 +342,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
                 );
                 if on_dead_seg {
-                    " ↑↓ navigate  Enter open  c clean up  ? help  q quit".into()
+                    " ↑↓ navigate  Enter open  d destroy  ? help  q quit".into()
                 } else {
                     " ↑↓ navigate  Enter open  ? help  q quit".into()
                 }
@@ -350,7 +350,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             View::Detail(_) => {
                 let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
                 if !alive {
-                    " Esc back  c clean up  ? help  q quit".into()
+                    " Esc back  d destroy  ? help  q quit".into()
                 } else {
                     " Esc back  ? help  q quit".into()
                 }
@@ -392,8 +392,8 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::raw("Back / close popup / quit"),
         ]),
         Line::from(vec![
-            Span::styled("  c        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Clean up dead segment (detail view)"),
+            Span::styled("  d        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Destroy dead segment"),
         ]),
         Line::from(vec![
             Span::styled("  r        ", Style::default().fg(Color::Yellow)),

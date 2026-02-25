@@ -11,7 +11,7 @@ struct Cli {
     base_dir: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -28,7 +28,7 @@ enum Commands {
         /// Segment name filter
         segment: Option<String>,
     },
-    /// Live TUI monitor
+    /// Live TUI monitor (default)
     Watch {
         /// App name filter
         app: Option<String>,
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let base_dir = cli.base_dir.unwrap_or_else(flux_utils::directories::local_share_dir);
 
-    match cli.command {
+    match cli.command.unwrap_or(Commands::Watch { app: None }) {
         Commands::List { verbose } => discovery::list_all(&base_dir, verbose),
         Commands::Inspect { app, segment } => {
             discovery::inspect(&base_dir, app.as_deref(), segment.as_deref())

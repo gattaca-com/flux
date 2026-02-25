@@ -771,8 +771,8 @@ fn detail_status_bar_shows_cleanup_hint_for_dead() {
 
     // Status bar should hint about cleanup for dead segments
     assert!(
-        text.contains("c clean"),
-        "status bar should show cleanup hint for dead segment:\n{text}"
+        text.contains("d destroy"),
+        "status bar should show destroy hint for dead segment:\n{text}"
     );
 }
 
@@ -923,7 +923,7 @@ fn list_status_bar_shows_cleanup_hint_for_dead() {
     let text = buffer_text(&buf);
 
     assert!(
-        text.contains("c clean"),
-        "status bar should show cleanup hint:\n{text}"
+        text.contains("d destroy"),
+        "status bar should show destroy hint:\n{text}"
     );
 }
