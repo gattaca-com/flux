@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::time::SystemTime;
 
 use flux_utils::ArrayStr;
@@ -10,7 +10,7 @@ pub const MAX_PIDS_PER_ENTRY: usize = 256;
 pub const REGISTRY_FLINK_NAME: &str = "flux/_shmem_registry";
 
 const REGISTRY_MAGIC: u32 = u32::from_le_bytes(*b"FLXR");
-const REGISTRY_VERSION: u32 = 2;
+const REGISTRY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -206,6 +206,8 @@ pub struct ShmemRegistry {
     pub version: AtomicU32,
     pub count: AtomicU32,
     pub _pad: u32,
+    /// Timestamp (nanos since epoch) of last `populate_from_fs` call.
+    pub last_populated_nanos: AtomicU64,
     pub entries: [ShmemEntry; MAX_REGISTRY_ENTRIES],
 }
 
@@ -454,7 +456,19 @@ impl ShmemRegistry {
     /// Scan the filesystem under `base_dir` for pre-existing shared memory
     /// flinks and register any that are not yet in the registry. Removes
     /// stale flinks whose backing shared memory no longer exists.
+    ///
+    /// Skips the scan if fewer than 5 seconds have passed since the last
+    /// successful populate (tracked via `last_populated_nanos` in the
+    /// registry header).
     pub fn populate_from_fs(&self, base_dir: &Path) -> PopulateResult {
+        const POPULATE_COOLDOWN_SECS: u64 = 5;
+
+        let now = now_nanos();
+        let last = self.last_populated_nanos.load(Ordering::Relaxed);
+        if last > 0 && now.saturating_sub(last) < POPULATE_COOLDOWN_SECS * 1_000_000_000 {
+            return PopulateResult::default();
+        }
+
         let mut result = PopulateResult::default();
 
         let Ok(dir_entries) = std::fs::read_dir(base_dir) else {
@@ -536,6 +550,7 @@ impl ShmemRegistry {
             }
         }
 
+        self.last_populated_nanos.store(now_nanos(), Ordering::Relaxed);
         result
     }
 }
