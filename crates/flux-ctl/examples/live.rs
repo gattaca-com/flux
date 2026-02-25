@@ -12,11 +12,13 @@
 //!   --reattach         Reattach to existing segments from a previous run
 //!   --workers <N>      Fork N child worker processes that attach to the same
 //!                      segments (default: 0, i.e. single-process mode)
+//!   --poison           After 3s, crash a child process mid-write to poison
+//!                      a seqlock slot (simulates a real production crash)
 //!
 //! Press Ctrl-C to stop (propagates to children).
 
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -24,7 +26,8 @@ use std::time::Duration;
 use flux_communication::queue::{Consumer, Producer, Queue, QueueType};
 use flux_communication::registry::ShmemRegistry;
 use flux_communication::{shmem_queue_with_base_dir, ShmemData};
-use flux_utils::directories::local_share_dir;
+use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
+use shared_memory::ShmemConf;
 
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(C)]
@@ -75,7 +78,9 @@ struct Flags {
     no_cleanup: bool,
     reattach: bool,
     workers: usize,
+    poison: bool,
     is_worker: bool,
+    is_poison_crash: bool,
 }
 
 fn parse_flags() -> Flags {
@@ -89,14 +94,18 @@ fn parse_flags() -> Flags {
         no_cleanup: args.iter().any(|a| a == "--no-cleanup"),
         reattach: args.iter().any(|a| a == "--reattach"),
         workers,
+        poison: args.iter().any(|a| a == "--poison"),
         is_worker: args.iter().any(|a| a == "--_worker"),
+        is_poison_crash: args.iter().any(|a| a == "--_poison_crash"),
     }
 }
 
 fn main() {
     let flags = parse_flags();
 
-    if flags.is_worker {
+    if flags.is_poison_crash {
+        run_poison_crash();
+    } else if flags.is_worker {
         run_worker();
     } else {
         run_primary(flags);
@@ -225,6 +234,29 @@ fn run_primary(flags: Flags) {
         }));
     }
 
+    // --poison: after 3s, spawn a child that opens the trade queue shmem,
+    // sets a seqlock slot's version to odd (simulating a mid-write crash),
+    // then aborts. The TUI will show ☠ poisoned on the Trade segment.
+    if flags.poison {
+        let exe = std::env::current_exe().expect("resolve own exe path");
+        let stop2 = stop.clone();
+        thread::spawn(move || {
+            for _ in 0..30 {
+                if stop2.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            println!("\n  💉 --poison: spawning child to crash mid-write on Trade queue...");
+            let mut child = Command::new(&exe)
+                .arg("--_poison_crash")
+                .spawn()
+                .expect("spawn poison child");
+            let status = child.wait().expect("wait poison child");
+            println!("  💉 poison child exited: {status} — Trade queue should now show ☠ poisoned");
+        });
+    }
+
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
     }
@@ -345,4 +377,42 @@ fn run_worker() {
     }
 
     eprintln!("  [worker {pid}] exiting");
+}
+
+/// Simulates a process crashing mid-write on the Trade queue.
+///
+/// Opens the shmem backing the Trade queue, finds the seqlock buffer,
+/// sets a slot's version to odd (exactly what `Seqlock::write` does as its
+/// first step via `fetch_add(1)`), then aborts without completing the write.
+fn run_poison_crash() {
+    let base_dir = local_share_dir();
+    let flink = shmem_dir_queues_with_base(&base_dir, "market-data").join("Trade");
+    let pid = std::process::id();
+
+    eprintln!("  [poison {pid}] opening Trade queue at {}", flink.display());
+
+    let shmem = ShmemConf::new()
+        .flink(&flink)
+        .open()
+        .expect("open Trade queue shmem");
+
+    let base = shmem.as_ptr();
+
+    // QueueHeader is repr(C, align(64)) → 64 bytes, buffer follows.
+    // Each slot is elsize bytes with AtomicU64 version at offset 0.
+    const HEADER_SIZE: usize = 64;
+    let elsize = unsafe { &*(base as *const flux_communication::queue::QueueHeader) }.elsize;
+
+    // Pick slot 3 (arbitrary, away from the active write head)
+    let slot = 3;
+    let version_ptr = unsafe { base.add(HEADER_SIZE + slot * elsize) } as *const AtomicU64;
+    let version = unsafe { &*version_ptr };
+
+    // Do exactly what Seqlock::write does first: fetch_add(1) → version becomes odd
+    let v = version.fetch_add(1, Ordering::Release);
+    eprintln!("  [poison {pid}] slot {slot} version {v} → {} (odd = write in progress)", v + 1);
+    eprintln!("  [poison {pid}] aborting — write will never complete ☠");
+
+    // Abort without completing the write. The slot stays at odd version forever.
+    std::process::abort();
 }
