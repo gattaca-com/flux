@@ -448,13 +448,33 @@ fn format_pids(entry: &ShmemEntry) -> String {
     }
 }
 
+/// Read AT_CLKTCK from /proc/self/auxv (ELF auxiliary vector).
+/// Falls back to 100 if the file can't be read.
+fn clock_ticks_per_sec() -> u64 {
+    const AT_CLKTCK: u64 = 17;
+    let Ok(data) = std::fs::read("/proc/self/auxv") else {
+        return 100;
+    };
+    // auxv is a sequence of (u64 type, u64 value) pairs, terminated by AT_NULL=0.
+    for chunk in data.chunks_exact(16) {
+        let a_type = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
+        if a_type == 0 {
+            break;
+        }
+        if a_type == AT_CLKTCK {
+            return u64::from_ne_bytes(chunk[8..16].try_into().unwrap());
+        }
+    }
+    100
+}
+
 fn read_start_time(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.rsplit_once(')')?.1;
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     // Field 19 after comm = starttime (field 21 in full stat, 0-indexed)
     let starttime_ticks: u64 = fields.get(19)?.parse().ok()?;
-    let ticks_per_sec: u64 = 100; // sysconf(_SC_CLK_TCK), typically 100 on Linux
+    let ticks_per_sec = clock_ticks_per_sec();
 
     let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
     let btime_line = proc_stat.lines().find(|l| l.starts_with("btime "))?;

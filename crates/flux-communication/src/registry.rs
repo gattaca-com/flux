@@ -131,7 +131,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct ShmemEntry {
     pub kind: ShmemKind,
     pub _pad0: [u8; 3],
@@ -144,6 +144,13 @@ pub struct ShmemEntry {
     pub capacity: usize,
     pub created_at_nanos: u64,
 }
+
+const _: () = {
+    // ShmemEntry must be a stable size across processes. If this fires,
+    // a field was added/removed — bump REGISTRY_VERSION.
+    assert!(std::mem::size_of::<ShmemEntry>() == 1472);
+    assert!(std::mem::align_of::<ShmemEntry>() == 64);
+};
 
 impl Clone for ShmemEntry {
     fn clone(&self) -> Self {

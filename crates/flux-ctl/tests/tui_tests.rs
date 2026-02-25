@@ -252,7 +252,7 @@ fn toggle_expand_collapse() {
 
     // Collapse
     app.selected = 0;
-    app.toggle_expand();
+    app.enter();
     assert_eq!(app.total_rows, 1);
     assert!(!app.groups[0].expanded);
 
@@ -263,7 +263,7 @@ fn toggle_expand_collapse() {
     assert!(text.contains("▶"), "collapsed icon:\n{text}");
 
     // Expand again
-    app.toggle_expand();
+    app.enter();
     assert_eq!(app.total_rows, 3);
     assert!(app.groups[0].expanded);
 

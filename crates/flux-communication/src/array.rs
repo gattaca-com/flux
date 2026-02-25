@@ -22,7 +22,6 @@ impl ArrayHeader {
 
     pub fn open_shared<S: AsRef<Path>>(path: S) -> Result<&'static mut Self, ShmemError> {
         let path = path.as_ref();
-        let _ = std::fs::create_dir_all(path);
         let shmem = ShmemConf::new().flink(path).open()?;
         let ptr = shmem.as_ptr();
         std::mem::forget(shmem);

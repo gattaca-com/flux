@@ -488,7 +488,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Press any key to close",
+            "  Press ? to close",
             Style::default().fg(Color::DarkGray).italic(),
         )),
     ];

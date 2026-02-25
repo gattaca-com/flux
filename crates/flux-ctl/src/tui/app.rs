@@ -419,8 +419,4 @@ impl App {
             None
         }
     }
-
-    pub fn toggle_expand(&mut self) {
-        self.enter();
-    }
 }
