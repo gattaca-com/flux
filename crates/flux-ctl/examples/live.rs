@@ -245,7 +245,7 @@ fn run_primary(flags: Flags) {
             // queue shows up healthy and active in the TUI before we poison it
             let start = std::time::Instant::now();
             let mut n = 0u64;
-            while start.elapsed() < Duration::from_secs(2) {
+            while start.elapsed() < Duration::from_secs(5) {
                 if stop2.load(Ordering::Relaxed) {
                     return;
                 }
@@ -253,7 +253,7 @@ fn run_primary(flags: Flags) {
                 n += 1;
                 thread::sleep(Duration::from_millis(10));
             }
-            println!("  💉 wrote {n} messages over 2s, now poisoning the next slot...");
+            println!("  💉 wrote {n} messages over 5s, now poisoning the next slot...");
 
             // The queue's write count is now 10. The next slot to be written
             // is at index (count & mask). We open the raw shmem and do exactly
