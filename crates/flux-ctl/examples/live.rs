@@ -8,17 +8,20 @@
 //!   cargo run -p flux-ctl -- watch
 //!
 //! Flags:
-//!   --no-cleanup   Leave shmem segments intact on exit
-//!   --reattach     Reattach to existing segments from a previous run
+//!   --no-cleanup       Leave shmem segments intact on exit
+//!   --reattach         Reattach to existing segments from a previous run
+//!   --workers <N>      Fork N child worker processes that attach to the same
+//!                      segments (default: 0, i.e. single-process mode)
 //!
-//! Press Ctrl-C to stop.
+//! Press Ctrl-C to stop (propagates to children).
 
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use flux_communication::queue::{Producer, Queue, QueueType};
+use flux_communication::queue::{Consumer, Producer, Queue, QueueType};
 use flux_communication::registry::ShmemRegistry;
 use flux_communication::{shmem_queue_with_base_dir, ShmemData};
 use flux_utils::directories::local_share_dir;
@@ -71,18 +74,36 @@ struct EngineState {
 struct Flags {
     no_cleanup: bool,
     reattach: bool,
+    workers: usize,
+    is_worker: bool,
 }
 
 fn parse_flags() -> Flags {
     let args: Vec<String> = std::env::args().collect();
+    let workers = args
+        .windows(2)
+        .find(|w| w[0] == "--workers")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(0);
     Flags {
         no_cleanup: args.iter().any(|a| a == "--no-cleanup"),
         reattach: args.iter().any(|a| a == "--reattach"),
+        workers,
+        is_worker: args.iter().any(|a| a == "--_worker"),
     }
 }
 
 fn main() {
     let flags = parse_flags();
+
+    if flags.is_worker {
+        run_worker();
+    } else {
+        run_primary(flags);
+    }
+}
+
+fn run_primary(flags: Flags) {
     let base_dir = local_share_dir();
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -94,16 +115,8 @@ fn main() {
         .expect("set Ctrl-C handler");
     }
 
-    let mode = if flags.reattach {
-        "reattach"
-    } else {
-        "new session"
-    };
-    let cleanup = if flags.no_cleanup {
-        "no cleanup"
-    } else {
-        "cleanup on exit"
-    };
+    let mode = if flags.reattach { "reattach" } else { "new session" };
+    let cleanup = if flags.no_cleanup { "no cleanup" } else { "cleanup on exit" };
 
     println!("╔══════════════════════════════════════════════════╗");
     println!("║  flux-ctl live demo                              ║");
@@ -115,11 +128,8 @@ fn main() {
     println!("║                                                  ║");
     println!("║  Press Ctrl-C to stop.                           ║");
     println!("╚══════════════════════════════════════════════════╝");
-    println!("  mode: {mode}, {cleanup}\n");
+    println!("  mode: {mode}, {cleanup}, workers: {}\n", flags.workers);
 
-    // shmem_queue_with_base_dir and ShmemData::open_or_init both use
-    // open-or-create semantics, so they naturally reattach to existing
-    // segments when --reattach is used. For a fresh start, clean first.
     if !flags.reattach {
         let registry = ShmemRegistry::open_or_create(&base_dir);
         registry.cleanup_app("market-data");
@@ -140,8 +150,21 @@ fn main() {
         ShmemData::open_or_init_with_base_dir(&base_dir, "order-engine", EngineState::default)
             .unwrap();
 
+    // Spawn child worker processes that attach to the same segments
+    let mut children: Vec<std::process::Child> = Vec::new();
+    let exe = std::env::current_exe().expect("resolve own exe path");
+    for i in 0..flags.workers {
+        let child = Command::new(&exe)
+            .arg("--_worker")
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn worker {i}: {e}"));
+        println!("  spawned worker {i} (pid {})", child.id());
+        children.push(child);
+    }
+
     let mut handles = Vec::new();
 
+    // Quotes: ~1000 msgs/sec
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
@@ -162,6 +185,7 @@ fn main() {
         }));
     }
 
+    // Trades: ~100 msgs/sec
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
@@ -181,6 +205,7 @@ fn main() {
         }));
     }
 
+    // Orders: ~10 msgs/sec
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
@@ -209,6 +234,14 @@ fn main() {
         h.join().unwrap();
     }
 
+    // Wait for worker children (Ctrl-C already propagated via process group)
+    for (i, mut child) in children.into_iter().enumerate() {
+        match child.wait() {
+            Ok(status) => println!("  worker {i} exited: {status}"),
+            Err(e) => eprintln!("  worker {i} wait error: {e}"),
+        }
+    }
+
     if flags.no_cleanup {
         println!("Skipping cleanup (--no-cleanup). Segments remain in shared memory.");
     } else {
@@ -218,4 +251,98 @@ fn main() {
         registry.cleanup_app("order-engine");
         println!("Done.");
     }
+}
+
+/// Worker process: attaches to the same segments as the primary and consumes
+/// messages in a loop until killed (Ctrl-C propagates from the parent's
+/// process group).
+fn run_worker() {
+    let base_dir = local_share_dir();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || {
+            stop.store(true, Ordering::Relaxed);
+        })
+        .expect("set Ctrl-C handler");
+    }
+
+    let pid = std::process::id();
+    eprintln!("  [worker {pid}] attaching to segments...");
+
+    // Attach to existing queues (open-or-create reattaches; registration
+    // records this PID against the same flink)
+    let quote_q: Queue<Quote> =
+        shmem_queue_with_base_dir(&base_dir, "market-data", 4096, QueueType::SPMC);
+    let trade_q: Queue<Trade> =
+        shmem_queue_with_base_dir(&base_dir, "market-data", 1024, QueueType::SPMC);
+    let _risk: ShmemData<RiskMetrics> =
+        ShmemData::open_or_init_with_base_dir(&base_dir, "market-data", RiskMetrics::default)
+            .unwrap();
+
+    let order_q: Queue<OrderEvent> =
+        shmem_queue_with_base_dir(&base_dir, "order-engine", 2048, QueueType::MPMC);
+    let _state: ShmemData<EngineState> =
+        ShmemData::open_or_init_with_base_dir(&base_dir, "order-engine", EngineState::default)
+            .unwrap();
+
+    let mut handles = Vec::new();
+
+    // Consumer on quotes
+    {
+        let stop = stop.clone();
+        handles.push(thread::spawn(move || {
+            let mut c = Consumer::from(quote_q);
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                if c.consume(|_| {}) {
+                    n += 1;
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            eprintln!("  [worker {pid}] quotes consumed: {n}");
+        }));
+    }
+
+    // Consumer on trades
+    {
+        let stop = stop.clone();
+        handles.push(thread::spawn(move || {
+            let mut c = Consumer::from(trade_q);
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                if c.consume(|_| {}) {
+                    n += 1;
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            eprintln!("  [worker {pid}] trades consumed: {n}");
+        }));
+    }
+
+    // Consumer on orders
+    {
+        let stop = stop.clone();
+        handles.push(thread::spawn(move || {
+            let mut c = Consumer::from(order_q);
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                if c.consume(|_| {}) {
+                    n += 1;
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            eprintln!("  [worker {pid}] orders consumed: {n}");
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    eprintln!("  [worker {pid}] exiting");
 }
