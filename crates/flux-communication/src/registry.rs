@@ -481,3 +481,24 @@ pub fn data_entry(
         created_at_nanos: now_nanos(),
     }
 }
+
+pub fn seqlock_array_entry(
+    app_name: &str,
+    type_name: &str,
+    flink: &str,
+    elem_size: usize,
+    capacity: usize,
+) -> ShmemEntry {
+    ShmemEntry {
+        kind: ShmemKind::SeqlockArray,
+        _pad0: [0; 3],
+        pids: pid_set_self(),
+        app_name: ArrayStr::from_str_truncate(app_name),
+        type_name: ArrayStr::from_str_truncate(type_name),
+        flink: ArrayStr::from_str_truncate(flink),
+        type_hash: 0,
+        elem_size,
+        capacity,
+        created_at_nanos: now_nanos(),
+    }
+}

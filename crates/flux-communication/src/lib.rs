@@ -11,7 +11,9 @@ use std::path::Path;
 pub use array::SeqlockArray;
 pub use error::{EmptyError, QueueError, ReadError};
 use flux_utils::{
-    directories::{local_share_dir, shmem_dir_queues, shmem_dir_queues_with_base},
+    directories::{
+        local_share_dir, shmem_dir_arrays_with_base, shmem_dir_queues, shmem_dir_queues_with_base,
+    },
     short_typename,
 };
 pub use registry::{ShmemEntry, ShmemKind, ShmemRegistry};
@@ -63,4 +65,33 @@ pub fn shmem_queue_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy>(
     ));
 
     queue
+}
+
+pub fn shmem_array<S: AsRef<Path>, T: Copy>(
+    app_name: S,
+    len: usize,
+) -> Result<SeqlockArray<T>, error::QueueError> {
+    shmem_array_with_base_dir(local_share_dir(), app_name, len)
+}
+
+pub fn shmem_array_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy>(
+    base_dir: D,
+    app_name: S,
+    len: usize,
+) -> Result<SeqlockArray<T>, error::QueueError> {
+    let type_name = short_typename::<T>();
+    let flink_path =
+        shmem_dir_arrays_with_base(&base_dir, &app_name).join(type_name.as_str());
+    let arr = SeqlockArray::create_or_open_shared(&flink_path, len)?;
+
+    let reg = registry::ShmemRegistry::open_or_create(base_dir.as_ref());
+    reg.register(registry::seqlock_array_entry(
+        &app_name.as_ref().to_string_lossy(),
+        type_name.as_str(),
+        &flink_path.to_string_lossy(),
+        std::mem::size_of::<T>(),
+        len,
+    ));
+
+    Ok(arr)
 }

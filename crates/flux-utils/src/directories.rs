@@ -56,3 +56,14 @@ pub fn shmem_dir_data_with_base<D: AsRef<Path>, S: AsRef<Path>>(
 ) -> PathBuf {
     shmem_dir_with_base(base_dir, app_name).join("data")
 }
+
+pub fn shmem_dir_arrays<S: AsRef<Path>>(app_name: S) -> PathBuf {
+    shmem_dir(app_name).join("arrays")
+}
+
+pub fn shmem_dir_arrays_with_base<D: AsRef<Path>, S: AsRef<Path>>(
+    base_dir: D,
+    app_name: S,
+) -> PathBuf {
+    shmem_dir_with_base(base_dir, app_name).join("arrays")
+}
