@@ -52,6 +52,36 @@ fn guarded_tmpdir() -> (tempfile::TempDir, ShmemGuard) {
 // ─── Unit tests: buffer rendering with synthetic data ───────────────────────
 
 #[test]
+fn help_hint_visible_by_default() {
+    let mut app = App::with_groups(vec![]);
+    let buf = render_to_buffer(&mut app, 80, 20);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("Press ? for help"),
+        "help hint should appear in status bar:\n{text}"
+    );
+}
+
+#[test]
+fn help_popup_toggle() {
+    let mut app = App::with_groups(vec![]);
+    assert!(!app.show_help);
+
+    // Show help
+    app.toggle_help();
+    assert!(app.show_help);
+    let buf = render_to_buffer(&mut app, 80, 24);
+    let text = buffer_text(&buf);
+    assert!(text.contains("Keybindings"), "popup should show title:\n{text}");
+    assert!(text.contains("Move up"), "popup should list keys:\n{text}");
+    assert!(text.contains("Quit"), "popup should show quit:\n{text}");
+
+    // Dismiss
+    app.toggle_help();
+    assert!(!app.show_help);
+}
+
+#[test]
 fn render_empty_app() {
     let mut app = App::with_groups(vec![]);
     let buf = render_to_buffer(&mut app, 80, 20);

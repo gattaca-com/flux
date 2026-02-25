@@ -28,6 +28,7 @@ pub struct App {
     pub base_dir: PathBuf,
     pub app_filter: Option<String>,
     pub last_refresh: Instant,
+    pub show_help: bool,
 }
 
 impl App {
@@ -39,6 +40,7 @@ impl App {
             base_dir: base_dir.to_path_buf(),
             app_filter: app_filter.map(String::from),
             last_refresh: Instant::now(),
+            show_help: false,
         };
         app.refresh();
         app
@@ -53,6 +55,7 @@ impl App {
             base_dir: PathBuf::new(),
             app_filter: None,
             last_refresh: Instant::now(),
+            show_help: false,
         };
         app.recount_rows();
         app
@@ -120,6 +123,10 @@ impl App {
 
     pub fn previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
     }
 
     pub fn toggle_expand(&mut self) {

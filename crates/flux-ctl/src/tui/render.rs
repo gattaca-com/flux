@@ -103,9 +103,81 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
 
-    // Status bar
-    let status =
-        Paragraph::new(" q:quit  ↑↓/jk:navigate  Enter:expand/collapse  r:refresh")
-            .style(Style::default().fg(Color::DarkGray));
+    // Status bar — just a hint
+    let status = Paragraph::new(" Press ? for help")
+        .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[2]);
+
+    // Help popup
+    if app.show_help {
+        render_help_popup(frame, area);
+    }
+}
+
+fn render_help_popup(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(
+            " Keybindings ",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ↑ / k    ", Style::default().fg(Color::Yellow)),
+            Span::raw("Move up"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ↓ / j    ", Style::default().fg(Color::Yellow)),
+            Span::raw("Move down"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter    ", Style::default().fg(Color::Yellow)),
+            Span::raw("Expand / collapse app group"),
+        ]),
+        Line::from(vec![
+            Span::styled("  r        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Force refresh"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ?        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Toggle this help"),
+        ]),
+        Line::from(vec![
+            Span::styled("  q / Esc  ", Style::default().fg(Color::Yellow)),
+            Span::raw("Quit"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press any key to close",
+            Style::default().fg(Color::DarkGray).italic(),
+        )),
+    ];
+
+    let popup_height = lines.len() as u16 + 2; // +2 for border
+    let popup_width = 40;
+
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Help ")
+            .title_alignment(Alignment::Center),
+    );
+    frame.render_widget(popup, popup_area);
+}
+
+/// Return a centered `Rect` of fixed `width` × `height` within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(
+        x,
+        y,
+        width.min(area.width),
+        height.min(area.height),
+    )
 }
