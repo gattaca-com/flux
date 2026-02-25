@@ -489,3 +489,52 @@ fn multi_pid_renders_count() {
     // Should show "×3" for 3 attached PIDs
     assert!(text.contains("×3"), "should show multi-pid count:\n{text}");
 }
+
+#[test]
+fn sweep_dead_pids_removes_stale() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("app", "Msg", "/dev/shm/test_sweep", 8, 16));
+
+    // Attach several dead PIDs
+    let entry = &registry.entries()[0];
+    entry.pids.attach(99999990);
+    entry.pids.attach(99999991);
+    entry.pids.attach(99999992);
+    assert_eq!(entry.pids.count(), 4); // self + 3 dead
+
+    // Sweep at entry level
+    let removed = entry.pids.sweep_dead();
+    assert_eq!(removed, 3);
+    assert_eq!(entry.pids.count(), 1); // only self remains
+
+    // Re-add dead PIDs and test registry-level sweep
+    entry.pids.attach(99999993);
+    entry.pids.attach(99999994);
+    assert_eq!(entry.pids.count(), 3);
+    let total = registry.sweep_dead_pids();
+    assert_eq!(total, 2);
+    assert_eq!(entry.pids.count(), 1);
+}
+
+#[test]
+fn register_reattach_sweeps_dead() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path();
+
+    let registry = ShmemRegistry::open_or_create(base);
+    registry.register(queue_entry("app", "Msg", "/dev/shm/test_rsweep", 8, 16));
+
+    // Simulate dead PIDs from previous runs
+    let entry = &registry.entries()[0];
+    entry.pids.attach(99999990);
+    entry.pids.attach(99999991);
+    assert_eq!(entry.pids.count(), 3);
+
+    // Re-register same flink — should sweep dead PIDs before attaching
+    registry.register(queue_entry("app", "Msg", "/dev/shm/test_rsweep", 8, 16));
+    assert_eq!(registry.entry_count(), 1, "should still be 1 entry");
+    assert_eq!(entry.pids.count(), 1, "dead PIDs should have been swept");
+}

@@ -104,6 +104,20 @@ impl PidSet {
     pub fn any_alive(&self) -> bool {
         self.active_pids().iter().any(|&pid| is_pid_alive(pid))
     }
+
+    /// Remove all dead PIDs from the set. Returns the number removed.
+    pub fn sweep_dead(&self) -> usize {
+        let mut removed = 0;
+        for slot in &self.pids {
+            let pid = slot.load(Ordering::Relaxed);
+            if pid != 0 && !is_pid_alive(pid) {
+                if slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
 }
 
 // PidSet is !Clone because of AtomicU32. Provide a manual byte-wise copy
@@ -309,11 +323,13 @@ impl ShmemRegistry {
         let pid = entry.pids.creator_pid();
         let flink = entry.flink;
 
-        // Check if an entry with this flink already exists — if so, just attach.
+        // Check if an entry with this flink already exists — if so, reap dead
+        // PIDs and attach.
         let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
         for i in 0..count {
             let existing = &self.entries[i as usize];
             if existing.flink.as_str() == flink.as_str() && !existing.is_empty() {
+                existing.pids.sweep_dead();
                 existing.pids.attach(pid);
                 return Some(i);
             }
@@ -376,6 +392,17 @@ impl ShmemRegistry {
 
     pub fn entry_count(&self) -> u32 {
         self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32)
+    }
+
+    /// Sweep dead PIDs from all entries. Returns total number of dead PIDs removed.
+    pub fn sweep_dead_pids(&self) -> usize {
+        let mut total = 0;
+        for entry in self.entries() {
+            if !entry.is_empty() {
+                total += entry.pids.sweep_dead();
+            }
+        }
+        total
     }
 
     /// Clean up shmem backing files for all entries matching the given app name.

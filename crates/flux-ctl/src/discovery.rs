@@ -6,10 +6,13 @@ use flux_communication::registry::{
     REGISTRY_FLINK_NAME, ShmemEntry, ShmemKind, ShmemRegistry, cleanup_flink,
 };
 
-/// Open the global registry at `<base_dir>/flux/_shmem_registry`
+/// Open the global registry at `<base_dir>/flux/_shmem_registry`.
+/// Sweeps dead PIDs from all entries on open.
 pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {
     let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
-    ShmemRegistry::open(&registry_path)
+    let reg = ShmemRegistry::open(&registry_path)?;
+    reg.sweep_dead_pids();
+    Some(reg)
 }
 
 // Re-export for convenience (used by tests and TUI)
