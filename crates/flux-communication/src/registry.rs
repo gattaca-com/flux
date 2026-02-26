@@ -368,7 +368,11 @@ impl ShmemRegistry {
             let existing = &self.entries[i as usize];
             if existing.flink.as_str() == flink.as_str() && !existing.is_empty() {
                 existing.pids.sweep_dead();
-                existing.pids.attach(pid);
+                // pid == 0 means the caller is an observer (e.g. populate_from_fs)
+                // that should not appear in the PID set.
+                if pid != 0 {
+                    existing.pids.attach(pid);
+                }
                 return Some(i);
             }
         }
@@ -386,7 +390,9 @@ impl ShmemRegistry {
             let existing = &self.entries[i as usize];
             if existing.flink.as_str() == flink.as_str() && !existing.is_empty() {
                 existing.pids.sweep_dead();
-                existing.pids.attach(pid);
+                if pid != 0 {
+                    existing.pids.attach(pid);
+                }
                 // Abandon our claimed slot by leaving it as zeroed/Unknown.
                 return Some(i);
             }
@@ -893,7 +899,7 @@ impl ShmemRegistry {
                         let entry = ShmemEntry {
                             kind: *kind,
                             _pad0: [0; 3],
-                            pids: pid_set_self(),
+                            pids: PidSet::default(),
                             app_name: ArrayStr::from_str_truncate(&app_name),
                             type_name: ArrayStr::from_str_truncate(&type_name),
                             flink: ArrayStr::from_str_truncate(&flink_str),
@@ -931,7 +937,7 @@ impl ShmemRegistry {
                     let entry = ShmemEntry {
                         kind: *kind,
                         _pad0: [0; 3],
-                        pids: pid_set_self(),
+                        pids: PidSet::default(),
                         app_name: ArrayStr::from_str_truncate(&app_name),
                         type_name: ArrayStr::from_str_truncate(&type_name),
                         flink: ArrayStr::from_str_truncate(&flink_str),
