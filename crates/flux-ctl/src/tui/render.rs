@@ -59,7 +59,7 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, chunks[0]);
 
-    let header = Row::new(vec!["Name", "Kind", "Details", "PIDs", "Status"])
+    let header = Row::new(vec!["Name", "Kind", "Details", "Conns", "Status"])
         .style(Style::default().fg(Color::Cyan).bold())
         .bottom_margin(1);
 
@@ -124,11 +124,7 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                     }
                     _ => format!("size={}B", seg.entry.elem_size),
                 };
-                let pid_display = if seg.pid_count <= 1 {
-                    format!("{}", seg.entry.creator_pid())
-                } else {
-                    format!("{} (×{})", seg.entry.creator_pid(), seg.pid_count)
-                };
+                let conn_display = format!("{}", seg.pid_count);
                 let row_style = if is_stale {
                     Style::default().fg(Color::DarkGray)
                 } else {
@@ -145,7 +141,7 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                     Cell::from(format!("  {}", seg.entry.type_name.as_str())),
                     Cell::from(kind),
                     Cell::from(details),
-                    Cell::from(pid_display),
+                    Cell::from(conn_display),
                     Cell::from(Span::styled(status, status_style)),
                 ]).style(row_style));
             }
@@ -164,8 +160,8 @@ fn render_list(frame: &mut Frame, app: &mut App) {
     let widths = [
         Constraint::Percentage(30),
         Constraint::Percentage(12),
-        Constraint::Percentage(28),
-        Constraint::Percentage(10),
+        Constraint::Percentage(33),
+        Constraint::Percentage(5),
         Constraint::Percentage(20),
     ];
 

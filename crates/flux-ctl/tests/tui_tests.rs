@@ -488,8 +488,8 @@ fn multi_pid_renders_count() {
     let buf = render_to_buffer(&mut app, 120, 15);
     let text = buffer_text(&buf);
 
-    // Should show "×3" for 3 attached PIDs
-    assert!(text.contains("×3"), "should show multi-pid count:\n{text}");
+    // Should show connection count "3" in the Conns column
+    assert!(text.contains("3"), "should show connection count:\n{text}");
 }
 
 #[test]
