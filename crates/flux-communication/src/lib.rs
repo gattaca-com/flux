@@ -16,7 +16,7 @@ use flux_utils::{
     },
     short_typename,
 };
-pub use registry::{PopulateResult, RegistryStats, ShmemEntry, ShmemKind, ShmemRegistry};
+pub use registry::{ShmemKind, cleanup_flink, cleanup_shmem, is_pid_alive};
 pub use seqlock::Seqlock;
 pub use shmem_data::ShmemData;
 pub use timer::{Timer, TimingMessage};
@@ -30,9 +30,7 @@ pub fn shmem_dir_queues_string_with_base<D: AsRef<Path>, S: AsRef<Path>>(
     base_dir: D,
     app_name: S,
 ) -> String {
-    shmem_dir_queues_with_base(base_dir, app_name)
-        .to_string_lossy()
-        .to_string()
+    shmem_dir_queues_with_base(base_dir, app_name).to_string_lossy().to_string()
 }
 
 pub fn shmem_queue<S: AsRef<Path>, T: Copy>(
@@ -50,21 +48,8 @@ pub fn shmem_queue_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy>(
     typ: queue::QueueType,
 ) -> queue::Queue<T> {
     let queue_name = short_typename::<T>();
-    let flink_path =
-        shmem_dir_queues_with_base(&base_dir, &app_name).join(queue_name.as_str());
-    let queue = queue::Queue::create_or_open_shared(&flink_path, len, typ);
-
-    // Auto-register in global shmem registry
-    let reg = registry::ShmemRegistry::open_or_create(base_dir.as_ref());
-    reg.register(registry::queue_entry(
-        &app_name.as_ref().to_string_lossy(),
-        queue_name.as_str(),
-        &flink_path.to_string_lossy(),
-        std::mem::size_of::<T>(),
-        len,
-    ));
-
-    queue
+    let flink_path = shmem_dir_queues_with_base(&base_dir, &app_name).join(queue_name.as_str());
+    queue::Queue::create_or_open_shared(&flink_path, len, typ)
 }
 
 pub fn shmem_array<S: AsRef<Path>, T: Copy>(
@@ -80,18 +65,7 @@ pub fn shmem_array_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy>(
     len: usize,
 ) -> Result<SeqlockArray<T>, error::QueueError> {
     let type_name = short_typename::<T>();
-    let flink_path =
-        shmem_dir_arrays_with_base(&base_dir, &app_name).join(type_name.as_str());
+    let flink_path = shmem_dir_arrays_with_base(&base_dir, &app_name).join(type_name.as_str());
     let arr = SeqlockArray::create_or_open_shared(&flink_path, len)?;
-
-    let reg = registry::ShmemRegistry::open_or_create(base_dir.as_ref());
-    reg.register(registry::seqlock_array_entry(
-        &app_name.as_ref().to_string_lossy(),
-        type_name.as_str(),
-        &flink_path.to_string_lossy(),
-        std::mem::size_of::<T>(),
-        len,
-    ));
-
     Ok(arr)
 }

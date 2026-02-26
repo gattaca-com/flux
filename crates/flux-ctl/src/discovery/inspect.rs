@@ -1,237 +1,308 @@
-//! Segment inspection: PID info, poison detection, backing file size, queue stats.
+//! Segment inspection: PID info, poison detection, backing file size, queue
+//! stats.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use flux_communication::array::ArrayHeader;
-use flux_communication::queue::QueueHeader;
-use flux_communication::registry::{ShmemEntry, ShmemKind};
+pub use flux_communication::registry::is_pid_alive;
+use flux_communication::{array::ArrayHeader, queue::QueueHeader, registry::ShmemKind};
+use flux_timing::Nanos;
 use shared_memory::ShmemConf;
+
+use super::registry::DiscoveredEntry;
 
 // ─── PID info ───────────────────────────────────────────────────────────────
 
 /// Metadata about an attached process, gathered from `/proc`.
 #[derive(Clone, Debug)]
 pub struct PidInfo {
-    /// The Linux process ID.
     pub pid: u32,
-    /// Whether the process is currently alive (signal-0 check).
     pub alive: bool,
-    /// Process name from `/proc/<pid>/comm`.
     pub name: String,
-    /// Full command line from `/proc/<pid>/cmdline` (NUL-separated args joined with spaces).
     pub cmdline: String,
-    /// Process start time as an RFC 3339 timestamp, or empty if unavailable.
     pub start_time: String,
 }
 
-/// Gather process metadata for a single PID.
-///
-/// Reads `/proc/<pid>/comm`, `/proc/<pid>/cmdline`, and `/proc/<pid>/stat`
-/// to populate the returned [`PidInfo`]. If the process is no longer alive,
-/// returns a [`PidInfo`] with `alive = false` and empty strings for name,
-/// cmdline, and start_time.
-pub fn pid_info(pid: u32) -> PidInfo {
-    let alive = is_pid_alive(pid);
-    if !alive {
-        return PidInfo {
-            pid,
-            alive: false,
-            name: String::new(),
-            cmdline: String::new(),
-            start_time: String::new(),
-        };
+impl PidInfo {
+    /// Gather process metadata for a single PID from `/proc`.
+    pub fn gather(pid: u32) -> Self {
+        let alive = is_pid_alive(pid);
+        if !alive {
+            return Self {
+                pid,
+                alive: false,
+                name: String::new(),
+                cmdline: String::new(),
+                start_time: String::new(),
+            };
+        }
+
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|bytes| {
+                bytes
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+
+        let start_time = Self::read_start_time(pid).unwrap_or_default();
+
+        Self { pid, alive, name, cmdline, start_time }
     }
 
-    let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    /// Gather process metadata for all given PIDs.
+    pub fn for_pids(pids: &[u32]) -> Vec<Self> {
+        pids.iter().map(|&pid| Self::gather(pid)).collect()
+    }
 
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|bytes| {
-            bytes
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).into_owned())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
+    /// Discover processes that have the shared-memory segment open, by
+    /// scanning `/proc/*/fd/` for symlinks that resolve to the backing file.
+    ///
+    /// The `flink` is the on-disk flink file whose first line contains the
+    /// OS shared-memory path (e.g. `/dev/shm/...`).  We resolve that path,
+    /// then walk all numeric `/proc/<pid>/fd/` directories looking for
+    /// matching symlink targets.
+    ///
+    /// This is inherently racy — processes can appear or vanish between the
+    /// scan and the metadata gather — but it gives a best-effort snapshot.
+    pub fn for_flink(flink: &str) -> Vec<Self> {
+        let Some(backing) = resolve_backing_path(flink) else {
+            return Vec::new();
+        };
 
-    let start_time = read_start_time(pid).unwrap_or_default();
+        let Ok(proc_iter) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
 
-    PidInfo { pid, alive, name, cmdline, start_time }
-}
+        let mut pids: Vec<u32> = Vec::new();
+        for proc_entry in proc_iter.flatten() {
+            let fname = proc_entry.file_name();
+            let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
 
-/// Gather process metadata for all PIDs attached to a registry entry.
-///
-/// Calls [`pid_info`] for each PID in the entry's [`PidSet`] and returns
-/// the collected results. Dead PIDs are included with `alive = false`.
-pub fn pids_info(entry: &ShmemEntry) -> Vec<PidInfo> {
-    entry.pids.active_pids().iter().map(|&pid| pid_info(pid)).collect()
+            let fd_dir = format!("/proc/{pid}/fd");
+            let Ok(fd_iter) = std::fs::read_dir(&fd_dir) else {
+                continue;
+            };
+
+            for fd_entry in fd_iter.flatten() {
+                if let Ok(target) = std::fs::read_link(fd_entry.path()) {
+                    if target == backing {
+                        pids.push(pid);
+                        break;
+                    }
+                }
+            }
+        }
+
+        pids.sort_unstable();
+        pids.dedup();
+        Self::for_pids(&pids)
+    }
+
+    /// Discover processes attached to a [`DiscoveredEntry`]'s shared-memory
+    /// segment by scanning `/proc`.
+    pub fn for_entry(entry: &DiscoveredEntry) -> Vec<Self> {
+        Self::for_flink(&entry.flink)
+    }
+
+    /// Read AT_CLKTCK from /proc/self/auxv (ELF auxiliary vector).
+    /// Falls back to 100 if the file can't be read.
+    fn clock_ticks_per_sec() -> u64 {
+        const AT_CLKTCK: u64 = 17;
+        let Ok(data) = std::fs::read("/proc/self/auxv") else {
+            return 100;
+        };
+        for chunk in data.chunks_exact(16) {
+            let a_type = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
+            if a_type == 0 {
+                break;
+            }
+            if a_type == AT_CLKTCK {
+                return u64::from_ne_bytes(chunk[8..16].try_into().unwrap());
+            }
+        }
+        100
+    }
+
+    fn read_start_time(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let starttime_ticks: u64 = fields.get(19)?.parse().ok()?;
+        let ticks_per_sec = Self::clock_ticks_per_sec();
+
+        let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let btime_line = proc_stat.lines().find(|l| l.starts_with("btime "))?;
+        let btime_secs: u64 = btime_line.split_whitespace().nth(1)?.parse().ok()?;
+
+        let start_secs = btime_secs + starttime_ticks / ticks_per_sec;
+        Some(Nanos::from_secs(start_secs).with_fmt_utc("%Y-%m-%dT%H:%M:%SZ"))
+    }
 }
 
 // ─── Poison detection ───────────────────────────────────────────────────────
 
-/// Summary of poisoned (stuck mid-write) seqlock slots in a shared memory segment.
+/// Summary of poisoned (stuck mid-write) seqlock slots in a shared memory
+/// segment.
 #[derive(Clone, Debug)]
 pub struct PoisonInfo {
-    /// Number of slots with an odd (stuck) version counter.
     pub n_poisoned: usize,
-    /// Index of the first poisoned slot (for diagnostic display).
     pub first_slot: usize,
-    /// Total number of slots in the buffer.
     pub total_slots: usize,
 }
 
-/// Scan a segment's seqlock buffer for poisoned slots.
-///
-/// Works for both `Queue` and `SeqlockArray` — both use the same pattern:
-/// a `repr(C, align(64))` header followed by `Seqlock<T>` slots where the
-/// first 8 bytes of each slot are the `AtomicU64` version.
-///
-/// A slot is poisoned when its version is odd (write-in-progress) and stays
-/// odd for >10µs, meaning the writer crashed mid-write.
-pub fn check_poison(entry: &ShmemEntry) -> Option<PoisonInfo> {
-    match entry.kind {
-        ShmemKind::Queue => check_queue_poison(entry.flink.as_str()),
-        ShmemKind::SeqlockArray => check_array_poison(entry.flink.as_str()),
-        _ => None,
-    }
-}
-
-fn check_queue_poison(flink: &str) -> Option<PoisonInfo> {
-    const HEADER_SIZE: usize = 64; // QueueHeader is repr(C, align(64))
-
-    let shmem = ShmemConf::new().flink(flink).open().ok()?;
-    let base = shmem.as_ptr();
-    let shmem_len = shmem.len();
-
-    if shmem_len < std::mem::size_of::<QueueHeader>() {
-        drop(shmem);
-        return None;
-    }
-
-    let header = unsafe { &*(base as *const QueueHeader) };
-    if !header.is_initialized() || header.elsize == 0 {
-        drop(shmem);
-        return None;
-    }
-
-    let n_slots = header.mask + 1;
-    let elsize = header.elsize;
-
-    if HEADER_SIZE + n_slots * elsize > shmem_len {
-        drop(shmem);
-        return None;
-    }
-
-    let buf_base = unsafe { base.add(HEADER_SIZE) };
-    let buf_remaining = shmem_len - HEADER_SIZE;
-    let result = scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
-    drop(shmem);
-    result
-}
-
-fn check_array_poison(flink: &str) -> Option<PoisonInfo> {
-    const HEADER_SIZE: usize = 64; // ArrayHeader is repr(C, align(64))
-
-    let shmem = ShmemConf::new().flink(flink).open().ok()?;
-    let base = shmem.as_ptr();
-    let shmem_len = shmem.len();
-
-    if shmem_len < std::mem::size_of::<ArrayHeader>() {
-        drop(shmem);
-        return None;
-    }
-
-    let header = unsafe { &*(base as *const ArrayHeader) };
-    if !header.is_initialized() || header.elsize == 0 {
-        drop(shmem);
-        return None;
-    }
-
-    let n_slots = header.bufsize;
-    let elsize = header.elsize;
-
-    if HEADER_SIZE + n_slots * elsize > shmem_len {
-        drop(shmem);
-        return None;
-    }
-
-    let buf_base = unsafe { base.add(HEADER_SIZE) };
-    let buf_remaining = shmem_len - HEADER_SIZE;
-    let result = scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
-    drop(shmem);
-    result
-}
-
-/// Walk `n_slots` seqlock slots starting at `buf_base` with stride `elsize`,
-/// reading the `AtomicU64` version at offset 0 of each slot.
-///
-/// Two snapshot reads separated by a yield — if a slot's version is odd in
-/// both reads it's stuck (poisoned). Transient odd values from in-flight
-/// writes resolve between snapshots. This avoids blocking the TUI thread.
-fn scan_seqlock_slots(
-    buf_base: *mut u8,
-    n_slots: usize,
-    elsize: usize,
-    buf_remaining: usize,
-) -> Option<PoisonInfo> {
-    // Each slot must be at least 8 bytes to hold the AtomicU64 version field.
-    if elsize < std::mem::size_of::<AtomicU64>() {
-        return None;
-    }
-
-    // First pass: collect slots with odd versions.
-    let mut odd_slots: Vec<usize> = Vec::new();
-    for i in 0..n_slots {
-        // Defense-in-depth: skip slots that would read beyond the mapped region.
-        if i * elsize + std::mem::size_of::<AtomicU64>() > buf_remaining {
-            break;
-        }
-        let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
-        let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
-        if v & 1 != 0 {
-            odd_slots.push(i);
+impl PoisonInfo {
+    /// Scan a segment's seqlock buffer for poisoned slots.
+    ///
+    /// Works for both `Queue` and `SeqlockArray` — both use the same pattern:
+    /// a `repr(C, align(64))` header followed by `Seqlock<T>` slots where the
+    /// first 8 bytes of each slot are the `AtomicU64` version.
+    pub fn check(entry: &DiscoveredEntry) -> Option<Self> {
+        match entry.kind {
+            ShmemKind::Queue => Self::check_queue(&entry.flink),
+            ShmemKind::SeqlockArray => Self::check_array(&entry.flink),
+            _ => None,
         }
     }
 
-    if odd_slots.is_empty() {
-        return None;
+    fn check_queue(flink: &str) -> Option<Self> {
+        const HEADER_SIZE: usize = 64;
+
+        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let base = shmem.as_ptr();
+        let shmem_len = shmem.len();
+
+        if shmem_len < std::mem::size_of::<QueueHeader>() {
+            drop(shmem);
+            return None;
+        }
+
+        let header = unsafe { &*(base as *const QueueHeader) };
+        if !header.is_initialized() || header.elsize == 0 {
+            drop(shmem);
+            return None;
+        }
+
+        let n_slots = header.mask + 1;
+        let elsize = header.elsize;
+
+        if HEADER_SIZE + n_slots * elsize > shmem_len {
+            drop(shmem);
+            return None;
+        }
+
+        let buf_base = unsafe { base.add(HEADER_SIZE) };
+        let buf_remaining = shmem_len - HEADER_SIZE;
+        let result = Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
+        drop(shmem);
+        result
     }
 
-    // Yield to let any in-flight writes complete.
-    std::thread::yield_now();
+    fn check_array(flink: &str) -> Option<Self> {
+        const HEADER_SIZE: usize = 64;
 
-    // Second pass: re-check only the odd slots.
-    let mut first_slot = None;
-    let mut n_poisoned = 0;
-    for &i in &odd_slots {
-        let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
-        let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
-        if v & 1 != 0 {
-            n_poisoned += 1;
-            if first_slot.is_none() {
-                first_slot = Some(i);
+        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let base = shmem.as_ptr();
+        let shmem_len = shmem.len();
+
+        if shmem_len < std::mem::size_of::<ArrayHeader>() {
+            drop(shmem);
+            return None;
+        }
+
+        let header = unsafe { &*(base as *const ArrayHeader) };
+        if !header.is_initialized() || header.elsize == 0 {
+            drop(shmem);
+            return None;
+        }
+
+        let n_slots = header.bufsize;
+        let elsize = header.elsize;
+
+        if HEADER_SIZE + n_slots * elsize > shmem_len {
+            drop(shmem);
+            return None;
+        }
+
+        let buf_base = unsafe { base.add(HEADER_SIZE) };
+        let buf_remaining = shmem_len - HEADER_SIZE;
+        let result = Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
+        drop(shmem);
+        result
+    }
+
+    /// Walk `n_slots` seqlock slots starting at `buf_base` with stride
+    /// `elsize`, reading the `AtomicU64` version at offset 0 of each slot.
+    ///
+    /// Two snapshot reads separated by a yield — if a slot's version is odd in
+    /// both reads it's stuck (poisoned).
+    fn scan_seqlock_slots(
+        buf_base: *mut u8,
+        n_slots: usize,
+        elsize: usize,
+        buf_remaining: usize,
+    ) -> Option<Self> {
+        if elsize < std::mem::size_of::<AtomicU64>() {
+            return None;
+        }
+
+        // First pass: collect slots with odd versions.
+        let mut odd_slots: Vec<usize> = Vec::new();
+        for i in 0..n_slots {
+            if i * elsize + std::mem::size_of::<AtomicU64>() > buf_remaining {
+                break;
+            }
+            let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
+            let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
+            if v & 1 != 0 {
+                odd_slots.push(i);
             }
         }
-    }
 
-    if n_poisoned > 0 {
-        Some(PoisonInfo { n_poisoned, first_slot: first_slot.unwrap(), total_slots: n_slots })
-    } else {
-        None
+        if odd_slots.is_empty() {
+            return None;
+        }
+
+        // Yield to let any in-flight writes complete.
+        std::thread::yield_now();
+
+        // Second pass: re-check only the odd slots.
+        let mut first_slot = None;
+        let mut n_poisoned = 0;
+        for &i in &odd_slots {
+            let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
+            let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
+            if v & 1 != 0 {
+                n_poisoned += 1;
+                if first_slot.is_none() {
+                    first_slot = Some(i);
+                }
+            }
+        }
+
+        if n_poisoned > 0 {
+            Some(Self { n_poisoned, first_slot: first_slot.unwrap(), total_slots: n_slots })
+        } else {
+            None
+        }
     }
 }
 
 // ─── Backing file size ──────────────────────────────────────────────────────
 
 /// Return the size (in bytes) of the shared memory backing file.
-///
-/// Opens the shmem read-only via its flink and returns `Shmem::len()`.
-/// Returns `None` if the shmem cannot be opened. The shmem is properly
-/// dropped (unmapped) after reading the size — dropping a non-owner `Shmem`
-/// only unmaps the local mapping without unlinking the backing file.
 pub fn backing_file_size(flink: &str) -> Option<u64> {
     let shmem = ShmemConf::new().flink(flink).open().ok()?;
     let size = shmem.len() as u64;
@@ -239,47 +310,116 @@ pub fn backing_file_size(flink: &str) -> Option<u64> {
     Some(size)
 }
 
+/// Read the OS shared-memory ID (first line of the flink file).
+pub fn read_shmem_os_id(flink: &str) -> Option<String> {
+    std::fs::read_to_string(flink).ok().map(|s| s.trim().to_string())
+}
+
+/// Map a flink's OS ID to the `/dev/shm/` path that appears in
+/// `/proc/<pid>/fd/`.
+///
+/// The flink file stores the `shm_open` name (e.g. `/shmem_ABC123`); the
+/// kernel exposes the backing file as `/dev/shm/shmem_ABC123`.
+fn resolve_backing_path(flink: &str) -> Option<PathBuf> {
+    let os_id = read_shmem_os_id(flink)?;
+    let raw = if os_id.starts_with('/') {
+        format!("/dev/shm{os_id}")
+    } else {
+        format!("/dev/shm/{os_id}")
+    };
+    Some(std::fs::canonicalize(&raw).unwrap_or_else(|_| PathBuf::from(raw)))
+}
+
+/// Single pass over `/proc/*/fd/` → map from backing-file path to PIDs.
+///
+/// Only entries under `/dev/shm/` are collected, so non-shmem fds are
+/// skipped cheaply by checking the readlink target prefix.
+pub fn scan_proc_fds() -> HashMap<PathBuf, Vec<u32>> {
+    let mut map: HashMap<PathBuf, Vec<u32>> = HashMap::new();
+
+    let Ok(proc_iter) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+
+    for proc_entry in proc_iter.flatten() {
+        let fname = proc_entry.file_name();
+        let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+
+        let fd_dir = format!("/proc/{pid}/fd");
+        let Ok(fd_iter) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+
+        for fd_entry in fd_iter.flatten() {
+            if let Ok(target) = std::fs::read_link(fd_entry.path()) {
+                if target.starts_with("/dev/shm/") {
+                    map.entry(target).or_default().push(pid);
+                }
+            }
+        }
+    }
+
+    // Sort + dedup each pid list for deterministic output.
+    for pids in map.values_mut() {
+        pids.sort_unstable();
+        pids.dedup();
+    }
+
+    map
+}
+
+// ─── DiscoveredEntry methods ────────────────────────────────────────────────
+
+impl DiscoveredEntry {
+    /// Resolve the `/dev/shm/` backing path for this entry's flink.
+    pub fn backing_path(&self) -> Option<PathBuf> {
+        resolve_backing_path(&self.flink)
+    }
+
+    /// Look up PIDs attached to this entry using a pre-built proc-fd map.
+    pub fn pids(&self, proc_map: &HashMap<PathBuf, Vec<u32>>) -> Vec<u32> {
+        self.backing_path().and_then(|backing| proc_map.get(&backing)).cloned().unwrap_or_default()
+    }
+}
+
 // ─── Queue stats ────────────────────────────────────────────────────────────
 
-/// Queue statistics read from shared memory without leaking.
+/// Queue statistics read from shared memory.
 #[derive(Clone, Debug)]
 pub struct QueueStats {
-    /// Total number of writes (`QueueHeader::count`).
     pub writes: usize,
-    /// Current fill level (`count & mask`).
     pub fill: usize,
-    /// Ring buffer capacity (`mask + 1`).
     pub capacity: usize,
 }
 
-/// Read queue statistics from shared memory without leaking.
-///
-/// Opens the shmem, reads `QueueHeader` fields, and drops the mapping.
-/// Returns `None` if the shmem cannot be opened or the header is invalid.
-pub fn read_queue_stats(flink: &str) -> Option<QueueStats> {
-    let shmem = ShmemConf::new().flink(flink).open().ok()?;
-    if shmem.len() < std::mem::size_of::<QueueHeader>() {
+impl QueueStats {
+    /// Read queue statistics from shared memory without leaking.
+    pub fn read(flink: &str) -> Option<Self> {
+        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        if shmem.len() < std::mem::size_of::<QueueHeader>() {
+            drop(shmem);
+            return None;
+        }
+        let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
+        if !header.is_initialized() {
+            drop(shmem);
+            return None;
+        }
+        let writes = header.count.load(Ordering::Relaxed);
+        let mask = header.mask;
+        let capacity = mask + 1;
+        let fill = writes & mask;
         drop(shmem);
-        return None;
+        Some(Self { writes, fill, capacity })
     }
-    let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
-    if !header.is_initialized() {
-        drop(shmem);
-        return None;
-    }
-    let writes = header.count.load(Ordering::Relaxed);
-    let mask = header.mask;
-    let capacity = mask + 1;
-    let fill = writes & mask;
-    drop(shmem);
-    Some(QueueStats { writes, fill, capacity })
 }
 
 // ─── Byte formatting ────────────────────────────────────────────────────────
 
-/// Format a byte count as a human-readable string using binary units (KiB, MiB, GiB).
-///
-/// Values below 1 KiB are shown as plain bytes (e.g. `"512 B"`).
+/// Format a byte count as a human-readable string using binary units (KiB, MiB,
+/// GiB).
 pub fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -294,45 +434,4 @@ pub fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
-}
-
-// ─── Internal helpers ───────────────────────────────────────────────────────
-
-pub use flux_communication::registry::is_pid_alive;
-
-/// Read AT_CLKTCK from /proc/self/auxv (ELF auxiliary vector).
-/// Falls back to 100 if the file can't be read.
-fn clock_ticks_per_sec() -> u64 {
-    const AT_CLKTCK: u64 = 17;
-    let Ok(data) = std::fs::read("/proc/self/auxv") else {
-        return 100;
-    };
-    // auxv is a sequence of (u64 type, u64 value) pairs, terminated by AT_NULL=0.
-    for chunk in data.chunks_exact(16) {
-        let a_type = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
-        if a_type == 0 {
-            break;
-        }
-        if a_type == AT_CLKTCK {
-            return u64::from_ne_bytes(chunk[8..16].try_into().unwrap());
-        }
-    }
-    100
-}
-
-fn read_start_time(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(')')?.1;
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    // Field 19 after comm = starttime (field 21 in full stat, 0-indexed)
-    let starttime_ticks: u64 = fields.get(19)?.parse().ok()?;
-    let ticks_per_sec = clock_ticks_per_sec();
-
-    let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let btime_line = proc_stat.lines().find(|l| l.starts_with("btime "))?;
-    let btime_secs: u64 = btime_line.split_whitespace().nth(1)?.parse().ok()?;
-
-    let start_secs = btime_secs + starttime_ticks / ticks_per_sec;
-    let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(start_secs);
-    Some(humantime::format_rfc3339_seconds(ts).to_string())
 }

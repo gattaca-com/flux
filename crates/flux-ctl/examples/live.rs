@@ -17,16 +17,22 @@
 //!
 //! Press Ctrl-C to stop (propagates to children).
 
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::{
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
-use flux_communication::queue::{Consumer, Producer, Queue, QueueType};
-use flux_communication::registry::ShmemRegistry;
-use flux_communication::{shmem_queue_with_base_dir, ShmemData};
-use flux_utils::directories::local_share_dir;
+use flux_communication::{
+    ShmemData, cleanup_shmem,
+    queue::{Consumer, Producer, Queue, QueueType},
+    shmem_queue_with_base_dir,
+};
+use flux_utils::directories::{local_share_dir, shmem_dir_with_base};
 
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(C)]
@@ -83,11 +89,8 @@ struct Flags {
 
 fn parse_flags() -> Flags {
     let args: Vec<String> = std::env::args().collect();
-    let workers = args
-        .windows(2)
-        .find(|w| w[0] == "--workers")
-        .and_then(|w| w[1].parse().ok())
-        .unwrap_or(0);
+    let workers =
+        args.windows(2).find(|w| w[0] == "--workers").and_then(|w| w[1].parse().ok()).unwrap_or(0);
     Flags {
         no_cleanup: args.iter().any(|a| a == "--no-cleanup"),
         reattach: args.iter().any(|a| a == "--reattach"),
@@ -135,9 +138,8 @@ fn run_primary(flags: Flags) {
     println!("  mode: {mode}, {cleanup}, workers: {}\n", flags.workers);
 
     if !flags.reattach {
-        let registry = ShmemRegistry::open_or_create(&base_dir);
-        for e in registry.cleanup_app("market-data") { eprintln!("warning: {e}"); }
-        for e in registry.cleanup_app("order-engine") { eprintln!("warning: {e}"); }
+        cleanup_shmem(&shmem_dir_with_base(&base_dir, "market-data"));
+        cleanup_shmem(&shmem_dir_with_base(&base_dir, "order-engine"));
     }
 
     let quote_q: Queue<Quote> =
@@ -259,11 +261,9 @@ fn run_primary(flags: Flags) {
             // is at index (count & mask). We open the raw shmem and do exactly
             // what Seqlock::write does first — fetch_add(1) on the version —
             // but never complete the write.
-            let flink = flux_utils::directories::shmem_dir_queues_with_base(
-                &base_dir2,
-                "poison-demo",
-            )
-            .join("Trade");
+            let flink =
+                flux_utils::directories::shmem_dir_queues_with_base(&base_dir2, "poison-demo")
+                    .join("Trade");
             let shmem = shared_memory::ShmemConf::new()
                 .flink(&flink)
                 .open()
@@ -271,16 +271,14 @@ fn run_primary(flags: Flags) {
 
             let base = shmem.as_ptr();
             const HEADER_SIZE: usize = 64;
-            let header =
-                unsafe { &*(base as *const flux_communication::queue::QueueHeader) };
+            let header = unsafe { &*(base as *const flux_communication::queue::QueueHeader) };
             let count = header.count.load(std::sync::atomic::Ordering::Relaxed);
             let slot = count & header.mask;
             let elsize = header.elsize;
 
             let version_ptr = unsafe { base.add(HEADER_SIZE + slot * elsize) }
                 as *const std::sync::atomic::AtomicU64;
-            let v = unsafe { &*version_ptr }
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            let v = unsafe { &*version_ptr }.fetch_add(1, std::sync::atomic::Ordering::Release);
 
             println!(
                 "  💉 slot {slot} version {v} → {} (odd = write in progress, never completed)",
@@ -313,10 +311,9 @@ fn run_primary(flags: Flags) {
         println!("Skipping cleanup (--no-cleanup). Segments remain in shared memory.");
     } else {
         println!("Cleaning up shmem...");
-        let registry = ShmemRegistry::open_or_create(&base_dir);
-        for e in registry.cleanup_app("market-data") { eprintln!("warning: {e}"); }
-        for e in registry.cleanup_app("order-engine") { eprintln!("warning: {e}"); }
-        for e in registry.cleanup_app("poison-demo") { eprintln!("warning: {e}"); }
+        cleanup_shmem(&shmem_dir_with_base(&base_dir, "market-data"));
+        cleanup_shmem(&shmem_dir_with_base(&base_dir, "order-engine"));
+        cleanup_shmem(&shmem_dir_with_base(&base_dir, "poison-demo"));
         println!("Done.");
     }
 }

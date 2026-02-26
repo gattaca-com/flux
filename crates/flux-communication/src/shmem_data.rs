@@ -37,8 +37,7 @@ impl<T> ShmemData<T> {
     ) -> Result<ShmemData<T>, ShmemError> {
         use shared_memory::{ShmemConf, ShmemError};
         let type_name = short_typename::<T>();
-        let shmem_file =
-            shmem_dir_data_with_base(&dir, &app_name).join(type_name.as_str());
+        let shmem_file = shmem_dir_data_with_base(&dir, &app_name).join(type_name.as_str());
         std::fs::create_dir_all(
             shmem_file
                 .parent()
@@ -46,11 +45,7 @@ impl<T> ShmemData<T> {
         )
         .unwrap_or_else(|_| panic!("couldn't create shmem dir for {}", shmem_file.display()));
 
-        let result = match ShmemConf::new()
-            .size(std::mem::size_of::<T>())
-            .flink(&shmem_file)
-            .create()
-        {
+        match ShmemConf::new().size(std::mem::size_of::<T>()).flink(&shmem_file).create() {
             Ok(shmem) => {
                 let inner = Self::shmem_ptr(shmem);
 
@@ -75,20 +70,7 @@ impl<T> ShmemData<T> {
                 Ok(Self { inner })
             }
             Err(e) => Err(e),
-        };
-
-        // Auto-register in global shmem registry (skip the registry itself)
-        if result.is_ok() && type_name.as_str() != "ShmemRegistry" {
-            let reg = crate::registry::ShmemRegistry::open_or_create(dir.as_ref());
-            reg.register(crate::registry::data_entry(
-                &app_name.as_ref().to_string_lossy(),
-                type_name.as_str(),
-                &shmem_file.to_string_lossy(),
-                std::mem::size_of::<T>(),
-            ));
         }
-
-        result
     }
 
     fn shmem_ptr(shmem: Shmem) -> NonNull<T> {

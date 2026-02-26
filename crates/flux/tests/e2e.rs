@@ -4,8 +4,7 @@ use std::sync::{
 };
 
 use flux::{
-    communication::ShmemData,
-    communication::registry::ShmemRegistry,
+    communication::{ShmemData, registry::cleanup_shmem},
     persistence::Persistable,
     spine::{SpineAdapter, SpineQueue},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
@@ -92,7 +91,7 @@ fn end_to_end_send_receive_and_exit() {
         );
     });
 
-    ShmemRegistry::destroy(base);
+    cleanup_shmem(base);
 
     assert_eq!(got.load(Ordering::Relaxed), want);
 }

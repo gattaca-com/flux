@@ -1,9 +1,8 @@
-use ratatui::prelude::*;
-use ratatui::widgets::*;
-
 use flux_communication::registry::ShmemKind;
+use ratatui::{prelude::*, widgets::*};
 
 use super::app::{App, SelectedItem, View};
+use crate::discovery::format_bytes;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.view {
@@ -35,21 +34,13 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
     let n_segments: usize = app.groups.iter().map(|g| g.segments.len()).sum();
     let n_apps = app.groups.len();
     let elapsed = app.last_refresh.elapsed().as_secs_u64();
-    let updated = if elapsed < 2 {
-        String::new()
-    } else {
-        format!(" (updated {elapsed}s ago)")
-    };
+    let updated = if elapsed < 2 { String::new() } else { format!(" (updated {elapsed}s ago)") };
     let title_text = format!(
         " flux-ctl — Shared Memory Monitor ({n_segments} segments, {n_apps} apps)  [sort: {}]{updated} ",
         app.sort_mode.label()
@@ -68,12 +59,7 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         let icon = if group.expanded { "▼" } else { "▶" };
         rows.push(
             Row::new(vec![
-                Cell::from(format!(
-                    "{} {} ({} segments)",
-                    icon,
-                    group.name,
-                    group.segments.len()
-                )),
+                Cell::from(format!("{} {} ({} segments)", icon, group.name, group.segments.len())),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -84,23 +70,12 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
         if group.expanded {
             for seg in &group.segments {
-                let now_nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                let age_secs = if seg.entry.created_at_nanos > 0 {
-                    (now_nanos.saturating_sub(seg.entry.created_at_nanos)) / 1_000_000_000
-                } else {
-                    0
-                };
-                let is_stale = !seg.alive && age_secs > 60;
+                let is_stale = !seg.alive;
 
                 let status = if seg.poison.is_some() {
                     "☠ poisoned".to_string()
                 } else if seg.alive {
                     "🟢 alive".to_string()
-                } else if is_stale {
-                    format!("💀 dead ({}s)", age_secs)
                 } else {
                     "💀 dead".to_string()
                 };
@@ -113,19 +88,14 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                             Some(r) => format!(" {:.0}msg/s", r),
                             None => String::new(),
                         };
-                        format!(
-                            "cap={} elem={}B{}",
-                            seg.entry.capacity, seg.entry.elem_size, rate
-                        )
+                        format!("cap={} elem={}B{}", seg.entry.capacity, seg.entry.elem_size, rate)
                     }
                     _ => format!("size={}B", seg.entry.elem_size),
                 };
-                let conn_display = format!("{}", seg.pid_count);
-                let row_style = if is_stale {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
+                let n_pids = seg.pids.len();
+                let conn_display = if n_pids > 0 { n_pids.to_string() } else { "—".to_string() };
+                let row_style =
+                    if is_stale { Style::default().fg(Color::DarkGray) } else { Style::default() };
                 let status_style = if seg.poison.is_some() {
                     Style::default().fg(Color::Red).bold()
                 } else if is_stale {
@@ -133,13 +103,16 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                 } else {
                     Style::default()
                 };
-                rows.push(Row::new(vec![
-                    Cell::from(format!("  {}", seg.entry.type_name.as_str())),
-                    Cell::from(kind),
-                    Cell::from(details),
-                    Cell::from(conn_display),
-                    Cell::from(Span::styled(status, status_style)),
-                ]).style(row_style));
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(format!("  {}", seg.entry.type_name.as_str())),
+                        Cell::from(kind),
+                        Cell::from(details),
+                        Cell::from(conn_display),
+                        Cell::from(Span::styled(status, status_style)),
+                    ])
+                    .style(row_style),
+                );
             }
         }
     }
@@ -156,8 +129,8 @@ fn render_list(frame: &mut Frame, app: &mut App) {
     let widths = [
         Constraint::Percentage(30),
         Constraint::Percentage(12),
-        Constraint::Percentage(33),
-        Constraint::Percentage(5),
+        Constraint::Percentage(30),
+        Constraint::Percentage(8),
         Constraint::Percentage(20),
     ];
 
@@ -189,13 +162,11 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 
     let seg = app.detail_segment();
     let elapsed = app.last_refresh.elapsed().as_secs_u64();
-    let updated = if elapsed < 2 {
-        String::new()
-    } else {
-        format!(" (updated {elapsed}s ago)")
-    };
+    let updated = if elapsed < 2 { String::new() } else { format!(" (updated {elapsed}s ago)") };
     let title_text = seg
-        .map(|s| format!(" {} — {}{updated} ", s.entry.app_name.as_str(), s.entry.type_name.as_str()))
+        .map(|s| {
+            format!(" {} — {}{updated} ", s.entry.app_name.as_str(), s.entry.type_name.as_str())
+        })
         .unwrap_or_else(|| format!(" Segment Detail{updated} "));
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Cyan).bold())
@@ -222,14 +193,6 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         "💀 dead"
     };
 
-    let created = if seg.entry.created_at_nanos > 0 {
-        let secs = seg.entry.created_at_nanos / 1_000_000_000;
-        let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-        humantime::format_rfc3339_seconds(ts).to_string()
-    } else {
-        "unknown".into()
-    };
-
     let mut lines = vec![
         Line::from(vec![
             Span::styled("  Kind:       ", Style::default().fg(Color::DarkGray)),
@@ -246,14 +209,6 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         Line::from(vec![
             Span::styled("  Capacity:   ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}", seg.entry.capacity)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Type hash:  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("0x{:016x}", seg.entry.type_hash)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Created:    ", Style::default().fg(Color::DarkGray)),
-            Span::raw(created),
         ]),
         Line::from(vec![
             Span::styled("  Flink:      ", Style::default().fg(Color::DarkGray)),
@@ -278,8 +233,8 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         ]),
     ];
 
-    if seg.entry.kind == ShmemKind::Queue
-        && let Some(writes) = seg.queue_writes
+    if seg.entry.kind == ShmemKind::Queue &&
+        let Some(writes) = seg.queue_writes
     {
         let rate_str = match seg.msgs_per_sec {
             Some(r) if r >= 1_000_000.0 => format!("  ({:.1} M/s)", r / 1_000_000.0),
@@ -294,20 +249,36 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         ]));
 
         if let (Some(pos), Some(cap)) = (seg.queue_fill, seg.queue_capacity) {
-            let pct = if cap > 0 {
-                (pos as f64 / cap as f64) * 100.0
+            let bar_width: usize = 20;
+            let filled = if cap > 0 {
+                ((pos as f64 / cap as f64) * bar_width as f64).round() as usize
             } else {
-                0.0
+                0
             };
-            let bar_width = 20;
-            let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
             let filled = filled.min(bar_width);
-            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
-            lines.push(Line::from(vec![
-                Span::styled("  Write Pos:  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(bar, Style::default().fg(Color::Cyan)),
-                Span::raw(format!(" {pos}/{cap}")),
-            ]));
+
+            // Position of the first poisoned slot within the bar (if any).
+            let poison_col = seg.poison.as_ref().map(|p| {
+                if cap > 0 {
+                    ((p.first_slot as f64 / cap as f64) * bar_width as f64).round() as usize
+                } else {
+                    0
+                }
+                .min(bar_width.saturating_sub(1))
+            });
+
+            let cyan = Style::default().fg(Color::Cyan);
+            let red = Style::default().fg(Color::Red).bold();
+
+            let mut bar_spans =
+                vec![Span::styled("  Write Pos:  ", Style::default().fg(Color::DarkGray))];
+            for i in 0..bar_width {
+                let ch = if i < filled { "█" } else { "░" };
+                let style = if poison_col == Some(i) { red } else { cyan };
+                bar_spans.push(Span::styled(ch, style));
+            }
+            bar_spans.push(Span::raw(format!(" {pos}/{cap}")));
+            lines.push(Line::from(bar_spans));
         }
     }
 
@@ -348,11 +319,8 @@ fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: R
                 Style::default().fg(Color::Red)
             };
             let name = if p.name.is_empty() { "—" } else { &p.name };
-            let cmd = if p.cmdline.is_empty() {
-                "—".to_string()
-            } else {
-                truncate_str(&p.cmdline, 60)
-            };
+            let cmd =
+                if p.cmdline.is_empty() { "—".to_string() } else { truncate_str(&p.cmdline, 60) };
 
             Row::new(vec![
                 Cell::from(format!("{}", p.pid)),
@@ -380,10 +348,7 @@ fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: R
             .title(title)
             .title_alignment(Alignment::Left)
             .border_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(
-            Paragraph::new("  No PIDs attached").block(block),
-            area,
-        );
+        frame.render_widget(Paragraph::new("  No PIDs attached").block(block), area);
     } else {
         let table = Table::new(rows, widths)
             .header(header)
@@ -436,11 +401,7 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect) {
 }
 
 fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
-    let dead_count: usize = app
-        .pending_cleanup_flinks
-        .as_ref()
-        .map(|f| f.len())
-        .unwrap_or(0);
+    let dead_count: usize = app.pending_cleanup_flinks.as_ref().map(|f| f.len()).unwrap_or(0);
 
     let lines = vec![
         Line::from(""),
@@ -504,8 +465,12 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
                 );
                 let base = match (on_dead_seg, has_any_dead) {
-                    (true, _) => " ↑↓ navigate  Enter open  d destroy  D destroy all  / filter  s sort  ? help  q quit",
-                    (false, true) => " ↑↓ navigate  Enter open  D destroy all  / filter  s sort  ? help  q quit",
+                    (true, _) => {
+                        " ↑↓ navigate  Enter open  d destroy  D destroy all  / filter  s sort  ? help  q quit"
+                    }
+                    (false, true) => {
+                        " ↑↓ navigate  Enter open  D destroy all  / filter  s sort  ? help  q quit"
+                    }
                     _ => " ↑↓ navigate  Enter open  / filter  s sort  ? help  q quit",
                 };
                 format!("{}{}", base, filter_hint)
@@ -534,10 +499,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_help_popup(frame: &mut Frame, area: Rect) {
     let lines = vec![
-        Line::from(Span::styled(
-            " Keybindings ",
-            Style::default().fg(Color::Cyan).bold(),
-        )),
+        Line::from(Span::styled(" Keybindings ", Style::default().fg(Color::Cyan).bold())),
         Line::from(""),
         Line::from(vec![
             Span::styled("  ↑ / k      ", Style::default().fg(Color::Yellow)),
@@ -568,7 +530,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::raw("Open segment / toggle app group"),
         ]),
         Line::from(vec![
-            Span::styled("  Esc        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  Esc / Bksp ", Style::default().fg(Color::Yellow)),
             Span::raw("Back / clear filter / quit"),
         ]),
         Line::from(vec![
@@ -624,21 +586,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

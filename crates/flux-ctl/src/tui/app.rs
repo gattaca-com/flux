@@ -1,11 +1,13 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use flux_communication::registry::{ShmemKind, cleanup_flink};
 use flux_timing::{Duration, Instant};
 
-use flux_communication::registry::{ShmemEntry, ShmemKind, cleanup_flink};
-
-use crate::discovery;
+use crate::{discovery, discovery::registry::DiscoveredEntry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
@@ -34,9 +36,8 @@ impl SortMode {
 
 #[derive(Clone)]
 pub struct SegmentInfo {
-    pub entry: ShmemEntry,
+    pub entry: DiscoveredEntry,
     pub alive: bool,
-    pub pid_count: usize,
     pub queue_writes: Option<usize>,
     /// Current write position within the ring buffer (`count & mask`).
     pub queue_fill: Option<usize>,
@@ -45,6 +46,8 @@ pub struct SegmentInfo {
     pub poison: Option<discovery::PoisonInfo>,
     /// Messages per second computed from delta writes / delta time.
     pub msgs_per_sec: Option<f64>,
+    /// PIDs attached to this segment's backing shmem (from `/proc` scan).
+    pub pids: Vec<u32>,
 }
 
 pub struct AppGroup {
@@ -86,7 +89,8 @@ pub struct App {
     pub status_msg: Option<(String, Instant)>,
     pub confirm_cleanup: bool,
     pub confirm_cleanup_all: bool,
-    /// Dead flinks captured on the first press of "cleanup all", used on confirm.
+    /// Dead flinks captured on the first press of "cleanup all", used on
+    /// confirm.
     pub pending_cleanup_flinks: Option<Vec<String>>,
     /// Whether the interactive filter input is active.
     pub filter_mode: bool,
@@ -162,44 +166,50 @@ impl App {
     /// Inner refresh that returns errors instead of panicking, so the TUI
     /// stays alive and shows a status message on failure.
     fn try_refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Preserve collapsed state across refreshes.
+        let prev_expanded: HashMap<String, bool> =
+            self.groups.iter().map(|g| (g.name.clone(), g.expanded)).collect();
+
         self.groups.clear();
-        let Some(registry) = discovery::open_registry(&self.base_dir) else {
-            return Ok(());
-        };
-        let entries = registry.entries();
-        let app_names = discovery::app_names(registry);
+        let all_entries = discovery::scan_base_dir(&self.base_dir);
+        let app_names = discovery::app_names(&all_entries);
+        let proc_map = discovery::scan_proc_fds();
 
         for name in app_names {
-            if let Some(ref filter) = self.app_filter
-                && &name != filter
+            if let Some(ref filter) = self.app_filter &&
+                &name != filter
             {
                 continue;
             }
             let filter_lower = self.filter_text.to_lowercase();
-            let segments: Vec<SegmentInfo> = entries
+            let segments: Vec<SegmentInfo> = all_entries
                 .iter()
-                .filter(|e| e.app_name.as_str() == name)
+                .filter(|e| e.app_name == name)
                 .filter(|e| discovery::entry_visible(e))
                 .filter(|e| {
-                    filter_lower.is_empty()
-                        || e.type_name.as_str().to_lowercase().contains(&filter_lower)
-                        || e.app_name.as_str().to_lowercase().contains(&filter_lower)
-                        || format!("{}", e.kind).to_lowercase().contains(&filter_lower)
+                    filter_lower.is_empty() ||
+                        e.type_name.to_lowercase().contains(&filter_lower) ||
+                        e.app_name.to_lowercase().contains(&filter_lower) ||
+                        format!("{}", e.kind).to_lowercase().contains(&filter_lower)
                 })
                 .map(|e| {
-                    let alive = e.pids.any_alive();
-                    let pid_count = e.pids.count();
-                    let (queue_writes, queue_fill, queue_capacity) = if alive && e.kind == ShmemKind::Queue {
-                        match discovery::read_queue_stats(e.flink.as_str()) {
-                            Some(stats) => (Some(stats.writes), Some(stats.fill), Some(stats.capacity)),
-                            None => (None, None, None),
-                        }
-                    } else {
-                        (None, None, None)
-                    };
-                    let poison = if alive { discovery::check_poison(e) } else { None };
+                    // Without PID tracking, we consider a segment alive if its
+                    // backing flink is reachable.
+                    let alive = discovery::flink_reachable(&e.flink);
+                    let (queue_writes, queue_fill, queue_capacity) =
+                        if alive && e.kind == ShmemKind::Queue {
+                            match discovery::QueueStats::read(&e.flink) {
+                                Some(stats) => {
+                                    (Some(stats.writes), Some(stats.fill), Some(stats.capacity))
+                                }
+                                None => (None, None, None),
+                            }
+                        } else {
+                            (None, None, None)
+                        };
+                    let poison = if alive { discovery::PoisonInfo::check(e) } else { None };
                     let msgs_per_sec = queue_writes.and_then(|w| {
-                        let flink = e.flink.as_str().to_string();
+                        let flink = e.flink.clone();
                         let now = Instant::now();
                         let rate = self.prev_writes.get(&flink).and_then(|(prev_w, prev_t)| {
                             let dt = now.elapsed_since(*prev_t).as_secs();
@@ -212,22 +222,24 @@ impl App {
                         self.prev_writes.insert(flink, (w, now));
                         rate
                     });
+                    let pids = e.pids(&proc_map);
                     SegmentInfo {
                         entry: e.clone(),
                         alive,
-                        pid_count,
                         queue_writes,
                         queue_fill,
                         queue_capacity,
                         poison,
                         msgs_per_sec,
+                        pids,
                     }
                 })
                 .collect();
             if segments.is_empty() {
                 continue;
             }
-            self.groups.push(AppGroup { name, segments, expanded: true });
+            let expanded = prev_expanded.get(&name).copied().unwrap_or(true);
+            self.groups.push(AppGroup { name, segments, expanded });
         }
 
         // Sort segments within each group according to the current sort mode.
@@ -235,9 +247,7 @@ impl App {
         for group in &mut self.groups {
             match sort_mode {
                 SortMode::Name => {
-                    group.segments.sort_by(|a, b| {
-                        a.entry.type_name.as_str().cmp(b.entry.type_name.as_str())
-                    });
+                    group.segments.sort_by(|a, b| a.entry.type_name.cmp(&b.entry.type_name));
                 }
                 SortMode::Kind => {
                     group.segments.sort_by(|a, b| {
@@ -269,11 +279,8 @@ impl App {
     }
 
     pub fn recount_rows(&mut self) {
-        self.total_rows = self
-            .groups
-            .iter()
-            .map(|g| 1 + if g.expanded { g.segments.len() } else { 0 })
-            .sum();
+        self.total_rows =
+            self.groups.iter().map(|g| 1 + if g.expanded { g.segments.len() } else { 0 }).sum();
         if self.selected >= self.total_rows && self.total_rows > 0 {
             self.selected = self.total_rows - 1;
         }
@@ -281,20 +288,18 @@ impl App {
 
     fn refresh_detail_pids(&mut self) {
         if let View::Detail(ref mut detail) = self.view {
-            let seg = self
-                .groups
-                .get(detail.group_idx)
-                .and_then(|g| g.segments.get(detail.segment_idx));
+            let seg =
+                self.groups.get(detail.group_idx).and_then(|g| g.segments.get(detail.segment_idx));
             match seg {
-                Some(s) => detail.pids = discovery::pids_info(&s.entry),
+                Some(seg) => detail.pids = discovery::PidInfo::for_pids(&seg.pids),
                 None => self.view = View::List,
             }
         }
     }
 
     pub fn tick(&mut self) {
-        if let Some((_, ts)) = &self.status_msg
-            && ts.elapsed() >= status_msg_duration()
+        if let Some((_, ts)) = &self.status_msg &&
+            ts.elapsed() >= status_msg_duration()
         {
             self.status_msg = None;
         }
@@ -402,8 +407,7 @@ impl App {
                     if group.expanded {
                         for si in 0..group.segments.len() {
                             if row == self.selected {
-                                let pids =
-                                    discovery::pids_info(&group.segments[si].entry);
+                                let pids = discovery::PidInfo::for_pids(&group.segments[si].pids);
                                 self.view = View::Detail(DetailState {
                                     group_idx: gi,
                                     segment_idx: si,
@@ -456,9 +460,7 @@ impl App {
 
     fn request_cleanup_list(&mut self) {
         let (alive, flink) = match self.selected_item() {
-            Some(SelectedItem::Segment(_, _, seg)) => {
-                (seg.alive, seg.entry.flink.as_str().to_string())
-            }
+            Some(SelectedItem::Segment(_, _, seg)) => (seg.alive, seg.entry.flink.clone()),
             _ => {
                 self.status_msg = Some(("Select a segment first".into(), Instant::now()));
                 return;
@@ -506,7 +508,7 @@ impl App {
         }
 
         if detail.confirm_cleanup {
-            let flink = seg.entry.flink.as_str().to_string();
+            let flink = seg.entry.flink.clone();
             match cleanup_flink(Path::new(&flink)) {
                 Ok(()) => {
                     self.status_msg = Some((format!("Cleaned up {}", flink), Instant::now()));
@@ -559,12 +561,11 @@ impl App {
                 .iter()
                 .flat_map(|g| &g.segments)
                 .filter(|s| !s.alive)
-                .map(|s| s.entry.flink.as_str().to_string())
+                .map(|s| s.entry.flink.clone())
                 .collect();
 
             if dead_flinks.is_empty() {
-                self.status_msg =
-                    Some(("No stale segments to clean".into(), Instant::now()));
+                self.status_msg = Some(("No stale segments to clean".into(), Instant::now()));
                 return;
             }
 
@@ -584,11 +585,109 @@ impl App {
 
     pub fn detail_segment(&self) -> Option<&SegmentInfo> {
         if let View::Detail(ref detail) = self.view {
-            self.groups
-                .get(detail.group_idx)
-                .and_then(|g| g.segments.get(detail.segment_idx))
+            self.groups.get(detail.group_idx).and_then(|g| g.segments.get(detail.segment_idx))
         } else {
             None
         }
+    }
+
+    /// Process a key event, returning `true` if the application should quit.
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+
+        if self.show_help {
+            self.show_help = false;
+            return false;
+        }
+
+        // ── Filter mode: capture typed characters ──────────────────────
+        if self.filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.filter_mode = false;
+                    self.filter_text.clear();
+                    self.refresh();
+                }
+                KeyCode::Enter => {
+                    self.filter_mode = false;
+                }
+                KeyCode::Backspace => {
+                    self.filter_text.pop();
+                    self.refresh();
+                }
+                KeyCode::Char(c) => {
+                    self.filter_text.push(c);
+                    self.refresh();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        let confirming = match &self.view {
+            View::List => self.confirm_cleanup || self.confirm_cleanup_all,
+            View::Detail(d) => d.confirm_cleanup,
+        };
+        if confirming {
+            match key.code {
+                KeyCode::Enter => {
+                    if self.confirm_cleanup_all {
+                        self.request_cleanup_all();
+                    } else {
+                        self.request_cleanup();
+                    }
+                }
+                _ => self.cancel_cleanup(),
+            }
+            return false;
+        }
+
+        match &self.view {
+            View::List => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    if !self.filter_text.is_empty() {
+                        self.filter_text.clear();
+                        self.refresh();
+                    } else {
+                        return true;
+                    }
+                }
+                KeyCode::Char('?') => self.toggle_help(),
+                KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                KeyCode::Down | KeyCode::Char('j') => self.next(),
+                KeyCode::Home | KeyCode::Char('g') => self.home(),
+                KeyCode::End | KeyCode::Char('G') => self.end(),
+                KeyCode::PageUp => self.page_up(),
+                KeyCode::PageDown => self.page_down(),
+                KeyCode::Enter => self.enter(),
+                KeyCode::Char('d') => self.request_cleanup(),
+                KeyCode::Char('D') => self.request_cleanup_all(),
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char('/') => {
+                    self.filter_mode = true;
+                }
+                KeyCode::Char('s') => self.toggle_sort(),
+                _ => {}
+            },
+            View::Detail(_) => match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Backspace => self.back(),
+                KeyCode::Char('?') => self.toggle_help(),
+                KeyCode::Char('d') => self.request_cleanup(),
+                KeyCode::Char('D') => self.request_cleanup_all(),
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                KeyCode::Down | KeyCode::Char('j') => self.next(),
+                KeyCode::Home | KeyCode::Char('g') => self.home(),
+                KeyCode::End | KeyCode::Char('G') => self.end(),
+                KeyCode::PageUp => self.page_up(),
+                KeyCode::PageDown => self.page_down(),
+                _ => {}
+            },
+        }
+
+        false
     }
 }

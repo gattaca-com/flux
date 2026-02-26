@@ -3,9 +3,12 @@
 //! Run with:
 //!   cargo run --example demo -p flux-ctl
 
-use flux_communication::queue::{Producer, Queue, QueueType};
-use flux_communication::registry::{ShmemRegistry, REGISTRY_FLINK_NAME};
-use flux_communication::{ShmemData, shmem_queue_with_base_dir};
+use flux_communication::{
+    ShmemData,
+    queue::{Producer, Queue, QueueType},
+    shmem_queue_with_base_dir,
+};
+use flux_ctl::discovery::scan_base_dir;
 use flux_utils::directories::local_share_dir;
 
 /// Example message types
@@ -37,10 +40,7 @@ fn main() {
     let app_name = "flux-demo";
 
     println!("Base dir: {}", base_dir.display());
-    println!(
-        "Registry: {}\n",
-        base_dir.join(REGISTRY_FLINK_NAME).display()
-    );
+    println!("Shmem dir: {}\n", base_dir.display());
 
     // Create some queues (auto-registered)
     println!("Creating shmem queues...");
@@ -66,30 +66,17 @@ fn main() {
         });
     }
     for i in 0..10 {
-        order_producer.produce(&OrderFill {
-            order_id: 1000 + i,
-            filled_qty: 5 * (i + 1),
-        });
+        order_producer.produce(&OrderFill { order_id: 1000 + i, filled_qty: 5 * (i + 1) });
     }
     println!("Wrote 50 PriceUpdates and 10 OrderFills\n");
 
-    // Show what's in the registry
-    let registry = ShmemRegistry::open_or_create(&base_dir);
-    println!(
-        "Registry has {} entries:",
-        registry.entry_count()
-    );
-    for entry in registry.entries() {
-        let pids = entry.pids.active_pids();
-        let pid_str = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    // Discover segments via filesystem scan
+    let entries = scan_base_dir(&base_dir);
+    println!("Discovered {} entries:", entries.len());
+    for entry in &entries {
         println!(
-            "  {} {:>14} {:>16}  elem={}B  cap={}  pids=[{}]",
-            entry.kind,
-            entry.app_name.as_str(),
-            entry.type_name.as_str(),
-            entry.elem_size,
-            entry.capacity,
-            pid_str,
+            "  {} {:>14} {:>16}  elem={}B  cap={}",
+            entry.kind, entry.app_name, entry.type_name, entry.elem_size, entry.capacity,
         );
     }
 

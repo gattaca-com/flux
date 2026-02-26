@@ -1,55 +1,130 @@
-//! Registry access, entry visibility, and PID formatting helpers.
+//! Filesystem-based discovery of shared memory segments.
 //!
-//! # Safety audit (A4) — 2026-02-26
-//!
-//! Verified: no TUI code (`flux-ctl`) calls `open_shared()` or
-//! `std::mem::forget(shmem)`.  All shmem opens go through the read-only
-//! helpers in `discovery::inspect` which properly `drop(shmem)` after use.
-//! The only `forget` calls live in `flux-communication::registry` (the
-//! `open()` / `open_or_create()` methods on `ShmemRegistry` itself) where
-//! the mapping must outlive the process.
+//! Replaces the old `ShmemRegistry`-based approach with direct filesystem
+//! scanning.  Each segment is represented as a [`DiscoveredEntry`] — a plain
+//! owned struct with no dependency on shared-memory–resident data structures.
 
 use std::path::Path;
 
-use flux_communication::registry::{REGISTRY_FLINK_NAME, ShmemEntry, ShmemRegistry};
+use flux_communication::{array::ArrayHeader, queue::QueueHeader, registry::ShmemKind};
+use shared_memory::ShmemConf;
 
-/// Open the global registry, sweeping dead PIDs and populating from the
-/// filesystem (so pre-existing shmem created before the registry is visible).
-/// Stale flinks whose backing shmem no longer exists are removed.
-pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {
-    let registry_path = base_dir.join(REGISTRY_FLINK_NAME);
-    let reg = ShmemRegistry::open(&registry_path)?;
-    reg.sweep_dead_pids();
-    reg.populate_from_fs(base_dir);
-    Some(reg)
+// ─── DiscoveredEntry ────────────────────────────────────────────────────────
+
+/// A shared-memory segment discovered by walking the filesystem.
+#[derive(Debug, Clone)]
+pub struct DiscoveredEntry {
+    /// The kind of segment (Queue, Data, SeqlockArray).
+    pub kind: ShmemKind,
+    /// Application name (the directory name directly under `base_dir`).
+    pub app_name: String,
+    /// Type name (the flink filename, which is the short type name).
+    pub type_name: String,
+    /// Absolute flink path on disk.
+    pub flink: String,
+    /// Element size in bytes (from the header, or `shmem.len()` for Data).
+    pub elem_size: usize,
+    /// Number of slots (mask+1 for queues, bufsize for arrays, 1 for data).
+    pub capacity: usize,
 }
 
-/// Scan the filesystem for pre-existing shared memory segments and register them.
+// ─── Scanning ───────────────────────────────────────────────────────────────
+
+/// Walk `base_dir/<app>/shmem/{queues,data,arrays}/<TypeName>` and return
+/// a [`DiscoveredEntry`] for every flink whose backing shmem can still be
+/// opened.
 ///
-/// Creates the registry if it doesn't exist, sweeps dead PIDs, then calls
-/// [`ShmemRegistry::populate_from_fs`] to discover shmem backing files under
-/// `base_dir`. Prints a summary of registered, already-known, stale-removed,
-/// and skipped (registry-full) entries.
-pub fn scan(base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let reg = ShmemRegistry::open_or_create(base_dir);
-    reg.sweep_dead_pids();
-    let result = reg.populate_from_fs(base_dir);
-    println!("Scanned {}", base_dir.display());
-    println!("  Registered:     {}", result.registered);
-    println!("  Already known:  {}", result.already_known);
-    println!("  Stale removed:  {}", result.stale_removed);
-    println!("  Skipped (full): {}", result.skipped);
-    Ok(())
+/// Stale flinks (where `ShmemConf::open` fails) are silently skipped.
+pub fn scan_base_dir(base_dir: &Path) -> Vec<DiscoveredEntry> {
+    let mut entries = Vec::new();
+
+    let Ok(app_iter) = std::fs::read_dir(base_dir) else {
+        return entries;
+    };
+
+    for dir_entry in app_iter.flatten() {
+        let app_dir = dir_entry.path();
+        if !app_dir.is_dir() {
+            continue;
+        }
+        let app_name = dir_entry.file_name().to_string_lossy().to_string();
+        let shmem_dir = app_dir.join("shmem");
+
+        for (subdir, kind) in [
+            ("queues", ShmemKind::Queue),
+            ("data", ShmemKind::Data),
+            ("arrays", ShmemKind::SeqlockArray),
+        ] {
+            let type_dir = shmem_dir.join(subdir);
+            let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
+                continue;
+            };
+            for flink_entry in flink_iter.flatten() {
+                let flink_path = flink_entry.path();
+                if flink_path.is_dir() {
+                    continue;
+                }
+                let type_name = flink_entry.file_name().to_string_lossy().to_string();
+
+                // Try to open the shmem — if the backing is gone, skip.
+                let Ok(shmem) = ShmemConf::new().flink(&flink_path).open() else {
+                    continue;
+                };
+
+                let (elem_size, capacity) = match kind {
+                    ShmemKind::Queue => read_queue_meta(&shmem),
+                    ShmemKind::SeqlockArray => read_array_meta(&shmem),
+                    ShmemKind::Data => (shmem.len(), 1),
+                    ShmemKind::Unknown => (0, 0),
+                };
+
+                // Drop shmem immediately — we only needed the header.
+                drop(shmem);
+
+                entries.push(DiscoveredEntry {
+                    kind,
+                    app_name: app_name.clone(),
+                    type_name,
+                    flink: flink_path.to_string_lossy().to_string(),
+                    elem_size,
+                    capacity,
+                });
+            }
+        }
+    }
+
+    entries
 }
 
-/// Return sorted, deduplicated application names from all non-empty registry entries.
-pub fn app_names(registry: &ShmemRegistry) -> Vec<String> {
-    let mut names: Vec<String> = registry
-        .entries()
-        .iter()
-        .filter(|e| !e.is_empty())
-        .map(|e| e.app_name.as_str().to_string())
-        .collect();
+// ─── Header reading helpers ─────────────────────────────────────────────────
+
+fn read_queue_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {
+    if shmem.len() < std::mem::size_of::<QueueHeader>() {
+        return (0, 0);
+    }
+    let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        return (0, 0);
+    }
+    (header.elsize, header.mask + 1)
+}
+
+fn read_array_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {
+    if shmem.len() < std::mem::size_of::<ArrayHeader>() {
+        return (0, 0);
+    }
+    let header = unsafe { &*(shmem.as_ptr() as *const ArrayHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        return (0, 0);
+    }
+    (header.elsize, header.bufsize)
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Return sorted, deduplicated application names from discovered entries.
+pub fn app_names(entries: &[DiscoveredEntry]) -> Vec<String> {
+    let mut names: Vec<String> = entries.iter().map(|e| e.app_name.clone()).collect();
     names.sort();
     names.dedup();
     names
@@ -59,45 +134,19 @@ pub fn app_names(registry: &ShmemRegistry) -> Vec<String> {
 ///
 /// Returns `false` for empty flink strings or missing/empty files.
 /// This is a lightweight filesystem-only check — it does **not** open or
-/// mmap the shared memory segment, avoiding the mmap leak that would occur
-/// if `ShmemConf::open()` were used on a non-owner handle.
+/// mmap the shared memory segment.
 pub fn flink_reachable(flink: &str) -> bool {
     if flink.is_empty() {
         return false;
     }
-    // Check that the flink file exists and is non-empty.  The shared_memory
-    // crate writes the OS ID into the flink file, so a valid (reachable) flink
-    // is always non-empty.  Previously this called `ShmemConf::open()` which
-    // leaked the mmap on success (the returned `Shmem` was dropped without
-    // being the owner, so the mapping was never unmapped).
-    std::fs::metadata(flink)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false)
+    std::fs::metadata(flink).map(|m| m.len() > 0).unwrap_or(false)
 }
 
-/// An entry is visible if it has live processes or its backing shmem still exists.
-pub fn entry_visible(entry: &ShmemEntry) -> bool {
-    if entry.is_empty() {
-        return false;
-    }
-    if entry.pids.any_alive() {
-        return true;
-    }
-    flink_reachable(entry.flink.as_str())
-}
-
-/// Format an entry's attached PIDs as a compact display string.
+/// An entry is visible if its backing shmem flink still exists on disk.
 ///
-/// Returns `"pid=none"` if no PIDs are attached, `"pid=<N>"` for a single
-/// PID, or `"pids(<count>)=[<comma-separated>]"` for multiple PIDs.
-pub fn format_pids(entry: &ShmemEntry) -> String {
-    let active = entry.pids.active_pids();
-    match active.len() {
-        0 => "pid=none".into(),
-        1 => format!("pid={}", active[0]),
-        n => {
-            let list: Vec<String> = active.iter().map(|p| p.to_string()).collect();
-            format!("pids({n})=[{}]", list.join(","))
-        }
-    }
+/// Since `scan_base_dir` already filters out entries whose shmem cannot be
+/// opened, this is a secondary liveness check for entries that may have
+/// become stale since the last scan.
+pub fn entry_visible(entry: &DiscoveredEntry) -> bool {
+    flink_reachable(&entry.flink)
 }
