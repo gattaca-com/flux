@@ -174,6 +174,7 @@ impl App {
         let all_entries = discovery::scan_base_dir(&self.base_dir);
         let app_names = discovery::app_names(&all_entries);
         let proc_map = discovery::scan_proc_fds();
+        let own_pid = std::process::id();
 
         for name in app_names {
             if let Some(ref filter) = self.app_filter &&
@@ -193,9 +194,10 @@ impl App {
                         format!("{}", e.kind).to_lowercase().contains(&filter_lower)
                 })
                 .map(|e| {
-                    // Without PID tracking, we consider a segment alive if its
-                    // backing flink is reachable.
-                    let alive = discovery::flink_reachable(&e.flink);
+                    let pids = e.pids(&proc_map);
+                    // A segment is alive if any process *other than us* has
+                    // its backing shmem open.
+                    let alive = pids.iter().any(|&p| p != own_pid);
                     let (queue_writes, queue_fill, queue_capacity) =
                         if alive && e.kind == ShmemKind::Queue {
                             match discovery::QueueStats::read(&e.flink) {
@@ -222,7 +224,8 @@ impl App {
                         self.prev_writes.insert(flink, (w, now));
                         rate
                     });
-                    let pids = e.pids(&proc_map);
+                    // Filter out our own PID so the TUI doesn't count itself.
+                    let pids: Vec<u32> = pids.into_iter().filter(|&p| p != own_pid).collect();
                     SegmentInfo {
                         entry: e.clone(),
                         alive,
