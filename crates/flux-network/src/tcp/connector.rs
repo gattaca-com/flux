@@ -182,13 +182,14 @@ impl ConnectionManager {
         if let Some(stream) = self.try_connect(o, addr) {
             let mut tcp_stream =
                 TcpStream::from_stream_with_telemetry(stream, o, addr, self.telemetry);
-            if let Some(msg) = &self.on_connect_msg
-                && tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+            if let Some(msg) = &self.on_connect_msg {
+                if tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
-            {
-                warn!(?addr, "on_connect_msg send failed");
-                return None;
+                {
+                    warn!(?addr, "on_connect_msg send failed");
+                    return None;
+                }
             }
             self.conns.push((o, ConnectionVariant::Outbound(tcp_stream)));
             self.next_token += 1;
