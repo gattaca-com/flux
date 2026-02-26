@@ -124,7 +124,7 @@ fn render_single_app_expanded() {
     assert!(text.contains("myapp"), "app name in TUI:\n{text}");
     assert!(text.contains("PriceUpdate"), "queue segment:\n{text}");
     assert!(text.contains("Config"), "data segment:\n{text}");
-    assert!(text.contains("writes=42"), "write count:\n{text}");
+    assert!(text.contains("cap="), "queue details:\n{text}");
     assert!(text.contains("Queue"), "queue kind:\n{text}");
     assert!(text.contains("Data"), "data kind:\n{text}");
     assert!(text.contains("alive"), "alive status:\n{text}");

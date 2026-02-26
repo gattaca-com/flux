@@ -107,10 +107,6 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                 let kind = format!("{}", seg.entry.kind);
                 let details = match seg.entry.kind {
                     ShmemKind::Queue => {
-                        let writes = seg
-                            .queue_writes
-                            .map(|w| format!(" writes={w}"))
-                            .unwrap_or_default();
                         let rate = match seg.msgs_per_sec {
                             Some(r) if r >= 1_000_000.0 => format!(" {:.1}M/s", r / 1_000_000.0),
                             Some(r) if r >= 1_000.0 => format!(" {:.1}K/s", r / 1_000.0),
@@ -118,8 +114,8 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                             None => String::new(),
                         };
                         format!(
-                            "cap={} elem={}B{}{}",
-                            seg.entry.capacity, seg.entry.elem_size, writes, rate
+                            "cap={} elem={}B{}",
+                            seg.entry.capacity, seg.entry.elem_size, rate
                         )
                     }
                     _ => format!("size={}B", seg.entry.elem_size),
