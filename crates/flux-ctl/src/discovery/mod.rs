@@ -6,7 +6,7 @@
 pub mod cli;
 pub mod inspect;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use cli::{clean, inspect, list_all, list_json, stats};
 pub use flux_communication::is_pid_alive;
@@ -21,7 +21,7 @@ use shared_memory::ShmemConf;
 pub struct DiscoveredEntry {
     /// The kind of segment (Queue, Data, SeqlockArray).
     pub kind: ShmemKind,
-    /// Application name (the directory name directly under `base_dir`).
+    /// Application name — the immediate parent of the `shmem/` directory.
     pub app_name: String,
     /// Type name (the flink filename, which is the short type name).
     pub type_name: String,
@@ -33,67 +33,98 @@ pub struct DiscoveredEntry {
     pub capacity: usize,
 }
 
-/// Walk `base_dir/<app>/shmem/{queues,data,arrays}/<TypeName>` and return
-/// a [`DiscoveredEntry`] for every flink whose backing shmem can still be
-/// opened.
+/// Recursively walk `base_dir` looking for `shmem/{queues,data,arrays}/`
+/// directories at any depth.  For each one found, the immediate parent of
+/// the `shmem/` directory is used as the application name.
 ///
-/// Stale flinks (where `ShmemConf::open` fails) are silently skipped.
+/// Returns a [`DiscoveredEntry`] for every flink whose backing shmem can
+/// still be opened.  Stale flinks are silently skipped.
 pub fn scan_base_dir(base_dir: &Path) -> Vec<DiscoveredEntry> {
     let mut entries = Vec::new();
+    let mut shmem_dirs: Vec<(String, PathBuf)> = Vec::new();
+    find_shmem_dirs(base_dir, &mut shmem_dirs);
 
-    let Ok(app_iter) = std::fs::read_dir(base_dir) else {
-        return entries;
-    };
-
-    for dir_entry in app_iter.flatten() {
-        let app_dir = dir_entry.path();
-        if !app_dir.is_dir() {
-            continue;
-        }
-        let app_name = dir_entry.file_name().to_string_lossy().to_string();
-        let shmem_dir = app_dir.join("shmem");
-
-        for (subdir, kind) in [
-            ("queues", ShmemKind::Queue),
-            ("data", ShmemKind::Data),
-            ("arrays", ShmemKind::SeqlockArray),
-        ] {
-            let type_dir = shmem_dir.join(subdir);
-            let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
-                continue;
-            };
-            for flink_entry in flink_iter.flatten() {
-                let flink_path = flink_entry.path();
-                if flink_path.is_dir() {
-                    continue;
-                }
-                let type_name = flink_entry.file_name().to_string_lossy().to_string();
-
-                // Try to open the shmem — if the backing is gone, skip.
-                let Ok(shmem) = ShmemConf::new().flink(&flink_path).open() else {
-                    continue;
-                };
-
-                let (elem_size, capacity) = match kind {
-                    ShmemKind::Queue => read_queue_meta(&shmem),
-                    ShmemKind::SeqlockArray => read_array_meta(&shmem),
-                    ShmemKind::Data => (shmem.len(), 1),
-                    ShmemKind::Unknown => (0, 0),
-                };
-
-                entries.push(DiscoveredEntry {
-                    kind,
-                    app_name: app_name.clone(),
-                    type_name,
-                    flink: flink_path.to_string_lossy().to_string(),
-                    elem_size,
-                    capacity,
-                });
-            }
-        }
+    for (app_name, shmem_dir) in &shmem_dirs {
+        collect_entries(app_name, shmem_dir, &mut entries);
     }
 
     entries
+}
+
+/// DFS through `dir` looking for directories named `shmem` that contain at
+/// least one of `queues`, `data`, or `arrays`.  Pushes `(app_name, shmem_path)`
+/// pairs and does **not** recurse below a matched `shmem/` directory.
+///
+/// `app_name` is the relative path from `base_dir` to the parent of `shmem/`,
+/// e.g. `gattaca/LOCAL_LOUIS/builder` for a `shmem/` found at
+/// `<base_dir>/gattaca/LOCAL_LOUIS/builder/shmem/`.
+pub(crate) fn find_shmem_dirs(base_dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    find_shmem_dirs_inner(base_dir, base_dir, out);
+}
+
+fn find_shmem_dirs_inner(base_dir: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(iter) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in iter.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if entry.file_name() == "shmem" && is_shmem_root(&path) {
+            let app_name = dir.strip_prefix(base_dir).unwrap_or(dir).to_string_lossy().to_string();
+            out.push((app_name, path));
+        } else {
+            find_shmem_dirs_inner(base_dir, &path, out);
+        }
+    }
+}
+
+/// Returns `true` when `dir` contains at least one of the expected shmem
+/// sub-directories (`queues`, `data`, `arrays`).
+fn is_shmem_root(dir: &Path) -> bool {
+    dir.join("queues").is_dir() || dir.join("data").is_dir() || dir.join("arrays").is_dir()
+}
+
+/// Read all flinks under a single `shmem/` directory and append entries.
+fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<DiscoveredEntry>) {
+    for (subdir, kind) in [
+        ("queues", ShmemKind::Queue),
+        ("data", ShmemKind::Data),
+        ("arrays", ShmemKind::SeqlockArray),
+    ] {
+        let type_dir = shmem_dir.join(subdir);
+        let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
+            continue;
+        };
+        for flink_entry in flink_iter.flatten() {
+            let flink_path = flink_entry.path();
+            if flink_path.is_dir() {
+                continue;
+            }
+            let type_name = flink_entry.file_name().to_string_lossy().to_string();
+
+            let Ok(shmem) = ShmemConf::new().flink(&flink_path).open() else {
+                continue;
+            };
+
+            let (elem_size, capacity) = match kind {
+                ShmemKind::Queue => read_queue_meta(&shmem),
+                ShmemKind::SeqlockArray => read_array_meta(&shmem),
+                ShmemKind::Data => (shmem.len(), 1),
+                ShmemKind::Unknown => (0, 0),
+            };
+
+            entries.push(DiscoveredEntry {
+                kind,
+                app_name: app_name.to_owned(),
+                type_name,
+                flink: flink_path.to_string_lossy().to_string(),
+                elem_size,
+                capacity,
+            });
+        }
+    }
 }
 
 fn read_queue_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {

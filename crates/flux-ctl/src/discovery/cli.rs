@@ -370,9 +370,9 @@ pub fn inspect(
 }
 /// Remove stale shared memory segments.
 ///
-/// Walks `base_dir/<app>/shmem/{queues,data,arrays}/` for flink files whose
-/// backing shmem can no longer be opened.  `scan_base_dir` only returns
-/// *openable* entries, so we walk the filesystem directly here.
+/// Recursively searches `base_dir` for `shmem/{queues,data,arrays}/`
+/// directories, then checks each flink file.  A flink is stale when its
+/// backing shmem can no longer be opened.
 ///
 /// In dry-run mode (the default), lists the stale segments without touching
 /// anything.  When `force` is `true`, deletes the flink files via
@@ -382,24 +382,17 @@ pub fn clean(
     app_filter: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use super::find_shmem_dirs;
+
+    let mut shmem_dirs = Vec::new();
+    find_shmem_dirs(base_dir, &mut shmem_dirs);
+
     let mut stale: Vec<(String, String, std::path::PathBuf)> = Vec::new();
 
-    let Ok(app_iter) = std::fs::read_dir(base_dir) else {
-        println!("No stale segments found");
-        return Ok(());
-    };
-
-    for dir_entry in app_iter.flatten() {
-        let app_dir = dir_entry.path();
-        if !app_dir.is_dir() {
-            continue;
-        }
-        let app_name = dir_entry.file_name().to_string_lossy().to_string();
+    for (app_name, shmem_dir) in &shmem_dirs {
         if app_filter.is_some_and(|f| app_name != f) {
             continue;
         }
-
-        let shmem_dir = app_dir.join("shmem");
         for subdir in ["queues", "data", "arrays"] {
             let type_dir = shmem_dir.join(subdir);
             let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
@@ -410,7 +403,6 @@ pub fn clean(
                 if flink_path.is_dir() {
                     continue;
                 }
-                // If the backing shmem can still be opened it's not stale.
                 if ShmemConf::new().flink(&flink_path).open().is_ok() {
                     continue;
                 }
