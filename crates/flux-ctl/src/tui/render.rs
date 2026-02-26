@@ -111,9 +111,15 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                             .queue_writes
                             .map(|w| format!(" writes={w}"))
                             .unwrap_or_default();
+                        let rate = match seg.msgs_per_sec {
+                            Some(r) if r >= 1_000_000.0 => format!(" {:.1}M/s", r / 1_000_000.0),
+                            Some(r) if r >= 1_000.0 => format!(" {:.1}K/s", r / 1_000.0),
+                            Some(r) => format!(" {:.0}msg/s", r),
+                            None => String::new(),
+                        };
                         format!(
-                            "cap={} elem={}B{}",
-                            seg.entry.capacity, seg.entry.elem_size, writes
+                            "cap={} elem={}B{}{}",
+                            seg.entry.capacity, seg.entry.elem_size, writes, rate
                         )
                     }
                     _ => format!("size={}B", seg.entry.elem_size),
@@ -283,9 +289,16 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
     if seg.entry.kind == ShmemKind::Queue
         && let Some(writes) = seg.queue_writes
     {
+        let rate_str = match seg.msgs_per_sec {
+            Some(r) if r >= 1_000_000.0 => format!("  ({:.1} M/s)", r / 1_000_000.0),
+            Some(r) if r >= 1_000.0 => format!("  ({:.1} K/s)", r / 1_000.0),
+            Some(r) => format!("  ({:.0} msg/s)", r),
+            None => String::new(),
+        };
         lines.push(Line::from(vec![
             Span::styled("  Writes:     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}", writes)),
+            Span::raw(format!("{writes}")),
+            Span::styled(rate_str, Style::default().fg(Color::Cyan)),
         ]));
 
         if let (Some(pos), Some(cap)) = (seg.queue_fill, seg.queue_capacity) {

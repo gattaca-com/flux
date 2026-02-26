@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use flux_timing::{Duration, Instant};
@@ -42,6 +43,8 @@ pub struct SegmentInfo {
     /// Ring buffer capacity (`mask + 1`).
     pub queue_capacity: Option<usize>,
     pub poison: Option<discovery::PoisonInfo>,
+    /// Messages per second computed from delta writes / delta time.
+    pub msgs_per_sec: Option<f64>,
 }
 
 pub struct AppGroup {
@@ -91,6 +94,8 @@ pub struct App {
     pub filter_text: String,
     /// Current sort order for segments within each group.
     pub sort_mode: SortMode,
+    /// Tracks (last_writes, timestamp) per flink for msgs/s calculation.
+    prev_writes: HashMap<String, (usize, Instant)>,
 }
 
 fn status_msg_duration() -> Duration {
@@ -119,6 +124,7 @@ impl App {
             filter_mode: false,
             filter_text: String::new(),
             sort_mode: SortMode::Name,
+            prev_writes: HashMap::new(),
         };
         app.refresh();
         app
@@ -141,6 +147,7 @@ impl App {
             filter_mode: false,
             filter_text: String::new(),
             sort_mode: SortMode::Name,
+            prev_writes: HashMap::new(),
         };
         app.recount_rows();
         app
@@ -191,6 +198,20 @@ impl App {
                         (None, None, None)
                     };
                     let poison = if alive { discovery::check_poison(e) } else { None };
+                    let msgs_per_sec = queue_writes.and_then(|w| {
+                        let flink = e.flink.as_str().to_string();
+                        let now = Instant::now();
+                        let rate = self.prev_writes.get(&flink).and_then(|(prev_w, prev_t)| {
+                            let dt = now.elapsed_since(*prev_t).as_secs();
+                            if dt > 0.1 && w >= *prev_w {
+                                Some((w - *prev_w) as f64 / dt)
+                            } else {
+                                None
+                            }
+                        });
+                        self.prev_writes.insert(flink, (w, now));
+                        rate
+                    });
                     SegmentInfo {
                         entry: e.clone(),
                         alive,
@@ -199,6 +220,7 @@ impl App {
                         queue_fill,
                         queue_capacity,
                         poison,
+                        msgs_per_sec,
                     }
                 })
                 .collect();
