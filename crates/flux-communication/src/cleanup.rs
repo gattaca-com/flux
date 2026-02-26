@@ -7,9 +7,6 @@ use tracing::warn;
 pub fn is_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
-
-// ─── Free functions ─────────────────────────────────────────────────────────
-
 /// Unlink the shmem backing for a flink, then remove the flink file.
 ///
 /// Returns `Ok(())` on success. Returns `Err` with a description if the

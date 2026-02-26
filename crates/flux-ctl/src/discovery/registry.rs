@@ -8,9 +8,6 @@ use std::path::Path;
 
 use flux_communication::{ShmemKind, array::ArrayHeader, queue::QueueHeader};
 use shared_memory::ShmemConf;
-
-// ─── DiscoveredEntry ────────────────────────────────────────────────────────
-
 /// A shared-memory segment discovered by walking the filesystem.
 #[derive(Debug, Clone)]
 pub struct DiscoveredEntry {
@@ -27,9 +24,6 @@ pub struct DiscoveredEntry {
     /// Number of slots (mask+1 for queues, bufsize for arrays, 1 for data).
     pub capacity: usize,
 }
-
-// ─── Scanning ───────────────────────────────────────────────────────────────
-
 /// Walk `base_dir/<app>/shmem/{queues,data,arrays}/<TypeName>` and return
 /// a [`DiscoveredEntry`] for every flink whose backing shmem can still be
 /// opened.
@@ -92,9 +86,6 @@ pub fn scan_base_dir(base_dir: &Path) -> Vec<DiscoveredEntry> {
 
     entries
 }
-
-// ─── Header reading helpers ─────────────────────────────────────────────────
-
 fn read_queue_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {
     if shmem.len() < std::mem::size_of::<QueueHeader>() {
         return (0, 0);
@@ -116,9 +107,6 @@ fn read_array_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {
     }
     (header.elsize, header.bufsize)
 }
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
 /// Return sorted, deduplicated application names from discovered entries.
 pub fn app_names(entries: &[DiscoveredEntry]) -> Vec<String> {
     let mut names: Vec<String> = entries.iter().map(|e| e.app_name.clone()).collect();

@@ -11,9 +11,6 @@ use flux_ctl::{
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use shared_memory::ShmemConf;
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
 /// Shorthand to construct a queue `DiscoveredEntry`.
 fn queue_entry(
     app: &str,
@@ -89,9 +86,6 @@ fn cleanup_raw_shmem(base_dir: &Path, app: &str, subdir: &str, name: &str) {
     }
     let _ = std::fs::remove_file(&flink_path);
 }
-
-// ─── Unit tests: buffer rendering with synthetic data ───────────────────────
-
 #[test]
 fn help_hint_visible_by_default() {
     let mut app = App::with_groups(vec![]);
@@ -335,9 +329,6 @@ fn toggle_expand_collapse() {
     assert!(text.contains("Q1"), "Q1 should be visible:\n{text}");
     assert!(text.contains("▼"), "expanded icon:\n{text}");
 }
-
-// ─── Integration tests: filesystem-based discovery ──────────────────────────
-
 #[test]
 fn scan_base_dir_discovers_preexisting_shmem() {
     let tmp = tempfile::tempdir().unwrap();
@@ -426,9 +417,6 @@ fn app_filter_limits_to_one_app() {
     cleanup_raw_shmem(base, "alpha", "data", "Msg");
     cleanup_raw_shmem(base, "beta", "data", "Msg");
 }
-
-// ─── Dead-segment tests (synthetic) ────────────────────────────────────────
-
 #[test]
 fn dead_segment_renders_skull() {
     let groups = vec![AppGroup {
@@ -453,9 +441,6 @@ fn dead_segment_renders_skull() {
     assert!(text.contains("dead"), "dead status should show:\n{text}");
     assert!(text.contains("OldData"), "segment name should show:\n{text}");
 }
-
-// ─── Detail view tests ──────────────────────────────────────────────────────
-
 #[test]
 fn enter_on_segment_opens_detail() {
     let groups = vec![AppGroup {
@@ -688,9 +673,6 @@ fn enter_on_app_header_still_toggles() {
     assert!(matches!(app.view, View::List));
     assert!(!app.groups[0].expanded);
 }
-
-// ─── List-view cleanup tests ────────────────────────────────────────────────
-
 #[test]
 fn list_cleanup_blocked_for_alive_segment() {
     let groups = vec![AppGroup {
@@ -820,9 +802,6 @@ fn list_status_bar_shows_cleanup_hint_for_dead() {
 
     assert!(text.contains("d destroy"), "status bar should show destroy hint:\n{text}");
 }
-
-// ─── Poison detection tests ─────────────────────────────────────────────────
-
 #[test]
 fn poisoned_segment_renders_skull_crossbones() {
     let groups = vec![AppGroup {
@@ -899,9 +878,6 @@ fn healthy_segment_has_no_poison() {
     assert!(!text.contains("poisoned"), "healthy segment should not show poisoned:\n{text}");
     assert!(text.contains("alive"), "should show alive:\n{text}");
 }
-
-// ─── Destroy-all tests ──────────────────────────────────────────────────────
-
 #[test]
 fn destroy_all_shows_confirm_when_dead_exist() {
     let groups = vec![AppGroup {
@@ -1020,9 +996,6 @@ fn status_bar_shows_destroy_all_hint() {
         "status bar should show D hint when dead segments exist:\n{text}"
     );
 }
-
-// ─── Filesystem discovery tests ─────────────────────────────────────────────
-
 #[test]
 fn scan_base_dir_skips_stale_flinks() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1038,9 +1011,6 @@ fn scan_base_dir_skips_stale_flinks() {
     let entries = discovery::scan_base_dir(base);
     assert_eq!(entries.len(), 0, "stale flink should be skipped by scan");
 }
-
-// ─── Phase 6: filter, sort, navigation, stress ─────────────────────────────
-
 #[test]
 fn filter_narrows_visible_segments() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1334,9 +1304,6 @@ fn filter_mode_input_and_clear() {
     assert!(text.contains("Alpha"), "Alpha should be visible after clearing filter:\n{text}");
     assert!(text.contains("Beta"), "Beta should be visible after clearing filter:\n{text}");
 }
-
-// ─── Phase 7: TUI polish tests ─────────────────────────────────────────────
-
 #[test]
 fn title_bar_shows_segment_and_app_counts() {
     let groups = vec![
@@ -1521,9 +1488,6 @@ fn auto_scroll_shows_last_group_at_end() {
     // The first group should NOT be visible (scrolled off)
     assert!(!text.contains("app00"), "first group should be scrolled off screen:\n{text}");
 }
-
-// ─── Section D: Testing hardening ───────────────────────────────────────────
-
 /// D14: TUI render with 100+ character app names and type names.
 /// The renderer must not panic on very long strings.
 #[test]

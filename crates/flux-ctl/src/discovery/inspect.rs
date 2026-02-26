@@ -13,9 +13,6 @@ use flux_timing::Nanos;
 use shared_memory::ShmemConf;
 
 use super::registry::DiscoveredEntry;
-
-// ─── PID info ───────────────────────────────────────────────────────────────
-
 /// Metadata about an attached process, gathered from `/proc`.
 #[derive(Clone, Debug)]
 pub struct PidInfo {
@@ -103,9 +100,6 @@ impl PidInfo {
         Some(Nanos::from_secs(start_secs).with_fmt_utc("%Y-%m-%dT%H:%M:%SZ"))
     }
 }
-
-// ─── Poison detection ───────────────────────────────────────────────────────
-
 /// Summary of poisoned (stuck mid-write) seqlock slots in a shared memory
 /// segment.
 #[derive(Clone, Debug)]
@@ -243,9 +237,6 @@ impl PoisonInfo {
         }
     }
 }
-
-// ─── Backing file size ──────────────────────────────────────────────────────
-
 /// Return the size (in bytes) of the shared memory backing file.
 pub fn backing_file_size(flink: &str) -> Option<u64> {
     let shmem = ShmemConf::new().flink(flink).open().ok()?;
@@ -311,9 +302,6 @@ pub fn scan_proc_fds() -> HashMap<PathBuf, Vec<u32>> {
 
     map
 }
-
-// ─── DiscoveredEntry methods ────────────────────────────────────────────────
-
 impl DiscoveredEntry {
     /// Resolve the `/dev/shm/` backing path for this entry's flink.
     pub fn backing_path(&self) -> Option<PathBuf> {
@@ -325,9 +313,6 @@ impl DiscoveredEntry {
         self.backing_path().and_then(|backing| proc_map.get(&backing)).cloned().unwrap_or_default()
     }
 }
-
-// ─── Queue stats ────────────────────────────────────────────────────────────
-
 /// Queue statistics read from shared memory.
 #[derive(Clone, Debug)]
 pub struct QueueStats {
@@ -354,9 +339,6 @@ impl QueueStats {
         Some(Self { writes, fill, capacity })
     }
 }
-
-// ─── Byte formatting ────────────────────────────────────────────────────────
-
 /// Format a byte count as a human-readable string using binary units (KiB, MiB,
 /// GiB).
 pub fn format_bytes(bytes: u64) -> String {

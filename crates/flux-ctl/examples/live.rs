@@ -5,7 +5,7 @@
 //!   cargo run --example live -p flux-ctl
 //!
 //! Then observe in another terminal:
-//!   cargo run -p flux-ctl -- watch
+//!   cargo run -p flux-ctl
 //!
 //! Flags:
 //!   --no-cleanup       Leave shmem segments intact on exit

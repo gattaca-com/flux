@@ -26,9 +26,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_help_popup(frame, frame.area());
     }
 }
-
-// ─── List view ──────────────────────────────────────────────────────────────
-
 fn render_list(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
@@ -144,9 +141,6 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
     render_status_bar(frame, app, chunks[2]);
 }
-
-// ─── Detail view ────────────────────────────────────────────────────────────
-
 fn render_detail(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
@@ -438,9 +432,6 @@ fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
         popup_area,
     );
 }
-
-// ─── Status bar ─────────────────────────────────────────────────────────────
-
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let confirming_single = match &app.view {
         View::List => app.confirm_cleanup,
@@ -497,9 +488,6 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
 fn render_help_popup(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(Span::styled(" Keybindings ", Style::default().fg(Color::Cyan).bold())),

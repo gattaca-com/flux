@@ -123,9 +123,6 @@ pub fn list_all(
     }
     Ok(())
 }
-
-// ─── JSON output ────────────────────────────────────────────────────────────
-
 #[derive(Serialize)]
 struct SegmentJson {
     app: String,
@@ -183,9 +180,6 @@ pub fn list_json(
     }
     Ok(())
 }
-
-// ─── Stats ──────────────────────────────────────────────────────────────────
-
 /// Print summary statistics for all registered shared memory segments.
 ///
 /// Shows counts of alive/dead/poisoned segments, a breakdown by kind
@@ -281,9 +275,6 @@ pub fn stats(
 
     Ok(())
 }
-
-// ─── Inspect ────────────────────────────────────────────────────────────────
-
 /// Print detailed inspection of one or more shared memory segments.
 ///
 /// For each matching entry (filtered by `app_filter` and `segment_filter`),
@@ -376,9 +367,6 @@ pub fn inspect(
     }
     Ok(())
 }
-
-// ─── Clean ──────────────────────────────────────────────────────────────────
-
 /// Remove stale shared memory segments.
 ///
 /// Walks `base_dir/<app>/shmem/{queues,data,arrays}/` for flink files whose
