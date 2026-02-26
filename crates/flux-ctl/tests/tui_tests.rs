@@ -9,6 +9,7 @@ use flux_ctl::{
         render,
     },
 };
+use flux_timing::Instant;
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use shared_memory::ShmemConf;
 /// Shorthand to construct a queue `DiscoveredEntry`.
@@ -26,6 +27,9 @@ fn queue_entry(
         flink: flink.to_string(),
         elem_size,
         capacity,
+        queue_writes: None,
+        queue_fill: None,
+        backing_path: None,
     }
 }
 
@@ -38,6 +42,9 @@ fn data_entry(app: &str, type_name: &str, flink: &str, size: usize) -> Discovere
         flink: flink.to_string(),
         elem_size: size,
         capacity: 1,
+        queue_writes: None,
+        queue_fill: None,
+        backing_path: None,
     }
 }
 
@@ -1547,6 +1554,68 @@ fn d14_render_long_names() {
     let buf_wide = render_to_buffer(&mut app, 300, 50);
     let text_wide = buffer_text(&buf_wide);
     assert!(text_wide.contains(&"a".repeat(20)), "wide render should show long name:\n{text_wide}");
+}
+
+/// Performance regression test: scan_base_dir with 250 segments across 40 apps
+/// should complete within a reasonable time (prevents future performance
+/// regressions).
+#[test]
+fn performance_scan_base_dir_250_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+
+    // Create 250 segments across 40 apps (6-7 segments per app)
+    let mut segment_paths = Vec::new();
+
+    for app_idx in 0..40 {
+        let app_name = format!("perfapp{:03}", app_idx);
+
+        // Create 6 segments for apps 0-29, 7 segments for apps 30-39 = 250 total
+        let segments_per_app = if app_idx < 30 { 6 } else { 7 };
+
+        for seg_idx in 0..segments_per_app {
+            let segment_name = format!("Segment{:02}", seg_idx);
+            let subdir = if seg_idx % 2 == 0 { "queues" } else { "data" };
+            let size = 1024 * (seg_idx + 1); // varying sizes
+
+            create_raw_shmem(base, &app_name, subdir, &segment_name, size);
+            segment_paths.push((app_name.clone(), subdir, segment_name));
+        }
+    }
+
+    // Verify we created exactly 250 segments
+    assert_eq!(segment_paths.len(), 250, "should have created exactly 250 segments");
+
+    // Time the scan_base_dir operation
+    let start = Instant::now();
+    let entries = discovery::scan_base_dir(base);
+    let elapsed = start.elapsed();
+
+    // Verify all segments were discovered
+    assert_eq!(entries.len(), 250, "should discover all 250 segments");
+
+    // Verify we have 40 unique apps
+    let app_names = discovery::app_names(&entries);
+    assert_eq!(app_names.len(), 40, "should have 40 unique apps");
+
+    // Performance assertion: should complete within 5 seconds
+    // (This is a generous upper bound - the optimized scan should be much faster)
+    let max_duration_secs = 5.0;
+    let elapsed_secs = elapsed.as_secs();
+    assert!(
+        elapsed_secs <= max_duration_secs,
+        "scan_base_dir took {:.2}s with 250 segments, expected <= {:.2}s (performance regression)",
+        elapsed_secs,
+        max_duration_secs
+    );
+
+    // Also log the actual timing for monitoring
+    println!("Performance: scan_base_dir processed 250 segments in {:.2}s", elapsed_secs);
+
+    // Cleanup all segments
+    for (app_name, subdir, segment_name) in segment_paths {
+        cleanup_raw_shmem(base, &app_name, subdir, &segment_name);
+    }
 }
 
 /// D15: TUI with exactly 1 segment (edge case for off-by-one).

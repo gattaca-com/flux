@@ -32,6 +32,18 @@ pub enum ShmemKind {
     SeqlockArray = 3,
 }
 
+impl ShmemKind {
+    /// Returns the lowercase string representation without allocation
+    pub fn as_str_lowercase(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Queue => "queue",
+            Self::Data => "data",
+            Self::SeqlockArray => "seqlockarray",
+        }
+    }
+}
+
 impl std::fmt::Display for ShmemKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

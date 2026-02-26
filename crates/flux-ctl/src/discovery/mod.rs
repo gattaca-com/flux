@@ -6,13 +6,17 @@
 pub mod cli;
 pub mod inspect;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+};
 
 pub use cli::{clean, inspect, list_all, list_json, stats};
 pub use flux_communication::is_pid_alive;
 use flux_communication::{ShmemKind, array::ArrayHeader, queue::QueueHeader};
 pub use inspect::{
-    PidInfo, PoisonInfo, QueueStats, backing_file_size, format_bytes, scan_proc_fds,
+    PidInfo, PoisonInfo, QueueStats, backing_file_size, format_bytes, resolve_backing_path,
+    scan_proc_fds,
 };
 use shared_memory::ShmemConf;
 
@@ -31,6 +35,12 @@ pub struct DiscoveredEntry {
     pub elem_size: usize,
     /// Number of slots (mask+1 for queues, bufsize for arrays, 1 for data).
     pub capacity: usize,
+    /// Total writes to the queue (None for non-queue segments or failed reads).
+    pub queue_writes: Option<usize>,
+    /// Current write position within the ring buffer (count & mask).
+    pub queue_fill: Option<usize>,
+    /// Cached backing path in `/dev/shm/` (None if resolution failed).
+    pub backing_path: Option<PathBuf>,
 }
 
 /// Recursively walk `base_dir` looking for `shmem/{queues,data,arrays}/`
@@ -48,6 +58,17 @@ pub fn scan_base_dir(base_dir: &Path) -> Vec<DiscoveredEntry> {
         collect_entries(app_name, shmem_dir, &mut entries);
     }
 
+    entries
+}
+
+/// Returns a [`DiscoveredEntry`] for every flink whose backing shmem can
+/// still be opened, using pre-discovered shmem directories.  
+/// Stale flinks are silently skipped.
+pub fn scan_base_dir_with_dirs(shmem_dirs: &[(String, PathBuf)]) -> Vec<DiscoveredEntry> {
+    let mut entries = Vec::new();
+    for (app_name, shmem_dir) in shmem_dirs {
+        collect_entries(app_name, shmem_dir, &mut entries);
+    }
     entries
 }
 
@@ -108,12 +129,18 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
                 continue;
             };
 
-            let (elem_size, capacity) = match kind {
-                ShmemKind::Queue => read_queue_meta(&shmem),
-                ShmemKind::SeqlockArray => read_array_meta(&shmem),
-                ShmemKind::Data => (shmem.len(), 1),
-                ShmemKind::Unknown => (0, 0),
+            let (elem_size, capacity, queue_writes, queue_fill) = match kind {
+                ShmemKind::Queue => read_queue_meta_with_stats(&shmem),
+                ShmemKind::SeqlockArray => {
+                    let (elem_size, capacity) = read_array_meta(&shmem);
+                    (elem_size, capacity, None, None)
+                }
+                ShmemKind::Data => (shmem.len(), 1, None, None),
+                ShmemKind::Unknown => (0, 0, None, None),
             };
+
+            // Resolve backing path once during discovery
+            let backing_path = resolve_backing_path(&flink_path.to_string_lossy());
 
             entries.push(DiscoveredEntry {
                 kind,
@@ -122,20 +149,27 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
                 flink: flink_path.to_string_lossy().to_string(),
                 elem_size,
                 capacity,
+                queue_writes,
+                queue_fill,
+                backing_path,
             });
         }
     }
 }
 
-fn read_queue_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {
+fn read_queue_meta_with_stats(
+    shmem: &shared_memory::Shmem,
+) -> (usize, usize, Option<usize>, Option<usize>) {
     if shmem.len() < std::mem::size_of::<QueueHeader>() {
-        return (0, 0);
+        return (0, 0, None, None);
     }
     let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
     if !header.is_initialized() || header.elsize == 0 {
-        return (0, 0);
+        return (0, 0, None, None);
     }
-    (header.elsize, header.mask + 1)
+    let queue_writes = header.count.load(Ordering::Relaxed);
+    let queue_fill = queue_writes & header.mask;
+    (header.elsize, header.mask + 1, Some(queue_writes), Some(queue_fill))
 }
 
 fn read_array_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {

@@ -123,6 +123,17 @@ impl PoisonInfo {
         }
     }
 
+    /// Quick O(1) poison check that only inspects the slot at the current write
+    /// position. Returns Some(true) if poison detected, Some(false) if no
+    /// poison, None if unable to check.
+    pub fn check_quick(entry: &DiscoveredEntry) -> Option<bool> {
+        match entry.kind {
+            ShmemKind::Queue => Self::check_queue_quick(&entry.flink),
+            ShmemKind::SeqlockArray => Self::check_array_quick(&entry.flink),
+            _ => None,
+        }
+    }
+
     fn check_queue(flink: &str) -> Option<Self> {
         const HEADER_SIZE: usize = 64;
 
@@ -179,6 +190,84 @@ impl PoisonInfo {
         let buf_remaining = shmem_len - HEADER_SIZE;
         // shmem must stay alive while scan_seqlock_slots reads the raw ptr.
         Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining)
+    }
+
+    fn check_queue_quick(flink: &str) -> Option<bool> {
+        const HEADER_SIZE: usize = 64;
+
+        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let base = shmem.as_ptr();
+        let shmem_len = shmem.len();
+
+        if shmem_len < std::mem::size_of::<QueueHeader>() {
+            return None;
+        }
+
+        let header = unsafe { &*(base as *const QueueHeader) };
+        if !header.is_initialized() || header.elsize == 0 {
+            return None;
+        }
+
+        let elsize = header.elsize;
+        let count = header.count.load(Ordering::Acquire);
+
+        // Calculate the write position (last written slot)
+        let write_pos = count & header.mask;
+
+        if HEADER_SIZE + write_pos * elsize + std::mem::size_of::<AtomicU64>() > shmem_len {
+            return None;
+        }
+
+        // Check only the slot at the write position
+        let slot_ptr = unsafe { base.add(HEADER_SIZE + write_pos * elsize) } as *const AtomicU64;
+        let version1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+
+        if version1 & 1 == 0 {
+            return Some(false); // Even version, not poisoned
+        }
+
+        // Yield and check again to confirm poison
+        std::thread::yield_now();
+        let version2 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+
+        Some(version2 & 1 != 0) // Still odd = poisoned
+    }
+
+    fn check_array_quick(flink: &str) -> Option<bool> {
+        const HEADER_SIZE: usize = 64;
+
+        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let base = shmem.as_ptr();
+        let shmem_len = shmem.len();
+
+        if shmem_len < std::mem::size_of::<ArrayHeader>() {
+            return None;
+        }
+
+        let header = unsafe { &*(base as *const ArrayHeader) };
+        if !header.is_initialized() || header.elsize == 0 {
+            return None;
+        }
+
+        // For arrays we don't have a write position — check the first slot
+        // as a heuristic.
+        if HEADER_SIZE + std::mem::size_of::<AtomicU64>() > shmem_len {
+            return None;
+        }
+
+        // Check the first slot
+        let slot_ptr = unsafe { base.add(HEADER_SIZE) } as *const AtomicU64;
+        let version1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+
+        if version1 & 1 == 0 {
+            return Some(false); // Even version, not poisoned
+        }
+
+        // Yield and check again to confirm poison
+        std::thread::yield_now();
+        let version2 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+
+        Some(version2 & 1 != 0) // Still odd = poisoned
     }
 
     /// Walk `n_slots` seqlock slots starting at `buf_base` with stride
@@ -253,7 +342,7 @@ pub fn read_shmem_os_id(flink: &str) -> Option<String> {
 ///
 /// The flink file stores the `shm_open` name (e.g. `/shmem_ABC123`); the
 /// kernel exposes the backing file as `/dev/shm/shmem_ABC123`.
-fn resolve_backing_path(flink: &str) -> Option<PathBuf> {
+pub fn resolve_backing_path(flink: &str) -> Option<PathBuf> {
     let os_id = read_shmem_os_id(flink)?;
     let raw = if os_id.starts_with('/') {
         format!("/dev/shm{os_id}")
@@ -305,7 +394,7 @@ pub fn scan_proc_fds() -> HashMap<PathBuf, Vec<u32>> {
 impl DiscoveredEntry {
     /// Resolve the `/dev/shm/` backing path for this entry's flink.
     pub fn backing_path(&self) -> Option<PathBuf> {
-        resolve_backing_path(&self.flink)
+        self.backing_path.clone().or_else(|| resolve_backing_path(&self.flink))
     }
 
     /// Look up PIDs attached to this entry using a pre-built proc-fd map.

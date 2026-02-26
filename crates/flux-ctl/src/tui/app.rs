@@ -100,6 +100,14 @@ pub struct App {
     pub sort_mode: SortMode,
     /// Tracks (last_writes, timestamp) per flink for msgs/s calculation.
     prev_writes: HashMap<String, (usize, Instant)>,
+    /// Cached result of scan_proc_fds() with TTL.
+    cached_proc_map: HashMap<PathBuf, Vec<u32>>,
+    /// Last time proc_map was scanned.
+    proc_map_last_scan: Option<Instant>,
+    /// Cached result of find_shmem_dirs() with TTL.
+    cached_shmem_dirs: Vec<(String, PathBuf)>,
+    /// Last time shmem dirs were scanned.
+    dirs_last_scan: Option<Instant>,
 }
 
 fn status_msg_duration() -> Duration {
@@ -129,6 +137,10 @@ impl App {
             filter_text: String::new(),
             sort_mode: SortMode::Name,
             prev_writes: HashMap::new(),
+            cached_proc_map: HashMap::new(),
+            proc_map_last_scan: None,
+            cached_shmem_dirs: Vec::new(),
+            dirs_last_scan: None,
         };
         app.refresh();
         app
@@ -152,6 +164,10 @@ impl App {
             filter_text: String::new(),
             sort_mode: SortMode::Name,
             prev_writes: HashMap::new(),
+            cached_proc_map: HashMap::new(),
+            proc_map_last_scan: None,
+            cached_shmem_dirs: Vec::new(),
+            dirs_last_scan: None,
         };
         app.recount_rows();
         app
@@ -171,9 +187,31 @@ impl App {
             self.groups.iter().map(|g| (g.name.clone(), g.expanded)).collect();
 
         self.groups.clear();
-        let all_entries = discovery::scan_base_dir(&self.base_dir);
+
+        // Cache shmem dirs scan with 10-second TTL
+        let now = Instant::now();
+        let should_rescan_dirs = self
+            .dirs_last_scan
+            .is_none_or(|last| now.elapsed_since(last) >= Duration::from_secs(10));
+
+        if should_rescan_dirs {
+            self.cached_shmem_dirs.clear();
+            discovery::find_shmem_dirs(&self.base_dir, &mut self.cached_shmem_dirs);
+            self.dirs_last_scan = Some(now);
+        }
+
+        let all_entries = discovery::scan_base_dir_with_dirs(&self.cached_shmem_dirs);
         let app_names = discovery::app_names(&all_entries);
-        let proc_map = discovery::scan_proc_fds();
+
+        // Cache proc scan with 5-second TTL
+        let should_rescan_proc = self
+            .proc_map_last_scan
+            .is_none_or(|last| now.elapsed_since(last) >= Duration::from_secs(5));
+
+        if should_rescan_proc {
+            self.cached_proc_map = discovery::scan_proc_fds();
+            self.proc_map_last_scan = Some(now);
+        }
         let own_pid = std::process::id();
 
         for name in app_names {
@@ -186,30 +224,42 @@ impl App {
             let segments: Vec<SegmentInfo> = all_entries
                 .iter()
                 .filter(|e| e.app_name == name)
-                .filter(|e| discovery::entry_visible(e))
                 .filter(|e| {
                     filter_lower.is_empty() ||
                         e.type_name.to_lowercase().contains(&filter_lower) ||
                         e.app_name.to_lowercase().contains(&filter_lower) ||
-                        format!("{}", e.kind).to_lowercase().contains(&filter_lower)
+                        e.kind.as_str_lowercase().contains(&filter_lower)
                 })
                 .map(|e| {
-                    let pids = e.pids(&proc_map);
+                    let pids = e.pids(&self.cached_proc_map);
                     // A segment is alive if any process *other than us* has
                     // its backing shmem open.
                     let alive = pids.iter().any(|&p| p != own_pid);
                     let (queue_writes, queue_fill, queue_capacity) =
                         if alive && e.kind == ShmemKind::Queue {
-                            match discovery::QueueStats::read(&e.flink) {
-                                Some(stats) => {
-                                    (Some(stats.writes), Some(stats.fill), Some(stats.capacity))
-                                }
-                                None => (None, None, None),
-                            }
+                            (e.queue_writes, e.queue_fill, Some(e.capacity))
                         } else {
                             (None, None, None)
                         };
-                    let poison = if alive { discovery::PoisonInfo::check(e) } else { None };
+                    // In list view, use quick O(1) poison check
+                    let poison = if alive {
+                        match discovery::PoisonInfo::check_quick(e) {
+                            Some(true) => {
+                                // Poison detected, create a placeholder PoisonInfo for display
+                                // We don't know exact counts without full scan, so use conservative
+                                // estimates
+                                Some(discovery::PoisonInfo {
+                                    n_poisoned: 1,
+                                    first_slot: 0, // We don't know the exact slot from quick check
+                                    total_slots: e.capacity,
+                                })
+                            }
+                            Some(false) => None, // No poison detected
+                            None => None,        // Unable to check
+                        }
+                    } else {
+                        None
+                    };
                     let msgs_per_sec = queue_writes.and_then(|w| {
                         let flink = e.flink.clone();
                         let now = Instant::now();
@@ -253,9 +303,7 @@ impl App {
                     group.segments.sort_by(|a, b| a.entry.type_name.cmp(&b.entry.type_name));
                 }
                 SortMode::Kind => {
-                    group.segments.sort_by(|a, b| {
-                        format!("{}", a.entry.kind).cmp(&format!("{}", b.entry.kind))
-                    });
+                    group.segments.sort_by(|a, b| (a.entry.kind as u8).cmp(&(b.entry.kind as u8)));
                 }
                 SortMode::Status => {
                     group.segments.sort_by(|a, b| {
@@ -291,10 +339,18 @@ impl App {
 
     fn refresh_detail_pids(&mut self) {
         if let View::Detail(ref mut detail) = self.view {
-            let seg =
-                self.groups.get(detail.group_idx).and_then(|g| g.segments.get(detail.segment_idx));
-            match seg {
-                Some(seg) => detail.pids = discovery::PidInfo::for_pids(&seg.pids),
+            let seg_opt = self
+                .groups
+                .get_mut(detail.group_idx)
+                .and_then(|g| g.segments.get_mut(detail.segment_idx));
+            match seg_opt {
+                Some(seg) => {
+                    detail.pids = discovery::PidInfo::for_pids(&seg.pids);
+                    // Refresh full poison scan for detail view
+                    if !seg.pids.is_empty() {
+                        seg.poison = discovery::PoisonInfo::check(&seg.entry);
+                    }
+                }
                 None => self.view = View::List,
             }
         }
@@ -411,6 +467,13 @@ impl App {
                         for si in 0..group.segments.len() {
                             if row == self.selected {
                                 let pids = discovery::PidInfo::for_pids(&group.segments[si].pids);
+
+                                // Perform full poison scan for detail view
+                                let segment = &mut self.groups[gi].segments[si];
+                                if !segment.pids.is_empty() {
+                                    segment.poison = discovery::PoisonInfo::check(&segment.entry);
+                                }
+
                                 self.view = View::Detail(DetailState {
                                     group_idx: gi,
                                     segment_idx: si,
