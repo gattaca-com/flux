@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use flux_communication::{ShmemKind, cleanup_flink};
 use flux_timing::{Duration, Instant};
 
-use crate::{discovery, discovery::registry::DiscoveredEntry};
+use crate::{discovery, discovery::DiscoveredEntry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {

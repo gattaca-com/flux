@@ -65,7 +65,7 @@ fn buffer_text(buf: &Buffer) -> String {
     lines.join("\n")
 }
 
-/// Helper: create a real shmem segment via ShmemConf (bypassing the registry)
+/// Helper: create a real shmem segment via ShmemConf
 /// and place the flink under `base_dir/<app>/shmem/<subdir>/<name>`.
 fn create_raw_shmem(base_dir: &Path, app: &str, subdir: &str, name: &str, size: usize) {
     let flink_dir = base_dir.join(app).join("shmem").join(subdir);

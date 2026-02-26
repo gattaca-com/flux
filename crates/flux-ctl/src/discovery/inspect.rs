@@ -12,7 +12,7 @@ use flux_communication::{ShmemKind, array::ArrayHeader, queue::QueueHeader};
 use flux_timing::Nanos;
 use shared_memory::ShmemConf;
 
-use super::registry::DiscoveredEntry;
+use super::DiscoveredEntry;
 /// Metadata about an attached process, gathered from `/proc`.
 #[derive(Clone, Debug)]
 pub struct PidInfo {

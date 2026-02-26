@@ -9,8 +9,9 @@ use serde::Serialize;
 use shared_memory::ShmemConf;
 
 use super::{
+    DiscoveredEntry, app_names, entry_visible, flink_reachable,
     inspect::{PoisonInfo, backing_file_size, format_bytes},
-    registry::{DiscoveredEntry, app_names, entry_visible, flink_reachable, scan_base_dir},
+    scan_base_dir,
 };
 
 /// List all visible shared memory segments in a human-readable table.
