@@ -1768,7 +1768,7 @@ fn empty_without_filter_shows_default_message() {
 }
 
 #[test]
-fn detail_view_shows_fill_level_bar() {
+fn detail_view_shows_write_pos_bar() {
     let entry = queue_entry("myapp", "Quote", "/dev/shm/fill1", 24, 64);
     let groups = vec![AppGroup {
         name: "myapp".into(),
@@ -1792,16 +1792,12 @@ fn detail_view_shows_fill_level_bar() {
     let text = buffer_text(&buf);
 
     assert!(
-        text.contains("Fill:"),
-        "detail view should show Fill label:\n{text}"
-    );
-    assert!(
-        text.contains("50%"),
-        "should show 50% fill (32/64):\n{text}"
+        text.contains("Write Pos:"),
+        "detail view should show Write Pos label:\n{text}"
     );
     assert!(
         text.contains("32/64"),
-        "should show count/capacity:\n{text}"
+        "should show pos/capacity:\n{text}"
     );
     // Should contain block chars for the bar
     assert!(

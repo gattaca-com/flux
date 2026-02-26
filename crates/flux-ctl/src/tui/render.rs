@@ -288,28 +288,20 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
             Span::raw(format!("{}", writes)),
         ]));
 
-        if let (Some(fill), Some(cap)) = (seg.queue_fill, seg.queue_capacity) {
+        if let (Some(pos), Some(cap)) = (seg.queue_fill, seg.queue_capacity) {
             let pct = if cap > 0 {
-                (fill as f64 / cap as f64) * 100.0
+                (pos as f64 / cap as f64) * 100.0
             } else {
                 0.0
             };
-            let filled = (pct / 10.0).round() as usize;
-            let filled = filled.min(10);
-            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+            let bar_width = 20;
+            let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+            let filled = filled.min(bar_width);
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
             lines.push(Line::from(vec![
-                Span::styled("  Fill:       ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    bar,
-                    if pct > 80.0 {
-                        Style::default().fg(Color::Red)
-                    } else if pct > 50.0 {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::Green)
-                    },
-                ),
-                Span::raw(format!(" {:.0}% ({}/{})", pct, fill, cap)),
+                Span::styled("  Write Pos:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(bar, Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {pos}/{cap}")),
             ]));
         }
     }
