@@ -16,6 +16,17 @@ use super::registry::{
     app_names, entry_visible, flink_reachable, format_pids, open_registry,
 };
 
+/// List all visible shared memory segments in a human-readable table.
+///
+/// Opens the global registry at `base_dir`, filters entries by `app_filter`
+/// (if provided), and prints a columnar summary grouped by application name.
+/// Each entry shows its kind, type, element size, capacity, attached PIDs,
+/// and a status icon (`🟢` alive, `💀` dead, `☠` poisoned).
+///
+/// When `verbose` is `true`, the flink path and queue header details
+/// (type, write count, capacity) are printed below each entry.
+///
+/// Output is colorised when stdout is a terminal.
 pub fn list_all(
     base_dir: &Path,
     verbose: bool,
@@ -172,6 +183,13 @@ impl SegmentJson {
     }
 }
 
+/// List all visible shared memory segments as pretty-printed JSON.
+///
+/// Produces an array of `SegmentJson` objects on stdout — one per visible
+/// entry in the registry (optionally filtered by `app_filter`).  This is
+/// intended for machine consumption and piping into `jq` or similar tools.
+///
+/// Prints `[]` if no registry exists at `base_dir`.
 pub fn list_json(
     base_dir: &Path,
     app_filter: Option<&str>,
@@ -195,9 +213,19 @@ pub fn list_json(
 
 // ─── Stats ──────────────────────────────────────────────────────────────────
 
+/// Print summary statistics for all registered shared memory segments.
+///
+/// Shows counts of alive/dead/poisoned segments, a breakdown by kind
+/// (Queue, SeqlockArray, Data), total slot count, and estimated memory
+/// usage.  Optionally filtered by `app_filter`.
+///
+/// When `verbose` is `true`, runs [`ShmemRegistry::health_check`] and
+/// appends its diagnostic messages (duplicates, stubs, dead-unreachable
+/// entries, capacity warnings).
 pub fn stats(
     base_dir: &Path,
     app_filter: Option<&str>,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(registry) = open_registry(base_dir) else {
         println!("No registry found");
@@ -289,11 +317,31 @@ pub fn stats(
         format_bytes(total_elem_bytes)
     );
 
+    if verbose {
+        println!();
+        if color {
+            println!("{}", "  Health Check:".bold());
+        } else {
+            println!("  Health Check:");
+        }
+        for msg in registry.health_check() {
+            println!("    • {msg}");
+        }
+    }
+
     Ok(())
 }
 
 // ─── Inspect ────────────────────────────────────────────────────────────────
 
+/// Print detailed inspection of one or more shared memory segments.
+///
+/// For each matching entry (filtered by `app_filter` and `segment_filter`),
+/// displays kind, status, element size, capacity, type hash, creation time,
+/// flink path, backing file size, write count (for queues), poison status,
+/// and a table of attached processes with PID, status, name, and command line.
+///
+/// Output is colorised when stdout is a terminal.
 pub fn inspect(
     base_dir: &Path,
     app_filter: Option<&str>,
@@ -431,6 +479,14 @@ pub fn inspect(
 
 // ─── Clean ──────────────────────────────────────────────────────────────────
 
+/// Remove stale (dead-PID) shared memory segments.
+///
+/// Scans the registry for entries with no alive PIDs whose flink backing
+/// file still exists. In dry-run mode (the default), lists the stale
+/// segments without touching anything. When `force` is `true`, deletes the
+/// flink files via [`cleanup_flink`] and compacts the registry afterwards.
+///
+/// Optionally filtered by `app_filter`.
 pub fn clean(
     base_dir: &Path,
     app_filter: Option<&str>,

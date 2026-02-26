@@ -1860,3 +1860,366 @@ fn auto_scroll_shows_last_group_at_end() {
         "first group should be scrolled off screen:\n{text}"
     );
 }
+
+// ─── Section D: Testing hardening ───────────────────────────────────────────
+
+/// D11: Concurrent register() with 4 threads, each using a different flink.
+/// All 4 entries must appear in the registry after all threads join.
+#[test]
+fn d11_concurrent_register_different_flinks() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path().to_path_buf();
+
+    let registry = ShmemRegistry::open_or_create(&base);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let barrier = barrier.clone();
+            let base = base.clone();
+            std::thread::spawn(move || {
+                let reg = ShmemRegistry::open_or_create(&base);
+                barrier.wait();
+                let flink = format!("/dev/shm/test_d11_thread_{i}");
+                let entry = queue_entry(
+                    &format!("app_d11_{i}"),
+                    &format!("Msg{i}"),
+                    &flink,
+                    8,
+                    16,
+                );
+                let result = reg.register(entry);
+                assert!(result.is_some(), "thread {i} register should succeed");
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread should not panic");
+    }
+
+    // All 4 distinct flinks should be registered.
+    assert_eq!(
+        registry.entry_count(),
+        4,
+        "4 entries from 4 threads with different flinks"
+    );
+
+    // Verify each flink is present.
+    for i in 0..4 {
+        let flink = format!("/dev/shm/test_d11_thread_{i}");
+        assert!(
+            registry.find_by_flink(&flink).is_some(),
+            "flink {flink} should exist in registry"
+        );
+    }
+}
+
+/// D12: Concurrent register() with same flink from 2 threads.
+/// Should result in exactly 1 entry, and the entry's PID set should contain
+/// the current process PID (both threads share the same PID since they are
+/// in the same process).
+#[test]
+fn d12_concurrent_register_same_flink() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path().to_path_buf();
+
+    let registry = ShmemRegistry::open_or_create(&base);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_i| {
+            let barrier = barrier.clone();
+            let base = base.clone();
+            std::thread::spawn(move || {
+                let reg = ShmemRegistry::open_or_create(&base);
+                barrier.wait();
+                let entry = queue_entry("shared_app", "SharedMsg", "/dev/shm/test_d12_same", 8, 16);
+                let result = reg.register(entry);
+                assert!(result.is_some(), "register should succeed");
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread should not panic");
+    }
+
+    // The dedup logic in register() should ensure only 1 logical entry for that flink.
+    // There may be an abandoned empty slot from the second thread's fetch_add, but
+    // find_by_flink should find exactly one non-empty entry with this flink.
+    let flink = "/dev/shm/test_d12_same";
+    let idx = registry.find_by_flink(flink);
+    assert!(idx.is_some(), "entry for shared flink must exist");
+
+    let entry = registry.entry_by_index(idx.unwrap()).unwrap();
+    assert_eq!(entry.type_name.as_str(), "SharedMsg");
+    assert_eq!(entry.app_name.as_str(), "shared_app");
+
+    // Both threads run in the same process, so the PID set should contain our PID.
+    let our_pid = std::process::id();
+    let pids = entry.pids.active_pids();
+    assert!(
+        pids.contains(&our_pid),
+        "PID set should contain our PID {our_pid}, got {pids:?}"
+    );
+
+    // There should be exactly 1 PID (same process registered twice → dedup).
+    assert_eq!(
+        entry.pids.count(),
+        1,
+        "same process registering twice should result in 1 PID"
+    );
+
+    // Count non-empty entries with this flink — should be exactly 1.
+    let entries = registry.entries();
+    let matching: Vec<_> = entries
+        .iter()
+        .filter(|e| !e.is_empty() && e.flink.as_str() == flink)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly 1 non-empty entry should have this flink"
+    );
+}
+
+/// D13: compact() running concurrently with entries() reads.
+/// Neither operation should panic or produce undefined behavior.
+#[test]
+fn d13_compact_under_concurrent_reads() {
+    let (tmpdir, _guard) = guarded_tmpdir();
+    let base = tmpdir.path().to_path_buf();
+
+    let registry = ShmemRegistry::open_or_create(&base);
+
+    // Pre-populate with some entries, including gaps for compact to work on.
+    for i in 0..20 {
+        let flink = format!("/dev/shm/test_d13_{i}");
+        registry.register(queue_entry("d13app", &format!("Msg{i}"), &flink, 8, 16));
+    }
+    assert_eq!(registry.entry_count(), 20);
+
+    // Create some empty gaps by zeroing out every other entry's kind.
+    let entries = registry.entries();
+    for i in (1..20).step_by(2) {
+        let kind_ptr = std::ptr::addr_of!(entries[i].kind) as *mut u8;
+        unsafe {
+            kind_ptr.write_volatile(ShmemKind::Unknown as u8);
+        }
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    // Thread 1: call entries() in a loop, reading type names.
+    let reader_barrier = barrier.clone();
+    let reader_base = base.clone();
+    let reader = std::thread::spawn(move || {
+        let reg = ShmemRegistry::open_or_create(&reader_base);
+        reader_barrier.wait();
+        let mut total_reads = 0usize;
+        for _ in 0..1000 {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let es = reg.entries();
+                let mut count = 0usize;
+                for e in es {
+                    if !e.is_empty() {
+                        // Access type_name to exercise the read path.
+                        let _ = e.type_name.as_str();
+                        count += 1;
+                    }
+                }
+                count
+            }));
+            assert!(result.is_ok(), "entries() reader should not panic");
+            total_reads += 1;
+        }
+        total_reads
+    });
+
+    // Thread 2: call compact() in a loop.
+    let compacter_barrier = barrier.clone();
+    let compacter_base = base.clone();
+    let compacter = std::thread::spawn(move || {
+        let reg = ShmemRegistry::open_or_create(&compacter_base);
+        compacter_barrier.wait();
+        let mut total_compacted = 0usize;
+        for _ in 0..50 {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reg.compact()
+            }));
+            assert!(result.is_ok(), "compact() should not panic");
+            if let Ok(removed) = result {
+                total_compacted += removed;
+            }
+        }
+        total_compacted
+    });
+
+    let reads = reader.join().expect("reader thread should not panic");
+    let _compacted = compacter.join().expect("compacter thread should not panic");
+
+    assert_eq!(reads, 1000, "reader should complete all 1000 iterations");
+
+    // After all compactions, no panics occurred — that's the main assertion.
+    // The entry count should be ≤ original (some empty slots were compacted).
+    assert!(
+        registry.entry_count() <= 20,
+        "entry count should not exceed original"
+    );
+}
+
+/// D14: TUI render with 100+ character app names and type names.
+/// The renderer must not panic on very long strings.
+#[test]
+fn d14_render_long_names() {
+    let long_app_name = "a".repeat(120);
+    let long_type_name = "b".repeat(120);
+    let long_flink = format!("/dev/shm/{}", "c".repeat(110));
+
+    let entry = queue_entry(&long_app_name, &long_type_name, &long_flink, 24, 1024);
+
+    let groups = vec![AppGroup {
+        name: long_app_name.clone(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(42),
+            queue_fill: Some(500),
+            queue_capacity: Some(1024),
+            poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    assert_eq!(app.total_rows, 2); // 1 header + 1 segment
+
+    // Render at a normal width — names should be truncated, not panic.
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+
+    // The long name should appear (possibly truncated) without crash.
+    // ArrayStr<64> truncates at 63 chars, but AppGroup.name is a String.
+    assert!(
+        text.contains(&"a".repeat(20)),
+        "at least part of the long app name should render:\n{text}"
+    );
+
+    // Enter detail view on the segment with long names.
+    app.selected = 1;
+    app.enter();
+    assert!(matches!(app.view, View::Detail(_)));
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+
+    // Detail view should render without panic.
+    assert!(
+        text.contains("Queue"),
+        "detail view should show kind:\n{text}"
+    );
+
+    // Also test at very narrow width.
+    app.back();
+    let buf_narrow = render_to_buffer(&mut app, 40, 10);
+    let _text_narrow = buffer_text(&buf_narrow);
+    // Just verify no panic at narrow width with long names.
+
+    // And very wide width.
+    let buf_wide = render_to_buffer(&mut app, 300, 50);
+    let text_wide = buffer_text(&buf_wide);
+    assert!(
+        text_wide.contains(&"a".repeat(20)),
+        "wide render should show long name:\n{text_wide}"
+    );
+}
+
+/// D15: TUI with exactly 1 segment (edge case for off-by-one).
+/// Verifies total_rows, render, navigation, and detail view all work.
+#[test]
+fn d15_single_segment() {
+    let entry = queue_entry("solo", "OnlyMsg", "/dev/shm/test_d15_solo", 16, 32);
+
+    let groups = vec![AppGroup {
+        name: "solo".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(7),
+            queue_fill: Some(3),
+            queue_capacity: Some(32),
+            poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+
+    // Exactly 1 app header + 1 segment = 2 rows.
+    assert_eq!(app.total_rows, 2);
+    assert_eq!(app.groups.len(), 1);
+    assert_eq!(app.groups[0].segments.len(), 1);
+
+    // Render the list view.
+    let buf = render_to_buffer(&mut app, 100, 15);
+    let text = buffer_text(&buf);
+    assert!(text.contains("solo"), "app name should appear:\n{text}");
+    assert!(text.contains("OnlyMsg"), "segment type should appear:\n{text}");
+    assert!(text.contains("▼"), "expanded icon should appear:\n{text}");
+
+    // Navigation: next should go to segment, then clamp.
+    assert_eq!(app.selected, 0);
+    app.next();
+    assert_eq!(app.selected, 1);
+    app.next();
+    assert_eq!(app.selected, 1, "should clamp at end with 1 segment");
+
+    // Previous back to header.
+    app.previous();
+    assert_eq!(app.selected, 0);
+    app.previous();
+    assert_eq!(app.selected, 0, "should clamp at start");
+
+    // Home and End.
+    app.end();
+    assert_eq!(app.selected, 1);
+    app.home();
+    assert_eq!(app.selected, 0);
+
+    // Enter detail view on the single segment.
+    app.selected = 1;
+    app.enter();
+    assert!(
+        matches!(app.view, View::Detail(_)),
+        "should enter detail view"
+    );
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+    assert!(text.contains("OnlyMsg"), "detail should show type:\n{text}");
+    assert!(text.contains("solo"), "detail should show app:\n{text}");
+    assert!(text.contains("Queue"), "detail should show kind:\n{text}");
+
+    // Back to list.
+    app.back();
+    assert!(matches!(app.view, View::List));
+
+    // Collapse the single group.
+    app.selected = 0;
+    app.enter();
+    assert_eq!(app.total_rows, 1, "collapsed: only header row");
+    assert!(!app.groups[0].expanded);
+
+    let buf = render_to_buffer(&mut app, 100, 15);
+    let text = buffer_text(&buf);
+    assert!(text.contains("▶"), "collapsed icon:\n{text}");
+    assert!(!text.contains("OnlyMsg"), "segment should be hidden:\n{text}");
+
+    // Re-expand.
+    app.enter();
+    assert_eq!(app.total_rows, 2);
+    assert!(app.groups[0].expanded);
+}

@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::time::{Duration, SystemTime};
 
 use flux_utils::ArrayStr;
@@ -10,7 +11,7 @@ pub const MAX_PIDS_PER_ENTRY: usize = 256;
 pub const REGISTRY_FLINK_NAME: &str = "flux/_shmem_registry";
 
 const REGISTRY_MAGIC: u32 = u32::from_le_bytes(*b"FLXR");
-const REGISTRY_VERSION: u32 = 3;
+const REGISTRY_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -240,7 +241,10 @@ pub struct ShmemRegistry {
     pub magic: AtomicU32,
     pub version: AtomicU32,
     pub count: AtomicU32,
-    pub _pad: u32,
+    /// Spin-lock that prevents concurrent `compact()` + `register()` races.
+    /// Acquire before compacting; callers of `register()` also check this.
+    pub compacting: AtomicBool,
+    pub _pad: [u8; 3],
     /// Timestamp (nanos since epoch) of last `populate_from_fs` call.
     pub last_populated_nanos: AtomicU64,
     pub entries: [ShmemEntry; MAX_REGISTRY_ENTRIES],
@@ -273,6 +277,7 @@ impl ShmemRegistry {
                     // Release on version acts as the "commit" flag.
                     let reg = unsafe { &*ptr };
                     reg.magic.store(REGISTRY_MAGIC, Ordering::Relaxed);
+                    reg.compacting.store(false, Ordering::Relaxed);
                     reg.version.store(REGISTRY_VERSION, Ordering::Release);
                     std::mem::forget(shmem);
                     return reg;
@@ -446,11 +451,19 @@ impl ShmemRegistry {
     /// Remove empty (kind == Unknown) entries by sliding non-empty entries
     /// toward the front and updating the count.
     ///
-    /// # Safety contract
-    ///
-    /// This is **not** safe to call concurrently with [`register()`]. It is
-    /// intended for offline maintenance (e.g. after a `clean --force`).
+    /// Protected by a CAS spin-lock on [`Self::compacting`] so that
+    /// concurrent calls from different processes are serialized. Returns `0`
+    /// immediately if another thread/process is already compacting.
     pub fn compact(&self) -> usize {
+        // Acquire the compacting spin-lock.
+        if self
+            .compacting
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return 0;
+        }
+
         let old_count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
         let mut write_idx: u32 = 0;
 
@@ -484,7 +497,172 @@ impl ShmemRegistry {
         }
 
         self.count.store(write_idx, Ordering::Release);
+
+        // Release the compacting spin-lock.
+        self.compacting.store(false, Ordering::Release);
+
         (old_count - write_idx) as usize
+    }
+
+    /// Deduplicate entries that share the same flink path.
+    ///
+    /// For each group of entries with an identical flink, the entry with the
+    /// most attached PIDs is kept ("winner").  PIDs from all other duplicates
+    /// are merged into the winner via [`PidSet::attach`], and the duplicate
+    /// entries are zeroed out.  Finally, [`compact`](Self::compact) is called
+    /// to reclaim the freed slots.
+    ///
+    /// Returns the number of duplicate entries that were merged and removed.
+    pub fn defragment(&self) -> usize {
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+
+        // Collect flink → list of (index, pid_count) for non-empty entries.
+        let mut flink_groups: HashMap<String, Vec<(u32, usize)>> = HashMap::new();
+        for i in 0..count {
+            let entry = &self.entries[i as usize];
+            if entry.is_empty() {
+                continue;
+            }
+            let flink = entry.flink.as_str().to_string();
+            if flink.is_empty() {
+                continue;
+            }
+            flink_groups.entry(flink).or_default().push((i, entry.pids.count()));
+        }
+
+        let mut removed = 0usize;
+
+        for (_flink, mut indices) in flink_groups {
+            if indices.len() <= 1 {
+                continue;
+            }
+
+            // Pick the entry with the most PIDs as the winner.
+            // Sort descending by pid count; first element wins.
+            indices.sort_by(|a, b| b.1.cmp(&a.1));
+            let winner_idx = indices[0].0;
+            let winner = &self.entries[winner_idx as usize];
+
+            for &(dup_idx, _) in &indices[1..] {
+                let dup = &self.entries[dup_idx as usize];
+
+                // Merge PIDs from the duplicate into the winner.
+                for pid in dup.pids.active_pids() {
+                    winner.pids.attach(pid);
+                }
+
+                // Zero out the duplicate entry.
+                unsafe {
+                    let base = self as *const Self as *mut u8;
+                    let offset = std::mem::offset_of!(Self, entries)
+                        + dup_idx as usize * std::mem::size_of::<ShmemEntry>();
+                    let slot = base.add(offset) as *mut ShmemEntry;
+                    std::ptr::write_volatile(slot, ShmemEntry::default());
+                }
+                fence(Ordering::Release);
+                removed += 1;
+            }
+        }
+
+        // Compact to reclaim the zeroed slots.
+        if removed > 0 {
+            self.compact();
+        }
+
+        removed
+    }
+
+    /// Run diagnostics on the registry and return a list of human-readable
+    /// warning/info messages.
+    ///
+    /// Checks performed:
+    /// - Duplicate flink paths across entries
+    /// - Corrupt stub entries (`elem_size == 0` for non-empty entries)
+    /// - Dead unreachable entries (no alive PIDs and flink file gone)
+    /// - Registry capacity warnings (count approaching `MAX_REGISTRY_ENTRIES`)
+    pub fn health_check(&self) -> Vec<String> {
+        let mut messages = Vec::new();
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+
+        // ── Duplicate flinks ────────────────────────────────────────────
+        let mut flink_counts: HashMap<String, usize> = HashMap::new();
+        for i in 0..count {
+            let entry = &self.entries[i as usize];
+            if entry.is_empty() {
+                continue;
+            }
+            let flink = entry.flink.as_str().to_string();
+            if !flink.is_empty() {
+                *flink_counts.entry(flink).or_default() += 1;
+            }
+        }
+        for (flink, n) in &flink_counts {
+            if *n > 1 {
+                messages.push(format!(
+                    "duplicate flink: {flink} appears {n} times (run defragment to merge)"
+                ));
+            }
+        }
+
+        // ── Per-entry checks ────────────────────────────────────────────
+        let mut empty_slots = 0u32;
+        let mut corrupt_stubs = 0u32;
+        let mut dead_unreachable = 0u32;
+
+        for i in 0..count {
+            let entry = &self.entries[i as usize];
+            if entry.is_empty() {
+                empty_slots += 1;
+                continue;
+            }
+
+            // Corrupt stub: non-empty entry but elem_size is zero
+            if entry.elem_size == 0 {
+                corrupt_stubs += 1;
+            }
+
+            // Dead + unreachable: no alive PIDs and flink file is gone
+            let flink = entry.flink.as_str();
+            if !entry.pids.any_alive() && !flink.is_empty() && !Path::new(flink).exists() {
+                dead_unreachable += 1;
+            }
+        }
+
+        if corrupt_stubs > 0 {
+            messages.push(format!(
+                "corrupt stubs: {corrupt_stubs} entries have elem_size=0 (metadata not backfilled)"
+            ));
+        }
+        if dead_unreachable > 0 {
+            messages.push(format!(
+                "dead unreachable: {dead_unreachable} entries have no alive PIDs and missing flink files"
+            ));
+        }
+        if empty_slots > 0 {
+            messages.push(format!(
+                "empty slots: {empty_slots} of {count} slots are empty (run compact to reclaim)"
+            ));
+        }
+
+        // ── Capacity warnings ───────────────────────────────────────────
+        let used = count;
+        let max = MAX_REGISTRY_ENTRIES as u32;
+        if used >= max {
+            messages.push(format!(
+                "registry full: {used}/{max} slots used — new registrations will fail"
+            ));
+        } else if used as f64 / max as f64 > 0.9 {
+            messages.push(format!(
+                "registry nearly full: {used}/{max} slots used ({:.0}%)",
+                used as f64 / max as f64 * 100.0
+            ));
+        }
+
+        if messages.is_empty() {
+            messages.push("registry healthy: no issues found".to_string());
+        }
+
+        messages
     }
 
     /// Compute statistics about the current registry contents.
@@ -724,8 +902,11 @@ impl ShmemRegistry {
                             capacity: 0,
                             created_at_nanos: now_nanos(),
                         };
-                        self.register(entry);
-                        result.registered += 1;
+                        if self.register(entry).is_none() {
+                            result.skipped += 1;
+                        } else {
+                            result.registered += 1;
+                        }
                         continue;
                     }
 
@@ -760,8 +941,11 @@ impl ShmemRegistry {
                         created_at_nanos: now_nanos(),
                     };
 
-                    self.register(entry);
-                    result.registered += 1;
+                    if self.register(entry).is_none() {
+                        result.skipped += 1;
+                    } else {
+                        result.registered += 1;
+                    }
                 }
             }
         }
@@ -782,6 +966,8 @@ pub struct PopulateResult {
     pub already_known: usize,
     /// Number of stub entries whose metadata was backfilled this scan.
     pub backfilled: usize,
+    /// Number of entries that could not be registered (registry full).
+    pub skipped: usize,
 }
 
 fn read_queue_meta(shmem: &Shmem) -> (usize, usize) {

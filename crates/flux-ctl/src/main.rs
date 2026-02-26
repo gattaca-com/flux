@@ -59,6 +59,9 @@ enum Commands {
         /// Filter by app name
         #[arg(short, long)]
         app: Option<String>,
+        /// Run health_check diagnostics and print results
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -84,6 +87,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch { app } => tui::run(&base_dir, app.as_deref()),
         Commands::Scan => discovery::scan(&base_dir),
         Commands::Clean { force, app } => discovery::clean(&base_dir, app.as_deref(), force),
-        Commands::Stats { app } => discovery::stats(&base_dir, app.as_deref()),
+        Commands::Stats { app, verbose } => discovery::stats(&base_dir, app.as_deref(), verbose),
     }
 }

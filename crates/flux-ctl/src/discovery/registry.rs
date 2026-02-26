@@ -1,4 +1,13 @@
 //! Registry access, entry visibility, and PID formatting helpers.
+//!
+//! # Safety audit (A4) — 2026-02-26
+//!
+//! Verified: no TUI code (`flux-ctl`) calls `open_shared()` or
+//! `std::mem::forget(shmem)`.  All shmem opens go through the read-only
+//! helpers in `discovery::inspect` which properly `drop(shmem)` after use.
+//! The only `forget` calls live in `flux-communication::registry` (the
+//! `open()` / `open_or_create()` methods on `ShmemRegistry` itself) where
+//! the mapping must outlive the process.
 
 use std::path::Path;
 
@@ -15,8 +24,12 @@ pub fn open_registry(base_dir: &Path) -> Option<&'static ShmemRegistry> {
     Some(reg)
 }
 
-/// Create the registry if needed, then scan the filesystem for pre-existing
-/// shmem and register any missing entries. Stale flinks are removed.
+/// Scan the filesystem for pre-existing shared memory segments and register them.
+///
+/// Creates the registry if it doesn't exist, sweeps dead PIDs, then calls
+/// [`ShmemRegistry::populate_from_fs`] to discover shmem backing files under
+/// `base_dir`. Prints a summary of registered, already-known, stale-removed,
+/// and skipped (registry-full) entries.
 pub fn scan(base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let reg = ShmemRegistry::open_or_create(base_dir);
     reg.sweep_dead_pids();
@@ -25,9 +38,11 @@ pub fn scan(base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Registered:     {}", result.registered);
     println!("  Already known:  {}", result.already_known);
     println!("  Stale removed:  {}", result.stale_removed);
+    println!("  Skipped (full): {}", result.skipped);
     Ok(())
 }
 
+/// Return sorted, deduplicated application names from all non-empty registry entries.
 pub fn app_names(registry: &ShmemRegistry) -> Vec<String> {
     let mut names: Vec<String> = registry
         .entries()
@@ -40,6 +55,12 @@ pub fn app_names(registry: &ShmemRegistry) -> Vec<String> {
     names
 }
 
+/// Check whether a flink's backing file exists and is non-empty.
+///
+/// Returns `false` for empty flink strings or missing/empty files.
+/// This is a lightweight filesystem-only check — it does **not** open or
+/// mmap the shared memory segment, avoiding the mmap leak that would occur
+/// if `ShmemConf::open()` were used on a non-owner handle.
 pub fn flink_reachable(flink: &str) -> bool {
     if flink.is_empty() {
         return false;
@@ -65,6 +86,10 @@ pub fn entry_visible(entry: &ShmemEntry) -> bool {
     flink_reachable(entry.flink.as_str())
 }
 
+/// Format an entry's attached PIDs as a compact display string.
+///
+/// Returns `"pid=none"` if no PIDs are attached, `"pid=<N>"` for a single
+/// PID, or `"pids(<count>)=[<comma-separated>]"` for multiple PIDs.
 pub fn format_pids(entry: &ShmemEntry) -> String {
     let active = entry.pids.active_pids();
     match active.len() {

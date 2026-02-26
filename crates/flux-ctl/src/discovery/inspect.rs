@@ -9,15 +9,27 @@ use shared_memory::ShmemConf;
 
 // ─── PID info ───────────────────────────────────────────────────────────────
 
+/// Metadata about an attached process, gathered from `/proc`.
 #[derive(Clone, Debug)]
 pub struct PidInfo {
+    /// The Linux process ID.
     pub pid: u32,
+    /// Whether the process is currently alive (signal-0 check).
     pub alive: bool,
+    /// Process name from `/proc/<pid>/comm`.
     pub name: String,
+    /// Full command line from `/proc/<pid>/cmdline` (NUL-separated args joined with spaces).
     pub cmdline: String,
+    /// Process start time as an RFC 3339 timestamp, or empty if unavailable.
     pub start_time: String,
 }
 
+/// Gather process metadata for a single PID.
+///
+/// Reads `/proc/<pid>/comm`, `/proc/<pid>/cmdline`, and `/proc/<pid>/stat`
+/// to populate the returned [`PidInfo`]. If the process is no longer alive,
+/// returns a [`PidInfo`] with `alive = false` and empty strings for name,
+/// cmdline, and start_time.
 pub fn pid_info(pid: u32) -> PidInfo {
     let alive = is_pid_alive(pid);
     if !alive {
@@ -50,16 +62,24 @@ pub fn pid_info(pid: u32) -> PidInfo {
     PidInfo { pid, alive, name, cmdline, start_time }
 }
 
+/// Gather process metadata for all PIDs attached to a registry entry.
+///
+/// Calls [`pid_info`] for each PID in the entry's [`PidSet`] and returns
+/// the collected results. Dead PIDs are included with `alive = false`.
 pub fn pids_info(entry: &ShmemEntry) -> Vec<PidInfo> {
     entry.pids.active_pids().iter().map(|&pid| pid_info(pid)).collect()
 }
 
 // ─── Poison detection ───────────────────────────────────────────────────────
 
+/// Summary of poisoned (stuck mid-write) seqlock slots in a shared memory segment.
 #[derive(Clone, Debug)]
 pub struct PoisonInfo {
+    /// Number of slots with an odd (stuck) version counter.
     pub n_poisoned: usize,
+    /// Index of the first poisoned slot (for diagnostic display).
     pub first_slot: usize,
+    /// Total number of slots in the buffer.
     pub total_slots: usize,
 }
 
@@ -106,7 +126,8 @@ fn check_queue_poison(flink: &str) -> Option<PoisonInfo> {
     }
 
     let buf_base = unsafe { base.add(HEADER_SIZE) };
-    let result = scan_seqlock_slots(buf_base, n_slots, elsize);
+    let buf_remaining = shmem_len - HEADER_SIZE;
+    let result = scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
     drop(shmem);
     result
 }
@@ -138,7 +159,8 @@ fn check_array_poison(flink: &str) -> Option<PoisonInfo> {
     }
 
     let buf_base = unsafe { base.add(HEADER_SIZE) };
-    let result = scan_seqlock_slots(buf_base, n_slots, elsize);
+    let buf_remaining = shmem_len - HEADER_SIZE;
+    let result = scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
     drop(shmem);
     result
 }
@@ -149,10 +171,24 @@ fn check_array_poison(flink: &str) -> Option<PoisonInfo> {
 /// Two snapshot reads separated by a yield — if a slot's version is odd in
 /// both reads it's stuck (poisoned). Transient odd values from in-flight
 /// writes resolve between snapshots. This avoids blocking the TUI thread.
-fn scan_seqlock_slots(buf_base: *mut u8, n_slots: usize, elsize: usize) -> Option<PoisonInfo> {
+fn scan_seqlock_slots(
+    buf_base: *mut u8,
+    n_slots: usize,
+    elsize: usize,
+    buf_remaining: usize,
+) -> Option<PoisonInfo> {
+    // Each slot must be at least 8 bytes to hold the AtomicU64 version field.
+    if elsize < std::mem::size_of::<AtomicU64>() {
+        return None;
+    }
+
     // First pass: collect slots with odd versions.
     let mut odd_slots: Vec<usize> = Vec::new();
     for i in 0..n_slots {
+        // Defense-in-depth: skip slots that would read beyond the mapped region.
+        if i * elsize + std::mem::size_of::<AtomicU64>() > buf_remaining {
+            break;
+        }
         let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
         let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
         if v & 1 != 0 {
@@ -241,6 +277,9 @@ pub fn read_queue_stats(flink: &str) -> Option<QueueStats> {
 
 // ─── Byte formatting ────────────────────────────────────────────────────────
 
+/// Format a byte count as a human-readable string using binary units (KiB, MiB, GiB).
+///
+/// Values below 1 KiB are shown as plain bytes (e.g. `"512 B"`).
 pub fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;

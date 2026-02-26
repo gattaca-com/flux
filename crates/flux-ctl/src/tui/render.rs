@@ -44,8 +44,14 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
     let n_segments: usize = app.groups.iter().map(|g| g.segments.len()).sum();
     let n_apps = app.groups.len();
+    let elapsed = app.last_refresh.elapsed().as_secs_u64();
+    let updated = if elapsed < 2 {
+        String::new()
+    } else {
+        format!(" (updated {elapsed}s ago)")
+    };
     let title_text = format!(
-        " flux-ctl — Shared Memory Monitor ({n_segments} segments, {n_apps} apps)  [sort: {}] ",
+        " flux-ctl — Shared Memory Monitor ({n_segments} segments, {n_apps} apps)  [sort: {}]{updated} ",
         app.sort_mode.label()
     );
     let title = Paragraph::new(title_text)
@@ -78,12 +84,25 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
         if group.expanded {
             for seg in &group.segments {
-                let status = if seg.poison.is_some() {
-                    "☠ poisoned"
-                } else if seg.alive {
-                    "🟢 alive"
+                let now_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let age_secs = if seg.entry.created_at_nanos > 0 {
+                    (now_nanos.saturating_sub(seg.entry.created_at_nanos)) / 1_000_000_000
                 } else {
-                    "💀 dead"
+                    0
+                };
+                let is_stale = !seg.alive && age_secs > 60;
+
+                let status = if seg.poison.is_some() {
+                    "☠ poisoned".to_string()
+                } else if seg.alive {
+                    "🟢 alive".to_string()
+                } else if is_stale {
+                    format!("💀 dead ({}s)", age_secs)
+                } else {
+                    "💀 dead".to_string()
                 };
                 let kind = format!("{}", seg.entry.kind);
                 let details = match seg.entry.kind {
@@ -104,8 +123,15 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                 } else {
                     format!("{} (×{})", seg.entry.creator_pid(), seg.pid_count)
                 };
+                let row_style = if is_stale {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
                 let status_style = if seg.poison.is_some() {
                     Style::default().fg(Color::Red).bold()
+                } else if is_stale {
+                    Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default()
                 };
@@ -114,8 +140,8 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                     Cell::from(kind),
                     Cell::from(details),
                     Cell::from(pid_display),
-                    Cell::from(Span::styled(status.to_string(), status_style)),
-                ]));
+                    Cell::from(Span::styled(status, status_style)),
+                ]).style(row_style));
             }
         }
     }
@@ -157,16 +183,22 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(13),
+            Constraint::Length(14),
             Constraint::Min(4),
             Constraint::Length(1),
         ])
         .split(area);
 
     let seg = app.detail_segment();
+    let elapsed = app.last_refresh.elapsed().as_secs_u64();
+    let updated = if elapsed < 2 {
+        String::new()
+    } else {
+        format!(" (updated {elapsed}s ago)")
+    };
     let title_text = seg
-        .map(|s| format!(" {} — {} ", s.entry.app_name.as_str(), s.entry.type_name.as_str()))
-        .unwrap_or_else(|| " Segment Detail ".into());
+        .map(|s| format!(" {} — {}{updated} ", s.entry.app_name.as_str(), s.entry.type_name.as_str()))
+        .unwrap_or_else(|| format!(" Segment Detail{updated} "));
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Cyan).bold())
         .block(Block::default().borders(Borders::ALL));
@@ -228,6 +260,15 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         Line::from(vec![
             Span::styled("  Flink:      ", Style::default().fg(Color::DarkGray)),
             Span::raw(seg.entry.flink.as_str().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("  OS ID:      ", Style::default().fg(Color::DarkGray)),
+            Span::raw(
+                std::fs::read_to_string(seg.entry.flink.as_str())
+                    .unwrap_or_else(|_| "unknown".into())
+                    .trim()
+                    .to_string(),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  Backing:    ", Style::default().fg(Color::DarkGray)),
@@ -510,11 +551,11 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::raw("Move down"),
         ]),
         Line::from(vec![
-            Span::styled("  Home       ", Style::default().fg(Color::Yellow)),
+            Span::styled("  Home / g   ", Style::default().fg(Color::Yellow)),
             Span::raw("Jump to first"),
         ]),
         Line::from(vec![
-            Span::styled("  End        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  End / G    ", Style::default().fg(Color::Yellow)),
             Span::raw("Jump to last"),
         ]),
         Line::from(vec![
