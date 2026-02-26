@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use flux_utils::ArrayStr;
 use shared_memory::{Shmem, ShmemConf, ShmemError};
@@ -577,6 +577,51 @@ impl ShmemRegistry {
         None
     }
 
+    /// Update the `elem_size` and `capacity` fields of an existing entry
+    /// by opening its backing shmem and reading the header metadata.
+    ///
+    /// Used to backfill entries that were registered via the mtime fast-path
+    /// (which skips the shmem open for recent flinks).
+    ///
+    /// Returns `true` if metadata was successfully updated.
+    pub fn backfill_entry_meta(&self, idx: u32) -> bool {
+        let Some(entry) = self.entry_by_index(idx) else {
+            return false;
+        };
+        if entry.elem_size != 0 {
+            return false; // already has metadata
+        }
+        let flink = entry.flink.as_str();
+        let shmem = match ShmemConf::new().flink(flink).open() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let (elem_size, capacity) = match entry.kind {
+            ShmemKind::Queue => read_queue_meta(&shmem),
+            ShmemKind::SeqlockArray => read_array_meta(&shmem),
+            ShmemKind::Data => (shmem.len(), 1),
+            _ => (0, 0),
+        };
+        drop(shmem);
+        if elem_size == 0 {
+            return false;
+        }
+        // Write updated metadata via volatile writes to the existing slot.
+        unsafe {
+            let base = self as *const Self as *mut u8;
+            let entry_offset = std::mem::offset_of!(Self, entries)
+                + idx as usize * std::mem::size_of::<ShmemEntry>();
+            let elem_size_offset =
+                entry_offset + std::mem::offset_of!(ShmemEntry, elem_size);
+            let capacity_offset =
+                entry_offset + std::mem::offset_of!(ShmemEntry, capacity);
+            std::ptr::write_volatile(base.add(elem_size_offset) as *mut usize, elem_size);
+            std::ptr::write_volatile(base.add(capacity_offset) as *mut usize, capacity);
+        }
+        fence(Ordering::Release);
+        true
+    }
+
     /// Scan the filesystem under `base_dir` for pre-existing shared memory
     /// flinks and register any that are not yet in the registry. Removes
     /// stale flinks whose backing shared memory no longer exists.
@@ -584,8 +629,16 @@ impl ShmemRegistry {
     /// Skips the scan if fewer than 5 seconds have passed since the last
     /// successful populate (tracked via `last_populated_nanos` in the
     /// registry header).
+    ///
+    /// **mtime fast-path:** flinks whose backing file was modified less than
+    /// 60 seconds ago are registered immediately with stub metadata
+    /// (`elem_size = 0, capacity = 0`) instead of opening the shmem.
+    /// On the *next* scan, already-known entries with missing metadata are
+    /// backfilled by opening their shmem once.
     pub fn populate_from_fs(&self, base_dir: &Path) -> PopulateResult {
         const POPULATE_COOLDOWN_SECS: u64 = 5;
+        /// flinks younger than this are registered without opening shmem.
+        const MTIME_FAST_PATH_SECS: u64 = 60;
 
         let now = now_nanos();
         let last = self.last_populated_nanos.load(Ordering::Relaxed);
@@ -594,6 +647,15 @@ impl ShmemRegistry {
         }
 
         let mut result = PopulateResult::default();
+
+        // ── Phase 0: backfill metadata for previously-stubbed entries ──
+        let count = self.count.load(Ordering::Acquire).min(MAX_REGISTRY_ENTRIES as u32);
+        for i in 0..count {
+            let entry = &self.entries[i as usize];
+            if !entry.is_empty() && entry.elem_size == 0 && self.backfill_entry_meta(i) {
+                result.backfilled += 1;
+            }
+        }
 
         let Ok(dir_entries) = std::fs::read_dir(base_dir) else {
             return result;
@@ -634,6 +696,36 @@ impl ShmemRegistry {
                     // Already registered — skip.
                     if self.find_by_flink(&flink_str).is_some() {
                         result.already_known += 1;
+                        continue;
+                    }
+
+                    // ── mtime fast-path ──────────────────────────────
+                    // If the flink file was modified very recently, register
+                    // a stub entry without opening the shmem.  The expensive
+                    // open + metadata read is deferred until the file ages
+                    // past the threshold and gets backfilled in Phase 0.
+                    let is_recent = flink_path
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age < Duration::from_secs(MTIME_FAST_PATH_SECS));
+
+                    if is_recent {
+                        let entry = ShmemEntry {
+                            kind: *kind,
+                            _pad0: [0; 3],
+                            pids: pid_set_self(),
+                            app_name: ArrayStr::from_str_truncate(&app_name),
+                            type_name: ArrayStr::from_str_truncate(&type_name),
+                            flink: ArrayStr::from_str_truncate(&flink_str),
+                            type_hash: 0,
+                            elem_size: 0,  // stub — backfilled on next scan
+                            capacity: 0,
+                            created_at_nanos: now_nanos(),
+                        };
+                        self.register(entry);
+                        result.registered += 1;
                         continue;
                     }
 
@@ -688,6 +780,8 @@ pub struct PopulateResult {
     pub stale_removed: usize,
     /// Number of flinks that were already in the registry.
     pub already_known: usize,
+    /// Number of stub entries whose metadata was backfilled this scan.
+    pub backfilled: usize,
 }
 
 fn read_queue_meta(shmem: &Shmem) -> (usize, usize) {

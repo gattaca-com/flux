@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use flux_timing::{Duration, Instant};
 
-use flux_communication::queue::QueueHeader;
 use flux_communication::registry::{ShmemEntry, ShmemKind, cleanup_flink};
 
 use crate::discovery;
@@ -39,6 +37,10 @@ pub struct SegmentInfo {
     pub alive: bool,
     pub pid_count: usize,
     pub queue_writes: Option<usize>,
+    /// Current write position within the ring buffer (`count & mask`).
+    pub queue_fill: Option<usize>,
+    /// Ring buffer capacity (`mask + 1`).
+    pub queue_capacity: Option<usize>,
     pub poison: Option<discovery::PoisonInfo>,
 }
 
@@ -145,9 +147,17 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
+        if let Err(e) = self.try_refresh() {
+            self.status_msg = Some((format!("Refresh error: {e}"), Instant::now()));
+        }
+    }
+
+    /// Inner refresh that returns errors instead of panicking, so the TUI
+    /// stays alive and shows a status message on failure.
+    fn try_refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.groups.clear();
         let Some(registry) = discovery::open_registry(&self.base_dir) else {
-            return;
+            return Ok(());
         };
         let entries = registry.entries();
         let app_names = discovery::app_names(registry);
@@ -172,15 +182,24 @@ impl App {
                 .map(|e| {
                     let alive = e.pids.any_alive();
                     let pid_count = e.pids.count();
-                    let queue_writes = if alive && e.kind == ShmemKind::Queue {
-                        QueueHeader::open_shared(e.flink.as_str())
-                            .ok()
-                            .map(|h| h.count.load(Ordering::Relaxed))
+                    let (queue_writes, queue_fill, queue_capacity) = if alive && e.kind == ShmemKind::Queue {
+                        match discovery::read_queue_stats(e.flink.as_str()) {
+                            Some(stats) => (Some(stats.writes), Some(stats.fill), Some(stats.capacity)),
+                            None => (None, None, None),
+                        }
                     } else {
-                        None
+                        (None, None, None)
                     };
                     let poison = if alive { discovery::check_poison(e) } else { None };
-                    SegmentInfo { entry: e.clone(), alive, pid_count, queue_writes, poison }
+                    SegmentInfo {
+                        entry: e.clone(),
+                        alive,
+                        pid_count,
+                        queue_writes,
+                        queue_fill,
+                        queue_capacity,
+                        poison,
+                    }
                 })
                 .collect();
             if segments.is_empty() {
@@ -224,9 +243,10 @@ impl App {
         self.recount_rows();
         self.refresh_detail_pids();
         self.last_refresh = Instant::now();
+        Ok(())
     }
 
-    fn recount_rows(&mut self) {
+    pub fn recount_rows(&mut self) {
         self.total_rows = self
             .groups
             .iter()

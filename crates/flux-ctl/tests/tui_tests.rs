@@ -103,13 +103,13 @@ fn render_single_app_expanded() {
                 entry: queue_entry("myapp", "PriceUpdate", "/dev/shm/q1", 24, 1024),
                 alive: true,
                 pid_count: 1,
-                queue_writes: Some(42), poison: None,
+                queue_writes: Some(42), queue_fill: None, queue_capacity: None, poison: None,
             },
             SegmentInfo {
                 entry: data_entry("myapp", "Config", "/dev/shm/d1", 128),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None, poison: None,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
             },
         ],
         expanded: true,
@@ -138,7 +138,7 @@ fn render_collapsed_app_hides_segments() {
             entry: queue_entry("hidden", "Msg", "/dev/shm/q", 8, 16),
             alive: true,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: false,
     }];
@@ -163,7 +163,7 @@ fn render_multiple_apps() {
                 entry: queue_entry("alpha", "MsgA", "/dev/shm/a", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None, poison: None,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
             }],
             expanded: true,
         },
@@ -173,7 +173,7 @@ fn render_multiple_apps() {
                 entry: data_entry("beta", "State", "/dev/shm/b", 64),
                 alive: false,
                 pid_count: 1,
-                queue_writes: None, poison: None,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
             }],
             expanded: true,
         },
@@ -198,7 +198,7 @@ fn navigation_next_previous() {
                 entry: queue_entry("a", "Q1", "/dev/shm/q1", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None, poison: None,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
             }],
             expanded: true,
         },
@@ -237,13 +237,13 @@ fn toggle_expand_collapse() {
                 entry: queue_entry("app", "Q1", "/dev/shm/q1", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None, poison: None,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
             },
             SegmentInfo {
                 entry: queue_entry("app", "Q2", "/dev/shm/q2", 8, 16),
                 alive: true,
                 pid_count: 1,
-                queue_writes: None, poison: None,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
             },
         ],
         expanded: true,
@@ -381,7 +381,7 @@ fn dead_segment_renders_skull() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -479,7 +479,7 @@ fn multi_pid_renders_count() {
             entry,
             alive: true,
             pid_count: 3,
-            queue_writes: Some(100), poison: None,
+            queue_writes: Some(100), queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -552,7 +552,7 @@ fn enter_on_segment_opens_detail() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: Some(42), poison: None,
+            queue_writes: Some(42), queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -577,7 +577,7 @@ fn detail_view_renders_segment_info() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: Some(42), poison: None,
+            queue_writes: Some(42), queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -610,7 +610,7 @@ fn detail_view_shows_pid_info() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -637,7 +637,7 @@ fn detail_view_back_returns_to_list() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -660,7 +660,7 @@ fn detail_cleanup_blocked_for_alive() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -692,7 +692,7 @@ fn detail_cleanup_shows_confirm_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -730,7 +730,7 @@ fn detail_cancel_cleanup_hides_confirm() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -759,7 +759,7 @@ fn detail_status_bar_shows_cleanup_hint_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -787,7 +787,7 @@ fn enter_on_app_header_still_toggles() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -812,7 +812,7 @@ fn list_cleanup_blocked_for_alive_segment() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -834,7 +834,7 @@ fn list_cleanup_blocked_on_app_header() {
             entry,
             alive: true,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -859,7 +859,7 @@ fn list_cleanup_shows_confirm_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -887,7 +887,7 @@ fn list_cancel_cleanup_hides_confirm() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -913,7 +913,7 @@ fn list_status_bar_shows_cleanup_hint_for_dead() {
             entry: dead_entry,
             alive: false,
             pid_count: 1,
-            queue_writes: None, poison: None,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
         }],
         expanded: true,
     }];
@@ -942,6 +942,8 @@ fn poisoned_segment_renders_skull_crossbones() {
             alive: true,
             pid_count: 1,
             queue_writes: Some(100),
+            queue_fill: None,
+            queue_capacity: None,
             poison: Some(discovery::PoisonInfo {
                 n_poisoned: 2,
                 first_slot: 5,
@@ -967,6 +969,8 @@ fn poisoned_detail_view_shows_poison_info() {
             alive: true,
             pid_count: 1,
             queue_writes: Some(100),
+            queue_fill: None,
+            queue_capacity: None,
             poison: Some(discovery::PoisonInfo {
                 n_poisoned: 3,
                 first_slot: 7,
@@ -998,6 +1002,8 @@ fn healthy_segment_has_no_poison() {
             alive: true,
             pid_count: 1,
             queue_writes: Some(42),
+            queue_fill: None,
+            queue_capacity: None,
             poison: None,
         }],
         expanded: true,
@@ -1026,6 +1032,8 @@ fn destroy_all_shows_confirm_when_dead_exist() {
             alive: false,
             pid_count: 1,
             queue_writes: None,
+            queue_fill: None,
+            queue_capacity: None,
             poison: None,
         }],
         expanded: true,
@@ -1051,6 +1059,8 @@ fn destroy_all_noop_when_all_alive() {
             alive: true,
             pid_count: 1,
             queue_writes: None,
+            queue_fill: None,
+            queue_capacity: None,
             poison: None,
         }],
         expanded: true,
@@ -1075,6 +1085,8 @@ fn destroy_all_cancel_hides_confirm() {
             alive: false,
             pid_count: 1,
             queue_writes: None,
+            queue_fill: None,
+            queue_capacity: None,
             poison: None,
         }],
         expanded: true,
@@ -1103,6 +1115,8 @@ fn status_bar_shows_destroy_all_hint() {
                 alive: false,
                 pid_count: 1,
                 queue_writes: None,
+                queue_fill: None,
+                queue_capacity: None,
                 poison: None,
             }],
             expanded: true,
@@ -1114,6 +1128,8 @@ fn status_bar_shows_destroy_all_hint() {
                 alive: true,
                 pid_count: 1,
                 queue_writes: None,
+                queue_fill: None,
+                queue_capacity: None,
                 poison: None,
             }],
             expanded: true,
@@ -1207,6 +1223,19 @@ fn populate_from_fs_removes_stale_flinks() {
     std::fs::create_dir_all(&flink_dir).unwrap();
     let stale_flink = flink_dir.join("GhostQueue");
     std::fs::write(&stale_flink, "bogus_os_id").unwrap();
+
+    // Set the flink file's mtime to >60s ago so it is not treated as a
+    // recent file by the mtime fast-path in populate_from_fs.
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    let times = std::fs::FileTimes::new()
+        .set_modified(old_time)
+        .set_accessed(old_time);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale_flink)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
 
     let reg = ShmemRegistry::open_or_create(base);
     reg.last_populated_nanos
@@ -1328,6 +1357,8 @@ fn home_end_navigation() {
                     alive: true,
                     pid_count: 1,
                     queue_writes: None,
+                    queue_fill: None,
+                    queue_capacity: None,
                     poison: None,
                 },
                 SegmentInfo {
@@ -1335,6 +1366,8 @@ fn home_end_navigation() {
                     alive: true,
                     pid_count: 1,
                     queue_writes: None,
+                    queue_fill: None,
+                    queue_capacity: None,
                     poison: None,
                 },
             ],
@@ -1347,6 +1380,8 @@ fn home_end_navigation() {
                 alive: true,
                 pid_count: 1,
                 queue_writes: None,
+                queue_fill: None,
+                queue_capacity: None,
                 poison: None,
             }],
             expanded: true,
@@ -1391,6 +1426,8 @@ fn page_up_page_down_navigation() {
                 alive: true,
                 pid_count: 1,
                 queue_writes: None,
+                queue_fill: None,
+                queue_capacity: None,
                 poison: None,
             }],
             expanded: true,
@@ -1444,6 +1481,8 @@ fn stress_test_many_entries() {
                     alive: true,
                     pid_count: 1,
                     queue_writes: Some((gi * 5 + si) as usize),
+                    queue_fill: None,
+                    queue_capacity: None,
                     poison: None,
                 })
                 .collect(),
@@ -1558,6 +1597,8 @@ fn filter_mode_input_and_clear() {
                     alive: true,
                     pid_count: 1,
                     queue_writes: None,
+                    queue_fill: None,
+                    queue_capacity: None,
                     poison: None,
                 },
                 SegmentInfo {
@@ -1565,6 +1606,8 @@ fn filter_mode_input_and_clear() {
                     alive: true,
                     pid_count: 1,
                     queue_writes: None,
+                    queue_fill: None,
+                    queue_capacity: None,
                     poison: None,
                 },
             ],
@@ -1606,5 +1649,214 @@ fn filter_mode_input_and_clear() {
     assert!(
         text.contains("Beta"),
         "Beta should be visible after clearing filter:\n{text}"
+    );
+}
+
+// ─── Phase 7: TUI polish tests (items 4-7) ─────────────────────────────────
+
+#[test]
+fn title_bar_shows_segment_and_app_counts() {
+    let groups = vec![
+        AppGroup {
+            name: "alpha".into(),
+            segments: vec![
+                SegmentInfo {
+                    entry: queue_entry("alpha", "Q1", "/dev/shm/tb1", 8, 16),
+                    alive: true,
+                    pid_count: 1,
+                    queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
+                },
+                SegmentInfo {
+                    entry: data_entry("alpha", "D1", "/dev/shm/tb2", 64),
+                    alive: true,
+                    pid_count: 1,
+                    queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
+                },
+            ],
+            expanded: true,
+        },
+        AppGroup {
+            name: "beta".into(),
+            segments: vec![SegmentInfo {
+                entry: queue_entry("beta", "Q2", "/dev/shm/tb3", 8, 16),
+                alive: true,
+                pid_count: 1,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
+            }],
+            expanded: true,
+        },
+    ];
+
+    let mut app = App::with_groups(groups);
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+
+    assert!(
+        text.contains("3 segments"),
+        "title bar should show segment count:\n{text}"
+    );
+    assert!(
+        text.contains("2 apps"),
+        "title bar should show app count:\n{text}"
+    );
+}
+
+#[test]
+fn title_bar_shows_zero_counts_when_empty() {
+    let mut app = App::with_groups(vec![]);
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+
+    assert!(
+        text.contains("0 segments"),
+        "empty state should show 0 segments:\n{text}"
+    );
+    assert!(
+        text.contains("0 apps"),
+        "empty state should show 0 apps:\n{text}"
+    );
+}
+
+#[test]
+fn empty_with_filter_shows_filter_message() {
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry: queue_entry("myapp", "Quote", "/dev/shm/ef1", 8, 16),
+            alive: true,
+            pid_count: 1,
+            queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+
+    // Set a filter that matches nothing, then manually clear groups to simulate
+    app.filter_text = "nonexistent".into();
+    app.groups.clear();
+    app.recount_rows();
+
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+
+    assert!(
+        text.contains("No segments match filter"),
+        "should show filter-specific empty message:\n{text}"
+    );
+    assert!(
+        text.contains("nonexistent"),
+        "should include the filter text:\n{text}"
+    );
+}
+
+#[test]
+fn empty_without_filter_shows_default_message() {
+    let mut app = App::with_groups(vec![]);
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+
+    assert!(
+        text.contains("No segments found"),
+        "should show default empty message:\n{text}"
+    );
+    // Ensure it does NOT show the filter-specific message
+    assert!(
+        !text.contains("No segments match filter"),
+        "should not show filter message when no filter is active:\n{text}"
+    );
+}
+
+#[test]
+fn detail_view_shows_fill_level_bar() {
+    let entry = queue_entry("myapp", "Quote", "/dev/shm/fill1", 24, 64);
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry,
+            alive: true,
+            pid_count: 1,
+            queue_writes: Some(100),
+            queue_fill: Some(32),
+            queue_capacity: Some(64),
+            poison: None,
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+    app.selected = 1;
+    app.enter();
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+
+    assert!(
+        text.contains("Fill:"),
+        "detail view should show Fill label:\n{text}"
+    );
+    assert!(
+        text.contains("50%"),
+        "should show 50% fill (32/64):\n{text}"
+    );
+    assert!(
+        text.contains("32/64"),
+        "should show count/capacity:\n{text}"
+    );
+    // Should contain block chars for the bar
+    assert!(
+        text.contains('█'),
+        "should contain filled bar chars:\n{text}"
+    );
+    assert!(
+        text.contains('░'),
+        "should contain empty bar chars:\n{text}"
+    );
+}
+
+#[test]
+fn auto_scroll_shows_last_group_at_end() {
+    // Build enough groups that the list exceeds the visible area.
+    // With height=20 and 3 chrome rows (title + status bar + header row),
+    // about 15 rows are visible. Create 30 groups to overflow.
+    let groups: Vec<AppGroup> = (0..30)
+        .map(|i| AppGroup {
+            name: format!("app{i:02}"),
+            segments: vec![SegmentInfo {
+                entry: queue_entry(
+                    &format!("app{i:02}"),
+                    &format!("Seg{i:02}"),
+                    &format!("/dev/shm/test_scroll_{i}"),
+                    8,
+                    16,
+                ),
+                alive: true,
+                pid_count: 1,
+                queue_writes: None, queue_fill: None, queue_capacity: None, poison: None,
+            }],
+            expanded: true,
+        })
+        .collect();
+
+    let mut app = App::with_groups(groups);
+    assert_eq!(app.total_rows, 60); // 30 headers + 30 segments
+
+    // Navigate to the very last row
+    app.end();
+    assert_eq!(app.selected, 59);
+
+    let buf = render_to_buffer(&mut app, 120, 20);
+    let text = buffer_text(&buf);
+
+    // The last group (app29) should be visible when scrolled to the end
+    assert!(
+        text.contains("app29"),
+        "last group should be visible after scrolling to end:\n{text}"
+    );
+
+    // The first group should NOT be visible (scrolled off)
+    assert!(
+        !text.contains("app00"),
+        "first group should be scrolled off screen:\n{text}"
     );
 }

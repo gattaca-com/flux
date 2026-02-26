@@ -27,6 +27,9 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Filter by app name
+        #[arg(short, long)]
+        app: Option<String>,
     },
     /// Inspect a specific segment
     Inspect {
@@ -52,7 +55,11 @@ enum Commands {
         app: Option<String>,
     },
     /// Show summary statistics for all registered segments
-    Stats,
+    Stats {
+        /// Filter by app name
+        #[arg(short, long)]
+        app: Option<String>,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,11 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command.unwrap_or(Commands::Watch { app: None }) {
-        Commands::List { verbose, json } => {
+        Commands::List { verbose, json, app } => {
             if json {
-                discovery::list_json(&base_dir)
+                discovery::list_json(&base_dir, app.as_deref())
             } else {
-                discovery::list_all(&base_dir, verbose)
+                discovery::list_all(&base_dir, verbose, app.as_deref())
             }
         }
         Commands::Inspect { app, segment } => {
@@ -77,6 +84,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch { app } => tui::run(&base_dir, app.as_deref()),
         Commands::Scan => discovery::scan(&base_dir),
         Commands::Clean { force, app } => discovery::clean(&base_dir, app.as_deref(), force),
-        Commands::Stats => discovery::stats(&base_dir),
+        Commands::Stats { app } => discovery::stats(&base_dir, app.as_deref()),
     }
 }

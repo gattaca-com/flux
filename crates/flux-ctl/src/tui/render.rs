@@ -42,8 +42,10 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
+    let n_segments: usize = app.groups.iter().map(|g| g.segments.len()).sum();
+    let n_apps = app.groups.len();
     let title_text = format!(
-        " flux-ctl — Shared Memory Monitor  [sort: {}] ",
+        " flux-ctl — Shared Memory Monitor ({n_segments} segments, {n_apps} apps)  [sort: {}] ",
         app.sort_mode.label()
     );
     let title = Paragraph::new(title_text)
@@ -119,9 +121,12 @@ fn render_list(frame: &mut Frame, app: &mut App) {
     }
 
     if rows.is_empty() {
-        rows.push(Row::new(vec![Cell::from(
-            "No segments found. Is a flux app running?",
-        )]));
+        let msg = if app.filter_text.is_empty() {
+            "No segments found. Is a flux app running?".to_string()
+        } else {
+            format!("No segments match filter '{}'", app.filter_text)
+        };
+        rows.push(Row::new(vec![Cell::from(msg)]));
     }
 
     let widths = [
@@ -241,6 +246,31 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
             Span::styled("  Writes:     ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}", writes)),
         ]));
+
+        if let (Some(fill), Some(cap)) = (seg.queue_fill, seg.queue_capacity) {
+            let pct = if cap > 0 {
+                (fill as f64 / cap as f64) * 100.0
+            } else {
+                0.0
+            };
+            let filled = (pct / 10.0).round() as usize;
+            let filled = filled.min(10);
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+            lines.push(Line::from(vec![
+                Span::styled("  Fill:       ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    bar,
+                    if pct > 80.0 {
+                        Style::default().fg(Color::Red)
+                    } else if pct > 50.0 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    },
+                ),
+                Span::raw(format!(" {:.0}% ({}/{})", pct, fill, cap)),
+            ]));
+        }
     }
 
     if let Some(ref poison) = seg.poison {
