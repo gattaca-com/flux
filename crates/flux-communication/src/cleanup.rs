@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use shared_memory::ShmemConf;
+use tracing::warn;
 
 /// Check whether a process is still running via `/proc/<pid>`.
 pub fn is_pid_alive(pid: u32) -> bool {
@@ -33,7 +34,7 @@ pub fn cleanup_flink(flink_path: &Path) -> Result<(), String> {
 pub fn cleanup_shmem(root: &Path) {
     for flink in all_flinks_under(root) {
         if let Err(e) = cleanup_flink(&flink) {
-            eprintln!("warning: {e}");
+            warn!(%e, flink = %flink.display(), "failed to clean flink");
         }
     }
     let _ = std::fs::remove_dir_all(root);

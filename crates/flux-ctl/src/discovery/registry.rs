@@ -78,9 +78,6 @@ pub fn scan_base_dir(base_dir: &Path) -> Vec<DiscoveredEntry> {
                     ShmemKind::Unknown => (0, 0),
                 };
 
-                // Drop shmem immediately — we only needed the header.
-                drop(shmem);
-
                 entries.push(DiscoveredEntry {
                     kind,
                     app_name: app_name.clone(),

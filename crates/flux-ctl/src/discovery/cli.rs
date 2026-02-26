@@ -113,7 +113,6 @@ pub fn list_all(
                                     );
                                 }
                             }
-                            drop(shmem);
                         }
                         Err(e) => println!("    queue: (could not open: {e})"),
                     }
@@ -360,7 +359,6 @@ pub fn inspect(
                     println!("  Writes:     {}", header.count.load(Ordering::Relaxed));
                 }
             }
-            drop(shmem);
         }
 
         if let Some(ref pi) = poison {
@@ -383,34 +381,55 @@ pub fn inspect(
 
 /// Remove stale shared memory segments.
 ///
-/// Scans the filesystem for flink entries whose backing shmem is no longer
-/// reachable. In dry-run mode (the default), lists the stale segments
-/// without touching anything. When `force` is `true`, deletes the
-/// flink files via [`cleanup_flink`].
+/// Walks `base_dir/<app>/shmem/{queues,data,arrays}/` for flink files whose
+/// backing shmem can no longer be opened.  `scan_base_dir` only returns
+/// *openable* entries, so we walk the filesystem directly here.
 ///
-/// Optionally filtered by `app_filter`.
+/// In dry-run mode (the default), lists the stale segments without touching
+/// anything.  When `force` is `true`, deletes the flink files via
+/// [`cleanup_flink`].
 pub fn clean(
     base_dir: &Path,
     app_filter: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let all_entries = scan_base_dir(base_dir);
+    let mut stale: Vec<(String, String, std::path::PathBuf)> = Vec::new();
 
-    // A segment is "stale" if its flink exists on disk but the backing shmem
-    // cannot be opened (scan_base_dir already filters those out, so we
-    // instead look at all discovered entries whose flink is still reachable
-    // but that we consider dead).  Since PID tracking is removed, we treat
-    // every discovered entry with a reachable flink as potentially stale
-    // only when asked by the user — the `clean` command is explicitly about
-    // removing flinks whose backing shmem is unreachable.
-    //
-    // Re-scan the filesystem for flink files that exist but whose shmem
-    // backing cannot be opened.
-    let stale: Vec<&DiscoveredEntry> = all_entries
-        .iter()
-        .filter(|e| app_filter.is_none_or(|f| e.app_name == f))
-        .filter(|e| !flink_reachable(&e.flink))
-        .collect();
+    let Ok(app_iter) = std::fs::read_dir(base_dir) else {
+        println!("No stale segments found");
+        return Ok(());
+    };
+
+    for dir_entry in app_iter.flatten() {
+        let app_dir = dir_entry.path();
+        if !app_dir.is_dir() {
+            continue;
+        }
+        let app_name = dir_entry.file_name().to_string_lossy().to_string();
+        if app_filter.is_some_and(|f| app_name != f) {
+            continue;
+        }
+
+        let shmem_dir = app_dir.join("shmem");
+        for subdir in ["queues", "data", "arrays"] {
+            let type_dir = shmem_dir.join(subdir);
+            let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
+                continue;
+            };
+            for flink_entry in flink_iter.flatten() {
+                let flink_path = flink_entry.path();
+                if flink_path.is_dir() {
+                    continue;
+                }
+                // If the backing shmem can still be opened it's not stale.
+                if ShmemConf::new().flink(&flink_path).open().is_ok() {
+                    continue;
+                }
+                let type_name = flink_entry.file_name().to_string_lossy().to_string();
+                stale.push((app_name.clone(), type_name, flink_path));
+            }
+        }
+    }
 
     if stale.is_empty() {
         println!("No stale segments found");
@@ -418,10 +437,9 @@ pub fn clean(
     }
 
     println!("Found {} stale segments:", stale.len());
-    for entry in &stale {
-        println!("  💀 {} {}", entry.app_name, entry.type_name);
+    for (app, typ, flink_path) in &stale {
+        println!("  💀 {app} {typ}");
         if force {
-            let flink_path = Path::new(&entry.flink);
             match cleanup_flink(flink_path) {
                 Ok(()) => println!("    ✓ cleaned {}", flink_path.display()),
                 Err(e) => eprintln!("    ✗ {e}"),

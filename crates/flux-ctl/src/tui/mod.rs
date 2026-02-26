@@ -20,6 +20,7 @@ pub fn run(base_dir: &Path, app_filter: Option<&str>) -> Result<(), Box<dyn std:
     loop {
         terminal.draw(|frame| render::render(frame, &mut app))?;
 
+        // crossterm::event::poll requires std::time::Duration.
         if event::poll(std::time::Duration::from_millis(250))? &&
             let Event::Key(key) = event::read()? &&
             app.handle_key(key)

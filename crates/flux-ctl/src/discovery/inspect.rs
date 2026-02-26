@@ -65,75 +65,27 @@ impl PidInfo {
         pids.iter().map(|&pid| Self::gather(pid)).collect()
     }
 
-    /// Discover processes that have the shared-memory segment open, by
-    /// scanning `/proc/*/fd/` for symlinks that resolve to the backing file.
-    ///
-    /// The `flink` is the on-disk flink file whose first line contains the
-    /// OS shared-memory path (e.g. `/dev/shm/...`).  We resolve that path,
-    /// then walk all numeric `/proc/<pid>/fd/` directories looking for
-    /// matching symlink targets.
-    ///
-    /// This is inherently racy — processes can appear or vanish between the
-    /// scan and the metadata gather — but it gives a best-effort snapshot.
-    pub fn for_flink(flink: &str) -> Vec<Self> {
-        let Some(backing) = resolve_backing_path(flink) else {
-            return Vec::new();
-        };
-
-        let Ok(proc_iter) = std::fs::read_dir("/proc") else {
-            return Vec::new();
-        };
-
-        let mut pids: Vec<u32> = Vec::new();
-        for proc_entry in proc_iter.flatten() {
-            let fname = proc_entry.file_name();
-            let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
-                continue;
+    /// Read AT_CLKTCK from /proc/self/auxv (ELF auxiliary vector).
+    /// Falls back to 100 if the file can't be read.  Cached after the first
+    /// call since the value never changes.
+    fn clock_ticks_per_sec() -> u64 {
+        static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            const AT_CLKTCK: u64 = 17;
+            let Ok(data) = std::fs::read("/proc/self/auxv") else {
+                return 100;
             };
-
-            let fd_dir = format!("/proc/{pid}/fd");
-            let Ok(fd_iter) = std::fs::read_dir(&fd_dir) else {
-                continue;
-            };
-
-            for fd_entry in fd_iter.flatten() {
-                if let Ok(target) = std::fs::read_link(fd_entry.path()) {
-                    if target == backing {
-                        pids.push(pid);
-                        break;
-                    }
+            for chunk in data.chunks_exact(16) {
+                let a_type = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
+                if a_type == 0 {
+                    break;
+                }
+                if a_type == AT_CLKTCK {
+                    return u64::from_ne_bytes(chunk[8..16].try_into().unwrap());
                 }
             }
-        }
-
-        pids.sort_unstable();
-        pids.dedup();
-        Self::for_pids(&pids)
-    }
-
-    /// Discover processes attached to a [`DiscoveredEntry`]'s shared-memory
-    /// segment by scanning `/proc`.
-    pub fn for_entry(entry: &DiscoveredEntry) -> Vec<Self> {
-        Self::for_flink(&entry.flink)
-    }
-
-    /// Read AT_CLKTCK from /proc/self/auxv (ELF auxiliary vector).
-    /// Falls back to 100 if the file can't be read.
-    fn clock_ticks_per_sec() -> u64 {
-        const AT_CLKTCK: u64 = 17;
-        let Ok(data) = std::fs::read("/proc/self/auxv") else {
-            return 100;
-        };
-        for chunk in data.chunks_exact(16) {
-            let a_type = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
-            if a_type == 0 {
-                break;
-            }
-            if a_type == AT_CLKTCK {
-                return u64::from_ne_bytes(chunk[8..16].try_into().unwrap());
-            }
-        }
-        100
+            100
+        })
     }
 
     fn read_start_time(pid: u32) -> Option<String> {
@@ -185,13 +137,11 @@ impl PoisonInfo {
         let shmem_len = shmem.len();
 
         if shmem_len < std::mem::size_of::<QueueHeader>() {
-            drop(shmem);
             return None;
         }
 
         let header = unsafe { &*(base as *const QueueHeader) };
         if !header.is_initialized() || header.elsize == 0 {
-            drop(shmem);
             return None;
         }
 
@@ -199,15 +149,13 @@ impl PoisonInfo {
         let elsize = header.elsize;
 
         if HEADER_SIZE + n_slots * elsize > shmem_len {
-            drop(shmem);
             return None;
         }
 
         let buf_base = unsafe { base.add(HEADER_SIZE) };
         let buf_remaining = shmem_len - HEADER_SIZE;
-        let result = Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
-        drop(shmem);
-        result
+        // shmem must stay alive while scan_seqlock_slots reads the raw ptr.
+        Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining)
     }
 
     fn check_array(flink: &str) -> Option<Self> {
@@ -218,13 +166,11 @@ impl PoisonInfo {
         let shmem_len = shmem.len();
 
         if shmem_len < std::mem::size_of::<ArrayHeader>() {
-            drop(shmem);
             return None;
         }
 
         let header = unsafe { &*(base as *const ArrayHeader) };
         if !header.is_initialized() || header.elsize == 0 {
-            drop(shmem);
             return None;
         }
 
@@ -232,15 +178,13 @@ impl PoisonInfo {
         let elsize = header.elsize;
 
         if HEADER_SIZE + n_slots * elsize > shmem_len {
-            drop(shmem);
             return None;
         }
 
         let buf_base = unsafe { base.add(HEADER_SIZE) };
         let buf_remaining = shmem_len - HEADER_SIZE;
-        let result = Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining);
-        drop(shmem);
-        result
+        // shmem must stay alive while scan_seqlock_slots reads the raw ptr.
+        Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining)
     }
 
     /// Walk `n_slots` seqlock slots starting at `buf_base` with stride
@@ -305,9 +249,7 @@ impl PoisonInfo {
 /// Return the size (in bytes) of the shared memory backing file.
 pub fn backing_file_size(flink: &str) -> Option<u64> {
     let shmem = ShmemConf::new().flink(flink).open().ok()?;
-    let size = shmem.len() as u64;
-    drop(shmem);
-    Some(size)
+    Some(shmem.len() as u64)
 }
 
 /// Read the OS shared-memory ID (first line of the flink file).
@@ -399,19 +341,16 @@ impl QueueStats {
     pub fn read(flink: &str) -> Option<Self> {
         let shmem = ShmemConf::new().flink(flink).open().ok()?;
         if shmem.len() < std::mem::size_of::<QueueHeader>() {
-            drop(shmem);
             return None;
         }
         let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
         if !header.is_initialized() {
-            drop(shmem);
             return None;
         }
         let writes = header.count.load(Ordering::Relaxed);
         let mask = header.mask;
         let capacity = mask + 1;
         let fill = writes & mask;
-        drop(shmem);
         Some(Self { writes, fill, capacity })
     }
 }

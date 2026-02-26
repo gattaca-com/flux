@@ -258,9 +258,12 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
             let filled = filled.min(bar_width);
 
             // Position of the first poisoned slot within the bar (if any).
+            // Use total_slots from PoisonInfo (same read as first_slot) to
+            // avoid races between the QueueStats and PoisonInfo reads.
             let poison_col = seg.poison.as_ref().map(|p| {
-                if cap > 0 {
-                    ((p.first_slot as f64 / cap as f64) * bar_width as f64).round() as usize
+                if p.total_slots > 0 {
+                    ((p.first_slot as f64 / p.total_slots as f64) * bar_width as f64).round()
+                        as usize
                 } else {
                     0
                 }
