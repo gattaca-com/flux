@@ -4,7 +4,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use flux_communication::registry::{ShmemKind, cleanup_flink};
+use flux_communication::{ShmemKind, cleanup_flink};
 use flux_timing::{Duration, Instant};
 
 use crate::{discovery, discovery::registry::DiscoveredEntry};

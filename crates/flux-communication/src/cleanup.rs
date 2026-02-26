@@ -2,27 +2,7 @@ use std::path::{Path, PathBuf};
 
 use shared_memory::ShmemConf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u8)]
-pub enum ShmemKind {
-    #[default]
-    Unknown = 0,
-    Queue = 1,
-    Data = 2,
-    SeqlockArray = 3,
-}
-
-impl std::fmt::Display for ShmemKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unknown => write!(f, "Unknown"),
-            Self::Queue => write!(f, "Queue"),
-            Self::Data => write!(f, "Data"),
-            Self::SeqlockArray => write!(f, "SeqlockArray"),
-        }
-    }
-}
-
+/// Check whether a process is still running via `/proc/<pid>`.
 pub fn is_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }

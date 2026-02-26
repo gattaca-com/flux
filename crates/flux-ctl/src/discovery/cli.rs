@@ -4,10 +4,7 @@
 use std::{io::IsTerminal, path::Path, sync::atomic::Ordering};
 
 use crossterm::style::Stylize;
-use flux_communication::{
-    queue::QueueHeader,
-    registry::{ShmemKind, cleanup_flink},
-};
+use flux_communication::{ShmemKind, cleanup_flink, queue::QueueHeader};
 use serde::Serialize;
 use shared_memory::ShmemConf;
 

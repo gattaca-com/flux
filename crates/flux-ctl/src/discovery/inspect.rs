@@ -7,8 +7,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub use flux_communication::registry::is_pid_alive;
-use flux_communication::{array::ArrayHeader, queue::QueueHeader, registry::ShmemKind};
+pub use flux_communication::is_pid_alive;
+use flux_communication::{ShmemKind, array::ArrayHeader, queue::QueueHeader};
 use flux_timing::Nanos;
 use shared_memory::ShmemConf;
 

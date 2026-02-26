@@ -1,7 +1,7 @@
 pub mod array;
+pub mod cleanup;
 mod error;
 pub mod queue;
-pub mod registry;
 mod seqlock;
 mod shmem_data;
 pub mod timer;
@@ -9,6 +9,7 @@ pub mod timer;
 use std::path::Path;
 
 pub use array::SeqlockArray;
+pub use cleanup::{cleanup_flink, cleanup_shmem, is_pid_alive};
 pub use error::{EmptyError, QueueError, ReadError};
 use flux_utils::{
     directories::{
@@ -16,10 +17,31 @@ use flux_utils::{
     },
     short_typename,
 };
-pub use registry::{ShmemKind, cleanup_flink, cleanup_shmem, is_pid_alive};
 pub use seqlock::Seqlock;
 pub use shmem_data::ShmemData;
 pub use timer::{Timer, TimingMessage};
+
+/// Classification of shared-memory segment types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ShmemKind {
+    #[default]
+    Unknown = 0,
+    Queue = 1,
+    Data = 2,
+    SeqlockArray = 3,
+}
+
+impl std::fmt::Display for ShmemKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "Unknown"),
+            Self::Queue => write!(f, "Queue"),
+            Self::Data => write!(f, "Data"),
+            Self::SeqlockArray => write!(f, "SeqlockArray"),
+        }
+    }
+}
 
 pub fn shmem_dir_queues_string<S: AsRef<Path>>(app_name: S) -> String {
     let queues_dir = shmem_dir_queues(app_name);

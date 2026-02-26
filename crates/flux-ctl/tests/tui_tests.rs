@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use flux_communication::registry::ShmemKind;
+use flux_communication::ShmemKind;
 use flux_ctl::{
     discovery,
     discovery::DiscoveredEntry,

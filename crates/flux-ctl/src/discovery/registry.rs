@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use flux_communication::{array::ArrayHeader, queue::QueueHeader, registry::ShmemKind};
+use flux_communication::{ShmemKind, array::ArrayHeader, queue::QueueHeader};
 use shared_memory::ShmemConf;
 
 // ─── DiscoveredEntry ────────────────────────────────────────────────────────

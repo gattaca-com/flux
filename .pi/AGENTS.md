@@ -21,14 +21,14 @@ No global shared-memory registry — the filesystem **is** the source of truth.
 - **cli.rs** — `list_all()`, `list_json()`, `stats()`, `inspect()`, `clean()`
   CLI implementations, all driven by `scan_base_dir()`.
 
-### Utilities kept in flux-communication (`crates/flux-communication/src/registry.rs`)
+### Utilities kept in flux-communication
 
-Only thin helpers remain — no `ShmemRegistry`, no `ShmemEntry`, no `PidSet`:
+- `ShmemKind` enum (Queue, Data, SeqlockArray) — in `lib.rs`
+- `cleanup_flink(path)` — unlink shmem backing + remove flink file — in `cleanup.rs`
+- `cleanup_shmem(root)` — walk a tree, cleanup all flinks, remove dir — in `cleanup.rs`
+- `is_pid_alive(pid)` — `/proc/<pid>` existence check — in `cleanup.rs`
 
-- `ShmemKind` enum (Queue, Data, SeqlockArray)
-- `cleanup_flink(path)` — unlink shmem backing + remove flink file
-- `cleanup_shmem(root)` — walk a tree, cleanup all flinks, remove dir
-- `is_pid_alive(pid)` — `/proc/<pid>` existence check
+All re-exported from `flux_communication::` top-level.
 
 ### Data plane (`crates/flux-communication/src/`)
 
@@ -56,7 +56,8 @@ directory convention and return the handle.
 ## File Map
 
 ```
-crates/flux-communication/src/registry.rs   — ShmemKind, cleanup_flink, cleanup_shmem (~80 lines)
+crates/flux-communication/src/lib.rs        — ShmemKind enum, top-level re-exports
+crates/flux-communication/src/cleanup.rs    — cleanup_flink, cleanup_shmem, is_pid_alive
 crates/flux-ctl/src/main.rs                 — clap CLI definition
 crates/flux-ctl/src/discovery/registry.rs   — DiscoveredEntry, scan_base_dir, flink_reachable
 crates/flux-ctl/src/discovery/cli.rs        — CLI command implementations
@@ -71,9 +72,7 @@ crates/flux-ctl/examples/live.rs            — live demo with --workers, --pois
 ## Constraints
 
 - Workspace edition 2024, rust-version 1.91.0
-- **Read [STYLE.md](STYLE.md)** before writing any code
-- No `anyhow` — use `thiserror` or `Box<dyn std::error::Error>`
-- No `libc` — use `/proc` filesystem or `std` APIs
-- `flux_timing::Instant` uses `elapsed_since()`, `Duration::as_secs()` returns `f64`
+- **Read [STYLE.md](STYLE.md) before writing any code** — it is the
+  authoritative reference for formatting, linting, error handling, naming,
+  time APIs, and all other coding conventions
 - Do NOT modify `crates/spine-derive/` without explicit approval
-- Favour methods on types over free-standing functions

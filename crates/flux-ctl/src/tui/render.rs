@@ -1,4 +1,4 @@
-use flux_communication::registry::ShmemKind;
+use flux_communication::ShmemKind;
 use ratatui::{prelude::*, widgets::*};
 
 use super::app::{App, SelectedItem, View};

@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use flux::{
-    communication::{ShmemData, registry::cleanup_shmem},
+    communication::{ShmemData, cleanup_shmem},
     persistence::Persistable,
     spine::{SpineAdapter, SpineQueue},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
