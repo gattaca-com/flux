@@ -2,13 +2,18 @@
 //!
 //! Each segment is represented as a [`DiscoveredEntry`] — a plain owned struct
 //! with no dependency on shared-memory–resident data structures.
+//!
+//! For long-lived consumers (e.g. the TUI), [`ShmemCache`] keeps segments
+//! mapped across refresh ticks so that reading headers is a plain pointer
+//! dereference — zero syscalls per tick.
 
 pub mod cli;
 pub mod inspect;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub use cli::{clean, inspect, list_all, list_json, stats};
@@ -18,7 +23,9 @@ pub use inspect::{
     PidInfo, PoisonInfo, QueueStats, backing_file_size, format_bytes, resolve_backing_path,
     scan_proc_fds,
 };
-use shared_memory::ShmemConf;
+use shared_memory::{Shmem, ShmemConf};
+
+// ── DiscoveredEntry ──────────────────────────────────────────────────────
 
 /// A shared-memory segment discovered by walking the filesystem.
 #[derive(Debug, Clone)]
@@ -41,7 +48,211 @@ pub struct DiscoveredEntry {
     pub queue_fill: Option<usize>,
     /// Cached backing path in `/dev/shm/` (None if resolution failed).
     pub backing_path: Option<PathBuf>,
+    /// Quick O(1) poison probe result from the initial shmem mapping.
+    /// `Some(true)` = write-position slot has an odd seqlock version,
+    /// `Some(false)` = even (clean), `None` = not applicable or couldn't
+    /// check.
+    pub poison_quick: Option<bool>,
 }
+
+// ── ShmemCache ───────────────────────────────────────────────────────────
+
+/// A cached open shmem handle together with its static metadata.
+///
+/// The metadata fields (kind, app_name, …) are determined once when the
+/// segment is first opened and never change.  Dynamic fields (queue_writes,
+/// poison_quick, …) are re-read from the still-mapped memory on every
+/// [`ShmemCache::read_entries`] call.
+struct CachedHandle {
+    shmem: Shmem,
+    kind: ShmemKind,
+    app_name: String,
+    type_name: String,
+    flink: String,
+    elem_size: usize,
+    capacity: usize,
+    backing_path: Option<PathBuf>,
+}
+
+/// Keeps shmem segments mapped across refresh ticks so that per-tick reads
+/// are plain pointer dereferences — zero `shm_open`/`mmap`/`munmap` syscalls.
+///
+/// Call [`refresh_handles`] periodically (e.g. every 10 s) to pick up new
+/// segments and drop stale ones.  Call [`read_entries`] on every tick to
+/// snapshot the live header data.
+pub struct ShmemCache {
+    /// Open handles keyed by flink path.
+    handles: HashMap<String, CachedHandle>,
+    /// Cached shmem directory listing.
+    cached_dirs: Vec<(String, PathBuf)>,
+    /// Last time the directory tree was walked.
+    dirs_last_scan: Option<flux_timing::Instant>,
+}
+
+impl Default for ShmemCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShmemCache {
+    pub fn new() -> Self {
+        Self { handles: HashMap::new(), cached_dirs: Vec::new(), dirs_last_scan: None }
+    }
+
+    /// High-level refresh: periodically rescan the directory tree (10 s TTL)
+    /// and reconcile the open handle set.
+    ///
+    /// Between rescans, this is a no-op — [`read_entries`] reads from
+    /// already-mapped memory.
+    pub fn refresh(&mut self, base_dir: &Path) {
+        let now = flux_timing::Instant::now();
+        let should_rescan = self
+            .dirs_last_scan
+            .is_none_or(|last| now.elapsed_since(last) >= flux_timing::Duration::from_secs(10));
+
+        if should_rescan {
+            self.cached_dirs.clear();
+            find_shmem_dirs(base_dir, &mut self.cached_dirs);
+            self.dirs_last_scan = Some(now);
+            self.refresh_handles(&self.cached_dirs.clone());
+        }
+    }
+
+    /// Open new segments and drop stale ones.
+    ///
+    /// `shmem_dirs` is the output of [`find_shmem_dirs`].  Only flinks whose
+    /// `/dev/shm/` backing file still exists are opened, avoiding the
+    /// `shared_memory` crate's 5×50 ms retry loop on stale segments.
+    pub fn refresh_handles(&mut self, shmem_dirs: &[(String, PathBuf)]) {
+        // Collect all flink paths that currently exist on disk.
+        let mut live_flinks: HashMap<String, (ShmemKind, &str, &Path)> = HashMap::new();
+        for (app_name, shmem_dir) in shmem_dirs {
+            for (subdir, kind) in [
+                ("queues", ShmemKind::Queue),
+                ("data", ShmemKind::Data),
+                ("arrays", ShmemKind::SeqlockArray),
+            ] {
+                let type_dir = shmem_dir.join(subdir);
+                let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
+                    continue;
+                };
+                for flink_entry in flink_iter.flatten() {
+                    let flink_path = flink_entry.path();
+                    if flink_path.is_dir() {
+                        continue;
+                    }
+                    let flink_str = flink_path.to_string_lossy().to_string();
+                    live_flinks.insert(flink_str, (kind, app_name.as_str(), shmem_dir.as_path()));
+                }
+            }
+        }
+
+        // Remove handles for flinks that no longer exist on disk.
+        self.handles.retain(|flink, _| live_flinks.contains_key(flink));
+
+        // Open handles for flinks we don't have yet.
+        for (flink_str, (kind, app_name, _shmem_dir)) in &live_flinks {
+            if self.handles.contains_key(flink_str) {
+                continue;
+            }
+
+            let Some((os_id, backing_path)) = read_and_resolve_backing(flink_str) else {
+                continue;
+            };
+            if !backing_path.exists() {
+                continue;
+            }
+
+            let Ok(shmem) = ShmemConf::new().os_id(&os_id).open() else {
+                continue;
+            };
+
+            let type_name = Path::new(flink_str)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let (elem_size, capacity) = match kind {
+                ShmemKind::Queue => {
+                    if shmem.len() < std::mem::size_of::<QueueHeader>() {
+                        continue;
+                    }
+                    let h = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
+                    if !h.is_initialized() || h.elsize == 0 {
+                        continue;
+                    }
+                    (h.elsize, h.mask + 1)
+                }
+                ShmemKind::SeqlockArray => {
+                    let (es, cap) = read_array_meta(&shmem);
+                    if es == 0 {
+                        continue;
+                    }
+                    (es, cap)
+                }
+                ShmemKind::Data => (shmem.len(), 1),
+                ShmemKind::Unknown => continue,
+            };
+
+            self.handles.insert(flink_str.clone(), CachedHandle {
+                shmem,
+                kind: *kind,
+                app_name: app_name.to_string(),
+                type_name,
+                flink: flink_str.clone(),
+                elem_size,
+                capacity,
+                backing_path: Some(backing_path),
+            });
+        }
+    }
+
+    /// Snapshot every cached segment's live header data into a
+    /// [`DiscoveredEntry`].
+    ///
+    /// This is the hot path — no file I/O, just pointer reads from
+    /// already-mapped memory.
+    pub fn read_entries(&self) -> Vec<DiscoveredEntry> {
+        self.handles
+            .values()
+            .map(|h| {
+                let base = h.shmem.as_ptr();
+                let shmem_len = h.shmem.len();
+
+                let (queue_writes, queue_fill, poison_quick) = match h.kind {
+                    ShmemKind::Queue => {
+                        let header = unsafe { &*(base as *const QueueHeader) };
+                        let writes = header.count.load(Ordering::Relaxed);
+                        let fill = writes & header.mask;
+                        let pq = quick_poison_queue(base, shmem_len);
+                        (Some(writes), Some(fill), pq)
+                    }
+                    ShmemKind::SeqlockArray => {
+                        let pq = quick_poison_array(base, shmem_len);
+                        (None, None, pq)
+                    }
+                    _ => (None, None, None),
+                };
+
+                DiscoveredEntry {
+                    kind: h.kind,
+                    app_name: h.app_name.clone(),
+                    type_name: h.type_name.clone(),
+                    flink: h.flink.clone(),
+                    elem_size: h.elem_size,
+                    capacity: h.capacity,
+                    queue_writes,
+                    queue_fill,
+                    backing_path: h.backing_path.clone(),
+                    poison_quick,
+                }
+            })
+            .collect()
+    }
+}
+
+// ── Filesystem scanning (stateless, used by CLI and initial cache fill) ──
 
 /// Recursively walk `base_dir` looking for `shmem/{queues,data,arrays}/`
 /// directories at any depth.  For each one found, the immediate parent of
@@ -57,13 +268,11 @@ pub fn scan_base_dir(base_dir: &Path) -> Vec<DiscoveredEntry> {
     for (app_name, shmem_dir) in &shmem_dirs {
         collect_entries(app_name, shmem_dir, &mut entries);
     }
-
     entries
 }
 
-/// Returns a [`DiscoveredEntry`] for every flink whose backing shmem can
-/// still be opened, using pre-discovered shmem directories.  
-/// Stale flinks are silently skipped.
+/// Like [`scan_base_dir`] but accepts pre-discovered shmem directories
+/// (from a previous [`find_shmem_dirs`] call).
 pub fn scan_base_dir_with_dirs(shmem_dirs: &[(String, PathBuf)]) -> Vec<DiscoveredEntry> {
     let mut entries = Vec::new();
     for (app_name, shmem_dir) in shmem_dirs {
@@ -72,22 +281,16 @@ pub fn scan_base_dir_with_dirs(shmem_dirs: &[(String, PathBuf)]) -> Vec<Discover
     entries
 }
 
-/// DFS through `dir` looking for directories named `shmem` that contain at
-/// least one of `queues`, `data`, or `arrays`.  Pushes `(app_name, shmem_path)`
-/// pairs and does **not** recurse below a matched `shmem/` directory.
-///
-/// `app_name` is the relative path from `base_dir` to the parent of `shmem/`,
-/// e.g. `gattaca/LOCAL_LOUIS/builder` for a `shmem/` found at
-/// `<base_dir>/gattaca/LOCAL_LOUIS/builder/shmem/`.
+/// Recursively walk `base_dir` collecting `(app_name, shmem_dir)` pairs.
 pub(crate) fn find_shmem_dirs(base_dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     find_shmem_dirs_inner(base_dir, base_dir, out);
 }
 
 fn find_shmem_dirs_inner(base_dir: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(iter) = std::fs::read_dir(dir) else {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in iter.flatten() {
+    for entry in read_dir.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -147,14 +350,22 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
 
             let type_name = flink_entry.file_name().to_string_lossy().to_string();
 
-            let (elem_size, capacity, queue_writes, queue_fill) = match kind {
-                ShmemKind::Queue => read_queue_meta_with_stats(&shmem),
-                ShmemKind::SeqlockArray => {
-                    let (elem_size, capacity) = read_array_meta(&shmem);
-                    (elem_size, capacity, None, None)
+            let base = shmem.as_ptr();
+            let shmem_len = shmem.len();
+
+            let (elem_size, capacity, queue_writes, queue_fill, poison_quick) = match kind {
+                ShmemKind::Queue => {
+                    let (es, cap, w, f) = read_queue_meta_with_stats(&shmem);
+                    let pq = quick_poison_queue(base, shmem_len);
+                    (es, cap, w, f, pq)
                 }
-                ShmemKind::Data => (shmem.len(), 1, None, None),
-                ShmemKind::Unknown => (0, 0, None, None),
+                ShmemKind::SeqlockArray => {
+                    let (es, cap) = read_array_meta(&shmem);
+                    let pq = quick_poison_array(base, shmem_len);
+                    (es, cap, None, None, pq)
+                }
+                ShmemKind::Data => (shmem_len, 1, None, None, None),
+                ShmemKind::Unknown => (0, 0, None, None, None),
             };
 
             entries.push(DiscoveredEntry {
@@ -167,10 +378,13 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
                 queue_writes,
                 queue_fill,
                 backing_path: Some(backing_path),
+                poison_quick,
             });
         }
     }
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Read a flink file's OS id and compute the `/dev/shm/` backing path in one
 /// pass.  Returns `None` if the flink can't be read or is empty.
@@ -187,9 +401,7 @@ fn read_and_resolve_backing(flink: &str) -> Option<(String, PathBuf)> {
     Some((os_id, PathBuf::from(raw)))
 }
 
-fn read_queue_meta_with_stats(
-    shmem: &shared_memory::Shmem,
-) -> (usize, usize, Option<usize>, Option<usize>) {
+fn read_queue_meta_with_stats(shmem: &Shmem) -> (usize, usize, Option<usize>, Option<usize>) {
     if shmem.len() < std::mem::size_of::<QueueHeader>() {
         return (0, 0, None, None);
     }
@@ -202,7 +414,56 @@ fn read_queue_meta_with_stats(
     (header.elsize, header.mask + 1, Some(queue_writes), Some(queue_fill))
 }
 
-fn read_array_meta(shmem: &shared_memory::Shmem) -> (usize, usize) {
+/// O(1) poison probe on an already-mapped queue: check the seqlock version at
+/// the current write position.
+fn quick_poison_queue(base: *const u8, shmem_len: usize) -> Option<bool> {
+    const HEADER_SIZE: usize = 64;
+    if shmem_len < std::mem::size_of::<QueueHeader>() {
+        return None;
+    }
+    let header = unsafe { &*(base as *const QueueHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        return None;
+    }
+    let elsize = header.elsize;
+    let write_pos = header.count.load(Ordering::Acquire) & header.mask;
+    if HEADER_SIZE + write_pos * elsize + std::mem::size_of::<AtomicU64>() > shmem_len {
+        return None;
+    }
+    let slot_ptr = unsafe { base.add(HEADER_SIZE + write_pos * elsize) } as *const AtomicU64;
+    let v1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+    if v1 & 1 == 0 {
+        return Some(false);
+    }
+    std::thread::yield_now();
+    let v2 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+    Some(v2 & 1 != 0)
+}
+
+/// O(1) poison probe on an already-mapped array: check the first slot.
+fn quick_poison_array(base: *const u8, shmem_len: usize) -> Option<bool> {
+    const HEADER_SIZE: usize = 64;
+    if shmem_len < std::mem::size_of::<ArrayHeader>() {
+        return None;
+    }
+    let header = unsafe { &*(base as *const ArrayHeader) };
+    if !header.is_initialized() || header.elsize == 0 {
+        return None;
+    }
+    if HEADER_SIZE + std::mem::size_of::<AtomicU64>() > shmem_len {
+        return None;
+    }
+    let slot_ptr = unsafe { base.add(HEADER_SIZE) } as *const AtomicU64;
+    let v1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+    if v1 & 1 == 0 {
+        return Some(false);
+    }
+    std::thread::yield_now();
+    let v2 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
+    Some(v2 & 1 != 0)
+}
+
+fn read_array_meta(shmem: &Shmem) -> (usize, usize) {
     if shmem.len() < std::mem::size_of::<ArrayHeader>() {
         return (0, 0);
     }

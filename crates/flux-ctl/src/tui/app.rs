@@ -7,7 +7,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use flux_communication::{ShmemKind, cleanup_flink};
 use flux_timing::{Duration, Instant};
 
-use crate::{discovery, discovery::DiscoveredEntry};
+use crate::{
+    discovery,
+    discovery::{DiscoveredEntry, ShmemCache},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
@@ -104,10 +107,9 @@ pub struct App {
     cached_proc_map: HashMap<PathBuf, Vec<u32>>,
     /// Last time proc_map was scanned.
     proc_map_last_scan: Option<Instant>,
-    /// Cached result of find_shmem_dirs() with TTL.
-    cached_shmem_dirs: Vec<(String, PathBuf)>,
-    /// Last time shmem dirs were scanned.
-    dirs_last_scan: Option<Instant>,
+    /// Persistent shmem cache — segments stay mapped across ticks so reading
+    /// headers is a plain pointer dereference (zero syscalls).
+    shmem_cache: ShmemCache,
 }
 
 fn status_msg_duration() -> Duration {
@@ -139,8 +141,7 @@ impl App {
             prev_writes: HashMap::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
-            cached_shmem_dirs: Vec::new(),
-            dirs_last_scan: None,
+            shmem_cache: ShmemCache::new(),
         };
         app.refresh();
         app
@@ -166,8 +167,7 @@ impl App {
             prev_writes: HashMap::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
-            cached_shmem_dirs: Vec::new(),
-            dirs_last_scan: None,
+            shmem_cache: ShmemCache::new(),
         };
         app.recount_rows();
         app
@@ -188,22 +188,17 @@ impl App {
 
         self.groups.clear();
 
-        // Cache shmem dirs scan with 10-second TTL
-        let now = Instant::now();
-        let should_rescan_dirs = self
-            .dirs_last_scan
-            .is_none_or(|last| now.elapsed_since(last) >= Duration::from_secs(10));
+        // Periodically rescan the filesystem for new/removed segments (10s
+        // TTL).  Between rescans we just re-read headers from the
+        // already-mapped memory — zero syscalls.
+        self.shmem_cache.refresh(&self.base_dir);
 
-        if should_rescan_dirs {
-            self.cached_shmem_dirs.clear();
-            discovery::find_shmem_dirs(&self.base_dir, &mut self.cached_shmem_dirs);
-            self.dirs_last_scan = Some(now);
-        }
-
-        let all_entries = discovery::scan_base_dir_with_dirs(&self.cached_shmem_dirs);
+        // Read live stats from cached mappings (pure pointer reads).
+        let all_entries = self.shmem_cache.read_entries();
         let app_names = discovery::app_names(&all_entries);
 
         // Cache proc scan with 5-second TTL
+        let now = Instant::now();
         let should_rescan_proc = self
             .proc_map_last_scan
             .is_none_or(|last| now.elapsed_since(last) >= Duration::from_secs(5));
@@ -232,8 +227,6 @@ impl App {
                 })
                 .map(|e| {
                     let pids = e.pids(&self.cached_proc_map);
-                    // A segment is alive if any process *other than us* has
-                    // its backing shmem open.
                     let alive = pids.iter().any(|&p| p != own_pid);
                     let (queue_writes, queue_fill, queue_capacity) =
                         if alive && e.kind == ShmemKind::Queue {
@@ -241,21 +234,16 @@ impl App {
                         } else {
                             (None, None, None)
                         };
-                    // In list view, use quick O(1) poison check
+                    // Use the poison result that was already read from the
+                    // cached mapping — no extra mmap.
                     let poison = if alive {
-                        match discovery::PoisonInfo::check_quick(e) {
-                            Some(true) => {
-                                // Poison detected, create a placeholder PoisonInfo for display
-                                // We don't know exact counts without full scan, so use conservative
-                                // estimates
-                                Some(discovery::PoisonInfo {
-                                    n_poisoned: 1,
-                                    first_slot: 0, // We don't know the exact slot from quick check
-                                    total_slots: e.capacity,
-                                })
-                            }
-                            Some(false) => None, // No poison detected
-                            None => None,        // Unable to check
+                        match e.poison_quick {
+                            Some(true) => Some(discovery::PoisonInfo {
+                                n_poisoned: 1,
+                                first_slot: 0,
+                                total_slots: e.capacity,
+                            }),
+                            _ => None,
                         }
                     } else {
                         None
@@ -274,7 +262,6 @@ impl App {
                         self.prev_writes.insert(flink, (w, now));
                         rate
                     });
-                    // Filter out our own PID so the TUI doesn't count itself.
                     let pids: Vec<u32> = pids.into_iter().filter(|&p| p != own_pid).collect();
                     SegmentInfo {
                         entry: e.clone(),
