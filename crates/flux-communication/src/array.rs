@@ -143,6 +143,9 @@ impl<T: Copy> InnerSeqlockArray<T> {
         len: usize,
     ) -> Result<*const Self, QueueError> {
         use shared_memory::{ShmemConf, ShmemError};
+        if let Some(p) = shmem_flink.as_ref().parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
         match ShmemConf::new().size(Self::size_of(len)).flink(&shmem_flink).create() {
             Ok(shmem) => {
                 let ptr = shmem.as_ptr();
