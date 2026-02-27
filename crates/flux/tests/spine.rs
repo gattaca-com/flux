@@ -134,11 +134,7 @@ fn all_shmem_files_reside_in_base_dir() {
     assert!(data_dir.is_dir(), "data dir should exist: {}", data_dir.display());
 
     let tile_info_file = data_dir.join("TileInfo");
-    assert!(
-        tile_info_file.exists(),
-        "TileInfo shmem should exist at {}",
-        tile_info_file.display()
-    );
+    assert!(tile_info_file.exists(), "TileInfo shmem should exist at {}", tile_info_file.display());
 
     let queue_files: Vec<_> = files
         .iter()

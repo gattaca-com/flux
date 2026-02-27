@@ -16,6 +16,8 @@ directories.workspace = true
 libc.workspace = true
 tracing.workspace = true
 serde.workspace = true
+rand.workspace = true
+spin.workspace = true
 wincode = { workspace = true, optional = true }
 
 [dev-dependencies]
