@@ -6,6 +6,7 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use flux_communication::{ShmemKind, cleanup_flink};
 use flux_timing::{Duration, Instant};
+use ratatui::widgets::TableState;
 
 use crate::{
     discovery,
@@ -110,6 +111,8 @@ pub struct App {
     /// Persistent shmem cache — segments stay mapped across ticks so reading
     /// headers is a plain pointer dereference (zero syscalls).
     shmem_cache: ShmemCache,
+    /// Persistent table state so the viewport offset survives across renders.
+    pub table_state: TableState,
 }
 
 fn status_msg_duration() -> Duration {
@@ -142,6 +145,7 @@ impl App {
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
+            table_state: TableState::default().with_selected(0),
         };
         app.refresh();
         app
@@ -168,6 +172,7 @@ impl App {
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
+            table_state: TableState::default().with_selected(0),
         };
         app.recount_rows();
         app

@@ -306,7 +306,7 @@ fn find_shmem_dirs_inner(base_dir: &Path, dir: &Path, out: &mut Vec<(String, Pat
     };
     for entry in read_dir.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        if !path.is_dir() || entry.file_name() == "data" {
             continue;
         }
         if entry.file_name() == "shmem" && is_shmem_root(&path) {

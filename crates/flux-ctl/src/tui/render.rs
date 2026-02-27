@@ -136,8 +136,8 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL))
         .row_highlight_style(Style::default().bg(Color::DarkGray));
 
-    let mut state = TableState::default().with_selected(Some(app.selected));
-    frame.render_stateful_widget(table, chunks[1], &mut state);
+    app.table_state.select(Some(app.selected));
+    frame.render_stateful_widget(table, chunks[1], &mut app.table_state);
 
     render_status_bar(frame, app, chunks[2]);
 }
