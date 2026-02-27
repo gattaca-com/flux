@@ -37,5 +37,8 @@ db-tools/
 # VSCode
 .vscode
 
+# Pi coding agent config (ask @louisponet for a .pi folder)
+.pi
+
 # Coverage report
 lcov.info

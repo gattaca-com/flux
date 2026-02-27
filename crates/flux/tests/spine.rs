@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use flux::{
-    communication::ShmemData,
+    communication::{ShmemData, cleanup_shmem},
     persistence::Persistable,
     spine::{SpineAdapter, SpineQueue},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
@@ -12,7 +12,6 @@ use flux::{
 use flux_timing::Duration;
 use flux_utils::directories::{shmem_dir_data_with_base, shmem_dir_queues_with_base};
 use serde::{Deserialize, Serialize};
-use shared_memory::ShmemConf;
 use spine_derive::from_spine;
 
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
@@ -66,15 +65,6 @@ impl Tile<TestSpine> for Reader {
             adapter.request_stop_scope();
         }
     }
-}
-
-fn cleanup_shmem(root: &std::path::Path) {
-    for flink in all_files_under(root) {
-        if let Ok(mut shmem) = ShmemConf::new().flink(&flink).open() {
-            shmem.set_owner(true);
-        }
-    }
-    let _ = std::fs::remove_dir_all(root);
 }
 
 fn all_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -134,11 +124,7 @@ fn all_shmem_files_reside_in_base_dir() {
     assert!(data_dir.is_dir(), "data dir should exist: {}", data_dir.display());
 
     let tile_info_file = data_dir.join("TileInfo");
-    assert!(
-        tile_info_file.exists(),
-        "TileInfo shmem should exist at {}",
-        tile_info_file.display()
-    );
+    assert!(tile_info_file.exists(), "TileInfo shmem should exist at {}", tile_info_file.display());
 
     let queue_files: Vec<_> = files
         .iter()

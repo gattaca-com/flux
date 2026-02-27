@@ -2,6 +2,7 @@
 members = [
   "crates/flux",
   "crates/flux-communication",
+  "crates/flux-ctl",
   "crates/flux-timing",
   "crates/flux-utils",
   "crates/flux-timekeeper",
@@ -59,3 +60,5 @@ wincode-derive = "0.2.3"
 mio = { version = "1.1.1", features = ["net", "os-poll"] }
 url = "2.5.8"
 tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"

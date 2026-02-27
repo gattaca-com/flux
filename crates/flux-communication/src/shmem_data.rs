@@ -36,8 +36,8 @@ impl<T> ShmemData<T> {
         init_f: impl FnOnce() -> T,
     ) -> Result<ShmemData<T>, ShmemError> {
         use shared_memory::{ShmemConf, ShmemError};
-        let shmem_file =
-            shmem_dir_data_with_base(&dir, &app_name).join(short_typename::<T>().as_str());
+        let type_name = short_typename::<T>();
+        let shmem_file = shmem_dir_data_with_base(&dir, &app_name).join(type_name.as_str());
         std::fs::create_dir_all(
             shmem_file
                 .parent()

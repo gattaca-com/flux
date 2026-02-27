@@ -4,9 +4,9 @@ use std::sync::{
 };
 
 use flux::{
-    communication::ShmemData,
+    communication::{ShmemData, cleanup_shmem},
     persistence::Persistable,
-    spine::{FluxSpine, SpineAdapter, SpineQueue},
+    spine::{SpineAdapter, SpineQueue},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
 use flux_timing::Duration;
@@ -69,7 +69,9 @@ impl Tile<MySpine> for ConsumerTile {
 
 #[test]
 fn end_to_end_send_receive_and_exit() {
-    let mut spine = MySpine::new(None);
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let base = tmp.path();
+    let mut spine = MySpine::new_with_base_dir(base, None);
 
     let got = Arc::new(AtomicU64::new(0));
     let want = 42u64;
@@ -89,7 +91,7 @@ fn end_to_end_send_receive_and_exit() {
         );
     });
 
-    MySpine::remove_all_files();
+    cleanup_shmem(base);
 
     assert_eq!(got.load(Ordering::Relaxed), want);
 }
