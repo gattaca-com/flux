@@ -30,6 +30,7 @@ fn queue_entry(
         queue_writes: None,
         queue_fill: None,
         backing_path: None,
+        backing_size: elem_size * capacity,
         poison_quick: None,
     }
 }
@@ -46,6 +47,7 @@ fn data_entry(app: &str, type_name: &str, flink: &str, size: usize) -> Discovere
         queue_writes: None,
         queue_fill: None,
         backing_path: None,
+        backing_size: size,
         poison_quick: None,
     }
 }

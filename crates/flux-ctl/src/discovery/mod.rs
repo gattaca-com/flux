@@ -47,6 +47,8 @@ pub struct DiscoveredEntry {
     pub queue_fill: Option<usize>,
     /// Cached backing path in `/dev/shm/` (None if resolution failed).
     pub backing_path: Option<PathBuf>,
+    /// Total size of the backing shmem mapping in bytes.
+    pub backing_size: usize,
     /// Quick O(1) poison probe result from the cached shmem mapping.
     /// `Some(true)` = write-position slot has an odd seqlock version,
     /// `Some(false)` = even (clean), `None` = not applicable or couldn't
@@ -175,6 +177,7 @@ impl CachedHandle {
             queue_writes,
             queue_fill,
             backing_path: self.backing_path.clone(),
+            backing_size: self.shmem.len(),
             poison_quick,
         }
     }
@@ -384,6 +387,7 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
                 queue_writes,
                 queue_fill,
                 backing_path: Some(backing_path),
+                backing_size: shmem_len,
                 poison_quick,
             });
         }

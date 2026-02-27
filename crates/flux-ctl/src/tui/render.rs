@@ -36,10 +36,13 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
     let n_segments: usize = app.groups.iter().map(|g| g.segments.len()).sum();
     let n_apps = app.groups.len();
+    let total_size: u64 =
+        app.groups.iter().flat_map(|g| &g.segments).map(|s| s.entry.backing_size as u64).sum();
     let elapsed = app.last_refresh.elapsed().as_secs_u64();
     let updated = if elapsed < 2 { String::new() } else { format!(" (updated {elapsed}s ago)") };
     let title_text = format!(
-        " flux-ctl — Shared Memory Monitor ({n_segments} segments, {n_apps} apps)  [sort: {}]{updated} ",
+        " flux-ctl — Shared Memory Monitor ({n_segments} segments, {n_apps} apps, {})  [sort: {}]{updated} ",
+        format_bytes(total_size),
         app.sort_mode.label()
     );
     let title = Paragraph::new(title_text)
