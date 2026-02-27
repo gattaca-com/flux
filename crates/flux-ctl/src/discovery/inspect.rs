@@ -116,9 +116,10 @@ impl PoisonInfo {
     /// a `repr(C, align(64))` header followed by `Seqlock<T>` slots where the
     /// first 8 bytes of each slot are the `AtomicU64` version.
     pub fn check(entry: &DiscoveredEntry) -> Option<Self> {
+        let os_id = os_id_from_entry(entry)?;
         match entry.kind {
-            ShmemKind::Queue => Self::check_queue(&entry.flink),
-            ShmemKind::SeqlockArray => Self::check_array(&entry.flink),
+            ShmemKind::Queue => Self::check_queue(&os_id),
+            ShmemKind::SeqlockArray => Self::check_array(&os_id),
             _ => None,
         }
     }
@@ -126,18 +127,22 @@ impl PoisonInfo {
     /// Quick O(1) poison check that only inspects the slot at the current write
     /// position. Returns Some(true) if poison detected, Some(false) if no
     /// poison, None if unable to check.
+    ///
+    /// Uses the cached `backing_path` to derive the OS shmem id, avoiding a
+    /// flink file read and the `shared_memory` crate's 5×50 ms retry loop.
     pub fn check_quick(entry: &DiscoveredEntry) -> Option<bool> {
+        let os_id = os_id_from_entry(entry)?;
         match entry.kind {
-            ShmemKind::Queue => Self::check_queue_quick(&entry.flink),
-            ShmemKind::SeqlockArray => Self::check_array_quick(&entry.flink),
+            ShmemKind::Queue => Self::check_queue_quick(&os_id),
+            ShmemKind::SeqlockArray => Self::check_array_quick(&os_id),
             _ => None,
         }
     }
 
-    fn check_queue(flink: &str) -> Option<Self> {
+    fn check_queue(os_id: &str) -> Option<Self> {
         const HEADER_SIZE: usize = 64;
 
-        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();
         let shmem_len = shmem.len();
 
@@ -163,10 +168,10 @@ impl PoisonInfo {
         Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining)
     }
 
-    fn check_array(flink: &str) -> Option<Self> {
+    fn check_array(os_id: &str) -> Option<Self> {
         const HEADER_SIZE: usize = 64;
 
-        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();
         let shmem_len = shmem.len();
 
@@ -192,10 +197,10 @@ impl PoisonInfo {
         Self::scan_seqlock_slots(buf_base, n_slots, elsize, buf_remaining)
     }
 
-    fn check_queue_quick(flink: &str) -> Option<bool> {
+    fn check_queue_quick(os_id: &str) -> Option<bool> {
         const HEADER_SIZE: usize = 64;
 
-        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();
         let shmem_len = shmem.len();
 
@@ -233,10 +238,10 @@ impl PoisonInfo {
         Some(version2 & 1 != 0) // Still odd = poisoned
     }
 
-    fn check_array_quick(flink: &str) -> Option<bool> {
+    fn check_array_quick(os_id: &str) -> Option<bool> {
         const HEADER_SIZE: usize = 64;
 
-        let shmem = ShmemConf::new().flink(flink).open().ok()?;
+        let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();
         let shmem_len = shmem.len();
 
@@ -391,6 +396,19 @@ pub fn scan_proc_fds() -> HashMap<PathBuf, Vec<u32>> {
 
     map
 }
+/// Derive the `shm_open` OS id from a `DiscoveredEntry`'s cached backing path.
+///
+/// The backing path is `/dev/shm/<id>` so the OS id is `/<id>` (the path
+/// relative to `/dev/shm`).  Falls back to reading the flink file if no
+/// cached path is available.
+fn os_id_from_entry(entry: &DiscoveredEntry) -> Option<String> {
+    if let Some(ref bp) = entry.backing_path {
+        bp.strip_prefix("/dev/shm").ok().map(|rel| format!("/{}", rel.display()))
+    } else {
+        read_shmem_os_id(&entry.flink)
+    }
+}
+
 impl DiscoveredEntry {
     /// Resolve the `/dev/shm/` backing path for this entry's flink.
     pub fn backing_path(&self) -> Option<PathBuf> {

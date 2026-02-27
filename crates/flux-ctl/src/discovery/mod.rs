@@ -108,6 +108,11 @@ fn is_shmem_root(dir: &Path) -> bool {
 }
 
 /// Read all flinks under a single `shmem/` directory and append entries.
+///
+/// For each flink we read the OS shmem id from the file, then check whether
+/// the backing `/dev/shm/<id>` still exists before calling `ShmemConf::open`.
+/// This avoids the `shared_memory` crate's 5×50 ms retry loop on stale
+/// segments that would otherwise dominate startup time.
 fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<DiscoveredEntry>) {
     for (subdir, kind) in [
         ("queues", ShmemKind::Queue),
@@ -123,11 +128,24 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
             if flink_path.is_dir() {
                 continue;
             }
-            let type_name = flink_entry.file_name().to_string_lossy().to_string();
 
-            let Ok(shmem) = ShmemConf::new().flink(&flink_path).open() else {
+            // Read the OS shmem id from the flink file and derive the
+            // backing path.  Skip stale flinks whose backing is gone —
+            // this is a single stat() instead of ShmemConf's 5×50ms
+            // retry loop.
+            let flink_str = flink_path.to_string_lossy().to_string();
+            let Some((os_id, backing_path)) = read_and_resolve_backing(&flink_str) else {
                 continue;
             };
+            if !backing_path.exists() {
+                continue;
+            }
+
+            let Ok(shmem) = ShmemConf::new().os_id(&os_id).open() else {
+                continue;
+            };
+
+            let type_name = flink_entry.file_name().to_string_lossy().to_string();
 
             let (elem_size, capacity, queue_writes, queue_fill) = match kind {
                 ShmemKind::Queue => read_queue_meta_with_stats(&shmem),
@@ -139,22 +157,34 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
                 ShmemKind::Unknown => (0, 0, None, None),
             };
 
-            // Resolve backing path once during discovery
-            let backing_path = resolve_backing_path(&flink_path.to_string_lossy());
-
             entries.push(DiscoveredEntry {
                 kind,
                 app_name: app_name.to_owned(),
                 type_name,
-                flink: flink_path.to_string_lossy().to_string(),
+                flink: flink_str,
                 elem_size,
                 capacity,
                 queue_writes,
                 queue_fill,
-                backing_path,
+                backing_path: Some(backing_path),
             });
         }
     }
+}
+
+/// Read a flink file's OS id and compute the `/dev/shm/` backing path in one
+/// pass.  Returns `None` if the flink can't be read or is empty.
+fn read_and_resolve_backing(flink: &str) -> Option<(String, PathBuf)> {
+    let os_id = std::fs::read_to_string(flink).ok()?.trim().to_string();
+    if os_id.is_empty() {
+        return None;
+    }
+    let raw = if os_id.starts_with('/') {
+        format!("/dev/shm{os_id}")
+    } else {
+        format!("/dev/shm/{os_id}")
+    };
+    Some((os_id, PathBuf::from(raw)))
 }
 
 fn read_queue_meta_with_stats(
