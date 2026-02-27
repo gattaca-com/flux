@@ -369,7 +369,7 @@ fn scan_base_dir_discovers_multiple_apps() {
     let entries = discovery::scan_base_dir(base);
     assert_eq!(entries.len(), 2, "should discover 2 segments");
 
-    let names = discovery::app_names(&entries);
+    let names = discovery::DiscoveredEntry::app_names(&entries);
     assert_eq!(names, vec!["app1", "app2"]);
 
     // Cleanup
@@ -1597,7 +1597,7 @@ fn performance_scan_base_dir_250_segments() {
     assert_eq!(entries.len(), 250, "should discover all 250 segments");
 
     // Verify we have 40 unique apps
-    let app_names = discovery::app_names(&entries);
+    let app_names = discovery::DiscoveredEntry::app_names(&entries);
     assert_eq!(app_names.len(), 40, "should have 40 unique apps");
 
     // Performance assertion: should complete within 5 seconds

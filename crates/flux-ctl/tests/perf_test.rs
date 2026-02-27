@@ -149,7 +149,7 @@ fn performance_scan_base_dir_50_segments() {
     assert_eq!(entries.len(), 50, "Should discover exactly 50 segments");
 
     // Verify we found all 10 apps
-    let app_names = flux_ctl::discovery::app_names(&entries);
+    let app_names = flux_ctl::discovery::DiscoveredEntry::app_names(&entries);
     assert_eq!(app_names.len(), 10, "Should discover exactly 10 apps");
 
     // Verify segment distribution by kind

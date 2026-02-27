@@ -20,10 +20,7 @@ fn main() {
         t1.elapsed_since(t0).as_millis(),
         entries.len()
     );
-    eprintln!(
-        "COLD  read_entries:     {:>8.2}ms",
-        t2.elapsed_since(t1).as_millis()
-    );
+    eprintln!("COLD  read_entries:     {:>8.2}ms", t2.elapsed_since(t1).as_millis());
 
     // ── Subsequent ticks (warm: just pointer reads) ──────────────────
     let mut total_warm = 0.0f64;
@@ -49,8 +46,5 @@ fn main() {
         proc_map.len()
     );
 
-    eprintln!(
-        "TOTAL first frame:      {:>8.2}ms",
-        t4.elapsed_since(t0).as_millis()
-    );
+    eprintln!("TOTAL first frame:      {:>8.2}ms", t4.elapsed_since(t0).as_millis());
 }

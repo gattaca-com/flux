@@ -9,7 +9,7 @@ use serde::Serialize;
 use shared_memory::ShmemConf;
 
 use super::{
-    DiscoveredEntry, app_names, entry_visible, flink_reachable,
+    DiscoveredEntry, flink_reachable,
     inspect::{PoisonInfo, backing_file_size, format_bytes},
     scan_base_dir,
 };
@@ -34,7 +34,7 @@ pub fn list_all(
 
     let entries: Vec<&DiscoveredEntry> = all_entries
         .iter()
-        .filter(|e| entry_visible(e))
+        .filter(|e| e.is_visible())
         .filter(|e| app_filter.is_none_or(|f| e.app_name == f))
         .collect();
     if entries.is_empty() {
@@ -43,7 +43,7 @@ pub fn list_all(
     }
 
     let color = std::io::stdout().is_terminal();
-    let apps = app_names(&all_entries);
+    let apps = DiscoveredEntry::app_names(&all_entries);
     println!("Found {} segments across {} apps\n", entries.len(), apps.len());
 
     // Compute column widths for aligned output.
@@ -169,7 +169,7 @@ pub fn list_json(
 
     let segments: Vec<SegmentJson> = all_entries
         .iter()
-        .filter(|e| entry_visible(e))
+        .filter(|e| e.is_visible())
         .filter(|e| app_filter.is_none_or(|f| e.app_name == f))
         .map(SegmentJson::from_entry)
         .collect();
@@ -198,7 +198,7 @@ pub fn stats(
 
     let entries: Vec<&DiscoveredEntry> = all_entries
         .iter()
-        .filter(|e| entry_visible(e))
+        .filter(|e| e.is_visible())
         .filter(|e| app_filter.is_none_or(|f| e.app_name == f))
         .collect();
     let apps: Vec<String> = {
@@ -296,7 +296,7 @@ pub fn inspect(
     }
 
     for entry in &all_entries {
-        if !entry_visible(entry) {
+        if !entry.is_visible() {
             continue;
         }
         if let Some(app) = app_filter &&

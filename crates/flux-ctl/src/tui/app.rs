@@ -195,7 +195,7 @@ impl App {
 
         // Read live stats from cached mappings (pure pointer reads).
         let all_entries = self.shmem_cache.read_entries();
-        let app_names = discovery::app_names(&all_entries);
+        let app_names = DiscoveredEntry::app_names(&all_entries);
 
         // Cache proc scan with 5-second TTL
         let now = Instant::now();
