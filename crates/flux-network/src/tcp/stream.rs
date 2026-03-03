@@ -7,7 +7,7 @@ use std::{
 use flux_communication::Timer;
 use flux_timing::Nanos;
 use mio::{Interest, Registry, Token, event::Event};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Controls emission of network latency and alloc telemetry.
 ///
@@ -118,6 +118,9 @@ pub struct TcpStream {
     /// Invariant: `writable_armed == !send_q.is_empty()`
     writable_armed: bool,
 
+    /// If set, frames with payload length exceeding this are discarded.
+    max_frame_len: Option<usize>,
+
     /// Timers for network latency and alloc telemetry.
     timers: Option<TcpTimers>,
 }
@@ -131,6 +134,7 @@ impl TcpStream {
         token: Token,
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
+        max_frame_len: Option<usize>,
     ) -> Self {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
@@ -153,6 +157,7 @@ impl TcpStream {
             send_backlog: VecDeque::with_capacity(64),
             send_cursor: 0,
             writable_armed: false,
+            max_frame_len,
             timers,
         }
     }
@@ -352,23 +357,33 @@ impl TcpStream {
                                     let msg_len = u32::from_le_bytes(
                                         buf[..LEN_HEADER_SIZE].try_into().unwrap(),
                                     ) as usize;
-                                    if msg_len > self.rx_buf.len() {
-                                        debug!(
-                                            buf_len = self.rx_buf.len(),
-                                            need_len = msg_len,
-                                            "tcp: buffer resized"
-                                        );
-                                        self.rx_buf.resize(msg_len, 0);
-                                    }
-                                    let send_ts = Nanos(u64::from_le_bytes(
-                                        buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
-                                    ));
                                     if msg_len == 0 {
                                         self.rx_state = RxState::ReadingHeader {
                                             buf: [0; FRAME_HEADER_SIZE],
                                             have: 0,
                                         };
+                                    } else if self.max_frame_len.is_some_and(|max| msg_len > max) {
+                                        error!(
+                                            msg_len,
+                                            max = self.max_frame_len.unwrap(),
+                                            peer = %self.peer_addr,
+                                            "tcp: frame too large"
+                                        );
+                                        return ReadOutcome::Disconnected;
                                     } else {
+                                        if msg_len > self.rx_buf.len() {
+                                            debug!(
+                                                buf_len = self.rx_buf.len(),
+                                                need_len = msg_len,
+                                                "tcp: buffer resized"
+                                            );
+                                            self.rx_buf.resize(msg_len, 0);
+                                        }
+                                        let send_ts = Nanos(u64::from_le_bytes(
+                                            buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
+                                                .try_into()
+                                                .unwrap(),
+                                        ));
                                         self.rx_state =
                                             RxState::ReadingPayload { msg_len, offset: 0, send_ts };
                                     }

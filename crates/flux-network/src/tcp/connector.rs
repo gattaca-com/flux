@@ -53,6 +53,7 @@ struct ConnectionManager {
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
+    max_frame_len: Option<usize>,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
@@ -68,6 +69,7 @@ impl Default for ConnectionManager {
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
+            max_frame_len: None,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
@@ -180,8 +182,13 @@ impl ConnectionManager {
     fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
         if let Some(stream) = self.try_connect(o, addr) {
-            let mut tcp_stream =
-                TcpStream::from_stream_with_telemetry(stream, o, addr, self.telemetry);
+            let mut tcp_stream = TcpStream::from_stream_with_telemetry(
+                stream,
+                o,
+                addr,
+                self.telemetry,
+                self.max_frame_len,
+            );
             if let Some(msg) = &self.on_connect_msg &&
                 tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
@@ -355,6 +362,7 @@ impl ConnectionManager {
                             token,
                             addr,
                             self.telemetry,
+                            self.max_frame_len,
                         );
 
                         if let Some(msg) = &self.on_connect_msg &&
@@ -455,6 +463,12 @@ impl TcpConnector {
     /// accepted).
     pub fn with_socket_buf_size(mut self, size: usize) -> Self {
         self.conn_mgr.socket_buf_size = Some(size);
+        self
+    }
+
+    /// Sets the maximum allowed frame payload length in bytes.
+    pub fn with_max_frame_len(mut self, max: usize) -> Self {
+        self.conn_mgr.max_frame_len = Some(max);
         self
     }
 
