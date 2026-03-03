@@ -249,7 +249,8 @@ impl TcpStream {
             }
             Ok(n) if n == self.send_buf.len() + FRAME_HEADER_SIZE => ConnState::Alive,
             Ok(n) => {
-                let data = self.alloc_vec(n);
+                let data = self.alloc_vec(0);
+                self.send_cursor = n;
                 self.enqueue_back(registry, data)
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
