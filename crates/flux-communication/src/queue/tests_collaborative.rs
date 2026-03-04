@@ -131,3 +131,59 @@ fn collaborative_and_broadcast_coexist() {
     assert_eq!(cn1 + cn2, N, "collaborative delivers every message to exactly one consumer");
     assert_eq!(cs1 + cs2, expected_sum);
 }
+
+#[test]
+fn perf_test_collaborative_consumers() {
+    // Data values are 1..=N; N+1 is used as a stop number.
+    const N: usize = 100_000_000;
+    const STOP: usize = N + 1;
+    const SIZE: usize = 1_000_000;
+    const CONSUMERS: usize = 4;
+
+    let q: Queue<usize> = Queue::new(SIZE.next_power_of_two(), QueueType::SPMC);
+    let mut p = Producer::from(q);
+
+    let barrier = Arc::new(Barrier::new(CONSUMERS + 1));
+
+    let mut consumer_handles = Vec::new();
+    for _ in 0..CONSUMERS {
+        let barrier = Arc::clone(&barrier);
+        let mut c = Consumer::from(q).without_log();
+
+        consumer_handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut local_sum = 0;
+            loop {
+                let mut stop = false;
+                c.consume_collaborative(|x| {
+                    if *x == STOP {
+                        stop = true;
+                    } else {
+                        local_sum += *x;
+                    }
+                });
+                if stop {
+                    break;
+                }
+            }
+            local_sum
+        }));
+    }
+
+    // Producer: publishes 1, 2, ..., N then one stop number per consumer.
+    let barrier = Arc::clone(&barrier);
+    let producer = std::thread::spawn(move || {
+        barrier.wait();
+        for i in 1..=N {
+            p.produce(&i);
+        }
+        for _ in 0..CONSUMERS {
+            p.produce(&STOP);
+        }
+    });
+
+    let total_sum: usize = consumer_handles.into_iter().map(|h| h.join().unwrap()).sum();
+    producer.join().unwrap();
+
+    assert_eq!(total_sum, N * (N + 1) / 2, "sum matches 1+2+…+N");
+}
