@@ -1,11 +1,13 @@
-use crate::queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType};
-use crate::ReadError;
+use crate::{
+    ReadError,
+    queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType},
+};
 
 #[test]
 fn headersize() {
     // Two cache lines: line 0 = producer fields (count), line 1 = consume_cursor
     assert_eq!(128, std::mem::size_of::<QueueHeader>());
-    assert_eq!(56, std::mem::size_of::<ConsumerBare<[u8; 60]>>())
+    assert_eq!(64, std::mem::size_of::<ConsumerBare<[u8; 60]>>())
 }
 
 #[test]
@@ -39,8 +41,9 @@ fn basic() {
 }
 
 fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
-    // Queue must hold all messages to prevent wrap-around: with a small ring, a slow
-    // reader can overshoot the seqlock version across a lap boundary and deadlock on Empty.
+    // Queue must hold all messages to prevent wrap-around: with a small ring, a
+    // slow reader can overshoot the seqlock version across a lap boundary and
+    // deadlock on Empty.
     let q = Queue::new(tot_messages.next_power_of_two(), QueueType::MPMC);
 
     let mut readhandles = Vec::new();

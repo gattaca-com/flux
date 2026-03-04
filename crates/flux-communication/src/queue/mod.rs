@@ -37,8 +37,8 @@ pub struct QueueHeader {
     _pad2: [u8; 32],           // 64 — pad to end of cache line
 
     // Cache line 1: written by collaborative consumers only
-    pub consume_cursor: AtomicUsize, // 64
-                                     // 56 bytes implicit padding (align 64 → total 128)
+    pub collaborative_cursor: AtomicUsize, /* 64
+                                            * 56 bytes implicit padding (align 64 → total 128) */
 }
 #[allow(dead_code)]
 impl QueueHeader {
@@ -117,7 +117,7 @@ impl<T: Copy> InnerQueue<T> {
             (*q).header.elsize = elsize;
             (*q).header.is_initialized = true as u8;
             (*q).header.count = AtomicUsize::new(0);
-            (*q).header.consume_cursor = AtomicUsize::new(0);
+            (*q).header.collaborative_cursor = AtomicUsize::new(0);
             q
         }
     }
@@ -253,36 +253,6 @@ impl<T: Copy> InnerQueue<T> {
                     p
                 } else {
                     self.produce(item)
-                }
-            }
-        }
-    }
-
-    #[inline]
-    pub fn try_consume_collaborative(&self, el: &mut T) -> Result<(), ReadError> {
-        loop {
-            let cur = self.header.consume_cursor.load(Ordering::Acquire);
-            if cur >= self.count() {
-                return Err(ReadError::Empty);
-            }
-            if self
-                .header
-                .consume_cursor
-                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                // We own this slot. Spin if the producer's write is still in flight
-                // (count is incremented before the seqlock write completes).
-                let ring_pos = cur & self.header.mask;
-                let expected = self.version_at(cur);
-                loop {
-                    match self.load(ring_pos).read_with_version(el, expected) {
-                        Ok(()) => return Ok(()),
-                        Err(ReadError::Empty) => {
-                            std::hint::spin_loop();
-                        }
-                        Err(e) => return Err(e),
-                    }
                 }
             }
         }
@@ -488,12 +458,14 @@ impl<T> AsMut<Producer<T>> for Producer<T> {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ConsumerBare<T> {
-    pos: usize,            // 8
-    mask: usize,           // 16
-    expected_version: u64, // 24
-    is_running: u8,        // 25
-    _pad: [u8; 11],        // 36
-    queue: Queue<T>,       // 56 fat ptr: (usize, pointer)
+    pos: usize,                 // 8
+    mask: usize,                // 16
+    expected_version: u64,      // 24
+    is_running: u8,             // 25
+    _pad: [u8; 7],              // 32
+    collaborative_version: u64, // 40
+    collaborative_slot: usize,  // 48 — absolute queue count of the next slot to read
+    queue: Queue<T>,            // 56 fat ptr: (usize, pointer)
 }
 
 impl<T: Copy> ConsumerBare<T> {
@@ -538,13 +510,21 @@ impl<T: Copy> ConsumerBare<T> {
         }
     }
 
+    #[inline]
+    pub fn update_collaborative_slot(&mut self) {
+        self.collaborative_slot =
+            self.queue.header.collaborative_cursor.fetch_add(1, Ordering::Relaxed);
+        self.collaborative_version = self.queue.version_at(self.collaborative_slot);
+    }
+
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn init_header(consumer_ptr: *mut ConsumerBare<T>, queue: Queue<T>) {
         unsafe {
             (*consumer_ptr).pos = queue.cur_pos();
             (*consumer_ptr).expected_version = queue.version();
             (*consumer_ptr).mask = queue.header.mask;
-            (*consumer_ptr).queue = queue
+            (*consumer_ptr).collaborative_slot = usize::MAX;
+            (*consumer_ptr).queue = queue;
         }
     }
 
@@ -577,7 +557,16 @@ impl<T: Copy> From<Queue<T>> for ConsumerBare<T> {
     fn from(queue: Queue<T>) -> Self {
         let pos = queue.cur_pos();
         let expected_version = queue.version();
-        Self { pos, mask: queue.header.mask, _pad: [0; 11], expected_version, is_running: 1, queue }
+        Self {
+            pos,
+            mask: queue.header.mask,
+            _pad: [0; 7],
+            expected_version,
+            is_running: 1,
+            collaborative_version: 0,
+            collaborative_slot: usize::MAX,
+            queue,
+        }
     }
 }
 
@@ -641,21 +630,29 @@ impl<T: 'static + Copy> Consumer<T> {
     where
         F: FnMut(&mut T),
     {
-        loop {
-            match self.consumer.queue.try_consume_collaborative(&mut self.message) {
-                Ok(()) => {
-                    f(&mut self.message);
-                    return true;
+        if self.consumer.collaborative_slot == usize::MAX {
+            self.consumer.update_collaborative_slot();
+        }
+
+        let my_slot = self.consumer.collaborative_slot;
+        let my_version = self.consumer.collaborative_version;
+        let ring_pos = my_slot & self.consumer.queue.header.mask;
+        match self.consumer.queue.load(ring_pos).read_with_version(&mut self.message, my_version) {
+            Ok(()) => {
+                self.consumer.update_collaborative_slot();
+                f(&mut self.message);
+                return true;
+            }
+            Err(ReadError::Empty) => return false,
+            Err(ReadError::SpedPast) => {
+                if self.should_log {
+                    safe_panic!(
+                        "Consumer<{}> collaborative got sped past.",
+                        std::any::type_name::<T>()
+                    );
                 }
-                Err(ReadError::SpedPast) => {
-                    if self.should_log {
-                        safe_panic!(
-                            "Consumer<{}> collaborative got sped past. Collaborative cursor moved to next element incremented by 1.",
-                            std::any::type_name::<T>()
-                        );
-                    }
-                }
-                Err(ReadError::Empty) => return false,
+                self.consumer.update_collaborative_slot();
+                return false;
             }
         }
     }
@@ -685,7 +682,6 @@ impl<T: Copy, Q: Into<ConsumerBare<T>>> From<Q> for Consumer<T> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests_basic;
