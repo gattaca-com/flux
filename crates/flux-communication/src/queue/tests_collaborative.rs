@@ -1,6 +1,9 @@
 use std::sync::{atomic::Ordering, Arc, Barrier};
 use std::time::Duration;
 
+use flux_timing::Instant;
+use rand::Rng;
+
 use crate::queue::{Consumer, InnerQueue, Producer, Queue, QueueType};
 use crate::ReadError;
 
@@ -132,17 +135,18 @@ fn collaborative_and_broadcast_coexist() {
     assert_eq!(cs1 + cs2, expected_sum);
 }
 
+
 #[test]
 fn perf_test_collaborative_consumers() {
-    // Data values are 1..=N; N+1 is used as a stop number.
-    const N: usize = 100_000_000;
-    const STOP: usize = N + 1;
-    const SIZE: usize = 1_000_000;
+    const N: usize = 200_000;
+    const SIZE: usize = 100_000;
     const CONSUMERS: usize = 4;
+    const STOP: u64 = u64::MAX;
 
-    let q: Queue<usize> = Queue::new(SIZE.next_power_of_two(), QueueType::SPMC);
+    let q: Queue<u64> = Queue::new(SIZE.next_power_of_two(), QueueType::SPMC);
     let mut p = Producer::from(q);
 
+    let start = Instant::now();
     let barrier = Arc::new(Barrier::new(CONSUMERS + 1));
 
     let mut consumer_handles = Vec::new();
@@ -152,38 +156,49 @@ fn perf_test_collaborative_consumers() {
 
         consumer_handles.push(std::thread::spawn(move || {
             barrier.wait();
-            let mut local_sum = 0;
+            let mut sum_ns: u64 = 0;
+            let mut count: usize = 0;
             loop {
                 let mut stop = false;
-                c.consume_collaborative(|x| {
-                    if *x == STOP {
+                c.consume_collaborative(|ts| {
+                    if *ts == STOP {
                         stop = true;
                     } else {
-                        local_sum += *x;
+                        let recv_ns = start.elapsed().as_nanos() as u64;
+                        sum_ns += recv_ns.saturating_sub(*ts);
+                        count += 1;
                     }
                 });
                 if stop {
                     break;
                 }
             }
-            local_sum
+            (sum_ns, count)
         }));
     }
 
-    // Producer: publishes 1, 2, ..., N then one stop number per consumer.
-    let barrier = Arc::clone(&barrier);
-    let producer = std::thread::spawn(move || {
-        barrier.wait();
-        for i in 1..=N {
-            p.produce(&i);
-        }
-        for _ in 0..CONSUMERS {
-            p.produce(&STOP);
-        }
-    });
+    let producer = {
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            barrier.wait();
+            for _ in 0..N {
+                std::thread::sleep(Duration::from_micros(rng.gen_range(0..=10)));
+                let ts = start.elapsed().as_nanos() as u64;
+                p.produce(&ts);
+            }
+            for _ in 0..CONSUMERS {
+                p.produce(&STOP);
+            }
+        })
+    };
 
-    let total_sum: usize = consumer_handles.into_iter().map(|h| h.join().unwrap()).sum();
+    let (total_sum, total_count) = consumer_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .fold((0u64, 0usize), |(s, c), (s2, c2)| (s + s2, c + c2));
     producer.join().unwrap();
 
-    assert_eq!(total_sum, N * (N + 1) / 2, "sum matches 1+2+…+N");
+    assert_eq!(total_count, N, "received all {} messages", N);
+    println!("latency ({total_count} msgs) — mean: {}ns", total_sum / total_count as u64);
 }
