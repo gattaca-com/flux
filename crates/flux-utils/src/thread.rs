@@ -36,6 +36,7 @@ fn set_thread_prio(prio: ThreadPriority) {
             let code = sched_setscheduler(0, SCHED_FIFO, &param);
             if code != 0 {
                 warn!(%code, ?param, "couldn't set thread priority");
+                panic!("couldn't set thread priority: code={}, param={:?}", code, param);
             }
         }
     }
@@ -51,6 +52,7 @@ fn set_thread_prio(prio: ThreadPriority) {
 fn set_thread_affinity(core: usize) {
     if !core_affinity::set_for_current(CoreId { id: core }) {
         warn!(?core, "couldn't set core affinity");
+        panic!("couldn't set core affinity: core={}", core);
     }
 }
 
