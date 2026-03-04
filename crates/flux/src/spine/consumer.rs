@@ -79,6 +79,20 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     }
 
     #[inline]
+    pub fn consume_collaborative<P, F>(&mut self, producers: &mut P, mut f: F) -> bool
+    where
+        P: SpineProducers,
+        F: FnMut(T, &mut P),
+    {
+        self.inner.consume_collaborative(|m| {
+            *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
+            self.timer.start();
+            f(m.into_data(), producers);
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+        })
+    }
+
+    #[inline]
     pub fn consume_last<P, F>(&mut self, producers: &mut P, mut f: F) -> bool
     where
         P: SpineProducers,

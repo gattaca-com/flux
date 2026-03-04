@@ -166,6 +166,24 @@ impl<S: FluxSpine> SpineAdapter<S> {
         consumed
     }
 
+    /// Consume one item from the shared collaborative cursor.
+    /// Multiple tiles on the same queue each get unique items (work-distribution).
+    #[inline]
+    pub fn consume_collaborative<T, F>(&mut self, mut f: F) -> bool
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        S::Producers: SpineProducers,
+        F: FnMut(T, &mut S::Producers),
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let consumed = c.consume_collaborative(&mut self.producers, &mut f);
+        if consumed {
+            self.did_work = true;
+        }
+        consumed
+    }
+
     #[inline]
     pub fn consume_internal_message<T: 'static + Copy, F>(&mut self, mut f: F)
     where

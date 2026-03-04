@@ -27,14 +27,18 @@ pub enum QueueType {
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct QueueHeader {
+    // Cache line 0: read/written by producers
     pub queue_type: QueueType, // 1
     is_initialized: u8,        // 2
     _pad1: [u8; 6],            // 8
     pub elsize: usize,         // 16
     pub mask: usize,           // 24
-    pub count: AtomicUsize,    /* 32 */
+    pub count: AtomicUsize,    // 32
+    _pad2: [u8; 32],           // 64 — pad to end of cache line
 
-                               /* add queue hash mismatch */
+    // Cache line 1: written by collaborative consumers only
+    pub consume_cursor: AtomicUsize, // 64
+                                     // 56 bytes implicit padding (align 64 → total 128)
 }
 #[allow(dead_code)]
 impl QueueHeader {
@@ -76,7 +80,7 @@ impl QueueHeader {
 // return an Arc instead of &'static or whatever.
 #[repr(C, align(64))]
 pub struct InnerQueue<T> {
-    header: QueueHeader,
+    pub(crate) header: QueueHeader,
     buffer: [Seqlock<T>],
 }
 
@@ -113,6 +117,7 @@ impl<T: Copy> InnerQueue<T> {
             (*q).header.elsize = elsize;
             (*q).header.is_initialized = true as u8;
             (*q).header.count = AtomicUsize::new(0);
+            (*q).header.consume_cursor = AtomicUsize::new(0);
             q
         }
     }
@@ -154,7 +159,7 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     #[inline]
-    fn load(&self, pos: usize) -> &Seqlock<T> {
+    pub(crate) fn load(&self, pos: usize) -> &Seqlock<T> {
         unsafe { self.buffer.get_unchecked(pos) }
     }
 
@@ -169,13 +174,18 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     #[inline]
+    pub(crate) fn version_at(&self, count: usize) -> u64 {
+        ((count / self.len()) * 2 + 2) as u64
+    }
+
+    #[inline]
     fn version(&self) -> u64 {
-        (((self.count() / (self.header.mask + 1)) << 1) + 2) as u64
+        self.version_at(self.count())
     }
 
     #[inline]
     fn last_version(&self) -> u64 {
-        ((((self.count().saturating_sub(1)) / (self.header.mask + 1)) << 1) + 2) as u64
+        self.version_at(self.count().saturating_sub(1))
     }
 
     #[allow(dead_code)]
@@ -243,6 +253,36 @@ impl<T: Copy> InnerQueue<T> {
                     p
                 } else {
                     self.produce(item)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn try_consume_collaborative(&self, el: &mut T) -> Result<(), ReadError> {
+        loop {
+            let cur = self.header.consume_cursor.load(Ordering::Acquire);
+            if cur >= self.count() {
+                return Err(ReadError::Empty);
+            }
+            if self
+                .header
+                .consume_cursor
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                // We own this slot. Spin if the producer's write is still in flight
+                // (count is incremented before the seqlock write completes).
+                let ring_pos = cur & self.header.mask;
+                let expected = self.version_at(cur);
+                loop {
+                    match self.load(ring_pos).read_with_version(el, expected) {
+                        Ok(()) => return Ok(()),
+                        Err(ReadError::Empty) => {
+                            std::hint::spin_loop();
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
@@ -597,6 +637,30 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 
     #[inline]
+    pub fn consume_collaborative<F>(&mut self, mut f: F) -> bool
+    where
+        F: FnMut(&mut T),
+    {
+        loop {
+            match self.consumer.queue.try_consume_collaborative(&mut self.message) {
+                Ok(()) => {
+                    f(&mut self.message);
+                    return true;
+                }
+                Err(ReadError::SpedPast) => {
+                    if self.should_log {
+                        safe_panic!(
+                            "Consumer<{}> collaborative got sped past. Collaborative cursor moved to next element incremented by 1.",
+                            std::any::type_name::<T>()
+                        );
+                    }
+                }
+                Err(ReadError::Empty) => return false,
+            }
+        }
+    }
+
+    #[inline]
     pub fn without_log(self) -> Self {
         Self { should_log: false, ..self }
     }
@@ -622,136 +686,9 @@ impl<T: Copy, Q: Into<ConsumerBare<T>>> From<Q> for Consumer<T> {
     }
 }
 
+
 #[cfg(test)]
-mod test {
-    use super::*;
+mod tests_basic;
 
-    #[test]
-    fn headersize() {
-        assert_eq!(64, std::mem::size_of::<QueueHeader>());
-        assert_eq!(56, std::mem::size_of::<ConsumerBare<[u8; 60]>>())
-    }
-
-    #[test]
-    fn basic() {
-        for typ in [QueueType::SPMC, QueueType::MPMC] {
-            let q = Queue::new(16, typ);
-            let mut p = Producer::from(q);
-            let mut c = ConsumerBare::from(q);
-            p.produce(&1);
-            let mut m = 0;
-
-            assert_eq!(c.try_consume(&mut m), Ok(()));
-            assert_eq!(m, 1);
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-            for i in 0..16 {
-                p.produce(&i);
-            }
-            for i in 0..16 {
-                c.try_consume(&mut m).unwrap();
-                assert_eq!(m, i);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-
-            for _ in 0..20 {
-                p.produce(&1);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
-        }
-    }
-
-    fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
-        let q = Queue::new(16, QueueType::MPMC);
-
-        let mut readhandles = Vec::new();
-        for _ in 0..n_readers {
-            let mut c1 = ConsumerBare::from(q);
-            let cons = std::thread::spawn(move || {
-                let mut c = 0;
-                let mut m = 0;
-                while c < tot_messages {
-                    c1.blocking_consume(&mut m);
-                    c += m;
-                }
-                assert_eq!(c, (0..tot_messages).sum::<usize>());
-            });
-            readhandles.push(cons)
-        }
-        let mut writehandles = Vec::new();
-        for n in 0..n_writers {
-            let mut p1 = Producer::from(q);
-            let prod1 = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                let mut c = n;
-                while c < tot_messages {
-                    p1.produce(&c);
-                    c += n_writers;
-                    std::thread::yield_now();
-                }
-            });
-            writehandles.push(prod1);
-        }
-
-        for h in readhandles {
-            let _ = h.join();
-        }
-        for h in writehandles {
-            let _ = h.join();
-        }
-    }
-    #[test]
-    fn multithread_1_2() {
-        multithread(1, 2, 100000);
-    }
-    #[test]
-    fn multithread_1_4() {
-        multithread(1, 4, 100000);
-    }
-    #[test]
-    fn multithread_2_4() {
-        multithread(2, 4, 100000);
-    }
-    #[test]
-    fn multithread_4_4() {
-        multithread(4, 4, 100000);
-    }
-    #[test]
-    fn multithread_8_8() {
-        multithread(8, 8, 100000);
-    }
-    #[test]
-    fn basic_shared() {
-        for typ in [QueueType::SPMC, QueueType::MPMC] {
-            let path = std::path::Path::new("/dev/shm/blabla_test");
-            let _ = std::fs::remove_file(path);
-            let q = Queue::create_or_open_shared(path, 16, typ);
-            let mut p = Producer::from(q);
-            let mut c = ConsumerBare::from(q);
-
-            p.produce(&1);
-            let mut m = 0;
-
-            assert_eq!(c.try_consume(&mut m), Ok(()));
-            assert_eq!(m, 1);
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-            for i in 0..16 {
-                p.produce(&i);
-            }
-            for i in 0..16 {
-                c.try_consume(&mut m).unwrap();
-                assert_eq!(m, i);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-
-            for _ in 0..20 {
-                p.produce(&1);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
-            let _ = crate::cleanup::cleanup_flink(path);
-        }
-    }
-}
+#[cfg(test)]
+mod tests_collaborative;
