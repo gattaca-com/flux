@@ -678,8 +678,8 @@ impl<T: 'static + Copy> Consumer<T> {
         let ring_pos = my_slot & self.consumer.queue.header.mask;
         match self.consumer.queue.load(ring_pos).read_with_version(&mut self.message, my_version) {
             Ok(()) => {
-                self.consumer.acquire_next_slot();
                 f(&mut self.message);
+                self.consumer.acquire_next_slot();
                 return true;
             }
             Err(ReadError::Empty) => return false,
