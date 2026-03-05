@@ -511,7 +511,7 @@ impl<T: Copy> ConsumerBare<T> {
     }
 
     #[inline]
-    pub fn update_collaborative_slot(&mut self) {
+    pub fn acquire_next_slot(&mut self) {
         self.collaborative_slot =
             self.queue.header.collaborative_cursor.fetch_add(1, Ordering::Relaxed);
         self.collaborative_version = self.queue.version_at(self.collaborative_slot);
@@ -631,7 +631,7 @@ impl<T: 'static + Copy> Consumer<T> {
         F: FnMut(&mut T),
     {
         if self.consumer.collaborative_slot == usize::MAX {
-            self.consumer.update_collaborative_slot();
+            self.consumer.acquire_next_slot();
         }
 
         let my_slot = self.consumer.collaborative_slot;
@@ -639,7 +639,7 @@ impl<T: 'static + Copy> Consumer<T> {
         let ring_pos = my_slot & self.consumer.queue.header.mask;
         match self.consumer.queue.load(ring_pos).read_with_version(&mut self.message, my_version) {
             Ok(()) => {
-                self.consumer.update_collaborative_slot();
+                self.consumer.acquire_next_slot();
                 f(&mut self.message);
                 return true;
             }
@@ -651,7 +651,7 @@ impl<T: 'static + Copy> Consumer<T> {
                         std::any::type_name::<T>()
                     );
                 }
-                self.consumer.update_collaborative_slot();
+                self.consumer.acquire_next_slot();
                 return false;
             }
         }

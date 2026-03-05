@@ -199,7 +199,7 @@ fn perf_test_collaborative_consumers() {
                 let ts = start.elapsed().as_nanos() as u64;
                 p.produce(&ts);
             }
-            for _ in 0..CONSUMERS {
+            for _ in 0..(2 * CONSUMERS) {
                 p.produce(&STOP);
             }
         })
