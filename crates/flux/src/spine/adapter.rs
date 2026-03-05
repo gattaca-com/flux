@@ -185,6 +185,23 @@ impl<S: FluxSpine> SpineAdapter<S> {
         consumed
     }
 
+    /// Point this tile's collaborative consumer for queue `T` at a named
+    /// persistent group. The group's cursor is backed by a shared-memory file
+    /// that survives restarts. Call this once in `Tile::init`.
+    ///
+    /// ```ignore
+    /// fn init(&mut self, adapter: &mut SpineAdapter<MySpine>) {
+    ///     adapter.set_collaborative_group::<OrderUpdate>("local_group");
+    /// }
+    /// ```
+    pub fn set_collaborative_group<T: 'static + Copy>(&mut self, label: &str)
+    where
+        S::Consumers: AsMut<SpineConsumer<T>>,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        c.inner.set_collaborative_group(label);
+    }
+
     #[inline]
     pub fn consume_internal_message<T: 'static + Copy, F>(&mut self, mut f: F)
     where

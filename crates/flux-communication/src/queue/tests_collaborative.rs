@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Barrier, atomic::Ordering},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -10,8 +13,11 @@ use crate::{
     queue::{Consumer, InnerQueue, Producer, Queue, QueueType},
 };
 
-fn get_collaborative_consumer<T: Copy + 'static>(q: &Queue<T>) -> Consumer<T> {
-    Consumer::from(*q).without_log()
+fn get_collaborative_consumer<T: Copy + 'static>(
+    q: &Queue<T>,
+    cursor: *const AtomicUsize,
+) -> Consumer<T> {
+    Consumer::new_collaborative_test(*q, cursor).without_log()
 }
 
 #[test]
@@ -29,10 +35,12 @@ fn collaborative_consume_race_with_write() {
         "unwritten slot must appear empty (write in-flight)"
     );
 
+    let cursor = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(2));
     let b2 = Arc::clone(&barrier);
+    let cursor_thread = Arc::clone(&cursor);
     let handle = std::thread::spawn(move || {
-        let mut c = get_collaborative_consumer(&q);
+        let mut c = get_collaborative_consumer(&q, &*cursor_thread as *const AtomicUsize);
         let mut received = 0;
         b2.wait();
         // consume_collaborative returns false when the slot isn't ready yet;
@@ -56,8 +64,9 @@ fn collaborative_sped_past() {
     // 0,1,2 are lost.
     for typ in [QueueType::SPMC, QueueType::MPMC] {
         let q: Queue<usize> = Queue::new(4, typ);
+        let cursor = Arc::new(AtomicUsize::new(0));
         let mut p = Producer::from(q);
-        let mut c = get_collaborative_consumer(&q);
+        let mut c = get_collaborative_consumer(&q, &*cursor as *const AtomicUsize);
 
         for i in 0..7 {
             p.produce(&i);
@@ -76,8 +85,9 @@ fn collaborative_sped_past() {
 fn collaborative_basic() {
     for typ in [QueueType::SPMC, QueueType::MPMC] {
         let q = Queue::new(16, typ);
+        let cursor = Arc::new(AtomicUsize::new(0));
         let mut p = Producer::from(q);
-        let mut c = get_collaborative_consumer(&q);
+        let mut c = get_collaborative_consumer(&q, &*cursor as *const AtomicUsize);
         let mut m = 0;
 
         p.produce(&1);
@@ -97,9 +107,65 @@ fn collaborative_basic() {
 }
 
 #[test]
+fn collaborative_multiple_groups() {
+    // Two independent collaborative groups (each with its own cursor). Each group
+    // should receive every message exactly once, split among its consumers.
+    const N: usize = 32;
+    const CONSUMERS_PER_GROUP: usize = 2;
+
+    let q: Queue<usize> = Queue::new(64, QueueType::MPMC);
+    let cursor_a = Arc::new(AtomicUsize::new(0));
+    let cursor_b = Arc::new(AtomicUsize::new(0));
+    let mut p = Producer::from(q);
+
+    let mut group_a = Vec::new();
+    let mut group_b = Vec::new();
+    for _ in 0..CONSUMERS_PER_GROUP {
+        group_a.push(get_collaborative_consumer(&q, &*cursor_a as *const AtomicUsize));
+        group_b.push(get_collaborative_consumer(&q, &*cursor_b as *const AtomicUsize));
+    }
+
+    for i in 0..N {
+        p.produce(&i);
+    }
+
+    let expected_sum: usize = (0..N).sum();
+
+    fn drain_sum(consumers: Vec<Consumer<usize>>) -> (usize, usize) {
+        let handles: Vec<_> = consumers
+            .into_iter()
+            .map(|mut c| {
+                std::thread::spawn(move || {
+                    let mut sum = 0;
+                    let mut count = 0;
+                    while c.consume_collaborative(|x| {
+                        sum += *x;
+                        count += 1;
+                    }) {}
+                    (sum, count)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .fold((0, 0), |(s, c), (s2, c2)| (s + s2, c + c2))
+    }
+
+    let (sum_a, count_a) = drain_sum(group_a);
+    let (sum_b, count_b) = drain_sum(group_b);
+
+    assert_eq!(count_a, N, "group A must receive every message exactly once");
+    assert_eq!(count_b, N, "group B must receive every message exactly once");
+    assert_eq!(sum_a, expected_sum, "group A must see full stream sum");
+    assert_eq!(sum_b, expected_sum, "group B must see full stream sum");
+}
+
+#[test]
 fn collaborative_and_broadcast_coexist() {
     const N: usize = 8;
     let q: Queue<usize> = Queue::new(16, QueueType::MPMC);
+    let cursor = Arc::new(AtomicUsize::new(0));
     let mut p = Producer::from(q);
 
     // Two broadcast consumers — do NOT claim collab slots.
@@ -107,8 +173,8 @@ fn collaborative_and_broadcast_coexist() {
     let mut bc2 = Consumer::from(q);
 
     // Two collaborative consumers — each claims a slot via .collaborative().
-    let mut cc1 = get_collaborative_consumer(&q);
-    let mut cc2 = get_collaborative_consumer(&q);
+    let mut cc1 = get_collaborative_consumer(&q, &*cursor as *const AtomicUsize);
+    let mut cc2 = get_collaborative_consumer(&q, &*cursor as *const AtomicUsize);
 
     for i in 0..N {
         p.produce(&i);
@@ -156,6 +222,7 @@ fn perf_test_collaborative_consumers() {
     const STOP: u64 = u64::MAX;
 
     let q: Queue<u64> = Queue::new(SIZE.next_power_of_two(), QueueType::SPMC);
+    let cursor = Arc::new(AtomicUsize::new(0));
     let mut p = Producer::from(q);
 
     let start = Instant::now();
@@ -164,7 +231,8 @@ fn perf_test_collaborative_consumers() {
     let mut consumer_handles = Vec::new();
     for _ in 0..CONSUMERS {
         let barrier = Arc::clone(&barrier);
-        let mut c = get_collaborative_consumer(&q);
+        let cursor = Arc::clone(&cursor);
+        let mut c = get_collaborative_consumer(&q, &*cursor as *const AtomicUsize);
 
         consumer_handles.push(std::thread::spawn(move || {
             barrier.wait();
