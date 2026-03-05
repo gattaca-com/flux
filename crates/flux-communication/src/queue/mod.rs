@@ -566,7 +566,8 @@ impl<T: Copy> ConsumerBare<T> {
         let delta = self
             .queue
             .count()
-            .saturating_sub(collaborative_cursor.load(Ordering::Relaxed) + self.queue.len());
+            .saturating_sub(collaborative_cursor.load(Ordering::Relaxed) + self.queue.len())
+            .max(1);
 
         self.collaborative_slot = collaborative_cursor.fetch_add(delta, Ordering::Relaxed);
         self.collaborative_version = self.queue.version_at(self.collaborative_slot);
