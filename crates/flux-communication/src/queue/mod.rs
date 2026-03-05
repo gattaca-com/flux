@@ -560,6 +560,18 @@ impl<T: Copy> ConsumerBare<T> {
         self.collaborative_version = self.queue.version_at(self.collaborative_slot);
     }
 
+    #[inline]
+    pub fn acquire_earliest_available_slot(&mut self) {
+        let collaborative_cursor = unsafe { &*self.collaborative_cursor };
+        let delta = self
+            .queue
+            .count()
+            .saturating_sub(collaborative_cursor.load(Ordering::Relaxed) + self.queue.len());
+
+        self.collaborative_slot = collaborative_cursor.fetch_add(delta, Ordering::Relaxed);
+        self.collaborative_version = self.queue.version_at(self.collaborative_slot);
+    }
+
     pub fn set_collaborative_group(&mut self, label: &str) {
         self.collaborative_cursor = self.queue.group_cursor(label);
     }
@@ -673,10 +685,10 @@ impl<T: 'static + Copy> Consumer<T> {
             self.consumer.acquire_next_slot();
         }
 
-        let my_slot = self.consumer.collaborative_slot;
-        let my_version = self.consumer.collaborative_version;
-        let ring_pos = my_slot & self.consumer.queue.header.mask;
-        match self.consumer.queue.load(ring_pos).read_with_version(&mut self.message, my_version) {
+        let slot = self.consumer.collaborative_slot;
+        let version = self.consumer.collaborative_version;
+        let ring_pos = slot & self.consumer.queue.header.mask;
+        match self.consumer.queue.load(ring_pos).read_with_version(&mut self.message, version) {
             Ok(()) => {
                 f(&mut self.message);
                 self.consumer.acquire_next_slot();
@@ -690,7 +702,7 @@ impl<T: 'static + Copy> Consumer<T> {
                         std::any::type_name::<T>()
                     );
                 }
-                self.consumer.acquire_next_slot();
+                self.consumer.acquire_earliest_available_slot();
                 return false;
             }
         }
