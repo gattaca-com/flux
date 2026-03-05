@@ -3,6 +3,9 @@ use type_hash_derive::TypeHash;
 
 use crate::{IngestionTime, Instant, Nanos, PublishDelta};
 
+/// Sentinel tile_id for producers not registered with a spine tile.
+pub const UNREGISTERED_TILE_ID: u16 = u16::MAX;
+
 /// This is used in InternalMessage to track who published
 /// a message when.
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Default, Deserialize, TypeHash)]
@@ -22,7 +25,10 @@ impl TrackingTimestamp {
     /// throughout the system. It's purely here due to legacy reasons.
     #[inline]
     pub fn new_without_tile() -> Self {
-        Self { ingestion_t: IngestionTime::now(), publish_delta: PublishDelta::new(u16::MAX) }
+        Self {
+            ingestion_t: IngestionTime::now(),
+            publish_delta: PublishDelta::new(UNREGISTERED_TILE_ID),
+        }
     }
 
     #[inline]

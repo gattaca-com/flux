@@ -1,6 +1,6 @@
 [package]
 name = "flux-utils"
-version = "0.0.22"
+version = "0.0.23"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0 AND MIT"
@@ -16,6 +16,8 @@ directories.workspace = true
 libc.workspace = true
 tracing.workspace = true
 serde.workspace = true
+rand.workspace = true
+spin.workspace = true
 wincode = { workspace = true, optional = true }
 
 [dev-dependencies]

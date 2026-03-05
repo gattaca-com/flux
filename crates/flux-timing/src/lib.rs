@@ -18,4 +18,4 @@ pub use internal_message::InternalMessage;
 pub use nanos::Nanos;
 pub use publish_delta::PublishDelta;
 pub use repeater::Repeater;
-pub use tracking_timestamp::TrackingTimestamp;
+pub use tracking_timestamp::{TrackingTimestamp, UNREGISTERED_TILE_ID};

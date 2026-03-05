@@ -139,6 +139,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut as_ref_impls = Vec::<proc_macro2::TokenStream>::new();
     let mut as_mut_impls = Vec::<proc_macro2::TokenStream>::new();
+    let mut spine_as_ref_impls = Vec::<proc_macro2::TokenStream>::new();
     let mut persisting = Vec::<proc_macro2::TokenStream>::new();
     let mut message_types = Vec::<proc_macro2::TokenStream>::new();
 
@@ -159,6 +160,12 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             as_ref_impls.push(quote! {
                 impl AsRef<::flux::spine::SpineProducer<#inner_ty>> for #producers_ident {
                     fn as_ref(&self)->&::flux::spine::SpineProducer<#inner_ty>{ &self.#field_ident }
+                }
+            });
+
+            spine_as_ref_impls.push(quote! {
+                impl AsRef<::flux::spine::SpineQueue<#inner_ty>> for #struct_ident {
+                    fn as_ref(&self) -> &::flux::spine::SpineQueue<#inner_ty> { &self.#field_ident }
                 }
             });
 
@@ -319,7 +326,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[derive(Clone, Copy, Debug)]
-        #vis struct #producers_ident { #producer_fields, pub timestamp: ::flux::timing::TrackingTimestamp }
+        #vis struct #producers_ident { #producer_fields, timestamp: ::flux::timing::TrackingTimestamp }
         impl #producers_ident {
             pub fn attach<Tl: ::flux::tile::Tile<#struct_ident>>(tile: &Tl, spine:&mut #struct_ident)->Self {
                 let id = spine.tile_info.register_tile(tile.name());
@@ -337,6 +344,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         // AsRef / AsMut passthroughs + legacy impls
         #(#as_ref_impls)*
         #(#as_mut_impls)*
+        #(#spine_as_ref_impls)*
 
         impl ::flux::spine::FluxSpine for #struct_ident {
             type Consumers = #consumers_ident;
