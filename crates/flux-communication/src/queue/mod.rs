@@ -35,6 +35,8 @@ pub struct QueueHeader {
     pub elsize: usize,         // 16
     pub mask: usize,           // 24
     pub count: AtomicUsize,    /* 32 */
+
+                               /* add queue hash mismatch */
 }
 
 #[allow(dead_code)]
