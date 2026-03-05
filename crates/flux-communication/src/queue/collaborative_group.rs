@@ -33,7 +33,10 @@ pub fn open_or_create(path: impl AsRef<Path>) -> *const AtomicUsize {
         }
         Err(ShmemError::LinkExists) => match ShmemConf::new().flink(path).open() {
             Ok(shmem) => leak_cursor(shmem),
-            Err(e) => panic!("Failed to open collaborative group at {}: {e}", path.display()),
+            Err(_) => {
+                let _ = std::fs::remove_file(path);
+                open_or_create(path)
+            }
         },
         Err(e) => panic!("Failed to create collaborative group at {}: {e}", path.display()),
     }
