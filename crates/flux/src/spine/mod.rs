@@ -1,6 +1,7 @@
 mod adapter;
 mod consumer;
 mod scoped;
+mod standalone_producer;
 
 use std::path::Path;
 
@@ -9,6 +10,7 @@ pub use consumer::SpineConsumer;
 use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
 use flux_utils::directories::shmem_dir;
 pub use scoped::ScopedSpine;
+pub use standalone_producer::StandaloneProducer;
 
 use crate::{
     communication::queue::{self},
@@ -22,7 +24,7 @@ pub trait SpineProducers {
     fn timestamp(&self) -> &TrackingTimestamp;
     fn timestamp_mut(&mut self) -> &mut TrackingTimestamp;
 
-    fn produce<T: Copy>(&mut self, d: T)
+    fn produce<T: Copy>(&self, d: T)
     where
         Self: AsRef<SpineProducer<T>>,
     {
@@ -30,7 +32,7 @@ pub trait SpineProducers {
         self.as_ref().produce_without_first(&msg);
     }
 
-    fn produce_with_ingestion<T: Copy>(&mut self, d: T, ingestion_t: IngestionTime)
+    fn produce_with_ingestion<T: Copy>(&self, d: T, ingestion_t: IngestionTime)
     where
         Self: AsRef<SpineProducer<T>>,
     {
@@ -38,7 +40,7 @@ pub trait SpineProducers {
         self.as_ref().produce_without_first(&msg);
     }
 
-    fn forward<T: Copy>(&mut self, msg: &InternalMessage<T>)
+    fn forward<T: Copy>(&self, msg: &InternalMessage<T>)
     where
         Self: AsRef<SpineProducer<T>>,
     {
@@ -57,6 +59,16 @@ pub trait FluxSpine: Sized + Send {
     fn register_tile(&mut self, name: TileName) -> u16;
     fn app_name() -> &'static str;
     fn base_dir(&self) -> &Path;
+
+    /// Returns a [`StandaloneProducer`] for the queue of message type `T`and
+    /// registers `name` as a tile entry.
+    fn standalone_producer_for<T: Copy>(&mut self, name: TileName) -> StandaloneProducer<T>
+    where
+        Self: AsRef<SpineQueue<T>>,
+    {
+        let id = self.register_tile(name);
+        StandaloneProducer::new(*<Self as AsRef<SpineQueue<T>>>::as_ref(self), id)
+    }
 
     /// Removes all files related to a given spine. Does not clear the shared
     /// memory itself. CAUTION: this includes data files.
