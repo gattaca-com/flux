@@ -53,16 +53,7 @@ impl<const N: usize> DataStore<N> {
             return Err(DataStoreError::StaleData);
         }
 
-        let base = self.data.get().cast::<u8>();
-        let from_ix = r_offset & (N - 1);
-        let head_len = (N - from_ix).min(r_len);
-        unsafe {
-            std::ptr::copy_nonoverlapping(base.add(from_ix), buf.as_mut_ptr(), head_len);
-            let tail_len = r_len - head_len;
-            if tail_len > 0 {
-                std::ptr::copy_nonoverlapping(base, buf[head_len..].as_mut_ptr(), tail_len);
-            }
-        }
+        self.copy(r_len, r_offset, buf);
 
         // Prevent the compiler from sinking the data reads past the staleness
         // check below.
@@ -73,6 +64,56 @@ impl<const N: usize> DataStore<N> {
         }
 
         Ok(())
+    }
+
+    #[inline]
+    fn copy(&self, r_len: usize, r_offset: usize, buf: &mut [u8]) {
+        let base = self.data.get().cast::<u8>();
+        let from_ix = r_offset & (N - 1);
+        let head_len = (N - from_ix).min(r_len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(base.add(from_ix), buf.as_mut_ptr(), head_len);
+            let tail_len = r_len - head_len;
+            if tail_len > 0 {
+                std::ptr::copy_nonoverlapping(base, buf[head_len..].as_mut_ptr(), tail_len);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn map<T, F, const C: usize>(&self, r: DataStoreRef, f: F) -> Result<T, DataStoreError>
+    where
+        F: FnOnce(&[u8]) -> T,
+    {
+        let (r_len, r_offset) = (r.len as usize, r.offset as usize);
+        if r_len > N {
+            return Err(DataStoreError::DataLenExceedsCapacity(r_len, N));
+        }
+
+        if r_offset + N < self.reserved.load(Relaxed) {
+            return Err(DataStoreError::StaleData);
+        }
+
+        let from_ix = r_offset & (N - 1);
+        let result = if r_len > N - from_ix {
+            if r_len > C {
+                return Err(DataStoreError::DataLenExceedsCapacity(r_len, C));
+            }
+            let mut buf = [0u8; C];
+            self.copy(r_len, r_offset, &mut buf);
+            f(buf.as_slice())
+        } else {
+            let base = self.data.get().cast::<u8>();
+            f(unsafe { std::slice::from_raw_parts(base.add(r_offset & (N - 1)), r_len) })
+        };
+
+        compiler_fence(AcqRel);
+
+        if r_offset + N < self.reserved.load(Relaxed) {
+            return Err(DataStoreError::StaleData);
+        }
+
+        Ok(result)
     }
 
     #[inline]
@@ -196,6 +237,27 @@ mod tests {
         let mut buf = [0u8; 80];
         dc.read(r, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn map_contiguous() {
+        let dc: DataStore<64> = DataStore::new();
+        let r = dc.write(b"hello").unwrap();
+        // from_ix=0, 0+5 <= 64 → zero-copy path, C unused
+        let got = dc.map::<_, _, 64>(r, |s| s.to_vec()).unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn map_wrap() {
+        // Same setup as wrap_around: second write straddles the N boundary.
+        // map must copy into the scratch ArrayVec and present contiguous data.
+        let dc: DataStore<128> = DataStore::new();
+        let _ = dc.write(&[0xAA; 10]).unwrap();
+        let r = dc.write(&[0xBB; 80]).unwrap();
+        assert_eq!(r.offset, 64); // from_ix=64, 64+80=144>128 → wrap path
+        let got = dc.map::<_, _, 80>(r, |s| s.to_vec()).unwrap();
+        assert!(got.iter().all(|&b| b == 0xBB));
     }
 
     #[test]
