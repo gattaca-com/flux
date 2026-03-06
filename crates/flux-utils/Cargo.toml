@@ -24,6 +24,8 @@ wincode = { workspace = true, optional = true }
 [dev-dependencies]
 criterion = "0.8"
 tinyvec = "1.10.0"
+flux-communication.workspace = true
+crossbeam-channel = "0.5"
 
 [features]
 default = []
@@ -31,4 +33,8 @@ wincode = ["dep:wincode"]
 
 [[bench]]
 name = "arrayvec"
+harness = false
+
+[[bench]]
+name = "datastore"
 harness = false

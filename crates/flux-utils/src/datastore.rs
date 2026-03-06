@@ -5,8 +5,8 @@ use std::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct DataStoreRef {
-    pub offset: u32,
-    pub len: u32,
+    pub offset: usize,
+    pub len: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,25 +41,24 @@ impl<const N: usize> DataStore<N> {
 
     #[inline]
     pub fn read(&self, r: DataStoreRef, buf: &mut [u8]) -> Result<(), DataStoreError> {
-        let (r_len, r_offset) = (r.len as usize, r.offset as usize);
-        if r_len > N {
-            return Err(DataStoreError::DataLenExceedsCapacity(r_len, N));
+        if r.len > N {
+            return Err(DataStoreError::DataLenExceedsCapacity(r.len, N));
         }
-        if r_len > buf.len() {
-            return Err(DataStoreError::BufferTooSmall(buf.len(), r_len));
+        if r.len > buf.len() {
+            return Err(DataStoreError::BufferTooSmall(buf.len(), r.len));
         }
 
-        if r_offset + N < self.reserved.load(Relaxed) {
+        if r.offset + N < self.reserved.load(Relaxed) {
             return Err(DataStoreError::StaleData);
         }
 
-        self.copy(r_len, r_offset, buf);
+        self.copy(r.len, r.offset, buf);
 
         // Prevent the compiler from sinking the data reads past the staleness
         // check below.
         compiler_fence(AcqRel);
 
-        if r_offset + N < self.reserved.load(Relaxed) {
+        if r.offset + N < self.reserved.load(Relaxed) {
             return Err(DataStoreError::StaleData);
         }
 
@@ -85,31 +84,30 @@ impl<const N: usize> DataStore<N> {
     where
         F: FnOnce(&[u8]) -> T,
     {
-        let (r_len, r_offset) = (r.len as usize, r.offset as usize);
-        if r_len > N {
-            return Err(DataStoreError::DataLenExceedsCapacity(r_len, N));
+        if r.len > N {
+            return Err(DataStoreError::DataLenExceedsCapacity(r.len, N));
         }
 
-        if r_offset + N < self.reserved.load(Relaxed) {
+        if r.offset + N < self.reserved.load(Relaxed) {
             return Err(DataStoreError::StaleData);
         }
 
-        let from_ix = r_offset & (N - 1);
-        let result = if r_len > N - from_ix {
-            if r_len > C {
-                return Err(DataStoreError::DataLenExceedsCapacity(r_len, C));
+        let from_ix = r.offset & (N - 1);
+        let result = if r.len > N - from_ix {
+            if r.len > C {
+                return Err(DataStoreError::DataLenExceedsCapacity(r.len, C));
             }
             let mut buf = [0u8; C];
-            self.copy(r_len, r_offset, &mut buf);
+            self.copy(r.len, r.offset, &mut buf);
             f(buf.as_slice())
         } else {
             let base = self.data.get().cast::<u8>();
-            f(unsafe { std::slice::from_raw_parts(base.add(r_offset & (N - 1)), r_len) })
+            f(unsafe { std::slice::from_raw_parts(base.add(r.offset & (N - 1)), r.len) })
         };
 
         compiler_fence(AcqRel);
 
-        if r_offset + N < self.reserved.load(Relaxed) {
+        if r.offset + N < self.reserved.load(Relaxed) {
             return Err(DataStoreError::StaleData);
         }
 
@@ -134,7 +132,7 @@ impl<const N: usize> DataStore<N> {
             }
         }
 
-        Ok(DataStoreRef { offset: from as u32, len: src.len() as u32 })
+        Ok(DataStoreRef { offset: from, len: src.len() })
     }
 }
 
@@ -289,8 +287,8 @@ mod tests {
         let mut expected = 0usize;
         for size in sizes {
             let r = dc.write(&vec![0u8; size]).unwrap();
-            assert_eq!(r.offset as usize, expected, "wrong offset for size {size}");
-            assert_eq!(r.offset as usize % 64, 0, "offset not cacheline-aligned for size {size}");
+            assert_eq!(r.offset, expected, "wrong offset for size {size}");
+            assert_eq!(r.offset % 64, 0, "offset not cacheline-aligned for size {size}");
             expected += size.next_multiple_of(64);
         }
     }
