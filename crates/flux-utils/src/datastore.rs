@@ -115,24 +115,25 @@ impl<const N: usize> DataStore<N> {
     }
 
     #[inline]
-    pub fn write(&self, src: &[u8]) -> Result<DataStoreRef, DataStoreError> {
-        if src.len() > N {
-            return Err(DataStoreError::DataLenExceedsCapacity(src.len(), N));
+    pub fn write<F>(&self, len: usize, f: F) -> Result<DataStoreRef, DataStoreError>
+    where
+        F: FnOnce(&mut [u8], &mut [u8]),
+    {
+        if len > N {
+            return Err(DataStoreError::DataLenExceedsCapacity(len, N));
         }
 
-        let from = self.reserved.fetch_add(src.len().next_multiple_of(Self::CACHELINE), Relaxed);
+        let from = self.reserved.fetch_add(len.next_multiple_of(Self::CACHELINE), Relaxed);
         let from_ix = from & (N - 1);
         let base = self.data.get().cast::<u8>();
-        let head_len = (N - from_ix).min(src.len());
+        let head_len = (N - from_ix).min(len);
         unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(from_ix), head_len);
-            let tail_len = src.len() - head_len;
-            if tail_len > 0 {
-                std::ptr::copy_nonoverlapping(src[head_len..].as_ptr(), base, tail_len);
-            }
+            let head = std::slice::from_raw_parts_mut(base.add(from_ix), head_len);
+            let tail = std::slice::from_raw_parts_mut(base, len - head_len);
+            f(head, tail);
         }
 
-        Ok(DataStoreRef { offset: from, len: src.len() })
+        Ok(DataStoreRef { offset: from, len })
     }
 }
 
@@ -217,7 +218,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let dc: DataStore<64> = DataStore::new();
-        let r = dc.write(b"hello").unwrap();
+        let r = dc.write(5, |head, _| head.copy_from_slice(b"hello")).unwrap();
         let mut buf = [0u8; 5];
         dc.read(r, &mut buf).unwrap();
         assert_eq!(&buf, b"hello");
@@ -229,8 +230,18 @@ mod tests {
         // Second write (80B): from_ix=64, head_len=64, tail_len=16 → crosses N
         // boundary.
         let dc: DataStore<128> = DataStore::new();
-        let _ = dc.write(&[0xAA; 10]).unwrap();
-        let r = dc.write(&[0xBB; 80]).unwrap();
+        let _ = dc
+            .write(10, |head, tail| {
+                head.fill(0xAA);
+                tail.fill(0xAA);
+            })
+            .unwrap();
+        let r = dc
+            .write(80, |head, tail| {
+                head.fill(0xBB);
+                tail.fill(0xBB);
+            })
+            .unwrap();
         assert_eq!(r.offset, 64);
         let mut buf = [0u8; 80];
         dc.read(r, &mut buf).unwrap();
@@ -240,7 +251,7 @@ mod tests {
     #[test]
     fn map_contiguous() {
         let dc: DataStore<64> = DataStore::new();
-        let r = dc.write(b"hello").unwrap();
+        let r = dc.write(5, |head, _| head.copy_from_slice(b"hello")).unwrap();
         // from_ix=0, 0+5 <= 64 → zero-copy path, C unused
         let got = dc.map::<_, _, 64>(r, |s| s.to_vec()).unwrap();
         assert_eq!(got, b"hello");
@@ -251,8 +262,18 @@ mod tests {
         // Same setup as wrap_around: second write straddles the N boundary.
         // map must copy into the scratch ArrayVec and present contiguous data.
         let dc: DataStore<128> = DataStore::new();
-        let _ = dc.write(&[0xAA; 10]).unwrap();
-        let r = dc.write(&[0xBB; 80]).unwrap();
+        let _ = dc
+            .write(10, |head, tail| {
+                head.fill(0xAA);
+                tail.fill(0xAA);
+            })
+            .unwrap();
+        let r = dc
+            .write(80, |head, tail| {
+                head.fill(0xBB);
+                tail.fill(0xBB);
+            })
+            .unwrap();
         assert_eq!(r.offset, 64); // from_ix=64, 64+80=144>128 → wrap path
         let got = dc.map::<_, _, 80>(r, |s| s.to_vec()).unwrap();
         assert!(got.iter().all(|&b| b == 0xBB));
@@ -261,8 +282,8 @@ mod tests {
     #[test]
     fn stale() {
         let dc: DataStore<64> = DataStore::new();
-        let r = dc.write(b"AAAA").unwrap();
-        let _ = dc.write(b"BBBB").unwrap();
+        let r = dc.write(4, |head, _| head.copy_from_slice(b"AAAA")).unwrap();
+        let _ = dc.write(4, |head, _| head.copy_from_slice(b"BBBB")).unwrap();
         // reserved=128, r.offset(0)+N(64)=64 < 128 → stale
         let mut buf = [0u8; 4];
         assert!(matches!(dc.read(r, &mut buf), Err(DataStoreError::StaleData)));
@@ -272,10 +293,10 @@ mod tests {
     fn len_too_large() {
         let dc: DataStore<64> = DataStore::new();
         assert!(matches!(
-            dc.write(&[0u8; 65]),
+            dc.write(65, |_, _| {}),
             Err(DataStoreError::DataLenExceedsCapacity(65, 64))
         ));
-        let r = dc.write(b"AB").unwrap();
+        let r = dc.write(2, |head, _| head.copy_from_slice(b"AB")).unwrap();
         let mut small = [0u8; 1];
         assert!(matches!(dc.read(r, &mut small), Err(DataStoreError::BufferTooSmall(1, 2))));
     }
@@ -286,7 +307,7 @@ mod tests {
         let sizes = [1usize, 63, 64, 65, 127, 128];
         let mut expected = 0usize;
         for size in sizes {
-            let r = dc.write(&vec![0u8; size]).unwrap();
+            let r = dc.write(size, |_, _| {}).unwrap();
             assert_eq!(r.offset, expected, "wrong offset for size {size}");
             assert_eq!(r.offset % 64, 0, "offset not cacheline-aligned for size {size}");
             expected += size.next_multiple_of(64);
@@ -313,7 +334,12 @@ mod tests {
                 thread::spawn(move || {
                     for j in 0..PER {
                         let payload = [(i * PER + j) as u8; MSG];
-                        let r = dc.write(&payload).unwrap();
+                        let r = dc
+                            .write(MSG, |head, tail| {
+                                head.copy_from_slice(&payload[..head.len()]);
+                                tail.copy_from_slice(&payload[head.len()..]);
+                            })
+                            .unwrap();
                         q.push((r, payload));
                     }
                     q.writer_done();

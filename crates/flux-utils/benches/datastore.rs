@@ -42,7 +42,12 @@ fn run_mp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
             let payload = payload.clone();
             thread::spawn(move || {
                 for _ in 0..per_producer {
-                    let r = ds.write(&payload).unwrap();
+                    let r = ds
+                        .write(payload.len(), |head, tail| {
+                            head.copy_from_slice(&payload[..head.len()]);
+                            tail.copy_from_slice(&payload[head.len()..]);
+                        })
+                        .unwrap();
                     p.produce_without_first(&r);
                 }
             })
@@ -111,7 +116,12 @@ fn run_mp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
             thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..per_producer {
-                    let r = ds.write(&payload).unwrap();
+                    let r = ds
+                        .write(payload.len(), |head, tail| {
+                            head.copy_from_slice(&payload[..head.len()]);
+                            tail.copy_from_slice(&payload[head.len()..]);
+                        })
+                        .unwrap();
                     p.produce_without_first(&r);
                 }
             })
@@ -122,7 +132,12 @@ fn run_mp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
     barrier.wait();
     let t0 = Instant::now();
     for _ in 0..per_producer {
-        let r = ds.write(&payload).unwrap();
+        let r = ds
+            .write(payload.len(), |head, tail| {
+                head.copy_from_slice(&payload[..head.len()]);
+                tail.copy_from_slice(&payload[head.len()..]);
+            })
+            .unwrap();
         black_box(p.produce_without_first(&r));
     }
     let elapsed = t0.elapsed();
@@ -243,7 +258,12 @@ fn run_sp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
             let payload = payload.clone();
             thread::spawn(move || {
                 for _ in 0..per_producer {
-                    let r = ds.write(&payload).unwrap();
+                    let r = ds
+                        .write(payload.len(), |head, tail| {
+                            head.copy_from_slice(&payload[..head.len()]);
+                            tail.copy_from_slice(&payload[head.len()..]);
+                        })
+                        .unwrap();
                     p.produce_without_first(&Msg { ds_ix: i, r });
                 }
             })
@@ -313,7 +333,12 @@ fn run_sp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
             thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..per_producer {
-                    let r = ds.write(&payload).unwrap();
+                    let r = ds
+                        .write(payload.len(), |head, tail| {
+                            head.copy_from_slice(&payload[..head.len()]);
+                            tail.copy_from_slice(&payload[head.len()..]);
+                        })
+                        .unwrap();
                     p.produce_without_first(&Msg { ds_ix: i, r });
                 }
             })
@@ -325,7 +350,12 @@ fn run_sp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
     barrier.wait();
     let t0 = Instant::now();
     for _ in 0..per_producer {
-        let r = measured_ds.write(&payload).unwrap();
+        let r = measured_ds
+            .write(payload.len(), |head, tail| {
+                head.copy_from_slice(&payload[..head.len()]);
+                tail.copy_from_slice(&payload[head.len()..]);
+            })
+            .unwrap();
         black_box(p.produce_without_first(&Msg { ds_ix: n_producers - 1, r }));
     }
     let elapsed = t0.elapsed();
