@@ -169,8 +169,8 @@ fn collaborative_and_broadcast_coexist() {
     let mut p = Producer::from(q);
 
     // Two broadcast consumers — do NOT claim collab slots.
-    let mut bc1 = Consumer::from(q);
-    let mut bc2 = Consumer::from(q);
+    let mut bc1 = Consumer::new_broadcast_test(q);
+    let mut bc2 = Consumer::new_broadcast_test(q);
 
     // Two collaborative consumers — each claims a slot via .collaborative().
     let mut cc1 = get_collaborative_consumer(&q, &*cursor as *const AtomicUsize);

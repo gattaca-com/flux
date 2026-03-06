@@ -15,7 +15,7 @@ fn basic() {
     for typ in [QueueType::SPMC, QueueType::MPMC] {
         let q = Queue::new(16, typ);
         let mut p = Producer::from(q);
-        let mut c = ConsumerBare::new_basic_test(q);
+        let mut c = ConsumerBare::new_broadcast_test(q);
         p.produce(&1);
         let mut m = 0;
 
@@ -48,7 +48,7 @@ fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
 
     let mut readhandles = Vec::new();
     for _ in 0..n_readers {
-        let mut c1 = ConsumerBare::new_basic_test(q);
+        let mut c1 = ConsumerBare::new_broadcast_test(q);
         let cons = std::thread::spawn(move || {
             let mut count = 0;
             let mut sum = 0;
@@ -117,7 +117,7 @@ fn basic_shared() {
         let _ = std::fs::remove_file(path);
         let q = Queue::create_or_open_shared(path, 16, typ);
         let mut p = Producer::from(q);
-        let mut c = ConsumerBare::new_basic_test(q);
+        let mut c = ConsumerBare::new_broadcast_test(q);
 
         p.produce(&1);
         let mut m = 0;

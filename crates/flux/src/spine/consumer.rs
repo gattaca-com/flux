@@ -211,6 +211,6 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             S::app_name(),
             format!("{}-{}", tile.name(), short_typename::<T>()),
         );
-        Self { timer, inner: queue::Consumer::from(queue) }
+        Self { timer, inner: queue::Consumer::new(queue) }
     }
 }

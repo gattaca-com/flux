@@ -477,24 +477,28 @@ pub struct ConsumerBare<T> {
 unsafe impl<T> Send for ConsumerBare<T> {}
 
 impl<T: Copy> ConsumerBare<T> {
-    #[cfg(test)]
-    pub fn new_basic_test(queue: Queue<T>) -> Self {
-        let mut s = Self::new_test(queue, std::ptr::null());
-        s.try_broadcast_init();
-        s
-    }
-
-    #[cfg(test)]
-    pub fn new_test(queue: Queue<T>, collab_cursor: *const AtomicUsize) -> Self {
+    fn new_with_cursor(queue: Queue<T>, collaborative_cursor: *const AtomicUsize) -> Self {
         Self {
             pos: usize::MAX,
             mask: queue.header.mask,
             expected_version: 0,
             is_running: 1,
             _pad: [0; 7],
-            collaborative_cursor: collab_cursor,
+            collaborative_cursor,
             queue,
         }
+    }
+
+    pub fn new(queue: Queue<T>) -> Self {
+        let cursor = queue.group_cursor("default");
+        Self::new_with_cursor(queue, cursor)
+    }
+
+    #[cfg(test)]
+    pub fn new_broadcast_test(queue: Queue<T>) -> Self {
+        let mut s = Self::new_with_cursor(queue, std::ptr::null());
+        s.try_broadcast_init();
+        s
     }
 
     #[inline]
@@ -640,13 +644,23 @@ pub struct Consumer<T: 'static + Copy> {
 }
 
 impl<T: 'static + Copy> Consumer<T> {
+    #[allow(clippy::uninit_assumed_init)]
+    fn from_bare(consumer: ConsumerBare<T>) -> Self {
+        Self { consumer, message: unsafe { std::mem::MaybeUninit::uninit().assume_init() }, should_log: true }
+    }
+
+    pub fn new(queue: Queue<T>) -> Self {
+        Self::from_bare(ConsumerBare::new(queue))
+    }
+
+    #[cfg(test)]
+    pub fn new_broadcast_test(queue: Queue<T>) -> Self {
+        Self::from_bare(ConsumerBare::new_broadcast_test(queue))
+    }
+
     #[cfg(test)]
     pub fn new_collaborative_test(queue: Queue<T>, cursor: *const AtomicUsize) -> Self {
-        Self {
-            consumer: ConsumerBare::new_test(queue, cursor),
-            message: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
-            should_log: true,
-        }
+        Self::from_bare(ConsumerBare::new_with_cursor(queue, cursor))
     }
 
     /// Maybe consume one message in a queue with error recovery and logging,
@@ -742,15 +756,9 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 }
 
-#[cfg(test)]
 impl<T: 'static + Copy> From<Queue<T>> for Consumer<T> {
-    #[allow(clippy::uninit_assumed_init)]
     fn from(queue: Queue<T>) -> Self {
-        Self {
-            consumer: ConsumerBare::new_basic_test(queue),
-            message: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
-            should_log: true,
-        }
+        Self::new(queue)
     }
 }
 
