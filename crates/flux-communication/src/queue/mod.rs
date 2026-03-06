@@ -1,7 +1,7 @@
 use std::{
     alloc::Layout,
     borrow::Borrow,
-    mem::{MaybeUninit, size_of},
+    mem::size_of,
     ops::Deref,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
@@ -161,14 +161,10 @@ impl<T: Copy> InnerQueue<T> {
         unsafe { self.buffer.get_unchecked(pos) }
     }
 
-    #[inline]
-    fn cur_pos(&self) -> usize {
-        self.count() & self.header.mask
-    }
 
     #[inline]
-    fn last_pos(&self) -> usize {
-        (self.count().saturating_sub(1)) & self.header.mask
+    fn last_count(&self) -> usize {
+        self.count().saturating_sub(1)
     }
 
     #[inline]
@@ -177,13 +173,8 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     #[inline]
-    fn version(&self) -> u64 {
-        self.version_at(self.count())
-    }
-
-    #[inline]
-    fn last_version(&self) -> u64 {
-        self.version_at(self.count().saturating_sub(1))
+    pub fn count_at(&self, pos: usize, version: u64) -> usize {
+        ((version as usize - 2) / 2) * self.len() + (pos & self.header.mask)
     }
 
     #[allow(dead_code)]
@@ -479,33 +470,36 @@ pub struct ConsumerBare<T> {
     expected_version: u64,                    // 24
     is_running: u8,                           // 25
     _pad: [u8; 7],                            // 32
-    collaborative_version: u64,               // 40
-    collaborative_slot: usize,                // 48 — absolute queue count of the next slot to read
-    collaborative_cursor: *const AtomicUsize, // 56
-    queue: Queue<T>,                          // 72 fat ptr: (usize, pointer)
+    collaborative_cursor: *const AtomicUsize, // 40
+    queue: Queue<T>,                          // 48 fat ptr: (usize, pointer)
 }
 
 unsafe impl<T> Send for ConsumerBare<T> {}
 
 impl<T: Copy> ConsumerBare<T> {
+    #[cfg(test)]
     pub fn new_basic_test(queue: Queue<T>) -> Self {
-        Self::new_test(queue, std::ptr::null())
+        let mut s = Self::new_test(queue, std::ptr::null());
+        s.try_broadcast_init();
+        s
     }
 
-    pub fn new_test(queue: Queue<T>, cursor: *const AtomicUsize) -> Self {
-        let pos = queue.cur_pos();
-        let expected_version = queue.version();
+    #[cfg(test)]
+    pub fn new_test(queue: Queue<T>, collab_cursor: *const AtomicUsize) -> Self {
         Self {
-            pos,
+            pos: usize::MAX,
             mask: queue.header.mask,
-            _pad: [0; 7],
-            expected_version,
+            expected_version: 0,
             is_running: 1,
-            collaborative_version: 0,
-            collaborative_slot: usize::MAX,
-            collaborative_cursor: cursor,
+            _pad: [0; 7],
+            collaborative_cursor: collab_cursor,
             queue,
         }
+    }
+
+    #[inline]
+    fn get_pos(&self, count: usize) -> usize {
+        count & self.mask
     }
 
     pub fn set_collaborative_cursor(&mut self, cursor: *const AtomicUsize) {
@@ -518,16 +512,32 @@ impl<T: Copy> ConsumerBare<T> {
     }
 
     #[inline]
-    fn update_pos(&mut self) {
-        self.pos = (self.pos + 1) & self.mask;
+    fn set_next_broadcast_slot(&mut self) {
+        self.pos = self.get_pos(self.pos + 1);
         self.expected_version = self.expected_version.wrapping_add(2 * (self.pos == 0) as u64);
+    }
+
+    #[inline]
+    fn try_broadcast_init(&mut self) {
+        if self.pos == usize::MAX {
+            self.pos = self.queue.count();
+            self.expected_version = self.queue.version_at(self.pos);
+        }
+    }
+
+    #[inline]
+    pub fn try_collaborative_init(&mut self) {
+        if self.pos == usize::MAX {
+            self.acquire_next_slot();
+        }
     }
 
     /// Nonblocking consume returning either Ok(()) or a ReadError
     #[inline]
     pub fn try_consume(&mut self, el: &mut T) -> Result<(), ReadError> {
-        self.queue.consume(el, self.pos, self.expected_version)?;
-        self.update_pos();
+        self.try_broadcast_init();
+        self.queue.consume(el, self.pos & self.mask, self.expected_version)?;
+        self.set_next_broadcast_slot();
         Ok(())
     }
 
@@ -554,14 +564,24 @@ impl<T: Copy> ConsumerBare<T> {
     }
 
     #[inline]
-    pub fn acquire_next_slot(&mut self) {
-        self.collaborative_slot =
-            unsafe { &*self.collaborative_cursor }.fetch_add(1, Ordering::Relaxed);
-        self.collaborative_version = self.queue.version_at(self.collaborative_slot);
+    fn set_pos(&mut self, count: usize) {
+        self.pos = self.get_pos(count);
+        self.expected_version = self.queue.version_at(count);
     }
 
     #[inline]
-    pub fn acquire_earliest_available_slot(&mut self) {
+    fn acquire_specific_slot(&mut self, delta: usize) {
+        let cursor = unsafe { &*self.collaborative_cursor }.fetch_add(delta, Ordering::Relaxed);
+        self.set_pos(cursor);
+    }
+
+    #[inline]
+    fn acquire_next_slot(&mut self) {
+        self.acquire_specific_slot(1);
+    }
+
+    #[inline]
+    fn acquire_earliest_available_slot(&mut self) {
         let collaborative_cursor = unsafe { &*self.collaborative_cursor };
         let delta = self
             .queue
@@ -569,8 +589,7 @@ impl<T: Copy> ConsumerBare<T> {
             .saturating_sub(collaborative_cursor.load(Ordering::Relaxed) + self.queue.len())
             .max(1);
 
-        self.collaborative_slot = collaborative_cursor.fetch_add(delta, Ordering::Relaxed);
-        self.collaborative_version = self.queue.version_at(self.collaborative_slot);
+        self.acquire_specific_slot(delta);
     }
 
     pub fn set_collaborative_group(&mut self, label: &str) {
@@ -580,10 +599,9 @@ impl<T: Copy> ConsumerBare<T> {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn init_header(consumer_ptr: *mut ConsumerBare<T>, queue: Queue<T>) {
         unsafe {
-            (*consumer_ptr).pos = queue.cur_pos();
-            (*consumer_ptr).expected_version = queue.version();
+            (*consumer_ptr).pos = usize::MAX;
+            (*consumer_ptr).expected_version = 0;
             (*consumer_ptr).mask = queue.header.mask;
-            (*consumer_ptr).collaborative_slot = usize::MAX;
             (*consumer_ptr).collaborative_cursor = queue.group_cursor("default");
             (*consumer_ptr).queue = queue;
         }
@@ -596,14 +614,14 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline]
     fn try_consume_last(&mut self, message: &mut T) -> Result<(), EmptyError> {
-        let last = self.queue.last_pos();
-        if last < self.pos {
+        self.try_broadcast_init();
+        let last_count = self.queue.last_count();
+        if last_count < self.queue.count_at(self.pos, self.expected_version) {
             return Err(EmptyError::Empty);
         }
-        self.pos = self.queue.last_pos();
-        self.expected_version = self.queue.last_version();
+        self.set_pos(last_count);
         self.queue.consume_always(message, self.pos)?;
-        self.update_pos();
+        self.set_next_broadcast_slot();
         Ok(())
     }
 }
@@ -622,10 +640,11 @@ pub struct Consumer<T: 'static + Copy> {
 }
 
 impl<T: 'static + Copy> Consumer<T> {
+    #[cfg(test)]
     pub fn new_collaborative_test(queue: Queue<T>, cursor: *const AtomicUsize) -> Self {
         Self {
             consumer: ConsumerBare::new_test(queue, cursor),
-            message: unsafe { MaybeUninit::uninit().assume_init() },
+            message: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
             should_log: true,
         }
     }
@@ -682,14 +701,9 @@ impl<T: 'static + Copy> Consumer<T> {
     where
         F: FnMut(&mut T),
     {
-        if self.consumer.collaborative_slot == usize::MAX {
-            self.consumer.acquire_next_slot();
-        }
+        self.consumer.try_collaborative_init();
 
-        let slot = self.consumer.collaborative_slot;
-        let version = self.consumer.collaborative_version;
-        let ring_pos = slot & self.consumer.queue.header.mask;
-        match self.consumer.queue.load(ring_pos).read_with_version(&mut self.message, version) {
+        match self.consumer.queue.load(self.consumer.pos).read_with_version(&mut self.message, self.consumer.expected_version) {
             Ok(()) => {
                 f(&mut self.message);
                 self.consumer.acquire_next_slot();
@@ -728,12 +742,13 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 }
 
+#[cfg(test)]
 impl<T: 'static + Copy> From<Queue<T>> for Consumer<T> {
     #[allow(clippy::uninit_assumed_init)]
     fn from(queue: Queue<T>) -> Self {
         Self {
             consumer: ConsumerBare::new_basic_test(queue),
-            message: unsafe { MaybeUninit::uninit().assume_init() },
+            message: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
             should_log: true,
         }
     }
