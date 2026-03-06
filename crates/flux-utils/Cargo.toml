@@ -11,6 +11,7 @@ repository = "https://github.com/gattaca-com/flux"
 flux-timing.workspace = true
 type-hash.workspace = true
 
+thiserror.workspace = true
 core_affinity.workspace = true
 directories.workspace = true
 libc.workspace = true

@@ -1,33 +1,22 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicUsize, Ordering::*},
+    sync::atomic::{AtomicUsize, Ordering::*, compiler_fence},
 };
 
 #[derive(Debug, Clone, Copy)]
 pub struct DataStoreRef {
-    pub offset: usize,
-    pub len: usize,
+    pub offset: u32,
+    pub len: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DataStoreError {
+    #[error("data length {0} exceeds capacity {1}")]
     DataLenExceedsCapacity(usize, usize),
+    #[error("output buffer {0} too small for {1} bytes")]
     BufferTooSmall(usize, usize),
+    #[error("referenced data store region was overwritten")]
     StaleData,
-}
-
-impl std::error::Error for DataStoreError {}
-
-impl std::fmt::Display for DataStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DataLenExceedsCapacity(n, cap) => {
-                write!(f, "data length {n} exceeds capacity {cap}")
-            }
-            Self::BufferTooSmall(n, m) => write!(f, "output buffer {n} too small for {m} bytes"),
-            Self::StaleData => f.write_str("referenced data store region was overwritten"),
-        }
-    }
 }
 
 /// Ring buffer data storage inspired by Firedancer's 'dcache'. Provides
@@ -43,50 +32,57 @@ pub struct DataStore<const N: usize> {
 }
 
 impl<const N: usize> DataStore<N> {
-    const _POW_2_CHECK: () = assert!(N.is_power_of_two());
+    const CACHELINE: usize = 64;
 
     pub fn new() -> Self {
-        let _ = Self::_POW_2_CHECK;
+        const { assert!(N.is_power_of_two() && N.is_multiple_of(Self::CACHELINE)) };
         Self { data: Box::new(UnsafeCell::new([0u8; N])), reserved: AtomicUsize::new(0) }
     }
 
+    #[inline]
     pub fn read(&self, r: DataStoreRef, buf: &mut [u8]) -> Result<(), DataStoreError> {
-        if r.len > N {
-            return Err(DataStoreError::DataLenExceedsCapacity(r.len, N));
+        let (r_len, r_offset) = (r.len as usize, r.offset as usize);
+        if r_len > N {
+            return Err(DataStoreError::DataLenExceedsCapacity(r_len, N));
         }
-        if r.len > buf.len() {
-            return Err(DataStoreError::BufferTooSmall(buf.len(), r.len));
+        if r_len > buf.len() {
+            return Err(DataStoreError::BufferTooSmall(buf.len(), r_len));
         }
 
-        if r.offset + N < self.reserved.load(Acquire) {
+        if r_offset + N < self.reserved.load(Relaxed) {
             return Err(DataStoreError::StaleData);
         }
 
         let base = self.data.get().cast::<u8>();
-        let from_ix = r.offset % N;
-        let head_len = (N - from_ix).min(r.len);
+        let from_ix = r_offset & (N - 1);
+        let head_len = (N - from_ix).min(r_len);
         unsafe {
             std::ptr::copy_nonoverlapping(base.add(from_ix), buf.as_mut_ptr(), head_len);
-            let tail_len = r.len - head_len;
+            let tail_len = r_len - head_len;
             if tail_len > 0 {
                 std::ptr::copy_nonoverlapping(base, buf[head_len..].as_mut_ptr(), tail_len);
             }
         }
 
-        if r.offset + N < self.reserved.load(Acquire) {
+        // Prevent the compiler from sinking the data reads past the staleness
+        // check below.
+        compiler_fence(AcqRel);
+
+        if r_offset + N < self.reserved.load(Relaxed) {
             return Err(DataStoreError::StaleData);
         }
 
         Ok(())
     }
 
+    #[inline]
     pub fn write(&self, src: &[u8]) -> Result<DataStoreRef, DataStoreError> {
         if src.len() > N {
             return Err(DataStoreError::DataLenExceedsCapacity(src.len(), N));
         }
 
-        let from = self.reserved.fetch_add(src.len(), Release);
-        let from_ix = from % N;
+        let from = self.reserved.fetch_add(src.len().next_multiple_of(Self::CACHELINE), Relaxed);
+        let from_ix = from & (N - 1);
         let base = self.data.get().cast::<u8>();
         let head_len = (N - from_ix).min(src.len());
         unsafe {
@@ -97,7 +93,7 @@ impl<const N: usize> DataStore<N> {
             }
         }
 
-        Ok(DataStoreRef { offset: from, len: src.len() })
+        Ok(DataStoreRef { offset: from as u32, len: src.len() as u32 })
     }
 }
 
@@ -181,7 +177,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let dc: DataStore<16> = DataStore::new();
+        let dc: DataStore<64> = DataStore::new();
         let r = dc.write(b"hello").unwrap();
         let mut buf = [0u8; 5];
         dc.read(r, &mut buf).unwrap();
@@ -190,32 +186,51 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let dc: DataStore<8> = DataStore::new();
-        let _ = dc.write(b"AAAAAA").unwrap();
-        let r = dc.write(b"BBBB").unwrap();
-        assert_eq!(r.offset, 6);
-        let mut buf = [0u8; 4];
+        // First write (10B) bumps reserved by 64 → from_ix for second write = 64.
+        // Second write (80B): from_ix=64, head_len=64, tail_len=16 → crosses N
+        // boundary.
+        let dc: DataStore<128> = DataStore::new();
+        let _ = dc.write(&[0xAA; 10]).unwrap();
+        let r = dc.write(&[0xBB; 80]).unwrap();
+        assert_eq!(r.offset, 64);
+        let mut buf = [0u8; 80];
         dc.read(r, &mut buf).unwrap();
-        assert_eq!(&buf, b"BBBB");
+        assert!(buf.iter().all(|&b| b == 0xBB));
     }
 
     #[test]
     fn stale() {
-        let dc: DataStore<4> = DataStore::new();
+        let dc: DataStore<64> = DataStore::new();
         let r = dc.write(b"AAAA").unwrap();
         let _ = dc.write(b"BBBB").unwrap();
-        // reserved=8, r.offset(0)+N(4)=4 < 8 → stale
+        // reserved=128, r.offset(0)+N(64)=64 < 128 → stale
         let mut buf = [0u8; 4];
         assert!(matches!(dc.read(r, &mut buf), Err(DataStoreError::StaleData)));
     }
 
     #[test]
     fn len_too_large() {
-        let dc: DataStore<4> = DataStore::new();
-        assert!(matches!(dc.write(&[0u8; 5]), Err(DataStoreError::DataLenExceedsCapacity(5, 4))));
+        let dc: DataStore<64> = DataStore::new();
+        assert!(matches!(
+            dc.write(&[0u8; 65]),
+            Err(DataStoreError::DataLenExceedsCapacity(65, 64))
+        ));
         let r = dc.write(b"AB").unwrap();
         let mut small = [0u8; 1];
         assert!(matches!(dc.read(r, &mut small), Err(DataStoreError::BufferTooSmall(1, 2))));
+    }
+
+    #[test]
+    fn cacheline_aligned_offsets() {
+        let dc: DataStore<1024> = DataStore::new();
+        let sizes = [1usize, 63, 64, 65, 127, 128];
+        let mut expected = 0usize;
+        for size in sizes {
+            let r = dc.write(&vec![0u8; size]).unwrap();
+            assert_eq!(r.offset as usize, expected, "wrong offset for size {size}");
+            assert_eq!(r.offset as usize % 64, 0, "offset not cacheline-aligned for size {size}");
+            expected += size.next_multiple_of(64);
+        }
     }
 
     #[test]
@@ -225,7 +240,10 @@ mod tests {
         const PER: usize = 16;
         const MSG: usize = 8;
 
-        let dc = Arc::new(DataStore::<1024>::new());
+        // 4 writers × 16 msgs × next_multiple_of(64, 8)=64B each = 4096B reserved
+        // total. N=4096 ensures oldest slot (offset=0, 0+4096=4096) is never
+        // stale.
+        let dc = Arc::new(DataStore::<4096>::new());
         let q: Arc<TestQueue<(DataStoreRef, [u8; MSG])>> = Arc::new(TestQueue::new());
 
         let write_handles: Vec<_> = (0..WRITERS)
