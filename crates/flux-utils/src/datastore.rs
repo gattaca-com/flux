@@ -99,7 +99,7 @@ impl<const N: usize> DataStore<N> {
             }
             let mut buf = [0u8; C];
             self.copy(r.len, r.offset, &mut buf);
-            f(buf.as_slice())
+            f(&buf[..r.len])
         } else {
             let base = self.data.get().cast::<u8>();
             f(unsafe { std::slice::from_raw_parts(base.add(r.offset & (N - 1)), r.len) })
