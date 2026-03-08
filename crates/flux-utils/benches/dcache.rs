@@ -11,12 +11,12 @@ use flux_communication::{
     ReadError,
     queue::{ConsumerBare, Producer, Queue, QueueType},
 };
-use flux_utils::{DataStore, DataStoreRef};
+use flux_utils::{DCache, DCacheRef};
 
 #[derive(Clone, Copy)]
 struct Msg {
     ds_ix: usize,
-    r: DataStoreRef,
+    r: DCacheRef,
 }
 
 const CAPACITY: usize = 64 * 1024 * 1024; // ~164 x 400KB messages before ring wraps
@@ -27,22 +27,22 @@ const QUEUE_LEN: usize = 1024 * 16;
 fn run_mp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
 
-    let ds = Arc::new(DataStore::<CAPACITY>::new());
-    let queue = Queue::<DataStoreRef>::new(QUEUE_LEN, QueueType::MPMC);
+    let dc = Arc::new(DCache::<CAPACITY>::new());
+    let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
     let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
 
     let mut c = ConsumerBare::from(queue);
-    let mut r = DataStoreRef { offset: 0, len: 0 };
+    let mut r = DCacheRef { offset: 0, len: 0 };
     let mut buf = vec![0u8; msg_size];
 
     let producers: Vec<_> = (0..n_producers)
         .map(|_| {
-            let ds = ds.clone();
+            let dc = dc.clone();
             let p = Producer::from(queue);
             let payload = payload.clone();
             thread::spawn(move || {
                 for _ in 0..per_producer {
-                    let r = ds
+                    let r = dc
                         .write(payload.len(), |head, tail| {
                             head.copy_from_slice(&payload[..head.len()]);
                             tail.copy_from_slice(&payload[head.len()..]);
@@ -59,7 +59,7 @@ fn run_mp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
     while seen < total {
         match c.try_consume(&mut r) {
             Ok(()) => {
-                let _ = ds.read(r, &mut buf[..r.len as usize]);
+                let _ = dc.read(r, &mut buf[..r.len as usize]);
                 black_box(buf.as_slice());
                 seen += 1;
             }
@@ -80,21 +80,21 @@ fn run_mp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
 fn run_mp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
 
-    let ds = Arc::new(DataStore::<CAPACITY>::new());
-    let queue = Queue::<DataStoreRef>::new(QUEUE_LEN, QueueType::MPMC);
+    let dc = Arc::new(DCache::<CAPACITY>::new());
+    let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
     let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
 
     let mut c = ConsumerBare::from(queue);
-    let mut r = DataStoreRef { offset: 0, len: 0 };
+    let mut r = DCacheRef { offset: 0, len: 0 };
     let mut buf = vec![0u8; msg_size];
     let consumer = {
-        let ds = ds.clone();
+        let dc = dc.clone();
         thread::spawn(move || {
             let mut seen = 0usize;
             while seen < total {
                 match c.try_consume(&mut r) {
                     Ok(()) => {
-                        let _ = ds.read(r, &mut buf[..r.len as usize]);
+                        let _ = dc.read(r, &mut buf[..r.len as usize]);
                         black_box(buf.as_slice());
                         seen += 1;
                     }
@@ -109,14 +109,14 @@ fn run_mp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
     let barrier = Arc::new(Barrier::new(n_producers));
     let bg: Vec<_> = (0..n_producers.saturating_sub(1))
         .map(|_| {
-            let ds = ds.clone();
+            let dc = dc.clone();
             let p = Producer::from(queue);
             let payload = payload.clone();
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..per_producer {
-                    let r = ds
+                    let r = dc
                         .write(payload.len(), |head, tail| {
                             head.copy_from_slice(&payload[..head.len()]);
                             tail.copy_from_slice(&payload[head.len()..]);
@@ -132,7 +132,7 @@ fn run_mp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
     barrier.wait();
     let t0 = Instant::now();
     for _ in 0..per_producer {
-        let r = ds
+        let r = dc
             .write(payload.len(), |head, tail| {
                 head.copy_from_slice(&payload[..head.len()]);
                 tail.copy_from_slice(&payload[head.len()..]);
@@ -162,7 +162,7 @@ fn run_mp_crossbeam_consumer(n_producers: usize, msg_size: usize, per_producer: 
             thread::spawn(move || {
                 for _ in 0..per_producer {
                     // Arc::from copies the payload, matching the memcpy cost
-                    // of ds.write() in the flux variants.
+                    // of dc.write() in the flux variants.
                     tx.send(Box::from(&payload[..])).unwrap();
                 }
             })
@@ -240,25 +240,25 @@ fn run_mp_crossbeam_producer(n_producers: usize, msg_size: usize, per_producer: 
 fn run_sp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
 
-    let stores: Vec<Arc<DataStore<CAPACITY>>> =
-        (0..n_producers).map(|_| Arc::new(DataStore::new())).collect();
+    let stores: Vec<Arc<DCache<CAPACITY>>> =
+        (0..n_producers).map(|_| Arc::new(DCache::new())).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
     let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
 
     let mut c = ConsumerBare::from(queue);
-    let mut slot = Msg { ds_ix: 0, r: DataStoreRef { offset: 0, len: 0 } };
+    let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
     let mut buf = vec![0u8; msg_size];
 
     let producers: Vec<_> = stores
         .iter()
         .enumerate()
-        .map(|(i, ds)| {
-            let ds = ds.clone();
+        .map(|(i, dc)| {
+            let dc = dc.clone();
             let p = Producer::from(queue);
             let payload = payload.clone();
             thread::spawn(move || {
                 for _ in 0..per_producer {
-                    let r = ds
+                    let r = dc
                         .write(payload.len(), |head, tail| {
                             head.copy_from_slice(&payload[..head.len()]);
                             tail.copy_from_slice(&payload[head.len()..]);
@@ -294,15 +294,15 @@ fn run_sp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
 fn run_sp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
 
-    let stores: Vec<Arc<DataStore<CAPACITY>>> =
-        (0..n_producers).map(|_| Arc::new(DataStore::new())).collect();
+    let stores: Vec<Arc<DCache<CAPACITY>>> =
+        (0..n_producers).map(|_| Arc::new(DCache::new())).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
     let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
 
     let consumer_stores = stores.clone();
     let mut c = ConsumerBare::from(queue);
     let mut buf = vec![0u8; msg_size];
-    let mut slot = Msg { ds_ix: 0, r: DataStoreRef { offset: 0, len: 0 } };
+    let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
     let consumer = thread::spawn(move || {
         let mut seen = 0usize;
         while seen < total {
@@ -325,15 +325,15 @@ fn run_sp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
     let bg: Vec<_> = stores[..n_producers - 1]
         .iter()
         .enumerate()
-        .map(|(i, ds)| {
-            let ds = ds.clone();
+        .map(|(i, dc)| {
+            let dc = dc.clone();
             let p = Producer::from(queue);
             let payload = payload.clone();
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..per_producer {
-                    let r = ds
+                    let r = dc
                         .write(payload.len(), |head, tail| {
                             head.copy_from_slice(&payload[..head.len()]);
                             tail.copy_from_slice(&payload[head.len()..]);

@@ -36,5 +36,5 @@ name = "arrayvec"
 harness = false
 
 [[bench]]
-name = "datastore"
+name = "dcache"
 harness = false

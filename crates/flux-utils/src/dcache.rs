@@ -1,16 +1,16 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicUsize, Ordering::*, compiler_fence},
+    sync::atomic::{AtomicUsize, Ordering::*, fence},
 };
 
 #[derive(Debug, Clone, Copy)]
-pub struct DataStoreRef {
+pub struct DCacheRef {
     pub offset: usize,
     pub len: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum DataStoreError {
+pub enum DCacheError {
     #[error("data length {0} exceeds capacity {1}")]
     DataLenExceedsCapacity(usize, usize),
     #[error("output buffer {0} too small for {1} bytes")]
@@ -23,43 +23,49 @@ pub enum DataStoreError {
 /// synchronised multi-producer allocation and leaves read-write ordering and
 /// synchronisation to the caller.
 ///
-/// Intended use: the caller exchanges [`DataStoreRef`]s through an external
+/// Intended use: the caller exchanges [`DCacheRef`]s through an external
 /// ordered channel (e.g. a spine queue) and the channel's Release/Acquire
 /// pair is the synchronisation point for the payload bytes stored here.
-pub struct DataStore<const N: usize> {
-    data: Box<UnsafeCell<[u8; N]>>,
+#[repr(C)]
+pub struct DCache<const N: usize> {
     reserved: AtomicUsize,
+    _pad: [u8; CACHELINE - size_of::<AtomicUsize>()],
+    data: Box<UnsafeCell<[u8; N]>>,
 }
 
-impl<const N: usize> DataStore<N> {
-    const CACHELINE: usize = 64;
+const CACHELINE: usize = 64;
 
+impl<const N: usize> DCache<N> {
     pub fn new() -> Self {
-        const { assert!(N.is_power_of_two() && N.is_multiple_of(Self::CACHELINE)) };
-        Self { data: Box::new(UnsafeCell::new([0u8; N])), reserved: AtomicUsize::new(0) }
+        const { assert!(N.is_power_of_two() && N.is_multiple_of(CACHELINE)) };
+        Self {
+            reserved: AtomicUsize::new(0),
+            _pad: [0; CACHELINE - size_of::<AtomicUsize>()],
+            data: Box::new(UnsafeCell::new([0u8; N])),
+        }
     }
 
     #[inline]
-    pub fn read(&self, r: DataStoreRef, buf: &mut [u8]) -> Result<(), DataStoreError> {
+    pub fn read(&self, r: DCacheRef, buf: &mut [u8]) -> Result<(), DCacheError> {
         if r.len > N {
-            return Err(DataStoreError::DataLenExceedsCapacity(r.len, N));
+            return Err(DCacheError::DataLenExceedsCapacity(r.len, N));
         }
         if r.len > buf.len() {
-            return Err(DataStoreError::BufferTooSmall(buf.len(), r.len));
+            return Err(DCacheError::BufferTooSmall(buf.len(), r.len));
         }
 
         if r.offset + N < self.reserved.load(Relaxed) {
-            return Err(DataStoreError::StaleData);
+            return Err(DCacheError::StaleData);
         }
 
         self.copy(r.len, r.offset, buf);
 
-        // Prevent the compiler from sinking the data reads past the staleness
+        // Prevents the sinking of the data reads past the staleness
         // check below.
-        compiler_fence(AcqRel);
+        fence(AcqRel);
 
         if r.offset + N < self.reserved.load(Relaxed) {
-            return Err(DataStoreError::StaleData);
+            return Err(DCacheError::StaleData);
         }
 
         Ok(())
@@ -80,22 +86,22 @@ impl<const N: usize> DataStore<N> {
     }
 
     #[inline]
-    pub fn map<T, F, const C: usize>(&self, r: DataStoreRef, f: F) -> Result<T, DataStoreError>
+    pub fn map<T, F, const C: usize>(&self, r: DCacheRef, f: F) -> Result<T, DCacheError>
     where
         F: FnOnce(&[u8]) -> T,
     {
         if r.len > N {
-            return Err(DataStoreError::DataLenExceedsCapacity(r.len, N));
+            return Err(DCacheError::DataLenExceedsCapacity(r.len, N));
         }
 
         if r.offset + N < self.reserved.load(Relaxed) {
-            return Err(DataStoreError::StaleData);
+            return Err(DCacheError::StaleData);
         }
 
         let from_ix = r.offset & (N - 1);
         let result = if r.len > N - from_ix {
             if r.len > C {
-                return Err(DataStoreError::DataLenExceedsCapacity(r.len, C));
+                return Err(DCacheError::DataLenExceedsCapacity(r.len, C));
             }
             let mut buf = [0u8; C];
             self.copy(r.len, r.offset, &mut buf);
@@ -105,25 +111,25 @@ impl<const N: usize> DataStore<N> {
             f(unsafe { std::slice::from_raw_parts(base.add(r.offset & (N - 1)), r.len) })
         };
 
-        compiler_fence(AcqRel);
+        fence(AcqRel);
 
         if r.offset + N < self.reserved.load(Relaxed) {
-            return Err(DataStoreError::StaleData);
+            return Err(DCacheError::StaleData);
         }
 
         Ok(result)
     }
 
     #[inline]
-    pub fn write<F>(&self, len: usize, f: F) -> Result<DataStoreRef, DataStoreError>
+    pub fn write<F>(&self, len: usize, f: F) -> Result<DCacheRef, DCacheError>
     where
         F: FnOnce(&mut [u8], &mut [u8]),
     {
         if len > N {
-            return Err(DataStoreError::DataLenExceedsCapacity(len, N));
+            return Err(DCacheError::DataLenExceedsCapacity(len, N));
         }
 
-        let from = self.reserved.fetch_add(len.next_multiple_of(Self::CACHELINE), Relaxed);
+        let from = self.reserved.fetch_add(len.next_multiple_of(CACHELINE), Relaxed);
         let from_ix = from & (N - 1);
         let base = self.data.get().cast::<u8>();
         let head_len = (N - from_ix).min(len);
@@ -133,18 +139,18 @@ impl<const N: usize> DataStore<N> {
             f(head, tail);
         }
 
-        Ok(DataStoreRef { offset: from, len })
+        Ok(DCacheRef { offset: from, len })
     }
 }
 
-impl<const N: usize> Default for DataStore<N> {
+impl<const N: usize> Default for DCache<N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-unsafe impl<const N: usize> Sync for DataStore<N> {}
-unsafe impl<const N: usize> Send for DataStore<N> {}
+unsafe impl<const N: usize> Sync for DCache<N> {}
+unsafe impl<const N: usize> Send for DCache<N> {}
 
 #[cfg(test)]
 mod tests {
@@ -217,7 +223,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let dc: DataStore<64> = DataStore::new();
+        let dc: DCache<64> = DCache::new();
         let r = dc.write(5, |head, _| head.copy_from_slice(b"hello")).unwrap();
         let mut buf = [0u8; 5];
         dc.read(r, &mut buf).unwrap();
@@ -229,7 +235,7 @@ mod tests {
         // First write (10B) bumps reserved by 64 → from_ix for second write = 64.
         // Second write (80B): from_ix=64, head_len=64, tail_len=16 → crosses N
         // boundary.
-        let dc: DataStore<128> = DataStore::new();
+        let dc: DCache<128> = DCache::new();
         let _ = dc
             .write(10, |head, tail| {
                 head.fill(0xAA);
@@ -250,7 +256,7 @@ mod tests {
 
     #[test]
     fn map_contiguous() {
-        let dc: DataStore<64> = DataStore::new();
+        let dc: DCache<64> = DCache::new();
         let r = dc.write(5, |head, _| head.copy_from_slice(b"hello")).unwrap();
         // from_ix=0, 0+5 <= 64 → zero-copy path, C unused
         let got = dc.map::<_, _, 64>(r, |s| s.to_vec()).unwrap();
@@ -261,7 +267,7 @@ mod tests {
     fn map_wrap() {
         // Same setup as wrap_around: second write straddles the N boundary.
         // map must copy into the scratch ArrayVec and present contiguous data.
-        let dc: DataStore<128> = DataStore::new();
+        let dc: DCache<128> = DCache::new();
         let _ = dc
             .write(10, |head, tail| {
                 head.fill(0xAA);
@@ -281,29 +287,29 @@ mod tests {
 
     #[test]
     fn stale() {
-        let dc: DataStore<64> = DataStore::new();
+        let dc: DCache<64> = DCache::new();
         let r = dc.write(4, |head, _| head.copy_from_slice(b"AAAA")).unwrap();
         let _ = dc.write(4, |head, _| head.copy_from_slice(b"BBBB")).unwrap();
         // reserved=128, r.offset(0)+N(64)=64 < 128 → stale
         let mut buf = [0u8; 4];
-        assert!(matches!(dc.read(r, &mut buf), Err(DataStoreError::StaleData)));
+        assert!(matches!(dc.read(r, &mut buf), Err(DCacheError::StaleData)));
     }
 
     #[test]
     fn len_too_large() {
-        let dc: DataStore<64> = DataStore::new();
+        let dc: DCache<64> = DCache::new();
         assert!(matches!(
             dc.write(65, |_, _| {}),
-            Err(DataStoreError::DataLenExceedsCapacity(65, 64))
+            Err(DCacheError::DataLenExceedsCapacity(65, 64))
         ));
         let r = dc.write(2, |head, _| head.copy_from_slice(b"AB")).unwrap();
         let mut small = [0u8; 1];
-        assert!(matches!(dc.read(r, &mut small), Err(DataStoreError::BufferTooSmall(1, 2))));
+        assert!(matches!(dc.read(r, &mut small), Err(DCacheError::BufferTooSmall(1, 2))));
     }
 
     #[test]
     fn cacheline_aligned_offsets() {
-        let dc: DataStore<1024> = DataStore::new();
+        let dc: DCache<1024> = DCache::new();
         let sizes = [1usize, 63, 64, 65, 127, 128];
         let mut expected = 0usize;
         for size in sizes {
@@ -324,8 +330,8 @@ mod tests {
         // 4 writers × 16 msgs × next_multiple_of(64, 8)=64B each = 4096B reserved
         // total. N=4096 ensures oldest slot (offset=0, 0+4096=4096) is never
         // stale.
-        let dc = Arc::new(DataStore::<4096>::new());
-        let q: Arc<TestQueue<(DataStoreRef, [u8; MSG])>> = Arc::new(TestQueue::new());
+        let dc = Arc::new(DCache::<4096>::new());
+        let q: Arc<TestQueue<(DCacheRef, [u8; MSG])>> = Arc::new(TestQueue::new());
 
         let write_handles: Vec<_> = (0..WRITERS)
             .map(|i| {
