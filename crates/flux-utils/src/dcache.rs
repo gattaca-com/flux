@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicUsize, Ordering::*},
+    sync::atomic::{AtomicUsize, Ordering::*, compiler_fence},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -19,7 +19,7 @@ pub enum DCacheError {
     StaleData,
 }
 
-/// Ring buffer data storage inspired by Firedancer's 'dcache'. Provides
+/// Ring buffer data storage inspired by Firedancer's `dcache`. Provides
 /// synchronised multi-producer allocation and leaves read-write ordering and
 /// synchronisation to the caller.
 ///
@@ -64,6 +64,8 @@ impl<const N: usize> DCache<N> {
         }
 
         self.copy(base, r.len, r.offset + Self::OFFSET, buf);
+
+        compiler_fence(AcqRel);
 
         if !Self::offsets_match(base, offset_ix, r.offset) {
             return Err(DCacheError::StaleData);
@@ -116,6 +118,8 @@ impl<const N: usize> DCache<N> {
             f(unsafe { std::slice::from_raw_parts(base.add(payload_ix), r.len) })
         };
 
+        compiler_fence(AcqRel);
+
         if !Self::offsets_match(base, offset_ix, r.offset) {
             return Err(DCacheError::StaleData);
         }
@@ -134,7 +138,7 @@ impl<const N: usize> DCache<N> {
     where
         F: FnOnce(&mut [u8], &mut [u8]),
     {
-        if Self::OFFSET + len > N {
+        if len > N - Self::OFFSET {
             return Err(DCacheError::DataLenExceedsCapacity(len, N - Self::OFFSET));
         }
 
