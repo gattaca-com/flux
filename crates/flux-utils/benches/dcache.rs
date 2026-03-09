@@ -1,8 +1,8 @@
 use std::{
     hint::{black_box, spin_loop},
-    sync::{Arc, Barrier},
+    sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -21,233 +21,113 @@ struct Msg {
 
 const CAPACITY: usize = 64 * 1024 * 1024; // ~164 x 400KB messages before ring wraps
 const QUEUE_LEN: usize = 1024 * 16;
+const MSG_SIZE: usize = 409600; // 400kb
+
+#[inline]
+fn now_nanos() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+}
+
+#[inline]
+fn write_ts(buf: &mut [u8]) {
+    buf[..8].copy_from_slice(&now_nanos().to_ne_bytes());
+}
+
+#[inline]
+fn read_ts(buf: &[u8]) -> u64 {
+    now_nanos() - u64::from_ne_bytes(buf[..8].try_into().unwrap())
+}
+
+#[inline]
+fn xorshift(s: &mut u64) -> u64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s
+}
 
 // Caller must ensure n_producers * per_producer <= QUEUE_LEN to prevent
 // ConsumerBare version corruption from queue lapping.
-fn run_mp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
-    let total = n_producers * per_producer;
 
+// Single shared DCache, one consumer thread. Returns sum of write-to-read
+// latencies.
+fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
+    let total = n_producers * per_producer;
     let dc = Arc::new(DCache::<CAPACITY>::new());
     let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
-    let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
 
-    let mut c = ConsumerBare::from(queue);
-    let mut r = DCacheRef { offset: 0, len: 0 };
-    let mut buf = vec![0u8; msg_size];
-
-    let producers: Vec<_> = (0..n_producers)
-        .map(|_| {
-            let dc = dc.clone();
-            let p = Producer::from(queue);
-            let payload = payload.clone();
-            thread::spawn(move || {
-                for _ in 0..per_producer {
-                    let r = dc
-                        .write(payload.len(), |head, tail| {
-                            head.copy_from_slice(&payload[..head.len()]);
-                            tail.copy_from_slice(&payload[head.len()..]);
-                        })
-                        .unwrap();
-                    p.produce_without_first(&r);
-                }
-            })
-        })
-        .collect();
-
-    let t0 = Instant::now();
-    let mut seen = 0usize;
-    while seen < total {
-        match c.try_consume(&mut r) {
-            Ok(()) => {
-                let _ = dc.read(r, &mut buf[..r.len as usize]);
-                black_box(buf.as_slice());
-                seen += 1;
-            }
-            Err(ReadError::SpedPast) => c.recover_after_error(),
-            Err(ReadError::Empty) => spin_loop(),
-        }
-    }
-    let elapsed = t0.elapsed();
-
-    for p in producers {
-        p.join().unwrap();
-    }
-    elapsed
-}
-
-// Times the main thread's per_producer produce operations; background threads
-// add queue contention.
-fn run_mp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
-    let total = n_producers * per_producer;
-
-    let dc = Arc::new(DCache::<CAPACITY>::new());
-    let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
-    let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
-
-    let mut c = ConsumerBare::from(queue);
-    let mut r = DCacheRef { offset: 0, len: 0 };
-    let mut buf = vec![0u8; msg_size];
-    let consumer = {
-        let dc = dc.clone();
-        thread::spawn(move || {
-            let mut seen = 0usize;
-            while seen < total {
-                match c.try_consume(&mut r) {
-                    Ok(()) => {
-                        let _ = dc.read(r, &mut buf[..r.len as usize]);
-                        black_box(buf.as_slice());
-                        seen += 1;
-                    }
-                    Err(ReadError::SpedPast) => c.recover_after_error(),
-                    Err(ReadError::Empty) => spin_loop(),
-                }
-            }
-        })
-    };
-
-    // Barrier ensures all bg producers are scheduled before timing starts.
-    let barrier = Arc::new(Barrier::new(n_producers));
-    let bg: Vec<_> = (0..n_producers.saturating_sub(1))
-        .map(|_| {
-            let dc = dc.clone();
-            let p = Producer::from(queue);
-            let payload = payload.clone();
-            let barrier = barrier.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                for _ in 0..per_producer {
-                    let r = dc
-                        .write(payload.len(), |head, tail| {
-                            head.copy_from_slice(&payload[..head.len()]);
-                            tail.copy_from_slice(&payload[head.len()..]);
-                        })
-                        .unwrap();
-                    p.produce_without_first(&r);
-                }
-            })
-        })
-        .collect();
-
-    let p = Producer::from(queue);
-    barrier.wait();
-    let t0 = Instant::now();
-    for _ in 0..per_producer {
-        let r = dc
-            .write(payload.len(), |head, tail| {
-                head.copy_from_slice(&payload[..head.len()]);
-                tail.copy_from_slice(&payload[head.len()..]);
-            })
-            .unwrap();
-        black_box(p.produce_without_first(&r));
-    }
-    let elapsed = t0.elapsed();
-
-    for b in bg {
-        b.join().unwrap();
-    }
-    consumer.join().unwrap();
-    elapsed
-}
-
-fn run_mp_crossbeam_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
-    let (tx, rx) = crossbeam_channel::bounded::<Box<[u8]>>(QUEUE_LEN);
-    let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
-    let total = n_producers * per_producer;
-
-    let mut buf = vec![0u8; msg_size];
-    let producers: Vec<_> = (0..n_producers)
-        .map(|_| {
-            let tx = tx.clone();
-            let payload = payload.clone();
-            thread::spawn(move || {
-                for _ in 0..per_producer {
-                    // Arc::from copies the payload, matching the memcpy cost
-                    // of dc.write() in the flux variants.
-                    tx.send(Box::from(&payload[..])).unwrap();
-                }
-            })
-        })
-        .collect();
-    drop(tx);
-
-    let t0 = Instant::now();
-    let mut seen = 0usize;
-    while seen < total {
-        match rx.try_recv() {
-            Ok(data) => {
-                buf.copy_from_slice(&data);
-                black_box(buf.as_slice());
-                seen += 1;
-            }
-            Err(TryRecvError::Empty) => spin_loop(),
-            Err(TryRecvError::Disconnected) => break,
-        }
-    }
-    let elapsed = t0.elapsed();
-
-    for p in producers {
-        p.join().unwrap();
-    }
-    elapsed
-}
-
-fn run_mp_crossbeam_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
-    let (tx, rx) = crossbeam_channel::bounded::<Box<[u8]>>(QUEUE_LEN);
-    let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
-    let total = n_producers * per_producer;
-
-    let mut buf = vec![0u8; msg_size];
+    let dc_c = dc.clone();
     let consumer = thread::spawn(move || {
+        let mut c = ConsumerBare::from(queue);
+        let mut r = DCacheRef { offset: 0, len: 0 };
+        let mut sum = 0u64;
         let mut seen = 0usize;
         while seen < total {
-            match rx.try_recv() {
-                Ok(data) => {
-                    buf.copy_from_slice(&data);
-                    black_box(buf.as_slice());
+            match c.try_consume(&mut r) {
+                Ok(()) => {
+                    sum += dc_c.map::<u64, _, MSG_SIZE>(r, read_ts).unwrap();
                     seen += 1;
                 }
-                Err(TryRecvError::Empty) => spin_loop(),
-                Err(TryRecvError::Disconnected) => break,
+                Err(ReadError::SpedPast) => c.recover_after_error(),
+                Err(ReadError::Empty) => spin_loop(),
             }
         }
+        sum
     });
 
-    let bg: Vec<_> = (0..n_producers.saturating_sub(1))
+    thread::sleep(Duration::from_millis(100));
+
+    let producers: Vec<_> = (0..n_producers)
         .map(|_| {
-            let tx = tx.clone();
-            let payload = payload.clone();
+            let dc = dc.clone();
+            let p = Producer::from(queue);
             thread::spawn(move || {
+                let mut rng = now_nanos();
                 for _ in 0..per_producer {
-                    tx.send(Box::from(&payload[..])).unwrap();
+                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
+                    p.produce_without_first(&r);
+                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
                 }
             })
         })
         .collect();
 
-    let t0 = Instant::now();
-    for _ in 0..per_producer {
-        tx.send(Box::from(&payload[..])).unwrap();
+    for p in producers {
+        p.join().unwrap();
     }
-    let elapsed = t0.elapsed();
-
-    for b in bg {
-        b.join().unwrap();
-    }
-    consumer.join().unwrap();
-    elapsed
+    Duration::from_nanos(consumer.join().unwrap())
 }
 
-fn run_sp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
+// Per-producer DCache, one consumer thread. Returns sum of write-to-read
+// latencies.
+fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
-
     let stores: Vec<Arc<DCache<CAPACITY>>> =
         (0..n_producers).map(|_| Arc::new(DCache::new())).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
-    let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
 
-    let mut c = ConsumerBare::from(queue);
-    let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
-    let mut buf = vec![0u8; msg_size];
+    let consumer_stores = stores.clone();
+    let consumer = thread::spawn(move || {
+        let mut c = ConsumerBare::from(queue);
+        let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
+        let mut sum = 0u64;
+        let mut seen = 0usize;
+        while seen < total {
+            match c.try_consume(&mut slot) {
+                Ok(()) => {
+                    sum += consumer_stores[slot.ds_ix]
+                        .map::<u64, _, MSG_SIZE>(slot.r, read_ts)
+                        .unwrap();
+                    seen += 1;
+                }
+                Err(ReadError::SpedPast) => c.recover_after_error(),
+                Err(ReadError::Empty) => spin_loop(),
+            }
+        }
+        sum
+    });
+
+    thread::sleep(Duration::from_millis(100));
 
     let producers: Vec<_> = stores
         .iter()
@@ -255,165 +135,232 @@ fn run_sp_consumer(n_producers: usize, msg_size: usize, per_producer: usize) -> 
         .map(|(i, dc)| {
             let dc = dc.clone();
             let p = Producer::from(queue);
-            let payload = payload.clone();
             thread::spawn(move || {
+                let mut rng = now_nanos();
                 for _ in 0..per_producer {
-                    let r = dc
-                        .write(payload.len(), |head, tail| {
-                            head.copy_from_slice(&payload[..head.len()]);
-                            tail.copy_from_slice(&payload[head.len()..]);
-                        })
-                        .unwrap();
+                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
                     p.produce_without_first(&Msg { ds_ix: i, r });
+                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
                 }
             })
         })
         .collect();
 
-    let t0 = Instant::now();
-    let mut seen = 0usize;
-    while seen < total {
-        match c.try_consume(&mut slot) {
-            Ok(()) => {
-                let _ = stores[slot.ds_ix].read(slot.r, &mut buf[..slot.r.len as usize]);
-                black_box(buf.as_slice());
-                seen += 1;
-            }
-            Err(ReadError::SpedPast) => c.recover_after_error(),
-            Err(ReadError::Empty) => spin_loop(),
-        }
+    for p in producers {
+        p.join().unwrap();
     }
-    let elapsed = t0.elapsed();
+    Duration::from_nanos(consumer.join().unwrap())
+}
+
+// Single shared DCache, multiple consumer threads. Returns average-per-consumer
+// sum of write-to-read latencies (comparable to run_mp).
+fn run_mp_mc(
+    n_producers: usize,
+    n_consumers: usize,
+    msg_size: usize,
+    per_producer: usize,
+) -> Duration {
+    let total = n_producers * per_producer;
+    let dc = Arc::new(DCache::<CAPACITY>::new());
+    let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
+
+    let consumers: Vec<_> = (0..n_consumers)
+        .map(|_| {
+            let dc_c = dc.clone();
+            let mut c = ConsumerBare::from(queue);
+            thread::spawn(move || {
+                let mut r = DCacheRef { offset: 0, len: 0 };
+                let mut sum = 0u64;
+                let mut seen = 0usize;
+                while seen < total {
+                    match c.try_consume(&mut r) {
+                        Ok(()) => {
+                            sum += dc_c.map::<u64, _, MSG_SIZE>(r, read_ts).unwrap();
+                            seen += 1;
+                        }
+                        Err(ReadError::SpedPast) => c.recover_after_error(),
+                        Err(ReadError::Empty) => spin_loop(),
+                    }
+                }
+                sum
+            })
+        })
+        .collect();
+
+    thread::sleep(Duration::from_millis(100));
+
+    let producers: Vec<_> = (0..n_producers)
+        .map(|_| {
+            let dc = dc.clone();
+            let p = Producer::from(queue);
+            thread::spawn(move || {
+                let mut rng = now_nanos();
+                for _ in 0..per_producer {
+                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
+                    p.produce_without_first(&r);
+                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
+                }
+            })
+        })
+        .collect();
 
     for p in producers {
         p.join().unwrap();
     }
-    elapsed
+    let total_sum: u64 = consumers.into_iter().map(|c| c.join().unwrap()).sum();
+    Duration::from_nanos(total_sum / n_consumers as u64)
 }
 
-fn run_sp_producer(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
+// Per-producer DCache, multiple consumer threads. Returns average-per-consumer
+// sum of write-to-read latencies (comparable to run_sp).
+fn run_sp_mc(
+    n_producers: usize,
+    n_consumers: usize,
+    msg_size: usize,
+    per_producer: usize,
+) -> Duration {
     let total = n_producers * per_producer;
-
     let stores: Vec<Arc<DCache<CAPACITY>>> =
         (0..n_producers).map(|_| Arc::new(DCache::new())).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
-    let payload: Arc<[u8]> = vec![0xABu8; msg_size].into();
 
-    let consumer_stores = stores.clone();
-    let mut c = ConsumerBare::from(queue);
-    let mut buf = vec![0u8; msg_size];
-    let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
-    let consumer = thread::spawn(move || {
-        let mut seen = 0usize;
-        while seen < total {
-            match c.try_consume(&mut slot) {
-                Ok(()) => {
-                    let _ =
-                        consumer_stores[slot.ds_ix].read(slot.r, &mut buf[..slot.r.len as usize]);
-                    black_box(buf.as_slice());
-                    seen += 1;
+    let consumers: Vec<_> = (0..n_consumers)
+        .map(|_| {
+            let consumer_stores = stores.clone();
+            let mut c = ConsumerBare::from(queue);
+            thread::spawn(move || {
+                let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
+                let mut sum = 0u64;
+                let mut seen = 0usize;
+                while seen < total {
+                    match c.try_consume(&mut slot) {
+                        Ok(()) => {
+                            sum += consumer_stores[slot.ds_ix]
+                                .map::<u64, _, MSG_SIZE>(slot.r, read_ts)
+                                .unwrap();
+                            seen += 1;
+                        }
+                        Err(ReadError::SpedPast) => c.recover_after_error(),
+                        Err(ReadError::Empty) => spin_loop(),
+                    }
                 }
-                Err(ReadError::SpedPast) => c.recover_after_error(),
-                Err(ReadError::Empty) => spin_loop(),
-            }
-        }
-    });
+                sum
+            })
+        })
+        .collect();
 
-    // Barrier ensures all bg producers are scheduled before timing starts.
-    let barrier = Arc::new(Barrier::new(n_producers));
-    // n_producers - 1 background producers add contention on the shared queue.
-    let bg: Vec<_> = stores[..n_producers - 1]
+    thread::sleep(Duration::from_millis(100));
+
+    let producers: Vec<_> = stores
         .iter()
         .enumerate()
         .map(|(i, dc)| {
             let dc = dc.clone();
             let p = Producer::from(queue);
-            let payload = payload.clone();
-            let barrier = barrier.clone();
             thread::spawn(move || {
-                barrier.wait();
+                let mut rng = now_nanos();
                 for _ in 0..per_producer {
-                    let r = dc
-                        .write(payload.len(), |head, tail| {
-                            head.copy_from_slice(&payload[..head.len()]);
-                            tail.copy_from_slice(&payload[head.len()..]);
-                        })
-                        .unwrap();
+                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
                     p.produce_without_first(&Msg { ds_ix: i, r });
+                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
                 }
             })
         })
         .collect();
 
-    let measured_ds = stores[n_producers - 1].clone();
-    let p = Producer::from(queue);
-    barrier.wait();
-    let t0 = Instant::now();
-    for _ in 0..per_producer {
-        let r = measured_ds
-            .write(payload.len(), |head, tail| {
-                head.copy_from_slice(&payload[..head.len()]);
-                tail.copy_from_slice(&payload[head.len()..]);
-            })
-            .unwrap();
-        black_box(p.produce_without_first(&Msg { ds_ix: n_producers - 1, r }));
+    for p in producers {
+        p.join().unwrap();
     }
-    let elapsed = t0.elapsed();
+    let total_sum: u64 = consumers.into_iter().map(|c| c.join().unwrap()).sum();
+    Duration::from_nanos(total_sum / n_consumers as u64)
+}
 
-    for b in bg {
-        b.join().unwrap();
+// Crossbeam baseline. Returns sum of write-to-read latencies.
+fn run_crossbeam(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
+    let total = n_producers * per_producer;
+    let (tx, rx) = crossbeam_channel::bounded::<Box<[u8]>>(QUEUE_LEN);
+
+    let consumer = thread::spawn(move || {
+        let mut sum = 0u64;
+        let mut seen = 0usize;
+        while seen < total {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    sum += read_ts(&msg);
+                    seen += 1;
+                }
+                Err(TryRecvError::Empty) => spin_loop(),
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        sum
+    });
+
+    thread::sleep(Duration::from_millis(100));
+
+    let producers: Vec<_> = (0..n_producers)
+        .map(|_| {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut rng = now_nanos();
+                for _ in 0..per_producer {
+                    let mut msg = vec![0u8; msg_size].into_boxed_slice();
+                    write_ts(&mut msg);
+                    tx.send(black_box(msg.clone())).unwrap();
+                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
+                }
+            })
+        })
+        .collect();
+    drop(tx);
+
+    for p in producers {
+        p.join().unwrap();
     }
-    consumer.join().unwrap();
+    Duration::from_nanos(consumer.join().unwrap())
+}
+
+fn measure(
+    iters: u64,
+    np: usize,
+    max_pp: usize,
+    mut run: impl FnMut(usize, usize) -> Duration,
+) -> Duration {
+    let mut remaining = iters as usize;
+    let mut elapsed = Duration::ZERO;
+    while remaining > 0 {
+        let per_producer = (remaining / np).clamp(1, max_pp);
+        elapsed += run(np, per_producer);
+        remaining = remaining.saturating_sub(np * per_producer);
+    }
     elapsed
 }
 
-fn bench_consumer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("consumer");
+fn bench_latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("latency");
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(10);
 
-    // 50kb, 400kb
-    for msg_size in [51200usize, 409600] {
-        for n in [1usize, 2, 4] {
-            // iters = total messages consumed. Each batch: n_producers * pp messages,
-            // with pp <= max_pp guaranteeing the queue never laps.
+    for msg_size in [MSG_SIZE] {
+        for n in [2, 4] {
+            // n_producers * per_producer <= QUEUE_LEN keeps the queue from lapping.
             let max_pp = (QUEUE_LEN / n).max(1);
             group.throughput(Throughput::Bytes(msg_size as u64));
             group.bench_with_input(
-                BenchmarkId::new("mp", format!("{n}p_{msg_size}")),
+                BenchmarkId::new("shared", format!("{n}p_{msg_size}")),
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        let mut remaining = iters as usize;
-                        let mut elapsed = Duration::ZERO;
-                        while remaining > 0 {
-                            let per_producer = (remaining / np).min(max_pp);
-                            if per_producer == 0 {
-                                break;
-                            }
-                            elapsed += run_mp_consumer(np, msg_size, per_producer);
-                            remaining -= np * per_producer;
-                        }
-                        elapsed
+                        measure(iters, np, max_pp, |np, pp| run_mp(np, msg_size, pp))
                     })
                 },
             );
             group.bench_with_input(
-                BenchmarkId::new("sp", format!("{n}p_{msg_size}")),
+                BenchmarkId::new("per_producer", format!("{n}p_{msg_size}")),
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        let mut remaining = iters as usize;
-                        let mut elapsed = Duration::ZERO;
-                        while remaining > 0 {
-                            let per_producer = (remaining / np).min(max_pp);
-                            if per_producer == 0 {
-                                break;
-                            }
-                            elapsed += run_sp_consumer(np, msg_size, per_producer);
-                            remaining -= np * per_producer;
-                        }
-                        elapsed
+                        measure(iters, np, max_pp, |np, pp| run_sp(np, msg_size, pp))
                     })
                 },
             );
@@ -422,17 +369,25 @@ fn bench_consumer(c: &mut Criterion) {
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        let mut remaining = iters as usize;
-                        let mut elapsed = Duration::ZERO;
-                        while remaining > 0 {
-                            let per_producer = (remaining / np).min(max_pp);
-                            if per_producer == 0 {
-                                break;
-                            }
-                            elapsed += run_mp_crossbeam_consumer(np, msg_size, per_producer);
-                            remaining -= np * per_producer;
-                        }
-                        elapsed
+                        measure(iters, np, max_pp, |np, pp| run_crossbeam(np, msg_size, pp))
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("shared_4c", format!("{n}p_{msg_size}")),
+                &n,
+                |b, &np| {
+                    b.iter_custom(|iters| {
+                        measure(iters, np, max_pp, |np, pp| run_mp_mc(np, 4, msg_size, pp))
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("per_producer_4c", format!("{n}p_{msg_size}")),
+                &n,
+                |b, &np| {
+                    b.iter_custom(|iters| {
+                        measure(iters, np, max_pp, |np, pp| run_sp_mc(np, 4, msg_size, pp))
                     })
                 },
             );
@@ -442,71 +397,5 @@ fn bench_consumer(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_producer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("producer");
-    group.measurement_time(Duration::from_secs(5));
-    group.sample_size(10);
-
-    // 50kb, 400kb
-    for msg_size in [51200usize, 409600] {
-        for n in [1usize, 2, 4] {
-            // iters = main-thread produces. Each batch: pp of them, with
-            // n_producers * pp <= QUEUE_LEN guaranteeing the queue never laps.
-            let max_pp = (QUEUE_LEN / n).max(1);
-            group.throughput(Throughput::Bytes(msg_size as u64));
-            group.bench_with_input(
-                BenchmarkId::new("mp", format!("{n}p_{msg_size}")),
-                &n,
-                |b, &np| {
-                    b.iter_custom(|iters| {
-                        let mut remaining = iters as usize;
-                        let mut elapsed = Duration::ZERO;
-                        while remaining > 0 {
-                            let per_producer = remaining.min(max_pp);
-                            elapsed += run_mp_producer(np, msg_size, per_producer);
-                            remaining -= per_producer;
-                        }
-                        elapsed
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("sp", format!("{n}p_{msg_size}")),
-                &n,
-                |b, &np| {
-                    b.iter_custom(|iters| {
-                        let mut remaining = iters as usize;
-                        let mut elapsed = Duration::ZERO;
-                        while remaining > 0 {
-                            let per_producer = remaining.min(max_pp);
-                            elapsed += run_sp_producer(np, msg_size, per_producer);
-                            remaining -= per_producer;
-                        }
-                        elapsed
-                    })
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("crossbeam", format!("{n}p_{msg_size}")),
-                &n,
-                |b, &np| {
-                    b.iter_custom(|iters| {
-                        let mut remaining = iters as usize;
-                        let mut elapsed = Duration::ZERO;
-                        while remaining > 0 {
-                            let per_producer = remaining.min(max_pp);
-                            elapsed += run_mp_crossbeam_producer(np, msg_size, per_producer);
-                            remaining -= per_producer;
-                        }
-                        elapsed
-                    })
-                },
-            );
-        }
-    }
-
-    group.finish();
-}
-
-criterion_group!(benches, bench_consumer, bench_producer,);
+criterion_group!(benches, bench_latency);
 criterion_main!(benches);
