@@ -1,4 +1,5 @@
 use std::{
+    alloc::{self, Layout},
     cell::UnsafeCell,
     sync::atomic::{AtomicUsize, Ordering::*, compiler_fence},
 };
@@ -30,20 +31,31 @@ pub enum DCacheError {
 pub struct DCache<const N: usize> {
     reserved: AtomicUsize,
     _pad: [u8; CACHELINE - size_of::<AtomicUsize>()],
-    data: Box<UnsafeCell<[u8; N]>>,
+    data: Box<UnsafeCell<Aligned<N>>>,
 }
 
 const CACHELINE: usize = 64;
+
+#[repr(C, align(64))]
+struct Aligned<const N: usize>([u8; N]);
 
 impl<const N: usize> DCache<N> {
     const OFFSET: usize = size_of::<usize>();
 
     pub fn new() -> Self {
         const { assert!(N.is_power_of_two() && N.is_multiple_of(CACHELINE)) };
+        let data = unsafe {
+            let layout = Layout::new::<UnsafeCell<Aligned<N>>>();
+            let ptr = alloc::alloc_zeroed(layout);
+            if ptr.is_null() {
+                alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(ptr.cast::<UnsafeCell<Aligned<N>>>())
+        };
         Self {
             reserved: AtomicUsize::new(0),
             _pad: [0; CACHELINE - size_of::<AtomicUsize>()],
-            data: Box::new(UnsafeCell::new([0u8; N])),
+            data,
         }
     }
 
