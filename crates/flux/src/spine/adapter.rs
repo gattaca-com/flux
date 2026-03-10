@@ -185,21 +185,22 @@ impl<S: FluxSpine> SpineAdapter<S> {
         consumed
     }
 
-    /// Point this tile's collaborative consumer for queue `T` at a named
-    /// persistent group. The group's cursor is backed by a shared-memory file
-    /// that survives restarts. Call this once in `Tile::init`.
+    /// Override the collaborative group label for queue `T`. By default each
+    /// tile instance gets a unique label (`TileType-N`) set automatically at
+    /// attach time. Group label can be set in `Tile::init` to share a group
+    /// across several tiles
     ///
     /// ```ignore
     /// fn init(&mut self, adapter: &mut SpineAdapter<MySpine>) {
-    ///     adapter.set_collaborative_group::<OrderUpdate>("local_group");
+    ///     adapter.set_collaborative_group::<OrderUpdate>("group_label");
     /// }
     /// ```
-    pub fn set_collaborative_group<T: 'static + Copy>(&mut self, label: &str)
+    pub fn set_collaborative_group<T: 'static + Copy>(&mut self, group_label: &'static str)
     where
         S::Consumers: AsMut<SpineConsumer<T>>,
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
-        c.inner.set_collaborative_group(label);
+        c.inner.set_collaborative_group(group_label);
     }
 
     #[inline]

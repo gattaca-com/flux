@@ -5,8 +5,7 @@ use crate::{
 
 #[test]
 fn headersize() {
-    // Two cache lines: line 0 = producer fields (count), line 1 = consume_cursor
-    assert_eq!(64, std::mem::size_of::<QueueHeader>());
+    assert_eq!(4160, std::mem::size_of::<QueueHeader>());
     assert_eq!(72, std::mem::size_of::<ConsumerBare<[u8; 60]>>())
 }
 
