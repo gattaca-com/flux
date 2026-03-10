@@ -556,7 +556,7 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline]
     pub fn recover_after_error(&mut self) {
-        self.expected_version += 2;
+        self.set_broadcast_pos(self.queue.count());
     }
 
     #[inline]
