@@ -34,8 +34,14 @@ fn write_ts(buf: &mut [u8]) {
 }
 
 #[inline]
-fn read_ts(buf: &[u8]) -> u64 {
-    now_nanos() - u64::from_ne_bytes(buf[..8].try_into().unwrap())
+fn read_ts(head: &[u8], tail: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = head.len().min(8);
+    buf[..n].copy_from_slice(&head[..n]);
+    if n < 8 {
+        buf[n..].copy_from_slice(&tail[..8 - n]);
+    }
+    now_nanos() - u64::from_ne_bytes(buf)
 }
 
 #[inline]
@@ -65,7 +71,7 @@ fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
         while seen < total {
             match c.try_consume(&mut r) {
                 Ok(()) => {
-                    sum += dc_c.map::<u64, _, MSG_SIZE>(r, read_ts).unwrap();
+                    sum += dc_c.map(r, read_ts).unwrap();
                     seen += 1;
                 }
                 Err(ReadError::SpedPast) => c.recover_after_error(),
@@ -115,9 +121,7 @@ fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
         while seen < total {
             match c.try_consume(&mut slot) {
                 Ok(()) => {
-                    sum += consumer_stores[slot.ds_ix]
-                        .map::<u64, _, MSG_SIZE>(slot.r, read_ts)
-                        .unwrap();
+                    sum += consumer_stores[slot.ds_ix].map(slot.r, read_ts).unwrap();
                     seen += 1;
                 }
                 Err(ReadError::SpedPast) => c.recover_after_error(),
@@ -175,7 +179,7 @@ fn run_mp_mc(
                 while seen < total {
                     match c.try_consume(&mut r) {
                         Ok(()) => {
-                            sum += dc_c.map::<u64, _, MSG_SIZE>(r, read_ts).unwrap();
+                            sum += dc_c.map(r, read_ts).unwrap();
                             seen += 1;
                         }
                         Err(ReadError::SpedPast) => c.recover_after_error(),
@@ -235,9 +239,7 @@ fn run_sp_mc(
                 while seen < total {
                     match c.try_consume(&mut slot) {
                         Ok(()) => {
-                            sum += consumer_stores[slot.ds_ix]
-                                .map::<u64, _, MSG_SIZE>(slot.r, read_ts)
-                                .unwrap();
+                            sum += consumer_stores[slot.ds_ix].map(slot.r, read_ts).unwrap();
                             seen += 1;
                         }
                         Err(ReadError::SpedPast) => c.recover_after_error(),
@@ -286,7 +288,7 @@ fn run_crossbeam(n_producers: usize, msg_size: usize, per_producer: usize) -> Du
         while seen < total {
             match rx.try_recv() {
                 Ok(msg) => {
-                    sum += read_ts(&msg);
+                    sum += now_nanos() - u64::from_ne_bytes(msg[..8].try_into().unwrap());
                     seen += 1;
                 }
                 Err(TryRecvError::Empty) => spin_loop(),

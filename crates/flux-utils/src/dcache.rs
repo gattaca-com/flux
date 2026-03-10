@@ -99,13 +99,13 @@ impl<const N: usize> DCache<N> {
         }
     }
 
-    /// Applies the function to the data referenced by DCacheRef.
-    /// The user must be prepared to tolerate execution on stale / invalid data,
-    /// otherwise they should prefer to use read instead
+    /// Applies f to the (head, tail) slices of the payload. Tail is empty when
+    /// the payload is contiguous. The caller must be able to tolerate execution
+    /// on stale / invalid data; prefer `read` if that is unacceptable.
     #[inline]
-    pub fn map<T, F, const C: usize>(&self, r: DCacheRef, f: F) -> Result<T, DCacheError>
+    pub fn map<T, F>(&self, r: DCacheRef, f: F) -> Result<T, DCacheError>
     where
-        F: FnOnce(&[u8]) -> T,
+        F: FnOnce(&[u8], &[u8]) -> T,
     {
         if r.len > N - Self::OFFSET {
             return Err(DCacheError::DataLenExceedsCapacity(r.len, N - Self::OFFSET));
@@ -119,15 +119,15 @@ impl<const N: usize> DCache<N> {
         }
 
         let payload_ix = (r.offset + Self::OFFSET) & (N - 1);
-        let result = if r.len > N - payload_ix {
-            if r.len > C {
-                return Err(DCacheError::DataLenExceedsCapacity(r.len, C));
+        let result = unsafe {
+            if r.len > N - payload_ix {
+                let head_len = N - payload_ix;
+                let head = std::slice::from_raw_parts(base.add(payload_ix), head_len);
+                let tail = std::slice::from_raw_parts(base, r.len - head_len);
+                f(head, tail)
+            } else {
+                f(std::slice::from_raw_parts(base.add(payload_ix), r.len), &[])
             }
-            let mut buf = [0u8; C];
-            self.copy(base, r.len, r.offset + Self::OFFSET, &mut buf);
-            f(&buf[..r.len])
-        } else {
-            f(unsafe { std::slice::from_raw_parts(base.add(payload_ix), r.len) })
         };
 
         compiler_fence(AcqRel);
@@ -159,8 +159,7 @@ impl<const N: usize> DCache<N> {
         let from_ix = from & (N - 1);
         let base = self.data.get().cast::<u8>();
 
-        // from_ix is cacheline-aligned so from_ix + Self::OFFSET <= N; no wrap for
-        // header.
+        // from_ix is cacheline-aligned: from_ix + Self::OFFSET <= N
         unsafe { base.add(from_ix).cast::<usize>().write_unaligned(from) };
 
         let payload_ix = from_ix + Self::OFFSET;
@@ -290,8 +289,7 @@ mod tests {
     fn map_contiguous() {
         let dc: DCache<64> = DCache::new();
         let r = dc.write(5, |head, _| head.copy_from_slice(b"hello")).unwrap();
-        // from_ix=0, 0+5 <= 64 → zero-copy path, C unused
-        let got = dc.map::<_, _, 64>(r, |s| s.to_vec()).unwrap();
+        let got = dc.map(r, |head, _| head.to_vec()).unwrap();
         assert_eq!(got, b"hello");
     }
 
@@ -313,7 +311,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(r.offset, 64); // from_ix=64, payload_ix=72, 72+80=152>128 → wrap path
-        let got = dc.map::<_, _, 80>(r, |s| s.to_vec()).unwrap();
+        let got = dc
+            .map(r, |head, tail| {
+                let mut v = head.to_vec();
+                v.extend_from_slice(tail);
+                v
+            })
+            .unwrap();
         assert!(got.iter().all(|&b| b == 0xBB));
     }
 
