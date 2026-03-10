@@ -391,23 +391,12 @@ impl<const N: usize> ArrayStr<N> {
 }
 
 /// Error returned when string exceeds ArrayStr capacity.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("string length {len} exceeds capacity {capacity}; use from_str_truncate() to truncate")]
 pub struct ArrayStrTooLong {
     pub len: usize,
     pub capacity: usize,
 }
-
-impl core::fmt::Display for ArrayStrTooLong {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "string length {} exceeds capacity {}; use from_str_truncate() to truncate",
-            self.len, self.capacity
-        )
-    }
-}
-
-impl std::error::Error for ArrayStrTooLong {}
 
 impl<const N: usize> TryFrom<&str> for ArrayStr<N> {
     type Error = ArrayStrTooLong;
