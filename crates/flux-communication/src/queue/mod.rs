@@ -4,9 +4,22 @@ use std::{
     mem::size_of,
     ops::Deref,
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
+
+fn binary_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_owned())
+    })
+}
 
 use flux_utils::safe_panic;
 use rand::Rng;
@@ -398,15 +411,11 @@ impl<T: std::fmt::Debug> std::fmt::Debug for InnerQueue<T> {
 #[derive(Clone, Copy, Debug)]
 pub struct Queue<T> {
     inner: *const InnerQueue<T>,
-    /// Label identifying the collaborative group/broadcast for this consumer.
-    /// Format: `TileType-N.{broadcast|collaborative}`.  `None` for
-    /// heap-allocated (test) queues.
-    label: Option<&'static str>,
 }
 
 impl<T: Copy> Queue<T> {
     pub fn new(len: usize, queue_type: QueueType) -> Self {
-        Self { inner: InnerQueue::new(len, queue_type), label: None }
+        Self { inner: InnerQueue::new(len, queue_type) }
     }
 
     pub fn create_or_open_shared<P: AsRef<Path>>(
@@ -415,7 +424,7 @@ impl<T: Copy> Queue<T> {
         queue_type: QueueType,
     ) -> Self {
         let shmem_file = shmem_file.as_ref();
-        Self { inner: InnerQueue::create_or_open_shared(shmem_file, len, queue_type), label: None }
+        Self { inner: InnerQueue::create_or_open_shared(shmem_file, len, queue_type) }
     }
 
     pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
@@ -423,26 +432,11 @@ impl<T: Copy> Queue<T> {
         Self {
             inner: InnerQueue::open_shared(shmem_file)
                 .expect("Couldn't open shared queue, was it initialized?"),
-            label: None,
         }
     }
 
-    pub fn with_label(mut self, label: &'static str) -> Self {
-        self.label = Some(label);
-        self
-    }
-
-    pub fn set_label(&mut self, label: &'static str) {
-        self.label = Some(label);
-    }
-
-    /// Returns a pointer to the shared `AtomicUsize` cursor for the given
-    /// group, stored in the queue header itself (works for both shmem and
-    /// heap queues).
-    fn group_cursor(&mut self, suffix: &str) -> *const AtomicUsize {
-        let label = self.label.unwrap_or("");
-        let key = format!("{label}.{suffix}");
-        unsafe { &mut *(self.inner as *mut InnerQueue<T>) }.header.find_or_insert_group(&key)
+    fn group_cursor(&self, key: &str) -> *const AtomicUsize {
+        unsafe { &mut *(self.inner as *mut InnerQueue<T>) }.header.find_or_insert_group(key)
     }
 }
 
@@ -519,13 +513,14 @@ pub struct ConsumerBare<T> {
     is_running: u8,             // 25
     _pad: [u8; 7],              // 32
     cursor: *const AtomicUsize, // 40
-    queue: Queue<T>,            // 48 fat ptr: (usize, pointer)
+    label: &'static str,        // 56 (ptr + len)
+    queue: Queue<T>,            // 64 fat ptr: (usize, pointer)
 }
 
 unsafe impl<T> Send for ConsumerBare<T> {}
 
 impl<T: Copy> ConsumerBare<T> {
-    pub fn new(queue: Queue<T>) -> Self {
+    pub fn new(queue: Queue<T>, label: &'static str) -> Self {
         Self {
             pos: usize::MAX,
             mask: queue.header.mask,
@@ -533,28 +528,26 @@ impl<T: Copy> ConsumerBare<T> {
             is_running: 1,
             _pad: [0; 7],
             cursor: std::ptr::null(),
+            label,
             queue,
         }
     }
 
     #[cfg(test)]
-    pub fn new_broadcast_test(mut queue: Queue<T>) -> Self {
+    pub fn new_broadcast_test(queue: Queue<T>) -> Self {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let label = std::boxed::Box::leak(format!("{}", id).into_boxed_str());
-        queue.set_label(label);
 
-        let mut s = Self::new(queue);
+        let mut s = Self::new(queue, label);
         s.try_init_broadcast();
         s
     }
 
     #[cfg(test)]
-    pub fn new_collaborative_test(mut queue: Queue<T>, label: &'static str) -> Self {
-        queue.set_label(label);
-
-        let mut s = Self::new(queue);
+    pub fn new_collaborative_test(queue: Queue<T>, label: &'static str) -> Self {
+        let mut s = Self::new(queue, label);
         s.try_init_collaborative();
         s
     }
@@ -611,7 +604,9 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn try_init_broadcast(&mut self) {
         if self.cursor.is_null() {
-            self.cursor = self.queue.group_cursor("broadcast");
+            self.cursor = self
+                .queue
+                .group_cursor(&format!("{}.{}.broadcast", binary_name(), self.label));
 
             // Always set current producer position without restoring value from cursor
             self.set_broadcast_pos(self.queue.count());
@@ -621,7 +616,9 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     pub fn try_init_collaborative(&mut self) {
         if self.cursor.is_null() {
-            self.cursor = self.queue.group_cursor("collaborative");
+            self.cursor = self
+                .queue
+                .group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
             self.acquire_next_slot();
         }
     }
@@ -658,16 +655,17 @@ impl<T: Copy> ConsumerBare<T> {
     }
 
     pub fn set_collaborative_group(&mut self, group_label: &'static str) {
-        self.queue.set_label(group_label);
+        self.label = group_label;
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn init_header(consumer_ptr: *mut ConsumerBare<T>, queue: Queue<T>) {
+    pub fn init_header(consumer_ptr: *mut ConsumerBare<T>, queue: Queue<T>, label: &'static str) {
         unsafe {
             (*consumer_ptr).pos = usize::MAX;
             (*consumer_ptr).expected_version = 0;
             (*consumer_ptr).mask = queue.header.mask;
             (*consumer_ptr).cursor = std::ptr::null();
+            (*consumer_ptr).label = label;
             (*consumer_ptr).queue = queue;
         }
     }
@@ -714,8 +712,8 @@ impl<T: 'static + Copy> Consumer<T> {
         }
     }
 
-    pub fn new(queue: Queue<T>) -> Self {
-        Self::from_bare(ConsumerBare::new(queue))
+    pub fn new(queue: Queue<T>, label: &'static str) -> Self {
+        Self::from_bare(ConsumerBare::new(queue, label))
     }
 
     #[cfg(test)]
@@ -826,11 +824,6 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 }
 
-impl<T: 'static + Copy> From<Queue<T>> for Consumer<T> {
-    fn from(queue: Queue<T>) -> Self {
-        Self::new(queue)
-    }
-}
 
 #[cfg(test)]
 mod tests_basic;
