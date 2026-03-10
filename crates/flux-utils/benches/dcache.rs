@@ -18,7 +18,7 @@ struct Msg {
 
 const CAPACITY: usize = 64 * 1024 * 1024; // ~164 x 400KB messages before ring wraps
 const QUEUE_LEN: usize = 1024 * 16;
-const MSG_SIZE: usize = 64; // 400kb
+const MSG_SIZE: usize = 64;
 const LAST_CORE: usize = 15;
 
 #[inline]

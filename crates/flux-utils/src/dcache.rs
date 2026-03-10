@@ -57,43 +57,18 @@ impl DCache {
     }
 
     #[inline]
-    fn capacity(&self) -> usize {
-        size_of_val(&self.data)
-    }
-
-    #[inline]
     pub fn read(&self, r: DCacheRef, buf: &mut [u8]) -> Result<(), DCacheError> {
         if r.len > buf.len() {
             return Err(DCacheError::BufferTooSmall(buf.len(), r.len));
         }
-
-        let n = self.capacity();
-        let base = self.data.get() as *mut u8;
-        let offset_ix = r.offset & (n - 1);
-
-        if r.len > n - offset_ix - Self::OFFSET {
-            return Err(DCacheError::DataLenExceedsCapacity(r.len, n - Self::OFFSET));
-        }
-
-        if !Self::offsets_match(base, offset_ix, r.offset) {
-            return Err(DCacheError::StaleData);
-        }
-
-        unsafe {
+        let (base, offset_ix) = self.deref(r)?;
+        Self::stale_guarded(base, offset_ix, r.offset, || unsafe {
             std::ptr::copy_nonoverlapping(
                 base.add(offset_ix + Self::OFFSET),
                 buf.as_mut_ptr(),
                 r.len,
             );
-        }
-
-        compiler_fence(AcqRel);
-
-        if !Self::offsets_match(base, offset_ix, r.offset) {
-            return Err(DCacheError::StaleData);
-        }
-
-        Ok(())
+        })
     }
 
     /// Applies `f` to the payload slice. The caller must be able to tolerate
@@ -104,39 +79,10 @@ impl DCache {
     where
         F: FnOnce(&[u8]) -> T,
     {
-        let n = self.capacity();
-        let base = self.data.get() as *mut u8;
-        let offset_ix = r.offset & (n - 1);
-
-        if r.len > n - offset_ix - Self::OFFSET {
-            return Err(DCacheError::DataLenExceedsCapacity(r.len, n - Self::OFFSET));
-        }
-
-        if !Self::offsets_match(base, offset_ix, r.offset) {
-            return Err(DCacheError::StaleData);
-        }
-
-        let result =
-            unsafe { f(std::slice::from_raw_parts(base.add(offset_ix + Self::OFFSET), r.len)) };
-
-        compiler_fence(AcqRel);
-
-        if !Self::offsets_match(base, offset_ix, r.offset) {
-            return Err(DCacheError::StaleData);
-        }
-
-        Ok(result)
-    }
-
-    #[inline]
-    fn offsets_match(base: *mut u8, offset_ix: usize, expected_offset: usize) -> bool {
-        let offset = unsafe { base.add(offset_ix).cast::<usize>().read() };
-        offset == expected_offset
-    }
-
-    #[inline]
-    fn next_multiple_of_64(x: usize) -> usize {
-        (x + 63) & !63
+        let (base, offset_ix) = self.deref(r)?;
+        Self::stale_guarded(base, offset_ix, r.offset, || unsafe {
+            f(std::slice::from_raw_parts(base.add(offset_ix + Self::OFFSET), r.len))
+        })
     }
 
     #[inline]
@@ -178,6 +124,54 @@ impl DCache {
         }
 
         Ok(DCacheRef { offset: from, len })
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        size_of_val(&self.data)
+    }
+
+    #[inline]
+    fn deref(&self, r: DCacheRef) -> Result<(*mut u8, usize), DCacheError> {
+        let n = self.capacity();
+        let base = self.data.get() as *mut u8;
+        let offset_ix = r.offset & (n - 1);
+        if r.len > n - offset_ix - Self::OFFSET {
+            return Err(DCacheError::DataLenExceedsCapacity(r.len, n - Self::OFFSET));
+        }
+        Ok((base, offset_ix))
+    }
+
+    #[inline]
+    fn stale_guarded<T, F>(
+        base: *mut u8,
+        offset_ix: usize,
+        expected_offset: usize,
+        f: F,
+    ) -> Result<T, DCacheError>
+    where
+        F: FnOnce() -> T,
+    {
+        if !Self::offsets_match(base, offset_ix, expected_offset) {
+            return Err(DCacheError::StaleData);
+        }
+        let result = f();
+        compiler_fence(AcqRel);
+        if !Self::offsets_match(base, offset_ix, expected_offset) {
+            return Err(DCacheError::StaleData);
+        }
+        Ok(result)
+    }
+
+    #[inline]
+    fn offsets_match(base: *mut u8, offset_ix: usize, expected_offset: usize) -> bool {
+        let offset = unsafe { base.add(offset_ix).cast::<usize>().read() };
+        offset == expected_offset
+    }
+
+    #[inline]
+    fn next_multiple_of_64(x: usize) -> usize {
+        (x + 63) & !63
     }
 }
 
