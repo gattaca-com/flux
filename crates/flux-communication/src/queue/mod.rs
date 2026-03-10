@@ -109,23 +109,16 @@ impl QueueHeader {
 
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == key_padded {
-                let cursor_val = self.group_cursors[i].cursor.load(Ordering::Relaxed);
-                tracing::info!(group_key = %key, slot = i, cursor_val, "group: found existing");
                 return &raw const self.group_cursors[i].cursor;
             }
         }
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == [0u8; GROUP_LABEL_LEN] {
                 self.group_labels[i].copy_from_slice(&key_padded);
-                let cursor_val = self.group_cursors[i].cursor.load(Ordering::Relaxed);
-                tracing::info!(group_key = %key, slot = i, cursor_val, "group: inserted new");
                 return &raw const self.group_cursors[i].cursor;
             }
         }
-        for i in 0..MAX_GROUPS {
-            let label = String::from_utf8_lossy(&self.group_labels[i]);
-            tracing::error!(slot = i, label = %label.trim_end_matches('\0'), "group: slot occupied");
-        }
+
         panic!("no group slots available (max {} groups)", MAX_GROUPS);
     }
 }
