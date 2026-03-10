@@ -1,16 +1,13 @@
-use std::{
-    hint::{black_box, spin_loop},
-    sync::Arc,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{hint::black_box, sync::Arc, thread};
 
+use core_affinity::CoreId;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_channel::TryRecvError;
 use flux_communication::{
     ReadError,
     queue::{ConsumerBare, Producer, Queue, QueueType},
 };
+use flux_timing::{Duration, Instant};
 use flux_utils::{DCache, DCacheRef};
 
 #[derive(Clone, Copy)]
@@ -21,11 +18,12 @@ struct Msg {
 
 const CAPACITY: usize = 64 * 1024 * 1024; // ~164 x 400KB messages before ring wraps
 const QUEUE_LEN: usize = 1024 * 16;
-const MSG_SIZE: usize = 409600; // 400kb
+const MSG_SIZE: usize = 64; // 400kb
+const LAST_CORE: usize = 15;
 
 #[inline]
 fn now_nanos() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    Instant::now().0
 }
 
 #[inline]
@@ -34,14 +32,8 @@ fn write_ts(buf: &mut [u8]) {
 }
 
 #[inline]
-fn read_ts(head: &[u8], tail: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    let n = head.len().min(8);
-    buf[..n].copy_from_slice(&head[..n]);
-    if n < 8 {
-        buf[n..].copy_from_slice(&tail[..8 - n]);
-    }
-    now_nanos() - u64::from_ne_bytes(buf)
+fn read_ts(buf: &[u8]) -> u64 {
+    now_nanos() - u64::from_ne_bytes(buf[..8].try_into().unwrap())
 }
 
 #[inline]
@@ -52,6 +44,12 @@ fn xorshift(s: &mut u64) -> u64 {
     *s
 }
 
+#[inline]
+fn busy_wait(duration: Duration) {
+    let curr = Instant::now();
+    while curr.elapsed() < duration {}
+}
+
 // Caller must ensure n_producers * per_producer <= QUEUE_LEN to prevent
 // ConsumerBare version corruption from queue lapping.
 
@@ -59,11 +57,12 @@ fn xorshift(s: &mut u64) -> u64 {
 // latencies.
 fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
-    let dc = Arc::new(DCache::<CAPACITY>::new());
+    let dc: Arc<DCache> = Arc::from(DCache::new(CAPACITY));
     let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
 
     let dc_c = dc.clone();
     let consumer = thread::spawn(move || {
+        core_affinity::set_for_current(CoreId { id: LAST_CORE });
         let mut c = ConsumerBare::from(queue);
         let mut r = DCacheRef { offset: 0, len: 0 };
         let mut sum = 0u64;
@@ -75,24 +74,26 @@ fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
                     seen += 1;
                 }
                 Err(ReadError::SpedPast) => c.recover_after_error(),
-                Err(ReadError::Empty) => spin_loop(),
+                Err(ReadError::Empty) => {}
             }
         }
         sum
     });
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(100).into());
 
     let producers: Vec<_> = (0..n_producers)
-        .map(|_| {
+        .map(|i| {
             let dc = dc.clone();
             let p = Producer::from(queue);
             thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - 1 - i });
                 let mut rng = now_nanos();
                 for _ in 0..per_producer {
-                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
+                    let r = dc.write(msg_size, write_ts).unwrap();
                     p.produce_without_first(&r);
-                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
+                    let duration = Duration::from_micros(xorshift(&mut rng) % 100);
+                    busy_wait(duration);
                 }
             })
         })
@@ -108,12 +109,13 @@ fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
 // latencies.
 fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
-    let stores: Vec<Arc<DCache<CAPACITY>>> =
-        (0..n_producers).map(|_| Arc::new(DCache::new())).collect();
+    let stores: Vec<Arc<DCache>> =
+        (0..n_producers).map(|_| Arc::from(DCache::new(CAPACITY))).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumer_stores = stores.clone();
     let consumer = thread::spawn(move || {
+        core_affinity::set_for_current(CoreId { id: LAST_CORE });
         let mut c = ConsumerBare::from(queue);
         let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
         let mut sum = 0u64;
@@ -125,13 +127,13 @@ fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
                     seen += 1;
                 }
                 Err(ReadError::SpedPast) => c.recover_after_error(),
-                Err(ReadError::Empty) => spin_loop(),
+                Err(ReadError::Empty) => {}
             }
         }
         sum
     });
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(100).into());
 
     let producers: Vec<_> = stores
         .iter()
@@ -140,11 +142,13 @@ fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
             let dc = dc.clone();
             let p = Producer::from(queue);
             thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - 1 - i });
                 let mut rng = now_nanos();
                 for _ in 0..per_producer {
-                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
+                    let r = dc.write(msg_size, write_ts).unwrap();
                     p.produce_without_first(&Msg { ds_ix: i, r });
-                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
+                    let duration = Duration::from_micros(xorshift(&mut rng) % 100);
+                    busy_wait(duration);
                 }
             })
         })
@@ -165,14 +169,15 @@ fn run_mp_mc(
     per_producer: usize,
 ) -> Duration {
     let total = n_producers * per_producer;
-    let dc = Arc::new(DCache::<CAPACITY>::new());
+    let dc: Arc<DCache> = Arc::from(DCache::new(CAPACITY));
     let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumers: Vec<_> = (0..n_consumers)
-        .map(|_| {
+        .map(|i| {
             let dc_c = dc.clone();
             let mut c = ConsumerBare::from(queue);
             thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
                 let mut r = DCacheRef { offset: 0, len: 0 };
                 let mut sum = 0u64;
                 let mut seen = 0usize;
@@ -183,7 +188,7 @@ fn run_mp_mc(
                             seen += 1;
                         }
                         Err(ReadError::SpedPast) => c.recover_after_error(),
-                        Err(ReadError::Empty) => spin_loop(),
+                        Err(ReadError::Empty) => {}
                     }
                 }
                 sum
@@ -191,18 +196,20 @@ fn run_mp_mc(
         })
         .collect();
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(100).into());
 
     let producers: Vec<_> = (0..n_producers)
-        .map(|_| {
+        .map(|i| {
             let dc = dc.clone();
             let p = Producer::from(queue);
             thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - n_consumers - i });
                 let mut rng = now_nanos();
                 for _ in 0..per_producer {
-                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
+                    let r = dc.write(msg_size, write_ts).unwrap();
                     p.produce_without_first(&r);
-                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
+                    let duration = Duration::from_micros(xorshift(&mut rng) % 100);
+                    busy_wait(duration);
                 }
             })
         })
@@ -224,15 +231,16 @@ fn run_sp_mc(
     per_producer: usize,
 ) -> Duration {
     let total = n_producers * per_producer;
-    let stores: Vec<Arc<DCache<CAPACITY>>> =
-        (0..n_producers).map(|_| Arc::new(DCache::new())).collect();
+    let stores: Vec<Arc<DCache>> =
+        (0..n_producers).map(|_| Arc::from(DCache::new(CAPACITY))).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumers: Vec<_> = (0..n_consumers)
-        .map(|_| {
+        .map(|i| {
             let consumer_stores = stores.clone();
             let mut c = ConsumerBare::from(queue);
             thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
                 let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
                 let mut sum = 0u64;
                 let mut seen = 0usize;
@@ -243,7 +251,7 @@ fn run_sp_mc(
                             seen += 1;
                         }
                         Err(ReadError::SpedPast) => c.recover_after_error(),
-                        Err(ReadError::Empty) => spin_loop(),
+                        Err(ReadError::Empty) => {}
                     }
                 }
                 sum
@@ -251,7 +259,7 @@ fn run_sp_mc(
         })
         .collect();
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(100).into());
 
     let producers: Vec<_> = stores
         .iter()
@@ -260,11 +268,13 @@ fn run_sp_mc(
             let dc = dc.clone();
             let p = Producer::from(queue);
             thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - n_consumers - i });
                 let mut rng = now_nanos();
                 for _ in 0..per_producer {
-                    let r = dc.write(msg_size, |head, _| write_ts(head)).unwrap();
+                    let r = dc.write(msg_size, write_ts).unwrap();
                     p.produce_without_first(&Msg { ds_ix: i, r });
-                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
+                    let duration = Duration::from_micros(xorshift(&mut rng) % 100);
+                    busy_wait(duration);
                 }
             })
         })
@@ -291,14 +301,14 @@ fn run_crossbeam(n_producers: usize, msg_size: usize, per_producer: usize) -> Du
                     sum += now_nanos() - u64::from_ne_bytes(msg[..8].try_into().unwrap());
                     seen += 1;
                 }
-                Err(TryRecvError::Empty) => spin_loop(),
+                Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => break,
             }
         }
         sum
     });
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(100).into());
 
     let producers: Vec<_> = (0..n_producers)
         .map(|_| {
@@ -309,7 +319,8 @@ fn run_crossbeam(n_producers: usize, msg_size: usize, per_producer: usize) -> Du
                     let mut msg = vec![0u8; msg_size].into_boxed_slice();
                     write_ts(&mut msg);
                     tx.send(black_box(msg.clone())).unwrap();
-                    thread::sleep(Duration::from_micros(xorshift(&mut rng) % 100));
+                    let duration = Duration::from_micros(xorshift(&mut rng) % 100);
+                    busy_wait(duration);
                 }
             })
         })
@@ -340,7 +351,7 @@ fn measure(
 
 fn bench_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("latency");
-    group.measurement_time(Duration::from_secs(5));
+    group.measurement_time(Duration::from_secs(5).into());
     group.sample_size(10);
 
     for msg_size in [MSG_SIZE] {
@@ -353,7 +364,7 @@ fn bench_latency(c: &mut Criterion) {
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        measure(iters, np, max_pp, |np, pp| run_mp(np, msg_size, pp))
+                        measure(iters, np, max_pp, |np, pp| run_mp(np, msg_size, pp)).into()
                     })
                 },
             );
@@ -362,7 +373,7 @@ fn bench_latency(c: &mut Criterion) {
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        measure(iters, np, max_pp, |np, pp| run_sp(np, msg_size, pp))
+                        measure(iters, np, max_pp, |np, pp| run_sp(np, msg_size, pp)).into()
                     })
                 },
             );
@@ -371,7 +382,7 @@ fn bench_latency(c: &mut Criterion) {
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        measure(iters, np, max_pp, |np, pp| run_crossbeam(np, msg_size, pp))
+                        measure(iters, np, max_pp, |np, pp| run_crossbeam(np, msg_size, pp)).into()
                     })
                 },
             );
@@ -380,7 +391,7 @@ fn bench_latency(c: &mut Criterion) {
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        measure(iters, np, max_pp, |np, pp| run_mp_mc(np, 4, msg_size, pp))
+                        measure(iters, np, max_pp, |np, pp| run_mp_mc(np, 4, msg_size, pp)).into()
                     })
                 },
             );
@@ -389,7 +400,7 @@ fn bench_latency(c: &mut Criterion) {
                 &n,
                 |b, &np| {
                     b.iter_custom(|iters| {
-                        measure(iters, np, max_pp, |np, pp| run_sp_mc(np, 4, msg_size, pp))
+                        measure(iters, np, max_pp, |np, pp| run_sp_mc(np, 4, msg_size, pp)).into()
                     })
                 },
             );

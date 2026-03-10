@@ -1,6 +1,7 @@
 use std::{
     alloc::{self, Layout},
     cell::UnsafeCell,
+    mem::size_of_val,
     sync::atomic::{AtomicUsize, Ordering::*, compiler_fence},
 };
 
@@ -27,55 +28,64 @@ pub enum DCacheError {
 /// Intended use: the caller exchanges [`DCacheRef`]s through an external
 /// ordered channel (e.g. a spine queue) and the channel's Release/Acquire
 /// pair is the synchronisation point for the payload bytes stored here.
-#[repr(C)]
-pub struct DCache<const N: usize> {
+#[repr(C, align(64))]
+pub struct DCache {
     reserved: AtomicUsize,
     _pad: [u8; CACHELINE - size_of::<AtomicUsize>()],
-    data: Box<UnsafeCell<Aligned<N>>>,
+    data: UnsafeCell<[u8]>,
 }
 
 const CACHELINE: usize = 64;
 
-#[repr(C, align(64))]
-struct Aligned<const N: usize>([u8; N]);
-
-impl<const N: usize> DCache<N> {
+impl DCache {
     const OFFSET: usize = size_of::<usize>();
 
-    pub fn new() -> Self {
-        const { assert!(N.is_power_of_two() && N.is_multiple_of(CACHELINE)) };
-        let data = unsafe {
-            let layout = Layout::new::<UnsafeCell<Aligned<N>>>();
+    pub fn new(n: usize) -> Box<Self> {
+        assert!(n.is_power_of_two() && n.is_multiple_of(CACHELINE));
+        let layout = Layout::from_size_align(CACHELINE + n, CACHELINE).unwrap();
+        unsafe {
             let ptr = alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 alloc::handle_alloc_error(layout);
             }
-            Box::from_raw(ptr.cast::<UnsafeCell<Aligned<N>>>())
-        };
-        Self {
-            reserved: AtomicUsize::new(0),
-            _pad: [0; CACHELINE - size_of::<AtomicUsize>()],
-            data,
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n) as *mut Self)
         }
+    }
+
+    pub fn from_ptr(ptr: *mut u8, n: usize) -> *const Self {
+        std::ptr::slice_from_raw_parts_mut(ptr, n) as *const Self
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        size_of_val(&self.data)
     }
 
     #[inline]
     pub fn read(&self, r: DCacheRef, buf: &mut [u8]) -> Result<(), DCacheError> {
-        if r.len > N - Self::OFFSET {
-            return Err(DCacheError::DataLenExceedsCapacity(r.len, N - Self::OFFSET));
-        }
         if r.len > buf.len() {
             return Err(DCacheError::BufferTooSmall(buf.len(), r.len));
         }
 
-        let base = self.data.get().cast::<u8>();
-        let offset_ix = r.offset & (N - 1);
+        let n = self.capacity();
+        let base = self.data.get() as *mut u8;
+        let offset_ix = r.offset & (n - 1);
+
+        if r.len > n - offset_ix - Self::OFFSET {
+            return Err(DCacheError::DataLenExceedsCapacity(r.len, n - Self::OFFSET));
+        }
 
         if !Self::offsets_match(base, offset_ix, r.offset) {
             return Err(DCacheError::StaleData);
         }
 
-        self.copy(base, r.len, r.offset + Self::OFFSET, buf);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                base.add(offset_ix + Self::OFFSET),
+                buf.as_mut_ptr(),
+                r.len,
+            );
+        }
 
         compiler_fence(AcqRel);
 
@@ -86,49 +96,28 @@ impl<const N: usize> DCache<N> {
         Ok(())
     }
 
-    #[inline]
-    fn copy(&self, base: *mut u8, r_len: usize, r_offset: usize, buf: &mut [u8]) {
-        let from_ix = r_offset & (N - 1);
-        let head_len = (N - from_ix).min(r_len);
-        unsafe {
-            std::ptr::copy_nonoverlapping(base.add(from_ix), buf.as_mut_ptr(), head_len);
-            let tail_len = r_len - head_len;
-            if tail_len > 0 {
-                std::ptr::copy_nonoverlapping(base, buf[head_len..].as_mut_ptr(), tail_len);
-            }
-        }
-    }
-
-    /// Applies f to the (head, tail) slices of the payload. Tail is empty when
-    /// the payload is contiguous. The caller must be able to tolerate execution
-    /// on stale / invalid data; prefer `read` if that is unacceptable.
+    /// Applies `f` to the payload slice. The caller must be able to tolerate
+    /// execution on stale / invalid data; prefer `read` if that is
+    /// unacceptable.
     #[inline]
     pub fn map<T, F>(&self, r: DCacheRef, f: F) -> Result<T, DCacheError>
     where
-        F: FnOnce(&[u8], &[u8]) -> T,
+        F: FnOnce(&[u8]) -> T,
     {
-        if r.len > N - Self::OFFSET {
-            return Err(DCacheError::DataLenExceedsCapacity(r.len, N - Self::OFFSET));
-        }
+        let n = self.capacity();
+        let base = self.data.get() as *mut u8;
+        let offset_ix = r.offset & (n - 1);
 
-        let base = self.data.get().cast::<u8>();
-        let offset_ix = r.offset & (N - 1);
+        if r.len > n - offset_ix - Self::OFFSET {
+            return Err(DCacheError::DataLenExceedsCapacity(r.len, n - Self::OFFSET));
+        }
 
         if !Self::offsets_match(base, offset_ix, r.offset) {
             return Err(DCacheError::StaleData);
         }
 
-        let payload_ix = (r.offset + Self::OFFSET) & (N - 1);
-        let result = unsafe {
-            if r.len > N - payload_ix {
-                let head_len = N - payload_ix;
-                let head = std::slice::from_raw_parts(base.add(payload_ix), head_len);
-                let tail = std::slice::from_raw_parts(base, r.len - head_len);
-                f(head, tail)
-            } else {
-                f(std::slice::from_raw_parts(base.add(payload_ix), r.len), &[])
-            }
-        };
+        let result =
+            unsafe { f(std::slice::from_raw_parts(base.add(offset_ix + Self::OFFSET), r.len)) };
 
         compiler_fence(AcqRel);
 
@@ -141,47 +130,59 @@ impl<const N: usize> DCache<N> {
 
     #[inline]
     fn offsets_match(base: *mut u8, offset_ix: usize, expected_offset: usize) -> bool {
-        let offset = unsafe { base.add(offset_ix).cast::<usize>().read_unaligned() };
+        let offset = unsafe { base.add(offset_ix).cast::<usize>().read() };
         offset == expected_offset
+    }
+
+    #[inline]
+    fn next_multiple_of_64(x: usize) -> usize {
+        (x + 63) & !63
     }
 
     #[inline]
     pub fn write<F>(&self, len: usize, f: F) -> Result<DCacheRef, DCacheError>
     where
-        F: FnOnce(&mut [u8], &mut [u8]),
+        F: FnOnce(&mut [u8]),
     {
-        if len > N - Self::OFFSET {
-            return Err(DCacheError::DataLenExceedsCapacity(len, N - Self::OFFSET));
+        let n = self.capacity();
+        if len > n - Self::OFFSET {
+            return Err(DCacheError::DataLenExceedsCapacity(len, n - Self::OFFSET));
         }
 
-        let from =
-            self.reserved.fetch_add((Self::OFFSET + len).next_multiple_of(CACHELINE), Relaxed);
-        let from_ix = from & (N - 1);
-        let base = self.data.get().cast::<u8>();
+        let slot_size = Self::next_multiple_of_64(Self::OFFSET + len);
 
-        // from_ix is cacheline-aligned: from_ix + Self::OFFSET <= N
-        unsafe { base.add(from_ix).cast::<usize>().write_unaligned(from) };
+        let from = loop {
+            let curr = self.reserved.load(Relaxed);
+            let from_ix = curr & (n - 1);
+            let (actual, next) = if from_ix + Self::OFFSET + len > n {
+                // skip to from_ix = 0
+                let aligned = (curr | (n - 1)) + 1;
+                (aligned, aligned + slot_size)
+            } else {
+                (curr, curr + slot_size)
+            };
+            if self.reserved.compare_exchange_weak(curr, next, Relaxed, Relaxed).is_ok() {
+                break actual;
+            }
+        };
 
-        let payload_ix = from_ix + Self::OFFSET;
-        let head_len = (N - payload_ix).min(len);
+        let from_ix = from & (n - 1);
+        let base = self.data.get() as *mut u8;
+
+        unsafe { base.add(from_ix).cast::<usize>().write(from) };
+
+        compiler_fence(Release);
+
         unsafe {
-            let head = std::slice::from_raw_parts_mut(base.add(payload_ix), head_len);
-            let tail = std::slice::from_raw_parts_mut(base, len - head_len);
-            f(head, tail);
+            f(std::slice::from_raw_parts_mut(base.add(from_ix + Self::OFFSET), len));
         }
 
         Ok(DCacheRef { offset: from, len })
     }
 }
 
-impl<const N: usize> Default for DCache<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-unsafe impl<const N: usize> Sync for DCache<N> {}
-unsafe impl<const N: usize> Send for DCache<N> {}
+unsafe impl Sync for DCache {}
+unsafe impl Send for DCache {}
 
 #[cfg(test)]
 mod tests {
@@ -254,32 +255,22 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let dc: DCache<64> = DCache::new();
-        let r = dc.write(5, |head, _| head.copy_from_slice(b"hello")).unwrap();
+        let dc = DCache::new(64);
+        let r = dc.write(5, |s| s.copy_from_slice(b"hello")).unwrap();
         let mut buf = [0u8; 5];
         dc.read(r, &mut buf).unwrap();
         assert_eq!(&buf, b"hello");
     }
 
     #[test]
-    fn wrap_around() {
-        // First write (10B) bumps reserved by 64 → from_ix for second write = 64.
-        // Second write (80B): from_ix=64, head_len=64, tail_len=16 → crosses N
-        // boundary.
-        let dc: DCache<128> = DCache::new();
-        let _ = dc
-            .write(10, |head, tail| {
-                head.fill(0xAA);
-                tail.fill(0xAA);
-            })
-            .unwrap();
-        let r = dc
-            .write(80, |head, tail| {
-                head.fill(0xBB);
-                tail.fill(0xBB);
-            })
-            .unwrap();
-        assert_eq!(r.offset, 64);
+    fn no_wrap() {
+        // First write(10): from_ix=0, fits → offset=0, reserved=64.
+        // Second write(80): from_ix=64, 64+8+80=152>128 → skip to lap 128.
+        // offset=128, from_ix=0, payload at [8,88).
+        let dc = DCache::new(128);
+        let _ = dc.write(10, |s| s.fill(0xAA)).unwrap();
+        let r = dc.write(80, |s| s.fill(0xBB)).unwrap();
+        assert_eq!(r.offset, 128);
         let mut buf = [0u8; 80];
         dc.read(r, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0xBB));
@@ -287,69 +278,51 @@ mod tests {
 
     #[test]
     fn map_contiguous() {
-        let dc: DCache<64> = DCache::new();
-        let r = dc.write(5, |head, _| head.copy_from_slice(b"hello")).unwrap();
-        let got = dc.map(r, |head, _| head.to_vec()).unwrap();
+        let dc = DCache::new(64);
+        let r = dc.write(5, |s| s.copy_from_slice(b"hello")).unwrap();
+        let got = dc.map(r, |s| s.to_vec()).unwrap();
         assert_eq!(got, b"hello");
     }
 
     #[test]
-    fn map_wrap() {
-        // Same setup as wrap_around: second write straddles the N boundary.
-        // map must copy into the scratch ArrayVec and present contiguous data.
-        let dc: DCache<128> = DCache::new();
-        let _ = dc
-            .write(10, |head, tail| {
-                head.fill(0xAA);
-                tail.fill(0xAA);
-            })
-            .unwrap();
-        let r = dc
-            .write(80, |head, tail| {
-                head.fill(0xBB);
-                tail.fill(0xBB);
-            })
-            .unwrap();
-        assert_eq!(r.offset, 64); // from_ix=64, payload_ix=72, 72+80=152>128 → wrap path
-        let got = dc
-            .map(r, |head, tail| {
-                let mut v = head.to_vec();
-                v.extend_from_slice(tail);
-                v
-            })
-            .unwrap();
+    fn map_lap_boundary() {
+        // Second write lands at lap boundary (offset=128, from_ix=0); map must
+        // present contiguous data with no copy.
+        let dc = DCache::new(128);
+        let _ = dc.write(10, |s| s.fill(0xAA)).unwrap();
+        let r = dc.write(80, |s| s.fill(0xBB)).unwrap();
+        assert_eq!(r.offset, 128);
+        let got = dc.map(r, |s| s.to_vec()).unwrap();
         assert!(got.iter().all(|&b| b == 0xBB));
     }
 
     #[test]
     fn stale() {
-        let dc: DCache<64> = DCache::new();
-        let r = dc.write(4, |head, _| head.copy_from_slice(b"AAAA")).unwrap();
-        let _ = dc.write(4, |head, _| head.copy_from_slice(b"BBBB")).unwrap();
-        // Second write at from_ix=0 overwrites header[0] with 64 != r.offset(0) → stale
+        let dc = DCache::new(64);
+        let r = dc.write(4, |s| s.copy_from_slice(b"AAAA")).unwrap();
+        let _ = dc.write(4, |s| s.copy_from_slice(b"BBBB")).unwrap();
+        // Second write at from_ix=0 overwrites header[0..8] with 64 != r.offset(0) →
+        // stale
         let mut buf = [0u8; 4];
         assert!(matches!(dc.read(r, &mut buf), Err(DCacheError::StaleData)));
     }
 
     #[test]
     fn len_too_large() {
-        let dc: DCache<64> = DCache::new();
-        assert!(matches!(
-            dc.write(57, |_, _| {}),
-            Err(DCacheError::DataLenExceedsCapacity(57, 56)) // N(64) - Self::OFFSET(8)
-        ));
-        let r = dc.write(2, |head, _| head.copy_from_slice(b"AB")).unwrap();
+        let dc = DCache::new(64);
+        assert!(matches!(dc.write(57, |_| {}), Err(DCacheError::DataLenExceedsCapacity(57, 56))));
+        let r = dc.write(2, |s| s.copy_from_slice(b"AB")).unwrap();
         let mut small = [0u8; 1];
         assert!(matches!(dc.read(r, &mut small), Err(DCacheError::BufferTooSmall(1, 2))));
     }
 
     #[test]
     fn cacheline_aligned_offsets() {
-        let dc: DCache<1024> = DCache::new();
+        let dc = DCache::new(1024);
         let sizes = [1usize, 63, 64, 65, 127, 128];
         let mut expected = 0usize;
         for size in sizes {
-            let r = dc.write(size, |_, _| {}).unwrap();
+            let r = dc.write(size, |_| {}).unwrap();
             assert_eq!(r.offset, expected, "wrong offset for size {size}");
             assert_eq!(r.offset % 64, 0, "offset not cacheline-aligned for size {size}");
             expected += (size_of::<usize>() + size).next_multiple_of(64);
@@ -363,10 +336,9 @@ mod tests {
         const PER: usize = 16;
         const MSG: usize = 8;
 
-        // 4 writers × 16 msgs × next_multiple_of(64, 8)=64B each = 4096B reserved
-        // total. N=4096 ensures oldest slot (offset=0, 0+4096=4096) is never
-        // stale.
-        let dc = Arc::new(DCache::<4096>::new());
+        // 4 writers × 16 msgs × 64B each = 4096B reserved total.
+        // N=4096 ensures the oldest slot is never stale.
+        let dc: Arc<DCache> = Arc::from(DCache::new(4096));
         let q: Arc<TestQueue<(DCacheRef, [u8; MSG])>> = Arc::new(TestQueue::new());
 
         let write_handles: Vec<_> = (0..WRITERS)
@@ -376,12 +348,7 @@ mod tests {
                 thread::spawn(move || {
                     for j in 0..PER {
                         let payload = [(i * PER + j) as u8; MSG];
-                        let r = dc
-                            .write(MSG, |head, tail| {
-                                head.copy_from_slice(&payload[..head.len()]);
-                                tail.copy_from_slice(&payload[head.len()..]);
-                            })
-                            .unwrap();
+                        let r = dc.write(MSG, |s| s.copy_from_slice(&payload)).unwrap();
                         q.push((r, payload));
                     }
                     q.writer_done();
