@@ -270,7 +270,7 @@ fn run_primary(flags: Flags) {
                 .expect("open poison-demo shmem");
 
             let base = shmem.as_ptr();
-            const HEADER_SIZE: usize = 64;
+            const HEADER_SIZE: usize = std::mem::size_of::<flux_communication::queue::QueueHeader>();
             let header = unsafe { &*(base as *const flux_communication::queue::QueueHeader) };
             let count = header.count.load(std::sync::atomic::Ordering::Relaxed);
             let slot = count & header.mask;
@@ -358,7 +358,7 @@ fn run_worker() {
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
-            let mut c = Consumer::from(quote_q);
+            let mut c = Consumer::new(quote_q, "ctl-quotes");
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 if c.consume(|_| {}) {
@@ -375,7 +375,7 @@ fn run_worker() {
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
-            let mut c = Consumer::from(trade_q);
+            let mut c = Consumer::new(trade_q, "ctl-trades");
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 if c.consume(|_| {}) {
@@ -392,7 +392,7 @@ fn run_worker() {
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
-            let mut c = Consumer::from(order_q);
+            let mut c = Consumer::new(order_q, "ctl-orders");
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 if c.consume(|_| {}) {

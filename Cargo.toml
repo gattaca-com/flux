@@ -64,3 +64,4 @@ url = "2.5.8"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+rand = "0.8.5"

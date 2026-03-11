@@ -1,7 +1,12 @@
-use std::{ops::Deref, path::Path};
+use std::{
+    collections::HashMap,
+    ops::Deref,
+    path::Path,
+    sync::{Mutex, OnceLock},
+};
 
 use flux_timing::InternalMessage;
-use flux_utils::short_typename;
+use flux_utils::{ShortTypename, short_typename};
 
 use crate::{
     Timer,
@@ -71,6 +76,20 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             if !predicate(m) {
                 return;
             }
+            *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
+            self.timer.start();
+            f(m.into_data(), producers);
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+        })
+    }
+
+    #[inline]
+    pub fn consume_collaborative<P, F>(&mut self, producers: &mut P, mut f: F) -> bool
+    where
+        P: SpineProducers,
+        F: FnMut(T, &mut P),
+    {
+        self.inner.consume_collaborative(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m.into_data(), producers);
@@ -184,6 +203,16 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     }
 }
 
+fn attach_id_for(tile: ShortTypename, queue: ShortTypename) -> usize {
+    static COUNTERS: OnceLock<Mutex<HashMap<(ShortTypename, ShortTypename), usize>>> =
+        OnceLock::new();
+    let mut map = COUNTERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let id = map.entry((tile, queue)).or_insert(0);
+    let result = *id;
+    *id += 1;
+    result
+}
+
 impl<T: 'static + Copy> SpineConsumer<T> {
     #[inline]
     pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineQueue<T>) -> Self
@@ -192,11 +221,17 @@ impl<T: 'static + Copy> SpineConsumer<T> {
         S: FluxSpine,
         Tl: Tile<S>,
     {
+        let label: &'static str = Box::leak(
+            format!("{}-{}", tile.name(), attach_id_for(tile.name(), short_typename::<T>()))
+                .into_boxed_str(),
+        );
+
         let timer = Timer::new_with_base_dir(
             base_dir,
             S::app_name(),
             format!("{}-{}", tile.name(), short_typename::<T>()),
         );
-        Self { timer, inner: queue::Consumer::from(queue) }
+
+        Self { timer, inner: queue::Consumer::new(queue, label) }
     }
 }

@@ -613,7 +613,10 @@ impl TimeKeeper {
                         continue;
                     }
 
-                    let view = TimerDataState::new(latency_q.into(), processing_q.into());
+                    let view = TimerDataState::new(
+                        Consumer::new(latency_q, "timekeeper-latency"),
+                        Consumer::new(processing_q, "timekeeper-processing"),
+                    );
                     let data = TimerData::new(
                         real_name.to_string().clone(),
                         SAMPLES_PER_PERCENTILE,

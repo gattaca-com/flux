@@ -166,6 +166,43 @@ impl<S: FluxSpine> SpineAdapter<S> {
         consumed
     }
 
+    /// Consume one item from the shared collaborative cursor.
+    /// Multiple tiles on the same queue each get unique items
+    /// (work-distribution).
+    #[inline]
+    pub fn consume_collaborative<T, F>(&mut self, mut f: F) -> bool
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        S::Producers: SpineProducers,
+        F: FnMut(T, &mut S::Producers),
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let consumed = c.consume_collaborative(&mut self.producers, &mut f);
+        if consumed {
+            self.did_work = true;
+        }
+        consumed
+    }
+
+    /// Override the collaborative group label for queue `T`. By default each
+    /// tile instance gets a unique label (`TileType-N`) set automatically at
+    /// attach time. Group label can be set in `Tile::init` to share a group
+    /// across several tiles
+    ///
+    /// ```ignore
+    /// fn init(&mut self, adapter: &mut SpineAdapter<MySpine>) {
+    ///     adapter.set_collaborative_group::<OrderUpdate>("group_label");
+    /// }
+    /// ```
+    pub fn set_collaborative_group<T: 'static + Copy>(&mut self, group_label: &'static str)
+    where
+        S::Consumers: AsMut<SpineConsumer<T>>,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        c.inner.set_collaborative_group(group_label);
+    }
+
     #[inline]
     pub fn consume_internal_message<T: 'static + Copy, F>(&mut self, mut f: F)
     where

@@ -97,18 +97,14 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>) {
     for attr in attrs {
         if attr.path().is_ident("queue") {
             attr.parse_nested_meta(|meta| {
-                // #[repr(C)]
                 if meta.path.is_ident("persist") {
                     is_persistent = true;
                     return Ok(());
                 }
-
-                // #[repr(align(N))]
                 if meta.path.is_ident("size") {
                     let content;
                     parenthesized!(content in meta.input);
                     let lit: Expr = content.parse()?;
-                    // let n: usize = lit.base10_parse()?;
                     size_expr = Some(lit);
                     return Ok(());
                 }

@@ -1,14 +1,28 @@
 use std::{
     alloc::Layout,
     borrow::Borrow,
-    mem::{MaybeUninit, size_of},
+    mem::size_of,
     ops::Deref,
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use flux_utils::safe_panic;
+fn binary_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_owned())
+    })
+}
+
+use flux_utils::{safe_panic, ArrayStr};
+use rand::Rng;
 use shared_memory::ShmemConf;
 
 use crate::{
@@ -24,6 +38,15 @@ pub enum QueueType {
     SPMC,
 }
 
+pub const MAX_GROUPS: usize = 32;
+pub const GROUP_LABEL_LEN: usize = 64;
+
+#[derive(Debug)]
+#[repr(C, align(64))]
+pub struct AlignedCursor {
+    pub cursor: AtomicUsize,
+}
+
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct QueueHeader {
@@ -34,8 +57,10 @@ pub struct QueueHeader {
     pub mask: usize,           // 24
     pub count: AtomicUsize,    /* 32 */
 
-                               /* add queue hash mismatch */
+    group_labels: [ArrayStr<GROUP_LABEL_LEN>; MAX_GROUPS],
+    group_cursors: [AlignedCursor; MAX_GROUPS],
 }
+
 #[allow(dead_code)]
 impl QueueHeader {
     /// in bytes
@@ -70,13 +95,35 @@ impl QueueHeader {
         std::mem::forget(shmem);
         Ok(Self::from_ptr(ptr))
     }
+
+    pub fn find_or_insert_group(&mut self, key: &str) -> *const AtomicUsize {
+        let key = ArrayStr::<GROUP_LABEL_LEN>::from_str_truncate(key);
+
+        // TODO: use better fix of potential data race, either spinlock or something
+        // similar to what is done in the collaborative consume
+        std::thread::sleep(Duration::from_micros(rand::thread_rng().gen_range(0..10)));
+
+        for i in 0..MAX_GROUPS {
+            if self.group_labels[i] == key {
+                return &raw const self.group_cursors[i].cursor;
+            }
+        }
+        for i in 0..MAX_GROUPS {
+            if self.group_labels[i] == ArrayStr::<GROUP_LABEL_LEN>::new() {
+                self.group_labels[i] = key;
+                return &raw const self.group_cursors[i].cursor;
+            }
+        }
+
+        panic!("no group slots available (max {} groups)", MAX_GROUPS);
+    }
 }
 
 //TODO @lopo: this should in reality really also implement drop and most likely
 // return an Arc instead of &'static or whatever.
 #[repr(C, align(64))]
 pub struct InnerQueue<T> {
-    header: QueueHeader,
+    pub(crate) header: QueueHeader,
     buffer: [Seqlock<T>],
 }
 
@@ -154,28 +201,23 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     #[inline]
-    fn load(&self, pos: usize) -> &Seqlock<T> {
+    pub(crate) fn load(&self, pos: usize) -> &Seqlock<T> {
         unsafe { self.buffer.get_unchecked(pos) }
     }
 
     #[inline]
-    fn cur_pos(&self) -> usize {
-        self.count() & self.header.mask
+    fn last_count(&self) -> usize {
+        self.count().saturating_sub(1)
     }
 
     #[inline]
-    fn last_pos(&self) -> usize {
-        (self.count().saturating_sub(1)) & self.header.mask
+    pub(crate) fn version_at(&self, count: usize) -> u64 {
+        ((count / self.len()) * 2 + 2) as u64
     }
 
     #[inline]
-    fn version(&self) -> u64 {
-        (((self.count() / (self.header.mask + 1)) << 1) + 2) as u64
-    }
-
-    #[inline]
-    fn last_version(&self) -> u64 {
-        ((((self.count().saturating_sub(1)) / (self.header.mask + 1)) << 1) + 2) as u64
+    pub fn count_at(&self, pos: usize, version: u64) -> usize {
+        ((version as usize - 2) / 2) * self.len() + (pos & self.header.mask)
     }
 
     #[allow(dead_code)]
@@ -370,14 +412,20 @@ impl<T: Copy> Queue<T> {
         len: usize,
         queue_type: QueueType,
     ) -> Self {
+        let shmem_file = shmem_file.as_ref();
         Self { inner: InnerQueue::create_or_open_shared(shmem_file, len, queue_type) }
     }
 
     pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
+        let shmem_file = shmem_file.as_ref();
         Self {
             inner: InnerQueue::open_shared(shmem_file)
                 .expect("Couldn't open shared queue, was it initialized?"),
         }
+    }
+
+    fn group_cursor(&self, key: &str) -> *const AtomicUsize {
+        unsafe { &mut *(self.inner as *mut InnerQueue<T>) }.header.find_or_insert_group(key)
     }
 }
 
@@ -448,31 +496,128 @@ impl<T> AsMut<Producer<T>> for Producer<T> {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ConsumerBare<T> {
-    pos: usize,            // 8
-    mask: usize,           // 16
-    expected_version: u64, // 24
-    is_running: u8,        // 25
-    _pad: [u8; 11],        // 36
-    queue: Queue<T>,       // 56 fat ptr: (usize, pointer)
+    pos: usize,                 // 8
+    mask: usize,                // 16
+    expected_version: u64,      // 24
+    is_running: u8,             // 25
+    _pad: [u8; 7],              // 32
+    cursor: *const AtomicUsize, // 40
+    label: &'static str,        // 56 (ptr + len)
+    queue: Queue<T>,            // 64 fat ptr: (usize, pointer)
 }
 
+unsafe impl<T> Send for ConsumerBare<T> {}
+
 impl<T: Copy> ConsumerBare<T> {
-    #[inline]
-    pub fn recover_after_error(&mut self) {
-        self.expected_version += 2;
+    pub fn new(queue: Queue<T>, label: &'static str) -> Self {
+        Self {
+            pos: usize::MAX,
+            mask: queue.header.mask,
+            expected_version: 0,
+            is_running: 1,
+            _pad: [0; 7],
+            cursor: std::ptr::null(),
+            label,
+            queue,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_broadcast_test(queue: Queue<T>) -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let label = std::boxed::Box::leak(format!("{}", id).into_boxed_str());
+
+        let mut s = Self::new(queue, label);
+        s.try_init_broadcast();
+        s
+    }
+
+    #[cfg(test)]
+    pub fn new_collaborative_test(queue: Queue<T>, label: &'static str) -> Self {
+        let mut s = Self::new(queue, label);
+        s.try_init_collaborative();
+        s
     }
 
     #[inline]
-    fn update_pos(&mut self) {
-        self.pos = (self.pos + 1) & self.mask;
-        self.expected_version = self.expected_version.wrapping_add(2 * (self.pos == 0) as u64);
+    fn get_pos(&self, count: usize) -> usize {
+        count & self.mask
+    }
+
+    pub fn set_collaborative_cursor(&mut self, cursor: *const AtomicUsize) {
+        self.cursor = cursor;
+    }
+
+    #[inline]
+    pub fn recover_after_error(&mut self) {
+        self.set_broadcast_pos(self.queue.count());
+    }
+
+    #[inline]
+    fn set_pos(&mut self, count: usize) {
+        self.pos = self.get_pos(count);
+        self.expected_version = self.queue.version_at(count);
+    }
+
+    #[inline]
+    fn set_broadcast_pos(&mut self, count: usize) {
+        self.set_pos(count);
+        unsafe { &*self.cursor }.store(count + 1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn acquire_specific_slot(&mut self, delta: usize) {
+        let cursor = unsafe { &*self.cursor }.fetch_add(delta, Ordering::Relaxed);
+        self.set_pos(cursor + delta - 1);
+    }
+
+    #[inline]
+    fn acquire_next_slot(&mut self) {
+        self.acquire_specific_slot(1);
+    }
+
+    #[inline]
+    fn acquire_earliest_available_slot(&mut self) {
+        let collaborative_cursor = unsafe { &*self.cursor };
+        let delta = self
+            .queue
+            .count()
+            .saturating_sub(collaborative_cursor.load(Ordering::Relaxed) + self.queue.len())
+            .max(1);
+
+        self.acquire_specific_slot(delta);
+    }
+
+    #[inline]
+    fn try_init_broadcast(&mut self) {
+        if self.cursor.is_null() {
+            self.cursor = self
+                .queue
+                .group_cursor(&format!("{}.{}.broadcast", binary_name(), self.label));
+
+            // Always set current producer position without restoring value from cursor
+            self.set_broadcast_pos(self.queue.count());
+        }
+    }
+
+    #[inline]
+    pub fn try_init_collaborative(&mut self) {
+        if self.cursor.is_null() {
+            self.cursor = self
+                .queue
+                .group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
+            self.acquire_next_slot();
+        }
     }
 
     /// Nonblocking consume returning either Ok(()) or a ReadError
     #[inline]
     pub fn try_consume(&mut self, el: &mut T) -> Result<(), ReadError> {
+        self.try_init_broadcast();
         self.queue.consume(el, self.pos, self.expected_version)?;
-        self.update_pos();
+        self.acquire_next_slot();
         Ok(())
     }
 
@@ -498,13 +643,19 @@ impl<T: Copy> ConsumerBare<T> {
         }
     }
 
+    pub fn set_collaborative_group(&mut self, group_label: &'static str) {
+        self.label = group_label;
+    }
+
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn init_header(consumer_ptr: *mut ConsumerBare<T>, queue: Queue<T>) {
+    pub fn init_header(consumer_ptr: *mut ConsumerBare<T>, queue: Queue<T>, label: &'static str) {
         unsafe {
-            (*consumer_ptr).pos = queue.cur_pos();
-            (*consumer_ptr).expected_version = queue.version();
+            (*consumer_ptr).pos = usize::MAX;
+            (*consumer_ptr).expected_version = 0;
             (*consumer_ptr).mask = queue.header.mask;
-            (*consumer_ptr).queue = queue
+            (*consumer_ptr).cursor = std::ptr::null();
+            (*consumer_ptr).label = label;
+            (*consumer_ptr).queue = queue;
         }
     }
 
@@ -515,14 +666,14 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline]
     fn try_consume_last(&mut self, message: &mut T) -> Result<(), EmptyError> {
-        let last = self.queue.last_pos();
-        if last < self.pos {
+        self.try_init_broadcast();
+        let last_count = self.queue.last_count();
+        if last_count < self.queue.count_at(self.pos, self.expected_version) {
             return Err(EmptyError::Empty);
         }
-        self.pos = self.queue.last_pos();
-        self.expected_version = self.queue.last_version();
-        self.queue.consume_always(message, self.pos)?;
-        self.update_pos();
+
+        self.queue.consume_always(message, self.get_pos(last_count))?;
+        self.set_broadcast_pos(last_count + 1);
         Ok(())
     }
 }
@@ -530,14 +681,6 @@ impl<T: Copy> ConsumerBare<T> {
 impl<T> AsMut<ConsumerBare<T>> for ConsumerBare<T> {
     fn as_mut(&mut self) -> &mut ConsumerBare<T> {
         self
-    }
-}
-
-impl<T: Copy> From<Queue<T>> for ConsumerBare<T> {
-    fn from(queue: Queue<T>) -> Self {
-        let pos = queue.cur_pos();
-        let expected_version = queue.version();
-        Self { pos, mask: queue.header.mask, _pad: [0; 11], expected_version, is_running: 1, queue }
     }
 }
 
@@ -549,6 +692,29 @@ pub struct Consumer<T: 'static + Copy> {
 }
 
 impl<T: 'static + Copy> Consumer<T> {
+    #[allow(clippy::uninit_assumed_init)]
+    fn from_bare(consumer: ConsumerBare<T>) -> Self {
+        Self {
+            consumer,
+            message: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
+            should_log: true,
+        }
+    }
+
+    pub fn new(queue: Queue<T>, label: &'static str) -> Self {
+        Self::from_bare(ConsumerBare::new(queue, label))
+    }
+
+    #[cfg(test)]
+    pub fn new_broadcast_test(queue: Queue<T>) -> Self {
+        Self::from_bare(ConsumerBare::new_broadcast_test(queue))
+    }
+
+    #[cfg(test)]
+    pub fn new_collaborative_test(queue: Queue<T>, label: &'static str) -> Self {
+        Self::from_bare(ConsumerBare::new_collaborative_test(queue, label))
+    }
+
     /// Maybe consume one message in a queue with error recovery and logging,
     /// and return whether one was read
     #[inline]
@@ -597,6 +763,38 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 
     #[inline]
+    pub fn consume_collaborative<F>(&mut self, mut f: F) -> bool
+    where
+        F: FnMut(&mut T),
+    {
+        self.consumer.try_init_collaborative();
+
+        match self
+            .consumer
+            .queue
+            .load(self.consumer.pos)
+            .read_with_version(&mut self.message, self.consumer.expected_version)
+        {
+            Ok(()) => {
+                f(&mut self.message);
+                self.consumer.acquire_next_slot();
+                return true;
+            }
+            Err(ReadError::Empty) => return false,
+            Err(ReadError::SpedPast) => {
+                if self.should_log {
+                    safe_panic!(
+                        "Consumer<{}> collaborative got sped past.",
+                        std::any::type_name::<T>()
+                    );
+                }
+                self.consumer.acquire_earliest_available_slot();
+                return false;
+            }
+        }
+    }
+
+    #[inline]
     pub fn without_log(self) -> Self {
         Self { should_log: false, ..self }
     }
@@ -609,149 +807,15 @@ impl<T: 'static + Copy> Consumer<T> {
     pub fn set_logging(&mut self, arg: bool) {
         self.should_log = arg
     }
-}
 
-impl<T: Copy, Q: Into<ConsumerBare<T>>> From<Q> for Consumer<T> {
-    #[allow(clippy::uninit_assumed_init)]
-    fn from(queue: Q) -> Self {
-        Self {
-            consumer: queue.into(),
-            message: unsafe { MaybeUninit::uninit().assume_init() },
-            should_log: true,
-        }
+    pub fn set_collaborative_group(&mut self, group_label: &'static str) {
+        self.consumer.set_collaborative_group(group_label);
     }
 }
+
 
 #[cfg(test)]
-mod test {
-    use super::*;
+mod tests_basic;
 
-    #[test]
-    fn headersize() {
-        assert_eq!(64, std::mem::size_of::<QueueHeader>());
-        assert_eq!(56, std::mem::size_of::<ConsumerBare<[u8; 60]>>())
-    }
-
-    #[test]
-    fn basic() {
-        for typ in [QueueType::SPMC, QueueType::MPMC] {
-            let q = Queue::new(16, typ);
-            let mut p = Producer::from(q);
-            let mut c = ConsumerBare::from(q);
-            p.produce(&1);
-            let mut m = 0;
-
-            assert_eq!(c.try_consume(&mut m), Ok(()));
-            assert_eq!(m, 1);
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-            for i in 0..16 {
-                p.produce(&i);
-            }
-            for i in 0..16 {
-                c.try_consume(&mut m).unwrap();
-                assert_eq!(m, i);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-
-            for _ in 0..20 {
-                p.produce(&1);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
-        }
-    }
-
-    fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
-        let q = Queue::new(16, QueueType::MPMC);
-
-        let mut readhandles = Vec::new();
-        for _ in 0..n_readers {
-            let mut c1 = ConsumerBare::from(q);
-            let cons = std::thread::spawn(move || {
-                let mut c = 0;
-                let mut m = 0;
-                while c < tot_messages {
-                    c1.blocking_consume(&mut m);
-                    c += m;
-                }
-                assert_eq!(c, (0..tot_messages).sum::<usize>());
-            });
-            readhandles.push(cons)
-        }
-        let mut writehandles = Vec::new();
-        for n in 0..n_writers {
-            let mut p1 = Producer::from(q);
-            let prod1 = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                let mut c = n;
-                while c < tot_messages {
-                    p1.produce(&c);
-                    c += n_writers;
-                    std::thread::yield_now();
-                }
-            });
-            writehandles.push(prod1);
-        }
-
-        for h in readhandles {
-            let _ = h.join();
-        }
-        for h in writehandles {
-            let _ = h.join();
-        }
-    }
-    #[test]
-    fn multithread_1_2() {
-        multithread(1, 2, 100000);
-    }
-    #[test]
-    fn multithread_1_4() {
-        multithread(1, 4, 100000);
-    }
-    #[test]
-    fn multithread_2_4() {
-        multithread(2, 4, 100000);
-    }
-    #[test]
-    fn multithread_4_4() {
-        multithread(4, 4, 100000);
-    }
-    #[test]
-    fn multithread_8_8() {
-        multithread(8, 8, 100000);
-    }
-    #[test]
-    fn basic_shared() {
-        for typ in [QueueType::SPMC, QueueType::MPMC] {
-            let path = std::path::Path::new("/dev/shm/blabla_test");
-            let _ = std::fs::remove_file(path);
-            let q = Queue::create_or_open_shared(path, 16, typ);
-            let mut p = Producer::from(q);
-            let mut c = ConsumerBare::from(q);
-
-            p.produce(&1);
-            let mut m = 0;
-
-            assert_eq!(c.try_consume(&mut m), Ok(()));
-            assert_eq!(m, 1);
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-            for i in 0..16 {
-                p.produce(&i);
-            }
-            for i in 0..16 {
-                c.try_consume(&mut m).unwrap();
-                assert_eq!(m, i);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-
-            for _ in 0..20 {
-                p.produce(&1);
-            }
-
-            assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
-            let _ = crate::cleanup::cleanup_flink(path);
-        }
-    }
-}
+#[cfg(test)]
+mod tests_collaborative;

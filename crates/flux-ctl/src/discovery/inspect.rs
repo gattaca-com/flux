@@ -140,13 +140,13 @@ impl PoisonInfo {
     }
 
     fn check_queue(os_id: &str) -> Option<Self> {
-        const HEADER_SIZE: usize = 64;
+        const HEADER_SIZE: usize = std::mem::size_of::<QueueHeader>();
 
         let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();
         let shmem_len = shmem.len();
 
-        if shmem_len < std::mem::size_of::<QueueHeader>() {
+        if shmem_len < HEADER_SIZE {
             return None;
         }
 
@@ -169,7 +169,7 @@ impl PoisonInfo {
     }
 
     fn check_array(os_id: &str) -> Option<Self> {
-        const HEADER_SIZE: usize = 64;
+        const HEADER_SIZE: usize = std::mem::size_of::<ArrayHeader>();
 
         let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();
@@ -198,13 +198,13 @@ impl PoisonInfo {
     }
 
     fn check_queue_quick(os_id: &str) -> Option<bool> {
-        const HEADER_SIZE: usize = 64;
+        const HEADER_SIZE: usize = std::mem::size_of::<QueueHeader>();
 
         let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();
         let shmem_len = shmem.len();
 
-        if shmem_len < std::mem::size_of::<QueueHeader>() {
+        if shmem_len < HEADER_SIZE {
             return None;
         }
 
@@ -239,7 +239,7 @@ impl PoisonInfo {
     }
 
     fn check_array_quick(os_id: &str) -> Option<bool> {
-        const HEADER_SIZE: usize = 64;
+        const HEADER_SIZE: usize = std::mem::size_of::<ArrayHeader>();
 
         let shmem = ShmemConf::new().os_id(os_id).open().ok()?;
         let base = shmem.as_ptr();

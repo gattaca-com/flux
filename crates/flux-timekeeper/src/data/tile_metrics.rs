@@ -153,7 +153,7 @@ impl TileMetricsView {
                 continue;
             };
 
-            let consumer = Consumer::from(queue).without_log();
+            let consumer = Consumer::new(queue, "tile-metrics").without_log();
             self.tiles.insert(tile_name.clone(), TileData::new(consumer));
             self.tile_order.push(tile_name);
         }

@@ -435,8 +435,8 @@ fn read_array_meta(shmem: &Shmem) -> (usize, usize) {
 /// O(1) poison probe on an already-mapped queue: check the seqlock version
 /// at the current write position.
 fn quick_poison_queue(base: *const u8, shmem_len: usize) -> Option<bool> {
-    const HEADER_SIZE: usize = 64;
-    if shmem_len < std::mem::size_of::<QueueHeader>() {
+    const HEADER_SIZE: usize = std::mem::size_of::<QueueHeader>();
+    if shmem_len < HEADER_SIZE {
         return None;
     }
     let header = unsafe { &*(base as *const QueueHeader) };
@@ -460,8 +460,8 @@ fn quick_poison_queue(base: *const u8, shmem_len: usize) -> Option<bool> {
 
 /// O(1) poison probe on an already-mapped array: check the first slot.
 fn quick_poison_array(base: *const u8, shmem_len: usize) -> Option<bool> {
-    const HEADER_SIZE: usize = 64;
-    if shmem_len < std::mem::size_of::<ArrayHeader>() {
+    const HEADER_SIZE: usize = std::mem::size_of::<ArrayHeader>();
+    if shmem_len < HEADER_SIZE {
         return None;
     }
     let header = unsafe { &*(base as *const ArrayHeader) };
