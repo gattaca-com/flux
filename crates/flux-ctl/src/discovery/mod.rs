@@ -21,8 +21,8 @@ pub use flux_communication::is_pid_alive;
 use flux_communication::{ShmemKind, array::ArrayHeader, queue::QueueHeader};
 use flux_timing::{Duration, Instant};
 pub use inspect::{
-    PidInfo, PoisonInfo, QueueStats, backing_file_size, format_bytes, resolve_backing_path,
-    scan_proc_fds,
+    ConsumerGroupInfo, PidInfo, PoisonInfo, QueueStats, backing_file_size, format_bytes,
+    read_consumer_groups, resolve_backing_path, scan_proc_fds,
 };
 use shared_memory::{Shmem, ShmemConf};
 

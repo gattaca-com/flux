@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crate::{
     ReadError,
     queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType},
@@ -141,4 +143,37 @@ fn basic_shared() {
         assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
         let _ = crate::cleanup::cleanup_flink(path);
     }
+}
+
+#[test]
+fn active_groups_round_trip() {
+    let q = Queue::<u64>::new(16, QueueType::SPMC);
+    let header: &mut QueueHeader =
+        &mut unsafe { &mut *(q.inner as *mut super::InnerQueue<u64>) }.header;
+
+    // Initially no groups.
+    assert!(header.active_groups().is_empty());
+
+    // Register two groups and write cursor values.
+    let cursor_a = header.find_or_insert_group("app.stream.broadcast");
+    unsafe { &*cursor_a }.store(42, Ordering::Relaxed);
+
+    let cursor_b = header.find_or_insert_group("relay.stream.collab");
+    unsafe { &*cursor_b }.store(100, Ordering::Relaxed);
+
+    let groups = header.active_groups();
+    assert_eq!(groups.len(), 2);
+
+    let (label_a, val_a) = &groups[0];
+    assert_eq!(*label_a, "app.stream.broadcast");
+    assert_eq!(*val_a, 42);
+
+    let (label_b, val_b) = &groups[1];
+    assert_eq!(*label_b, "relay.stream.collab");
+    assert_eq!(*val_b, 100);
+
+    // Same key returns existing slot — no duplicate.
+    let cursor_a2 = header.find_or_insert_group("app.stream.broadcast");
+    assert_eq!(cursor_a, cursor_a2);
+    assert_eq!(header.active_groups().len(), 2);
 }

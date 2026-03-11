@@ -1705,3 +1705,99 @@ fn d15_single_segment() {
     assert_eq!(app.total_rows, 2);
     assert!(app.groups[0].expanded);
 }
+
+// ── Consumer Groups panel tests ───────────────────────────────────────
+
+#[test]
+fn detail_view_shows_consumer_groups() {
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry: queue_entry("myapp", "TelemetryUpdate", "/dev/shm/test_cg1", 64, 1024),
+            alive: true,
+            queue_writes: Some(5000),
+            queue_fill: Some(100),
+            queue_capacity: Some(1024),
+            poison: None,
+            msgs_per_sec: None,
+            pids: vec![],
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+
+    // Manually enter detail view with consumer groups.
+    app.view = View::Detail(flux_ctl::tui::app::DetailState {
+        group_idx: 0,
+        segment_idx: 0,
+        pids: vec![],
+        selected_pid: 0,
+        confirm_cleanup: false,
+        consumer_groups: vec![
+            discovery::ConsumerGroupInfo {
+                label: "builder.telemetry.broadcast".into(),
+                cursor: 4990,
+            },
+            discovery::ConsumerGroupInfo { label: "relay.telemetry.collab".into(), cursor: 4800 },
+            discovery::ConsumerGroupInfo {
+                label: "monitor.metrics.broadcast".into(),
+                cursor: 5000,
+            },
+        ],
+    });
+
+    let buf = render_to_buffer(&mut app, 120, 40);
+    let text = buffer_text(&buf);
+
+    // Section header should appear
+    assert!(text.contains("Consumer Groups (3)"), "should show consumer groups header:\n{text}");
+
+    // Group labels should appear
+    assert!(text.contains("builder.telemetry.broadcast"), "should show first group label:\n{text}");
+    assert!(text.contains("relay.telemetry.collab"), "should show second group label:\n{text}");
+    assert!(text.contains("monitor.metrics.broadcast"), "should show third group label:\n{text}");
+
+    // Lag values: 5000-4990=10, 5000-4800=200, 5000-5000=0
+    assert!(text.contains("10"), "should show lag of 10:\n{text}");
+    assert!(text.contains("200"), "should show lag of 200:\n{text}");
+}
+
+#[test]
+fn detail_view_hides_consumer_groups_when_empty() {
+    let groups = vec![AppGroup {
+        name: "myapp".into(),
+        segments: vec![SegmentInfo {
+            entry: queue_entry("myapp", "SomeMsg", "/dev/shm/test_cg2", 32, 512),
+            alive: true,
+            queue_writes: Some(100),
+            queue_fill: Some(10),
+            queue_capacity: Some(512),
+            poison: None,
+            msgs_per_sec: None,
+            pids: vec![],
+        }],
+        expanded: true,
+    }];
+
+    let mut app = App::with_groups(groups);
+
+    // Detail view with no consumer groups.
+    app.view = View::Detail(flux_ctl::tui::app::DetailState {
+        group_idx: 0,
+        segment_idx: 0,
+        pids: vec![],
+        selected_pid: 0,
+        confirm_cleanup: false,
+        consumer_groups: vec![],
+    });
+
+    let buf = render_to_buffer(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+
+    // Consumer Groups section should NOT appear.
+    assert!(
+        !text.contains("Consumer Groups"),
+        "should not show consumer groups when empty:\n{text}"
+    );
+}

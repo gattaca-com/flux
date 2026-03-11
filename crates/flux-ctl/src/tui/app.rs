@@ -73,6 +73,7 @@ pub struct DetailState {
     pub pids: Vec<discovery::PidInfo>,
     pub selected_pid: usize,
     pub confirm_cleanup: bool,
+    pub consumer_groups: Vec<discovery::ConsumerGroupInfo>,
 }
 
 /// What the cursor is pointing at in the list view.
@@ -342,6 +343,11 @@ impl App {
                     if !seg.pids.is_empty() {
                         seg.poison = discovery::PoisonInfo::check(&seg.entry);
                     }
+                    // Refresh consumer groups (cursors move in real-time)
+                    if seg.entry.kind == ShmemKind::Queue {
+                        detail.consumer_groups =
+                            discovery::read_consumer_groups(&seg.entry.flink);
+                    }
                 }
                 None => self.view = View::List,
             }
@@ -466,12 +472,19 @@ impl App {
                                     segment.poison = discovery::PoisonInfo::check(&segment.entry);
                                 }
 
+                                let consumer_groups = if segment.entry.kind == ShmemKind::Queue {
+                                    discovery::read_consumer_groups(&segment.entry.flink)
+                                } else {
+                                    Vec::new()
+                                };
+
                                 self.view = View::Detail(DetailState {
                                     group_idx: gi,
                                     segment_idx: si,
                                     pids,
                                     selected_pid: 0,
                                     confirm_cleanup: false,
+                                    consumer_groups,
                                 });
                                 return;
                             }

@@ -270,7 +270,8 @@ fn run_primary(flags: Flags) {
                 .expect("open poison-demo shmem");
 
             let base = shmem.as_ptr();
-            const HEADER_SIZE: usize = std::mem::size_of::<flux_communication::queue::QueueHeader>();
+            const HEADER_SIZE: usize =
+                std::mem::size_of::<flux_communication::queue::QueueHeader>();
             let header = unsafe { &*(base as *const flux_communication::queue::QueueHeader) };
             let count = header.count.load(std::sync::atomic::Ordering::Relaxed);
             let slot = count & header.mask;
@@ -354,24 +355,45 @@ fn run_worker() {
 
     let mut handles = Vec::new();
 
-    // Consumer on quotes
+    // Consumer on quotes — "slow consumer": consumes for 2s, then stalls
+    // for 3s, cycling.  The lag will ramp up during stalls and drain back
+    // down while consuming — visible in the flux-ctl detail panel.
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
             let mut c = Consumer::new(quote_q, "ctl-quotes");
             let mut n = 0u64;
+            let mut phase_start = std::time::Instant::now();
+            let mut consuming = true;
             while !stop.load(Ordering::Relaxed) {
-                if c.consume(|_| {}) {
-                    n += 1;
+                let elapsed = phase_start.elapsed();
+                if consuming && elapsed >= Duration::from_secs(2) {
+                    // Switch to stall phase
+                    consuming = false;
+                    phase_start = std::time::Instant::now();
+                    eprintln!("  [worker {pid}] quotes: stalling for 3s...");
+                } else if !consuming && elapsed >= Duration::from_secs(3) {
+                    // Switch back to consuming
+                    consuming = true;
+                    phase_start = std::time::Instant::now();
+                    eprintln!("  [worker {pid}] quotes: resuming consume");
+                }
+
+                if consuming {
+                    if c.consume(|_| {}) {
+                        n += 1;
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 } else {
-                    thread::sleep(Duration::from_millis(1));
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
             eprintln!("  [worker {pid}] quotes consumed: {n}");
         }));
     }
 
-    // Consumer on trades
+    // Consumer on trades — steady consumer
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
@@ -388,7 +410,7 @@ fn run_worker() {
         }));
     }
 
-    // Consumer on orders
+    // Consumer on orders — steady consumer
     {
         let stop = stop.clone();
         handles.push(thread::spawn(move || {
