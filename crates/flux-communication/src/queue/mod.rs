@@ -21,7 +21,7 @@ fn binary_name() -> &'static str {
     })
 }
 
-use flux_utils::safe_panic;
+use flux_utils::{safe_panic, ArrayStr};
 use rand::Rng;
 use shared_memory::ShmemConf;
 
@@ -57,7 +57,7 @@ pub struct QueueHeader {
     pub mask: usize,           // 24
     pub count: AtomicUsize,    /* 32 */
 
-    group_labels: [[u8; GROUP_LABEL_LEN]; MAX_GROUPS],
+    group_labels: [ArrayStr<GROUP_LABEL_LEN>; MAX_GROUPS],
     group_cursors: [AlignedCursor; MAX_GROUPS],
 }
 
@@ -97,24 +97,20 @@ impl QueueHeader {
     }
 
     pub fn find_or_insert_group(&mut self, key: &str) -> *const AtomicUsize {
-        let key_bytes = key.as_bytes();
-        let mut key_padded = [0u8; GROUP_LABEL_LEN];
-
-        let copy_len = std::cmp::min(key_bytes.len(), GROUP_LABEL_LEN);
-        key_padded[..copy_len].copy_from_slice(&key_bytes[..copy_len]);
+        let key = ArrayStr::<GROUP_LABEL_LEN>::from_str_truncate(key);
 
         // TODO: use better fix of potential data race, either spinlock or something
         // similar to what is done in the collaborative consume
         std::thread::sleep(Duration::from_micros(rand::thread_rng().gen_range(0..10)));
 
         for i in 0..MAX_GROUPS {
-            if self.group_labels[i] == key_padded {
+            if self.group_labels[i] == key {
                 return &raw const self.group_cursors[i].cursor;
             }
         }
         for i in 0..MAX_GROUPS {
-            if self.group_labels[i] == [0u8; GROUP_LABEL_LEN] {
-                self.group_labels[i].copy_from_slice(&key_padded);
+            if self.group_labels[i] == ArrayStr::<GROUP_LABEL_LEN>::new() {
+                self.group_labels[i] = key;
                 return &raw const self.group_cursors[i].cursor;
             }
         }
