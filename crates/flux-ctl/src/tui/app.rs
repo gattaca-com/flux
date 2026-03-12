@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -18,6 +18,7 @@ pub enum SortMode {
     Name,
     Kind,
     Status,
+    Activity,
 }
 
 impl SortMode {
@@ -25,7 +26,8 @@ impl SortMode {
         match self {
             SortMode::Name => SortMode::Kind,
             SortMode::Kind => SortMode::Status,
-            SortMode::Status => SortMode::Name,
+            SortMode::Status => SortMode::Activity,
+            SortMode::Activity => SortMode::Name,
         }
     }
 
@@ -34,6 +36,7 @@ impl SortMode {
             SortMode::Name => "name",
             SortMode::Kind => "kind",
             SortMode::Status => "status",
+            SortMode::Activity => "activity",
         }
     }
 }
@@ -101,10 +104,13 @@ pub struct App {
     pub filter_mode: bool,
     /// Current filter text typed by the user.
     pub filter_text: String,
+    /// Whether to hide dead (stale) segments from the list view.
+    pub hide_dead: bool,
     /// Current sort order for segments within each group.
     pub sort_mode: SortMode,
-    /// Tracks (last_writes, timestamp) per flink for msgs/s calculation.
-    prev_writes: HashMap<String, (usize, Instant)>,
+    /// Rolling (writes, timestamp) history per flink for smoothed msgs/s
+    /// over a 10-second window.
+    write_history: HashMap<String, VecDeque<(usize, Instant)>>,
     /// Cached result of scan_proc_fds() with TTL.
     cached_proc_map: HashMap<PathBuf, Vec<u32>>,
     /// Last time proc_map was scanned.
@@ -141,8 +147,9 @@ impl App {
             pending_cleanup_flinks: None,
             filter_mode: false,
             filter_text: String::new(),
+            hide_dead: true,
             sort_mode: SortMode::Name,
-            prev_writes: HashMap::new(),
+            write_history: HashMap::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
@@ -168,8 +175,9 @@ impl App {
             pending_cleanup_flinks: None,
             filter_mode: false,
             filter_text: String::new(),
+            hide_dead: true,
             sort_mode: SortMode::Name,
-            prev_writes: HashMap::new(),
+            write_history: HashMap::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
@@ -257,16 +265,28 @@ impl App {
                     let msgs_per_sec = queue_writes.and_then(|w| {
                         let flink = e.flink.clone();
                         let now = Instant::now();
-                        let rate = self.prev_writes.get(&flink).and_then(|(prev_w, prev_t)| {
-                            let dt = now.elapsed_since(*prev_t).as_secs();
-                            if dt > 0.1 && w >= *prev_w {
-                                Some((w - *prev_w) as f64 / dt)
+                        let history = self.write_history.entry(flink).or_default();
+                        history.push_back((w, now));
+                        // Drop entries older than 10 seconds.
+                        while let Some(&(_, t)) = history.front() {
+                            if now.elapsed_since(t).as_secs() > 10.0 {
+                                history.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        if history.len() >= 2 {
+                            let &(oldest_w, oldest_t) = history.front().unwrap();
+                            let &(newest_w, _) = history.back().unwrap();
+                            let dt = now.elapsed_since(oldest_t).as_secs();
+                            if dt > 0.1 && newest_w >= oldest_w {
+                                Some((newest_w - oldest_w) as f64 / dt)
                             } else {
                                 None
                             }
-                        });
-                        self.prev_writes.insert(flink, (w, now));
-                        rate
+                        } else {
+                            None
+                        }
                     });
                     let pids: Vec<u32> = pids.into_iter().filter(|&p| p != own_pid).collect();
                     SegmentInfo {
@@ -280,11 +300,12 @@ impl App {
                         pids,
                     }
                 })
+                .filter(|s| !self.hide_dead || s.alive)
                 .collect();
             if segments.is_empty() {
                 continue;
             }
-            let expanded = prev_expanded.get(&name).copied().unwrap_or(true);
+            let expanded = prev_expanded.get(&name).copied().unwrap_or(false);
             self.groups.push(AppGroup { name, segments, expanded });
         }
 
@@ -311,6 +332,15 @@ impl App {
                             }
                         }
                         rank(a).cmp(&rank(b))
+                    });
+                }
+                SortMode::Activity => {
+                    group.segments.sort_by(|a, b| {
+                        let a_rate = a.msgs_per_sec.unwrap_or(-1.0);
+                        let b_rate = b.msgs_per_sec.unwrap_or(-1.0);
+                        b_rate
+                            .partial_cmp(&a_rate)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     });
                 }
             }
@@ -735,6 +765,10 @@ impl App {
                     self.filter_mode = true;
                 }
                 KeyCode::Char('s') => self.toggle_sort(),
+                KeyCode::Char('a') => {
+                    self.hide_dead = !self.hide_dead;
+                    self.refresh();
+                }
                 _ => {}
             },
             View::Detail(_) => match key.code {

@@ -397,10 +397,18 @@ fn app_from_real_discovery() {
 
     // Build App from the real base_dir
     let mut app = App::new(base, None);
+    // Test segments have no running process, so they appear dead.
+    // Disable hide_dead so they remain visible for assertions.
+    app.hide_dead = false;
+    app.refresh();
     assert_eq!(app.groups.len(), 1);
     assert_eq!(app.groups[0].name, "demo");
     assert_eq!(app.groups[0].segments.len(), 1);
-    assert_eq!(app.total_rows, 2); // 1 header + 1 segment
+    assert_eq!(app.total_rows, 1); // 1 header (collapsed by default)
+
+    // Expand group so the segment row renders for the text check.
+    app.groups[0].expanded = true;
+    app.recount_rows();
 
     // Render and verify
     let buf = render_to_buffer(&mut app, 120, 20);
@@ -420,7 +428,9 @@ fn app_filter_limits_to_one_app() {
     create_raw_shmem(base, "alpha", "data", "Msg", 64);
     create_raw_shmem(base, "beta", "data", "Msg", 64);
 
-    let app = App::new(base, Some("alpha"));
+    let mut app = App::new(base, Some("alpha"));
+    app.hide_dead = false;
+    app.refresh();
     assert_eq!(app.groups.len(), 1);
     assert_eq!(app.groups[0].name, "alpha");
 
@@ -1033,6 +1043,9 @@ fn filter_narrows_visible_segments() {
 
     // No filter: all three segments should appear
     let mut app = App::new(base, None);
+    // Test segments are dead (no running process) — show them for testing.
+    app.hide_dead = false;
+    app.refresh();
     assert_eq!(app.groups.len(), 1);
     assert_eq!(app.groups[0].segments.len(), 3);
 
@@ -1064,12 +1077,14 @@ fn sort_mode_cycles_through_all_variants() {
     // Verify the enum cycling: Name → Kind → Status → Name
     assert_eq!(SortMode::Name.next(), SortMode::Kind);
     assert_eq!(SortMode::Kind.next(), SortMode::Status);
-    assert_eq!(SortMode::Status.next(), SortMode::Name);
+    assert_eq!(SortMode::Status.next(), SortMode::Activity);
+    assert_eq!(SortMode::Activity.next(), SortMode::Name);
 
     // Verify labels
     assert_eq!(SortMode::Name.label(), "name");
     assert_eq!(SortMode::Kind.label(), "kind");
     assert_eq!(SortMode::Status.label(), "status");
+    assert_eq!(SortMode::Activity.label(), "activity");
 
     // Verify toggle_sort() on a synthetic App updates sort_mode
     let mut app = App::with_groups(vec![]);
@@ -1078,6 +1093,8 @@ fn sort_mode_cycles_through_all_variants() {
     assert_eq!(app.sort_mode, SortMode::Kind);
     app.sort_mode = app.sort_mode.next();
     assert_eq!(app.sort_mode, SortMode::Status);
+    app.sort_mode = app.sort_mode.next();
+    assert_eq!(app.sort_mode, SortMode::Activity);
     app.sort_mode = app.sort_mode.next();
     assert_eq!(app.sort_mode, SortMode::Name);
 }

@@ -572,14 +572,19 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     app.selected_item(),
                     Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
                 );
+                let dead_toggle = if app.hide_dead {
+                    "a show dead"
+                } else {
+                    "a hide dead"
+                };
                 let base = match (on_dead_seg, has_any_dead) {
                     (true, _) => {
-                        " ↑↓ navigate  Enter open  d destroy  D destroy all  / filter  s sort  ? help  q quit"
+                        format!(" ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit")
                     }
                     (false, true) => {
-                        " ↑↓ navigate  Enter open  D destroy all  / filter  s sort  ? help  q quit"
+                        format!(" ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit")
                     }
-                    _ => " ↑↓ navigate  Enter open  / filter  s sort  ? help  q quit",
+                    _ => format!(" ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"),
                 };
                 format!("{}{}", base, filter_hint)
             }
@@ -644,7 +649,11 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  s          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Cycle sort (name → kind → status)"),
+            Span::raw("Cycle sort (name → kind → status → activity)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Toggle show/hide dead segments"),
         ]),
         Line::from(vec![
             Span::styled("  d          ", Style::default().fg(Color::Yellow)),
