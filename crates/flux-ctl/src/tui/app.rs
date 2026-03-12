@@ -344,10 +344,8 @@ impl App {
                         seg.poison = discovery::PoisonInfo::check(&seg.entry);
                     }
                     // Refresh consumer groups (cursors move in real-time)
-                    if seg.entry.kind == ShmemKind::Queue {
-                        detail.consumer_groups =
-                            discovery::read_consumer_groups(&seg.entry.flink);
-                    }
+                    detail.consumer_groups =
+                        self.shmem_cache.consumer_groups(&seg.entry.flink);
                 }
                 None => self.view = View::List,
             }
@@ -472,11 +470,8 @@ impl App {
                                     segment.poison = discovery::PoisonInfo::check(&segment.entry);
                                 }
 
-                                let consumer_groups = if segment.entry.kind == ShmemKind::Queue {
-                                    discovery::read_consumer_groups(&segment.entry.flink)
-                                } else {
-                                    Vec::new()
-                                };
+                                let consumer_groups =
+                                    self.shmem_cache.consumer_groups(&segment.entry.flink);
 
                                 self.view = View::Detail(DetailState {
                                     group_idx: gi,

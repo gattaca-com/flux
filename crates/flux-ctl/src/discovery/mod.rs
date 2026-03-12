@@ -269,6 +269,31 @@ impl ShmemCache {
             }
         }
     }
+
+    /// Read consumer groups from a cached queue mapping — zero syscalls.
+    pub fn consumer_groups(&self, flink: &str) -> Vec<ConsumerGroupInfo> {
+        let Some(handle) = self.handles.get(flink) else {
+            return Vec::new();
+        };
+        if handle.kind != ShmemKind::Queue {
+            return Vec::new();
+        }
+        if handle.shmem.len() < std::mem::size_of::<QueueHeader>() {
+            return Vec::new();
+        }
+        let header = unsafe { &*(handle.shmem.as_ptr() as *const QueueHeader) };
+        if !header.is_initialized() {
+            return Vec::new();
+        }
+        header
+            .active_groups()
+            .into_iter()
+            .map(|(label, cursor)| ConsumerGroupInfo {
+                label: label.to_owned(),
+                cursor,
+            })
+            .collect()
+    }
 }
 
 /// Recursively walk `base_dir` looking for `shmem/{queues,data,arrays}/`
