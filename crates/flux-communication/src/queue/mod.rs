@@ -630,28 +630,38 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn try_init_broadcast(&mut self) {
         if self.cursor.is_null() {
-            let id = broadcast_id_for(self.label, std::any::type_name::<T>());
-            let id = if id == 0 { "" } else { &format!(".{}", id) };
-
-            self.cursor = self.queue.group_cursor(&format!(
-                "{}.{}{}.broadcast",
-                binary_name(),
-                self.label,
-                id
-            ));
-
-            // Always set current producer position without restoring value from cursor
-            self.set_broadcast_pos(self.queue.count());
+            self.init_broadcast();
         }
+    }
+
+    #[inline(never)]
+    fn init_broadcast(&mut self) {
+        let id = broadcast_id_for(self.label, std::any::type_name::<T>());
+        let id = if id == 0 { "" } else { &format!(".{}", id) };
+
+        self.cursor = self.queue.group_cursor(&format!(
+            "{}.{}{}.broadcast",
+            binary_name(),
+            self.label,
+            id
+        ));
+
+        // Always set current producer position without restoring value from cursor
+        self.set_broadcast_pos(self.queue.count());
     }
 
     #[inline]
     pub fn try_init_collaborative(&mut self) {
         if self.cursor.is_null() {
-            self.cursor =
-                self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
-            self.acquire_next_slot();
+            self.init_collaborative();
         }
+    }
+
+    #[inline(never)]
+    fn init_collaborative(&mut self) {
+        self.cursor =
+            self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
+        self.acquire_next_slot();
     }
 
     /// Nonblocking consume returning either Ok(()) or a ReadError
