@@ -19,6 +19,8 @@ pub enum DCacheError {
     BufferTooSmall(usize, usize),
     #[error("referenced data store region was overwritten")]
     StaleData,
+    #[error("Invalid offset {0} for a reserved slot of length {1}")]
+    InvalidWriteIntoOffset(usize, usize),
 }
 
 /// Ring buffer data storage inspired by Firedancer's `dcache`. Provides
@@ -90,18 +92,26 @@ impl DCache {
     where
         F: FnOnce(&mut [u8]),
     {
+        let r = self.reserve(len)?;
+        self.write_into(r, 0, f)?;
+        Ok(r)
+    }
+
+    /// Reserves a slot of `len` bytes and writes the offset header.
+    #[inline]
+    pub fn reserve(&self, len: usize) -> Result<DCacheRef, DCacheError> {
         let n = self.capacity();
         if len > n - Self::OFFSET {
             return Err(DCacheError::DataLenExceedsCapacity(len, n - Self::OFFSET));
         }
 
         let slot_size = Self::next_multiple_of_64(Self::OFFSET + len);
+        let base = self.data.get() as *mut u8;
 
         let from = loop {
             let curr = self.reserved.load(Relaxed);
             let from_ix = curr & (n - 1);
             let (actual, next) = if from_ix + Self::OFFSET + len > n {
-                // skip to from_ix = 0
                 let aligned = (curr | (n - 1)) + 1;
                 (aligned, aligned + slot_size)
             } else {
@@ -112,18 +122,30 @@ impl DCache {
             }
         };
 
-        let from_ix = from & (n - 1);
-        let base = self.data.get() as *mut u8;
-
-        unsafe { base.add(from_ix).cast::<usize>().write(from) };
-
+        unsafe { base.add(from & (n - 1)).cast::<usize>().write(from) };
         compiler_fence(Release);
 
-        unsafe {
-            f(std::slice::from_raw_parts_mut(base.add(from_ix + Self::OFFSET), len));
-        }
-
         Ok(DCacheRef { offset: from, len })
+    }
+
+    /// Calls `f` with a mutable view of `r`'s data region starting at `offset`.
+    #[inline]
+    pub fn write_into<F, R>(&self, r: DCacheRef, offset: usize, f: F) -> Result<R, DCacheError>
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        if offset > r.len {
+            return Err(DCacheError::InvalidWriteIntoOffset(offset, r.len));
+        }
+        let base = self.data.get() as *mut u8;
+        let offset_ix = r.offset & (self.capacity() - 1);
+        let buf = unsafe {
+            std::slice::from_raw_parts_mut(
+                base.add(offset_ix + Self::OFFSET + offset),
+                r.len - offset,
+            )
+        };
+        Self::stale_guarded(base, offset_ix, r.offset, || f(buf))
     }
 
     #[inline]

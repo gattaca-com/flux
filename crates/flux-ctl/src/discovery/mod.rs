@@ -288,10 +288,7 @@ impl ShmemCache {
         header
             .active_groups()
             .into_iter()
-            .map(|(label, cursor)| ConsumerGroupInfo {
-                label: label.to_owned(),
-                cursor,
-            })
+            .map(|(label, cursor)| ConsumerGroupInfo { label: label.to_owned(), cursor })
             .collect()
     }
 }
