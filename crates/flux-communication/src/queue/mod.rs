@@ -101,7 +101,7 @@ impl QueueHeader {
 
         // TODO: use better fix of potential data race, either spinlock or something
         // similar to what is done in the collaborative consume
-        std::thread::sleep(Duration::from_micros(rand::thread_rng().gen_range(0..10)));
+        std::thread::sleep(Duration::from_micros(rand::rng().random_range(0..10)));
 
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == key {
