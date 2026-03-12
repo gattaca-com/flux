@@ -1,12 +1,7 @@
-use std::{
-    collections::HashMap,
-    ops::Deref,
-    path::Path,
-    sync::{Mutex, OnceLock},
-};
+use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::{ShortTypename, short_typename};
+use flux_utils::short_typename;
 
 use crate::{
     Timer,
@@ -203,16 +198,6 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     }
 }
 
-fn attach_id_for(tile: ShortTypename, queue: ShortTypename) -> usize {
-    static COUNTERS: OnceLock<Mutex<HashMap<(ShortTypename, ShortTypename), usize>>> =
-        OnceLock::new();
-    let mut map = COUNTERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    let id = map.entry((tile, queue)).or_insert(0);
-    let result = *id;
-    *id += 1;
-    result
-}
-
 impl<T: 'static + Copy> SpineConsumer<T> {
     #[inline]
     pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineQueue<T>) -> Self
@@ -221,10 +206,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
         S: FluxSpine,
         Tl: Tile<S>,
     {
-        let label: &'static str = Box::leak(
-            format!("{}-{}", tile.name(), attach_id_for(tile.name(), short_typename::<T>()))
-                .into_boxed_str(),
-        );
+        let label: &'static str = Box::leak(tile.name().as_str().to_owned().into_boxed_str());
 
         let timer = Timer::new_with_base_dir(
             base_dir,

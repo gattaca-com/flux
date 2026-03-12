@@ -1,15 +1,25 @@
 use std::{
     alloc::Layout,
     borrow::Borrow,
+    collections::HashMap,
     mem::size_of,
     ops::Deref,
     path::Path,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
+
+fn broadcast_id_for(label: &str, queue: &str) -> usize {
+    static COUNTERS: OnceLock<Mutex<HashMap<(String, String), usize>>> = OnceLock::new();
+    let mut map = COUNTERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let id = map.entry((label.to_owned(), queue.to_owned())).or_insert(0);
+    let result = *id;
+    *id += 1;
+    result
+}
 
 fn binary_name() -> &'static str {
     static NAME: OnceLock<String> = OnceLock::new();
@@ -620,21 +630,38 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn try_init_broadcast(&mut self) {
         if self.cursor.is_null() {
-            self.cursor =
-                self.queue.group_cursor(&format!("{}.{}.broadcast", binary_name(), self.label));
-
-            // Always set current producer position without restoring value from cursor
-            self.set_broadcast_pos(self.queue.count());
+            self.init_broadcast();
         }
+    }
+
+    #[inline(never)]
+    fn init_broadcast(&mut self) {
+        let id = broadcast_id_for(self.label, std::any::type_name::<T>());
+        let id = if id == 0 { "" } else { &format!(".{}", id) };
+
+        self.cursor = self.queue.group_cursor(&format!(
+            "{}.{}{}.broadcast",
+            binary_name(),
+            self.label,
+            id
+        ));
+
+        // Always set current producer position without restoring value from cursor
+        self.set_broadcast_pos(self.queue.count());
     }
 
     #[inline]
     pub fn try_init_collaborative(&mut self) {
         if self.cursor.is_null() {
-            self.cursor =
-                self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
-            self.acquire_next_slot();
+            self.init_collaborative();
         }
+    }
+
+    #[inline(never)]
+    fn init_collaborative(&mut self) {
+        self.cursor =
+            self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
+        self.acquire_next_slot();
     }
 
     /// Nonblocking consume returning either Ok(()) or a ReadError

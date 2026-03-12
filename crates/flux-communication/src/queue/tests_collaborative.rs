@@ -251,10 +251,10 @@ fn perf_test_collaborative_consumers() {
     let producer = {
         let barrier = Arc::clone(&barrier);
         std::thread::spawn(move || {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             barrier.wait();
             for _ in 0..N {
-                std::thread::sleep(Duration::from_micros(rng.gen_range(0..=10)));
+                std::thread::sleep(Duration::from_micros(rng.random_range(0..=10)));
                 let ts = start.elapsed().as_nanos() as u64;
                 p.produce(&ts);
             }
