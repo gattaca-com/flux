@@ -21,7 +21,7 @@ fn binary_name() -> &'static str {
     })
 }
 
-use flux_utils::{safe_panic, ArrayStr};
+use flux_utils::{ArrayStr, safe_panic};
 use rand::Rng;
 use shared_memory::ShmemConf;
 
@@ -101,7 +101,7 @@ impl QueueHeader {
 
         // TODO: use better fix of potential data race, either spinlock or something
         // similar to what is done in the collaborative consume
-        std::thread::sleep(Duration::from_micros(rand::thread_rng().gen_range(0..10)));
+        std::thread::sleep(Duration::from_micros(rand::rng().random_range(0..10)));
 
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == key {
@@ -116,6 +116,33 @@ impl QueueHeader {
         }
 
         panic!("no group slots available (max {} groups)", MAX_GROUPS);
+    }
+
+    /// Returns all non-empty consumer group slots as `(label, cursor_value)`
+    /// pairs.
+    ///
+    /// Queues created by older flux versions may not have the group_labels
+    /// region initialised — the raw `ArrayStr::len` field will contain
+    /// garbage.  We detect this (len > GROUP_LABEL_LEN) and bail early
+    /// with an empty vec instead of letting `from_raw_parts` abort.
+    pub fn active_groups(&self) -> Vec<(&str, usize)> {
+        let mut out = Vec::new();
+        for i in 0..MAX_GROUPS {
+            let label = &self.group_labels[i];
+
+            // Guard: if the stored length exceeds the fixed-size buffer the
+            // memory is uninitialised / from an incompatible header layout.
+            if label.len() > GROUP_LABEL_LEN {
+                return out;
+            }
+
+            if !label.is_empty() {
+                let label = label.as_str();
+                let cursor = self.group_cursors[i].cursor.load(Ordering::Relaxed);
+                out.push((label, cursor));
+            }
+        }
+        out
     }
 }
 
@@ -593,9 +620,8 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn try_init_broadcast(&mut self) {
         if self.cursor.is_null() {
-            self.cursor = self
-                .queue
-                .group_cursor(&format!("{}.{}.broadcast", binary_name(), self.label));
+            self.cursor =
+                self.queue.group_cursor(&format!("{}.{}.broadcast", binary_name(), self.label));
 
             // Always set current producer position without restoring value from cursor
             self.set_broadcast_pos(self.queue.count());
@@ -605,9 +631,8 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     pub fn try_init_collaborative(&mut self) {
         if self.cursor.is_null() {
-            self.cursor = self
-                .queue
-                .group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
+            self.cursor =
+                self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
             self.acquire_next_slot();
         }
     }
@@ -812,7 +837,6 @@ impl<T: 'static + Copy> Consumer<T> {
         self.consumer.set_collaborative_group(group_label);
     }
 }
-
 
 #[cfg(test)]
 mod tests_basic;

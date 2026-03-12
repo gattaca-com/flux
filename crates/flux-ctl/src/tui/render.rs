@@ -147,15 +147,35 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 fn render_detail(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let has_groups = matches!(&app.view, View::Detail(d) if !d.consumer_groups.is_empty());
+    let cg_height: u16 = if has_groups {
+        match &app.view {
+            View::Detail(d) => (d.consumer_groups.len() as u16 + 4).min(12),
+            _ => 0,
+        }
+    } else {
+        0
+    };
+
+    let constraints: Vec<Constraint> = if has_groups {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(14),
+            Constraint::Length(cg_height),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![
             Constraint::Length(3),
             Constraint::Length(14),
             Constraint::Min(4),
             Constraint::Length(1),
-        ])
-        .split(area);
+        ]
+    };
+
+    let chunks =
+        Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
 
     let seg = app.detail_segment();
     let elapsed = app.last_refresh.elapsed().as_secs_u64();
@@ -174,11 +194,21 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         render_segment_info(frame, &seg, chunks[1]);
     }
 
-    if let View::Detail(ref detail) = app.view {
-        render_pid_table(frame, detail, chunks[2]);
+    if has_groups {
+        if let View::Detail(ref detail) = app.view {
+            let seg = app.detail_segment();
+            let write_pos = seg.and_then(|s| s.queue_writes);
+            let capacity = seg.and_then(|s| s.queue_capacity);
+            render_consumer_groups(frame, detail, write_pos, capacity, chunks[2]);
+            render_pid_table(frame, detail, chunks[3]);
+        }
+        render_status_bar(frame, app, chunks[4]);
+    } else {
+        if let View::Detail(ref detail) = app.view {
+            render_pid_table(frame, detail, chunks[2]);
+        }
+        render_status_bar(frame, app, chunks[3]);
     }
-
-    render_status_bar(frame, app, chunks[3]);
 }
 
 fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: Rect) {
@@ -301,6 +331,87 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         .title_alignment(Alignment::Left)
         .border_style(Style::default().fg(Color::DarkGray));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_consumer_groups(
+    frame: &mut Frame,
+    detail: &super::app::DetailState,
+    write_pos: Option<usize>,
+    capacity: Option<usize>,
+    area: Rect,
+) {
+    let header = Row::new(vec!["Group", "Cursor", "Lag", "Backlog"])
+        .style(Style::default().fg(Color::Cyan).bold())
+        .bottom_margin(1);
+
+    let cap = capacity.unwrap_or(0);
+    let bar_width: usize = 12;
+
+    let rows: Vec<Row> = detail
+        .consumer_groups
+        .iter()
+        .map(|cg| {
+            let lag = write_pos.map(|w| w.saturating_sub(cg.cursor));
+            let lag_str = lag.map(|l| format!("{l}")).unwrap_or_else(|| "—".into());
+            let lag_style = if cap > 0 {
+                match lag {
+                    Some(l) if l * 4 >= cap * 3 => Style::default().fg(Color::Red),
+                    Some(l) if l * 4 >= cap => Style::default().fg(Color::Yellow),
+                    _ => Style::default().fg(Color::Green),
+                }
+            } else {
+                match lag {
+                    Some(l) if l > 1000 => Style::default().fg(Color::Red),
+                    Some(l) if l > 100 => Style::default().fg(Color::Yellow),
+                    _ => Style::default(),
+                }
+            };
+
+            // Backlog bar: filled portion = lag / capacity
+            let bar = if cap > 0 {
+                let filled = lag
+                    .map(|l| {
+                        ((l as f64 / cap as f64) * bar_width as f64).round() as usize
+                    })
+                    .unwrap_or(0)
+                    .min(bar_width);
+                let empty = bar_width - filled;
+                let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+                Span::styled(bar_str, lag_style)
+            } else {
+                Span::raw("—")
+            };
+
+            Row::new(vec![
+                Cell::from(truncate_str(&cg.label, 40)),
+                Cell::from(format!("{}", cg.cursor)),
+                Cell::from(Span::styled(lag_str, lag_style)),
+                Cell::from(bar),
+            ])
+        })
+        .collect();
+
+    let title = format!(" Consumer Groups ({}) ", detail.consumer_groups.len());
+
+    let widths = [
+        Constraint::Length(42),
+        Constraint::Length(14),
+        Constraint::Length(10),
+        Constraint::Min(14),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_alignment(Alignment::Left)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
+
+    frame.render_widget(table, area);
 }
 
 fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: Rect) {
@@ -461,14 +572,19 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     app.selected_item(),
                     Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
                 );
+                let dead_toggle = if app.hide_dead {
+                    "a show dead"
+                } else {
+                    "a hide dead"
+                };
                 let base = match (on_dead_seg, has_any_dead) {
                     (true, _) => {
-                        " ↑↓ navigate  Enter open  d destroy  D destroy all  / filter  s sort  ? help  q quit"
+                        format!(" ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit")
                     }
                     (false, true) => {
-                        " ↑↓ navigate  Enter open  D destroy all  / filter  s sort  ? help  q quit"
+                        format!(" ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit")
                     }
-                    _ => " ↑↓ navigate  Enter open  / filter  s sort  ? help  q quit",
+                    _ => format!(" ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"),
                 };
                 format!("{}{}", base, filter_hint)
             }
@@ -533,7 +649,11 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  s          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Cycle sort (name → kind → status)"),
+            Span::raw("Cycle sort (name → kind → status → activity)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Toggle show/hide dead segments"),
         ]),
         Line::from(vec![
             Span::styled("  d          ", Style::default().fg(Color::Yellow)),

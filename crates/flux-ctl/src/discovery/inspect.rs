@@ -446,6 +446,38 @@ impl QueueStats {
         Some(Self { writes, fill, capacity })
     }
 }
+
+/// A consumer group's label and cursor position, read from shared memory.
+#[derive(Clone, Debug)]
+pub struct ConsumerGroupInfo {
+    pub label: String,
+    pub cursor: usize,
+}
+
+/// Read consumer groups from a queue's shared memory header.
+///
+/// Opens the shmem backing the given flink, reads all active group slots
+/// from the `QueueHeader`, and returns owned `ConsumerGroupInfo` values.
+/// Returns an empty `Vec` if the segment cannot be opened or is not an
+/// initialized queue.
+pub fn read_consumer_groups(flink: &str) -> Vec<ConsumerGroupInfo> {
+    let shmem = match ShmemConf::new().flink(flink).open() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    if shmem.len() < std::mem::size_of::<QueueHeader>() {
+        return Vec::new();
+    }
+    let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
+    if !header.is_initialized() {
+        return Vec::new();
+    }
+    header
+        .active_groups()
+        .into_iter()
+        .map(|(label, cursor)| ConsumerGroupInfo { label: label.to_owned(), cursor })
+        .collect()
+}
 /// Format a byte count as a human-readable string using binary units (KiB, MiB,
 /// GiB).
 pub fn format_bytes(bytes: u64) -> String {

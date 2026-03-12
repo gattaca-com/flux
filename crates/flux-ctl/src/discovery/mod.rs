@@ -21,8 +21,8 @@ pub use flux_communication::is_pid_alive;
 use flux_communication::{ShmemKind, array::ArrayHeader, queue::QueueHeader};
 use flux_timing::{Duration, Instant};
 pub use inspect::{
-    PidInfo, PoisonInfo, QueueStats, backing_file_size, format_bytes, resolve_backing_path,
-    scan_proc_fds,
+    ConsumerGroupInfo, PidInfo, PoisonInfo, QueueStats, backing_file_size, format_bytes,
+    read_consumer_groups, resolve_backing_path, scan_proc_fds,
 };
 use shared_memory::{Shmem, ShmemConf};
 
@@ -268,6 +268,31 @@ impl ShmemCache {
                 self.handles.insert(flink_str.clone(), handle);
             }
         }
+    }
+
+    /// Read consumer groups from a cached queue mapping — zero syscalls.
+    pub fn consumer_groups(&self, flink: &str) -> Vec<ConsumerGroupInfo> {
+        let Some(handle) = self.handles.get(flink) else {
+            return Vec::new();
+        };
+        if handle.kind != ShmemKind::Queue {
+            return Vec::new();
+        }
+        if handle.shmem.len() < std::mem::size_of::<QueueHeader>() {
+            return Vec::new();
+        }
+        let header = unsafe { &*(handle.shmem.as_ptr() as *const QueueHeader) };
+        if !header.is_initialized() {
+            return Vec::new();
+        }
+        header
+            .active_groups()
+            .into_iter()
+            .map(|(label, cursor)| ConsumerGroupInfo {
+                label: label.to_owned(),
+                cursor,
+            })
+            .collect()
     }
 }
 
