@@ -21,7 +21,7 @@ use std::{
     process::Command,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -29,7 +29,7 @@ use std::{
 
 use flux_communication::{
     ShmemData, cleanup_shmem,
-    queue::{Consumer, Producer, Queue, QueueType},
+    queue::{Consumer, Producer, Queue, QueueHeader, QueueType},
     shmem_queue_with_base_dir,
 };
 use flux_utils::directories::{local_share_dir, shmem_dir_with_base};
@@ -270,16 +270,14 @@ fn run_primary(flags: Flags) {
                 .expect("open poison-demo shmem");
 
             let base = shmem.as_ptr();
-            const HEADER_SIZE: usize =
-                std::mem::size_of::<flux_communication::queue::QueueHeader>();
-            let header = unsafe { &*(base as *const flux_communication::queue::QueueHeader) };
-            let count = header.count.load(std::sync::atomic::Ordering::Relaxed);
+            const HEADER_SIZE: usize = std::mem::size_of::<QueueHeader>();
+            let header = unsafe { &*(base as *const QueueHeader) };
+            let count = header.count.load(Ordering::Relaxed);
             let slot = count & header.mask;
             let elsize = header.elsize;
 
-            let version_ptr = unsafe { base.add(HEADER_SIZE + slot * elsize) }
-                as *const std::sync::atomic::AtomicU64;
-            let v = unsafe { &*version_ptr }.fetch_add(1, std::sync::atomic::Ordering::Release);
+            let version_ptr = unsafe { base.add(HEADER_SIZE + slot * elsize) } as *const AtomicU64;
+            let v = unsafe { &*version_ptr }.fetch_add(1, Ordering::Release);
 
             println!(
                 "  💉 slot {slot} version {v} → {} (odd = write in progress, never completed)",
