@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use flux_timing::{Duration, Nanos, Repeater};
-use flux_utils::safe_panic;
+use flux_utils::{DCache, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
-use crate::tcp::{ConnState, TcpStream, TcpTelemetry, stream::set_socket_buf_size};
+use crate::tcp::{ConnState, MessagePayload, TcpStream, TcpTelemetry, stream::set_socket_buf_size};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -43,7 +43,7 @@ pub enum PollEvent<'a> {
     /// A connection was closed (by the remote or due to an IO error).
     Disconnect { token: Token },
     /// A complete framed message was received.
-    Message { token: Token, payload: &'a [u8], send_ts: Nanos },
+    Message { token: Token, payload: MessagePayload<'a>, send_ts: Nanos },
 }
 
 struct ConnectionManager {
@@ -53,6 +53,7 @@ struct ConnectionManager {
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
+    dcache: Option<Arc<DCache>>,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
@@ -68,6 +69,7 @@ impl Default for ConnectionManager {
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
+            dcache: None,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
@@ -180,8 +182,13 @@ impl ConnectionManager {
     fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
         if let Some(stream) = self.try_connect(o, addr) {
-            let mut tcp_stream =
-                TcpStream::from_stream_with_telemetry(stream, o, addr, self.telemetry);
+            let mut tcp_stream = TcpStream::from_stream_with_telemetry(
+                stream,
+                o,
+                addr,
+                self.telemetry,
+                self.dcache.clone(),
+            );
             if let Some(msg) = &self.on_connect_msg &&
                 tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
@@ -355,6 +362,7 @@ impl ConnectionManager {
                             token,
                             addr,
                             self.telemetry,
+                            self.dcache.clone(),
                         );
 
                         if let Some(msg) = &self.on_connect_msg &&
@@ -409,14 +417,16 @@ impl ConnectionManager {
 /// If configured via [`with_on_connect_msg`], the provided bytes are sent once
 /// after a connection is established (both outbound and newly accepted
 /// inbound).
+///
+/// ## DCache
+/// If built via [`with_dcache`], each received message payload is written
+/// into the dcache and [`PollEvent::Message`] carries
+/// [`MessagePayload::Cached`]. Otherwise it carries [`MessagePayload::Raw`].
 pub struct TcpConnector {
     events: Events,
     conn_mgr: ConnectionManager,
 }
 impl Default for TcpConnector {
-    /// Creates a new connector with the given telemetry.
-    ///
-    /// The default outbound reconnect interval is 2 seconds.
     fn default() -> Self {
         Self { events: Events::with_capacity(128), conn_mgr: ConnectionManager::default() }
     }
@@ -442,6 +452,16 @@ impl TcpConnector {
     pub fn with_on_connect_msg(mut self, msg: Vec<u8>) -> Self {
         assert!(msg.len() <= TcpStream::SEND_BUF_SIZE, "on_connect_msg exceeds send buffer size");
         self.conn_mgr.on_connect_msg = Some(msg);
+        self
+    }
+
+    /// Attaches a [`DCache`] as the message receive buffer.
+    ///
+    /// When set, each received payload is written into it directly and
+    /// [`PollEvent::Message`] carries [`MessagePayload::Cached`] instead of
+    /// [`MessagePayload::Raw`].
+    pub fn with_dcache(mut self, dcache: Arc<DCache>) -> Self {
+        self.conn_mgr.dcache = Some(dcache);
         self
     }
 

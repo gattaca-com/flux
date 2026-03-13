@@ -2,12 +2,24 @@ use std::{
     collections::VecDeque,
     io::{self, IoSlice, Read, Write},
     net::SocketAddr,
+    sync::Arc,
 };
 
 use flux_communication::Timer;
 use flux_timing::Nanos;
+use flux_utils::{DCache, DCacheRef};
+
+enum RxBuf {
+    Heap(Vec<u8>),
+    DCache(Arc<DCache>),
+}
 use mio::{Interest, Registry, Token, event::Event};
 use tracing::{debug, warn};
+
+pub enum MessagePayload<'a> {
+    Raw(&'a [u8]),
+    Cached(DCacheRef),
+}
 
 /// Controls emission of network latency and alloc telemetry.
 ///
@@ -55,17 +67,16 @@ pub enum ConnState {
 }
 
 enum ReadOutcome<'a> {
-    PayloadDone { frame: &'a [u8], send_ts: Nanos },
+    PayloadDone { payload: MessagePayload<'a>, send_ts: Nanos },
     WouldBlock,
     Disconnected,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy)]
 enum RxState {
-    /// Waiting for the frame header.
     ReadingHeader { buf: [u8; FRAME_HEADER_SIZE], have: usize },
-    /// Reading the payload of `msg_len` bytes.
-    ReadingPayload { msg_len: usize, offset: usize, send_ts: Nanos },
+    ReadingPayload { msg_len: usize, offset: usize, send_ts: Nanos, dc_offset: Option<usize> },
 }
 impl Default for RxState {
     fn default() -> Self {
@@ -103,7 +114,7 @@ pub struct TcpStream {
     token: Token,
 
     rx_state: RxState,
-    rx_buf: Vec<u8>,
+    rx_buf: RxBuf,
     header_buf: [u8; FRAME_HEADER_SIZE],
     send_buf: Vec<u8>,
     /// Filled when send would block.
@@ -131,6 +142,7 @@ impl TcpStream {
         token: Token,
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
+        dcache: Option<Arc<DCache>>,
     ) -> Self {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
@@ -141,13 +153,17 @@ impl TcpStream {
                 Some(TcpTimers::new(app_name, &steam_label))
             }
         };
+        let rx_buf = match dcache {
+            Some(dc) => RxBuf::DCache(dc),
+            None => RxBuf::Heap(vec![0; RX_BUF_SIZE]),
+        };
 
         Self {
             stream,
             peer_addr,
             token,
             rx_state: Default::default(),
-            rx_buf: vec![0; RX_BUF_SIZE],
+            rx_buf,
             header_buf: [0; FRAME_HEADER_SIZE],
             send_buf: vec![0; Self::SEND_BUF_SIZE],
             send_backlog: VecDeque::with_capacity(64),
@@ -165,7 +181,6 @@ impl TcpStream {
         on_connect_msg: Option<&Vec<u8>>,
     ) -> ConnState {
         self.rx_state = Default::default();
-        self.rx_buf.clear();
         self.send_buf.clear();
         self.send_cursor = 0;
         self.header_buf.fill(0);
@@ -186,17 +201,20 @@ impl TcpStream {
     }
 
     /// Poll socket and calls `on_msg` for every fully assembled frame.
-    /// Frame data is only valid for the duration of the callback.
+    ///
+    /// When no DCache is set, `payload` is [`MessagePayload::Raw`] and the
+    /// slice is only valid for the duration of the callback. When DCache is
+    /// set, `payload` is [`MessagePayload::Cached`] and the ref may be kept.
     #[inline]
     pub fn poll_with<F>(&mut self, registry: &Registry, ev: &Event, on_msg: &mut F) -> ConnState
     where
-        F: for<'a> FnMut(Token, &'a [u8], Nanos),
+        F: for<'a> FnMut(Token, MessagePayload<'a>, Nanos),
     {
         if ev.is_readable() {
             loop {
                 match self.read_frame() {
-                    ReadOutcome::PayloadDone { frame, send_ts } => {
-                        on_msg(ev.token(), frame, send_ts);
+                    ReadOutcome::PayloadDone { payload, send_ts } => {
+                        on_msg(ev.token(), payload, send_ts);
                     }
                     ReadOutcome::WouldBlock => break,
                     ReadOutcome::Disconnected => return ConnState::Disconnected,
@@ -352,14 +370,6 @@ impl TcpStream {
                                     let msg_len = u32::from_le_bytes(
                                         buf[..LEN_HEADER_SIZE].try_into().unwrap(),
                                     ) as usize;
-                                    if msg_len > self.rx_buf.len() {
-                                        debug!(
-                                            buf_len = self.rx_buf.len(),
-                                            need_len = msg_len,
-                                            "tcp: buffer resized"
-                                        );
-                                        self.rx_buf.resize(msg_len, 0);
-                                    }
                                     let send_ts = Nanos(u64::from_le_bytes(
                                         buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
                                     ));
@@ -368,10 +378,34 @@ impl TcpStream {
                                             buf: [0; FRAME_HEADER_SIZE],
                                             have: 0,
                                         };
-                                    } else {
-                                        self.rx_state =
-                                            RxState::ReadingPayload { msg_len, offset: 0, send_ts };
+                                        continue;
                                     }
+                                    let dc_offset = match &mut self.rx_buf {
+                                        RxBuf::DCache(dc) => match dc.reserve(msg_len) {
+                                            Ok(r) => Some(r.offset),
+                                            Err(e) => {
+                                                warn!("dcache reserve failed: {e}");
+                                                return ReadOutcome::Disconnected;
+                                            }
+                                        },
+                                        RxBuf::Heap(buf) => {
+                                            if msg_len > buf.len() {
+                                                debug!(
+                                                    buf_len = buf.len(),
+                                                    need_len = msg_len,
+                                                    "tcp: buffer resized"
+                                                );
+                                                buf.resize(msg_len, 0);
+                                            }
+                                            None
+                                        }
+                                    };
+                                    self.rx_state = RxState::ReadingPayload {
+                                        msg_len,
+                                        offset: 0,
+                                        send_ts,
+                                        dc_offset,
+                                    };
                                 }
                             }
 
@@ -388,41 +422,53 @@ impl TcpStream {
                     }
                 }
 
-                RxState::ReadingPayload { msg_len, mut offset, send_ts } => {
+                RxState::ReadingPayload { msg_len, mut offset, send_ts, dc_offset } => {
                     while offset < msg_len {
-                        match self.stream.read(&mut self.rx_buf[offset..msg_len]) {
+                        let result = if let Some(dc_offset) = dc_offset {
+                            let dref = DCacheRef { offset: dc_offset, len: msg_len };
+                            let RxBuf::DCache(dc) = &self.rx_buf else { unreachable!() };
+                            match dc.write_into(dref, offset, |buf| self.stream.read(buf)) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    warn!("dcache write_into error: {e}");
+                                    return ReadOutcome::Disconnected;
+                                }
+                            }
+                        } else {
+                            let RxBuf::Heap(buf) = &mut self.rx_buf else { unreachable!() };
+                            self.stream.read(&mut buf[offset..msg_len])
+                        };
+                        match result {
                             Ok(0) => return ReadOutcome::Disconnected,
-
                             Ok(n) => {
                                 offset += n;
-
-                                // offset can never be > msg_len as we pass a fixed length slice
-                                // into rx_buf. stream will only ever read <= msg_len bytes.
                                 if offset == msg_len {
                                     if let Some(timers) = &mut self.timers {
                                         timers
                                             .latency
                                             .emit_latency_from_nanos(send_ts, Nanos::now());
                                     }
-
                                     self.rx_state = RxState::ReadingHeader {
                                         buf: [0; FRAME_HEADER_SIZE],
                                         have: 0,
                                     };
-
-                                    return ReadOutcome::PayloadDone {
-                                        frame: &self.rx_buf[..msg_len],
-                                        send_ts,
+                                    let payload = if let Some(dc_offset) = dc_offset {
+                                        MessagePayload::Cached(DCacheRef {
+                                            offset: dc_offset,
+                                            len: msg_len,
+                                        })
+                                    } else {
+                                        let RxBuf::Heap(buf) = &self.rx_buf else { unreachable!() };
+                                        MessagePayload::Raw(&buf[..msg_len])
                                     };
+                                    return ReadOutcome::PayloadDone { payload, send_ts };
                                 }
                             }
-
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 self.rx_state =
-                                    RxState::ReadingPayload { msg_len, offset, send_ts };
+                                    RxState::ReadingPayload { msg_len, offset, send_ts, dc_offset };
                                 return ReadOutcome::WouldBlock;
                             }
-
                             Err(err) => {
                                 debug!(?err, "tcp: read payload");
                                 return ReadOutcome::Disconnected;

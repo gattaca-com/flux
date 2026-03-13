@@ -338,9 +338,7 @@ impl App {
                     group.segments.sort_by(|a, b| {
                         let a_rate = a.msgs_per_sec.unwrap_or(-1.0);
                         let b_rate = b.msgs_per_sec.unwrap_or(-1.0);
-                        b_rate
-                            .partial_cmp(&a_rate)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        b_rate.partial_cmp(&a_rate).unwrap_or(std::cmp::Ordering::Equal)
                     });
                 }
             }
@@ -374,8 +372,7 @@ impl App {
                         seg.poison = discovery::PoisonInfo::check(&seg.entry);
                     }
                     // Refresh consumer groups (cursors move in real-time)
-                    detail.consumer_groups =
-                        self.shmem_cache.consumer_groups(&seg.entry.flink);
+                    detail.consumer_groups = self.shmem_cache.consumer_groups(&seg.entry.flink);
                 }
                 None => self.view = View::List,
             }

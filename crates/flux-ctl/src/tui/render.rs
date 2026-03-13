@@ -370,9 +370,7 @@ fn render_consumer_groups(
             // Backlog bar: filled portion = lag / capacity
             let bar = if cap > 0 {
                 let filled = lag
-                    .map(|l| {
-                        ((l as f64 / cap as f64) * bar_width as f64).round() as usize
-                    })
+                    .map(|l| ((l as f64 / cap as f64) * bar_width as f64).round() as usize)
                     .unwrap_or(0)
                     .min(bar_width);
                 let empty = bar_width - filled;
@@ -572,19 +570,21 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     app.selected_item(),
                     Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
                 );
-                let dead_toggle = if app.hide_dead {
-                    "a show dead"
-                } else {
-                    "a hide dead"
-                };
+                let dead_toggle = if app.hide_dead { "a show dead" } else { "a hide dead" };
                 let base = match (on_dead_seg, has_any_dead) {
                     (true, _) => {
-                        format!(" ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit")
+                        format!(
+                            " ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
+                        )
                     }
                     (false, true) => {
-                        format!(" ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit")
+                        format!(
+                            " ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
+                        )
                     }
-                    _ => format!(" ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"),
+                    _ => format!(
+                        " ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"
+                    ),
                 };
                 format!("{}{}", base, filter_hint)
             }
