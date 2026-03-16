@@ -60,7 +60,7 @@ impl DcacheWriter {
     /// max possible size to lap dcache, guaranteeing the consumer's
     /// held slot seqlock version will have changed before any region is reused.
     pub fn required_capacity(queue_depth: usize, mtu: usize) -> usize {
-        queue_depth * Self::next_multiple_of_64(mtu)
+        (queue_depth + 1) * Self::next_multiple_of_64(mtu)
     }
 
     pub fn new(n: usize) -> Self {
@@ -115,7 +115,7 @@ impl DcacheWriter {
 
     /// Calls `f` with a mutable view of `r`'s data region starting at `offset`.
     #[inline]
-    pub fn write_into<F, R>(&mut self, r: DCacheRef, offset: usize, f: F) -> Result<R, DCacheError>
+    pub fn write_into<F, R>(&self, r: DCacheRef, offset: usize, f: F) -> Result<R, DCacheError>
     where
         F: FnOnce(&mut [u8]) -> R,
     {

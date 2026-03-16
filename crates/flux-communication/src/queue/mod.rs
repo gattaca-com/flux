@@ -842,9 +842,9 @@ impl<T: 'static + Copy> Consumer<T> {
             Ok(()) => {
                 f(&mut self.message);
                 self.consumer.acquire_next_slot();
-                return true;
+                true
             }
-            Err(ReadError::Empty) => return false,
+            Err(ReadError::Empty) => false,
             Err(ReadError::SpedPast) => {
                 if self.should_log {
                     safe_panic!(
@@ -853,7 +853,7 @@ impl<T: 'static + Copy> Consumer<T> {
                     );
                 }
                 self.consumer.acquire_earliest_available_slot();
-                return false;
+                false
             }
         }
     }

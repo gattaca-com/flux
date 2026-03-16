@@ -200,38 +200,28 @@ impl<T: 'static + Copy> SpineConsumer<T> {
 
 impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
     #[inline]
-    pub fn consume_dcache<P, F>(
-        &mut self,
-        producers: &mut P,
-        dcache: &DcacheReader,
-        mut f: F,
-    ) -> bool
+    pub fn consume_dcache<R, F>(&mut self, dcache: &DcacheReader, mut read: F) -> Option<R>
     where
-        P: SpineProducers,
-        F: FnMut(&[u8], &mut P),
+        F: FnMut(&[u8]) -> R,
     {
         loop {
             match self.inner.try_consume_with_epoch() {
                 Ok((msg, slot_pos, slot_ver)) => {
-                    let ingestion_t = msg.ingestion_time();
                     let r: DCacheRef = (*msg.data()).into();
-                    *producers.timestamp_mut().ingestion_t_mut() = ingestion_t;
-                    self.timer.start();
-                    let dcache_ok = dcache.map(r, |payload| f(payload, producers)).is_ok();
-                    if dcache_ok && self.inner.slot_version(slot_pos) == slot_ver {
-                        self.timer.record_processing_and_latency_from(
-                            producers.timestamp().ingestion_t.into(),
-                        );
-                        return true;
+                    let Ok(extracted) = dcache.map(r, |payload| read(payload)) else {
+                        self.inner.recover_after_error();
+                        return None;
+                    };
+                    if self.inner.slot_version(slot_pos) != slot_ver {
+                        self.inner.recover_after_error();
+                        return None;
                     }
-                    // overrun: producer lapped during dcache read
-                    self.inner.recover_after_error();
-                    return false;
+                    return Some(extracted);
                 }
                 Err(ReadError::SpedPast) => {
                     self.inner.recover_after_error();
                 }
-                Err(ReadError::Empty) => return false,
+                Err(ReadError::Empty) => return None,
             }
         }
     }

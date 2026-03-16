@@ -187,17 +187,18 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn consume_dcache<T, F>(&mut self, dcache: &DcacheReader, mut f: F)
+    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DcacheReader, mut read: F) -> Option<R>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,
-        S::Producers: SpineProducers,
-        F: FnMut(&[u8], &mut S::Producers),
+        F: FnMut(&[u8]) -> R,
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
-        while c.consume_dcache(&mut self.producers, dcache, &mut f) {
+        let result = c.consume_dcache(dcache, &mut read);
+        if result.is_some() {
             self.did_work = true;
         }
+        result
     }
 
     /// Override the collaborative group label for queue `T`. By default each
