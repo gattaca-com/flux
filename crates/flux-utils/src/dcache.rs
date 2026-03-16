@@ -55,6 +55,14 @@ unsafe impl Sync for DcacheReader {}
 const CACHELINE: usize = 64;
 
 impl DcacheWriter {
+    /// Minimum dcache capacity for the epoch check in `consume_dcache` to be
+    /// sufficient. The producer must publish at least `queue_depth` messages of
+    /// max possible size to lap dcache, guaranteeing the consumer's
+    /// held slot seqlock version will have changed before any region is reused.
+    pub fn required_capacity(queue_depth: usize, mtu: usize) -> usize {
+        queue_depth * Self::next_multiple_of_64(mtu)
+    }
+
     pub fn new(n: usize) -> Self {
         assert!(n.is_power_of_two() && n.is_multiple_of(CACHELINE));
         let layout = Layout::from_size_align(n, CACHELINE).unwrap();
@@ -134,6 +142,11 @@ impl DcacheWriter {
 
 impl DcacheReader {
     #[inline]
+    pub fn capacity(&self) -> usize {
+        unsafe { size_of_val(&*self.data.data.get()) }
+    }
+
+    #[inline]
     pub fn read(&self, r: DCacheRef, buf: &mut [u8]) -> Result<(), DCacheError> {
         if r.len > buf.len() {
             return Err(DCacheError::BufferTooSmall(buf.len(), r.len));
@@ -151,11 +164,6 @@ impl DcacheReader {
     {
         let (base, offset_ix) = self.deref(r)?;
         Ok(unsafe { f(std::slice::from_raw_parts(base.add(offset_ix), r.len)) })
-    }
-
-    #[inline]
-    fn capacity(&self) -> usize {
-        unsafe { size_of_val(&*self.data.data.get()) }
     }
 
     #[inline]
