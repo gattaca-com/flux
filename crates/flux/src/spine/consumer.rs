@@ -1,11 +1,11 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::short_typename;
+use flux_utils::{DCacheRef, DcacheReader, short_typename};
 
 use crate::{
     Timer,
-    communication::queue,
+    communication::{ReadError, queue},
     spine::{FluxSpine, SpineProducers, SpineQueue},
     tile::Tile,
 };
@@ -195,6 +195,45 @@ impl<T: 'static + Copy> SpineConsumer<T> {
                     .record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
             }
         })
+    }
+}
+
+impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
+    #[inline]
+    pub fn consume_dcache<P, F>(
+        &mut self,
+        producers: &mut P,
+        dcache: &DcacheReader,
+        mut f: F,
+    ) -> bool
+    where
+        P: SpineProducers,
+        F: FnMut(&[u8], &mut P),
+    {
+        loop {
+            match self.inner.try_consume_with_epoch() {
+                Ok((msg, slot_pos, slot_ver)) => {
+                    let ingestion_t = msg.ingestion_time();
+                    let r: DCacheRef = (*msg.data()).into();
+                    *producers.timestamp_mut().ingestion_t_mut() = ingestion_t;
+                    self.timer.start();
+                    let dcache_ok = dcache.map(r, |payload| f(payload, producers)).is_ok();
+                    if dcache_ok && self.inner.slot_version(slot_pos) == slot_ver {
+                        self.timer.record_processing_and_latency_from(
+                            producers.timestamp().ingestion_t.into(),
+                        );
+                        return true;
+                    }
+                    // overrun: producer lapped during dcache read
+                    self.inner.recover_after_error();
+                    return false;
+                }
+                Err(ReadError::SpedPast) => {
+                    self.inner.recover_after_error();
+                }
+                Err(ReadError::Empty) => return false,
+            }
+        }
     }
 }
 

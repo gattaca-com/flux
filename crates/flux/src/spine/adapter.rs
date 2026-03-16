@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
+use flux_utils::{DCacheRef, DcacheReader};
 use signal_hook::consts::SIGINT;
 
 use crate::{
@@ -183,6 +184,20 @@ impl<S: FluxSpine> SpineAdapter<S> {
             self.did_work = true;
         }
         consumed
+    }
+
+    #[inline]
+    pub fn consume_dcache<T, F>(&mut self, dcache: &DcacheReader, mut f: F)
+    where
+        T: 'static + Copy + Into<DCacheRef>,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        S::Producers: SpineProducers,
+        F: FnMut(&[u8], &mut S::Producers),
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        while c.consume_dcache(&mut self.producers, dcache, &mut f) {
+            self.did_work = true;
+        }
     }
 
     /// Override the collaborative group label for queue `T`. By default each
