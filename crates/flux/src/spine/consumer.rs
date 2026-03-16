@@ -209,11 +209,9 @@ impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
                 Ok((msg, slot_pos, slot_ver)) => {
                     let r: DCacheRef = (*msg.data()).into();
                     let Ok(extracted) = dcache.map(r, |payload| read(payload)) else {
-                        self.inner.recover_after_error();
                         return None;
                     };
                     if self.inner.slot_version(slot_pos) != slot_ver {
-                        self.inner.recover_after_error();
                         return None;
                     }
                     return Some(extracted);
