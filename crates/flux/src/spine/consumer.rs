@@ -1,11 +1,11 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::short_typename;
+use flux_utils::{DCacheRef, DcacheReader, short_typename};
 
 use crate::{
     Timer,
-    communication::queue,
+    communication::{ReadError, queue},
     spine::{FluxSpine, SpineProducers, SpineQueue},
     tile::Tile,
 };
@@ -195,6 +195,33 @@ impl<T: 'static + Copy> SpineConsumer<T> {
                     .record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
             }
         })
+    }
+}
+
+impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
+    #[inline]
+    pub fn consume_dcache<R, F>(&mut self, dcache: &DcacheReader, mut read: F) -> Option<R>
+    where
+        F: FnMut(&[u8]) -> R,
+    {
+        loop {
+            match self.inner.try_consume_with_epoch() {
+                Ok((msg, slot_pos, slot_ver)) => {
+                    let r: DCacheRef = (*msg.data()).into();
+                    let Ok(extracted) = dcache.map(r, |payload| read(payload)) else {
+                        return None;
+                    };
+                    if self.inner.slot_version(slot_pos) != slot_ver {
+                        return None;
+                    }
+                    return Some(extracted);
+                }
+                Err(ReadError::SpedPast) => {
+                    self.inner.recover_after_error();
+                }
+                Err(ReadError::Empty) => return None,
+            }
+        }
     }
 }
 

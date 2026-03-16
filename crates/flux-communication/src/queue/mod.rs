@@ -639,12 +639,8 @@ impl<T: Copy> ConsumerBare<T> {
         let id = broadcast_id_for(self.label, std::any::type_name::<T>());
         let id = if id == 0 { "" } else { &format!(".{}", id) };
 
-        self.cursor = self.queue.group_cursor(&format!(
-            "{}.{}{}.broadcast",
-            binary_name(),
-            self.label,
-            id
-        ));
+        self.cursor =
+            self.queue.group_cursor(&format!("{}.{}{}.broadcast", binary_name(), self.label, id));
 
         // Always set current producer position without restoring value from cursor
         self.set_broadcast_pos(self.queue.count());
@@ -659,8 +655,7 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline(never)]
     fn init_collaborative(&mut self) {
-        self.cursor =
-            self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
+        self.cursor = self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
         self.acquire_next_slot();
     }
 
@@ -671,6 +666,23 @@ impl<T: Copy> ConsumerBare<T> {
         self.queue.consume(el, self.pos, self.expected_version)?;
         self.acquire_next_slot();
         Ok(())
+    }
+
+    /// Like `try_consume` but also returns `(slot_pos, slot_version)` for the
+    /// consumed slot.
+    #[inline]
+    pub fn try_consume_with_epoch(&mut self, el: &mut T) -> Result<(usize, u64), ReadError> {
+        self.try_init_broadcast();
+        let slot_pos = self.pos;
+        let slot_ver = self.expected_version;
+        self.queue.consume(el, slot_pos, slot_ver)?;
+        self.acquire_next_slot();
+        Ok((slot_pos, slot_ver))
+    }
+
+    #[inline]
+    pub fn slot_version(&self, slot_pos: usize) -> u64 {
+        self.queue.load(slot_pos).version.load(Ordering::Acquire)
     }
 
     /// Blocking consume
@@ -830,9 +842,9 @@ impl<T: 'static + Copy> Consumer<T> {
             Ok(()) => {
                 f(&mut self.message);
                 self.consumer.acquire_next_slot();
-                return true;
+                true
             }
-            Err(ReadError::Empty) => return false,
+            Err(ReadError::Empty) => false,
             Err(ReadError::SpedPast) => {
                 if self.should_log {
                     safe_panic!(
@@ -841,9 +853,26 @@ impl<T: 'static + Copy> Consumer<T> {
                     );
                 }
                 self.consumer.acquire_earliest_available_slot();
-                return false;
+                false
             }
         }
+    }
+
+    /// Consumes one message, returning `(&message, slot_pos, slot_ver)`.
+    #[inline]
+    pub fn try_consume_with_epoch(&mut self) -> Result<(&T, usize, u64), ReadError> {
+        let (pos, ver) = self.consumer.try_consume_with_epoch(&mut self.message)?;
+        Ok((&self.message, pos, ver))
+    }
+
+    #[inline]
+    pub fn slot_version(&self, slot_pos: usize) -> u64 {
+        self.consumer.slot_version(slot_pos)
+    }
+
+    #[inline]
+    pub fn recover_after_error(&mut self) {
+        self.consumer.recover_after_error();
     }
 
     #[inline]

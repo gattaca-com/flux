@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
+use flux_network::tcp::{MessagePayload, PollEvent, SendBehavior, TcpConnector};
 
 const NUM_RECEIVERS: usize = 4;
 const BURST_SIZE: usize = 20;
@@ -27,7 +27,9 @@ fn spawn_receiver(addr: SocketAddr) -> thread::JoinHandle<Vec<Vec<u8>>> {
         while !disconnected && std::time::Instant::now() < deadline {
             conn.poll_with(|event| match event {
                 PollEvent::Message { payload, .. } => {
-                    frames.push(payload.to_vec());
+                    if let MessagePayload::Raw(bytes) = payload {
+                        frames.push(bytes.to_vec());
+                    }
                 }
                 PollEvent::Disconnect { .. } => {
                     disconnected = true;

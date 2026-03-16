@@ -2,16 +2,15 @@ use std::{
     collections::VecDeque,
     io::{self, IoSlice, Read, Write},
     net::SocketAddr,
-    sync::Arc,
 };
 
 use flux_communication::Timer;
 use flux_timing::Nanos;
-use flux_utils::{DCache, DCacheRef};
+use flux_utils::{DCacheRef, DcacheWriter};
 
 enum RxBuf {
     Heap(Vec<u8>),
-    DCache(Arc<DCache>),
+    DCache,
 }
 use mio::{Interest, Registry, Token, event::Event};
 use tracing::{debug, warn};
@@ -142,7 +141,7 @@ impl TcpStream {
         token: Token,
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
-        dcache: Option<Arc<DCache>>,
+        use_dcache: bool,
     ) -> Self {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
@@ -153,10 +152,7 @@ impl TcpStream {
                 Some(TcpTimers::new(app_name, &steam_label))
             }
         };
-        let rx_buf = match dcache {
-            Some(dc) => RxBuf::DCache(dc),
-            None => RxBuf::Heap(vec![0; RX_BUF_SIZE]),
-        };
+        let rx_buf = if use_dcache { RxBuf::DCache } else { RxBuf::Heap(vec![0; RX_BUF_SIZE]) };
 
         Self {
             stream,
@@ -206,13 +202,19 @@ impl TcpStream {
     /// slice is only valid for the duration of the callback. When DCache is
     /// set, `payload` is [`MessagePayload::Cached`] and the ref may be kept.
     #[inline]
-    pub fn poll_with<F>(&mut self, registry: &Registry, ev: &Event, on_msg: &mut F) -> ConnState
+    pub fn poll_with<F>(
+        &mut self,
+        registry: &Registry,
+        ev: &Event,
+        mut dcache: Option<&mut DcacheWriter>,
+        on_msg: &mut F,
+    ) -> ConnState
     where
         F: for<'a> FnMut(Token, MessagePayload<'a>, Nanos),
     {
         if ev.is_readable() {
             loop {
-                match self.read_frame() {
+                match self.read_frame(dcache.as_deref_mut()) {
                     ReadOutcome::PayloadDone { payload, send_ts } => {
                         on_msg(ev.token(), payload, send_ts);
                     }
@@ -356,7 +358,7 @@ impl TcpStream {
     /// Loops until a frame is received or we've read everything and the read
     /// would block.
     #[inline]
-    fn read_frame(&mut self) -> ReadOutcome<'_> {
+    fn read_frame(&mut self, mut dcache: Option<&mut DcacheWriter>) -> ReadOutcome<'_> {
         loop {
             match self.rx_state {
                 RxState::ReadingHeader { mut buf, mut have } => {
@@ -381,13 +383,18 @@ impl TcpStream {
                                         continue;
                                     }
                                     let dc_offset = match &mut self.rx_buf {
-                                        RxBuf::DCache(dc) => match dc.reserve(msg_len) {
-                                            Ok(r) => Some(r.offset),
-                                            Err(e) => {
-                                                warn!("dcache reserve failed: {e}");
-                                                return ReadOutcome::Disconnected;
+                                        RxBuf::DCache => {
+                                            let writer = dcache
+                                                .as_deref_mut()
+                                                .expect("dcache stream but no writer passed");
+                                            match writer.reserve(msg_len) {
+                                                Ok(r) => Some(r.offset),
+                                                Err(e) => {
+                                                    warn!("dcache reserve failed: {e}");
+                                                    return ReadOutcome::Disconnected;
+                                                }
                                             }
-                                        },
+                                        }
                                         RxBuf::Heap(buf) => {
                                             if msg_len > buf.len() {
                                                 debug!(
@@ -426,8 +433,9 @@ impl TcpStream {
                     while offset < msg_len {
                         let result = if let Some(dc_offset) = dc_offset {
                             let dref = DCacheRef { offset: dc_offset, len: msg_len };
-                            let RxBuf::DCache(dc) = &self.rx_buf else { unreachable!() };
-                            match dc.write_into(dref, offset, |buf| self.stream.read(buf)) {
+                            let writer =
+                                dcache.as_deref_mut().expect("dcache stream but no writer passed");
+                            match writer.write_into(dref, offset, |buf| self.stream.read(buf)) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     warn!("dcache write_into error: {e}");

@@ -88,11 +88,13 @@ impl FromSpineArg {
 mod kw {
     syn::custom_keyword!(persist);
     syn::custom_keyword!(size);
+    syn::custom_keyword!(flavour);
 }
 
-fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>) {
+fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool) {
     let mut is_persistent = false;
     let mut size_expr: Option<Expr> = None;
+    let mut is_spmc = false;
 
     for attr in attrs {
         if attr.path().is_ident("queue") {
@@ -108,13 +110,20 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>) {
                     size_expr = Some(lit);
                     return Ok(());
                 }
+                if meta.path.is_ident("flavour") {
+                    let content;
+                    parenthesized!(content in meta.input);
+                    let s: LitStr = content.parse()?;
+                    is_spmc = s.value() == "spmc";
+                    return Ok(());
+                }
                 Err(meta.error("unrecognized repr"))
             })
             .expect("couldn't parse attr");
         }
     }
 
-    (is_persistent, size_expr)
+    (is_persistent, size_expr, is_spmc)
 }
 
 #[proc_macro_attribute]
@@ -193,7 +202,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // ------------------------ NEW: only if #[persist] or needs size for
             // PersistingQueueTile
-            let (is_persistent, _size_expr_opt) = get_queue_config(&field.attrs);
+            let (is_persistent, _size_expr_opt, _is_spmc) = get_queue_config(&field.attrs);
             if is_persistent {
                 persisting.push(quote! {
                                 let last_core = ::flux::core_affinity::get_core_ids().unwrap().last().unwrap().id;
@@ -232,18 +241,23 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             });
         } else if let Type::Path(tp_for_new) = field_ty_for_new {
             if tp_for_new.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
-                let (_is_persistent, size_expr_opt_for_new) =
+                let (_is_persistent, size_expr_opt_for_new, is_spmc) =
                     get_queue_config(&field_for_new.attrs);
                 let size_arg_for_new = match size_expr_opt_for_new {
                     Some(expr_for_new) => quote! { #expr_for_new },
                     None => quote! { 2usize.pow(15) },
+                };
+                let queue_type = if is_spmc {
+                    quote! { ::flux::communication::queue::QueueType::SPMC }
+                } else {
+                    quote! { ::flux::communication::queue::QueueType::MPMC }
                 };
                 new_method_initializers_for_new_fn.push(quote! {
                     #field_ident_for_new: ::flux::communication::shmem_queue_with_base_dir(
                         &base_dir,
                         &format!("{}{}", #app_name_tokens, path_suffix),
                         #size_arg_for_new,
-                        ::flux::communication::queue::QueueType::MPMC
+                        #queue_type
                     )
                 });
             } else {
