@@ -8,7 +8,7 @@ use flux_communication::{
     queue::{ConsumerBare, Producer, Queue, QueueType},
 };
 use flux_timing::{Duration, Instant};
-use flux_utils::{DCacheRef, DcacheReader, DcacheWriter};
+use flux_utils::{DCache, DCacheRef};
 
 #[derive(Clone, Copy)]
 struct Msg {
@@ -50,17 +50,126 @@ fn busy_wait(duration: Duration) {
     while curr.elapsed() < duration {}
 }
 
+// Single shared DCache, one consumer thread. Returns sum of write-to-read
+// latencies.
+fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
+    let total = n_producers * per_producer;
+    let dc = DCache::new(CAPACITY);
+    let reader = dc.clone();
+    let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
+
+    let consumer = thread::spawn(move || {
+        core_affinity::set_for_current(CoreId { id: LAST_CORE });
+        let mut c = ConsumerBare::new(queue, "bench");
+        let mut r = DCacheRef { offset: 0, len: 0 };
+        let mut sum = 0u64;
+        let mut seen = 0usize;
+        while seen < total {
+            match c.try_consume(&mut r) {
+                Ok(()) => {
+                    sum += reader.map(r, read_ts).unwrap();
+                    seen += 1;
+                }
+                Err(ReadError::SpedPast) => c.recover_after_error(),
+                Err(ReadError::Empty) => {}
+            }
+        }
+        sum
+    });
+
+    thread::sleep(Duration::from_millis(100).into());
+
+    let producers: Vec<_> = (0..n_producers)
+        .map(|i| {
+            let dc = dc.clone();
+            let p = Producer::from(queue);
+            thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - 1 - i });
+                let mut rng = now_nanos();
+                for _ in 0..per_producer {
+                    let r = dc.write(msg_size, write_ts).unwrap();
+                    p.produce_without_first(&r);
+                    let duration = Duration::from_micros(xorshift(&mut rng) % 100);
+                    busy_wait(duration);
+                }
+            })
+        })
+        .collect();
+
+    for p in producers {
+        p.join().unwrap();
+    }
+    Duration::from_nanos(consumer.join().unwrap())
+}
+
+// Single shared DCache, multiple consumer threads. Returns average-per-consumer
+// sum of write-to-read latencies (comparable to run_mp).
+fn run_mp_mc(
+    n_producers: usize,
+    n_consumers: usize,
+    msg_size: usize,
+    per_producer: usize,
+) -> Duration {
+    let total = n_producers * per_producer;
+    let dc = DCache::new(CAPACITY);
+    let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
+
+    let consumers: Vec<_> = (0..n_consumers)
+        .map(|i| {
+            let reader = dc.clone();
+            let mut c = ConsumerBare::new(queue, "bench");
+            thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
+                let mut r = DCacheRef { offset: 0, len: 0 };
+                let mut sum = 0u64;
+                let mut seen = 0usize;
+                while seen < total {
+                    match c.try_consume(&mut r) {
+                        Ok(()) => {
+                            sum += reader.map(r, read_ts).unwrap();
+                            seen += 1;
+                        }
+                        Err(ReadError::SpedPast) => c.recover_after_error(),
+                        Err(ReadError::Empty) => {}
+                    }
+                }
+                sum
+            })
+        })
+        .collect();
+
+    thread::sleep(Duration::from_millis(100).into());
+
+    let producers: Vec<_> = (0..n_producers)
+        .map(|i| {
+            let dc = dc.clone();
+            let p = Producer::from(queue);
+            thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - n_consumers - i });
+                let mut rng = now_nanos();
+                for _ in 0..per_producer {
+                    let r = dc.write(msg_size, write_ts).unwrap();
+                    p.produce_without_first(&r);
+                    let duration = Duration::from_micros(xorshift(&mut rng) % 100);
+                    busy_wait(duration);
+                }
+            })
+        })
+        .collect();
+
+    for p in producers {
+        p.join().unwrap();
+    }
+    let total_sum: u64 = consumers.into_iter().map(|c| c.join().unwrap()).sum();
+    Duration::from_nanos(total_sum / n_consumers as u64)
+}
+
 // Per-producer DCache, one consumer thread. Returns sum of write-to-read
 // latencies.
 fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
-    let (writers, readers): (Vec<DcacheWriter>, Vec<DcacheReader>) = (0..n_producers)
-        .map(|_| {
-            let w = DcacheWriter::new(CAPACITY);
-            let r = w.reader();
-            (w, r)
-        })
-        .unzip();
+    let dcaches: Vec<DCache> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
+    let readers: Vec<DCache> = dcaches.iter().map(|dc| dc.clone()).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumer = thread::spawn(move || {
@@ -84,10 +193,10 @@ fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
 
     thread::sleep(Duration::from_millis(100).into());
 
-    let producers: Vec<_> = writers
+    let producers: Vec<_> = dcaches
         .into_iter()
         .enumerate()
-        .map(|(i, mut dc)| {
+        .map(|(i, dc)| {
             let p = Producer::from(queue);
             thread::spawn(move || {
                 core_affinity::set_for_current(CoreId { id: LAST_CORE - 1 - i });
@@ -117,13 +226,8 @@ fn run_sp_mc(
     per_producer: usize,
 ) -> Duration {
     let total = n_producers * per_producer;
-    let (writers, readers): (Vec<DcacheWriter>, Vec<DcacheReader>) = (0..n_producers)
-        .map(|_| {
-            let w = DcacheWriter::new(CAPACITY);
-            let r = w.reader();
-            (w, r)
-        })
-        .unzip();
+    let dcaches: Vec<DCache> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
+    let readers: Vec<DCache> = dcaches.iter().map(|dc| dc.clone()).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumers: Vec<_> = (0..n_consumers)
@@ -152,10 +256,10 @@ fn run_sp_mc(
 
     thread::sleep(Duration::from_millis(100).into());
 
-    let producers: Vec<_> = writers
+    let producers: Vec<_> = dcaches
         .into_iter()
         .enumerate()
-        .map(|(i, mut dc)| {
+        .map(|(i, dc)| {
             let p = Producer::from(queue);
             thread::spawn(move || {
                 core_affinity::set_for_current(CoreId { id: LAST_CORE - n_consumers - i });
@@ -250,6 +354,15 @@ fn bench_latency(c: &mut Criterion) {
             let max_pp = (QUEUE_LEN / n).max(1);
             group.throughput(Throughput::Bytes(msg_size as u64));
             group.bench_with_input(
+                BenchmarkId::new("shared", format!("{n}p_{msg_size}")),
+                &n,
+                |b, &np| {
+                    b.iter_custom(|iters| {
+                        measure(iters, np, max_pp, |np, pp| run_mp(np, msg_size, pp)).into()
+                    })
+                },
+            );
+            group.bench_with_input(
                 BenchmarkId::new("per_producer", format!("{n}p_{msg_size}")),
                 &n,
                 |b, &np| {
@@ -264,6 +377,15 @@ fn bench_latency(c: &mut Criterion) {
                 |b, &np| {
                     b.iter_custom(|iters| {
                         measure(iters, np, max_pp, |np, pp| run_crossbeam(np, msg_size, pp)).into()
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("shared_4c", format!("{n}p_{msg_size}")),
+                &n,
+                |b, &np| {
+                    b.iter_custom(|iters| {
+                        measure(iters, np, max_pp, |np, pp| run_mp_mc(np, 4, msg_size, pp)).into()
                     })
                 },
             );

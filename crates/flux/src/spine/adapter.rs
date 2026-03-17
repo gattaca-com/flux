@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
-use flux_utils::{DCacheRef, DcacheReader};
+use flux_utils::{DCache, DCacheRef};
 use signal_hook::consts::SIGINT;
 
 use crate::{
@@ -187,7 +187,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DcacheReader, mut read: F) -> Option<R>
+    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<R>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,

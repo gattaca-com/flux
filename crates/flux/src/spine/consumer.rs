@@ -1,7 +1,7 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::{DCacheRef, DcacheReader, short_typename};
+use flux_utils::{DCache, DCacheRef, short_typename};
 
 use crate::{
     Timer,
@@ -200,7 +200,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
 
 impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
     #[inline]
-    pub fn consume_dcache<R, F>(&mut self, dcache: &DcacheReader, mut read: F) -> Option<R>
+    pub fn consume_dcache<R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<R>
     where
         F: FnMut(&[u8]) -> R,
     {

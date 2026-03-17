@@ -6,7 +6,7 @@ use std::{
 
 use flux_communication::Timer;
 use flux_timing::Nanos;
-use flux_utils::{DCacheRef, DcacheWriter};
+use flux_utils::{DCache, DCacheRef};
 
 enum RxBuf {
     Heap(Vec<u8>),
@@ -206,7 +206,7 @@ impl TcpStream {
         &mut self,
         registry: &Registry,
         ev: &Event,
-        mut dcache: Option<&mut DcacheWriter>,
+        mut dcache: Option<&mut DCache>,
         on_msg: &mut F,
     ) -> ConnState
     where
@@ -358,7 +358,7 @@ impl TcpStream {
     /// Loops until a frame is received or we've read everything and the read
     /// would block.
     #[inline]
-    fn read_frame(&mut self, mut dcache: Option<&mut DcacheWriter>) -> ReadOutcome<'_> {
+    fn read_frame(&mut self, mut dcache: Option<&mut DCache>) -> ReadOutcome<'_> {
         loop {
             match self.rx_state {
                 RxState::ReadingHeader { mut buf, mut have } => {

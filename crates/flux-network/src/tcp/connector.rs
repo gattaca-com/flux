@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use flux_timing::{Duration, Nanos, Repeater};
-use flux_utils::{DcacheWriter, safe_panic};
+use flux_utils::{DCache, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
@@ -53,7 +53,7 @@ struct ConnectionManager {
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
-    dcache: Option<DcacheWriter>,
+    dcache: Option<DCache>,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
@@ -457,7 +457,7 @@ impl TcpConnector {
     }
 
     /// Attaches a dcache writer as the shared receive buffer for all streams.
-    pub fn with_dcache(mut self, writer: DcacheWriter) -> Self {
+    pub fn with_dcache(mut self, writer: DCache) -> Self {
         self.conn_mgr.dcache = Some(writer);
         self
     }

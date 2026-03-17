@@ -5,7 +5,7 @@ use std::{
 };
 
 use flux_network::tcp::{MessagePayload, PollEvent, SendBehavior, TcpConnector};
-use flux_utils::DcacheWriter;
+use flux_utils::DCache;
 
 /// Two inbound connections both write into the same connector dcache.
 /// Verifies that both payloads are readable via the single shared reader.
@@ -17,8 +17,8 @@ fn dcache_multi_stream() {
     const MSG_B: &[u8] = b"stream-b";
     const CAPACITY: usize = 4096;
 
-    let writer = DcacheWriter::new(CAPACITY);
-    let reader = writer.reader();
+    let writer = DCache::new(CAPACITY);
+    let reader = writer.clone();
 
     let server = thread::spawn(move || {
         let mut conn = TcpConnector::default().with_dcache(writer);
