@@ -1,7 +1,7 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::{DCacheRef, DcacheReader, short_typename};
+use flux_utils::{DCache, DCacheRef, short_typename};
 
 use crate::{
     Timer,
@@ -200,15 +200,69 @@ impl<T: 'static + Copy> SpineConsumer<T> {
 
 impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
     #[inline]
-    pub fn consume_dcache<R, F>(&mut self, dcache: &DcacheReader, mut read: F) -> Option<R>
+    pub fn consume_dcache<R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<(T, R)>
     where
         F: FnMut(&[u8]) -> R,
+    {
+        self.consume_dcache_internal_message(dcache, |msg, payload| (*msg.data(), read(payload)))
+    }
+
+    #[inline]
+    pub fn consume_dcache_collaborative<R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<(T, R)>
+    where
+        F: FnMut(&[u8]) -> R,
+    {
+        self.consume_dcache_collaborative_internal_message(dcache, |msg, payload| {
+            (*msg.data(), read(payload))
+        })
+    }
+
+    #[inline]
+    pub fn consume_dcache_collaborative_internal_message<R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<R>
+    where
+        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
+    {
+        match self.inner.try_consume_with_epoch_collaborative() {
+            Ok((msg, slot_pos, slot_ver)) => {
+                let r: DCacheRef = (*msg.data()).into();
+                let Ok(extracted) = dcache.map(r, |payload| read(msg, payload)) else {
+                    return None;
+                };
+                if self.inner.slot_version(slot_pos) != slot_ver {
+                    return None;
+                }
+                Some(extracted)
+            }
+            Err(ReadError::SpedPast) => {
+                self.inner.recover_collaborative_after_error();
+                None
+            }
+            Err(ReadError::Empty) => None,
+        }
+    }
+
+    #[inline]
+    pub fn consume_dcache_internal_message<R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<R>
+    where
+        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
         loop {
             match self.inner.try_consume_with_epoch() {
                 Ok((msg, slot_pos, slot_ver)) => {
                     let r: DCacheRef = (*msg.data()).into();
-                    let Ok(extracted) = dcache.map(r, |payload| read(payload)) else {
+                    let Ok(extracted) = dcache.map(r, |payload| read(msg, payload)) else {
                         return None;
                     };
                     if self.inner.slot_version(slot_pos) != slot_ver {

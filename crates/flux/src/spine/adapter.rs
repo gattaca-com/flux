@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
-use flux_utils::{DCacheRef, DcacheReader};
+use flux_utils::{DCache, DCacheRef};
 use signal_hook::consts::SIGINT;
 
 use crate::{
@@ -187,7 +187,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DcacheReader, mut read: F) -> Option<R>
+    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<(T, R)>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,
@@ -195,6 +195,63 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache(dcache, &mut read);
+        if result.is_some() {
+            self.did_work = true;
+        }
+        result
+    }
+
+    #[inline]
+    pub fn consume_dcache_collaborative<T, R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<(T, R)>
+    where
+        T: 'static + Copy + Into<DCacheRef>,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        F: FnMut(&[u8]) -> R,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let result = c.consume_dcache_collaborative(dcache, &mut read);
+        if result.is_some() {
+            self.did_work = true;
+        }
+        result
+    }
+
+    #[inline]
+    pub fn consume_dcache_internal_message<T, R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<R>
+    where
+        T: 'static + Copy + Into<DCacheRef>,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let result = c.consume_dcache_internal_message(dcache, &mut read);
+        if result.is_some() {
+            self.did_work = true;
+        }
+        result
+    }
+
+    #[inline]
+    pub fn consume_dcache_collaborative_internal_message<T, R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<R>
+    where
+        T: 'static + Copy + Into<DCacheRef>,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let result = c.consume_dcache_collaborative_internal_message(dcache, &mut read);
         if result.is_some() {
             self.did_work = true;
         }

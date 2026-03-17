@@ -866,6 +866,16 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 
     #[inline]
+    pub fn try_consume_with_epoch_collaborative(&mut self) -> Result<(&T, usize, u64), ReadError> {
+        self.consumer.try_init_collaborative();
+        let slot_pos = self.consumer.pos;
+        let slot_ver = self.consumer.expected_version;
+        self.consumer.queue.consume(&mut self.message, slot_pos, slot_ver)?;
+        self.consumer.acquire_next_slot();
+        Ok((&self.message, slot_pos, slot_ver))
+    }
+
+    #[inline]
     pub fn slot_version(&self, slot_pos: usize) -> u64 {
         self.consumer.slot_version(slot_pos)
     }
@@ -873,6 +883,11 @@ impl<T: 'static + Copy> Consumer<T> {
     #[inline]
     pub fn recover_after_error(&mut self) {
         self.consumer.recover_after_error();
+    }
+
+    #[inline]
+    pub fn recover_collaborative_after_error(&mut self) {
+        self.consumer.acquire_earliest_available_slot();
     }
 
     #[inline]
