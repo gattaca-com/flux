@@ -8,7 +8,7 @@ use flux_utils::{DCache, DCacheRef};
 use signal_hook::consts::SIGINT;
 
 use crate::{
-    spine::{FluxSpine, SpineConsumer, SpineProducer, SpineProducers},
+    spine::{DcacheRead, FluxSpine, SpineConsumer, SpineProducer, SpineProducers},
     tile::Tile,
 };
 
@@ -187,7 +187,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<(T, R)>
+    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> DcacheRead<(T, R)>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,
@@ -195,7 +195,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache(dcache, &mut read);
-        if result.is_some() {
+        if matches!(result, DcacheRead::Ok(_)) {
             self.did_work = true;
         }
         result
@@ -206,7 +206,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         &mut self,
         dcache: &DCache,
         mut read: F,
-    ) -> Option<(T, R)>
+    ) -> DcacheRead<(T, R)>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,
@@ -214,7 +214,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache_collaborative(dcache, &mut read);
-        if result.is_some() {
+        if matches!(result, DcacheRead::Ok(_)) {
             self.did_work = true;
         }
         result
@@ -225,7 +225,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         &mut self,
         dcache: &DCache,
         mut read: F,
-    ) -> Option<R>
+    ) -> DcacheRead<R>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,
@@ -233,7 +233,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache_internal_message(dcache, &mut read);
-        if result.is_some() {
+        if matches!(result, DcacheRead::Ok(_)) {
             self.did_work = true;
         }
         result
@@ -244,7 +244,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         &mut self,
         dcache: &DCache,
         mut read: F,
-    ) -> Option<R>
+    ) -> DcacheRead<R>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,
@@ -252,7 +252,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache_collaborative_internal_message(dcache, &mut read);
-        if result.is_some() {
+        if matches!(result, DcacheRead::Ok(_)) {
             self.did_work = true;
         }
         result

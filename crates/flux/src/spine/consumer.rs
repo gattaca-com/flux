@@ -10,6 +10,16 @@ use crate::{
     tile::Tile,
 };
 
+#[derive(Debug)]
+pub enum DcacheRead<R> {
+    Ok(R),
+    /// Queue was empty.
+    Empty,
+    /// A message was dequeued but the payload could not be safely read
+    /// (producer lapped the consumer in either the queue seqlock or dcache).
+    Lost,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SpineConsumer<T: 'static + Copy> {
     timer: Timer,
@@ -200,7 +210,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
 
 impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
     #[inline]
-    pub fn consume_dcache<R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<(T, R)>
+    pub fn consume_dcache<R, F>(&mut self, dcache: &DCache, mut read: F) -> DcacheRead<(T, R)>
     where
         F: FnMut(&[u8]) -> R,
     {
@@ -212,7 +222,7 @@ impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
         &mut self,
         dcache: &DCache,
         mut read: F,
-    ) -> Option<(T, R)>
+    ) -> DcacheRead<(T, R)>
     where
         F: FnMut(&[u8]) -> R,
     {
@@ -226,7 +236,7 @@ impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
         &mut self,
         dcache: &DCache,
         mut read: F,
-    ) -> Option<R>
+    ) -> DcacheRead<R>
     where
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
@@ -234,18 +244,18 @@ impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
             Ok((msg, slot_pos, slot_ver)) => {
                 let r: DCacheRef = (*msg.data()).into();
                 let Ok(extracted) = dcache.map(r, |payload| read(msg, payload)) else {
-                    return None;
+                    return DcacheRead::Lost;
                 };
                 if self.inner.slot_version(slot_pos) != slot_ver {
-                    return None;
+                    return DcacheRead::Lost;
                 }
-                Some(extracted)
+                DcacheRead::Ok(extracted)
             }
             Err(ReadError::SpedPast) => {
                 self.inner.recover_collaborative_after_error();
-                None
+                DcacheRead::Lost
             }
-            Err(ReadError::Empty) => None,
+            Err(ReadError::Empty) => DcacheRead::Empty,
         }
     }
 
@@ -254,7 +264,7 @@ impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
         &mut self,
         dcache: &DCache,
         mut read: F,
-    ) -> Option<R>
+    ) -> DcacheRead<R>
     where
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
@@ -263,17 +273,17 @@ impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
                 Ok((msg, slot_pos, slot_ver)) => {
                     let r: DCacheRef = (*msg.data()).into();
                     let Ok(extracted) = dcache.map(r, |payload| read(msg, payload)) else {
-                        return None;
+                        return DcacheRead::Lost;
                     };
                     if self.inner.slot_version(slot_pos) != slot_ver {
-                        return None;
+                        return DcacheRead::Lost;
                     }
-                    return Some(extracted);
+                    return DcacheRead::Ok(extracted);
                 }
                 Err(ReadError::SpedPast) => {
                     self.inner.recover_after_error();
                 }
-                Err(ReadError::Empty) => return None,
+                Err(ReadError::Empty) => return DcacheRead::Empty,
             }
         }
     }
