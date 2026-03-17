@@ -195,9 +195,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache(dcache, &mut read);
-        if matches!(result, DcacheRead::Ok(_)) {
-            self.did_work = true;
-        }
+        self.did_work |= matches!(result, DcacheRead::Ok(_));
         result
     }
 
@@ -214,9 +212,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache_collaborative(dcache, &mut read);
-        if matches!(result, DcacheRead::Ok(_)) {
-            self.did_work = true;
-        }
+        self.did_work |= matches!(result, DcacheRead::Ok(_));
         result
     }
 
@@ -233,9 +229,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache_internal_message(dcache, &mut read);
-        if matches!(result, DcacheRead::Ok(_)) {
-            self.did_work = true;
-        }
+        self.did_work |= matches!(result, DcacheRead::Ok(_));
         result
     }
 
@@ -252,9 +246,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
         let result = c.consume_dcache_collaborative_internal_message(dcache, &mut read);
-        if matches!(result, DcacheRead::Ok(_)) {
-            self.did_work = true;
-        }
+        self.did_work |= matches!(result, DcacheRead::Ok(_));
         result
     }
 
