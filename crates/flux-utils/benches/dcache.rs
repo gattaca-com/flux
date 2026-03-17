@@ -1,4 +1,4 @@
-use std::{hint::black_box, thread};
+use std::{hint::black_box, sync::Arc, thread};
 
 use core_affinity::CoreId;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -168,8 +168,8 @@ fn run_mp_mc(
 // latencies.
 fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
-    let dcaches: Vec<DCache> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
-    let readers: Vec<DCache> = dcaches.iter().map(|dc| dc.clone()).collect();
+    let dcaches: Vec<Arc<DCache>> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
+    let readers: Vec<Arc<DCache>> = dcaches.iter().map(|dc| dc.clone()).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumer = thread::spawn(move || {
@@ -226,8 +226,8 @@ fn run_sp_mc(
     per_producer: usize,
 ) -> Duration {
     let total = n_producers * per_producer;
-    let dcaches: Vec<DCache> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
-    let readers: Vec<DCache> = dcaches.iter().map(|dc| dc.clone()).collect();
+    let dcaches: Vec<Arc<DCache>> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
+    let readers: Vec<Arc<DCache>> = dcaches.iter().map(|dc| dc.clone()).collect();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumers: Vec<_> = (0..n_consumers)

@@ -26,14 +26,6 @@ pub enum DCacheError {
     SpedPast,
 }
 
-#[repr(C, align(64))]
-struct Dcache {
-    data: UnsafeCell<[u8]>,
-}
-
-unsafe impl Send for Dcache {}
-unsafe impl Sync for Dcache {}
-
 /// Ring buffer data storage inspired by Firedancer's `dcache`. Provides
 /// synchronised multi-producer allocation and leaves read-write ordering and
 /// epoch tracking to the caller.
@@ -44,10 +36,11 @@ unsafe impl Sync for Dcache {}
 ///
 /// Epoch tracking should be done via the spine queue seqlock:
 /// use `try_consume_with_epoch` + `slot_version` on the consumer side.
-#[derive(Clone)]
+#[repr(C, align(64))]
 pub struct DCache {
-    reserved: Arc<AtomicUsize>,
-    data: Arc<Dcache>,
+    reserved: AtomicUsize,
+    _pad: [u8; CACHELINE - size_of::<AtomicUsize>()],
+    data: UnsafeCell<[u8]>,
 }
 
 unsafe impl Send for DCache {}
@@ -64,17 +57,20 @@ impl DCache {
         (queue_depth + 1) * Self::next_multiple_of_64(mtu)
     }
 
-    pub fn new(n: usize) -> Self {
+    pub fn from_ptr(ptr: *mut u8, n: usize) -> *const Self {
+        std::ptr::slice_from_raw_parts_mut(ptr, n) as *const Self
+    }
+
+    pub fn new(n: usize) -> Arc<Self> {
         assert!(n.is_power_of_two() && n.is_multiple_of(CACHELINE));
-        let layout = Layout::from_size_align(n, CACHELINE).unwrap();
-        let data: Arc<Dcache> = unsafe {
+        let layout = Layout::from_size_align(CACHELINE + n, CACHELINE).unwrap();
+        unsafe {
             let ptr = alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 alloc::handle_alloc_error(layout);
             }
-            Arc::from(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n) as *mut Dcache))
-        };
-        Self { reserved: Arc::new(AtomicUsize::new(0)), data }
+            Arc::from(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n) as *mut Self))
+        }
     }
 
     #[inline]
@@ -108,7 +104,7 @@ impl DCache {
             };
             if self
                 .reserved
-                .compare_exchange(curr, next, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(curr, next, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 return Ok(DCacheRef { offset: actual, len });
@@ -125,7 +121,7 @@ impl DCache {
         if offset > r.len {
             return Err(DCacheError::InvalidWriteIntoOffset(offset, r.len));
         }
-        let base = self.data.data.get() as *mut u8;
+        let base = self.data.get() as *mut u8;
         let offset_ix = r.offset & (self.capacity() - 1);
         let buf =
             unsafe { std::slice::from_raw_parts_mut(base.add(offset_ix + offset), r.len - offset) };
@@ -154,13 +150,13 @@ impl DCache {
 
     #[inline]
     pub fn capacity(&self) -> usize {
-        unsafe { size_of_val(&*self.data.data.get()) }
+        size_of_val(&self.data)
     }
 
     #[inline]
     fn deref(&self, r: DCacheRef) -> Result<(*mut u8, usize), DCacheError> {
         let n = self.capacity();
-        let base = self.data.data.get() as *mut u8;
+        let base = self.data.get() as *mut u8;
         let offset_ix = r.offset & (n - 1);
         if r.len > n - offset_ix {
             return Err(DCacheError::DataLenExceedsCapacity(r.len, n));

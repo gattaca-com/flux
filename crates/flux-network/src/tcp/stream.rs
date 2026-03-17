@@ -206,7 +206,7 @@ impl TcpStream {
         &mut self,
         registry: &Registry,
         ev: &Event,
-        mut dcache: Option<&mut DCache>,
+        dcache: Option<&DCache>,
         on_msg: &mut F,
     ) -> ConnState
     where
@@ -214,7 +214,7 @@ impl TcpStream {
     {
         if ev.is_readable() {
             loop {
-                match self.read_frame(dcache.as_deref_mut()) {
+                match self.read_frame(dcache) {
                     ReadOutcome::PayloadDone { payload, send_ts } => {
                         on_msg(ev.token(), payload, send_ts);
                     }
@@ -358,7 +358,7 @@ impl TcpStream {
     /// Loops until a frame is received or we've read everything and the read
     /// would block.
     #[inline]
-    fn read_frame(&mut self, mut dcache: Option<&mut DCache>) -> ReadOutcome<'_> {
+    fn read_frame(&mut self, dcache: Option<&DCache>) -> ReadOutcome<'_> {
         loop {
             match self.rx_state {
                 RxState::ReadingHeader { mut buf, mut have } => {
@@ -384,9 +384,8 @@ impl TcpStream {
                                     }
                                     let dc_offset = match &mut self.rx_buf {
                                         RxBuf::DCache => {
-                                            let writer = dcache
-                                                .as_deref_mut()
-                                                .expect("dcache stream but no writer passed");
+                                            let writer =
+                                                dcache.expect("dcache stream but no writer passed");
                                             match writer.reserve(msg_len) {
                                                 Ok(r) => Some(r.offset),
                                                 Err(e) => {
@@ -433,8 +432,7 @@ impl TcpStream {
                     while offset < msg_len {
                         let result = if let Some(dc_offset) = dc_offset {
                             let dref = DCacheRef { offset: dc_offset, len: msg_len };
-                            let writer =
-                                dcache.as_deref_mut().expect("dcache stream but no writer passed");
+                            let writer = dcache.expect("dcache stream but no writer passed");
                             match writer.write_into(dref, offset, |buf| self.stream.read(buf)) {
                                 Ok(r) => r,
                                 Err(e) => {
