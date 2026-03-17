@@ -201,6 +201,63 @@ impl<S: FluxSpine> SpineAdapter<S> {
         result
     }
 
+    #[inline]
+    pub fn consume_dcache_collaborative<T, R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<(T, R)>
+    where
+        T: 'static + Copy + Into<DCacheRef>,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        F: FnMut(&[u8]) -> R,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let result = c.consume_dcache_collaborative(dcache, &mut read);
+        if result.is_some() {
+            self.did_work = true;
+        }
+        result
+    }
+
+    #[inline]
+    pub fn consume_dcache_internal_message<T, R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<R>
+    where
+        T: 'static + Copy + Into<DCacheRef>,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let result = c.consume_dcache_internal_message(dcache, &mut read);
+        if result.is_some() {
+            self.did_work = true;
+        }
+        result
+    }
+
+    #[inline]
+    pub fn consume_dcache_collaborative_internal_message<T, R, F>(
+        &mut self,
+        dcache: &DCache,
+        mut read: F,
+    ) -> Option<R>
+    where
+        T: 'static + Copy + Into<DCacheRef>,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
+    {
+        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        let result = c.consume_dcache_collaborative_internal_message(dcache, &mut read);
+        if result.is_some() {
+            self.did_work = true;
+        }
+        result
+    }
+
     /// Override the collaborative group label for queue `T`. By default each
     /// tile instance gets a unique label (`TileType-N`) set automatically at
     /// attach time. Group label can be set in `Tile::init` to share a group
