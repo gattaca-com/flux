@@ -187,7 +187,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<R>
+    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<(T, R)>
     where
         T: 'static + Copy + Into<DCacheRef>,
         S::Consumers: AsMut<SpineConsumer<T>>,

@@ -200,21 +200,22 @@ impl<T: 'static + Copy> SpineConsumer<T> {
 
 impl<T: 'static + Copy + Into<DCacheRef>> SpineConsumer<T> {
     #[inline]
-    pub fn consume_dcache<R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<R>
+    pub fn consume_dcache<R, F>(&mut self, dcache: &DCache, mut read: F) -> Option<(T, R)>
     where
         F: FnMut(&[u8]) -> R,
     {
         loop {
             match self.inner.try_consume_with_epoch() {
                 Ok((msg, slot_pos, slot_ver)) => {
-                    let r: DCacheRef = (*msg.data()).into();
+                    let queue_msg = *msg.data();
+                    let r: DCacheRef = queue_msg.into();
                     let Ok(extracted) = dcache.map(r, |payload| read(payload)) else {
                         return None;
                     };
                     if self.inner.slot_version(slot_pos) != slot_ver {
                         return None;
                     }
-                    return Some(extracted);
+                    return Some((queue_msg, extracted));
                 }
                 Err(ReadError::SpedPast) => {
                     self.inner.recover_after_error();
