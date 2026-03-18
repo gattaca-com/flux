@@ -1808,9 +1808,12 @@ fn detail_view_shows_consumer_groups() {
                 cursor: 5000,
             },
         ],
+        focus: flux_ctl::tui::app::DetailFocus::ConsumerGroups,
+        selected_group: 0,
     });
 
-    let buf = render_to_buffer(&mut app, 120, 40);
+    // Use 200 cols wide so side-by-side panels have room for full labels.
+    let buf = render_to_buffer(&mut app, 200, 40);
     let text = buffer_text(&buf);
 
     // Section header should appear
@@ -1820,6 +1823,13 @@ fn detail_view_shows_consumer_groups() {
     assert!(text.contains("builder.telemetry.broadcast"), "should show first group label:\n{text}");
     assert!(text.contains("relay.telemetry.collab"), "should show second group label:\n{text}");
     assert!(text.contains("monitor.metrics.broadcast"), "should show third group label:\n{text}");
+
+    // Panels should be side-by-side (both on same line)
+    for line in text.lines() {
+        if line.contains("Consumer Groups") && line.contains("Attached Processes") {
+            break;
+        }
+    }
 
     // Lag values: 5000-4990=10, 5000-4800=200, 5000-5000=0
     assert!(text.contains("10"), "should show lag of 10:\n{text}");
@@ -1854,6 +1864,8 @@ fn detail_view_hides_consumer_groups_when_empty() {
         selected_pid: 0,
         confirm_cleanup: false,
         consumer_groups: vec![],
+        focus: flux_ctl::tui::app::DetailFocus::Processes,
+        selected_group: 0,
     });
 
     let buf = render_to_buffer(&mut app, 120, 30);
