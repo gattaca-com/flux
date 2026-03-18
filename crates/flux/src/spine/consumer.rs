@@ -1,7 +1,7 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::{DCache, DCacheRef, short_typename};
+use flux_utils::{DCacheRef, DcachePtr, short_typename};
 
 use crate::{
     Timer,
@@ -13,12 +13,12 @@ use crate::{
 #[derive(Debug)]
 pub enum DCacheRead<T, R> {
     Ok((T, R)),
+    /// Message consumed but no dcache ref present; payload not read.
+    NoRef(T),
     /// Queue was empty.
     Empty,
     /// Consumer got sped past.
     SpedPast,
-    /// Message consumed but no dcache ref present; payload not read.
-    NoRef(T),
     /// A message was dequeued but the payload could not be safely read
     /// (producer lapped the consumer in either the queue seqlock or dcache).
     Lost(T),
@@ -32,6 +32,7 @@ pub trait WithDCacheRef {
 pub struct SpineConsumer<T: 'static + Copy> {
     timer: Timer,
     pub inner: queue::Consumer<InternalMessage<T>>,
+    dcache: Option<DcachePtr>,
 }
 
 impl<T: 'static + Copy> Deref for SpineConsumer<T> {
@@ -218,11 +219,11 @@ impl<T: 'static + Copy> SpineConsumer<T> {
 
 impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
     #[inline]
-    pub fn consume_dcache<R, F>(&mut self, dcache: &DCache, mut read: F) -> DCacheRead<T, R>
+    pub fn consume_with_dcache<R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
     where
         F: FnMut(&[u8]) -> R,
     {
-        match self.consume_dcache_internal_message(dcache, |_msg, payload| read(payload)) {
+        match self.consume_with_dcache_internal_message(|_msg, payload| read(payload)) {
             DCacheRead::Ok((msg, r)) => DCacheRead::Ok((*msg.data(), r)),
             DCacheRead::Lost(msg) => DCacheRead::Lost(*msg.data()),
             DCacheRead::NoRef(msg) => DCacheRead::NoRef(*msg.data()),
@@ -232,15 +233,11 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
     }
 
     #[inline]
-    pub fn consume_dcache_collaborative<R, F>(
-        &mut self,
-        dcache: &DCache,
-        mut read: F,
-    ) -> DCacheRead<T, R>
+    pub fn consume_with_dcache_collaborative<R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
     where
         F: FnMut(T, &[u8]) -> R,
     {
-        match self.consume_dcache_collaborative_internal_message(dcache, |msg, payload| {
+        match self.consume_with_dcache_collaborative_internal_message(|msg, payload| {
             read(*msg.data(), payload)
         }) {
             DCacheRead::Ok((msg, r)) => DCacheRead::Ok((*msg.data(), r)),
@@ -252,9 +249,8 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
     }
 
     #[inline]
-    pub fn consume_dcache_collaborative_internal_message<R, F>(
+    pub fn consume_with_dcache_collaborative_internal_message<R, F>(
         &mut self,
-        dcache: &DCache,
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
@@ -265,7 +261,10 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
                 let Some(dref) = msg.data().get_ref() else {
                     return DCacheRead::NoRef(msg);
                 };
-                let Ok(extracted) = dcache.map(dref, |payload| read(&msg, payload)) else {
+                let Some(dc) = self.dcache else {
+                    return DCacheRead::NoRef(msg);
+                };
+                let Ok(extracted) = dc.map(dref, |payload| read(&msg, payload)) else {
                     return DCacheRead::Lost(msg);
                 };
                 if self.inner.slot_version(slot_pos) != slot_ver {
@@ -282,9 +281,8 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
     }
 
     #[inline]
-    pub fn consume_dcache_internal_message<R, F>(
+    pub fn consume_with_dcache_internal_message<R, F>(
         &mut self,
-        dcache: &DCache,
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
@@ -296,7 +294,10 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
                     let Some(dref) = msg.data().get_ref() else {
                         return DCacheRead::NoRef(msg);
                     };
-                    let Ok(extracted) = dcache.map(dref, |payload| read(&msg, payload)) else {
+                    let Some(dc) = self.dcache else {
+                        return DCacheRead::NoRef(msg);
+                    };
+                    let Ok(extracted) = dc.map(dref, |payload| read(&msg, payload)) else {
                         return DCacheRead::Lost(msg);
                     };
                     if self.inner.slot_version(slot_pos) != slot_ver {
@@ -329,6 +330,23 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             format!("{}-{}", tile.name(), short_typename::<T>()),
         );
 
-        Self { timer, inner: queue::Consumer::new(queue, label) }
+        Self { timer, inner: queue::Consumer::new(queue, label), dcache: None }
+    }
+
+    #[inline]
+    pub fn attach_with_dcache<D, S, Tl>(
+        base_dir: D,
+        tile: &Tl,
+        queue: SpineQueue<T>,
+        dcache: DcachePtr,
+    ) -> Self
+    where
+        D: AsRef<Path>,
+        S: FluxSpine,
+        Tl: Tile<S>,
+    {
+        let mut s = Self::attach::<D, S, Tl>(base_dir, tile, queue);
+        s.dcache = Some(dcache);
+        s
     }
 }

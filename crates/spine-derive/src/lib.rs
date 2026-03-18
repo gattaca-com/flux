@@ -89,12 +89,14 @@ mod kw {
     syn::custom_keyword!(persist);
     syn::custom_keyword!(size);
     syn::custom_keyword!(flavour);
+    syn::custom_keyword!(mtu);
 }
 
-fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool) {
+fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>) {
     let mut is_persistent = false;
     let mut size_expr: Option<Expr> = None;
     let mut is_spmc = false;
+    let mut mtu_expr: Option<Expr> = None;
 
     for attr in attrs {
         if attr.path().is_ident("queue") {
@@ -117,13 +119,20 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool) {
                     is_spmc = s.value() == "spmc";
                     return Ok(());
                 }
+                if meta.path.is_ident("mtu") {
+                    let content;
+                    parenthesized!(content in meta.input);
+                    let lit: Expr = content.parse()?;
+                    mtu_expr = Some(lit);
+                    return Ok(());
+                }
                 Err(meta.error("unrecognized repr"))
             })
             .expect("couldn't parse attr");
         }
     }
 
-    (is_persistent, size_expr, is_spmc)
+    (is_persistent, size_expr, is_spmc, mtu_expr)
 }
 
 #[proc_macro_attribute]
@@ -195,14 +204,22 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .push(quote! { pub #field_ident : ::flux::spine::SpineConsumer<#inner_ty> });
             producer_fields
                 .push(quote! { pub #field_ident : ::flux::spine::SpineProducer<#inner_ty> });
-            consumer_init.push(quote! {
-                            #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(&spine.base_dir, tile, spine.#field_ident)
-                        });
+            let (is_persistent, _size_expr_opt, _is_spmc, mtu_expr) =
+                get_queue_config(&field.attrs);
+            if mtu_expr.is_some() {
+                let dcache_ident = format_ident!("{}_dcache", field_ident);
+                consumer_init.push(quote! {
+                    #field_ident : ::flux::spine::SpineConsumer::attach_with_dcache::<_, #struct_ident, _>(&spine.base_dir, tile, spine.#field_ident, spine.#dcache_ident)
+                });
+            } else {
+                consumer_init.push(quote! {
+                    #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(&spine.base_dir, tile, spine.#field_ident)
+                });
+            }
             producer_init.push(quote! { #field_ident : ::flux::communication::queue::Producer::from(spine.#field_ident) });
 
             // ------------------------ NEW: only if #[persist] or needs size for
             // PersistingQueueTile
-            let (is_persistent, _size_expr_opt, _is_spmc) = get_queue_config(&field.attrs);
             if is_persistent {
                 persisting.push(quote! {
                                 let last_core = ::flux::core_affinity::get_core_ids().unwrap().last().unwrap().id;
@@ -222,29 +239,31 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             .push(quote! { #field_ident : #field.ty::attach(#app_name_tokens, tile, spine) });
     }
 
-    // ---- Prepare initializers for the `new` method ----
-    let mut new_method_initializers_for_new_fn =
-        Punctuated::<proc_macro2::TokenStream, Comma>::new();
-    for field_for_new in &input.fields {
-        let field_ident_for_new =
-            field_for_new.ident.as_ref().expect("named field required for new method");
-        let field_ty_for_new = &field_for_new.ty;
+    // ---- Build `new_with_base_dir` body as explicit let-bindings ----
+    // This allows dcache queue fields to destructure a tuple (queue, dcache_ptr)
+    // while non-dcache fields remain single-binding.
+    let mut new_let_stmts: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut new_struct_field_names: Vec<proc_macro2::TokenStream> = Vec::new();
+    new_struct_field_names.push(quote! { base_dir });
 
-        //TODO: @gd this is so cursed
-        if field_ident_for_new == "tile_info" {
-            new_method_initializers_for_new_fn.push(quote! {
-                #field_ident_for_new: ::flux::communication::ShmemData::open_or_init_with_base_dir(
+    for field in &input.fields {
+        let field_ident = field.ident.as_ref().expect("named field required for new method");
+
+        if field_ident == "tile_info" {
+            new_let_stmts.push(quote! {
+                let tile_info = ::flux::communication::ShmemData::open_or_init_with_base_dir(
                     &base_dir,
                     &format!("{}{}", #app_name_tokens, path_suffix),
                     || Default::default(),
-                ).expect("couldn't open or init tile info shmem")
+                ).expect("couldn't open or init tile info shmem");
             });
-        } else if let Type::Path(tp_for_new) = field_ty_for_new {
-            if tp_for_new.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
-                let (_is_persistent, size_expr_opt_for_new, is_spmc) =
-                    get_queue_config(&field_for_new.attrs);
-                let size_arg_for_new = match size_expr_opt_for_new {
-                    Some(expr_for_new) => quote! { #expr_for_new },
+            new_struct_field_names.push(quote! { tile_info });
+        } else if let Type::Path(tp) = &field.ty {
+            if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
+                let (_is_persistent, size_expr_opt, is_spmc, mtu_expr_opt) =
+                    get_queue_config(&field.attrs);
+                let size_arg = match size_expr_opt {
+                    Some(expr) => quote! { #expr },
                     None => quote! { 2usize.pow(15) },
                 };
                 let queue_type = if is_spmc {
@@ -252,21 +271,38 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 } else {
                     quote! { ::flux::communication::queue::QueueType::MPMC }
                 };
-                new_method_initializers_for_new_fn.push(quote! {
-                    #field_ident_for_new: ::flux::communication::shmem_queue_with_base_dir(
-                        &base_dir,
-                        &format!("{}{}", #app_name_tokens, path_suffix),
-                        #size_arg_for_new,
-                        #queue_type
-                    )
-                });
+                if let Some(mtu_expr) = mtu_expr_opt {
+                    let dcache_ident = format_ident!("{}_dcache", field_ident);
+                    new_let_stmts.push(quote! {
+                        let (#field_ident, #dcache_ident) =
+                            ::flux::communication::shmem_queue_dcache_with_base_dir(
+                                &base_dir,
+                                &format!("{}{}", #app_name_tokens, path_suffix),
+                                #size_arg,
+                                #mtu_expr,
+                                #queue_type,
+                            );
+                    });
+                    new_struct_field_names.push(quote! { #field_ident });
+                    new_struct_field_names.push(quote! { #dcache_ident });
+                } else {
+                    new_let_stmts.push(quote! {
+                        let #field_ident = ::flux::communication::shmem_queue_with_base_dir(
+                            &base_dir,
+                            &format!("{}{}", #app_name_tokens, path_suffix),
+                            #size_arg,
+                            #queue_type,
+                        );
+                    });
+                    new_struct_field_names.push(quote! { #field_ident });
+                }
             } else {
-                new_method_initializers_for_new_fn
-                    .push(quote! { #field_ident_for_new: Default::default() });
+                new_let_stmts.push(quote! { let #field_ident = Default::default(); });
+                new_struct_field_names.push(quote! { #field_ident });
             }
         } else {
-            new_method_initializers_for_new_fn
-                .push(quote! { #field_ident_for_new: Default::default() });
+            new_let_stmts.push(quote! { let #field_ident = Default::default(); });
+            new_struct_field_names.push(quote! { #field_ident });
         }
     }
 
@@ -276,14 +312,15 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         pub fn new_with_base_dir<D: AsRef<std::path::Path>>(base_dir: D, path_suffix: Option<&str>) -> Self {
             let path_suffix = path_suffix.unwrap_or(&"");
-            Self {
-                base_dir: base_dir.as_ref().to_path_buf(),
-                #new_method_initializers_for_new_fn
-            }
+            let base_dir = base_dir.as_ref().to_path_buf();
+            #(#new_let_stmts)*
+            Self { #(#new_struct_field_names),* }
         }
     };
 
-    // Reconstruct the input struct without #[queue] attributes on its fields
+    // Reconstruct the input struct without #[queue] attributes on its fields.
+    // For SpineQueue fields with `mtu`, also inject a `{field}_dcache: DcachePtr`
+    // field.
     let input_attrs = &input.attrs;
     let vis = &input.vis;
     let struct_ident = &input.ident;
@@ -291,25 +328,34 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let reconstructed_fields = match &input.fields {
         syn::Fields::Named(fields_named) => {
-            let iter = fields_named.named.iter().map(|f| {
-                let attrs = f.attrs.iter().filter(|attr| !attr.path().is_ident("queue"));
-                let vis = &f.vis;
+            let mut all_fields: Vec<proc_macro2::TokenStream> = Vec::new();
+            for f in &fields_named.named {
+                let attrs = f.attrs.iter().filter(|a| !a.path().is_ident("queue"));
+                let fvis = &f.vis;
                 let ident = &f.ident;
                 let colon_token = &f.colon_token;
                 let ty = &f.ty;
-                quote! { #(#attrs)* #vis #ident #colon_token #ty }
-            });
-            quote! { {
-                #(#iter),*,
-                base_dir: std::path::PathBuf
-            } }
+                all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #ty });
+                // Inject dcache handle field directly after its queue field.
+                if let Type::Path(tp) = ty {
+                    if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
+                        let (_, _, _, mtu_opt) = get_queue_config(&f.attrs);
+                        if mtu_opt.is_some() {
+                            let dcache_ident = format_ident!("{}_dcache", ident.as_ref().unwrap());
+                            all_fields.push(quote! { #dcache_ident: ::flux::utils::DcachePtr });
+                        }
+                    }
+                }
+            }
+            all_fields.push(quote! { base_dir: std::path::PathBuf });
+            quote! { { #(#all_fields),* } }
         }
         syn::Fields::Unnamed(fields_unnamed) => {
             let iter = fields_unnamed.unnamed.iter().map(|f| {
                 let attrs = f.attrs.iter().filter(|attr| !attr.path().is_ident("queue"));
-                let vis = &f.vis;
+                let fvis = &f.vis;
                 let ty = &f.ty;
-                quote! { #(#attrs)* #vis #ty }
+                quote! { #(#attrs)* #fvis #ty }
             });
             quote! { ( #(#iter),*, std::path::PathBuf ); }
         }

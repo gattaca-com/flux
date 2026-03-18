@@ -170,6 +170,32 @@ impl DCache {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct DcachePtr(*const DCache);
+
+unsafe impl Send for DcachePtr {}
+unsafe impl Sync for DcachePtr {}
+
+impl DcachePtr {
+    pub unsafe fn from_raw(ptr: *const DCache) -> Self {
+        Self(ptr)
+    }
+}
+
+impl std::ops::Deref for DcachePtr {
+    type Target = DCache;
+
+    fn deref(&self) -> &DCache {
+        unsafe { &*self.0 }
+    }
+}
+
+impl std::fmt::Debug for DcachePtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DcachePtr({:p})", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

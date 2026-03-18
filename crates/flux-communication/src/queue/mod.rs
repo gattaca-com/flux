@@ -461,6 +461,32 @@ impl<T: Copy> Queue<T> {
         }
     }
 
+    /// Size in bytes of the queue region for `len` slots (len rounded to next
+    /// power of two).
+    pub(crate) fn byte_size(len: usize) -> usize {
+        InnerQueue::<T>::size_of(len)
+    }
+
+    /// Initialise a new queue at a pre-mapped pointer. The caller owns the
+    /// mapping.
+    pub(crate) fn from_raw_init(ptr: *mut u8, len: usize, typ: QueueType) -> Self {
+        Self { inner: InnerQueue::from_uninitialized_ptr(ptr, len, typ) }
+    }
+
+    /// Open an existing queue at a pre-mapped pointer, validating element size.
+    pub(crate) fn from_raw_open(ptr: *mut u8) -> Result<Self, QueueError> {
+        let inner = InnerQueue::<T>::from_initialized_ptr(ptr as *mut QueueHeader)?;
+        unsafe {
+            if (*inner).header.elsize != std::mem::size_of::<Seqlock<T>>() {
+                return Err(QueueError::ElementSizeChanged(
+                    (*inner).header.elsize,
+                    std::mem::size_of::<Seqlock<T>>(),
+                ));
+            }
+        }
+        Ok(Self { inner })
+    }
+
     fn group_cursor(&self, key: &str) -> *const AtomicUsize {
         unsafe { &mut *(self.inner as *mut InnerQueue<T>) }.header.find_or_insert_group(key)
     }
