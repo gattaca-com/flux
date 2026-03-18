@@ -1801,11 +1801,17 @@ fn detail_view_shows_consumer_groups() {
             discovery::ConsumerGroupInfo {
                 label: "builder.telemetry.broadcast".into(),
                 cursor: 4990,
+                msgs_per_sec: Some(123.4),
             },
-            discovery::ConsumerGroupInfo { label: "relay.telemetry.collab".into(), cursor: 4800 },
+            discovery::ConsumerGroupInfo {
+                label: "relay.telemetry.collab".into(),
+                cursor: 4800,
+                msgs_per_sec: None,
+            },
             discovery::ConsumerGroupInfo {
                 label: "monitor.metrics.broadcast".into(),
                 cursor: 5000,
+                msgs_per_sec: Some(0.0),
             },
         ],
         focus: flux_ctl::tui::app::DetailFocus::ConsumerGroups,
@@ -1830,6 +1836,12 @@ fn detail_view_shows_consumer_groups() {
             break;
         }
     }
+
+    // msgs/s column header should appear
+    assert!(text.contains("msgs/s"), "should show msgs/s column header:\n{text}");
+
+    // msgs/s values: 123.4 for first group, — for second (None), 0 for third
+    assert!(text.contains("123.4"), "should show msgs/s rate of 123.4:\n{text}");
 
     // Lag values: 5000-4990=10, 5000-4800=200, 5000-5000=0
     assert!(text.contains("10"), "should show lag of 10:\n{text}");

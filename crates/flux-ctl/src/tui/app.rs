@@ -178,6 +178,9 @@ pub struct App {
     shmem_cache: ShmemCache,
     /// Persistent table state so the viewport offset survives across renders.
     pub table_state: TableState,
+    /// Rolling (cursor, timestamp) history per consumer group for smoothed
+    /// msgs/s over a 10-second window. Key is `{flink}::{group_label}`.
+    consumer_cursor_history: HashMap<String, VecDeque<(usize, Instant)>>,
 }
 
 fn status_msg_duration() -> Duration {
@@ -213,6 +216,7 @@ impl App {
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
             table_state: TableState::default().with_selected(0),
+            consumer_cursor_history: HashMap::new(),
         };
         app.refresh();
         app
@@ -242,6 +246,7 @@ impl App {
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
             table_state: TableState::default().with_selected(0),
+            consumer_cursor_history: HashMap::new(),
         };
         app.recount_rows();
         app
@@ -460,7 +465,32 @@ impl App {
                         seg.poison = discovery::PoisonInfo::check(&seg.entry);
                     }
                     // Refresh consumer groups (cursors move in real-time)
-                    detail.consumer_groups = self.shmem_cache.consumer_groups(&seg.entry.flink);
+                    let mut groups = self.shmem_cache.consumer_groups(&seg.entry.flink);
+                    let now = Instant::now();
+                    for cg in &mut groups {
+                        let key = format!("{}::{}", seg.entry.flink, cg.label);
+                        let history =
+                            self.consumer_cursor_history.entry(key).or_default();
+                        history.push_back((cg.cursor, now));
+                        // Drop entries older than 10 seconds.
+                        while let Some(&(_, t)) = history.front() {
+                            if now.elapsed_since(t).as_secs() > 10.0 {
+                                history.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        if history.len() >= 2 {
+                            let &(oldest_c, oldest_t) = history.front().unwrap();
+                            let &(newest_c, _) = history.back().unwrap();
+                            let dt = now.elapsed_since(oldest_t).as_secs();
+                            if dt > 0.1 && newest_c >= oldest_c {
+                                cg.msgs_per_sec =
+                                    Some((newest_c - oldest_c) as f64 / dt);
+                            }
+                        }
+                    }
+                    detail.consumer_groups = groups;
                 }
                 None => self.view = View::List,
             }
@@ -652,6 +682,7 @@ impl App {
 
     pub fn back(&mut self) {
         if let View::Detail(_) = &self.view {
+            self.consumer_cursor_history.clear();
             self.view = View::List;
         }
     }

@@ -336,7 +336,7 @@ fn render_consumer_groups(
 ) {
     let focused = detail.focus == DetailFocus::ConsumerGroups;
 
-    let header = Row::new(vec!["Group", "Cursor", "Lag", "Backlog"])
+    let header = Row::new(vec!["Group", "Cursor", "msgs/s", "Lag", "Backlog"])
         .style(Style::default().fg(Color::Cyan).bold())
         .bottom_margin(1);
 
@@ -363,6 +363,14 @@ fn render_consumer_groups(
                 }
             };
 
+            let rate_str = match cg.msgs_per_sec {
+                Some(r) if r >= 1_000.0 => format!("{:.1}", r),
+                Some(r) if r >= 1.0 => format!("{:.1}", r),
+                Some(r) if r > 0.0 => format!("{:.2}", r),
+                Some(_) => "0".into(),
+                None => "—".into(),
+            };
+
             // Backlog bar: filled portion = lag / capacity
             let bar = if cap > 0 {
                 let filled = lag
@@ -379,6 +387,7 @@ fn render_consumer_groups(
             Row::new(vec![
                 Cell::from(truncate_str(&cg.label, 40)),
                 Cell::from(format!("{}", cg.cursor)),
+                Cell::from(rate_str),
                 Cell::from(Span::styled(lag_str, lag_style)),
                 Cell::from(bar),
             ])
@@ -395,6 +404,7 @@ fn render_consumer_groups(
     let widths = [
         Constraint::Percentage(40),
         Constraint::Length(14),
+        Constraint::Length(12),
         Constraint::Length(10),
         Constraint::Min(14),
     ];
