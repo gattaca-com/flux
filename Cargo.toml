@@ -60,6 +60,7 @@ indexmap = { features = ["serde"], version = "2.11.1" }
 wincode = "0.2.5"
 wincode-derive = "0.2.3"
 mio = { version = "1.1.1", features = ["net", "os-poll"] }
+io-uring = "0.7"
 url = "2.5.8"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }

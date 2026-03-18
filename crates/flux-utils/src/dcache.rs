@@ -5,6 +5,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering::*, compiler_fence},
 };
 
+use libc;
+
 #[derive(Debug, Clone, Copy)]
 pub struct DCacheRef {
     pub offset: usize,
@@ -149,8 +151,27 @@ impl DCache {
     }
 
     #[inline]
-    fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         size_of_val(&self.data)
+    }
+
+    /// Raw pointer to payload byte `byte_offset` within slot `r`.
+    ///
+    /// Used to build io_uring `READ_FIXED` SQEs that write directly into this
+    /// slot without an intermediate copy. The caller must ensure `r` is still
+    /// live (not overwritten by a later `reserve`) for the duration of the I/O.
+    #[inline]
+    pub fn payload_ptr(&self, r: DCacheRef, byte_offset: usize) -> *mut u8 {
+        let base = self.data.get() as *mut u8;
+        unsafe { base.add((r.offset & (self.capacity() - 1)) + Self::OFFSET + byte_offset) }
+    }
+
+    /// `iovec` covering the entire data region for `io_uring_register_buffers`.
+    ///
+    /// Register once at startup; the kernel pins these pages so subsequent
+    /// `READ_FIXED` SQEs skip per-call pinning overhead.
+    pub fn as_iovec(&self) -> libc::iovec {
+        libc::iovec { iov_base: self.data.get() as *mut libc::c_void, iov_len: self.capacity() }
     }
 
     #[inline]

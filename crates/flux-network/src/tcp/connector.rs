@@ -1,11 +1,23 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    os::fd::{AsRawFd, FromRawFd},
+    sync::Arc,
+    time::Duration,
+};
 
-use flux_timing::{Duration, Nanos, Repeater};
+use flux_timing::{Duration as FluxDuration, Nanos, Repeater};
 use flux_utils::{DCache, safe_panic};
-use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
-use tracing::{debug, error, warn};
+use io_uring::{IoUring, opcode, types};
+use tracing::{debug, error, info, warn};
 
-use crate::tcp::{ConnState, MessagePayload, TcpStream, TcpTelemetry, stream::set_socket_buf_size};
+use crate::Token;
+use crate::tcp::{
+    ConnState, MessagePayload, TcpStream, TcpTelemetry,
+    stream::{
+        PHASE_ACCEPT, PHASE_HEADER, PHASE_PAYLOAD, HeaderCqeOutcome, IoState, PayloadCqeOutcome,
+        decode_user_data, encode_user_data, set_socket_buf_size,
+    },
+};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -14,31 +26,21 @@ pub enum SendBehavior {
     Single(Token),
 }
 
-// Outbound will try to reconnect, inbound not
 #[repr(u8)]
 pub enum ConnectionVariant {
-    /// Connections that we initiated, will be reconnected
+    /// Connections that we initiated; will be reconnected on failure.
     Outbound(TcpStream),
-    /// Connections that were initated from outside through one of
-    /// the listeners
+    /// Connections accepted from a listener.
     Inbound(TcpStream),
-    /// Listeners for new connections. When a new connection
-    /// is made to one of the listeners, it will
-    /// be turned into an Inbound
-    Listener(TcpListener),
+    /// Listeners for new connections.
+    Listener(std::net::TcpListener),
 }
 
 /// Event emitted by [`TcpConnector::poll_with`] for each notable IO occurrence.
 pub enum PollEvent<'a> {
     /// A new connection was accepted from a listener.
-    ///
-    /// - `listener`: token of the listening socket that accepted
-    /// - `stream`: token assigned to the new inbound stream
-    /// - `peer_addr`: remote address
-    ///
-    /// Use the `stream` token with [`SendBehavior::Single`] to write back.
     Accept { listener: Token, stream: Token, peer_addr: SocketAddr },
-    /// Succuessfully reconnected to an outbound stream.
+    /// Successfully reconnected an outbound stream.
     Reconnect { token: Token },
     /// A connection was closed (by the remote or due to an IO error).
     Disconnect { token: Token },
@@ -46,39 +48,57 @@ pub enum PollEvent<'a> {
     Message { token: Token, payload: MessagePayload<'a>, send_ts: Nanos },
 }
 
+/// io_uring SQ ring size. Must be a power of 2.
+const RING_ENTRIES: u32 = 256;
+
 struct ConnectionManager {
-    poll: Poll,
+    ring: IoUring,
     conns: Vec<(Token, ConnectionVariant)>,
     reconnector: Repeater,
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
     dcache: Option<Arc<DCache>>,
+    /// Fixed buffer index for the DCache region, set after `register_buffers`.
+    dc_buf_index: Option<u16>,
 
-    // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
-    // Outbound connections that completed during maybe_reconnect, drained in poll_with.
     reconnected_to: Vec<Token>,
     next_token: usize,
 }
+
 impl Default for ConnectionManager {
     fn default() -> Self {
         Self {
+            ring: IoUring::new(RING_ENTRIES).expect("io_uring init failed"),
             conns: Vec::with_capacity(5),
-            reconnector: Repeater::every(Duration::from_secs(2)),
+            reconnector: Repeater::every(FluxDuration::from_secs(2)),
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
             dcache: None,
+            dc_buf_index: None,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
-            poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
         }
     }
 }
+
 impl ConnectionManager {
-    #[inline]
+    fn register_dcache(&mut self, dc: &DCache) {
+        let iov = dc.as_iovec();
+        match unsafe { self.ring.submitter().register_buffers(&[iov]) } {
+            Ok(()) => {
+                self.dc_buf_index = Some(0);
+                debug!("dcache buffer registered with io_uring ({}B)", dc.capacity());
+            }
+            Err(e) => {
+                warn!("io_uring register_buffers failed: {e}; falling back to plain RECV");
+            }
+        }
+    }
+
     fn disconnect_all_outbound(&mut self) {
         let mut i = self.conns.len();
         while i != 0 {
@@ -90,18 +110,16 @@ impl ConnectionManager {
     }
 
     fn disconnect_at_index(&mut self, index: usize) {
-        let (token, stream) = self.conns.swap_remove(index);
-        match stream {
-            ConnectionVariant::Outbound(mut tcp_connection) => {
-                tcp_connection.close(self.poll.registry());
-                self.to_be_reconnected.push((token, ConnectionVariant::Outbound(tcp_connection)));
+        let (token, conn) = self.conns.swap_remove(index);
+        match conn {
+            ConnectionVariant::Outbound(mut s) => {
+                s.close();
+                self.to_be_reconnected.push((token, ConnectionVariant::Outbound(s)));
             }
-            ConnectionVariant::Inbound(mut tcp_connection) => {
-                tcp_connection.close(self.poll.registry());
+            ConnectionVariant::Inbound(mut s) => {
+                s.close();
             }
-            ConnectionVariant::Listener(mut tcp_listener) => {
-                let _ = self.poll.registry().deregister(&mut tcp_listener);
-            }
+            ConnectionVariant::Listener(l) => drop(l),
         }
     }
 
@@ -120,15 +138,12 @@ impl ConnectionManager {
         while i != 0 {
             i -= 1;
             match &mut self.conns[i].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
-                    if tcp_connection.write_or_enqueue_with(self.poll.registry(), serialise) ==
-                        ConnState::Disconnected
-                    {
+                ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => {
+                    if s.write_or_enqueue_with(serialise) == ConnState::Disconnected {
                         self.disconnect_at_index(i);
                     }
                 }
-                ConnectionVariant::Listener(_tcp_listener) => {}
+                ConnectionVariant::Listener(_) => {}
             }
         }
     }
@@ -143,21 +158,18 @@ impl ConnectionManager {
             SendBehavior::Single(token) => {
                 if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
                     match &mut self.conns[i].1 {
-                        ConnectionVariant::Outbound(tcp_connection) |
-                        ConnectionVariant::Inbound(tcp_connection) => {
-                            if tcp_connection.write_or_enqueue_with(self.poll.registry(), serialise) ==
-                                ConnState::Disconnected
-                            {
-                                tracing::warn!("issue when writing to {token:?} disconnecting");
+                        ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => {
+                            if s.write_or_enqueue_with(serialise) == ConnState::Disconnected {
+                                warn!("issue writing to {token:?}, disconnecting");
                                 self.disconnect_at_index(i);
                             }
                         }
-                        ConnectionVariant::Listener(_tcp_listener) => error!(
-                            "cannot write to listener bound to token {token:?}, what are you doing"
-                        ),
+                        ConnectionVariant::Listener(_) => {
+                            error!("cannot write to listener token {token:?}");
+                        }
                     }
                 } else {
-                    error!("tcp sending: unknown token {token:?}");
+                    error!("tcp send: unknown token {token:?}");
                 }
             }
         }
@@ -167,58 +179,55 @@ impl ConnectionManager {
         let mut i = self.conns.len();
         while i != 0 {
             i -= 1;
-            let stream = match &mut self.conns[i].1 {
+            let s = match &mut self.conns[i].1 {
                 ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
                 ConnectionVariant::Listener(_) => continue,
             };
-            if stream.has_backlog() &&
-                stream.drain_backlog(self.poll.registry()) == ConnState::Disconnected
-            {
+            if s.has_backlog() && s.drain_backlog() == ConnState::Disconnected {
                 self.disconnect_at_index(i);
             }
         }
     }
 
     fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
-        let o = Token(self.next_token);
-        if let Some(stream) = self.try_connect(o, addr) {
-            let mut tcp_stream = TcpStream::from_stream_with_telemetry(
-                stream,
-                o,
-                addr,
-                self.telemetry,
-                self.dcache.clone(),
-            );
-            if let Some(msg) = &self.on_connect_msg &&
-                tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
-                    buf.extend_from_slice(msg);
-                }) == ConnState::Disconnected
+        let token = Token(self.next_token);
+        let stream = self.try_connect(addr)?;
+        let mut tcp = TcpStream::new(stream, token, addr, self.telemetry, self.dcache.clone());
+        if let Some(msg) = &self.on_connect_msg {
+            if tcp.write_or_enqueue_with(|buf| buf.extend_from_slice(msg)) ==
+                ConnState::Disconnected
             {
                 warn!(?addr, "on_connect_msg send failed");
                 return None;
             }
-            self.conns.push((o, ConnectionVariant::Outbound(tcp_stream)));
-            self.next_token += 1;
-            Some(o)
-        } else {
-            None
         }
+        self.conns.push((token, ConnectionVariant::Outbound(tcp)));
+        self.next_token += 1;
+        // Post AFTER push so the SQE pointer targets the element's stable heap location.
+        let last = self.conns.len() - 1;
+        if let ConnectionVariant::Outbound(s) = &mut self.conns[last].1 {
+            s.post_header_sqe(&mut self.ring.submission());
+        }
+        Some(token)
     }
 
-    // This will start listening on a given port, returning the token tied to that
-    // port. When a connection comes in through that port, this token will be
-    // communicated to the handling function so the handler can know what
-    // endpoint it is receiving a connection for.
     fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
-        let mut listener = mio::net::TcpListener::bind(addr)
-            .inspect_err(|e| warn!("couldn't start listening at {addr:?}: {e}"))
+        let listener = std::net::TcpListener::bind(addr)
+            .inspect_err(|e| warn!("couldn't listen at {addr}: {e}"))
             .ok()?;
+        listener.set_nonblocking(true).ok()?;
         let token = Token(self.next_token);
-        self.poll
-            .registry()
-            .register(&mut listener, token, Interest::READABLE)
-            .inspect_err(|err| warn!("Couldn't register listening addr {addr:?}: {err}"))
-            .ok()?;
+        // Multishot ACCEPT: the kernel fires a CQE for every new connection
+        // and automatically re-arms unless IORING_CQE_F_MORE is absent.
+        let sqe = opcode::AcceptMulti::new(types::Fd(listener.as_raw_fd()))
+            .build()
+            .user_data(encode_user_data(token, PHASE_ACCEPT));
+        // SAFETY: listener fd is owned and lives in conns after the push below.
+        if unsafe { self.ring.submission().push(&sqe) }.is_err() {
+            warn!("SQ full on listen_at {addr}");
+            return None;
+        }
+        self.ring.submit().ok()?;
         self.conns.push((token, ConnectionVariant::Listener(listener)));
         self.next_token += 1;
         Some(token)
@@ -228,264 +237,314 @@ impl ConnectionManager {
         if !self.reconnector.fired() {
             return;
         }
-
         let mut i = self.to_be_reconnected.len();
         while i != 0 {
             i -= 1;
-            let (token, mut stream) = self.to_be_reconnected.swap_remove(i);
-            if self.try_reconnect(token, &mut stream) {
-                self.conns.push((token, stream));
+            let (token, mut variant) = self.to_be_reconnected.swap_remove(i);
+            if self.try_reconnect(token, &mut variant) {
+                self.conns.push((token, variant));
                 self.reconnected_to.push(token);
             } else {
-                self.to_be_reconnected.push((token, stream))
+                self.to_be_reconnected.push((token, variant));
             }
         }
     }
 
-    fn try_connect(&self, token: Token, addr: SocketAddr) -> Option<mio::net::TcpStream> {
-        let Ok(mut new_stream) = mio::net::TcpStream::connect(addr)
+    fn try_connect(&self, addr: SocketAddr) -> Option<std::net::TcpStream> {
+        let stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
             .inspect_err(|e| warn!("couldn't connect to {addr}: {e}"))
-        else {
-            return None;
-        };
-
-        if let Some(size) = self.socket_buf_size {
-            set_socket_buf_size(&new_stream, size);
-        }
-        let Ok(err) =
-            new_stream.take_error().inspect_err(|e| error!("couldn't take error on stream: {e}"))
-        else {
-            return None;
-        };
-        if let Some(err) = err {
-            warn!("got error while connecting to {addr}: {err}");
-            return None;
-        }
-
-        if let Err(e) = self.poll.registry().register(&mut new_stream, token, Interest::READABLE) {
-            error!("couldn't register tcp stream for {addr} with registry: {e}");
-            return None;
-        };
-        new_stream
-            .set_nodelay(true)
-            .inspect_err(|e| {
-                error!("couldn't setup nodelay for tcp stream for {addr}: {e}");
-            })
             .ok()?;
-        Some(new_stream)
+        stream
+            .set_nonblocking(true)
+            .inspect_err(|e| error!("set_nonblocking for {addr}: {e}"))
+            .ok()?;
+        stream
+            .set_nodelay(true)
+            .inspect_err(|e| error!("set_nodelay for {addr}: {e}"))
+            .ok()?;
+        if let Some(size) = self.socket_buf_size {
+            set_socket_buf_size(&stream, size);
+        }
+        Some(stream)
     }
 
-    fn try_reconnect(&self, token: Token, stream: &mut ConnectionVariant) -> bool {
-        let ConnectionVariant::Outbound(stream) = stream else {
-            panic!("Can only try to connect a Outbound connection");
+    fn try_reconnect(&self, _token: Token, variant: &mut ConnectionVariant) -> bool {
+        let ConnectionVariant::Outbound(stream) = variant else {
+            panic!("can only reconnect Outbound connections");
         };
         let addr = stream.peer();
-
-        let Some(new_stream) = self.try_connect(token, addr) else {
-            return false;
-        };
-
-        if stream.reset_with_new_stream(
-            self.poll.registry(),
-            new_stream,
-            self.on_connect_msg.as_ref(),
-        ) == ConnState::Disconnected
+        let Some(new_stream) = self.try_connect(addr) else { return false };
+        if stream.reset_for_reconnect(new_stream, self.on_connect_msg.as_ref()) ==
+            ConnState::Disconnected
         {
-            warn!(addr = ?addr, "on_connect_msg send failed");
+            warn!(?addr, "on_connect_msg send failed on reconnect");
             return false;
         }
-
-        debug!(?addr, "connected");
-
+        debug!(?addr, "reconnected");
         true
     }
 
-    #[inline]
     fn currently_disconnected(&self) -> impl Iterator<Item = Token> {
         self.to_be_reconnected.iter().map(|(t, _)| *t)
     }
 
-    #[inline]
     fn force_reconnect(&mut self) {
         self.reconnector.reset();
         self.maybe_reconnect();
     }
 
-    #[inline]
-    fn handle_event<F>(&mut self, e: &Event, handler: &mut F)
+    /// Submit pending SQEs and drain all available CQEs, then re-arm Idle
+    /// streams with a new header RECV SQE.
+    fn poll_with<F>(&mut self, handler: &mut F)
     where
         F: for<'a> FnMut(PollEvent<'a>),
     {
-        let event_token = e.token();
-        let Some(stream_id) = self.conns.iter().position(|(t, _)| t == &event_token) else {
-            safe_panic!("got event for unknown token");
+        self.flush_backlogs();
+
+        if let Err(e) = self.ring.submit_and_wait(0) {
+            safe_panic!("io_uring submit_and_wait: {e}");
             return;
+        }
+
+        // Collect CQE data before processing to avoid split borrows when
+        // pushing follow-up SQEs.
+        let cqes: Vec<(u64, i32, u32)> = {
+            let cq = self.ring.completion();
+            cq.map(|e| (e.user_data(), e.result(), e.flags())).collect()
         };
 
-        loop {
-            match &mut self.conns[stream_id].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
-                    if tcp_connection.poll_with(
-                        self.poll.registry(),
-                        e,
-                        &mut |token, payload, send_ts| {
-                            handler(PollEvent::Message { token, payload, send_ts });
-                        },
-                    ) == ConnState::Disconnected
-                    {
-                        handler(PollEvent::Disconnect { token: event_token });
-                        self.disconnect_at_index(stream_id);
-                    }
-                    return;
-                }
-                ConnectionVariant::Listener(tcp_listener) => {
-                    if let Ok((mut stream, addr)) = tcp_listener.accept() {
-                        tracing::info!(?addr, "client connected");
-                        if let Some(size) = self.socket_buf_size {
-                            set_socket_buf_size(&stream, size);
-                        }
-                        let token = Token(self.next_token);
-                        if let Err(e) =
-                            self.poll.registry().register(&mut stream, token, Interest::READABLE)
-                        {
-                            error!("couldn't register client {e}");
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                            continue;
-                        };
-                        if let Err(e) = stream.set_nodelay(true) {
-                            error!("couldn't set nodelay on stream to {addr}: {e}");
-                            continue;
-                        }
-                        let mut conn = TcpStream::from_stream_with_telemetry(
-                            stream,
-                            token,
-                            addr,
-                            self.telemetry,
-                            self.dcache.clone(),
-                        );
+        for (ud, result, flags) in cqes {
+            let (token, phase) = decode_user_data(ud);
+            match phase {
+                PHASE_ACCEPT => self.handle_accept_cqe(token, result, flags, handler),
+                PHASE_HEADER => self.handle_header_cqe(token, result, handler),
+                PHASE_PAYLOAD => self.handle_payload_cqe(token, result, handler),
+                _ => safe_panic!("io_uring: unknown phase in user_data {ud:#x}"),
+            }
+        }
 
-                        if let Some(msg) = &self.on_connect_msg &&
-                            conn.write_or_enqueue_with(
-                                self.poll.registry(),
-                                |buf: &mut Vec<u8>| {
-                                    buf.extend_from_slice(msg);
-                                },
-                            ) == ConnState::Disconnected
-                        {
-                            continue;
-                        }
-                        handler(PollEvent::Accept {
-                            listener: event_token,
-                            stream: token,
-                            peer_addr: addr,
-                        });
-                        self.conns.push((token, ConnectionVariant::Inbound(conn)));
-                        self.next_token += 1;
-                    } else {
-                        return;
-                    }
+        // Re-arm any stream that became Idle during CQE processing.
+        let mut sq = self.ring.submission();
+        for (_, variant) in &mut self.conns {
+            let s = match variant {
+                ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
+                ConnectionVariant::Listener(_) => continue,
+            };
+            if matches!(s.io_state, IoState::Idle) {
+                s.post_header_sqe(&mut sq);
+            }
+        }
+        drop(sq);
+    }
+
+    fn handle_accept_cqe<F>(
+        &mut self,
+        listener_token: Token,
+        result: i32,
+        flags: u32,
+        handler: &mut F,
+    ) where
+        F: for<'a> FnMut(PollEvent<'a>),
+    {
+        if result < 0 {
+            warn!(token = ?listener_token, errno = -result, "accept CQE error");
+            self.maybe_rearm_accept(listener_token, flags);
+            return;
+        }
+
+        let client_fd = result;
+        // SAFETY: kernel handed us ownership of this fd.
+        let client_stream = unsafe { std::net::TcpStream::from_raw_fd(client_fd) };
+
+        if client_stream.set_nonblocking(true).is_err() ||
+            client_stream.set_nodelay(true).is_err()
+        {
+            error!("socket option set failed for accepted fd {client_fd}");
+            return;
+        }
+        if let Some(size) = self.socket_buf_size {
+            set_socket_buf_size(&client_stream, size);
+        }
+
+        let peer_addr = match client_stream.peer_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                error!("peer_addr for accepted fd {client_fd}: {e}");
+                return;
+            }
+        };
+        info!(?peer_addr, "client connected");
+
+        let stream_token = Token(self.next_token);
+        self.next_token += 1;
+
+        let mut tcp = TcpStream::new(
+            client_stream,
+            stream_token,
+            peer_addr,
+            self.telemetry,
+            self.dcache.clone(),
+        );
+        if let Some(msg) = &self.on_connect_msg {
+            if tcp.write_or_enqueue_with(|buf| buf.extend_from_slice(msg)) ==
+                ConnState::Disconnected
+            {
+                return;
+            }
+        }
+        handler(PollEvent::Accept { listener: listener_token, stream: stream_token, peer_addr });
+        self.conns.push((stream_token, ConnectionVariant::Inbound(tcp)));
+        // Post AFTER push so the SQE pointer targets the element's stable heap location.
+        let last = self.conns.len() - 1;
+        if let ConnectionVariant::Inbound(s) = &mut self.conns[last].1 {
+            s.post_header_sqe(&mut self.ring.submission());
+        }
+
+        self.maybe_rearm_accept(listener_token, flags);
+    }
+
+    /// Re-post the multishot ACCEPT SQE if the kernel cancelled it
+    /// (IORING_CQE_F_MORE absent).
+    fn maybe_rearm_accept(&mut self, listener_token: Token, flags: u32) {
+        if io_uring::cqueue::more(flags) {
+            return;
+        }
+        let Some(i) = self.conns.iter().position(|(t, _)| *t == listener_token) else { return };
+        if let ConnectionVariant::Listener(l) = &self.conns[i].1 {
+            let sqe = opcode::AcceptMulti::new(types::Fd(l.as_raw_fd()))
+                .build()
+                .user_data(encode_user_data(listener_token, PHASE_ACCEPT));
+            let _ = unsafe { self.ring.submission().push(&sqe) };
+        }
+    }
+
+    fn handle_header_cqe<F>(&mut self, token: Token, result: i32, handler: &mut F)
+    where
+        F: for<'a> FnMut(PollEvent<'a>),
+    {
+        let Some(i) = self.conns.iter().position(|(t, _)| *t == token) else {
+            safe_panic!("header CQE for unknown token {token:?}");
+            return;
+        };
+        let s = match &mut self.conns[i].1 {
+            ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
+            ConnectionVariant::Listener(_) => {
+                safe_panic!("header CQE for listener token {token:?}");
+                return;
+            }
+        };
+        match s.handle_header_cqe(result) {
+            HeaderCqeOutcome::PayloadReady => {
+                s.post_payload_sqe(&mut self.ring.submission(), self.dc_buf_index);
+            }
+            HeaderCqeOutcome::NeedHeaderSqe => {
+                s.post_header_sqe(&mut self.ring.submission());
+            }
+            HeaderCqeOutcome::Idle => { /* will be re-armed in poll_with sweep */ }
+            HeaderCqeOutcome::Disconnect => {
+                handler(PollEvent::Disconnect { token });
+                self.disconnect_at_index(i);
+            }
+        }
+    }
+
+    fn handle_payload_cqe<F>(&mut self, token: Token, result: i32, handler: &mut F)
+    where
+        F: for<'a> FnMut(PollEvent<'a>),
+    {
+        let Some(i) = self.conns.iter().position(|(t, _)| *t == token) else {
+            safe_panic!("payload CQE for unknown token {token:?}");
+            return;
+        };
+        let s = match &mut self.conns[i].1 {
+            ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
+            ConnectionVariant::Listener(_) => {
+                safe_panic!("payload CQE for listener token {token:?}");
+                return;
+            }
+        };
+
+        // Transmute to 'static so we can call the handler without holding a
+        // borrow on conns. Safe because:
+        // - Cached variant holds only DCacheRef (indices, no slice ptr).
+        // - Raw variant's slice is into the stream's heap buf; conns[i] is not
+        //   removed (handler can only write to other tokens), so the buf lives.
+        let outcome: PayloadCqeOutcome<'static> =
+            unsafe { std::mem::transmute(s.handle_payload_cqe(result)) };
+
+        match outcome {
+            PayloadCqeOutcome::Done { payload, send_ts } => {
+                handler(PollEvent::Message { token, payload, send_ts });
+                // Re-arm for the next frame.
+                if let ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) =
+                    &mut self.conns[i].1
+                {
+                    s.post_header_sqe(&mut self.ring.submission());
                 }
+            }
+            PayloadCqeOutcome::NeedPayloadSqe => {
+                if let ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) =
+                    &mut self.conns[i].1
+                {
+                    s.post_payload_sqe(&mut self.ring.submission(), self.dc_buf_index);
+                }
+            }
+            PayloadCqeOutcome::Disconnect => {
+                handler(PollEvent::Disconnect { token });
+                self.disconnect_at_index(i);
             }
         }
     }
 }
 
-/// Non-blocking TCP connector/acceptor built on `mio`.
+/// Non-blocking TCP connector/acceptor built on io_uring.
 ///
-/// Manages:
-/// - **Outbound (client) connections** created via [`connect`]. These are
-///   **auto-retried** on failure/disconnect based on the configured reconnect
-///   interval.
-/// - **Listeners** created via [`listen_at`] and **inbound (server)
-///   connections** accepted from them. Inbound connections are **not**
-///   reconnected.
+/// Manages outbound (auto-reconnecting) connections and inbound connections
+/// accepted from registered listeners. Drive all IO by calling [`poll_with`]
+/// in a tight loop.
 ///
-/// Drive all IO by calling [`poll_with`] regularly (typically in your event
-/// loop). Use [`write_or_enqueue_with`] to send to one connection or broadcast
-/// to all.
-///
-/// ## Tokens
-/// Every listener and stream is identified by a `mio::Token`.
-/// - [`listen_at`] returns the listener token.
-/// - Each accepted inbound stream receives a new token (reported via
-///   [`ConnectionEvent`]).
-/// - [`connect`] returns the token for the outbound stream if the connection is
-///   established.
-///
-/// ## on-connect message
-/// If configured via [`with_on_connect_msg`], the provided bytes are sent once
-/// after a connection is established (both outbound and newly accepted
-/// inbound).
-///
-/// ## DCache
-/// If built via [`with_dcache`], each received message payload is written
-/// into the dcache and [`PollEvent::Message`] carries
-/// [`MessagePayload::Cached`]. Otherwise it carries [`MessagePayload::Raw`].
+/// When a [`DCache`] is attached via [`with_dcache`], its backing memory is
+/// registered as a fixed io_uring buffer. Payload bytes are then written
+/// directly into reserved DCache slots via `READ_FIXED` SQEs — no copy.
 pub struct TcpConnector {
-    events: Events,
     conn_mgr: ConnectionManager,
 }
+
 impl Default for TcpConnector {
     fn default() -> Self {
-        Self { events: Events::with_capacity(128), conn_mgr: ConnectionManager::default() }
+        Self { conn_mgr: ConnectionManager::default() }
     }
 }
+
 impl TcpConnector {
-    /// Sets the interval used to retry disconnected/failed outbound
-    /// connections.
-    ///
-    /// Reconnect attempts are performed from within [`poll_with`].
-    pub fn with_reconnect_interval(mut self, interval: Duration) -> Self {
+    pub fn with_reconnect_interval(mut self, interval: FluxDuration) -> Self {
         self.conn_mgr.reconnector = Repeater::every(interval);
         self
     }
 
-    /// Sends this message once immediately after a connection becomes usable.
-    ///
-    /// Applied to:
-    /// - outbound connections after a successful (re)connect
-    /// - inbound connections right after accept
-    ///
-    /// # Panics
-    /// Panics if `msg.len() > TcpConnection::SEND_BUF_SIZE`.
     pub fn with_on_connect_msg(mut self, msg: Vec<u8>) -> Self {
         assert!(msg.len() <= TcpStream::SEND_BUF_SIZE, "on_connect_msg exceeds send buffer size");
         self.conn_mgr.on_connect_msg = Some(msg);
         self
     }
 
-    /// Attaches a [`DCache`] as the message receive buffer.
-    ///
-    /// When set, each received payload is written into it directly and
-    /// [`PollEvent::Message`] carries [`MessagePayload::Cached`] instead of
-    /// [`MessagePayload::Raw`].
     pub fn with_dcache(mut self, dcache: Arc<DCache>) -> Self {
+        self.conn_mgr.register_dcache(&dcache);
         self.conn_mgr.dcache = Some(dcache);
         self
     }
 
-    /// Sets telemetry config for all streams created by this connector.
     pub fn with_telemetry(mut self, telemetry: TcpTelemetry) -> Self {
         self.conn_mgr.telemetry = telemetry;
         self
     }
 
-    /// Sets kernel SO_SNDBUF and SO_RCVBUF on all sockets (outbound and
-    /// accepted).
     pub fn with_socket_buf_size(mut self, size: usize) -> Self {
         self.conn_mgr.socket_buf_size = Some(size);
         self
     }
 
-    /// Polls sockets once (non-blocking) and dispatches events via
-    /// [`PollEvent`].
-    ///
-    /// This call:
-    /// 1) attempts outbound reconnects if the interval fired
-    /// 2) polls `mio` with a zero timeout
-    /// 3) for each event calls `handler` with the appropriate [`PollEvent`]
-    /// 4) returns whether any IO events were processed
+    /// Poll io_uring once (non-blocking) and dispatch events via `handler`.
     #[inline]
     pub fn poll_with<F>(&mut self, mut handler: F) -> bool
     where
@@ -494,27 +553,20 @@ impl TcpConnector {
         self.conn_mgr.maybe_reconnect();
         for token in self.conn_mgr.reconnected_to.drain(..) {
             handler(PollEvent::Reconnect { token });
+            // Post initial header SQE for the reconnected stream.
+            if let Some(i) = self.conn_mgr.conns.iter().position(|(t, _)| *t == token) {
+                if let ConnectionVariant::Outbound(s) = &mut self.conn_mgr.conns[i].1 {
+                    if matches!(s.io_state, IoState::Idle) {
+                        s.post_header_sqe(&mut self.conn_mgr.ring.submission());
+                    }
+                }
+            }
         }
-        if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
-            safe_panic!("got error polling {e}");
-            return false;
-        }
-        let mut o = false;
-
-        for e in self.events.iter() {
-            o = true;
-            self.conn_mgr.handle_event(e, &mut handler);
-        }
-        self.conn_mgr.flush_backlogs();
-        o
+        let had_cqes = !self.conn_mgr.ring.completion().is_empty();
+        self.conn_mgr.poll_with(&mut handler);
+        had_cqes
     }
 
-    /// Writes immediately or enqueues bytes for later sending.
-    ///
-    /// `serialise` is called with a mutable send buffer and must return the
-    /// number of bytes written. Use [`SendBehavior::BroadCast`] to send to
-    /// all active connections or [`SendBehavior::Single`] to target one
-    /// token.
     #[inline]
     pub fn write_or_enqueue_with<F>(&mut self, where_to: SendBehavior, serialise: F)
     where
@@ -523,54 +575,26 @@ impl TcpConnector {
         self.conn_mgr.write_or_enqueue_with(serialise, where_to);
     }
 
-    /// Disconnects all outbound connections and schedules them for
-    /// reconnection.
-    ///
-    /// Inbound connections and listeners are left untouched.
     pub fn disconnect_outbound(&mut self) {
         self.conn_mgr.disconnect_all_outbound();
     }
 
-    /// Disconnects a specific connection by token.
-    ///
-    /// If the token is an outbound connection, it will be scheduled for
-    /// reconnection. If inbound, it's simply closed. No-op if token not found.
     pub fn disconnect(&mut self, token: Token) {
         self.conn_mgr.disconnect_token(token);
     }
 
-    /// Initiates (or schedules) an outbound connection to `addr`.
-    ///
-    /// Returns the token for this connection if the connection becomes
-    /// established; otherwise returns `None` (the connector may still retry
-    /// later).
-    ///
-    /// Note: reconnect attempts are driven by [`poll_with`].
-    #[inline]
     pub fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         self.conn_mgr.connect(addr)
     }
 
-    /// Starts listening on `addr` and registers the listener for readable
-    /// events.
-    ///
-    /// Returns the token associated with the listener socket. When a client
-    /// connects, `poll_with` will accept it, allocate a new token for the
-    /// inbound stream, and emit a [`ConnectionEvent`] through `on_accept`.
     pub fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
         self.conn_mgr.listen_at(addr)
     }
 
-    /// Returns an iterator over tokens that are currently pending reconnection
-    /// (outbound only).
-    #[inline]
     pub fn currently_disconnected(&self) -> impl Iterator<Item = Token> {
         self.conn_mgr.currently_disconnected()
     }
 
-    /// Forces the reconnect timer to fire and immediately attempts
-    /// reconnections.
-    #[inline]
     pub fn force_reconnect(&mut self) {
         self.conn_mgr.force_reconnect();
     }

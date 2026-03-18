@@ -1,20 +1,18 @@
 use std::{
     collections::VecDeque,
-    io::{self, IoSlice, Read, Write},
+    io::{self, IoSlice, Write},
     net::SocketAddr,
+    os::fd::AsRawFd,
     sync::Arc,
 };
 
 use flux_communication::Timer;
 use flux_timing::Nanos;
 use flux_utils::{DCache, DCacheRef};
-
-enum RxBuf {
-    Heap(Vec<u8>),
-    DCache(Arc<DCache>),
-}
-use mio::{Interest, Registry, Token, event::Event};
+use io_uring::{opcode, types};
 use tracing::{debug, warn};
+
+use crate::Token;
 
 pub enum MessagePayload<'a> {
     Raw(&'a [u8]),
@@ -22,16 +20,12 @@ pub enum MessagePayload<'a> {
 }
 
 /// Controls emission of network latency and alloc telemetry.
-///
-/// Has no effect on framing or message delivery.
-/// `send_ts` is always surfaced via `poll_with`.
 #[derive(Clone, Copy)]
 pub enum TcpTelemetry {
     Disabled,
     Enabled { app_name: &'static str },
 }
 
-/// Timers for TCP stream metrics.
 #[derive(Clone, Copy, Debug)]
 struct TcpTimers {
     latency: Timer,
@@ -47,89 +41,66 @@ impl TcpTimers {
     }
 }
 
-/// Frame length prefix.
+/// Frame layout: 4-byte LE length | 8-byte LE send_ts | payload bytes.
 const LEN_HEADER_SIZE: usize = core::mem::size_of::<u32>();
-/// Nanos timestamp when the sender finished serialising and handed bytes to
-/// kernel or enqueued in backlog.
 const TS_HEADER_SIZE: usize = core::mem::size_of::<Nanos>();
-const FRAME_HEADER_SIZE: usize = LEN_HEADER_SIZE + TS_HEADER_SIZE;
-// TODO: might need to tweak these
-const RX_BUF_SIZE: usize = 32 * 1024;
+pub(crate) const FRAME_HEADER_SIZE: usize = LEN_HEADER_SIZE + TS_HEADER_SIZE;
 
-/// Response type for all external calls.
-///
-/// `Alive` means the connection is still usable.
-/// `Disconnected` means the peer is gone and the connection must be rebuilt.
+/// Phase tags packed into the upper 32 bits of SQE user_data.
+pub(crate) const PHASE_ACCEPT: u32 = 0;
+pub(crate) const PHASE_HEADER: u32 = 1;
+pub(crate) const PHASE_PAYLOAD: u32 = 2;
+
+pub(crate) fn encode_user_data(token: Token, phase: u32) -> u64 {
+    (token.0 as u64) | ((phase as u64) << 32)
+}
+
+pub(crate) fn decode_user_data(ud: u64) -> (Token, u32) {
+    (Token(ud as u32 as usize), (ud >> 32) as u32)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConnState {
     Alive,
     Disconnected,
 }
 
-enum ReadOutcome<'a> {
-    PayloadDone { payload: MessagePayload<'a>, send_ts: Nanos },
-    WouldBlock,
-    Disconnected,
+enum RxBuf {
+    Heap(Vec<u8>),
+    DCache(Arc<DCache>),
 }
 
-#[allow(clippy::enum_variant_names)]
-#[derive(Clone, Copy)]
-enum RxState {
-    ReadingHeader { buf: [u8; FRAME_HEADER_SIZE], have: usize },
-    ReadingPayload { msg_len: usize, offset: usize, send_ts: Nanos, dc_offset: Option<usize> },
-}
-impl Default for RxState {
-    fn default() -> Self {
-        Self::ReadingHeader { buf: [0; FRAME_HEADER_SIZE], have: 0 }
-    }
+/// Per-connection receive state for the io_uring-driven read path.
+pub(crate) enum IoState {
+    /// No SQE in flight; connector will post a header RECV next iteration.
+    Idle,
+    /// RECV SQE in flight targeting `header_buf[have..]`.
+    HeaderPending { have: usize },
+    /// READ_FIXED (or RECV for the heap path) in flight into `dc_ref` at
+    /// `offset` bytes into the payload.
+    PayloadPending { msg_len: usize, offset: usize, send_ts: Nanos, dc_ref: Option<DCacheRef> },
 }
 
-/// Single mio-backed TCP connection.
+/// Single TCP connection managed by the io_uring connector.
 ///
-/// Frames are length-prefixed and contain the send ts:
-///   - 4-byte LE length header
-///   - 8-byte LE nanosecond ts
-///   - payload bytes
-///
-/// Outbound:
-///   - `write_or_enqueue(msg)` serialises `msg` into an internal staging
-///     buffer.
-///   - Attempts to write bytes (non-blocking) to socket.
-///   - Any unwritten remainder is queued (this path allocates).
-///   - Backlogged frames are flushed whenever the socket becomes writable.
-///
-/// Inbound:
-///   - Reads the 4-byte length prefix, then reads exactly that many bytes.
-///   - When a full frame is assembled, `poll_with` invokes the caller callback
-///     with the deserialised T.
-///   - Continues reading frames until `WouldBlock` (no more messages are
-///     ready).
-///
-/// Recconect handling:
-///   - If `ConnState::Disconnected` is returned caller must treat the
-///     connection as dead and rebuild the state
+/// All receive I/O is driven externally via `post_header_sqe`, `post_payload_sqe`,
+/// `handle_header_cqe`, and `handle_payload_cqe`. Send I/O uses direct
+/// non-blocking writes; responses are small so no fixed-buffer path is needed
+/// on the send side.
 pub struct TcpStream {
-    stream: mio::net::TcpStream,
+    pub(crate) stream: std::net::TcpStream,
     peer_addr: SocketAddr,
-    token: Token,
+    pub(crate) token: Token,
 
-    rx_state: RxState,
+    pub(crate) io_state: IoState,
     rx_buf: RxBuf,
-    header_buf: [u8; FRAME_HEADER_SIZE],
+    /// Accumulates the 12-byte frame header across partial recvs.
+    pub(crate) header_buf: [u8; FRAME_HEADER_SIZE],
+
     send_buf: Vec<u8>,
-    /// Filled when send would block.
-    /// First entry will either be a full message or the current partially
-    /// written head.
     send_backlog: VecDeque<Vec<u8>>,
-    /// We don't pop until the full message is written,
-    /// so we use this cursor to know what slice to write
     send_cursor: usize,
 
-    /// True if WRITABLE interest is currently registered in `poll`.
-    /// Invariant: `writable_armed == !send_q.is_empty()`
-    writable_armed: bool,
-
-    /// Timers for network latency and alloc telemetry.
     timers: Option<TcpTimers>,
 }
 
@@ -137,8 +108,8 @@ impl TcpStream {
     pub const SEND_BUF_SIZE: usize = 32 * 1024;
 
     #[inline(never)]
-    pub(crate) fn from_stream_with_telemetry(
-        stream: mio::net::TcpStream,
+    pub(crate) fn new(
+        stream: std::net::TcpStream,
         token: Token,
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
@@ -149,95 +120,194 @@ impl TcpStream {
             TcpTelemetry::Enabled { app_name } => {
                 let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
                 let peer = peer_addr.to_string();
-                let steam_label = format!("{local_port}-{peer}");
-                Some(TcpTimers::new(app_name, &steam_label))
+                Some(TcpTimers::new(app_name, &format!("{local_port}-{peer}")))
             }
         };
         let rx_buf = match dcache {
             Some(dc) => RxBuf::DCache(dc),
-            None => RxBuf::Heap(vec![0; RX_BUF_SIZE]),
+            None => RxBuf::Heap(vec![0u8; 32 * 1024]),
         };
-
         Self {
             stream,
             peer_addr,
             token,
-            rx_state: Default::default(),
+            io_state: IoState::Idle,
             rx_buf,
             header_buf: [0; FRAME_HEADER_SIZE],
-            send_buf: vec![0; Self::SEND_BUF_SIZE],
+            send_buf: Vec::with_capacity(Self::SEND_BUF_SIZE),
             send_backlog: VecDeque::with_capacity(64),
             send_cursor: 0,
-            writable_armed: false,
             timers,
         }
     }
 
-    #[inline]
-    pub fn reset_with_new_stream(
+    pub(crate) fn reset_for_reconnect(
         &mut self,
-        registry: &Registry,
-        stream: mio::net::TcpStream,
+        stream: std::net::TcpStream,
         on_connect_msg: Option<&Vec<u8>>,
     ) -> ConnState {
-        self.rx_state = Default::default();
+        self.stream = stream;
+        self.io_state = IoState::Idle;
+        self.header_buf.fill(0);
         self.send_buf.clear();
         self.send_cursor = 0;
-        self.header_buf.fill(0);
-        self.stream = stream;
-        if !self.send_backlog.is_empty() {
-            self.writable_armed = false;
-            if let Some(message) = on_connect_msg {
-                self.serialise_frame(|bytes| bytes.extend_from_slice(message));
-                let data = self.alloc_vec(0);
-                return self.enqueue_front(registry, data);
-            }
-            self.arm_writable(registry)
-        } else if let Some(message) = on_connect_msg {
-            self.write_or_enqueue_with(registry, |bytes| bytes.extend_from_slice(message))
-        } else {
-            ConnState::Alive
+        if let Some(msg) = on_connect_msg {
+            return self.write_or_enqueue_with(|buf| buf.extend_from_slice(msg));
         }
-    }
-
-    /// Poll socket and calls `on_msg` for every fully assembled frame.
-    ///
-    /// When no DCache is set, `payload` is [`MessagePayload::Raw`] and the
-    /// slice is only valid for the duration of the callback. When DCache is
-    /// set, `payload` is [`MessagePayload::Cached`] and the ref may be kept.
-    #[inline]
-    pub fn poll_with<F>(&mut self, registry: &Registry, ev: &Event, on_msg: &mut F) -> ConnState
-    where
-        F: for<'a> FnMut(Token, MessagePayload<'a>, Nanos),
-    {
-        if ev.is_readable() {
-            loop {
-                match self.read_frame() {
-                    ReadOutcome::PayloadDone { payload, send_ts } => {
-                        on_msg(ev.token(), payload, send_ts);
-                    }
-                    ReadOutcome::WouldBlock => break,
-                    ReadOutcome::Disconnected => return ConnState::Disconnected,
-                }
-            }
-        }
-
-        if ev.is_writable() && self.drain_backlog(registry) == ConnState::Disconnected {
-            return ConnState::Disconnected;
-        }
-
         ConnState::Alive
     }
 
-    /// Happy path: serialises into `self.send_buf`, writes frame to stream.
-    /// If write would block or we have already blocked on a previous write,
-    /// allocates a new vec and stores frame in the backlog to be flushed at
-    /// the next writable event.
+    /// Post a RECV SQE for the frame header (or the remainder of one).
     ///
-    /// TODO: avoid allocation by queueing offsets into `self.send_buf` instead
-    /// of Vec<u8>.
+    /// Only valid when `io_state` is `Idle` or `HeaderPending`.
+    pub(crate) fn post_header_sqe(&mut self, sq: &mut io_uring::SubmissionQueue<'_>) {
+        let have = match self.io_state {
+            IoState::Idle => 0,
+            IoState::HeaderPending { have } => have,
+            _ => return,
+        };
+        let fd = self.stream.as_raw_fd();
+        let ptr = unsafe { self.header_buf.as_mut_ptr().add(have) };
+        let len = (FRAME_HEADER_SIZE - have) as u32;
+        let ud = encode_user_data(self.token, PHASE_HEADER);
+        let sqe = opcode::Recv::new(types::Fd(fd), ptr, len).build().user_data(ud);
+        // SAFETY: fd lives as long as self.stream.
+        if unsafe { sq.push(&sqe) }.is_err() {
+            warn!(token = ?self.token, "SQ full, skipping header RECV");
+            return;
+        }
+        self.io_state = IoState::HeaderPending { have };
+    }
+
+    /// Post the payload SQE. Uses READ_FIXED when `buf_index` is `Some`
+    /// (DCache registered), plain RECV otherwise.
+    pub(crate) fn post_payload_sqe(
+        &mut self,
+        sq: &mut io_uring::SubmissionQueue<'_>,
+        buf_index: Option<u16>,
+    ) {
+        let (msg_len, offset, dc_ref) = match self.io_state {
+            IoState::PayloadPending { msg_len, offset, dc_ref, .. } => (msg_len, offset, dc_ref),
+            _ => return,
+        };
+
+        let fd = self.stream.as_raw_fd();
+        let remaining = (msg_len - offset) as u32;
+        let ud = encode_user_data(self.token, PHASE_PAYLOAD);
+
+        let result = match (dc_ref, buf_index) {
+            (Some(r), Some(buf_idx)) => {
+                // Zero-copy: kernel writes directly into the registered DCache region.
+                let RxBuf::DCache(dc) = &self.rx_buf else { unreachable!() };
+                let ptr = dc.payload_ptr(r, offset);
+                let sqe =
+                    opcode::ReadFixed::new(types::Fd(fd), ptr, remaining, buf_idx)
+                        .build()
+                        .user_data(ud);
+                unsafe { sq.push(&sqe) }
+            }
+            _ => {
+                // Heap fallback or unregistered DCache: plain RECV.
+                let ptr = match &mut self.rx_buf {
+                    RxBuf::Heap(buf) => unsafe { buf.as_mut_ptr().add(offset) },
+                    RxBuf::DCache(dc) => dc.payload_ptr(dc_ref.unwrap(), offset),
+                };
+                let sqe =
+                    opcode::Recv::new(types::Fd(fd), ptr, remaining).build().user_data(ud);
+                unsafe { sq.push(&sqe) }
+            }
+        };
+
+        if result.is_err() {
+            warn!(token = ?self.token, "SQ full, skipping payload SQE");
+        }
+    }
+
+    /// Handle CQE for a header RECV.
+    pub(crate) fn handle_header_cqe(&mut self, result: i32) -> HeaderCqeOutcome {
+        let have = match self.io_state {
+            IoState::HeaderPending { have } => have,
+            _ => return HeaderCqeOutcome::Disconnect,
+        };
+
+        if result <= 0 {
+            return HeaderCqeOutcome::Disconnect;
+        }
+        let new_have = have + result as usize;
+
+        if new_have < FRAME_HEADER_SIZE {
+            self.io_state = IoState::HeaderPending { have: new_have };
+            return HeaderCqeOutcome::NeedHeaderSqe;
+        }
+
+        let msg_len =
+            u32::from_le_bytes(self.header_buf[..LEN_HEADER_SIZE].try_into().unwrap()) as usize;
+        let send_ts = Nanos(u64::from_le_bytes(
+            self.header_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
+        ));
+        self.header_buf.fill(0);
+
+        if msg_len == 0 {
+            self.io_state = IoState::Idle;
+            return HeaderCqeOutcome::Idle;
+        }
+
+        let dc_ref = match &mut self.rx_buf {
+            RxBuf::DCache(dc) => match dc.reserve(msg_len) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!("dcache reserve failed: {e}");
+                    return HeaderCqeOutcome::Disconnect;
+                }
+            },
+            RxBuf::Heap(buf) => {
+                if msg_len > buf.len() {
+                    buf.resize(msg_len, 0);
+                }
+                None
+            }
+        };
+
+        self.io_state = IoState::PayloadPending { msg_len, offset: 0, send_ts, dc_ref };
+        HeaderCqeOutcome::PayloadReady
+    }
+
+    /// Handle CQE for a payload SQE.
+    pub(crate) fn handle_payload_cqe(&mut self, result: i32) -> PayloadCqeOutcome<'_> {
+        let (msg_len, offset, send_ts, dc_ref) = match self.io_state {
+            IoState::PayloadPending { msg_len, offset, send_ts, dc_ref } => {
+                (msg_len, offset, send_ts, dc_ref)
+            }
+            _ => return PayloadCqeOutcome::Disconnect,
+        };
+
+        if result <= 0 {
+            return PayloadCqeOutcome::Disconnect;
+        }
+        let new_offset = offset + result as usize;
+
+        if new_offset < msg_len {
+            self.io_state =
+                IoState::PayloadPending { msg_len, offset: new_offset, send_ts, dc_ref };
+            return PayloadCqeOutcome::NeedPayloadSqe;
+        }
+
+        if let Some(timers) = &mut self.timers {
+            timers.latency.emit_latency_from_nanos(send_ts, Nanos::now());
+        }
+        self.io_state = IoState::Idle;
+
+        let payload = if let Some(r) = dc_ref {
+            MessagePayload::Cached(r)
+        } else {
+            let RxBuf::Heap(buf) = &self.rx_buf else { unreachable!() };
+            MessagePayload::Raw(&buf[..msg_len])
+        };
+        PayloadCqeOutcome::Done { payload, send_ts }
+    }
+
     #[inline]
-    pub fn write_or_enqueue_with<F>(&mut self, registry: &Registry, serialise: F) -> ConnState
+    pub fn write_or_enqueue_with<F>(&mut self, serialise: F) -> ConnState
     where
         F: Fn(&mut Vec<u8>),
     {
@@ -247,18 +317,18 @@ impl TcpStream {
         }
 
         if !self.send_backlog.is_empty() {
-            if self.drain_backlog(registry) == ConnState::Disconnected {
+            if self.drain_backlog() == ConnState::Disconnected {
                 return ConnState::Disconnected;
             }
             if !self.send_backlog.is_empty() {
                 let data = self.alloc_vec(0);
-                return self.enqueue_back(registry, data);
+                self.send_backlog.push_back(data);
+                return ConnState::Alive;
             }
-            // backlog drained, fall through to direct write
         }
 
         match self.stream.write_vectored(&[
-            IoSlice::new(self.header_buf.as_slice()),
+            IoSlice::new(&self.header_buf),
             IoSlice::new(&self.send_buf),
         ]) {
             Ok(0) => {
@@ -269,41 +339,17 @@ impl TcpStream {
             Ok(n) => {
                 let data = self.alloc_vec(0);
                 self.send_cursor = n;
-                self.enqueue_back(registry, data)
+                self.send_backlog.push_back(data);
+                ConnState::Alive
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 let data = self.alloc_vec(0);
-                self.enqueue_back(registry, data)
+                self.send_backlog.push_back(data);
+                ConnState::Alive
             }
             Err(err) => {
                 warn!(?err, "tcp: stream write fail");
                 ConnState::Disconnected
-            }
-        }
-    }
-
-    /// Allocate send_buf[start..end] to vec. Times the alloc if telemetry
-    /// enabled.
-    #[inline]
-    fn alloc_vec(&mut self, written: usize) -> Vec<u8> {
-        match &mut self.timers {
-            Some(timers) => {
-                let t0 = Nanos::now();
-                let mut v = Vec::with_capacity(
-                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
-                );
-                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
-                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
-                timers.alloc.emit_latency_from_nanos(t0, Nanos::now());
-                v
-            }
-            None => {
-                let mut v = Vec::with_capacity(
-                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
-                );
-                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
-                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
-                v
             }
         }
     }
@@ -313,204 +359,41 @@ impl TcpStream {
         !self.send_backlog.is_empty()
     }
 
-    /// Flush queued data until kernel blocks, queue empty or we've written the
-    /// max bytes per iter.
-    /// returns connstate and whether it should be deregistered from writable
     #[inline]
-    pub(crate) fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
+    pub(crate) fn drain_backlog(&mut self) -> ConnState {
         while let Some(front) = self.send_backlog.front() {
             match self.stream.write(&front[self.send_cursor..]) {
                 Ok(0) => return ConnState::Disconnected,
-
                 Ok(n) => {
                     self.send_cursor += n;
                     if self.send_cursor == front.len() {
                         self.send_backlog.pop_front();
-                        self.send_cursor = 0
+                        self.send_cursor = 0;
                     }
                 }
-
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-
                 Err(err) => {
                     debug!(?err, "tcp: write from backlog");
                     return ConnState::Disconnected;
                 }
             }
         }
-
-        // Drop WRITABLE interest only when fully drained
-        if self.send_backlog.is_empty() && self.writable_armed {
-            if let Err(err) = registry.reregister(&mut self.stream, self.token, Interest::READABLE)
-            {
-                debug!(?err, "tcp: reregister drop writable");
-                return ConnState::Disconnected;
-            }
-            self.writable_armed = false;
-        }
-
         ConnState::Alive
     }
 
-    /// Read a single complete frame if present.
-    /// Loops until a frame is received or we've read everything and the read
-    /// would block.
     #[inline]
-    fn read_frame(&mut self) -> ReadOutcome<'_> {
-        loop {
-            match self.rx_state {
-                RxState::ReadingHeader { mut buf, mut have } => {
-                    while have < FRAME_HEADER_SIZE {
-                        match self.stream.read(&mut buf[have..]) {
-                            Ok(0) => return ReadOutcome::Disconnected,
-
-                            Ok(n) => {
-                                have += n;
-                                if have == FRAME_HEADER_SIZE {
-                                    let msg_len = u32::from_le_bytes(
-                                        buf[..LEN_HEADER_SIZE].try_into().unwrap(),
-                                    ) as usize;
-                                    let send_ts = Nanos(u64::from_le_bytes(
-                                        buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
-                                    ));
-                                    if msg_len == 0 {
-                                        self.rx_state = RxState::ReadingHeader {
-                                            buf: [0; FRAME_HEADER_SIZE],
-                                            have: 0,
-                                        };
-                                        continue;
-                                    }
-                                    let dc_offset = match &mut self.rx_buf {
-                                        RxBuf::DCache(dc) => match dc.reserve(msg_len) {
-                                            Ok(r) => Some(r.offset),
-                                            Err(e) => {
-                                                warn!("dcache reserve failed: {e}");
-                                                return ReadOutcome::Disconnected;
-                                            }
-                                        },
-                                        RxBuf::Heap(buf) => {
-                                            if msg_len > buf.len() {
-                                                debug!(
-                                                    buf_len = buf.len(),
-                                                    need_len = msg_len,
-                                                    "tcp: buffer resized"
-                                                );
-                                                buf.resize(msg_len, 0);
-                                            }
-                                            None
-                                        }
-                                    };
-                                    self.rx_state = RxState::ReadingPayload {
-                                        msg_len,
-                                        offset: 0,
-                                        send_ts,
-                                        dc_offset,
-                                    };
-                                }
-                            }
-
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                self.rx_state = RxState::ReadingHeader { buf, have };
-                                return ReadOutcome::WouldBlock;
-                            }
-
-                            Err(err) => {
-                                debug!(?err, "tcp: read header");
-                                return ReadOutcome::Disconnected;
-                            }
-                        }
-                    }
-                }
-
-                RxState::ReadingPayload { msg_len, mut offset, send_ts, dc_offset } => {
-                    while offset < msg_len {
-                        let result = if let Some(dc_offset) = dc_offset {
-                            let dref = DCacheRef { offset: dc_offset, len: msg_len };
-                            let RxBuf::DCache(dc) = &self.rx_buf else { unreachable!() };
-                            match dc.write_into(dref, offset, |buf| self.stream.read(buf)) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    warn!("dcache write_into error: {e}");
-                                    return ReadOutcome::Disconnected;
-                                }
-                            }
-                        } else {
-                            let RxBuf::Heap(buf) = &mut self.rx_buf else { unreachable!() };
-                            self.stream.read(&mut buf[offset..msg_len])
-                        };
-                        match result {
-                            Ok(0) => return ReadOutcome::Disconnected,
-                            Ok(n) => {
-                                offset += n;
-                                if offset == msg_len {
-                                    if let Some(timers) = &mut self.timers {
-                                        timers
-                                            .latency
-                                            .emit_latency_from_nanos(send_ts, Nanos::now());
-                                    }
-                                    self.rx_state = RxState::ReadingHeader {
-                                        buf: [0; FRAME_HEADER_SIZE],
-                                        have: 0,
-                                    };
-                                    let payload = if let Some(dc_offset) = dc_offset {
-                                        MessagePayload::Cached(DCacheRef {
-                                            offset: dc_offset,
-                                            len: msg_len,
-                                        })
-                                    } else {
-                                        let RxBuf::Heap(buf) = &self.rx_buf else { unreachable!() };
-                                        MessagePayload::Raw(&buf[..msg_len])
-                                    };
-                                    return ReadOutcome::PayloadDone { payload, send_ts };
-                                }
-                            }
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                self.rx_state =
-                                    RxState::ReadingPayload { msg_len, offset, send_ts, dc_offset };
-                                return ReadOutcome::WouldBlock;
-                            }
-                            Err(err) => {
-                                debug!(?err, "tcp: read payload");
-                                return ReadOutcome::Disconnected;
-                            }
-                        }
-                    }
-                }
-            }
+    fn alloc_vec(&mut self, written: usize) -> Vec<u8> {
+        let total = FRAME_HEADER_SIZE + self.send_buf.len();
+        let t0 = self.timers.is_some().then(Nanos::now);
+        let mut v = Vec::with_capacity(total.saturating_sub(written));
+        v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
+        v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
+        if let (Some(timers), Some(t0)) = (&mut self.timers, t0) {
+            timers.alloc.emit_latency_from_nanos(t0, Nanos::now());
         }
+        v
     }
 
-    #[inline]
-    fn enqueue_front(&mut self, registry: &Registry, data: Vec<u8>) -> ConnState {
-        self.send_backlog.push_front(data);
-        self.arm_writable(registry)
-    }
-
-    #[inline]
-    fn enqueue_back(&mut self, registry: &Registry, data: Vec<u8>) -> ConnState {
-        self.send_backlog.push_back(data);
-        self.arm_writable(registry)
-    }
-
-    /// Arm WRITABLE notifications when transitioning from empty -> non-empty
-    /// queue. `self.poll` will start polling for writable events.
-    #[inline]
-    fn arm_writable(&mut self, registry: &Registry) -> ConnState {
-        if !self.writable_armed {
-            if let Err(err) = registry.reregister(
-                &mut self.stream,
-                self.token,
-                Interest::READABLE | Interest::WRITABLE,
-            ) {
-                debug!(?err, "tcp: poll reregister");
-                return ConnState::Disconnected;
-            }
-            self.writable_armed = true;
-        }
-        ConnState::Alive
-    }
-
-    /// Serialise payload into send buffer and prepend frame header.
     #[inline(always)]
     fn serialise_frame<F>(&mut self, serialise: F)
     where
@@ -518,16 +401,14 @@ impl TcpStream {
     {
         self.send_buf.clear();
         serialise(&mut self.send_buf);
-        // write frame header
         self.header_buf[..LEN_HEADER_SIZE]
             .copy_from_slice(&(self.send_buf.len() as u32).to_le_bytes());
         self.header_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
             .copy_from_slice(&Nanos::now().0.to_le_bytes());
     }
 
-    pub fn close(&mut self, registry: &Registry) {
+    pub fn close(&mut self) {
         debug!("terminating connection");
-        let _ = registry.deregister(&mut self.stream);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
@@ -536,9 +417,25 @@ impl TcpStream {
     }
 }
 
-/// Set kernel SO_SNDBUF and SO_RCVBUF on a mio TcpStream.
-pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
-    use std::os::fd::AsRawFd;
+pub(crate) enum HeaderCqeOutcome {
+    /// Full header parsed; stream is `PayloadPending`. Caller must post payload SQE.
+    PayloadReady,
+    /// Zero-length keepalive; stream returned to `Idle`.
+    Idle,
+    /// Partial; re-post header RECV for the remainder.
+    NeedHeaderSqe,
+    Disconnect,
+}
+
+pub(crate) enum PayloadCqeOutcome<'a> {
+    Done { payload: MessagePayload<'a>, send_ts: Nanos },
+    /// Partial; re-post payload SQE for the remainder.
+    NeedPayloadSqe,
+    Disconnect,
+}
+
+/// Set kernel SO_SNDBUF and SO_RCVBUF.
+pub(crate) fn set_socket_buf_size(stream: &std::net::TcpStream, size: usize) {
     let fd = stream.as_raw_fd();
     let size = size as libc::c_int;
     unsafe {

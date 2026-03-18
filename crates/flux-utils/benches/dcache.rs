@@ -63,7 +63,7 @@ fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
     let dc_c = dc.clone();
     let consumer = thread::spawn(move || {
         core_affinity::set_for_current(CoreId { id: LAST_CORE });
-        let mut c = ConsumerBare::from(queue);
+        let mut c = ConsumerBare::new(queue, "bench");
         let mut r = DCacheRef { offset: 0, len: 0 };
         let mut sum = 0u64;
         let mut seen = 0usize;
@@ -116,7 +116,7 @@ fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
     let consumer_stores = stores.clone();
     let consumer = thread::spawn(move || {
         core_affinity::set_for_current(CoreId { id: LAST_CORE });
-        let mut c = ConsumerBare::from(queue);
+        let mut c = ConsumerBare::new(queue, "bench");
         let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
         let mut sum = 0u64;
         let mut seen = 0usize;
@@ -175,7 +175,7 @@ fn run_mp_mc(
     let consumers: Vec<_> = (0..n_consumers)
         .map(|i| {
             let dc_c = dc.clone();
-            let mut c = ConsumerBare::from(queue);
+            let mut c = ConsumerBare::new(queue, "bench");
             thread::spawn(move || {
                 core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
                 let mut r = DCacheRef { offset: 0, len: 0 };
@@ -238,7 +238,7 @@ fn run_sp_mc(
     let consumers: Vec<_> = (0..n_consumers)
         .map(|i| {
             let consumer_stores = stores.clone();
-            let mut c = ConsumerBare::from(queue);
+            let mut c = ConsumerBare::new(queue, "bench");
             thread::spawn(move || {
                 core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
                 let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };

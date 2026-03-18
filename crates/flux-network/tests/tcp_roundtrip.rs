@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
+use flux_network::tcp::{MessagePayload, PollEvent, SendBehavior, TcpConnector};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
@@ -42,7 +42,8 @@ fn tcp_roundtrip() {
             listener.poll_with(|event| {
                 if let PollEvent::Message { token, payload, .. } = event {
                     assert_eq!(token, stream_token);
-                    let msg: TestMsg = wincode::deserialize(payload).unwrap();
+                    let MessagePayload::Raw(bytes) = payload else { panic!("unexpected Cached payload") };
+                    let msg: TestMsg = wincode::deserialize(bytes).unwrap();
                     recv = Some(msg);
                 }
             });
@@ -76,7 +77,8 @@ fn tcp_roundtrip() {
         loop {
             conn.poll_with(|event| {
                 if let PollEvent::Message { payload, .. } = event {
-                    let msg: TestMsg = wincode::deserialize(payload).unwrap();
+                    let MessagePayload::Raw(bytes) = payload else { panic!("unexpected Cached payload") };
+                    let msg: TestMsg = wincode::deserialize(bytes).unwrap();
                     recv = Some(msg);
                 }
             });
