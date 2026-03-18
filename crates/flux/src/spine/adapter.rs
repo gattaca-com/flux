@@ -4,11 +4,14 @@ use std::sync::{
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
-use flux_utils::{DCache, DCacheRef};
+use flux_utils::DCache;
 use signal_hook::consts::SIGINT;
 
 use crate::{
-    spine::{DCacheRead, FluxSpine, SpineConsumer, SpineProducer, SpineProducers},
+    spine::{
+        DCacheRead, FluxSpine, SpineConsumer, SpineProducer, SpineProducers,
+        consumer::WithDCacheRef,
+    },
     tile::Tile,
 };
 
@@ -189,7 +192,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     #[inline]
     pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> DCacheRead<T, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
+        T: 'static + Copy + WithDCacheRef,
         S::Consumers: AsMut<SpineConsumer<T>>,
         F: FnMut(&[u8]) -> R,
     {
@@ -206,7 +209,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         mut read: F,
     ) -> DCacheRead<T, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
+        T: 'static + Copy + WithDCacheRef,
         S::Consumers: AsMut<SpineConsumer<T>>,
         F: FnMut(T, &[u8]) -> R,
     {
@@ -223,7 +226,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
+        T: 'static + Copy + WithDCacheRef,
         S::Consumers: AsMut<SpineConsumer<T>>,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
@@ -240,7 +243,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
+        T: 'static + Copy + WithDCacheRef,
         S::Consumers: AsMut<SpineConsumer<T>>,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
