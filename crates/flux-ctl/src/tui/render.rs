@@ -88,7 +88,15 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                             Some(r) => format!(" {:.0}msg/s", r),
                             None => String::new(),
                         };
-                        format!("cap={} elem={}B{}", seg.entry.capacity, seg.entry.elem_size, rate)
+                        let lagger = match seg.max_lagger_pct {
+                            Some(pct) if pct >= 100.0 => " lag:⚠>100%".to_string(),
+                            Some(pct) => format!(" lag:{:.0}%", pct),
+                            None => String::new(),
+                        };
+                        format!(
+                            "cap={} elem={}B{}{}",
+                            seg.entry.capacity, seg.entry.elem_size, rate, lagger
+                        )
                     }
                     _ => format!("size={}B", seg.entry.elem_size),
                 };

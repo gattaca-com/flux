@@ -86,6 +86,12 @@ pub struct SegmentInfo {
     pub poison: Option<discovery::PoisonInfo>,
     /// Messages per second computed from delta writes / delta time.
     pub msgs_per_sec: Option<f64>,
+    /// Longest consumer-group lag as a percentage of queue capacity.
+    ///
+    /// Computed as `(writes - min_cursor) / capacity * 100` across all
+    /// registered consumer groups.  Only set for alive Queue segments with
+    /// at least one consumer group.
+    pub max_lagger_pct: Option<f64>,
     /// PIDs attached to this segment's backing shmem (from `/proc` scan).
     pub pids: Vec<u32>,
 }
@@ -335,6 +341,23 @@ impl App {
                     } else {
                         raw_rate
                     };
+                    // Longest consumer-group lag as % of capacity.
+                    let max_lagger_pct = queue_writes.and_then(|writes| {
+                        let capacity = queue_capacity?;
+                        if capacity == 0 {
+                            return None;
+                        }
+                        let groups = self.shmem_cache.consumer_groups(&e.flink);
+                        if groups.is_empty() {
+                            return None;
+                        }
+                        let max_lag = groups
+                            .iter()
+                            .map(|g| writes.saturating_sub(g.cursor))
+                            .max()
+                            .unwrap_or(0);
+                        Some(max_lag as f64 / capacity as f64 * 100.0)
+                    });
                     let pids: Vec<u32> = pids.into_iter().filter(|&p| p != own_pid).collect();
                     SegmentInfo {
                         entry: e.clone(),
@@ -344,6 +367,7 @@ impl App {
                         queue_capacity,
                         poison,
                         msgs_per_sec,
+                        max_lagger_pct,
                         pids,
                     }
                 })
