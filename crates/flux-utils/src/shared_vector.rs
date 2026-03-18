@@ -93,6 +93,22 @@ impl<T> SharedVector<T> {
         result
     }
 
+    /// Removes and returns the item at the given position, clearing the slot.
+    /// Returns None if the position is invalid or has already been taken.
+    #[inline]
+    pub fn take(&self, position: usize) -> Option<Arc<T>> {
+        let index = self.convert_to_index(position);
+        let position_address = unsafe { self.data.get_unchecked(index) };
+        let mut guard = position_address.write();
+        if self.is_outdated_position(position) {
+            return None;
+        }
+        guard.take_if(|arc| {
+            // ??
+            Arc::strong_count(arc) == 1 && Arc::weak_count(arc) == 0
+        })
+    }
+
     /// Clears all items and invalidates existing indices, only objects that was
     /// received from get will be still valid. Returns the latest position
     /// which was cleared. Designed for only single clearing at a time and
