@@ -1,31 +1,18 @@
 use flux_timing::{TrackingTimestamp, UNREGISTERED_TILE_ID};
 use flux_utils::DCachePtr;
 
-use super::{DCacheMsg, SpineProducer, SpineProducers, SpineQueue};
+use super::{DCacheMsg, SpineProducer, SpineProducerWithDCache, SpineProducers, SpineQueue};
 use crate::communication::queue;
 
 #[derive(Debug)]
 pub struct StandaloneProducer<T: 'static + Copy> {
     producer: SpineProducer<T>,
     timestamp: TrackingTimestamp,
-    dcache: Option<DCachePtr>,
 }
 
 impl<T: 'static + Copy> StandaloneProducer<T> {
     pub(super) fn new(queue: SpineQueue<T>, tile_id: u16) -> Self {
-        Self {
-            producer: queue::Producer::from(queue),
-            timestamp: TrackingTimestamp::new(tile_id),
-            dcache: None,
-        }
-    }
-
-    pub(super) fn new_with_dcache(queue: SpineQueue<T>, dcache: DCachePtr, tile_id: u16) -> Self {
-        Self {
-            producer: queue::Producer::from(queue),
-            timestamp: TrackingTimestamp::new(tile_id),
-            dcache: Some(dcache),
-        }
+        Self { producer: queue::Producer::from(queue), timestamp: TrackingTimestamp::new(tile_id) }
     }
 }
 
@@ -51,18 +38,39 @@ impl<T: 'static + Copy> From<SpineQueue<T>> for StandaloneProducer<T> {
     }
 }
 
-impl<T: 'static + Copy> StandaloneProducer<DCacheMsg<T>> {
-    pub fn produce_with_dcache<F: FnOnce(&mut [u8])>(
-        &mut self,
-        data: T,
-        payload: Option<(usize, F)>,
-    ) {
-        let dref = payload.map(|(len, write)| {
-            self.dcache
-                .expect("producer has no dcache")
-                .write(len, write)
-                .expect("dcache write failed")
-        });
-        self.produce(DCacheMsg::new(data, dref));
+#[derive(Debug)]
+pub struct StandaloneDCacheProducer<T: 'static + Copy> {
+    inner: SpineProducerWithDCache<T>,
+    timestamp: TrackingTimestamp,
+}
+
+impl<T: 'static + Copy> StandaloneDCacheProducer<T> {
+    pub(super) fn new(queue: SpineQueue<DCacheMsg<T>>, dcache: DCachePtr, tile_id: u16) -> Self {
+        Self {
+            inner: SpineProducerWithDCache::new(queue, dcache),
+            timestamp: TrackingTimestamp::new(tile_id),
+        }
+    }
+}
+
+impl<T: 'static + Copy> SpineProducers for StandaloneDCacheProducer<T> {
+    fn timestamp(&self) -> &TrackingTimestamp {
+        &self.timestamp
+    }
+
+    fn timestamp_mut(&mut self) -> &mut TrackingTimestamp {
+        &mut self.timestamp
+    }
+}
+
+impl<T: 'static + Copy> AsRef<SpineProducer<DCacheMsg<T>>> for StandaloneDCacheProducer<T> {
+    fn as_ref(&self) -> &SpineProducer<DCacheMsg<T>> {
+        self.inner.as_ref()
+    }
+}
+
+impl<T: 'static + Copy> AsMut<SpineProducerWithDCache<T>> for StandaloneDCacheProducer<T> {
+    fn as_mut(&mut self) -> &mut SpineProducerWithDCache<T> {
+        &mut self.inner
     }
 }

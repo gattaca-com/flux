@@ -104,12 +104,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Producers: SpineProducers + AsMut<SpineProducerWithDCache<T>>,
         F: FnOnce(&mut [u8]),
     {
-        let ts = self.producers.timestamp().with_new_publish_delta();
-        let p: &mut SpineProducerWithDCache<T> = self.producers.as_mut();
-        let dref =
-            payload.map(|(len, write)| p.dcache.write(len, write).expect("dcache write failed"));
-        let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
-        p.inner.produce_without_first(&msg);
+        self.producers.produce_with_dcache(data, payload);
         self.did_work = true;
     }
 
