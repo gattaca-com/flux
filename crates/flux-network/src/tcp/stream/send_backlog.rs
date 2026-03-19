@@ -31,6 +31,7 @@ impl SendBacklog {
     /// WRITABLE, so arm_writable must reregister unconditionally.
     pub(super) fn disarm(&mut self) {
         self.writable_armed = false;
+        self.cursor = 0;
     }
 
     pub(super) fn enqueue_front(

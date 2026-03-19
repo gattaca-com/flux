@@ -64,8 +64,7 @@ impl RawStream {
         if !self.backlog.is_empty() {
             self.backlog.disarm();
             if let Some(message) = on_connect_msg {
-                return self
-                    .write_or_enqueue_with(registry, |bytes| bytes.extend_from_slice(message));
+                return self.backlog.enqueue_front(registry, &mut self.stream, message.clone());
             }
             self.backlog.arm_writable(registry, &mut self.stream)
         } else if let Some(message) = on_connect_msg {
@@ -86,12 +85,14 @@ impl RawStream {
         F: for<'a> FnMut(Token, MessagePayload<'a>, Nanos),
     {
         if ev.is_readable() {
-            match self.read_raw() {
-                ReadOutcome::PayloadDone { payload, send_ts } => {
-                    on_msg(ev.token(), payload, send_ts);
+            loop {
+                match self.read_raw() {
+                    ReadOutcome::PayloadDone { payload, send_ts } => {
+                        on_msg(ev.token(), payload, send_ts);
+                    }
+                    ReadOutcome::WouldBlock => break,
+                    ReadOutcome::Disconnected => return ConnState::Disconnected,
                 }
-                ReadOutcome::WouldBlock => {}
-                ReadOutcome::Disconnected => return ConnState::Disconnected,
             }
         }
 
@@ -183,7 +184,8 @@ impl RawStream {
                 Ok(n) => {
                     total += n;
                     if total == self.rx_buf.len() {
-                        // Buffer full; emit now, re-triggered next poll.
+                        // Buffer full; emit now. Caller must loop — mio is
+                        // edge-triggered and won't re-fire until new data arrives.
                         let _ = &mut self.timers; // suppress unused warning
                         return ReadOutcome::PayloadDone {
                             payload: MessagePayload::Raw(&self.rx_buf[..total]),
