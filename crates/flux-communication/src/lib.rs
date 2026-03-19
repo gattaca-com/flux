@@ -106,6 +106,8 @@ where
     S: AsRef<Path>,
     T: Copy,
 {
+    assert!(mtu > 0, "mtu must be > 0");
+
     let queue_name = short_typename::<T>();
     let flink_path = shmem_dir_queues_with_base(&base_dir, &app_name).join(queue_name.as_str());
 
@@ -116,7 +118,16 @@ where
     // 64: DCache fixed prefix (reserved + cacheline pad) preceding the data slice.
     let total = queue_bytes_aligned + 64 + dcache_cap;
 
-    let (ptr, is_new) = queue::shmem_map_create_or_open(&flink_path, total);
+    let (ptr, is_new, mapped_size) = queue::shmem_map_create_or_open(&flink_path, total);
+
+    if !is_new && mapped_size < total {
+        tracing::error!(
+            "shmem at {flink_path:?} is too small ({mapped_size} < {total}); \
+             mtu or queue_len changed — removing and recreating.",
+        );
+        let _ = std::fs::remove_file(&flink_path);
+        return shmem_queue_dcache_with_base_dir(base_dir, app_name, queue_len, mtu, typ);
+    }
 
     let q = if is_new {
         queue::Queue::from_raw_init(ptr, real_len, typ)

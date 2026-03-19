@@ -1,7 +1,7 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::{DCachePtr, DCacheRef, short_typename};
+use flux_utils::{DCachePtr, DCacheRef, safe_panic, short_typename};
 
 use crate::{
     Timer,
@@ -26,9 +26,6 @@ pub enum DCacheRead<T, R> {
 
 /// Queue element wrapper for dcache-backed queues. Produced by
 /// [`SpineProducerWithDCache`]; never constructed directly by users.
-///
-/// `DCacheRef` is private — it is meaningless without the seqlock epoch
-/// check performed inside the consume path.
 #[derive(Clone, Copy, Debug)]
 pub struct DCacheMsg<T> {
     pub data: T,
@@ -276,6 +273,9 @@ impl<T: 'static + Copy> SpineConsumer<DCacheMsg<T>> {
                     return DCacheRead::NoRef(msg.with_data(msg.data().data));
                 }
                 let Some(dc) = self.dcache else {
+                    safe_panic!(
+                        "dcache-backed consumer has no dcache handle; use attach_with_dcache"
+                    );
                     return DCacheRead::NoRef(msg.with_data(msg.data().data));
                 };
                 let user_msg = msg.with_data(msg.data().data);
@@ -311,6 +311,9 @@ impl<T: 'static + Copy> SpineConsumer<DCacheMsg<T>> {
                         return DCacheRead::NoRef(msg.with_data(msg.data().data));
                     }
                     let Some(dc) = self.dcache else {
+                        safe_panic!(
+                            "dcache-backed consumer has no dcache handle; use attach_with_dcache"
+                        );
                         return DCacheRead::NoRef(msg.with_data(msg.data().data));
                     };
                     let user_msg = msg.with_data(msg.data().data);

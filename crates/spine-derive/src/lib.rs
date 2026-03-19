@@ -157,7 +157,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut persisting = Vec::<proc_macro2::TokenStream>::new();
     let mut message_types = Vec::<proc_macro2::TokenStream>::new();
 
-    let mut new_method_initializers = Punctuated::<proc_macro2::TokenStream, Comma>::new();
     for field in &input.fields {
         let field_ident = field.ident.as_ref().expect("named field required");
 
@@ -173,6 +172,15 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let (is_persistent, _size_expr_opt, _is_spmc, mtu_expr) =
                 get_queue_config(&field.attrs);
+
+            if is_persistent && mtu_expr.is_some() {
+                return syn::Error::new_spanned(
+                    field_ident,
+                    "persist and mtu cannot be combined: PersistingQueueTile does not support dcache-backed queues",
+                )
+                .to_compile_error()
+                .into();
+            }
 
             if mtu_expr.is_some() {
                 // ── dcache-backed queue ───────────────────────────────────
@@ -303,8 +311,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                             });
             }
         }
-        new_method_initializers
-            .push(quote! { #field_ident : #field.ty::attach(#app_name_tokens, tile, spine) });
     }
 
     // ---- Build `new_with_base_dir` body as explicit let-bindings ----
@@ -317,6 +323,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     for field in &input.fields {
         let field_ident = field.ident.as_ref().expect("named field required for new method");
 
+        //TODO: @gd this is so cursed
         if field_ident == "tile_info" {
             new_let_stmts.push(quote! {
                 let tile_info = ::flux::communication::ShmemData::open_or_init_with_base_dir(

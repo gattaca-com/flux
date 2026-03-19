@@ -156,19 +156,20 @@ impl QueueHeader {
     }
 }
 
-pub(crate) fn shmem_map_create_or_open(flink_path: &Path, size: usize) -> (*mut u8, bool) {
+pub(crate) fn shmem_map_create_or_open(flink_path: &Path, size: usize) -> (*mut u8, bool, usize) {
     let _ = std::fs::create_dir_all(flink_path.parent().unwrap());
     match ShmemConf::new().size(size).flink(flink_path).create() {
         Ok(shmem) => {
             let ptr = shmem.as_ptr();
             std::mem::forget(shmem);
-            (ptr, true)
+            (ptr, true, size)
         }
         Err(ShmemError::LinkExists) => match ShmemConf::new().flink(flink_path).open() {
             Ok(shmem) => {
+                let mapped_size = shmem.len();
                 let ptr = shmem.as_ptr();
                 std::mem::forget(shmem);
-                (ptr, false)
+                (ptr, false, mapped_size)
             }
             Err(_) => {
                 let _ = std::fs::remove_file(flink_path);
@@ -399,7 +400,7 @@ impl<T: Copy> InnerQueue<T> {
         typ: QueueType,
     ) -> *const Self {
         len = len.next_power_of_two();
-        let (ptr, is_new) = shmem_map_create_or_open(shmem_file.as_ref(), Self::size_of(len));
+        let (ptr, is_new, _) = shmem_map_create_or_open(shmem_file.as_ref(), Self::size_of(len));
         if is_new {
             return Self::from_uninitialized_ptr(ptr, len, typ);
         }
@@ -480,8 +481,7 @@ impl<T: Copy> Queue<T> {
         }
     }
 
-    /// Size in bytes of the queue region for `len` slots (len rounded to next
-    /// power of two).
+    /// Size in bytes of the queue region for `len` slots
     pub(crate) fn byte_size(len: usize) -> usize {
         InnerQueue::<T>::size_of(len)
     }

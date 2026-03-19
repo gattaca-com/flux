@@ -20,9 +20,6 @@ use crate::{
 pub type SpineProducer<T> = queue::Producer<InternalMessage<T>>;
 pub type SpineQueue<T> = queue::Queue<InternalMessage<T>>;
 
-/// Bundles the queue producer and dcache handle for dcache-backed queues.
-/// Constructed by the spine macro; use [`SpineAdapter::produce_with_dcache`]
-/// to write payloads rather than accessing fields directly.
 #[derive(Clone, Copy, Debug)]
 pub struct SpineProducerWithDCache<T: 'static + Copy> {
     pub(crate) inner: SpineProducer<DCacheMsg<T>>,

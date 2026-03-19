@@ -33,6 +33,8 @@ pub enum DCacheError {
     InvalidWriteIntoOffset(usize, usize),
     #[error("producer overrun consumer during payload read")]
     SpedPast,
+    #[error("reserving zero")]
+    ReserveZero,
 }
 
 /// Ring buffer data storage inspired by Firedancer's `dcache`. Provides
@@ -96,8 +98,12 @@ impl DCache {
     /// Reserves a slot of `len` bytes and returns a [`DCacheRef`].
     #[inline]
     pub fn reserve(&self, len: usize) -> Result<DCacheRef, DCacheError> {
+        if len == 0 {
+            return Err(DCacheError::ReserveZero);
+        }
+
         let n = self.capacity();
-        if len == 0 || len > n {
+        if len > n {
             return Err(DCacheError::DataLenExceedsCapacity(len, n));
         }
 
