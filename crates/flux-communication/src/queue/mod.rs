@@ -48,7 +48,7 @@ pub enum QueueType {
     SPMC,
 }
 
-pub const MAX_GROUPS: usize = 32;
+pub const MAX_GROUPS: usize = 256;
 pub const GROUP_LABEL_LEN: usize = 64;
 
 #[derive(Debug)]
