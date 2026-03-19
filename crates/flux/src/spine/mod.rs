@@ -6,9 +6,9 @@ mod standalone_producer;
 use std::path::Path;
 
 pub use adapter::SpineAdapter;
-pub use consumer::{DCacheRead, SpineConsumer};
+pub use consumer::{DCacheMsg, DCacheRead, SpineConsumer};
 use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
-use flux_utils::directories::shmem_dir;
+use flux_utils::{DCachePtr, directories::shmem_dir};
 pub use scoped::ScopedSpine;
 pub use standalone_producer::StandaloneProducer;
 
@@ -19,6 +19,30 @@ use crate::{
 
 pub type SpineProducer<T> = queue::Producer<InternalMessage<T>>;
 pub type SpineQueue<T> = queue::Queue<InternalMessage<T>>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SpineProducerWithDCache<T: 'static + Copy> {
+    pub(crate) inner: SpineProducer<DCacheMsg<T>>,
+    pub(crate) dcache: DCachePtr,
+}
+
+impl<T: 'static + Copy> SpineProducerWithDCache<T> {
+    pub fn new(queue: SpineQueue<DCacheMsg<T>>, dcache: DCachePtr) -> Self {
+        Self { inner: queue::Producer::from(queue), dcache }
+    }
+}
+
+impl<T: 'static + Copy> AsRef<SpineProducer<DCacheMsg<T>>> for SpineProducerWithDCache<T> {
+    fn as_ref(&self) -> &SpineProducer<DCacheMsg<T>> {
+        &self.inner
+    }
+}
+
+/// Implemented by spine structs for each dcache-backed queue field. Generated
+/// by the `#[from_spine]` macro; used by `standalone_dcache_producer_for`.
+pub trait HasDCacheQueue<T: 'static + Copy> {
+    fn dcache_queue_and_ptr(&self) -> (SpineQueue<DCacheMsg<T>>, DCachePtr);
+}
 
 pub trait SpineProducers {
     fn timestamp(&self) -> &TrackingTimestamp;
@@ -60,7 +84,7 @@ pub trait FluxSpine: Sized + Send {
     fn app_name() -> &'static str;
     fn base_dir(&self) -> &Path;
 
-    /// Returns a [`StandaloneProducer`] for the queue of message type `T`and
+    /// Returns a [`StandaloneProducer`] for the queue of message type `T` and
     /// registers `name` as a tile entry.
     fn standalone_producer_for<T: Copy>(&mut self, name: TileName) -> StandaloneProducer<T>
     where
@@ -68,6 +92,18 @@ pub trait FluxSpine: Sized + Send {
     {
         let id = self.register_tile(name);
         StandaloneProducer::new(*<Self as AsRef<SpineQueue<T>>>::as_ref(self), id)
+    }
+
+    fn standalone_dcache_producer_for<T: Copy>(
+        &mut self,
+        name: TileName,
+    ) -> StandaloneProducer<DCacheMsg<T>>
+    where
+        Self: HasDCacheQueue<T>,
+    {
+        let id = self.register_tile(name);
+        let (queue, dcache) = self.dcache_queue_and_ptr();
+        StandaloneProducer::new_with_dcache(queue, dcache, id)
     }
 
     /// Removes all files related to a given spine. Does not clear the shared

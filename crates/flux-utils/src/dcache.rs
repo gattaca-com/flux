@@ -14,6 +14,15 @@ pub struct DCacheRef {
     pub len: usize,
 }
 
+impl DCacheRef {
+    pub const NONE: Self = Self { offset: 0, len: 0 };
+
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.len == 0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DCacheError {
     #[error("data length {0} exceeds capacity {1}")]
@@ -24,6 +33,8 @@ pub enum DCacheError {
     InvalidWriteIntoOffset(usize, usize),
     #[error("producer overrun consumer during payload read")]
     SpedPast,
+    #[error("reserving zero")]
+    ReserveZero,
 }
 
 /// Ring buffer data storage inspired by Firedancer's `dcache`. Provides
@@ -58,6 +69,7 @@ impl DCache {
     }
 
     pub fn from_ptr(ptr: *mut u8, n: usize) -> *const Self {
+        assert!(n.is_power_of_two() && n.is_multiple_of(CACHELINE));
         std::ptr::slice_from_raw_parts_mut(ptr, n) as *const Self
     }
 
@@ -86,6 +98,10 @@ impl DCache {
     /// Reserves a slot of `len` bytes and returns a [`DCacheRef`].
     #[inline]
     pub fn reserve(&self, len: usize) -> Result<DCacheRef, DCacheError> {
+        if len == 0 {
+            return Err(DCacheError::ReserveZero);
+        }
+
         let n = self.capacity();
         if len > n {
             return Err(DCacheError::DataLenExceedsCapacity(len, n));
@@ -167,6 +183,33 @@ impl DCache {
     #[inline]
     fn next_multiple_of_64(x: usize) -> usize {
         (x + 63) & !63
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct DCachePtr(*const DCache);
+
+unsafe impl Send for DCachePtr {}
+unsafe impl Sync for DCachePtr {}
+
+impl DCachePtr {
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn from_raw(ptr: *const DCache) -> Self {
+        Self(ptr)
+    }
+}
+
+impl std::ops::Deref for DCachePtr {
+    type Target = DCache;
+
+    fn deref(&self) -> &DCache {
+        unsafe { &*self.0 }
+    }
+}
+
+impl std::fmt::Debug for DCachePtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DCachePtr({:p})", self.0)
     }
 }
 

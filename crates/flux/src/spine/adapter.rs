@@ -4,11 +4,13 @@ use std::sync::{
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
-use flux_utils::{DCache, DCacheRef};
 use signal_hook::consts::SIGINT;
 
 use crate::{
-    spine::{DCacheRead, FluxSpine, SpineConsumer, SpineProducer, SpineProducers},
+    spine::{
+        DCacheMsg, DCacheRead, FluxSpine, SpineConsumer, SpineProducer, SpineProducerWithDCache,
+        SpineProducers,
+    },
     tile::Tile,
 };
 
@@ -86,11 +88,28 @@ impl<S: FluxSpine> SpineAdapter<S> {
         *self.producers.timestamp_mut().ingestion_t_mut() = now;
     }
 
+    #[inline]
     pub fn produce<T: Copy>(&mut self, d: T)
     where
         S::Producers: SpineProducers + AsRef<SpineProducer<T>>,
     {
         self.producers.produce(d);
+        self.did_work = true;
+    }
+
+    #[inline]
+    pub fn produce_with_dcache<T, F>(&mut self, data: T, payload: Option<(usize, F)>)
+    where
+        T: 'static + Copy,
+        S::Producers: SpineProducers + AsMut<SpineProducerWithDCache<T>>,
+        F: FnOnce(&mut [u8]),
+    {
+        let ts = self.producers.timestamp().with_new_publish_delta();
+        let p: &mut SpineProducerWithDCache<T> = self.producers.as_mut();
+        let dref =
+            payload.map(|(len, write)| p.dcache.write(len, write).expect("dcache write failed"));
+        let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
+        p.inner.produce_without_first(&msg);
         self.did_work = true;
     }
 
@@ -187,66 +206,60 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn consume_dcache<T, R, F>(&mut self, dcache: &DCache, mut read: F) -> DCacheRead<T, R>
+    pub fn consume_with_dcache<T, R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
-        S::Consumers: AsMut<SpineConsumer<T>>,
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<DCacheMsg<T>>>,
         F: FnMut(&[u8]) -> R,
     {
-        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_dcache(dcache, &mut read);
-        self.did_work |= matches!(result, DCacheRead::Ok(_));
+        let c: &mut SpineConsumer<DCacheMsg<T>> = self.consumers.as_mut();
+        let result = c.consume_with_dcache(&mut read);
+        self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
 
     #[inline]
-    pub fn consume_dcache_collaborative<T, R, F>(
-        &mut self,
-        dcache: &DCache,
-        mut read: F,
-    ) -> DCacheRead<T, R>
+    pub fn consume_with_dcache_collaborative<T, R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
-        S::Consumers: AsMut<SpineConsumer<T>>,
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<DCacheMsg<T>>>,
         F: FnMut(T, &[u8]) -> R,
     {
-        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_dcache_collaborative(dcache, &mut read);
-        self.did_work |= matches!(result, DCacheRead::Ok(_));
+        let c: &mut SpineConsumer<DCacheMsg<T>> = self.consumers.as_mut();
+        let result = c.consume_with_dcache_collaborative(&mut read);
+        self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
 
     #[inline]
-    pub fn consume_dcache_internal_message<T, R, F>(
+    pub fn consume_with_dcache_internal_message<T, R, F>(
         &mut self,
-        dcache: &DCache,
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
-        S::Consumers: AsMut<SpineConsumer<T>>,
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<DCacheMsg<T>>>,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
-        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_dcache_internal_message(dcache, &mut read);
-        self.did_work |= matches!(result, DCacheRead::Ok(_));
+        let c: &mut SpineConsumer<DCacheMsg<T>> = self.consumers.as_mut();
+        let result = c.consume_with_dcache_internal_message(&mut read);
+        self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
 
     #[inline]
-    pub fn consume_dcache_collaborative_internal_message<T, R, F>(
+    pub fn consume_with_dcache_collaborative_internal_message<T, R, F>(
         &mut self,
-        dcache: &DCache,
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
-        T: 'static + Copy + Into<DCacheRef>,
-        S::Consumers: AsMut<SpineConsumer<T>>,
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<DCacheMsg<T>>>,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
-        let c: &mut SpineConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_dcache_collaborative_internal_message(dcache, &mut read);
-        self.did_work |= matches!(result, DCacheRead::Ok(_));
+        let c: &mut SpineConsumer<DCacheMsg<T>> = self.consumers.as_mut();
+        let result = c.consume_with_dcache_collaborative_internal_message(&mut read);
+        self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
 

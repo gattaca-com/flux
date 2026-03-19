@@ -33,7 +33,7 @@ fn binary_name() -> &'static str {
 
 use flux_utils::{ArrayStr, safe_panic};
 use rand::Rng;
-use shared_memory::ShmemConf;
+use shared_memory::{ShmemConf, ShmemError};
 
 use crate::{
     Seqlock,
@@ -156,6 +156,30 @@ impl QueueHeader {
     }
 }
 
+pub(crate) fn shmem_map_create_or_open(flink_path: &Path, size: usize) -> (*mut u8, bool, usize) {
+    let _ = std::fs::create_dir_all(flink_path.parent().unwrap());
+    match ShmemConf::new().size(size).flink(flink_path).create() {
+        Ok(shmem) => {
+            let ptr = shmem.as_ptr();
+            std::mem::forget(shmem);
+            (ptr, true, size)
+        }
+        Err(ShmemError::LinkExists) => match ShmemConf::new().flink(flink_path).open() {
+            Ok(shmem) => {
+                let mapped_size = shmem.len();
+                let ptr = shmem.as_ptr();
+                std::mem::forget(shmem);
+                (ptr, false, mapped_size)
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(flink_path);
+                shmem_map_create_or_open(flink_path, size)
+            }
+        },
+        Err(e) => panic!("shmem create failed at {flink_path:?}: {e}"),
+    }
+}
+
 //TODO @lopo: this should in reality really also implement drop and most likely
 // return an Arc instead of &'static or whatever.
 #[repr(C, align(64))]
@@ -183,7 +207,7 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     const fn size_of(len: usize) -> usize {
-        size_of::<QueueHeader>() + len.next_power_of_two() * size_of::<Seqlock<T>>()
+        size_of::<QueueHeader>() + len * size_of::<Seqlock<T>>()
     }
 
     fn from_uninitialized_ptr(ptr: *mut u8, len: usize, queue_type: QueueType) -> *const Self {
@@ -375,53 +399,49 @@ impl<T: Copy> InnerQueue<T> {
         mut len: usize,
         typ: QueueType,
     ) -> *const Self {
-        use shared_memory::{ShmemConf, ShmemError};
-        let _ = std::fs::create_dir_all(shmem_file.as_ref().parent().unwrap());
         len = len.next_power_of_two();
-        match ShmemConf::new().size(Self::size_of(len)).flink(&shmem_file).create() {
-            Ok(shmem) => {
-                let ptr = shmem.as_ptr();
-                std::mem::forget(shmem);
-                Self::from_uninitialized_ptr(ptr, len, typ)
-            }
-            Err(ShmemError::LinkExists) => {
-                let Ok(v) = Self::open_shared(&shmem_file).inspect_err(|e| {
-                    tracing::warn!("issue opening preexisting shmem at {:?}: {e}. Removing the link file and recreating.", shmem_file.as_ref())
-                }) else {
-                    let _ = std::fs::remove_file(&shmem_file);
-                    return Self::create_or_open_shared(shmem_file, len, typ);
-                };
-                if let Err(e) = unsafe { (&*v).validate(len) } {
-                    tracing::error!(
-                        "issue with preexisting shmem at {:?}: {e}. Removing the link file and recreating. Should probably upgrade and reaattach any other processes.",
-                        shmem_file.as_ref()
-                    );
-                    let _ = std::fs::remove_file(&shmem_file);
-                    return Self::create_or_open_shared(shmem_file, len, typ);
-                }
-                v
-            }
-            Err(e) => panic!("{e}"),
+        let (ptr, is_new, _) = shmem_map_create_or_open(shmem_file.as_ref(), Self::size_of(len));
+        if is_new {
+            return Self::from_uninitialized_ptr(ptr, len, typ);
         }
+        let Ok(v) = Self::open_initialized(ptr, len).inspect_err(|e| {
+            tracing::error!(
+                "issue with preexisting shmem at {:?}: {e}. Removing and recreating. Should probably upgrade and reattach any other processes.",
+                shmem_file.as_ref()
+            );
+        }) else {
+            let _ = std::fs::remove_file(shmem_file.as_ref());
+            return Self::create_or_open_shared(shmem_file, len, typ);
+        };
+        v
     }
 
     fn open_shared<S: AsRef<Path>>(shmem_file: S) -> Result<*const Self, QueueError> {
-        if !shmem_file.as_ref().exists() {
+        let path = shmem_file.as_ref();
+        if !path.exists() {
             return Err(QueueError::NonExistingFile);
         }
+        let shmem = ShmemConf::new().flink(path).open()?;
+        let ptr = shmem.as_ptr();
+        std::mem::forget(shmem);
+        // len=0: skip floor check, still validates elsize + poisoned slots.
+        Self::open_initialized(ptr, 0)
+    }
+
+    // Wait for the queue at `ptr` to finish initialising, then validate it.
+    fn open_initialized(ptr: *mut u8, len: usize) -> Result<*const Self, QueueError> {
+        let header = ptr as *mut QueueHeader;
         let mut tries = 0;
-        let mut header = QueueHeader::open_shared(shmem_file.as_ref())?;
-        while !header.is_initialized() {
-            // This is to handle the case where two people are trying to initialize the same
-            // queue
+        while unsafe { !(*header).is_initialized() } {
             std::thread::sleep(std::time::Duration::from_millis(1));
-            header = QueueHeader::open_shared(shmem_file.as_ref())?;
+            tries += 1;
             if tries == 10 {
                 return Err(QueueError::UnInitialized);
             }
-            tries += 1;
         }
-        Self::from_initialized_ptr(header)
+        let v = Self::from_initialized_ptr(header)?;
+        unsafe { (&*v).validate(len) }?;
+        Ok(v)
     }
 }
 
@@ -459,6 +479,24 @@ impl<T: Copy> Queue<T> {
             inner: InnerQueue::open_shared(shmem_file)
                 .expect("Couldn't open shared queue, was it initialized?"),
         }
+    }
+
+    /// Size in bytes of the queue region for `len` slots
+    pub(crate) fn byte_size(len: usize) -> usize {
+        InnerQueue::<T>::size_of(len)
+    }
+
+    /// Initialise a new queue at a pre-mapped pointer. The caller owns the
+    /// mapping.
+    pub(crate) fn from_raw_init(ptr: *mut u8, len: usize, typ: QueueType) -> Self {
+        Self { inner: InnerQueue::from_uninitialized_ptr(ptr, len, typ) }
+    }
+
+    /// Open an existing queue at a pre-mapped pointer. Waits for init and
+    /// validates element size + length.
+    pub(crate) fn from_raw_open(ptr: *mut u8, len: usize) -> Result<Self, QueueError> {
+        let inner = InnerQueue::<T>::open_initialized(ptr, len)?;
+        Ok(Self { inner })
     }
 
     fn group_cursor(&self, key: &str) -> *const AtomicUsize {
@@ -510,6 +548,7 @@ impl<T: Copy> From<Queue<T>> for Producer<T> {
 }
 
 impl<T: Copy> Producer<T> {
+    #[inline]
     pub fn produce(&mut self, msg: &T) -> usize {
         if self.produced_first == 0 {
             self.produced_first = 1;
@@ -519,6 +558,7 @@ impl<T: Copy> Producer<T> {
         }
     }
 
+    #[inline]
     pub fn produce_without_first(&self, msg: &T) -> usize {
         self.queue.produce(msg)
     }
