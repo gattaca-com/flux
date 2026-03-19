@@ -133,7 +133,16 @@ where
         queue::Queue::from_raw_init(ptr, real_len, typ)
     } else {
         match queue::Queue::<T>::from_raw_open(ptr, real_len) {
-            Ok(q) => q,
+            Ok(q) if q.n_slots() == real_len => q,
+            Ok(q) => {
+                tracing::error!(
+                    "queue at {flink_path:?} has {} slots, expected {real_len}; \
+                     queue_len changed — removing and recreating.",
+                    q.n_slots()
+                );
+                let _ = std::fs::remove_file(&flink_path);
+                return shmem_queue_dcache_with_base_dir(base_dir, app_name, queue_len, mtu, typ);
+            }
             Err(e) => {
                 tracing::error!("invalid queue at {:?}: {e}. Removing and recreating.", flink_path);
                 let _ = std::fs::remove_file(&flink_path);
