@@ -8,7 +8,7 @@ mod thread;
 mod vsync;
 
 pub use arrayvec::{ArrayStr, ArrayVec};
-pub use dcache::{DCache, DCacheError, DCacheRef, DcachePtr};
+pub use dcache::{DCache, DCacheError, DCachePtr, DCacheRef};
 pub use namespace::{ShortTypename, short_typename};
 pub use shared_vector::SharedVector;
 pub use thread::{ThreadPriority, thread_boot};

@@ -1,7 +1,7 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::{DCacheRef, DcachePtr, short_typename};
+use flux_utils::{DCachePtr, DCacheRef, short_typename};
 
 use crate::{
     Timer,
@@ -24,15 +24,28 @@ pub enum DCacheRead<T, R> {
     Lost(T),
 }
 
-pub trait WithDCacheRef {
-    fn get_ref(&self) -> Option<DCacheRef>;
+/// Queue element wrapper for dcache-backed queues. Produced by
+/// [`SpineProducerWithDCache`]; never constructed directly by users.
+///
+/// `DCacheRef` is private — it is meaningless without the seqlock epoch
+/// check performed inside the consume path.
+#[derive(Clone, Copy, Debug)]
+pub struct DCacheMsg<T> {
+    pub data: T,
+    dref: Option<DCacheRef>,
+}
+
+impl<T: Copy> DCacheMsg<T> {
+    pub(crate) fn new(data: T, dref: Option<DCacheRef>) -> Self {
+        Self { data, dref }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct SpineConsumer<T: 'static + Copy> {
     timer: Timer,
     pub inner: queue::Consumer<InternalMessage<T>>,
-    dcache: Option<DcachePtr>,
+    dcache: Option<DCachePtr>,
 }
 
 impl<T: 'static + Copy> Deref for SpineConsumer<T> {
@@ -217,16 +230,16 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     }
 }
 
-impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
+impl<T: 'static + Copy> SpineConsumer<DCacheMsg<T>> {
     #[inline]
     pub fn consume_with_dcache<R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
     where
         F: FnMut(&[u8]) -> R,
     {
         match self.consume_with_dcache_internal_message(|_msg, payload| read(payload)) {
-            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((*msg.data(), r)),
-            DCacheRead::Lost(msg) => DCacheRead::Lost(*msg.data()),
-            DCacheRead::NoRef(msg) => DCacheRead::NoRef(*msg.data()),
+            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
+            DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
+            DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
             DCacheRead::Empty => DCacheRead::Empty,
             DCacheRead::SpedPast => DCacheRead::SpedPast,
         }
@@ -237,12 +250,12 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
     where
         F: FnMut(T, &[u8]) -> R,
     {
-        match self.consume_with_dcache_collaborative_internal_message(|msg, payload| {
-            read(*msg.data(), payload)
-        }) {
-            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((*msg.data(), r)),
-            DCacheRead::Lost(msg) => DCacheRead::Lost(*msg.data()),
-            DCacheRead::NoRef(msg) => DCacheRead::NoRef(*msg.data()),
+        match self
+            .consume_with_dcache_collaborative_internal_message(|msg, payload| read(**msg, payload))
+        {
+            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
+            DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
+            DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
             DCacheRead::Empty => DCacheRead::Empty,
             DCacheRead::SpedPast => DCacheRead::SpedPast,
         }
@@ -258,19 +271,20 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
     {
         match self.inner.try_consume_with_epoch_collaborative() {
             Ok((&msg, slot_pos, slot_ver)) => {
-                let Some(dref) = msg.data().get_ref() else {
-                    return DCacheRead::NoRef(msg);
+                let Some(dref) = msg.data().dref else {
+                    return DCacheRead::NoRef(msg.with_data(msg.data().data));
                 };
                 let Some(dc) = self.dcache else {
-                    return DCacheRead::NoRef(msg);
+                    return DCacheRead::NoRef(msg.with_data(msg.data().data));
                 };
-                let Ok(extracted) = dc.map(dref, |payload| read(&msg, payload)) else {
-                    return DCacheRead::Lost(msg);
+                let user_msg = msg.with_data(msg.data().data);
+                let Ok(extracted) = dc.map(dref, |payload| read(&user_msg, payload)) else {
+                    return DCacheRead::Lost(user_msg);
                 };
                 if self.inner.slot_version(slot_pos) != slot_ver {
-                    return DCacheRead::Lost(msg);
+                    return DCacheRead::Lost(user_msg);
                 }
-                DCacheRead::Ok((msg, extracted))
+                DCacheRead::Ok((user_msg, extracted))
             }
             Err(ReadError::SpedPast) => {
                 self.inner.recover_collaborative_after_error();
@@ -291,19 +305,20 @@ impl<T: 'static + Copy + WithDCacheRef> SpineConsumer<T> {
         loop {
             match self.inner.try_consume_with_epoch() {
                 Ok((&msg, slot_pos, slot_ver)) => {
-                    let Some(dref) = msg.data().get_ref() else {
-                        return DCacheRead::NoRef(msg);
+                    let Some(dref) = msg.data().dref else {
+                        return DCacheRead::NoRef(msg.with_data(msg.data().data));
                     };
                     let Some(dc) = self.dcache else {
-                        return DCacheRead::NoRef(msg);
+                        return DCacheRead::NoRef(msg.with_data(msg.data().data));
                     };
-                    let Ok(extracted) = dc.map(dref, |payload| read(&msg, payload)) else {
-                        return DCacheRead::Lost(msg);
+                    let user_msg = msg.with_data(msg.data().data);
+                    let Ok(extracted) = dc.map(dref, |payload| read(&user_msg, payload)) else {
+                        return DCacheRead::Lost(user_msg);
                     };
                     if self.inner.slot_version(slot_pos) != slot_ver {
-                        return DCacheRead::Lost(msg);
+                        return DCacheRead::Lost(user_msg);
                     }
-                    return DCacheRead::Ok((msg, extracted));
+                    return DCacheRead::Ok((user_msg, extracted));
                 }
                 Err(ReadError::SpedPast) => {
                     self.inner.recover_after_error();
@@ -338,7 +353,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
         base_dir: D,
         tile: &Tl,
         queue: SpineQueue<T>,
-        dcache: DcachePtr,
+        dcache: DCachePtr,
     ) -> Self
     where
         D: AsRef<Path>,

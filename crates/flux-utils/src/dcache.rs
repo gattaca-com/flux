@@ -171,18 +171,19 @@ impl DCache {
 }
 
 #[derive(Clone, Copy)]
-pub struct DcachePtr(*const DCache);
+pub struct DCachePtr(*const DCache);
 
-unsafe impl Send for DcachePtr {}
-unsafe impl Sync for DcachePtr {}
+unsafe impl Send for DCachePtr {}
+unsafe impl Sync for DCachePtr {}
 
-impl DcachePtr {
+impl DCachePtr {
+    #[allow(clippy::missing_safety_doc)]
     pub unsafe fn from_raw(ptr: *const DCache) -> Self {
         Self(ptr)
     }
 }
 
-impl std::ops::Deref for DcachePtr {
+impl std::ops::Deref for DCachePtr {
     type Target = DCache;
 
     fn deref(&self) -> &DCache {
@@ -190,9 +191,9 @@ impl std::ops::Deref for DcachePtr {
     }
 }
 
-impl std::fmt::Debug for DcachePtr {
+impl std::fmt::Debug for DCachePtr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DcachePtr({:p})", self.0)
+        write!(f, "DCachePtr({:p})", self.0)
     }
 }
 

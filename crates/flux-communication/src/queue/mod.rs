@@ -548,6 +548,7 @@ impl<T: Copy> From<Queue<T>> for Producer<T> {
 }
 
 impl<T: Copy> Producer<T> {
+    #[inline]
     pub fn produce(&mut self, msg: &T) -> usize {
         if self.produced_first == 0 {
             self.produced_first = 1;
@@ -557,6 +558,7 @@ impl<T: Copy> Producer<T> {
         }
     }
 
+    #[inline]
     pub fn produce_without_first(&self, msg: &T) -> usize {
         self.queue.produce(msg)
     }

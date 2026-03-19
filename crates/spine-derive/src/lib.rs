@@ -170,56 +170,124 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             message_types.push(quote! {
                 ::flux::utils::short_typename::<#inner_ty>().to_string()
             });
-            // --------------------------------- standard impls
-            as_ref_impls.push(quote! {
-                impl AsRef<::flux::spine::SpineProducer<#inner_ty>> for #producers_ident {
-                    fn as_ref(&self)->&::flux::spine::SpineProducer<#inner_ty>{ &self.#field_ident }
-                }
-            });
 
-            spine_as_ref_impls.push(quote! {
-                impl AsRef<::flux::spine::SpineQueue<#inner_ty>> for #struct_ident {
-                    fn as_ref(&self) -> &::flux::spine::SpineQueue<#inner_ty> { &self.#field_ident }
-                }
-            });
-
-            as_mut_impls.push(quote! {
-                impl AsMut<::flux::spine::SpineConsumer<#inner_ty>> for #consumers_ident {
-                    fn as_mut(&mut self)->&mut ::flux::spine::SpineConsumer<#inner_ty>{
-                        &mut self.#field_ident
-                    }
-                }
-            });
-
-            as_mut_impls.push(quote! {
-                impl AsRef<::flux::spine::SpineConsumer<#inner_ty>> for #consumers_ident {
-                    fn as_ref(&self)->&::flux::spine::SpineConsumer<#inner_ty>{
-                        &self.#field_ident
-                    }
-                }
-            });
-
-            // struct field lists
-            consumer_fields
-                .push(quote! { pub #field_ident : ::flux::spine::SpineConsumer<#inner_ty> });
-            producer_fields
-                .push(quote! { pub #field_ident : ::flux::spine::SpineProducer<#inner_ty> });
             let (is_persistent, _size_expr_opt, _is_spmc, mtu_expr) =
                 get_queue_config(&field.attrs);
+
             if mtu_expr.is_some() {
+                // ── dcache-backed queue ───────────────────────────────────
                 let dcache_ident = format_ident!("{}_dcache", field_ident);
+
+                consumer_fields.push(quote! {
+                    pub #field_ident : ::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>>
+                });
+                producer_fields.push(quote! {
+                    pub #field_ident : ::flux::spine::SpineProducerWithDCache<#inner_ty>
+                });
+
                 consumer_init.push(quote! {
-                    #field_ident : ::flux::spine::SpineConsumer::attach_with_dcache::<_, #struct_ident, _>(&spine.base_dir, tile, spine.#field_ident, spine.#dcache_ident)
+                    #field_ident : ::flux::spine::SpineConsumer::attach_with_dcache::<_, #struct_ident, _>(
+                        &spine.base_dir, tile, spine.#field_ident, spine.#dcache_ident)
+                });
+                producer_init.push(quote! {
+                    #field_ident : ::flux::spine::SpineProducerWithDCache::new(
+                        spine.#field_ident, spine.#dcache_ident)
+                });
+
+                as_ref_impls.push(quote! {
+                    impl AsRef<::flux::spine::SpineProducer<::flux::spine::DCacheMsg<#inner_ty>>>
+                        for #producers_ident
+                    {
+                        fn as_ref(&self) -> &::flux::spine::SpineProducer<::flux::spine::DCacheMsg<#inner_ty>> {
+                            self.#field_ident.as_ref()
+                        }
+                    }
+                    impl AsMut<::flux::spine::SpineProducerWithDCache<#inner_ty>>
+                        for #producers_ident
+                    {
+                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineProducerWithDCache<#inner_ty> {
+                            &mut self.#field_ident
+                        }
+                    }
+                });
+
+                as_mut_impls.push(quote! {
+                    impl AsMut<::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>>>
+                        for #consumers_ident
+                    {
+                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>> {
+                            &mut self.#field_ident
+                        }
+                    }
+                    impl AsRef<::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>>>
+                        for #consumers_ident
+                    {
+                        fn as_ref(&self) -> &::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>> {
+                            &self.#field_ident
+                        }
+                    }
+                });
+
+                spine_as_ref_impls.push(quote! {
+                    impl AsRef<::flux::spine::SpineQueue<::flux::spine::DCacheMsg<#inner_ty>>>
+                        for #struct_ident
+                    {
+                        fn as_ref(&self) -> &::flux::spine::SpineQueue<::flux::spine::DCacheMsg<#inner_ty>> {
+                            &self.#field_ident
+                        }
+                    }
+                    impl ::flux::spine::HasDCacheQueue<#inner_ty> for #struct_ident {
+                        fn dcache_queue_and_ptr(
+                            &self,
+                        ) -> (
+                            ::flux::spine::SpineQueue<::flux::spine::DCacheMsg<#inner_ty>>,
+                            ::flux::utils::DCachePtr,
+                        ) {
+                            (self.#field_ident, self.#dcache_ident)
+                        }
+                    }
                 });
             } else {
+                // ── standard queue ────────────────────────────────────────
+                consumer_fields
+                    .push(quote! { pub #field_ident : ::flux::spine::SpineConsumer<#inner_ty> });
+                producer_fields
+                    .push(quote! { pub #field_ident : ::flux::spine::SpineProducer<#inner_ty> });
+
                 consumer_init.push(quote! {
-                    #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(&spine.base_dir, tile, spine.#field_ident)
+                    #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(
+                        &spine.base_dir, tile, spine.#field_ident)
+                });
+                producer_init.push(quote! {
+                    #field_ident : ::flux::communication::queue::Producer::from(spine.#field_ident)
+                });
+
+                as_ref_impls.push(quote! {
+                    impl AsRef<::flux::spine::SpineProducer<#inner_ty>> for #producers_ident {
+                        fn as_ref(&self)->&::flux::spine::SpineProducer<#inner_ty>{ &self.#field_ident }
+                    }
+                });
+
+                spine_as_ref_impls.push(quote! {
+                    impl AsRef<::flux::spine::SpineQueue<#inner_ty>> for #struct_ident {
+                        fn as_ref(&self) -> &::flux::spine::SpineQueue<#inner_ty> { &self.#field_ident }
+                    }
+                });
+
+                as_mut_impls.push(quote! {
+                    impl AsMut<::flux::spine::SpineConsumer<#inner_ty>> for #consumers_ident {
+                        fn as_mut(&mut self)->&mut ::flux::spine::SpineConsumer<#inner_ty>{
+                            &mut self.#field_ident
+                        }
+                    }
+                    impl AsRef<::flux::spine::SpineConsumer<#inner_ty>> for #consumers_ident {
+                        fn as_ref(&self)->&::flux::spine::SpineConsumer<#inner_ty>{
+                            &self.#field_ident
+                        }
+                    }
                 });
             }
-            producer_init.push(quote! { #field_ident : ::flux::communication::queue::Producer::from(spine.#field_ident) });
 
-            // ------------------------ NEW: only if #[persist] or needs size for
-            // PersistingQueueTile
             if is_persistent {
                 persisting.push(quote! {
                                 let last_core = ::flux::core_affinity::get_core_ids().unwrap().last().unwrap().id;
@@ -319,7 +387,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Reconstruct the input struct without #[queue] attributes on its fields.
-    // For SpineQueue fields with `mtu`, also inject a `{field}_dcache: DcachePtr`
+    // For SpineQueue fields with `mtu`, also inject a `{field}_dcache: DCachePtr`
     // field.
     let input_attrs = &input.attrs;
     let vis = &input.vis;
@@ -335,16 +403,28 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let ident = &f.ident;
                 let colon_token = &f.colon_token;
                 let ty = &f.ty;
-                all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #ty });
-                // Inject dcache handle field directly after its queue field.
-                if let Type::Path(tp) = ty {
-                    if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
-                        let (_, _, _, mtu_opt) = get_queue_config(&f.attrs);
-                        if mtu_opt.is_some() {
-                            let dcache_ident = format_ident!("{}_dcache", ident.as_ref().unwrap());
-                            all_fields.push(quote! { #dcache_ident: ::flux::utils::DcachePtr });
-                        }
+
+                // For dcache queue fields, rewrite SpineQueue<T> → SpineQueue<DCacheMsg<T>>
+                // and inject the private dcache handle field immediately after.
+                if let Type::Path(tp) = ty &&
+                    tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") &&
+                    let PathArguments::AngleBracketed(ref targs) =
+                        tp.path.segments.last().unwrap().arguments &&
+                    let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
+                {
+                    let (_, _, _, mtu_opt) = get_queue_config(&f.attrs);
+                    if mtu_opt.is_some() {
+                        let dcache_ident = format_ident!("{}_dcache", ident.as_ref().unwrap());
+                        let new_ty = quote! {
+                            ::flux::spine::SpineQueue<::flux::spine::DCacheMsg<#inner_ty>>
+                        };
+                        all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #new_ty });
+                        all_fields.push(quote! { #dcache_ident: ::flux::utils::DCachePtr });
+                    } else {
+                        all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #ty });
                     }
+                } else {
+                    all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #ty });
                 }
             }
             all_fields.push(quote! { base_dir: std::path::PathBuf });

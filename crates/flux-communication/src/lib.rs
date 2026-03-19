@@ -12,7 +12,7 @@ pub use array::SeqlockArray;
 pub use cleanup::{cleanup_flink, cleanup_shmem, is_pid_alive};
 pub use error::{EmptyError, QueueError, ReadError};
 use flux_utils::{
-    DCache, DcachePtr,
+    DCache, DCachePtr,
     directories::{
         local_share_dir, shmem_dir_arrays_with_base, shmem_dir_queues, shmem_dir_queues_with_base,
     },
@@ -100,7 +100,7 @@ pub fn shmem_queue_dcache_with_base_dir<D, S, T>(
     queue_len: usize,
     mtu: usize,
     typ: queue::QueueType,
-) -> (queue::Queue<T>, DcachePtr)
+) -> (queue::Queue<T>, DCachePtr)
 where
     D: AsRef<Path>,
     S: AsRef<Path>,
@@ -132,7 +132,7 @@ where
     };
 
     let dcache_ptr = unsafe { ptr.add(queue_bytes_aligned) };
-    let dc = unsafe { DcachePtr::from_raw(DCache::from_ptr(dcache_ptr, dcache_cap)) };
+    let dc = unsafe { DCachePtr::from_raw(DCache::from_ptr(dcache_ptr, dcache_cap)) };
 
     (q, dc)
 }
