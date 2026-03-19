@@ -231,9 +231,9 @@ impl<T: 'static + Copy> SpineConsumer<DCacheMsg<T>> {
     #[inline]
     pub fn consume_with_dcache<R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
     where
-        F: FnMut(&[u8]) -> R,
+        F: FnMut(T, &[u8]) -> R,
     {
-        match self.consume_with_dcache_internal_message(|_msg, payload| read(payload)) {
+        match self.consume_with_dcache_internal_message(|msg, payload| read(**msg, payload)) {
             DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
             DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
             DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),

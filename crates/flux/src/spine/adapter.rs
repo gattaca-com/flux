@@ -210,7 +210,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineConsumer<DCacheMsg<T>>>,
-        F: FnMut(&[u8]) -> R,
+        F: FnMut(T, &[u8]) -> R,
     {
         let c: &mut SpineConsumer<DCacheMsg<T>> = self.consumers.as_mut();
         let result = c.consume_with_dcache(&mut read);
