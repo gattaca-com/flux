@@ -206,7 +206,7 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     const fn size_of(len: usize) -> usize {
-        size_of::<QueueHeader>() + len.next_power_of_two() * size_of::<Seqlock<T>>()
+        size_of::<QueueHeader>() + len * size_of::<Seqlock<T>>()
     }
 
     fn from_uninitialized_ptr(ptr: *mut u8, len: usize, queue_type: QueueType) -> *const Self {

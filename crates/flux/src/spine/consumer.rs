@@ -32,12 +32,12 @@ pub enum DCacheRead<T, R> {
 #[derive(Clone, Copy, Debug)]
 pub struct DCacheMsg<T> {
     pub data: T,
-    dref: Option<DCacheRef>,
+    dref: DCacheRef,
 }
 
 impl<T: Copy> DCacheMsg<T> {
     pub(crate) fn new(data: T, dref: Option<DCacheRef>) -> Self {
-        Self { data, dref }
+        Self { data, dref: dref.unwrap_or(DCacheRef::NONE) }
     }
 }
 
@@ -271,9 +271,10 @@ impl<T: 'static + Copy> SpineConsumer<DCacheMsg<T>> {
     {
         match self.inner.try_consume_with_epoch_collaborative() {
             Ok((&msg, slot_pos, slot_ver)) => {
-                let Some(dref) = msg.data().dref else {
+                let dref = msg.data().dref;
+                if dref.is_none() {
                     return DCacheRead::NoRef(msg.with_data(msg.data().data));
-                };
+                }
                 let Some(dc) = self.dcache else {
                     return DCacheRead::NoRef(msg.with_data(msg.data().data));
                 };
@@ -305,9 +306,10 @@ impl<T: 'static + Copy> SpineConsumer<DCacheMsg<T>> {
         loop {
             match self.inner.try_consume_with_epoch() {
                 Ok((&msg, slot_pos, slot_ver)) => {
-                    let Some(dref) = msg.data().dref else {
+                    let dref = msg.data().dref;
+                    if dref.is_none() {
                         return DCacheRead::NoRef(msg.with_data(msg.data().data));
-                    };
+                    }
                     let Some(dc) = self.dcache else {
                         return DCacheRead::NoRef(msg.with_data(msg.data().data));
                     };

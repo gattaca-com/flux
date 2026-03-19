@@ -14,6 +14,15 @@ pub struct DCacheRef {
     pub len: usize,
 }
 
+impl DCacheRef {
+    pub const NONE: Self = Self { offset: 0, len: 0 };
+
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.len == 0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DCacheError {
     #[error("data length {0} exceeds capacity {1}")]
@@ -58,6 +67,7 @@ impl DCache {
     }
 
     pub fn from_ptr(ptr: *mut u8, n: usize) -> *const Self {
+        assert!(n.is_power_of_two() && n.is_multiple_of(CACHELINE));
         std::ptr::slice_from_raw_parts_mut(ptr, n) as *const Self
     }
 
@@ -87,7 +97,7 @@ impl DCache {
     #[inline]
     pub fn reserve(&self, len: usize) -> Result<DCacheRef, DCacheError> {
         let n = self.capacity();
-        if len > n {
+        if len == 0 || len > n {
             return Err(DCacheError::DataLenExceedsCapacity(len, n));
         }
 
