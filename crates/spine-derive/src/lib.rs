@@ -210,11 +210,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                             self.#field_ident.as_ref()
                         }
                     }
-                    impl AsMut<::flux::spine::SpineProducerWithDCache<#inner_ty>>
+                    impl AsRef<::flux::spine::SpineProducerWithDCache<#inner_ty>>
                         for #producers_ident
                     {
-                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineProducerWithDCache<#inner_ty> {
-                            &mut self.#field_ident
+                        fn as_ref(&self) -> &::flux::spine::SpineProducerWithDCache<#inner_ty> {
+                            &self.#field_ident
                         }
                     }
                 });

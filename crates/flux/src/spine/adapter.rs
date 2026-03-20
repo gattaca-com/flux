@@ -101,7 +101,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     pub fn produce_with_dcache<T, F>(&mut self, data: T, payload: Option<(usize, F)>)
     where
         T: 'static + Copy,
-        S::Producers: SpineProducers + AsMut<SpineProducerWithDCache<T>>,
+        S::Producers: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: FnOnce(&mut [u8]),
     {
         self.producers.produce_with_dcache(data, payload);

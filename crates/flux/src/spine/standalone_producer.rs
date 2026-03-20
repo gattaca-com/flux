@@ -1,7 +1,7 @@
-use flux_timing::{TrackingTimestamp, UNREGISTERED_TILE_ID};
+use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
 use flux_utils::DCachePtr;
 
-use super::{DCacheMsg, SpineProducer, SpineProducerWithDCache, SpineProducers, SpineQueue};
+use super::{DCacheMsg, SpineProducer, SpineProducerWithDCache, SpineQueue};
 use crate::communication::queue;
 
 #[derive(Debug)]
@@ -14,27 +14,10 @@ impl<T: 'static + Copy> StandaloneProducer<T> {
     pub(super) fn new(queue: SpineQueue<T>, tile_id: u16) -> Self {
         Self { producer: queue::Producer::from(queue), timestamp: TrackingTimestamp::new(tile_id) }
     }
-}
 
-impl<T: 'static + Copy> SpineProducers for StandaloneProducer<T> {
-    fn timestamp(&self) -> &TrackingTimestamp {
-        &self.timestamp
-    }
-
-    fn timestamp_mut(&mut self) -> &mut TrackingTimestamp {
-        &mut self.timestamp
-    }
-}
-
-impl<T: 'static + Copy> AsRef<SpineProducer<T>> for StandaloneProducer<T> {
-    fn as_ref(&self) -> &SpineProducer<T> {
-        &self.producer
-    }
-}
-
-impl<T: 'static + Copy> From<SpineQueue<T>> for StandaloneProducer<T> {
-    fn from(queue: SpineQueue<T>) -> Self {
-        Self::new(queue, UNREGISTERED_TILE_ID)
+    pub fn produce_with_ingestion(&self, d: T, ingestion_t: IngestionTime) {
+        let msg = InternalMessage::new(self.timestamp.with_ingestion_t(ingestion_t), d);
+        self.producer.produce_without_first(&msg);
     }
 }
 
@@ -51,26 +34,17 @@ impl<T: 'static + Copy> StandaloneDCacheProducer<T> {
             timestamp: TrackingTimestamp::new(tile_id),
         }
     }
-}
 
-impl<T: 'static + Copy> SpineProducers for StandaloneDCacheProducer<T> {
-    fn timestamp(&self) -> &TrackingTimestamp {
-        &self.timestamp
-    }
-
-    fn timestamp_mut(&mut self) -> &mut TrackingTimestamp {
-        &mut self.timestamp
-    }
-}
-
-impl<T: 'static + Copy> AsRef<SpineProducer<DCacheMsg<T>>> for StandaloneDCacheProducer<T> {
-    fn as_ref(&self) -> &SpineProducer<DCacheMsg<T>> {
-        self.inner.as_ref()
-    }
-}
-
-impl<T: 'static + Copy> AsMut<SpineProducerWithDCache<T>> for StandaloneDCacheProducer<T> {
-    fn as_mut(&mut self) -> &mut SpineProducerWithDCache<T> {
-        &mut self.inner
+    pub fn produce_with_dcache_and_ingestion<F: FnOnce(&mut [u8])>(
+        &self,
+        data: T,
+        payload: Option<(usize, F)>,
+        ingestion_t: IngestionTime,
+    ) {
+        let ts = self.timestamp.with_ingestion_t(ingestion_t);
+        let dref =
+            payload.map(|(len, write)| self.inner.dcache.write(len, write).expect("dcache write"));
+        let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
+        self.inner.inner.produce_without_first(&msg);
     }
 }

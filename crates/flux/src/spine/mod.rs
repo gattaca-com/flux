@@ -72,14 +72,14 @@ pub trait SpineProducers {
     }
 
     fn produce_with_dcache<T: 'static + Copy, F: FnOnce(&mut [u8])>(
-        &mut self,
+        &self,
         data: T,
         payload: Option<(usize, F)>,
     ) where
-        Self: AsMut<SpineProducerWithDCache<T>>,
+        Self: AsRef<SpineProducerWithDCache<T>>,
     {
         let ts = self.timestamp().with_new_publish_delta();
-        let p: &mut SpineProducerWithDCache<T> = self.as_mut();
+        let p: &SpineProducerWithDCache<T> = self.as_ref();
         let dref =
             payload.map(|(len, write)| p.dcache.write(len, write).expect("dcache write failed"));
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
@@ -87,15 +87,15 @@ pub trait SpineProducers {
     }
 
     fn produce_with_dcache_and_ingestion<T: 'static + Copy, F: FnOnce(&mut [u8])>(
-        &mut self,
+        &self,
         data: T,
         payload: Option<(usize, F)>,
         ingestion_t: IngestionTime,
     ) where
-        Self: AsMut<SpineProducerWithDCache<T>>,
+        Self: AsRef<SpineProducerWithDCache<T>>,
     {
         let ts = self.timestamp().with_ingestion_t(ingestion_t);
-        let p: &mut SpineProducerWithDCache<T> = self.as_mut();
+        let p: &SpineProducerWithDCache<T> = self.as_ref();
         let dref =
             payload.map(|(len, write)| p.dcache.write(len, write).expect("dcache write failed"));
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
