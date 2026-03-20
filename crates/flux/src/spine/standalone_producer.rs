@@ -35,7 +35,7 @@ impl<T: 'static + Copy> StandaloneDCacheProducer<T> {
         }
     }
 
-    pub fn produce_with_dcache_and_ingestion<F: FnOnce(&mut [u8])>(
+    pub fn produce_with_ingestion<F: FnOnce(&mut [u8])>(
         &self,
         data: T,
         payload: Option<(usize, F)>,
