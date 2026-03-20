@@ -145,6 +145,7 @@ fn render_single_app_expanded() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             },
             SegmentInfo {
@@ -155,6 +156,7 @@ fn render_single_app_expanded() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             },
         ],
@@ -188,6 +190,7 @@ fn render_collapsed_app_hides_segments() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: false,
@@ -217,6 +220,7 @@ fn render_multiple_apps() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -231,6 +235,7 @@ fn render_multiple_apps() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -260,6 +265,7 @@ fn navigation_next_previous() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -299,6 +305,7 @@ fn toggle_expand_collapse() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             },
             SegmentInfo {
@@ -309,6 +316,7 @@ fn toggle_expand_collapse() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             },
         ],
@@ -450,6 +458,7 @@ fn dead_segment_renders_skull() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -474,6 +483,7 @@ fn enter_on_segment_opens_detail() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -499,6 +509,7 @@ fn detail_view_renders_segment_info() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -531,6 +542,7 @@ fn detail_view_back_returns_to_list() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -557,6 +569,7 @@ fn detail_cleanup_blocked_for_alive() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -586,6 +599,7 @@ fn detail_cleanup_shows_confirm_for_dead() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -621,6 +635,7 @@ fn detail_cancel_cleanup_hides_confirm() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -650,6 +665,7 @@ fn detail_status_bar_shows_cleanup_hint_for_dead() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -681,6 +697,7 @@ fn enter_on_app_header_still_toggles() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -706,6 +723,7 @@ fn list_cleanup_blocked_for_alive_segment() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -731,6 +749,7 @@ fn list_cleanup_blocked_on_app_header() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -756,6 +775,7 @@ fn list_cleanup_shows_confirm_for_dead() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -784,6 +804,7 @@ fn list_cancel_cleanup_hides_confirm() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -810,6 +831,7 @@ fn list_status_bar_shows_cleanup_hint_for_dead() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -835,6 +857,7 @@ fn poisoned_segment_renders_skull_crossbones() {
             queue_capacity: None,
             poison: Some(discovery::PoisonInfo { n_poisoned: 2, first_slot: 5, total_slots: 64 }),
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -858,6 +881,7 @@ fn poisoned_detail_view_shows_poison_info() {
             queue_capacity: None,
             poison: Some(discovery::PoisonInfo { n_poisoned: 3, first_slot: 7, total_slots: 64 }),
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -887,6 +911,7 @@ fn healthy_segment_has_no_poison() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -911,6 +936,7 @@ fn destroy_all_shows_confirm_when_dead_exist() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -938,6 +964,7 @@ fn destroy_all_noop_when_all_alive() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -961,6 +988,7 @@ fn destroy_all_cancel_hides_confirm() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -986,6 +1014,7 @@ fn status_bar_shows_destroy_all_hint() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -1000,6 +1029,7 @@ fn status_bar_shows_destroy_all_hint() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -1113,6 +1143,7 @@ fn home_end_navigation() {
                     queue_capacity: None,
                     poison: None,
                     msgs_per_sec: None,
+                    max_lagger_pct: None,
                     pids: vec![],
                 },
                 SegmentInfo {
@@ -1123,6 +1154,7 @@ fn home_end_navigation() {
                     queue_capacity: None,
                     poison: None,
                     msgs_per_sec: None,
+                    max_lagger_pct: None,
                     pids: vec![],
                 },
             ],
@@ -1138,6 +1170,7 @@ fn home_end_navigation() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -1185,6 +1218,7 @@ fn page_up_page_down_navigation() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -1241,6 +1275,7 @@ fn stress_test_many_entries() {
                     queue_capacity: None,
                     poison: None,
                     msgs_per_sec: None,
+                    max_lagger_pct: None,
                     pids: vec![],
                 })
                 .collect(),
@@ -1286,6 +1321,7 @@ fn filter_mode_input_and_clear() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             },
             SegmentInfo {
@@ -1296,6 +1332,7 @@ fn filter_mode_input_and_clear() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             },
         ],
@@ -1346,6 +1383,7 @@ fn title_bar_shows_segment_and_app_counts() {
                     queue_capacity: None,
                     poison: None,
                     msgs_per_sec: None,
+                    max_lagger_pct: None,
                     pids: vec![],
                 },
                 SegmentInfo {
@@ -1356,6 +1394,7 @@ fn title_bar_shows_segment_and_app_counts() {
                     queue_capacity: None,
                     poison: None,
                     msgs_per_sec: None,
+                    max_lagger_pct: None,
                     pids: vec![],
                 },
             ],
@@ -1371,6 +1410,7 @@ fn title_bar_shows_segment_and_app_counts() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -1407,6 +1447,7 @@ fn empty_with_filter_shows_filter_message() {
             queue_capacity: None,
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -1455,6 +1496,7 @@ fn detail_view_shows_write_pos_bar() {
             queue_capacity: Some(64),
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -1494,6 +1536,7 @@ fn auto_scroll_shows_last_group_at_end() {
                 queue_capacity: None,
                 poison: None,
                 msgs_per_sec: None,
+                max_lagger_pct: None,
                 pids: vec![],
             }],
             expanded: true,
@@ -1536,6 +1579,7 @@ fn d14_render_long_names() {
             queue_capacity: Some(1024),
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -1653,6 +1697,7 @@ fn d15_single_segment() {
             queue_capacity: Some(32),
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -1737,6 +1782,7 @@ fn detail_view_shows_consumer_groups() {
             queue_capacity: Some(1024),
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -1755,16 +1801,25 @@ fn detail_view_shows_consumer_groups() {
             discovery::ConsumerGroupInfo {
                 label: "builder.telemetry.broadcast".into(),
                 cursor: 4990,
+                msgs_per_sec: Some(123.4),
             },
-            discovery::ConsumerGroupInfo { label: "relay.telemetry.collab".into(), cursor: 4800 },
+            discovery::ConsumerGroupInfo {
+                label: "relay.telemetry.collab".into(),
+                cursor: 4800,
+                msgs_per_sec: None,
+            },
             discovery::ConsumerGroupInfo {
                 label: "monitor.metrics.broadcast".into(),
                 cursor: 5000,
+                msgs_per_sec: Some(0.0),
             },
         ],
+        focus: flux_ctl::tui::app::DetailFocus::ConsumerGroups,
+        selected_group: 0,
     });
 
-    let buf = render_to_buffer(&mut app, 120, 40);
+    // Use 200 cols wide so side-by-side panels have room for full labels.
+    let buf = render_to_buffer(&mut app, 200, 40);
     let text = buffer_text(&buf);
 
     // Section header should appear
@@ -1774,6 +1829,19 @@ fn detail_view_shows_consumer_groups() {
     assert!(text.contains("builder.telemetry.broadcast"), "should show first group label:\n{text}");
     assert!(text.contains("relay.telemetry.collab"), "should show second group label:\n{text}");
     assert!(text.contains("monitor.metrics.broadcast"), "should show third group label:\n{text}");
+
+    // Panels should be side-by-side (both on same line)
+    for line in text.lines() {
+        if line.contains("Consumer Groups") && line.contains("Attached Processes") {
+            break;
+        }
+    }
+
+    // msgs/s column header should appear
+    assert!(text.contains("msgs/s"), "should show msgs/s column header:\n{text}");
+
+    // msgs/s values: 123.4 for first group, — for second (None), 0 for third
+    assert!(text.contains("123.4"), "should show msgs/s rate of 123.4:\n{text}");
 
     // Lag values: 5000-4990=10, 5000-4800=200, 5000-5000=0
     assert!(text.contains("10"), "should show lag of 10:\n{text}");
@@ -1792,6 +1860,7 @@ fn detail_view_hides_consumer_groups_when_empty() {
             queue_capacity: Some(512),
             poison: None,
             msgs_per_sec: None,
+            max_lagger_pct: None,
             pids: vec![],
         }],
         expanded: true,
@@ -1807,6 +1876,8 @@ fn detail_view_hides_consumer_groups_when_empty() {
         selected_pid: 0,
         confirm_cleanup: false,
         consumer_groups: vec![],
+        focus: flux_ctl::tui::app::DetailFocus::Processes,
+        selected_group: 0,
     });
 
     let buf = render_to_buffer(&mut app, 120, 30);

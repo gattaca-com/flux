@@ -13,6 +13,39 @@ use crate::{
     discovery::{DiscoveredEntry, ShmemCache},
 };
 
+/// Rolling window (in seconds) over which msgs/s samples are averaged.
+const RATE_SMOOTHING_WINDOW_SECS: f64 = 30.0;
+
+/// Averages raw per-tick msgs/s samples over a [`RATE_SMOOTHING_WINDOW_SECS`]
+/// rolling window so the displayed rate is less jittery.
+struct RateSmoother {
+    /// Per-segment ring of `(timestamp, rate)` samples, keyed by flink path.
+    samples: HashMap<String, VecDeque<(Instant, f64)>>,
+}
+
+impl RateSmoother {
+    fn new() -> Self {
+        Self { samples: HashMap::new() }
+    }
+
+    /// Record a raw msgs/s sample for the segment identified by `key` and
+    /// return the smoothed (averaged) rate over the rolling window.
+    fn record(&mut self, key: &str, rate: f64) -> f64 {
+        let now = Instant::now();
+        let ring = self.samples.entry(key.to_owned()).or_default();
+        ring.push_back((now, rate));
+        // Evict samples older than the window.
+        while ring
+            .front()
+            .is_some_and(|(t, _)| t.elapsed().as_secs() > RATE_SMOOTHING_WINDOW_SECS)
+        {
+            ring.pop_front();
+        }
+        let sum: f64 = ring.iter().map(|(_, r)| r).sum();
+        sum / ring.len() as f64
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
     Name,
@@ -53,6 +86,12 @@ pub struct SegmentInfo {
     pub poison: Option<discovery::PoisonInfo>,
     /// Messages per second computed from delta writes / delta time.
     pub msgs_per_sec: Option<f64>,
+    /// Longest consumer-group lag as a percentage of queue capacity.
+    ///
+    /// Computed as `(writes - min_cursor) / capacity * 100` across all
+    /// registered consumer groups.  Only set for alive Queue segments with
+    /// at least one consumer group.
+    pub max_lagger_pct: Option<f64>,
     /// PIDs attached to this segment's backing shmem (from `/proc` scan).
     pub pids: Vec<u32>,
 }
@@ -69,6 +108,21 @@ pub enum View {
     Detail(DetailState),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailFocus {
+    ConsumerGroups,
+    Processes,
+}
+
+impl DetailFocus {
+    pub fn toggle(self) -> Self {
+        match self {
+            DetailFocus::ConsumerGroups => DetailFocus::Processes,
+            DetailFocus::Processes => DetailFocus::ConsumerGroups,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DetailState {
     pub group_idx: usize,
@@ -77,6 +131,8 @@ pub struct DetailState {
     pub selected_pid: usize,
     pub confirm_cleanup: bool,
     pub consumer_groups: Vec<discovery::ConsumerGroupInfo>,
+    pub focus: DetailFocus,
+    pub selected_group: usize,
 }
 
 /// What the cursor is pointing at in the list view.
@@ -108,9 +164,11 @@ pub struct App {
     pub hide_dead: bool,
     /// Current sort order for segments within each group.
     pub sort_mode: SortMode,
-    /// Rolling (writes, timestamp) history per flink for smoothed msgs/s
-    /// over a 10-second window.
+    /// Rolling (writes, timestamp) history per flink for raw msgs/s
+    /// computation over a 10-second window.
     write_history: HashMap<String, VecDeque<(usize, Instant)>>,
+    /// Smooths raw per-tick msgs/s over a 30-second rolling window.
+    rate_smoother: RateSmoother,
     /// Cached result of scan_proc_fds() with TTL.
     cached_proc_map: HashMap<PathBuf, Vec<u32>>,
     /// Last time proc_map was scanned.
@@ -120,6 +178,9 @@ pub struct App {
     shmem_cache: ShmemCache,
     /// Persistent table state so the viewport offset survives across renders.
     pub table_state: TableState,
+    /// Rolling (cursor, timestamp) history per consumer group for smoothed
+    /// msgs/s over a 10-second window. Key is `{flink}::{group_label}`.
+    consumer_cursor_history: HashMap<String, VecDeque<(usize, Instant)>>,
 }
 
 fn status_msg_duration() -> Duration {
@@ -150,10 +211,12 @@ impl App {
             hide_dead: true,
             sort_mode: SortMode::Name,
             write_history: HashMap::new(),
+            rate_smoother: RateSmoother::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
             table_state: TableState::default().with_selected(0),
+            consumer_cursor_history: HashMap::new(),
         };
         app.refresh();
         app
@@ -178,10 +241,12 @@ impl App {
             hide_dead: true,
             sort_mode: SortMode::Name,
             write_history: HashMap::new(),
+            rate_smoother: RateSmoother::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
             table_state: TableState::default().with_selected(0),
+            consumer_cursor_history: HashMap::new(),
         };
         app.recount_rows();
         app
@@ -262,7 +327,7 @@ impl App {
                     } else {
                         None
                     };
-                    let msgs_per_sec = queue_writes.and_then(|w| {
+                    let raw_rate = queue_writes.and_then(|w| {
                         let flink = e.flink.clone();
                         let now = Instant::now();
                         let history = self.write_history.entry(flink).or_default();
@@ -288,6 +353,33 @@ impl App {
                             None
                         }
                     });
+                    // Smooth the rate over a 30-second rolling window.
+                    // When a segment stops reporting (raw_rate is None) we
+                    // still record 0 so stale non-zero samples are pushed
+                    // out of the window.
+                    let msgs_per_sec = if alive && e.kind == ShmemKind::Queue {
+                        let rate = raw_rate.unwrap_or(0.0);
+                        Some(self.rate_smoother.record(&e.flink, rate))
+                    } else {
+                        raw_rate
+                    };
+                    // Longest consumer-group lag as % of capacity.
+                    let max_lagger_pct = queue_writes.and_then(|writes| {
+                        let capacity = queue_capacity?;
+                        if capacity == 0 {
+                            return None;
+                        }
+                        let groups = self.shmem_cache.consumer_groups(&e.flink);
+                        if groups.is_empty() {
+                            return None;
+                        }
+                        let max_lag = groups
+                            .iter()
+                            .map(|g| writes.saturating_sub(g.cursor))
+                            .max()
+                            .unwrap_or(0);
+                        Some(max_lag as f64 / capacity as f64 * 100.0)
+                    });
                     let pids: Vec<u32> = pids.into_iter().filter(|&p| p != own_pid).collect();
                     SegmentInfo {
                         entry: e.clone(),
@@ -297,6 +389,7 @@ impl App {
                         queue_capacity,
                         poison,
                         msgs_per_sec,
+                        max_lagger_pct,
                         pids,
                     }
                 })
@@ -372,7 +465,32 @@ impl App {
                         seg.poison = discovery::PoisonInfo::check(&seg.entry);
                     }
                     // Refresh consumer groups (cursors move in real-time)
-                    detail.consumer_groups = self.shmem_cache.consumer_groups(&seg.entry.flink);
+                    let mut groups = self.shmem_cache.consumer_groups(&seg.entry.flink);
+                    let now = Instant::now();
+                    for cg in &mut groups {
+                        let key = format!("{}::{}", seg.entry.flink, cg.label);
+                        let history =
+                            self.consumer_cursor_history.entry(key).or_default();
+                        history.push_back((cg.cursor, now));
+                        // Drop entries older than 10 seconds.
+                        while let Some(&(_, t)) = history.front() {
+                            if now.elapsed_since(t).as_secs() > 10.0 {
+                                history.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        if history.len() >= 2 {
+                            let &(oldest_c, oldest_t) = history.front().unwrap();
+                            let &(newest_c, _) = history.back().unwrap();
+                            let dt = now.elapsed_since(oldest_t).as_secs();
+                            if dt > 0.1 && newest_c >= oldest_c {
+                                cg.msgs_per_sec =
+                                    Some((newest_c - oldest_c) as f64 / dt);
+                            }
+                        }
+                    }
+                    detail.consumer_groups = groups;
                 }
                 None => self.view = View::List,
             }
@@ -397,12 +515,20 @@ impl App {
                     self.selected = (self.selected + 1).min(self.total_rows.saturating_sub(1));
                 }
             }
-            View::Detail(detail) => {
-                if !detail.pids.is_empty() {
-                    detail.selected_pid =
-                        (detail.selected_pid + 1).min(detail.pids.len().saturating_sub(1));
+            View::Detail(detail) => match detail.focus {
+                DetailFocus::ConsumerGroups => {
+                    if !detail.consumer_groups.is_empty() {
+                        detail.selected_group = (detail.selected_group + 1)
+                            .min(detail.consumer_groups.len().saturating_sub(1));
+                    }
                 }
-            }
+                DetailFocus::Processes => {
+                    if !detail.pids.is_empty() {
+                        detail.selected_pid =
+                            (detail.selected_pid + 1).min(detail.pids.len().saturating_sub(1));
+                    }
+                }
+            },
         }
     }
 
@@ -411,16 +537,24 @@ impl App {
             View::List => {
                 self.selected = self.selected.saturating_sub(1);
             }
-            View::Detail(detail) => {
-                detail.selected_pid = detail.selected_pid.saturating_sub(1);
-            }
+            View::Detail(detail) => match detail.focus {
+                DetailFocus::ConsumerGroups => {
+                    detail.selected_group = detail.selected_group.saturating_sub(1);
+                }
+                DetailFocus::Processes => {
+                    detail.selected_pid = detail.selected_pid.saturating_sub(1);
+                }
+            },
         }
     }
 
     pub fn home(&mut self) {
         match &mut self.view {
             View::List => self.selected = 0,
-            View::Detail(detail) => detail.selected_pid = 0,
+            View::Detail(detail) => match detail.focus {
+                DetailFocus::ConsumerGroups => detail.selected_group = 0,
+                DetailFocus::Processes => detail.selected_pid = 0,
+            },
         }
     }
 
@@ -431,11 +565,18 @@ impl App {
                     self.selected = self.total_rows - 1;
                 }
             }
-            View::Detail(detail) => {
-                if !detail.pids.is_empty() {
-                    detail.selected_pid = detail.pids.len() - 1;
+            View::Detail(detail) => match detail.focus {
+                DetailFocus::ConsumerGroups => {
+                    if !detail.consumer_groups.is_empty() {
+                        detail.selected_group = detail.consumer_groups.len() - 1;
+                    }
                 }
-            }
+                DetailFocus::Processes => {
+                    if !detail.pids.is_empty() {
+                        detail.selected_pid = detail.pids.len() - 1;
+                    }
+                }
+            },
         }
     }
 
@@ -444,9 +585,14 @@ impl App {
             View::List => {
                 self.selected = self.selected.saturating_sub(10);
             }
-            View::Detail(detail) => {
-                detail.selected_pid = detail.selected_pid.saturating_sub(10);
-            }
+            View::Detail(detail) => match detail.focus {
+                DetailFocus::ConsumerGroups => {
+                    detail.selected_group = detail.selected_group.saturating_sub(10);
+                }
+                DetailFocus::Processes => {
+                    detail.selected_pid = detail.selected_pid.saturating_sub(10);
+                }
+            },
         }
     }
 
@@ -457,12 +603,20 @@ impl App {
                     self.selected = (self.selected + 10).min(self.total_rows.saturating_sub(1));
                 }
             }
-            View::Detail(detail) => {
-                if !detail.pids.is_empty() {
-                    detail.selected_pid =
-                        (detail.selected_pid + 10).min(detail.pids.len().saturating_sub(1));
+            View::Detail(detail) => match detail.focus {
+                DetailFocus::ConsumerGroups => {
+                    if !detail.consumer_groups.is_empty() {
+                        detail.selected_group = (detail.selected_group + 10)
+                            .min(detail.consumer_groups.len().saturating_sub(1));
+                    }
                 }
-            }
+                DetailFocus::Processes => {
+                    if !detail.pids.is_empty() {
+                        detail.selected_pid =
+                            (detail.selected_pid + 10).min(detail.pids.len().saturating_sub(1));
+                    }
+                }
+            },
         }
     }
 
@@ -500,6 +654,11 @@ impl App {
                                 let consumer_groups =
                                     self.shmem_cache.consumer_groups(&segment.entry.flink);
 
+                                let initial_focus = if consumer_groups.is_empty() {
+                                    DetailFocus::Processes
+                                } else {
+                                    DetailFocus::ConsumerGroups
+                                };
                                 self.view = View::Detail(DetailState {
                                     group_idx: gi,
                                     segment_idx: si,
@@ -507,6 +666,8 @@ impl App {
                                     selected_pid: 0,
                                     confirm_cleanup: false,
                                     consumer_groups,
+                                    focus: initial_focus,
+                                    selected_group: 0,
                                 });
                                 return;
                             }
@@ -521,6 +682,7 @@ impl App {
 
     pub fn back(&mut self) {
         if let View::Detail(_) = &self.view {
+            self.consumer_cursor_history.clear();
             self.view = View::List;
         }
     }
@@ -684,6 +846,15 @@ impl App {
         }
     }
 
+    pub fn toggle_detail_focus(&mut self) {
+        if let View::Detail(detail) = &mut self.view {
+            // Only toggle if there are consumer groups to focus on.
+            if !detail.consumer_groups.is_empty() {
+                detail.focus = detail.focus.toggle();
+            }
+        }
+    }
+
     /// Process a key event, returning `true` if the application should quit.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
@@ -775,6 +946,7 @@ impl App {
                 KeyCode::Char('d') => self.request_cleanup(),
                 KeyCode::Char('D') => self.request_cleanup_all(),
                 KeyCode::Char('r') => self.refresh(),
+                KeyCode::Tab => self.toggle_detail_focus(),
                 KeyCode::Up | KeyCode::Char('k') => self.previous(),
                 KeyCode::Down | KeyCode::Char('j') => self.next(),
                 KeyCode::Home | KeyCode::Char('g') => self.home(),
@@ -786,5 +958,51 @@ impl App {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_smoother_single_sample() {
+        let mut s = RateSmoother::new();
+        let rate = s.record("seg_a", 100.0);
+        assert!((rate - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_smoother_averages_multiple_samples() {
+        let mut s = RateSmoother::new();
+        s.record("seg_a", 100.0);
+        s.record("seg_a", 200.0);
+        let avg = s.record("seg_a", 300.0);
+        // (100 + 200 + 300) / 3 = 200
+        assert!((avg - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_smoother_independent_keys() {
+        let mut s = RateSmoother::new();
+        s.record("seg_a", 100.0);
+        s.record("seg_b", 500.0);
+        let a = s.record("seg_a", 200.0);
+        let b = s.record("seg_b", 600.0);
+        // seg_a: (100 + 200) / 2 = 150
+        assert!((a - 150.0).abs() < f64::EPSILON);
+        // seg_b: (500 + 600) / 2 = 550
+        assert!((b - 550.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_smoother_zero_decay() {
+        // Recording 0s should pull the average down.
+        let mut s = RateSmoother::new();
+        s.record("seg_a", 1000.0);
+        s.record("seg_a", 0.0);
+        let avg = s.record("seg_a", 0.0);
+        // (1000 + 0 + 0) / 3 ≈ 333.33
+        assert!((avg - 1000.0 / 3.0).abs() < 0.01);
     }
 }

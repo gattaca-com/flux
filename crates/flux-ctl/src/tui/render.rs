@@ -1,7 +1,7 @@
 use flux_communication::ShmemKind;
 use ratatui::{prelude::*, widgets::*};
 
-use super::app::{App, SelectedItem, View};
+use super::app::{App, DetailFocus, SelectedItem, View};
 use crate::discovery::format_bytes;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -88,7 +88,15 @@ fn render_list(frame: &mut Frame, app: &mut App) {
                             Some(r) => format!(" {:.0}msg/s", r),
                             None => String::new(),
                         };
-                        format!("cap={} elem={}B{}", seg.entry.capacity, seg.entry.elem_size, rate)
+                        let lagger = match seg.max_lagger_pct {
+                            Some(pct) if pct >= 100.0 => " lag:⚠>100%".to_string(),
+                            Some(pct) => format!(" lag:{:.0}%", pct),
+                            None => String::new(),
+                        };
+                        format!(
+                            "cap={} elem={}B{}{}",
+                            seg.entry.capacity, seg.entry.elem_size, rate, lagger
+                        )
                     }
                     _ => format!("size={}B", seg.entry.elem_size),
                 };
@@ -147,35 +155,16 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 fn render_detail(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    let has_groups = matches!(&app.view, View::Detail(d) if !d.consumer_groups.is_empty());
-    let cg_height: u16 = if has_groups {
-        match &app.view {
-            View::Detail(d) => (d.consumer_groups.len() as u16 + 4).min(12),
-            _ => 0,
-        }
-    } else {
-        0
-    };
-
-    let constraints: Vec<Constraint> = if has_groups {
-        vec![
-            Constraint::Length(3),
-            Constraint::Length(14),
-            Constraint::Length(cg_height),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ]
-    } else {
-        vec![
+    // Top-level vertical layout: title | segment info | bottom panels | status bar
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
             Constraint::Length(3),
             Constraint::Length(14),
             Constraint::Min(4),
             Constraint::Length(1),
-        ]
-    };
-
-    let chunks =
-        Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+        ])
+        .split(area);
 
     let seg = app.detail_segment();
     let elapsed = app.last_refresh.elapsed().as_secs_u64();
@@ -194,21 +183,26 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         render_segment_info(frame, &seg, chunks[1]);
     }
 
-    if has_groups {
-        if let View::Detail(ref detail) = app.view {
+    if let View::Detail(ref detail) = app.view {
+        let has_groups = !detail.consumer_groups.is_empty();
+        if has_groups {
+            // Horizontal split: consumer groups (left) | processes (right)
+            let bottom = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[2]);
+
             let seg = app.detail_segment();
             let write_pos = seg.and_then(|s| s.queue_writes);
             let capacity = seg.and_then(|s| s.queue_capacity);
-            render_consumer_groups(frame, detail, write_pos, capacity, chunks[2]);
-            render_pid_table(frame, detail, chunks[3]);
-        }
-        render_status_bar(frame, app, chunks[4]);
-    } else {
-        if let View::Detail(ref detail) = app.view {
+            render_consumer_groups(frame, detail, write_pos, capacity, bottom[0]);
+            render_pid_table(frame, detail, bottom[1]);
+        } else {
             render_pid_table(frame, detail, chunks[2]);
         }
-        render_status_bar(frame, app, chunks[3]);
     }
+
+    render_status_bar(frame, app, chunks[3]);
 }
 
 fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: Rect) {
@@ -340,7 +334,9 @@ fn render_consumer_groups(
     capacity: Option<usize>,
     area: Rect,
 ) {
-    let header = Row::new(vec!["Group", "Cursor", "Lag", "Backlog"])
+    let focused = detail.focus == DetailFocus::ConsumerGroups;
+
+    let header = Row::new(vec!["Group", "Cursor", "msgs/s", "Lag", "Backlog"])
         .style(Style::default().fg(Color::Cyan).bold())
         .bottom_margin(1);
 
@@ -367,6 +363,14 @@ fn render_consumer_groups(
                 }
             };
 
+            let rate_str = match cg.msgs_per_sec {
+                Some(r) if r >= 1_000.0 => format!("{:.1}", r),
+                Some(r) if r >= 1.0 => format!("{:.1}", r),
+                Some(r) if r > 0.0 => format!("{:.2}", r),
+                Some(_) => "0".into(),
+                None => "—".into(),
+            };
+
             // Backlog bar: filled portion = lag / capacity
             let bar = if cap > 0 {
                 let filled = lag
@@ -383,6 +387,7 @@ fn render_consumer_groups(
             Row::new(vec![
                 Cell::from(truncate_str(&cg.label, 40)),
                 Cell::from(format!("{}", cg.cursor)),
+                Cell::from(rate_str),
                 Cell::from(Span::styled(lag_str, lag_style)),
                 Cell::from(bar),
             ])
@@ -390,10 +395,16 @@ fn render_consumer_groups(
         .collect();
 
     let title = format!(" Consumer Groups ({}) ", detail.consumer_groups.len());
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
     let widths = [
-        Constraint::Length(42),
+        Constraint::Percentage(40),
         Constraint::Length(14),
+        Constraint::Length(12),
         Constraint::Length(10),
         Constraint::Min(14),
     ];
@@ -405,14 +416,26 @@ fn render_consumer_groups(
                 .borders(Borders::ALL)
                 .title(title)
                 .title_alignment(Alignment::Left)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(border_style),
         )
-        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        .row_highlight_style(Style::default().bg(Color::DarkGray));
 
-    frame.render_widget(table, area);
+    if focused {
+        let mut state = TableState::default().with_selected(Some(detail.selected_group));
+        frame.render_stateful_widget(table, area, &mut state);
+    } else {
+        frame.render_widget(table, area);
+    }
 }
 
 fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: Rect) {
+    let focused = detail.focus == DetailFocus::Processes;
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
     let header = Row::new(vec!["PID", "Status", "Process", "Command"])
         .style(Style::default().fg(Color::Cyan).bold())
         .bottom_margin(1);
@@ -456,7 +479,7 @@ fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: R
             .borders(Borders::ALL)
             .title(title)
             .title_alignment(Alignment::Left)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(border_style);
         frame.render_widget(Paragraph::new("  No PIDs attached").block(block), area);
     } else {
         let table = Table::new(rows, widths)
@@ -466,12 +489,16 @@ fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: R
                     .borders(Borders::ALL)
                     .title(title)
                     .title_alignment(Alignment::Left)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(border_style),
             )
             .row_highlight_style(Style::default().bg(Color::DarkGray));
 
-        let mut state = TableState::default().with_selected(Some(detail.selected_pid));
-        frame.render_stateful_widget(table, area, &mut state);
+        if focused {
+            let mut state = TableState::default().with_selected(Some(detail.selected_pid));
+            frame.render_stateful_widget(table, area, &mut state);
+        } else {
+            frame.render_widget(table, area);
+        }
     }
 }
 
@@ -588,14 +615,23 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 };
                 format!("{}{}", base, filter_hint)
             }
-            View::Detail(_) => {
+            View::Detail(detail) => {
                 let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
-                let base = match (!alive, has_any_dead) {
-                    (true, _) => " Esc back  d destroy  D destroy all  ? help  q quit",
-                    (false, true) => " Esc back  D destroy all  ? help  q quit",
-                    _ => " Esc back  ? help  q quit",
+                let tab_hint = if !detail.consumer_groups.is_empty() {
+                    "Tab switch panel  "
+                } else {
+                    ""
                 };
-                base.into()
+                let base = match (!alive, has_any_dead) {
+                    (true, _) => format!(
+                        " Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit"
+                    ),
+                    (false, true) => {
+                        format!(" Esc back  {tab_hint}D destroy all  ? help  q quit")
+                    }
+                    _ => format!(" Esc back  {tab_hint}? help  q quit"),
+                };
+                base
             }
         }
     };
@@ -654,6 +690,10 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  a          ", Style::default().fg(Color::Yellow)),
             Span::raw("Toggle show/hide dead segments"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch focus (groups ↔ processes)"),
         ]),
         Line::from(vec![
             Span::styled("  d          ", Style::default().fg(Color::Yellow)),

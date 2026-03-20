@@ -452,6 +452,9 @@ impl QueueStats {
 pub struct ConsumerGroupInfo {
     pub label: String,
     pub cursor: usize,
+    /// Consumption rate (messages per second), computed from cursor deltas over
+    /// time. Populated by the TUI tick loop, not by the initial read.
+    pub msgs_per_sec: Option<f64>,
 }
 
 /// Read consumer groups from a queue's shared memory header.
@@ -475,7 +478,11 @@ pub fn read_consumer_groups(flink: &str) -> Vec<ConsumerGroupInfo> {
     header
         .active_groups()
         .into_iter()
-        .map(|(label, cursor)| ConsumerGroupInfo { label: label.to_owned(), cursor })
+        .map(|(label, cursor)| ConsumerGroupInfo {
+            label: label.to_owned(),
+            cursor,
+            msgs_per_sec: None,
+        })
         .collect()
 }
 /// Format a byte count as a human-readable string using binary units (KiB, MiB,
