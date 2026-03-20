@@ -7,7 +7,6 @@ mod timer;
 
 pub use core_affinity;
 pub use flux_communication as communication;
-pub use flux_network as network;
 pub use flux_timing as timing;
 pub use flux_utils as utils;
 pub use spine_derive;

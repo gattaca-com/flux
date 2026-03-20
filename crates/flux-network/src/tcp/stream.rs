@@ -4,6 +4,7 @@ use std::{
     net::SocketAddr,
 };
 
+use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_communication::Timer;
 use flux_timing::Nanos;
 use flux_utils::{DCache, DCacheRef};
@@ -15,7 +16,7 @@ enum RxBuf {
 use mio::{Interest, Registry, Token, event::Event};
 use tracing::{debug, warn};
 
-pub enum MessagePayload<'a> {
+enum MessagePayload<'a> {
     Raw(&'a [u8]),
     Cached(DCacheRef),
 }
@@ -198,9 +199,9 @@ impl TcpStream {
 
     /// Poll socket and calls `on_msg` for every fully assembled frame.
     ///
-    /// When no DCache is set, `payload` is [`MessagePayload::Raw`] and the
-    /// slice is only valid for the duration of the callback. When DCache is
-    /// set, `payload` is [`MessagePayload::Cached`] and the ref may be kept.
+    /// The byte slice passed to `on_msg` is only valid for the duration of the
+    /// callback. Use with non-dcache connectors; for dcache use
+    /// [`poll_with_produce`].
     #[inline]
     pub fn poll_with<F>(
         &mut self,
@@ -210,13 +211,69 @@ impl TcpStream {
         on_msg: &mut F,
     ) -> ConnState
     where
-        F: for<'a> FnMut(Token, MessagePayload<'a>, Nanos),
+        F: for<'a> FnMut(Token, &'a [u8], Nanos),
     {
         if ev.is_readable() {
             loop {
                 match self.read_frame(dcache) {
-                    ReadOutcome::PayloadDone { payload, send_ts } => {
-                        on_msg(ev.token(), payload, send_ts);
+                    ReadOutcome::PayloadDone { payload: MessagePayload::Raw(bytes), send_ts } => {
+                        on_msg(ev.token(), bytes, send_ts);
+                    }
+                    ReadOutcome::PayloadDone { payload: MessagePayload::Cached(_), .. } => {
+                        flux_utils::safe_panic!(
+                            "poll_with called on dcache stream; use poll_with_produce"
+                        );
+                    }
+                    ReadOutcome::WouldBlock => break,
+                    ReadOutcome::Disconnected => return ConnState::Disconnected,
+                }
+            }
+        }
+
+        if ev.is_writable() && self.drain_backlog(registry) == ConnState::Disconnected {
+            return ConnState::Disconnected;
+        }
+
+        ConnState::Alive
+    }
+
+    /// Like [`poll_with`] but for dcache-backed streams. Applies `parse` to
+    /// each payload's bytes and calls `produce(t, send_ts)` on `Ok`. Use with
+    /// dcache connectors; for raw use [`poll_with`].
+    #[inline]
+    pub fn poll_with_produce<T, E, G, P, F>(
+        &mut self,
+        registry: &Registry,
+        ev: &Event,
+        dcache: &DCache,
+        parse: &mut G,
+        produce: &mut P,
+        on_msg: &mut F,
+    ) -> ConnState
+    where
+        T: 'static + Copy,
+        G: FnMut(&[u8]) -> Result<T, E>,
+        P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
+        F: FnMut(Token, Result<T, E>, Nanos),
+    {
+        if ev.is_readable() {
+            loop {
+                match self.read_frame(Some(dcache)) {
+                    ReadOutcome::PayloadDone { payload: MessagePayload::Raw(_), .. } => {
+                        flux_utils::safe_panic!(
+                            "poll_with_produce called on non-dcache stream; use poll_with"
+                        );
+                    }
+                    ReadOutcome::PayloadDone { payload: MessagePayload::Cached(dref), send_ts } => {
+                        match dcache.map(dref, |bytes| parse(bytes)) {
+                            Ok(result) => {
+                                if let Ok(t) = &result {
+                                    produce.produce_with_dref(*t, dref, send_ts);
+                                }
+                                on_msg(ev.token(), result, send_ts);
+                            }
+                            Err(e) => warn!("dcache map failed: {e}"),
+                        }
                     }
                     ReadOutcome::WouldBlock => break,
                     ReadOutcome::Disconnected => return ConnState::Disconnected,

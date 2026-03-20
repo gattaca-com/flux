@@ -1,62 +1,143 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use flux_network::tcp::{MessagePayload, PollEvent, SendBehavior, TcpConnector};
-use flux_utils::DCache;
+use flux::{
+    communication::{ShmemData, cleanup_shmem},
+    spine::{DCacheRead, ScopedSpine, SpineAdapter, SpineProducerWithDCache},
+    tile::{Tile, TileConfig, TileInfo, attach_tile},
+};
+use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
+use spine_derive::from_spine;
 
-/// Two inbound connections both write into the same connector dcache.
-/// Verifies that both payloads are readable via the single shared reader.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct Payload([u8; 8]);
+
+#[from_spine("tcp-dcache-test")]
+#[derive(Debug)]
+struct TcpDcacheSpine {
+    pub tile_info: ShmemData<TileInfo>,
+    #[queue(mtu(64))]
+    pub msg: SpineQueue<Payload>,
+}
+
+const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 24713);
+
+struct NetworkTile {
+    conn: Option<TcpConnector>,
+    ready: Arc<AtomicBool>,
+}
+
+impl Tile<TcpDcacheSpine> for NetworkTile {
+    fn try_init(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) -> bool {
+        let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
+        let mut conn = TcpConnector::default().with_dcache(sp.dcache_ptr());
+        conn.listen_at(BIND_ADDR).unwrap();
+        self.conn = Some(conn);
+        self.ready.store(true, Ordering::Release);
+        true
+    }
+
+    fn loop_body(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) {
+        let Some(conn) = &mut self.conn else { return };
+        conn.poll_with_produce(
+            &mut |bytes: &[u8]| -> Result<Payload, ()> {
+                Ok(Payload(bytes.try_into().map_err(|_| ())?))
+            },
+            &mut adapter.producers,
+            |_: PollEvent<_>| {},
+        );
+    }
+}
+
+struct ReaderTile {
+    received: Arc<Mutex<Vec<Payload>>>,
+    count: usize,
+    expected: usize,
+}
+
+impl Tile<TcpDcacheSpine> for ReaderTile {
+    fn loop_body(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) {
+        let received = &self.received;
+        let count = &mut self.count;
+        adapter.consume_with_dcache::<Payload, (), _, _>(
+            |msg, bytes| assert_eq!(&msg.0[..], bytes),
+            |result| {
+                if let DCacheRead::Ok((msg, ())) = result {
+                    received.lock().unwrap().push(msg);
+                    *count += 1;
+                }
+            },
+        );
+        if self.count >= self.expected {
+            adapter.request_stop_scope();
+        }
+    }
+}
+
+/// Two TCP streams into the same dcache-backed spine queue.
+/// Verifies dcache bytes match the queue message (same shmem region).
 #[test]
 fn dcache_multi_stream() {
-    let bind_addr = SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), 24712));
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
 
-    const MSG_A: &[u8] = b"stream-a";
-    const MSG_B: &[u8] = b"stream-b";
-    const CAPACITY: usize = 4096;
+    let mut spine = TcpDcacheSpine::new_with_base_dir(base, None);
 
-    let writer = DCache::new(CAPACITY);
-    let reader = writer.clone();
+    const MSG_A: &[u8; 8] = b"stream-a";
+    const MSG_B: &[u8; 8] = b"stream-b";
 
-    let server = thread::spawn(move || {
-        let mut conn = TcpConnector::default().with_dcache(writer);
-        conn.listen_at(bind_addr).unwrap();
+    let ready = Arc::new(AtomicBool::new(false));
+    let received: Arc<Mutex<Vec<Payload>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let mut accepted = 0usize;
-        let mut received = Vec::new();
+    let ready_c = ready.clone();
+    let client = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (accepted < 2 || received.len() < 2) && Instant::now() < deadline {
-            conn.poll_with(|ev| match ev {
-                PollEvent::Accept { .. } => accepted += 1,
-                PollEvent::Message { payload: MessagePayload::Cached(r), .. } => {
-                    received.push(reader.map(r, |b| b.to_vec()).unwrap());
-                }
-                _ => {}
-            });
-            thread::sleep(Duration::from_micros(50));
+        while !ready_c.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(received.len(), 2);
-        assert!(received.contains(&MSG_A.to_vec()));
-        assert!(received.contains(&MSG_B.to_vec()));
-    });
-
-    for msg in [MSG_A, MSG_B] {
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
+        for msg in [MSG_A, MSG_B] {
             let mut conn = TcpConnector::default();
-            let tok = conn.connect(bind_addr).unwrap();
+            let tok = conn.connect(BIND_ADDR).unwrap();
             conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
                 buf.extend_from_slice(msg);
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
+            let flush = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < flush {
                 conn.poll_with(|_| {});
                 thread::sleep(Duration::from_micros(50));
             }
-        });
-    }
+        }
+    });
 
-    server.join().unwrap();
+    thread::scope(|scope| {
+        let mut scoped = ScopedSpine::new(&mut spine, scope, None, None);
+        attach_tile(
+            NetworkTile { conn: None, ready: ready.clone() },
+            &mut scoped,
+            TileConfig::background(None, Some(flux::timing::Duration::from_millis(1))),
+        );
+        attach_tile(
+            ReaderTile { received: received.clone(), count: 0, expected: 2 },
+            &mut scoped,
+            TileConfig::background(None, None),
+        );
+    });
+
+    client.join().unwrap();
+
+    {
+        let guard = received.lock().unwrap();
+        assert_eq!(guard.len(), 2);
+        assert!(guard.iter().any(|p| p.0 == *MSG_A));
+        assert!(guard.iter().any(|p| p.0 == *MSG_B));
+    }
+    cleanup_shmem(base);
 }
