@@ -1,12 +1,12 @@
 use std::{ops::Deref, path::Path};
 
 use flux_timing::InternalMessage;
-use flux_utils::{DCachePtr, DCacheRef, short_typename};
+use flux_utils::{DCachePtr, short_typename};
 
 use crate::{
     Timer,
     communication::{ReadError, queue},
-    spine::{FluxSpine, SpineProducers, SpineQueue},
+    spine::{DCacheMsg, FluxSpine, SpineProducers, SpineQueue},
     tile::Tile,
 };
 
@@ -231,18 +231,6 @@ pub enum DCacheRead<T, R> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct DCacheMsg<T> {
-    pub data: T,
-    dref: DCacheRef,
-}
-
-impl<T: Copy> DCacheMsg<T> {
-    pub(crate) fn new(data: T, dref: Option<DCacheRef>) -> Self {
-        Self { data, dref: dref.unwrap_or(DCacheRef::NONE) }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct SpineDCacheConsumer<T: 'static + Copy> {
     timer: Timer,
     pub inner: queue::Consumer<InternalMessage<DCacheMsg<T>>>,
@@ -280,11 +268,12 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
     }
 
     #[inline]
-    pub fn consume<R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
+    pub fn consume<P, R, F>(&mut self, producers: &mut P, mut read: F) -> DCacheRead<T, R>
     where
+        P: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
     {
-        match self.consume_internal_message(|msg, payload| read(**msg, payload)) {
+        match self.consume_internal_message(producers, |msg, payload| read(**msg, payload)) {
             DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
             DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
             DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
@@ -294,30 +283,40 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
     }
 
     #[inline]
-    pub fn consume_collaborative<R, F>(&mut self, mut read: F) -> DCacheRead<T, R>
-    where
-        F: FnMut(T, &[u8]) -> R,
-    {
-        match self.consume_collaborative_internal_message(|msg, payload| read(**msg, payload)) {
-            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
-            DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
-            DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
-            DCacheRead::Empty => DCacheRead::Empty,
-            DCacheRead::SpedPast => DCacheRead::SpedPast,
-        }
-    }
-
-    #[inline]
-    pub fn consume_collaborative_internal_message<R, F>(
+    pub fn consume_collaborative<P, R, F>(
         &mut self,
+        producers: &mut P,
+        mut read: F,
+    ) -> DCacheRead<T, R>
+    where
+        P: SpineProducers,
+        F: FnMut(T, &[u8]) -> R,
+    {
+        match self
+            .consume_collaborative_internal_message(producers, |msg, payload| read(**msg, payload))
+        {
+            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
+            DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
+            DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
+            DCacheRead::Empty => DCacheRead::Empty,
+            DCacheRead::SpedPast => DCacheRead::SpedPast,
+        }
+    }
+
+    #[inline]
+    pub fn consume_collaborative_internal_message<P, R, F>(
+        &mut self,
+        producers: &mut P,
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
+        P: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
         match self.inner.try_consume_with_epoch_collaborative() {
             Ok((&msg, slot_pos, slot_ver)) => {
                 let ingestion_t = msg.ingestion_time();
+                *producers.timestamp_mut().ingestion_t_mut() = ingestion_t;
                 let dref = msg.data().dref;
                 if dref.is_none() {
                     return DCacheRead::NoRef(msg.with_data(msg.data().data));
@@ -343,17 +342,20 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
     }
 
     #[inline]
-    pub fn consume_internal_message<R, F>(
+    pub fn consume_internal_message<P, R, F>(
         &mut self,
+        producers: &mut P,
         mut read: F,
     ) -> DCacheRead<InternalMessage<T>, R>
     where
+        P: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
         loop {
             match self.inner.try_consume_with_epoch() {
                 Ok((&msg, slot_pos, slot_ver)) => {
                     let ingestion_t = msg.ingestion_time();
+                    *producers.timestamp_mut().ingestion_t_mut() = ingestion_t;
                     let dref = msg.data().dref;
                     if dref.is_none() {
                         return DCacheRead::NoRef(msg.with_data(msg.data().data));

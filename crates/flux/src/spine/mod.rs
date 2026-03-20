@@ -6,9 +6,9 @@ mod standalone_producer;
 use std::path::Path;
 
 pub use adapter::SpineAdapter;
-pub use consumer::{DCacheMsg, DCacheRead, SpineConsumer, SpineDCacheConsumer};
+pub use consumer::{DCacheRead, SpineConsumer, SpineDCacheConsumer};
 use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
-use flux_utils::{DCachePtr, directories::shmem_dir};
+use flux_utils::{DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
 pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
@@ -19,6 +19,20 @@ use crate::{
 
 pub type SpineProducer<T> = queue::Producer<InternalMessage<T>>;
 pub type SpineQueue<T> = queue::Queue<InternalMessage<T>>;
+
+/// Wire type for dcache-backed queues. Internal to the spine; users see `T`
+/// and `&[u8]` at consume sites.
+#[derive(Clone, Copy, Debug)]
+pub struct DCacheMsg<T> {
+    pub data: T,
+    dref: DCacheRef,
+}
+
+impl<T: Copy> DCacheMsg<T> {
+    pub(crate) fn new(data: T, dref: Option<DCacheRef>) -> Self {
+        Self { data, dref: dref.unwrap_or(DCacheRef::NONE) }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SpineProducerWithDCache<T: 'static + Copy> {

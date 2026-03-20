@@ -205,10 +205,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
+        S::Producers: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let result = c.consume(&mut read);
+        let result = c.consume(&mut self.producers, &mut read);
         self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
@@ -218,10 +219,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
+        S::Producers: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_collaborative(&mut read);
+        let result = c.consume_collaborative(&mut self.producers, &mut read);
         self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
@@ -234,10 +236,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
+        S::Producers: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_internal_message(&mut read);
+        let result = c.consume_internal_message(&mut self.producers, &mut read);
         self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
@@ -250,10 +253,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
+        S::Producers: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_collaborative_internal_message(&mut read);
+        let result = c.consume_collaborative_internal_message(&mut self.producers, &mut read);
         self.did_work |= !matches!(result, DCacheRead::Empty);
         result
     }
@@ -273,6 +277,14 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineConsumer<T>>,
     {
         let c: &mut SpineConsumer<T> = self.consumers.as_mut();
+        c.inner.set_collaborative_group(group_label);
+    }
+
+    pub fn set_collaborative_group_dcache<T: 'static + Copy>(&mut self, group_label: &'static str)
+    where
+        S::Consumers: AsMut<SpineDCacheConsumer<T>>,
+    {
+        let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
         c.inner.set_collaborative_group(group_label);
     }
 
