@@ -6,7 +6,7 @@ mod standalone_producer;
 use std::path::Path;
 
 pub use adapter::SpineAdapter;
-pub use consumer::{DCacheMsg, DCacheRead, SpineConsumer};
+pub use consumer::{DCacheMsg, DCacheRead, SpineConsumer, SpineDCacheConsumer};
 use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
 use flux_utils::{DCachePtr, directories::shmem_dir};
 pub use scoped::ScopedSpine;
