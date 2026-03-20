@@ -13,6 +13,39 @@ use crate::{
     discovery::{DiscoveredEntry, ShmemCache},
 };
 
+/// Rolling window (in seconds) over which msgs/s samples are averaged.
+const RATE_SMOOTHING_WINDOW_SECS: f64 = 30.0;
+
+/// Averages raw per-tick msgs/s samples over a [`RATE_SMOOTHING_WINDOW_SECS`]
+/// rolling window so the displayed rate is less jittery.
+struct RateSmoother {
+    /// Per-segment ring of `(timestamp, rate)` samples, keyed by flink path.
+    samples: HashMap<String, VecDeque<(Instant, f64)>>,
+}
+
+impl RateSmoother {
+    fn new() -> Self {
+        Self { samples: HashMap::new() }
+    }
+
+    /// Record a raw msgs/s sample for the segment identified by `key` and
+    /// return the smoothed (averaged) rate over the rolling window.
+    fn record(&mut self, key: &str, rate: f64) -> f64 {
+        let now = Instant::now();
+        let ring = self.samples.entry(key.to_owned()).or_default();
+        ring.push_back((now, rate));
+        // Evict samples older than the window.
+        while ring
+            .front()
+            .is_some_and(|(t, _)| t.elapsed().as_secs() > RATE_SMOOTHING_WINDOW_SECS)
+        {
+            ring.pop_front();
+        }
+        let sum: f64 = ring.iter().map(|(_, r)| r).sum();
+        sum / ring.len() as f64
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
     Name,
@@ -108,9 +141,11 @@ pub struct App {
     pub hide_dead: bool,
     /// Current sort order for segments within each group.
     pub sort_mode: SortMode,
-    /// Rolling (writes, timestamp) history per flink for smoothed msgs/s
-    /// over a 10-second window.
+    /// Rolling (writes, timestamp) history per flink for raw msgs/s
+    /// computation over a 10-second window.
     write_history: HashMap<String, VecDeque<(usize, Instant)>>,
+    /// Smooths raw per-tick msgs/s over a 30-second rolling window.
+    rate_smoother: RateSmoother,
     /// Cached result of scan_proc_fds() with TTL.
     cached_proc_map: HashMap<PathBuf, Vec<u32>>,
     /// Last time proc_map was scanned.
@@ -150,6 +185,7 @@ impl App {
             hide_dead: true,
             sort_mode: SortMode::Name,
             write_history: HashMap::new(),
+            rate_smoother: RateSmoother::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
@@ -178,6 +214,7 @@ impl App {
             hide_dead: true,
             sort_mode: SortMode::Name,
             write_history: HashMap::new(),
+            rate_smoother: RateSmoother::new(),
             cached_proc_map: HashMap::new(),
             proc_map_last_scan: None,
             shmem_cache: ShmemCache::new(),
@@ -262,7 +299,7 @@ impl App {
                     } else {
                         None
                     };
-                    let msgs_per_sec = queue_writes.and_then(|w| {
+                    let raw_rate = queue_writes.and_then(|w| {
                         let flink = e.flink.clone();
                         let now = Instant::now();
                         let history = self.write_history.entry(flink).or_default();
@@ -288,6 +325,16 @@ impl App {
                             None
                         }
                     });
+                    // Smooth the rate over a 30-second rolling window.
+                    // When a segment stops reporting (raw_rate is None) we
+                    // still record 0 so stale non-zero samples are pushed
+                    // out of the window.
+                    let msgs_per_sec = if alive && e.kind == ShmemKind::Queue {
+                        let rate = raw_rate.unwrap_or(0.0);
+                        Some(self.rate_smoother.record(&e.flink, rate))
+                    } else {
+                        raw_rate
+                    };
                     let pids: Vec<u32> = pids.into_iter().filter(|&p| p != own_pid).collect();
                     SegmentInfo {
                         entry: e.clone(),
@@ -786,5 +833,51 @@ impl App {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_smoother_single_sample() {
+        let mut s = RateSmoother::new();
+        let rate = s.record("seg_a", 100.0);
+        assert!((rate - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_smoother_averages_multiple_samples() {
+        let mut s = RateSmoother::new();
+        s.record("seg_a", 100.0);
+        s.record("seg_a", 200.0);
+        let avg = s.record("seg_a", 300.0);
+        // (100 + 200 + 300) / 3 = 200
+        assert!((avg - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_smoother_independent_keys() {
+        let mut s = RateSmoother::new();
+        s.record("seg_a", 100.0);
+        s.record("seg_b", 500.0);
+        let a = s.record("seg_a", 200.0);
+        let b = s.record("seg_b", 600.0);
+        // seg_a: (100 + 200) / 2 = 150
+        assert!((a - 150.0).abs() < f64::EPSILON);
+        // seg_b: (500 + 600) / 2 = 550
+        assert!((b - 550.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_smoother_zero_decay() {
+        // Recording 0s should pull the average down.
+        let mut s = RateSmoother::new();
+        s.record("seg_a", 1000.0);
+        s.record("seg_a", 0.0);
+        let avg = s.record("seg_a", 0.0);
+        // (1000 + 0 + 0) / 3 ≈ 333.33
+        assert!((avg - 1000.0 / 3.0).abs() < 0.01);
     }
 }
