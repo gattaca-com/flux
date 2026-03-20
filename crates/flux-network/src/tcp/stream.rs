@@ -252,7 +252,7 @@ impl TcpStream {
     ) -> ConnState
     where
         T: 'static + Copy,
-        G: FnMut(&[u8]) -> Result<T, E>,
+        G: FnMut(Token, &[u8]) -> Result<T, E>,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: FnMut(Token, Result<T, E>, Nanos),
     {
@@ -265,7 +265,7 @@ impl TcpStream {
                         );
                     }
                     ReadOutcome::PayloadDone { payload: MessagePayload::Cached(dref), send_ts } => {
-                        match dcache.map(dref, |bytes| parse(bytes)) {
+                        match dcache.map(dref, |bytes| parse(self.token, bytes)) {
                             Ok(result) => {
                                 if let Ok(t) = &result {
                                     produce.produce_with_dref(*t, dref, send_ts);

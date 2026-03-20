@@ -405,7 +405,7 @@ impl ConnectionManager {
         handler: &mut F,
     ) where
         T: 'static + Copy,
-        G: FnMut(&[u8]) -> Result<T, E>,
+        G: FnMut(Token, &[u8]) -> Result<T, E>,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: FnMut(PollEvent<Result<T, E>>),
     {
@@ -618,7 +618,7 @@ impl TcpConnector {
     ) -> bool
     where
         T: 'static + Copy,
-        G: FnMut(&[u8]) -> Result<T, E>,
+        G: FnMut(Token, &[u8]) -> Result<T, E>,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: FnMut(PollEvent<Result<T, E>>),
     {

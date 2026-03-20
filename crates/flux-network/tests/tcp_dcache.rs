@@ -48,7 +48,7 @@ impl Tile<TcpDcacheSpine> for NetworkTile {
     fn loop_body(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) {
         let Some(conn) = &mut self.conn else { return };
         conn.poll_with_produce(
-            &mut |bytes: &[u8]| -> Result<Payload, ()> {
+            &mut |_, bytes| -> Result<Payload, ()> {
                 Ok(Payload(bytes.try_into().map_err(|_| ())?))
             },
             &mut adapter.producers,
@@ -69,7 +69,7 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
         let count = &mut self.count;
         adapter.consume_with_dcache::<Payload, (), _, _>(
             |msg, bytes| assert_eq!(&msg.0[..], bytes),
-            |result| {
+            |result, _| {
                 if let DCacheRead::Ok((msg, ())) = result {
                     received.lock().unwrap().push(msg);
                     *count += 1;

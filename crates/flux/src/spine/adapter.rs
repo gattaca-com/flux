@@ -207,7 +207,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
-        G: FnMut(DCacheRead<T, R>),
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
         loop {
@@ -215,7 +215,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
                 DCacheRead::Empty => break,
                 result => {
                     self.did_work = true;
-                    handle(result);
+                    handle(result, &mut self.producers);
                 }
             }
         }
@@ -228,17 +228,13 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
-        G: FnMut(DCacheRead<T, R>),
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        loop {
-            match c.consume_collaborative(&mut self.producers, &mut read) {
-                DCacheRead::Empty => break,
-                DCacheRead::SpedPast => {}
-                result => {
-                    self.did_work = true;
-                    handle(result);
-                }
+        match c.consume_collaborative(&mut self.producers, &mut read) {
+            result => {
+                self.did_work = true;
+                handle(result, &mut self.producers);
             }
         }
     }
@@ -250,7 +246,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
-        G: FnMut(DCacheRead<InternalMessage<T>, R>),
+        G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
         loop {
@@ -258,7 +254,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
                 DCacheRead::Empty => break,
                 result => {
                     self.did_work = true;
-                    handle(result);
+                    handle(result, &mut self.producers);
                 }
             }
         }
@@ -274,17 +270,13 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
-        G: FnMut(DCacheRead<InternalMessage<T>, R>),
+        G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        loop {
-            match c.consume_collaborative_internal_message(&mut self.producers, &mut read) {
-                DCacheRead::Empty => break,
-                DCacheRead::SpedPast => {}
-                result => {
-                    self.did_work = true;
-                    handle(result);
-                }
+        match c.consume_collaborative_internal_message(&mut self.producers, &mut read) {
+            result => {
+                self.did_work = true;
+                handle(result, &mut self.producers);
             }
         }
     }
