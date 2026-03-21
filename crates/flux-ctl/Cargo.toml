@@ -15,6 +15,7 @@ name = "flux-ctl"
 path = "src/main.rs"
 
 [dependencies]
+flux.workspace = true
 flux-communication.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true

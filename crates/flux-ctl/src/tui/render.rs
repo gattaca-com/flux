@@ -8,6 +8,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.view {
         View::List => render_list(frame, app),
         View::Detail(_) => render_detail(frame, app),
+        View::Tiles => render_tiles(frame, app),
     }
 
     if app.confirm_cleanup_all {
@@ -16,6 +17,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let confirming = match &app.view {
             View::List => app.confirm_cleanup,
             View::Detail(d) => d.confirm_cleanup,
+            View::Tiles => false,
         };
         if confirming {
             render_confirm_popup(frame, frame.area());
@@ -571,10 +573,233 @@ fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
         popup_area,
     );
 }
+
+fn render_tiles(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
+    let n_tiles = app.tile_metrics.total_tiles();
+    let n_apps = app.tile_metrics.groups().iter().filter(|g| !g.is_empty()).count();
+    let title_text = format!(
+        " flux-ctl — Tile Metrics ({n_tiles} tiles, {n_apps} apps)  [window: {:.0}s] ",
+        app.tile_metrics.stats_window_secs()
+    );
+    let title = Paragraph::new(title_text)
+        .style(Style::default().fg(Color::Magenta).bold())
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(title, chunks[0]);
+
+    // Build rows — app headers + per-tile gauge rows
+    let inner = chunks[1];
+    let block = Block::default().borders(Borders::ALL);
+    let inner_area = block.inner(inner);
+    frame.render_widget(block, inner);
+
+    if n_tiles == 0 {
+        frame.render_widget(
+            Paragraph::new("No tile metrics found. Is a flux app running?")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner_area,
+        );
+        render_status_bar(frame, app, chunks[2]);
+        return;
+    }
+
+    // Each tile gets 2 rows: stats line + gauge bar.
+    // App headers get 1 row.
+    let window_secs = app.tile_metrics.stats_window_secs();
+    let mut row_specs: Vec<TileRow> = Vec::new();
+    for group in app.tile_metrics.groups() {
+        if group.is_empty() {
+            continue;
+        }
+        row_specs.push(TileRow::AppHeader(group.app_name.clone(), group.tile_order.len()));
+        for name in &group.tile_order {
+            let stats = group.tile_stats(name, window_secs);
+            row_specs.push(TileRow::Tile(name.clone(), stats));
+        }
+    }
+
+    // Calculate how many rows we can show (2 lines per tile, 1 per header)
+    let available_height = inner_area.height as usize;
+    let selected = app.tile_metrics.selected;
+
+    // Scroll offset calculation
+    let mut cumulative_heights: Vec<(usize, usize)> = Vec::new(); // (row_idx, y_start)
+    let mut y = 0usize;
+    for (i, row) in row_specs.iter().enumerate() {
+        cumulative_heights.push((i, y));
+        y += match row {
+            TileRow::AppHeader(..) => 1,
+            TileRow::Tile(..) => 2,
+        };
+    }
+    let total_content_height = y;
+
+    // Find y position of selected row
+    let selected_y = cumulative_heights
+        .get(selected)
+        .map(|(_, y)| *y)
+        .unwrap_or(0);
+    let selected_height = row_specs
+        .get(selected)
+        .map(|r| match r {
+            TileRow::AppHeader(..) => 1,
+            TileRow::Tile(..) => 2,
+        })
+        .unwrap_or(1);
+
+    // Simple scroll: ensure selected is visible
+    let scroll_offset = if selected_y + selected_height > available_height {
+        (selected_y + selected_height).saturating_sub(available_height)
+    } else {
+        0
+    };
+
+    // Render visible rows
+    let mut current_y = 0usize;
+    for (i, row) in row_specs.iter().enumerate() {
+        let row_height = match row {
+            TileRow::AppHeader(..) => 1,
+            TileRow::Tile(..) => 2,
+        };
+
+        if current_y + row_height <= scroll_offset {
+            current_y += row_height;
+            continue;
+        }
+        if current_y >= scroll_offset + available_height {
+            break;
+        }
+
+        let render_y = (current_y - scroll_offset) as u16;
+        let is_selected = i == selected;
+
+        match row {
+            TileRow::AppHeader(name, count) => {
+                let area = Rect::new(
+                    inner_area.x,
+                    inner_area.y + render_y,
+                    inner_area.width,
+                    1.min(inner_area.height.saturating_sub(render_y)),
+                );
+                let style = if is_selected {
+                    Style::default().fg(Color::Yellow).bold().bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow).bold()
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("▶ {} ({count} tiles)", name)).style(style),
+                    area,
+                );
+            }
+            TileRow::Tile(name, stats) => {
+                let lines_available = inner_area.height.saturating_sub(render_y);
+                if lines_available == 0 {
+                    current_y += row_height;
+                    continue;
+                }
+
+                // Stats line
+                let stats_area = Rect::new(
+                    inner_area.x,
+                    inner_area.y + render_y,
+                    inner_area.width,
+                    1,
+                );
+                let (stats_text, stats_color) = match stats {
+                    Some(s) => (
+                        format!(
+                            "  {:<30} util:{:5.1}%  avg:{:<10} min:{:<10} max:{:<10} loops:{}",
+                            truncate_str(name, 30),
+                            s.utilisation * 100.0,
+                            s.busy_avg,
+                            s.busy_min,
+                            s.busy_max,
+                            s.loop_count,
+                        ),
+                        Color::White,
+                    ),
+                    None => (
+                        format!("  {:<30} waiting for data…", truncate_str(name, 30)),
+                        Color::DarkGray,
+                    ),
+                };
+                let text_style = if is_selected {
+                    Style::default().fg(stats_color).bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(stats_color)
+                };
+                frame.render_widget(Paragraph::new(stats_text).style(text_style), stats_area);
+
+                // Gauge bar (if we have room)
+                if lines_available >= 2 {
+                    let gauge_area = Rect::new(
+                        inner_area.x + 2,
+                        inner_area.y + render_y + 1,
+                        inner_area.width.saturating_sub(4),
+                        1,
+                    );
+                    let util = stats.map(|s| s.utilisation).unwrap_or(0.0);
+                    let gauge = Gauge::default()
+                        .ratio(util.clamp(0.0, 1.0))
+                        .gauge_style(util_colour(util))
+                        .label(format!("{:5.1}%", util * 100.0));
+                    frame.render_widget(gauge, gauge_area);
+                }
+            }
+        }
+
+        current_y += row_height;
+    }
+
+    // Scroll indicator
+    if total_content_height > available_height {
+        let pct = if total_content_height <= available_height {
+            0
+        } else {
+            (scroll_offset * 100) / (total_content_height - available_height)
+        };
+        let indicator = Paragraph::new(format!(" {pct}%"))
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Right);
+        let indicator_area = Rect::new(
+            inner_area.x,
+            inner_area.y + inner_area.height.saturating_sub(1),
+            inner_area.width,
+            1,
+        );
+        frame.render_widget(indicator, indicator_area);
+    }
+
+    render_status_bar(frame, app, chunks[2]);
+}
+
+/// Intermediate type for tile view row rendering.
+enum TileRow {
+    AppHeader(String, usize),
+    Tile(String, Option<crate::tui::tile_metrics::TileStats>),
+}
+
+fn util_colour(util: f64) -> Color {
+    if util < 0.3 {
+        Color::Green
+    } else if util < 0.7 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let confirming_single = match &app.view {
         View::List => app.confirm_cleanup,
         View::Detail(d) => d.confirm_cleanup,
+        View::Tiles => false,
     };
 
     let has_any_dead = app.groups.iter().any(|g| g.segments.iter().any(|s| !s.alive));
@@ -601,16 +826,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 let base = match (on_dead_seg, has_any_dead) {
                     (true, _) => {
                         format!(
-                            " ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
+                            " ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  t tiles  ? help  q quit"
                         )
                     }
                     (false, true) => {
                         format!(
-                            " ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
+                            " ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  t tiles  ? help  q quit"
                         )
                     }
                     _ => format!(
-                        " ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"
+                        " ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  t tiles  ? help  q quit"
                     ),
                 };
                 format!("{}{}", base, filter_hint)
@@ -632,6 +857,9 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     _ => format!(" Esc back  {tab_hint}? help  q quit"),
                 };
                 base
+            }
+            View::Tiles => {
+                " ↑↓ navigate  Esc/t back  ? help  q quit".into()
             }
         }
     };
@@ -702,6 +930,10 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  D          ", Style::default().fg(Color::Yellow)),
             Span::raw("Destroy all dead segments"),
+        ]),
+        Line::from(vec![
+            Span::styled("  t          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Tile metrics view"),
         ]),
         Line::from(vec![
             Span::styled("  r          ", Style::default().fg(Color::Yellow)),

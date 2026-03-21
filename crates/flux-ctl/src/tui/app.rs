@@ -11,6 +11,7 @@ use ratatui::widgets::TableState;
 use crate::{
     discovery,
     discovery::{DiscoveredEntry, ShmemCache},
+    tui::tile_metrics::TileMetricsStore,
 };
 
 /// Rolling window (in seconds) over which msgs/s samples are averaged.
@@ -106,6 +107,7 @@ pub struct AppGroup {
 pub enum View {
     List,
     Detail(DetailState),
+    Tiles,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +183,8 @@ pub struct App {
     /// Rolling (cursor, timestamp) history per consumer group for smoothed
     /// msgs/s over a 10-second window. Key is `{flink}::{group_label}`.
     consumer_cursor_history: HashMap<String, VecDeque<(usize, Instant)>>,
+    /// Tile metrics discovery and stats.
+    pub tile_metrics: TileMetricsStore,
 }
 
 fn status_msg_duration() -> Duration {
@@ -217,6 +221,7 @@ impl App {
             shmem_cache: ShmemCache::new(),
             table_state: TableState::default().with_selected(0),
             consumer_cursor_history: HashMap::new(),
+            tile_metrics: TileMetricsStore::new(base_dir),
         };
         app.refresh();
         app
@@ -247,6 +252,7 @@ impl App {
             shmem_cache: ShmemCache::new(),
             table_state: TableState::default().with_selected(0),
             consumer_cursor_history: HashMap::new(),
+            tile_metrics: TileMetricsStore::new(Path::new("")),
         };
         app.recount_rows();
         app
@@ -506,6 +512,7 @@ impl App {
         if self.last_refresh.elapsed() >= refresh_interval() {
             self.refresh();
         }
+        self.tile_metrics.tick();
     }
 
     pub fn next(&mut self) {
@@ -529,6 +536,7 @@ impl App {
                     }
                 }
             },
+            View::Tiles => self.tile_metrics.select_next(),
         }
     }
 
@@ -545,6 +553,7 @@ impl App {
                     detail.selected_pid = detail.selected_pid.saturating_sub(1);
                 }
             },
+            View::Tiles => self.tile_metrics.select_prev(),
         }
     }
 
@@ -555,6 +564,7 @@ impl App {
                 DetailFocus::ConsumerGroups => detail.selected_group = 0,
                 DetailFocus::Processes => detail.selected_pid = 0,
             },
+            View::Tiles => self.tile_metrics.select_home(),
         }
     }
 
@@ -577,6 +587,7 @@ impl App {
                     }
                 }
             },
+            View::Tiles => self.tile_metrics.select_end(),
         }
     }
 
@@ -593,6 +604,7 @@ impl App {
                     detail.selected_pid = detail.selected_pid.saturating_sub(10);
                 }
             },
+            View::Tiles => self.tile_metrics.select_page_up(),
         }
     }
 
@@ -617,6 +629,7 @@ impl App {
                     }
                 }
             },
+            View::Tiles => self.tile_metrics.select_page_down(),
         }
     }
 
@@ -631,6 +644,7 @@ impl App {
 
     pub fn enter(&mut self) {
         match &self.view {
+            View::Tiles => {}
             View::List => {
                 let mut row = 0;
                 for (gi, group) in self.groups.iter_mut().enumerate() {
@@ -681,9 +695,13 @@ impl App {
     }
 
     pub fn back(&mut self) {
-        if let View::Detail(_) = &self.view {
-            self.consumer_cursor_history.clear();
-            self.view = View::List;
+        match &self.view {
+            View::Detail(_) => {
+                self.consumer_cursor_history.clear();
+                self.view = View::List;
+            }
+            View::Tiles => self.view = View::List,
+            View::List => {}
         }
     }
 
@@ -710,6 +728,7 @@ impl App {
         match &self.view {
             View::List => self.request_cleanup_list(),
             View::Detail(_) => self.request_cleanup_detail(),
+            View::Tiles => {}
         }
     }
 
@@ -893,6 +912,7 @@ impl App {
         let confirming = match &self.view {
             View::List => self.confirm_cleanup || self.confirm_cleanup_all,
             View::Detail(d) => d.confirm_cleanup,
+            View::Tiles => false,
         };
         if confirming {
             match key.code {
@@ -937,6 +957,19 @@ impl App {
                     self.hide_dead = !self.hide_dead;
                     self.refresh();
                 }
+                KeyCode::Char('t') => self.view = View::Tiles,
+                _ => {}
+            },
+            View::Tiles => match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('t') => self.back(),
+                KeyCode::Char('?') => self.toggle_help(),
+                KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                KeyCode::Down | KeyCode::Char('j') => self.next(),
+                KeyCode::Home | KeyCode::Char('g') => self.home(),
+                KeyCode::End | KeyCode::Char('G') => self.end(),
+                KeyCode::PageUp => self.page_up(),
+                KeyCode::PageDown => self.page_down(),
                 _ => {}
             },
             View::Detail(_) => match key.code {
