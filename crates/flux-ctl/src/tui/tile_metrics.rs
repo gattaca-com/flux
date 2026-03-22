@@ -227,7 +227,7 @@ impl TileMetricsStore {
 
     /// Scan base_dir for app directories containing shmem/queues.
     fn discover_apps(&mut self) {
-        let shmem_root = self.base_dir.join("shmem");
+        let shmem_root = &self.base_dir;
         let Ok(entries) = std::fs::read_dir(&shmem_root) else {
             return;
         };
