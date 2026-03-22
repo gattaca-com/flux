@@ -24,8 +24,10 @@ pub enum ConnectionVariant {
     Inbound(TcpStream),
     /// Listeners for new connections. When a new connection
     /// is made to one of the listeners, it will
-    /// be turned into an Inbound
-    Listener(TcpListener),
+    /// be turned into an Inbound.
+    /// The `bool` indicates whether accepted connections should use raw
+    /// (unframed) IO (`true`) or length-prefixed framing (`false`).
+    Listener(TcpListener, bool),
 }
 
 /// Event emitted by [`TcpConnector::poll_with`] for each notable IO occurrence.
@@ -65,7 +67,6 @@ struct ConnectionManager {
     // Outbound connections that completed during maybe_reconnect, drained in poll_with.
     reconnected_to: Vec<Token>,
     next_token: usize,
-    raw_listeners: Vec<Token>,
 }
 impl Default for ConnectionManager {
     fn default() -> Self {
@@ -80,7 +81,6 @@ impl Default for ConnectionManager {
             reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
-            raw_listeners: Vec::new(),
         }
     }
 }
@@ -106,7 +106,7 @@ impl ConnectionManager {
             ConnectionVariant::Inbound(mut tcp_connection) => {
                 tcp_connection.close(self.poll.registry());
             }
-            ConnectionVariant::Listener(mut tcp_listener) => {
+            ConnectionVariant::Listener(mut tcp_listener, _) => {
                 let _ = self.poll.registry().deregister(&mut tcp_listener);
             }
         }
@@ -135,7 +135,7 @@ impl ConnectionManager {
                         self.disconnect_at_index(i);
                     }
                 }
-                ConnectionVariant::Listener(_tcp_listener) => {}
+                ConnectionVariant::Listener(..) => {}
             }
         }
     }
@@ -159,7 +159,7 @@ impl ConnectionManager {
                                 self.disconnect_at_index(i);
                             }
                         }
-                        ConnectionVariant::Listener(_tcp_listener) => error!(
+                        ConnectionVariant::Listener(..) => error!(
                             "cannot write to listener bound to token {token:?}, what are you doing"
                         ),
                     }
@@ -176,7 +176,7 @@ impl ConnectionManager {
             i -= 1;
             let stream = match &mut self.conns[i].1 {
                 ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
-                ConnectionVariant::Listener(_) => continue,
+                ConnectionVariant::Listener(..) => continue,
             };
             if stream.has_backlog() &&
                 stream.drain_backlog(self.poll.registry()) == ConnState::Disconnected
@@ -233,9 +233,7 @@ impl ConnectionManager {
     }
 
     fn bind_raw(&mut self, addr: SocketAddr) -> Option<Token> {
-        let token = self.listen_at(addr)?;
-        self.raw_listeners.push(token);
-        Some(token)
+        self.listen_at_inner(addr, true)
     }
 
     // This will start listening on a given port, returning the token tied to that
@@ -243,6 +241,10 @@ impl ConnectionManager {
     // communicated to the handling function so the handler can know what
     // endpoint it is receiving a connection for.
     fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
+        self.listen_at_inner(addr, false)
+    }
+
+    fn listen_at_inner(&mut self, addr: SocketAddr, raw: bool) -> Option<Token> {
         let mut listener = mio::net::TcpListener::bind(addr)
             .inspect_err(|e| warn!("couldn't start listening at {addr:?}: {e}"))
             .ok()?;
@@ -252,7 +254,7 @@ impl ConnectionManager {
             .register(&mut listener, token, Interest::READABLE)
             .inspect_err(|err| warn!("Couldn't register listening addr {addr:?}: {err}"))
             .ok()?;
-        self.conns.push((token, ConnectionVariant::Listener(listener)));
+        self.conns.push((token, ConnectionVariant::Listener(listener, raw)));
         self.next_token += 1;
         Some(token)
     }
@@ -380,7 +382,8 @@ impl ConnectionManager {
                     }
                     return;
                 }
-                ConnectionVariant::Listener(tcp_listener) => {
+                ConnectionVariant::Listener(tcp_listener, raw) => {
+                    let raw = *raw;
                     if let Ok((mut stream, addr)) = tcp_listener.accept() {
                         tracing::info!(?addr, "client connected");
                         if let Some(size) = self.socket_buf_size {
@@ -398,8 +401,7 @@ impl ConnectionManager {
                             error!("couldn't set nodelay on stream to {addr}: {e}");
                             continue;
                         }
-                        let is_raw_listener = self.raw_listeners.contains(&event_token);
-                        let mut conn = if is_raw_listener {
+                        let mut conn = if raw {
                             TcpStream::raw(stream, token, addr, self.telemetry)
                         } else {
                             TcpStream::from_stream_with_telemetry(
