@@ -1,5 +1,6 @@
 pub mod app;
 pub mod render;
+pub mod tile_metrics;
 
 use std::{io::stdout, path::Path};
 

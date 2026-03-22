@@ -1,33 +1,69 @@
 use flux_communication::ShmemKind;
 use ratatui::{prelude::*, widgets::*};
 
-use super::app::{App, DetailFocus, SelectedItem, View};
+use super::app::{App, DetailFocus, FluxTab, SelectedItem, View};
 use crate::discovery::format_bytes;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    match &app.view {
-        View::List => render_list(frame, app),
-        View::Detail(_) => render_detail(frame, app),
+    let area = frame.area();
+
+    // Split the terminal area into a 1-row tab bar at the top and the
+    // remaining content area below.
+    let [tab_bar_area, content_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+
+    render_tab_bar(frame, app, tab_bar_area);
+
+    match app.tab {
+        FluxTab::Apps => match &app.view {
+            View::List | View::Tiles => render_list(frame, app, content_area),
+            View::Detail(_) => render_detail(frame, app, content_area),
+        },
+        FluxTab::Tiles => render_tiles(frame, app, content_area),
     }
 
     if app.confirm_cleanup_all {
-        render_confirm_all_popup(frame, app, frame.area());
+        render_confirm_all_popup(frame, app, area);
     } else {
-        let confirming = match &app.view {
-            View::List => app.confirm_cleanup,
-            View::Detail(d) => d.confirm_cleanup,
+        let confirming = match app.tab {
+            FluxTab::Tiles => false,
+            FluxTab::Apps => match &app.view {
+                View::List | View::Tiles => app.confirm_cleanup,
+                View::Detail(d) => d.confirm_cleanup,
+            },
         };
         if confirming {
-            render_confirm_popup(frame, frame.area());
+            render_confirm_popup(frame, area);
         }
     }
 
     if app.show_help {
-        render_help_popup(frame, frame.area());
+        render_help_popup(frame, area, app.tab);
     }
 }
-fn render_list(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+
+fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::style::palette::tailwind;
+
+    let titles = [FluxTab::Apps, FluxTab::Tiles].map(FluxTab::title);
+
+    let palette = app.tab.palette();
+    let highlight_style = Style::new().fg(palette.c100).bg(palette.c600).bold();
+    let bar_style = Style::new().bg(tailwind::SLATE.c950);
+
+    let selected = app.tab as usize;
+    Tabs::new(titles)
+        .select(selected)
+        .highlight_style(highlight_style)
+        .style(bar_style)
+        .padding("", "")
+        .divider(" ")
+        .render(area, frame.buffer_mut());
+}
+fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -152,8 +188,7 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
     render_status_bar(frame, app, chunks[2]);
 }
-fn render_detail(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Top-level vertical layout: title | segment info | bottom panels | status bar
     let chunks = Layout::default()
@@ -571,10 +606,234 @@ fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
         popup_area,
     );
 }
+
+fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
+    let n_tiles = app.tile_metrics.total_tiles();
+    let n_apps = app.tile_metrics.groups().iter().filter(|g| !g.is_empty()).count();
+    let title_text = format!(
+        " flux-ctl — Tile Metrics ({n_tiles} tiles, {n_apps} apps)  [window: {:.0}s] ",
+        app.tile_metrics.stats_window_secs()
+    );
+    let title = Paragraph::new(title_text)
+        .style(Style::default().fg(Color::Magenta).bold())
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(title, chunks[0]);
+
+    // Build rows — app headers + per-tile gauge rows
+    let inner = chunks[1];
+    let block = Block::default().borders(Borders::ALL);
+    let inner_area = block.inner(inner);
+    frame.render_widget(block, inner);
+
+    if n_tiles == 0 {
+        frame.render_widget(
+            Paragraph::new("No tile metrics found. Is a flux app running?")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner_area,
+        );
+        render_status_bar(frame, app, chunks[2]);
+        return;
+    }
+
+    // Each tile gets 2 rows: stats line + gauge bar.
+    // App headers get 1 row.
+    let window_secs = app.tile_metrics.stats_window_secs();
+    let mut row_specs: Vec<TileRow> = Vec::new();
+    for group in app.tile_metrics.groups() {
+        if group.is_empty() {
+            continue;
+        }
+        row_specs.push(TileRow::AppHeader(group.app_name.clone(), group.tile_order.len()));
+        for name in &group.tile_order {
+            let stats = group.tile_stats(name, window_secs);
+            row_specs.push(TileRow::Tile(name.clone(), stats));
+        }
+    }
+
+    // Calculate how many rows we can show (2 lines per tile, 1 per header)
+    let available_height = inner_area.height as usize;
+    let selected = app.tile_metrics.selected;
+
+    // Scroll offset calculation
+    let mut cumulative_heights: Vec<(usize, usize)> = Vec::new(); // (row_idx, y_start)
+    let mut y = 0usize;
+    for (i, row) in row_specs.iter().enumerate() {
+        cumulative_heights.push((i, y));
+        y += match row {
+            TileRow::AppHeader(..) => 1,
+            TileRow::Tile(..) => 2,
+        };
+    }
+    let total_content_height = y;
+
+    // Find y position of selected row
+    let selected_y = cumulative_heights
+        .get(selected)
+        .map(|(_, y)| *y)
+        .unwrap_or(0);
+    let selected_height = row_specs
+        .get(selected)
+        .map(|r| match r {
+            TileRow::AppHeader(..) => 1,
+            TileRow::Tile(..) => 2,
+        })
+        .unwrap_or(1);
+
+    // Simple scroll: ensure selected is visible
+    let scroll_offset = if selected_y + selected_height > available_height {
+        (selected_y + selected_height).saturating_sub(available_height)
+    } else {
+        0
+    };
+
+    // Render visible rows
+    let mut current_y = 0usize;
+    for (i, row) in row_specs.iter().enumerate() {
+        let row_height = match row {
+            TileRow::AppHeader(..) => 1,
+            TileRow::Tile(..) => 2,
+        };
+
+        if current_y < scroll_offset {
+            current_y += row_height;
+            continue;
+        }
+        if current_y >= scroll_offset + available_height {
+            break;
+        }
+
+        let render_y = (current_y - scroll_offset) as u16;
+        let is_selected = i == selected;
+
+        match row {
+            TileRow::AppHeader(name, count) => {
+                let area = Rect::new(
+                    inner_area.x,
+                    inner_area.y + render_y,
+                    inner_area.width,
+                    1.min(inner_area.height.saturating_sub(render_y)),
+                );
+                let style = if is_selected {
+                    Style::default().fg(Color::Yellow).bold().bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow).bold()
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("▶ {} ({count} tiles)", name)).style(style),
+                    area,
+                );
+            }
+            TileRow::Tile(name, stats) => {
+                let lines_available = inner_area.height.saturating_sub(render_y);
+                if lines_available == 0 {
+                    current_y += row_height;
+                    continue;
+                }
+
+                // Stats line
+                let stats_area = Rect::new(
+                    inner_area.x,
+                    inner_area.y + render_y,
+                    inner_area.width,
+                    1,
+                );
+                let (stats_text, stats_color) = match stats {
+                    Some(s) => (
+                        format!(
+                            "  {:<30} util:{:5.1}%  avg:{:<10} min:{:<10} max:{:<10} loops:{}",
+                            truncate_str(name, 30),
+                            s.utilisation * 100.0,
+                            s.busy_avg,
+                            s.busy_min,
+                            s.busy_max,
+                            s.loop_count,
+                        ),
+                        Color::White,
+                    ),
+                    None => (
+                        format!("  {:<30} waiting for data…", truncate_str(name, 30)),
+                        Color::DarkGray,
+                    ),
+                };
+                let text_style = if is_selected {
+                    Style::default().fg(stats_color).bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(stats_color)
+                };
+                frame.render_widget(Paragraph::new(stats_text).style(text_style), stats_area);
+
+                // Gauge bar (if we have room)
+                if lines_available >= 2 {
+                    let gauge_area = Rect::new(
+                        inner_area.x + 2,
+                        inner_area.y + render_y + 1,
+                        inner_area.width.saturating_sub(4),
+                        1,
+                    );
+                    let util = stats.map(|s| s.utilisation).unwrap_or(0.0);
+                    let gauge = Gauge::default()
+                        .ratio(util.clamp(0.0, 1.0))
+                        .gauge_style(util_colour(util))
+                        .label(format!("{:5.1}%", util * 100.0));
+                    frame.render_widget(gauge, gauge_area);
+                }
+            }
+        }
+
+        current_y += row_height;
+    }
+
+    // Scroll indicator
+    if total_content_height > available_height {
+        let pct = if total_content_height <= available_height {
+            0
+        } else {
+            (scroll_offset * 100) / (total_content_height - available_height)
+        };
+        let indicator = Paragraph::new(format!(" {pct}%"))
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Right);
+        let indicator_area = Rect::new(
+            inner_area.x,
+            inner_area.y + inner_area.height.saturating_sub(1),
+            inner_area.width,
+            1,
+        );
+        frame.render_widget(indicator, indicator_area);
+    }
+
+    render_status_bar(frame, app, chunks[2]);
+}
+
+/// Intermediate type for tile view row rendering.
+enum TileRow {
+    AppHeader(String, usize),
+    Tile(String, Option<crate::tui::tile_metrics::TileStats>),
+}
+
+fn util_colour(util: f64) -> Color {
+    if util < 0.3 {
+        Color::Green
+    } else if util < 0.7 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let confirming_single = match &app.view {
-        View::List => app.confirm_cleanup,
-        View::Detail(d) => d.confirm_cleanup,
+    let confirming_single = match app.tab {
+        FluxTab::Tiles => false,
+        FluxTab::Apps => match &app.view {
+            View::List | View::Tiles => app.confirm_cleanup,
+            View::Detail(d) => d.confirm_cleanup,
+        },
     };
 
     let has_any_dead = app.groups.iter().any(|g| g.segments.iter().any(|s| !s.alive));
@@ -591,48 +850,51 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             String::new()
         };
-        match &app.view {
-            View::List => {
-                let on_dead_seg = matches!(
-                    app.selected_item(),
-                    Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
-                );
-                let dead_toggle = if app.hide_dead { "a show dead" } else { "a hide dead" };
-                let base = match (on_dead_seg, has_any_dead) {
-                    (true, _) => {
-                        format!(
-                            " ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
-                        )
-                    }
-                    (false, true) => {
-                        format!(
-                            " ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
-                        )
-                    }
-                    _ => format!(
-                        " ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"
-                    ),
-                };
-                format!("{}{}", base, filter_hint)
-            }
-            View::Detail(detail) => {
-                let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
-                let tab_hint = if !detail.consumer_groups.is_empty() {
-                    "Tab switch panel  "
-                } else {
-                    ""
-                };
-                let base = match (!alive, has_any_dead) {
-                    (true, _) => format!(
-                        " Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit"
-                    ),
-                    (false, true) => {
-                        format!(" Esc back  {tab_hint}D destroy all  ? help  q quit")
-                    }
-                    _ => format!(" Esc back  {tab_hint}? help  q quit"),
-                };
-                base
-            }
+        match app.tab {
+            FluxTab::Tiles => " ↑↓ navigate  ←→ tabs  Esc back  ? help  q quit".into(),
+            FluxTab::Apps => match &app.view {
+                View::List | View::Tiles => {
+                    let on_dead_seg = matches!(
+                        app.selected_item(),
+                        Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
+                    );
+                    let dead_toggle = if app.hide_dead { "a show dead" } else { "a hide dead" };
+                    let base = match (on_dead_seg, has_any_dead) {
+                        (true, _) => {
+                            format!(
+                                " ↑↓ navigate  ←→ tabs  Enter open  d/D destroy  {dead_toggle}  / filter  s sort  ? help  q quit"
+                            )
+                        }
+                        (false, true) => {
+                            format!(
+                                " ↑↓ navigate  ←→ tabs  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
+                            )
+                        }
+                        _ => format!(
+                            " ↑↓ navigate  ←→ tabs  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"
+                        ),
+                    };
+                    format!("{}{}", base, filter_hint)
+                }
+                View::Detail(detail) => {
+                    let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
+                    let tab_hint = if !detail.consumer_groups.is_empty() {
+                        "Tab switch panel  "
+                    } else {
+                        ""
+                    };
+                    let base = match (!alive, has_any_dead) {
+                        (true, _) => format!(
+                            " Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit"
+                        ),
+                        (false, true) => {
+                            format!(" Esc back  {tab_hint}D destroy all  ? help  q quit")
+                        }
+                        _ => format!(" Esc back  {tab_hint}? help  q quit"),
+                    };
+                    base
+                }
+            },
         }
     };
 
@@ -643,84 +905,60 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
-fn render_help_popup(frame: &mut Frame, area: Rect) {
-    let lines = vec![
+fn render_help_popup(frame: &mut Frame, area: Rect, tab: FluxTab) {
+    let key = |k: &str| Span::styled(format!("  {k:<13}"), Style::default().fg(Color::Yellow));
+
+    let mut lines = vec![
         Line::from(Span::styled(" Keybindings ", Style::default().fg(Color::Cyan).bold())),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  ↑ / k      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Move up"),
-        ]),
-        Line::from(vec![
-            Span::styled("  ↓ / j      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Move down"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Home / g   ", Style::default().fg(Color::Yellow)),
-            Span::raw("Jump to first"),
-        ]),
-        Line::from(vec![
-            Span::styled("  End / G    ", Style::default().fg(Color::Yellow)),
-            Span::raw("Jump to last"),
-        ]),
-        Line::from(vec![
-            Span::styled("  PgUp       ", Style::default().fg(Color::Yellow)),
-            Span::raw("Page up (10 rows)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  PgDn       ", Style::default().fg(Color::Yellow)),
-            Span::raw("Page down (10 rows)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Enter      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Open segment / toggle app group"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Esc / Bksp ", Style::default().fg(Color::Yellow)),
-            Span::raw("Back / clear filter / quit"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Filter segments by name"),
-        ]),
-        Line::from(vec![
-            Span::styled("  s          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Cycle sort (name → kind → status → activity)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  a          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Toggle show/hide dead segments"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Tab        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Switch focus (groups ↔ processes)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  d          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Destroy dead segment"),
-        ]),
-        Line::from(vec![
-            Span::styled("  D          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Destroy all dead segments"),
-        ]),
-        Line::from(vec![
-            Span::styled("  r          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Force refresh"),
-        ]),
-        Line::from(vec![
-            Span::styled("  ?          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Toggle this help"),
-        ]),
-        Line::from(vec![
-            Span::styled("  q          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Quit"),
-        ]),
+        // ── Navigation (common to all tabs) ──
+        Line::from(vec![key("↑ / k"), Span::raw("Move up")]),
+        Line::from(vec![key("↓ / j"), Span::raw("Move down")]),
+        Line::from(vec![key("Home / g"), Span::raw("Jump to first")]),
+        Line::from(vec![key("End / G"), Span::raw("Jump to last")]),
+        Line::from(vec![key("PgUp"), Span::raw("Page up (10 rows)")]),
+        Line::from(vec![key("PgDn"), Span::raw("Page down (10 rows)")]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Press ? to close",
-            Style::default().fg(Color::DarkGray).italic(),
-        )),
+        // ── Tab switching (common) ──
+        Line::from(vec![key("← / →"), Span::raw("Switch tab")]),
+        Line::from(vec![key("1 / 2"), Span::raw("Jump to tab (Apps / Tiles)")]),
     ];
+
+    match tab {
+        FluxTab::Apps => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Apps tab ",
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+            lines.push(Line::from(vec![key("Enter"), Span::raw("Open segment / toggle app group")]));
+            lines.push(Line::from(vec![key("Esc / Bksp"), Span::raw("Back / clear filter / quit")]));
+            lines.push(Line::from(vec![key("/"), Span::raw("Filter segments by name")]));
+            lines.push(Line::from(vec![key("s"), Span::raw("Cycle sort (name → kind → status → activity)")]));
+            lines.push(Line::from(vec![key("a"), Span::raw("Toggle show/hide dead segments")]));
+            lines.push(Line::from(vec![key("Tab"), Span::raw("Switch focus (groups ↔ processes)")]));
+            lines.push(Line::from(vec![key("d"), Span::raw("Destroy dead segment")]));
+            lines.push(Line::from(vec![key("D"), Span::raw("Destroy all dead segments")]));
+            lines.push(Line::from(vec![key("r"), Span::raw("Force refresh")]));
+        }
+        FluxTab::Tiles => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Tiles tab ",
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+            lines.push(Line::from(vec![key("Esc / t"), Span::raw("Back to Apps tab")]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![key("?"), Span::raw("Toggle this help")]));
+    lines.push(Line::from(vec![key("q"), Span::raw("Quit")]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press ? to close",
+        Style::default().fg(Color::DarkGray).italic(),
+    )));
 
     let popup_area = centered_rect(52, lines.len() as u16 + 2, area);
     frame.render_widget(Clear, popup_area);
