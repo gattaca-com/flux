@@ -113,7 +113,7 @@ fn help_popup_toggle() {
     // Show help
     app.toggle_help();
     assert!(app.show_help);
-    let buf = render_to_buffer(&mut app, 80, 24);
+    let buf = render_to_buffer(&mut app, 80, 30);
     let text = buffer_text(&buf);
     assert!(text.contains("Keybindings"), "popup should show title:\n{text}");
     assert!(text.contains("Move up"), "popup should list keys:\n{text}");
@@ -843,7 +843,7 @@ fn list_status_bar_shows_cleanup_hint_for_dead() {
     let buf = render_to_buffer(&mut app, 120, 15);
     let text = buffer_text(&buf);
 
-    assert!(text.contains("d destroy"), "status bar should show destroy hint:\n{text}");
+    assert!(text.contains("d/D destroy"), "status bar should show destroy hint:\n{text}");
 }
 #[test]
 fn poisoned_segment_renders_skull_crossbones() {

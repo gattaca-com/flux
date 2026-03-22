@@ -1004,13 +1004,13 @@ impl App {
             return false;
         }
 
-        // ── Global tab switching (number keys work from any tab) ───────────
+        // ── Global tab switching (number keys + arrow keys work from any tab) ──
         match key.code {
-            KeyCode::Char('1') => {
+            KeyCode::Char('1') | KeyCode::Left => {
                 self.tab = FluxTab::Apps;
                 return false;
             }
-            KeyCode::Char('2') => {
+            KeyCode::Char('2') | KeyCode::Right => {
                 self.tab = FluxTab::Tiles;
                 return false;
             }

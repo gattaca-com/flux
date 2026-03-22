@@ -41,7 +41,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     if app.show_help {
-        render_help_popup(frame, area);
+        render_help_popup(frame, area, app.tab);
     }
 }
 
@@ -851,7 +851,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             String::new()
         };
         match app.tab {
-            FluxTab::Tiles => " ↑↓ navigate  Esc/t back  1 Apps  ? help  q quit".into(),
+            FluxTab::Tiles => " ↑↓ navigate  ←→ tabs  Esc back  ? help  q quit".into(),
             FluxTab::Apps => match &app.view {
                 View::List | View::Tiles => {
                     let on_dead_seg = matches!(
@@ -862,16 +862,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     let base = match (on_dead_seg, has_any_dead) {
                         (true, _) => {
                             format!(
-                                " ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  2 tiles  ? help  q quit"
+                                " ↑↓ navigate  ←→ tabs  Enter open  d/D destroy  {dead_toggle}  / filter  s sort  ? help  q quit"
                             )
                         }
                         (false, true) => {
                             format!(
-                                " ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  2 tiles  ? help  q quit"
+                                " ↑↓ navigate  ←→ tabs  Enter open  D destroy all  {dead_toggle}  / filter  s sort  ? help  q quit"
                             )
                         }
                         _ => format!(
-                            " ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  2 tiles  ? help  q quit"
+                            " ↑↓ navigate  ←→ tabs  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"
                         ),
                     };
                     format!("{}{}", base, filter_hint)
@@ -905,92 +905,60 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
-fn render_help_popup(frame: &mut Frame, area: Rect) {
-    let lines = vec![
+fn render_help_popup(frame: &mut Frame, area: Rect, tab: FluxTab) {
+    let key = |k: &str| Span::styled(format!("  {k:<13}"), Style::default().fg(Color::Yellow));
+
+    let mut lines = vec![
         Line::from(Span::styled(" Keybindings ", Style::default().fg(Color::Cyan).bold())),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  ↑ / k      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Move up"),
-        ]),
-        Line::from(vec![
-            Span::styled("  ↓ / j      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Move down"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Home / g   ", Style::default().fg(Color::Yellow)),
-            Span::raw("Jump to first"),
-        ]),
-        Line::from(vec![
-            Span::styled("  End / G    ", Style::default().fg(Color::Yellow)),
-            Span::raw("Jump to last"),
-        ]),
-        Line::from(vec![
-            Span::styled("  PgUp       ", Style::default().fg(Color::Yellow)),
-            Span::raw("Page up (10 rows)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  PgDn       ", Style::default().fg(Color::Yellow)),
-            Span::raw("Page down (10 rows)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Enter      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Open segment / toggle app group"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Esc / Bksp ", Style::default().fg(Color::Yellow)),
-            Span::raw("Back / clear filter / quit"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Filter segments by name"),
-        ]),
-        Line::from(vec![
-            Span::styled("  s          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Cycle sort (name → kind → status → activity)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  a          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Toggle show/hide dead segments"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Tab        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Switch focus (groups ↔ processes)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  d          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Destroy dead segment"),
-        ]),
-        Line::from(vec![
-            Span::styled("  D          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Destroy all dead segments"),
-        ]),
-        Line::from(vec![
-            Span::styled("  1 / 2      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Switch tab (Apps / Tiles)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  t          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Switch to Tiles tab"),
-        ]),
-        Line::from(vec![
-            Span::styled("  r          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Force refresh"),
-        ]),
-        Line::from(vec![
-            Span::styled("  ?          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Toggle this help"),
-        ]),
-        Line::from(vec![
-            Span::styled("  q          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Quit"),
-        ]),
+        // ── Navigation (common to all tabs) ──
+        Line::from(vec![key("↑ / k"), Span::raw("Move up")]),
+        Line::from(vec![key("↓ / j"), Span::raw("Move down")]),
+        Line::from(vec![key("Home / g"), Span::raw("Jump to first")]),
+        Line::from(vec![key("End / G"), Span::raw("Jump to last")]),
+        Line::from(vec![key("PgUp"), Span::raw("Page up (10 rows)")]),
+        Line::from(vec![key("PgDn"), Span::raw("Page down (10 rows)")]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Press ? to close",
-            Style::default().fg(Color::DarkGray).italic(),
-        )),
+        // ── Tab switching (common) ──
+        Line::from(vec![key("← / →"), Span::raw("Switch tab")]),
+        Line::from(vec![key("1 / 2"), Span::raw("Jump to tab (Apps / Tiles)")]),
     ];
+
+    match tab {
+        FluxTab::Apps => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Apps tab ",
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+            lines.push(Line::from(vec![key("Enter"), Span::raw("Open segment / toggle app group")]));
+            lines.push(Line::from(vec![key("Esc / Bksp"), Span::raw("Back / clear filter / quit")]));
+            lines.push(Line::from(vec![key("/"), Span::raw("Filter segments by name")]));
+            lines.push(Line::from(vec![key("s"), Span::raw("Cycle sort (name → kind → status → activity)")]));
+            lines.push(Line::from(vec![key("a"), Span::raw("Toggle show/hide dead segments")]));
+            lines.push(Line::from(vec![key("Tab"), Span::raw("Switch focus (groups ↔ processes)")]));
+            lines.push(Line::from(vec![key("d"), Span::raw("Destroy dead segment")]));
+            lines.push(Line::from(vec![key("D"), Span::raw("Destroy all dead segments")]));
+            lines.push(Line::from(vec![key("r"), Span::raw("Force refresh")]));
+        }
+        FluxTab::Tiles => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Tiles tab ",
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+            lines.push(Line::from(vec![key("Esc / t"), Span::raw("Back to Apps tab")]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![key("?"), Span::raw("Toggle this help")]));
+    lines.push(Line::from(vec![key("q"), Span::raw("Quit")]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press ? to close",
+        Style::default().fg(Color::DarkGray).italic(),
+    )));
 
     let popup_area = centered_rect(52, lines.len() as u16 + 2, area);
     frame.render_widget(Clear, popup_area);
