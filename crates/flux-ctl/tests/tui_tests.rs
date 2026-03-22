@@ -1611,7 +1611,7 @@ fn d14_render_long_names() {
 
     // Also test at very narrow width.
     app.back();
-    let buf_narrow = render_to_buffer(&mut app, 40, 10);
+    let buf_narrow = render_to_buffer(&mut app, 40, 11);
     let _text_narrow = buffer_text(&buf_narrow);
     // Just verify no panic at narrow width with long names.
 

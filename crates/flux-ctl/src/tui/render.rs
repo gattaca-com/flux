@@ -1,35 +1,69 @@
 use flux_communication::ShmemKind;
 use ratatui::{prelude::*, widgets::*};
 
-use super::app::{App, DetailFocus, SelectedItem, View};
+use super::app::{App, DetailFocus, FluxTab, SelectedItem, View};
 use crate::discovery::format_bytes;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    match &app.view {
-        View::List => render_list(frame, app),
-        View::Detail(_) => render_detail(frame, app),
-        View::Tiles => render_tiles(frame, app),
+    let area = frame.area();
+
+    // Split the terminal area into a 1-row tab bar at the top and the
+    // remaining content area below.
+    let [tab_bar_area, content_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+
+    render_tab_bar(frame, app, tab_bar_area);
+
+    match app.tab {
+        FluxTab::Apps => match &app.view {
+            View::List | View::Tiles => render_list(frame, app, content_area),
+            View::Detail(_) => render_detail(frame, app, content_area),
+        },
+        FluxTab::Tiles => render_tiles(frame, app, content_area),
     }
 
     if app.confirm_cleanup_all {
-        render_confirm_all_popup(frame, app, frame.area());
+        render_confirm_all_popup(frame, app, area);
     } else {
-        let confirming = match &app.view {
-            View::List => app.confirm_cleanup,
-            View::Detail(d) => d.confirm_cleanup,
-            View::Tiles => false,
+        let confirming = match app.tab {
+            FluxTab::Tiles => false,
+            FluxTab::Apps => match &app.view {
+                View::List | View::Tiles => app.confirm_cleanup,
+                View::Detail(d) => d.confirm_cleanup,
+            },
         };
         if confirming {
-            render_confirm_popup(frame, frame.area());
+            render_confirm_popup(frame, area);
         }
     }
 
     if app.show_help {
-        render_help_popup(frame, frame.area());
+        render_help_popup(frame, area);
     }
 }
-fn render_list(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+
+fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::style::palette::tailwind;
+
+    let titles = [FluxTab::Apps, FluxTab::Tiles].map(FluxTab::title);
+
+    let palette = app.tab.palette();
+    let highlight_style = Style::new().fg(palette.c100).bg(palette.c600).bold();
+    let bar_style = Style::new().bg(tailwind::SLATE.c950);
+
+    let selected = app.tab as usize;
+    Tabs::new(titles)
+        .select(selected)
+        .highlight_style(highlight_style)
+        .style(bar_style)
+        .padding("", "")
+        .divider(" ")
+        .render(area, frame.buffer_mut());
+}
+fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -154,8 +188,7 @@ fn render_list(frame: &mut Frame, app: &mut App) {
 
     render_status_bar(frame, app, chunks[2]);
 }
-fn render_detail(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Top-level vertical layout: title | segment info | bottom panels | status bar
     let chunks = Layout::default()
@@ -574,8 +607,7 @@ fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn render_tiles(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -796,10 +828,12 @@ fn util_colour(util: f64) -> Color {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let confirming_single = match &app.view {
-        View::List => app.confirm_cleanup,
-        View::Detail(d) => d.confirm_cleanup,
-        View::Tiles => false,
+    let confirming_single = match app.tab {
+        FluxTab::Tiles => false,
+        FluxTab::Apps => match &app.view {
+            View::List | View::Tiles => app.confirm_cleanup,
+            View::Detail(d) => d.confirm_cleanup,
+        },
     };
 
     let has_any_dead = app.groups.iter().any(|g| g.segments.iter().any(|s| !s.alive));
@@ -816,51 +850,51 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             String::new()
         };
-        match &app.view {
-            View::List => {
-                let on_dead_seg = matches!(
-                    app.selected_item(),
-                    Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
-                );
-                let dead_toggle = if app.hide_dead { "a show dead" } else { "a hide dead" };
-                let base = match (on_dead_seg, has_any_dead) {
-                    (true, _) => {
-                        format!(
-                            " ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  t tiles  ? help  q quit"
-                        )
-                    }
-                    (false, true) => {
-                        format!(
-                            " ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  t tiles  ? help  q quit"
-                        )
-                    }
-                    _ => format!(
-                        " ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  t tiles  ? help  q quit"
-                    ),
-                };
-                format!("{}{}", base, filter_hint)
-            }
-            View::Detail(detail) => {
-                let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
-                let tab_hint = if !detail.consumer_groups.is_empty() {
-                    "Tab switch panel  "
-                } else {
-                    ""
-                };
-                let base = match (!alive, has_any_dead) {
-                    (true, _) => format!(
-                        " Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit"
-                    ),
-                    (false, true) => {
-                        format!(" Esc back  {tab_hint}D destroy all  ? help  q quit")
-                    }
-                    _ => format!(" Esc back  {tab_hint}? help  q quit"),
-                };
-                base
-            }
-            View::Tiles => {
-                " ↑↓ navigate  Esc/t back  ? help  q quit".into()
-            }
+        match app.tab {
+            FluxTab::Tiles => " ↑↓ navigate  Esc/t back  1 Apps  ? help  q quit".into(),
+            FluxTab::Apps => match &app.view {
+                View::List | View::Tiles => {
+                    let on_dead_seg = matches!(
+                        app.selected_item(),
+                        Some(SelectedItem::Segment(_, _, seg)) if !seg.alive
+                    );
+                    let dead_toggle = if app.hide_dead { "a show dead" } else { "a hide dead" };
+                    let base = match (on_dead_seg, has_any_dead) {
+                        (true, _) => {
+                            format!(
+                                " ↑↓ navigate  Enter open  d destroy  D destroy all  {dead_toggle}  / filter  s sort  2 tiles  ? help  q quit"
+                            )
+                        }
+                        (false, true) => {
+                            format!(
+                                " ↑↓ navigate  Enter open  D destroy all  {dead_toggle}  / filter  s sort  2 tiles  ? help  q quit"
+                            )
+                        }
+                        _ => format!(
+                            " ↑↓ navigate  Enter open  {dead_toggle}  / filter  s sort  2 tiles  ? help  q quit"
+                        ),
+                    };
+                    format!("{}{}", base, filter_hint)
+                }
+                View::Detail(detail) => {
+                    let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
+                    let tab_hint = if !detail.consumer_groups.is_empty() {
+                        "Tab switch panel  "
+                    } else {
+                        ""
+                    };
+                    let base = match (!alive, has_any_dead) {
+                        (true, _) => format!(
+                            " Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit"
+                        ),
+                        (false, true) => {
+                            format!(" Esc back  {tab_hint}D destroy all  ? help  q quit")
+                        }
+                        _ => format!(" Esc back  {tab_hint}? help  q quit"),
+                    };
+                    base
+                }
+            },
         }
     };
 
@@ -932,8 +966,12 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::raw("Destroy all dead segments"),
         ]),
         Line::from(vec![
+            Span::styled("  1 / 2      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch tab (Apps / Tiles)"),
+        ]),
+        Line::from(vec![
             Span::styled("  t          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Tile metrics view"),
+            Span::raw("Switch to Tiles tab"),
         ]),
         Line::from(vec![
             Span::styled("  r          ", Style::default().fg(Color::Yellow)),

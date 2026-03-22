@@ -6,7 +6,11 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use flux_communication::{ShmemKind, cleanup_flink};
 use flux_timing::{Duration, Instant};
-use ratatui::widgets::TableState;
+use ratatui::{
+    style::{Stylize, palette::tailwind},
+    text::Line,
+    widgets::TableState,
+};
 
 use crate::{
     discovery,
@@ -71,6 +75,39 @@ impl SortMode {
             SortMode::Kind => "kind",
             SortMode::Status => "status",
             SortMode::Activity => "activity",
+        }
+    }
+}
+
+
+/// Tabs available in the flux-ctl TUI.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum FluxTab {
+    /// The Apps tab — shows list view and segment detail sub-view.
+    #[default]
+    Apps,
+    /// The Tiles tab — shows tile utilisation metrics.
+    Tiles,
+}
+
+impl FluxTab {
+    pub fn title(self) -> Line<'static> {
+        format!("  {self}  ").fg(self.palette().c300).bg(tailwind::SLATE.c950).into()
+    }
+
+    pub const fn palette(self) -> tailwind::Palette {
+        match self {
+            Self::Apps => tailwind::TEAL,
+            Self::Tiles => tailwind::VIOLET,
+        }
+    }
+}
+
+impl std::fmt::Display for FluxTab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Apps => write!(f, "1:Apps"),
+            Self::Tiles => write!(f, "2:Tiles"),
         }
     }
 }
@@ -152,6 +189,8 @@ pub struct App {
     pub last_refresh: Instant,
     pub show_help: bool,
     pub view: View,
+    /// Active tab.
+    pub tab: FluxTab,
     pub status_msg: Option<(String, Instant)>,
     pub confirm_cleanup: bool,
     pub confirm_cleanup_all: bool,
@@ -206,6 +245,7 @@ impl App {
             last_refresh: Instant::now(),
             show_help: false,
             view: View::List,
+            tab: FluxTab::Apps,
             status_msg: None,
             confirm_cleanup: false,
             confirm_cleanup_all: false,
@@ -237,6 +277,7 @@ impl App {
             last_refresh: Instant::now(),
             show_help: false,
             view: View::List,
+            tab: FluxTab::Apps,
             status_msg: None,
             confirm_cleanup: false,
             confirm_cleanup_all: false,
@@ -516,6 +557,10 @@ impl App {
     }
 
     pub fn next(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            self.tile_metrics.select_next();
+            return;
+        }
         match &mut self.view {
             View::List => {
                 if self.total_rows > 0 {
@@ -536,11 +581,15 @@ impl App {
                     }
                 }
             },
-            View::Tiles => self.tile_metrics.select_next(),
+            View::Tiles => {}
         }
     }
 
     pub fn previous(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            self.tile_metrics.select_prev();
+            return;
+        }
         match &mut self.view {
             View::List => {
                 self.selected = self.selected.saturating_sub(1);
@@ -553,22 +602,30 @@ impl App {
                     detail.selected_pid = detail.selected_pid.saturating_sub(1);
                 }
             },
-            View::Tiles => self.tile_metrics.select_prev(),
+            View::Tiles => {}
         }
     }
 
     pub fn home(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            self.tile_metrics.select_home();
+            return;
+        }
         match &mut self.view {
             View::List => self.selected = 0,
             View::Detail(detail) => match detail.focus {
                 DetailFocus::ConsumerGroups => detail.selected_group = 0,
                 DetailFocus::Processes => detail.selected_pid = 0,
             },
-            View::Tiles => self.tile_metrics.select_home(),
+            View::Tiles => {}
         }
     }
 
     pub fn end(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            self.tile_metrics.select_end();
+            return;
+        }
         match &mut self.view {
             View::List => {
                 if self.total_rows > 0 {
@@ -587,11 +644,15 @@ impl App {
                     }
                 }
             },
-            View::Tiles => self.tile_metrics.select_end(),
+            View::Tiles => {}
         }
     }
 
     pub fn page_up(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            self.tile_metrics.select_page_up();
+            return;
+        }
         match &mut self.view {
             View::List => {
                 self.selected = self.selected.saturating_sub(10);
@@ -604,11 +665,15 @@ impl App {
                     detail.selected_pid = detail.selected_pid.saturating_sub(10);
                 }
             },
-            View::Tiles => self.tile_metrics.select_page_up(),
+            View::Tiles => {}
         }
     }
 
     pub fn page_down(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            self.tile_metrics.select_page_down();
+            return;
+        }
         match &mut self.view {
             View::List => {
                 if self.total_rows > 0 {
@@ -629,7 +694,7 @@ impl App {
                     }
                 }
             },
-            View::Tiles => self.tile_metrics.select_page_down(),
+            View::Tiles => {}
         }
     }
 
@@ -643,6 +708,9 @@ impl App {
     }
 
     pub fn enter(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            return;
+        }
         match &self.view {
             View::Tiles => {}
             View::List => {
@@ -695,13 +763,16 @@ impl App {
     }
 
     pub fn back(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            self.tab = FluxTab::Apps;
+            return;
+        }
         match &self.view {
             View::Detail(_) => {
                 self.consumer_cursor_history.clear();
                 self.view = View::List;
             }
-            View::Tiles => self.view = View::List,
-            View::List => {}
+            View::List | View::Tiles => {}
         }
     }
 
@@ -725,6 +796,9 @@ impl App {
     }
 
     pub fn request_cleanup(&mut self) {
+        if self.tab == FluxTab::Tiles {
+            return;
+        }
         match &self.view {
             View::List => self.request_cleanup_list(),
             View::Detail(_) => self.request_cleanup_detail(),
@@ -909,10 +983,12 @@ impl App {
             return false;
         }
 
-        let confirming = match &self.view {
-            View::List => self.confirm_cleanup || self.confirm_cleanup_all,
-            View::Detail(d) => d.confirm_cleanup,
-            View::Tiles => false,
+        let confirming = match self.tab {
+            FluxTab::Tiles => false,
+            FluxTab::Apps => match &self.view {
+                View::List | View::Tiles => self.confirm_cleanup || self.confirm_cleanup_all,
+                View::Detail(d) => d.confirm_cleanup,
+            },
         };
         if confirming {
             match key.code {
@@ -928,39 +1004,21 @@ impl App {
             return false;
         }
 
-        match &self.view {
-            View::List => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    if !self.filter_text.is_empty() {
-                        self.filter_text.clear();
-                        self.refresh();
-                    } else {
-                        return true;
-                    }
-                }
-                KeyCode::Char('?') => self.toggle_help(),
-                KeyCode::Up | KeyCode::Char('k') => self.previous(),
-                KeyCode::Down | KeyCode::Char('j') => self.next(),
-                KeyCode::Home | KeyCode::Char('g') => self.home(),
-                KeyCode::End | KeyCode::Char('G') => self.end(),
-                KeyCode::PageUp => self.page_up(),
-                KeyCode::PageDown => self.page_down(),
-                KeyCode::Enter => self.enter(),
-                KeyCode::Char('d') => self.request_cleanup(),
-                KeyCode::Char('D') => self.request_cleanup_all(),
-                KeyCode::Char('r') => self.refresh(),
-                KeyCode::Char('/') => {
-                    self.filter_mode = true;
-                }
-                KeyCode::Char('s') => self.toggle_sort(),
-                KeyCode::Char('a') => {
-                    self.hide_dead = !self.hide_dead;
-                    self.refresh();
-                }
-                KeyCode::Char('t') => self.view = View::Tiles,
-                _ => {}
-            },
-            View::Tiles => match key.code {
+        // ── Global tab switching (number keys work from any tab) ───────────
+        match key.code {
+            KeyCode::Char('1') => {
+                self.tab = FluxTab::Apps;
+                return false;
+            }
+            KeyCode::Char('2') => {
+                self.tab = FluxTab::Tiles;
+                return false;
+            }
+            _ => {}
+        }
+
+        match self.tab {
+            FluxTab::Tiles => match key.code {
                 KeyCode::Char('q') => return true,
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('t') => self.back(),
                 KeyCode::Char('?') => self.toggle_help(),
@@ -972,21 +1030,55 @@ impl App {
                 KeyCode::PageDown => self.page_down(),
                 _ => {}
             },
-            View::Detail(_) => match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Backspace => self.back(),
-                KeyCode::Char('?') => self.toggle_help(),
-                KeyCode::Char('d') => self.request_cleanup(),
-                KeyCode::Char('D') => self.request_cleanup_all(),
-                KeyCode::Char('r') => self.refresh(),
-                KeyCode::Tab => self.toggle_detail_focus(),
-                KeyCode::Up | KeyCode::Char('k') => self.previous(),
-                KeyCode::Down | KeyCode::Char('j') => self.next(),
-                KeyCode::Home | KeyCode::Char('g') => self.home(),
-                KeyCode::End | KeyCode::Char('G') => self.end(),
-                KeyCode::PageUp => self.page_up(),
-                KeyCode::PageDown => self.page_down(),
-                _ => {}
+            FluxTab::Apps => match &self.view {
+                View::List => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if !self.filter_text.is_empty() {
+                            self.filter_text.clear();
+                            self.refresh();
+                        } else {
+                            return true;
+                        }
+                    }
+                    KeyCode::Char('?') => self.toggle_help(),
+                    KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                    KeyCode::Down | KeyCode::Char('j') => self.next(),
+                    KeyCode::Home | KeyCode::Char('g') => self.home(),
+                    KeyCode::End | KeyCode::Char('G') => self.end(),
+                    KeyCode::PageUp => self.page_up(),
+                    KeyCode::PageDown => self.page_down(),
+                    KeyCode::Enter => self.enter(),
+                    KeyCode::Char('d') => self.request_cleanup(),
+                    KeyCode::Char('D') => self.request_cleanup_all(),
+                    KeyCode::Char('r') => self.refresh(),
+                    KeyCode::Char('/') => {
+                        self.filter_mode = true;
+                    }
+                    KeyCode::Char('s') => self.toggle_sort(),
+                    KeyCode::Char('a') => {
+                        self.hide_dead = !self.hide_dead;
+                        self.refresh();
+                    }
+                    KeyCode::Char('t') => self.tab = FluxTab::Tiles,
+                    _ => {}
+                },
+                View::Detail(_) => match key.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Esc | KeyCode::Backspace => self.back(),
+                    KeyCode::Char('?') => self.toggle_help(),
+                    KeyCode::Char('d') => self.request_cleanup(),
+                    KeyCode::Char('D') => self.request_cleanup_all(),
+                    KeyCode::Char('r') => self.refresh(),
+                    KeyCode::Tab => self.toggle_detail_focus(),
+                    KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                    KeyCode::Down | KeyCode::Char('j') => self.next(),
+                    KeyCode::Home | KeyCode::Char('g') => self.home(),
+                    KeyCode::End | KeyCode::Char('G') => self.end(),
+                    KeyCode::PageUp => self.page_up(),
+                    KeyCode::PageDown => self.page_down(),
+                    _ => {}
+                },
+                View::Tiles => {} // unreachable on Apps tab
             },
         }
 
