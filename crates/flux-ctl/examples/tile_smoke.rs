@@ -129,8 +129,12 @@ fn main() {
         let mut scoped = flux::spine::ScopedSpine::new(&mut spine, scope, None, None);
         let stop = Arc::clone(&scoped.stop_flag);
 
-        // Hot tile — no pacing
-        attach_tile(QuoteIngester::default(), &mut scoped, TileConfig::background(None, None));
+        // Hot tile — minimal pacing (still high utilisation, but won't lap consumers)
+        attach_tile(
+            QuoteIngester::default(),
+            &mut scoped,
+            TileConfig::background(None, Some(Duration::from_micros(10))),
+        );
 
         // Medium tile — slight pacing
         attach_tile(
