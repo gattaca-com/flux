@@ -60,6 +60,7 @@ struct ConnectionManager {
     // Outbound connections that completed during maybe_reconnect, drained in poll_with.
     reconnected_to: Vec<Token>,
     next_token: usize,
+    raw: bool,
 }
 impl Default for ConnectionManager {
     fn default() -> Self {
@@ -74,6 +75,7 @@ impl Default for ConnectionManager {
             reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
+            raw: false,
         }
     }
 }
@@ -182,13 +184,11 @@ impl ConnectionManager {
     fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
         if let Some(stream) = self.try_connect(o, addr) {
-            let mut tcp_stream = TcpStream::from_stream_with_telemetry(
-                stream,
-                o,
-                addr,
-                self.telemetry,
-                self.dcache.is_some(),
-            );
+            let mut tcp_stream = if self.raw {
+                TcpStream::raw(stream, o, addr, self.telemetry)
+            } else {
+                TcpStream::from_stream_with_telemetry(stream, o, addr, self.telemetry, self.dcache.is_some())
+            };
             if let Some(msg) = &self.on_connect_msg &&
                 tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
@@ -358,13 +358,11 @@ impl ConnectionManager {
                             error!("couldn't set nodelay on stream to {addr}: {e}");
                             continue;
                         }
-                        let mut conn = TcpStream::from_stream_with_telemetry(
-                            stream,
-                            token,
-                            addr,
-                            self.telemetry,
-                            self.dcache.is_some(),
-                        );
+                        let mut conn = if self.raw {
+                            TcpStream::raw(stream, token, addr, self.telemetry)
+                        } else {
+                            TcpStream::from_stream_with_telemetry(stream, token, addr, self.telemetry, self.dcache.is_some())
+                        };
 
                         if let Some(msg) = &self.on_connect_msg &&
                             conn.write_or_enqueue_with(
@@ -433,6 +431,16 @@ impl Default for TcpConnector {
     }
 }
 impl TcpConnector {
+    /// Switches all streams managed by this connector to raw (unframed) mode.
+    ///
+    /// In raw mode, sends are written verbatim and receives deliver whatever
+    /// bytes arrived from the OS in one read call. There is no length prefix or
+    /// timestamp header. The caller is responsible for framing and reassembly.
+    pub fn with_raw(mut self) -> Self {
+        self.conn_mgr.raw = true;
+        self
+    }
+
     /// Sets the interval used to retry disconnected/failed outbound
     /// connections.
     ///
