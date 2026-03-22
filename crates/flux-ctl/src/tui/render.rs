@@ -668,7 +668,7 @@ fn render_tiles(frame: &mut Frame, app: &mut App) {
             TileRow::Tile(..) => 2,
         };
 
-        if current_y + row_height <= scroll_offset {
+        if current_y < scroll_offset {
             current_y += row_height;
             continue;
         }
