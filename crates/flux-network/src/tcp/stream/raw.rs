@@ -180,7 +180,18 @@ impl RawStream {
         let mut total = 0;
         loop {
             match self.stream.read(&mut self.rx_buf[total..]) {
-                Ok(0) => return ReadOutcome::Disconnected,
+                Ok(0) => {
+                    // Peer closed. If we already accumulated bytes, deliver
+                    // them first — the next call will see Ok(0) again and
+                    // return Disconnected.
+                    if total > 0 {
+                        return ReadOutcome::PayloadDone {
+                            payload: MessagePayload::Raw(&self.rx_buf[..total]),
+                            send_ts: Nanos(0),
+                        };
+                    }
+                    return ReadOutcome::Disconnected;
+                }
                 Ok(n) => {
                     total += n;
                     if total == self.rx_buf.len() {

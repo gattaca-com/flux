@@ -44,6 +44,11 @@ pub enum PollEvent<'a> {
     Disconnect { token: Token },
     /// A complete framed message was received.
     Message { token: Token, payload: MessagePayload<'a>, send_ts: Nanos },
+    /// A raw (unframed) message arrived.
+    ///
+    /// Raw connections never carry a sender timestamp and never produce
+    /// `Cached` payloads — the data is always a plain byte slice.
+    RawMessage { token: Token, data: &'a [u8] },
 }
 
 struct ConnectionManager {
@@ -60,6 +65,7 @@ struct ConnectionManager {
     // Outbound connections that completed during maybe_reconnect, drained in poll_with.
     reconnected_to: Vec<Token>,
     next_token: usize,
+    raw_listeners: Vec<Token>,
 }
 impl Default for ConnectionManager {
     fn default() -> Self {
@@ -74,6 +80,7 @@ impl Default for ConnectionManager {
             reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
+            raw_listeners: Vec::new(),
         }
     }
 }
@@ -205,6 +212,32 @@ impl ConnectionManager {
         }
     }
 
+    fn connect_raw(&mut self, addr: SocketAddr) -> Option<Token> {
+        let o = Token(self.next_token);
+        if let Some(stream) = self.try_connect(o, addr) {
+            let mut tcp_stream = TcpStream::raw(stream, o, addr, self.telemetry);
+            if let Some(msg) = &self.on_connect_msg &&
+                tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+                    buf.extend_from_slice(msg);
+                }) == ConnState::Disconnected
+            {
+                warn!(?addr, "on_connect_msg send failed");
+                return None;
+            }
+            self.conns.push((o, ConnectionVariant::Outbound(tcp_stream)));
+            self.next_token += 1;
+            Some(o)
+        } else {
+            None
+        }
+    }
+
+    fn bind_raw(&mut self, addr: SocketAddr) -> Option<Token> {
+        let token = self.listen_at(addr)?;
+        self.raw_listeners.push(token);
+        Some(token)
+    }
+
     // This will start listening on a given port, returning the token tied to that
     // port. When a connection comes in through that port, this token will be
     // communicated to the handling function so the handler can know what
@@ -326,12 +359,19 @@ impl ConnectionManager {
             match &mut self.conns[stream_id].1 {
                 ConnectionVariant::Outbound(tcp_connection) |
                 ConnectionVariant::Inbound(tcp_connection) => {
+                    let is_raw = tcp_connection.is_raw();
                     if tcp_connection.poll_with(
                         self.poll.registry(),
                         e,
                         self.dcache.as_deref(),
                         &mut |token, payload, send_ts| {
-                            handler(PollEvent::Message { token, payload, send_ts });
+                            if is_raw {
+                                if let MessagePayload::Raw(data) = payload {
+                                    handler(PollEvent::RawMessage { token, data });
+                                }
+                            } else {
+                                handler(PollEvent::Message { token, payload, send_ts });
+                            }
                         },
                     ) == ConnState::Disconnected
                     {
@@ -358,13 +398,18 @@ impl ConnectionManager {
                             error!("couldn't set nodelay on stream to {addr}: {e}");
                             continue;
                         }
-                        let mut conn = TcpStream::from_stream_with_telemetry(
-                            stream,
-                            token,
-                            addr,
-                            self.telemetry,
-                            self.dcache.is_some(),
-                        );
+                        let is_raw_listener = self.raw_listeners.contains(&event_token);
+                        let mut conn = if is_raw_listener {
+                            TcpStream::raw(stream, token, addr, self.telemetry)
+                        } else {
+                            TcpStream::from_stream_with_telemetry(
+                                stream,
+                                token,
+                                addr,
+                                self.telemetry,
+                                self.dcache.is_some(),
+                            )
+                        };
 
                         if let Some(msg) = &self.on_connect_msg &&
                             conn.write_or_enqueue_with(
@@ -556,6 +601,23 @@ impl TcpConnector {
     /// inbound stream, and emit a [`ConnectionEvent`] through `on_accept`.
     pub fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
         self.conn_mgr.listen_at(addr)
+    }
+
+    /// Like [`connect`] but creates a **raw** (unframed) outbound connection.
+    ///
+    /// Messages on this stream arrive as [`PollEvent::RawMessage`] — no
+    /// length-prefix framing or send-timestamp header is added/expected.
+    #[inline]
+    pub fn connect_raw(&mut self, addr: SocketAddr) -> Option<Token> {
+        self.conn_mgr.connect_raw(addr)
+    }
+
+    /// Like [`listen_at`] but marks the listener as **raw** so that
+    /// every accepted connection uses unframed IO.
+    ///
+    /// Messages on accepted streams arrive as [`PollEvent::RawMessage`].
+    pub fn bind_raw(&mut self, addr: SocketAddr) -> Option<Token> {
+        self.conn_mgr.bind_raw(addr)
     }
 
     /// Returns an iterator over tokens that are currently pending reconnection

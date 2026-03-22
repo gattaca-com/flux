@@ -103,6 +103,10 @@ impl TcpStream {
         Self(TcpStreamInner::Raw(RawStream::new(stream, token, peer_addr, telemetry)))
     }
 
+    pub fn is_raw(&self) -> bool {
+        matches!(self.0, TcpStreamInner::Raw(_))
+    }
+
     #[inline]
     pub fn reset_with_new_stream(
         &mut self,
