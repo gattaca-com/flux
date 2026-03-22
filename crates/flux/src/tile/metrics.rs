@@ -1,7 +1,7 @@
 use std::{fmt::Display, path::Path};
 
 use flux_communication::shmem_dir_queues_string_with_base;
-use flux_timing::{IngestionTime, Instant, Nanos};
+use flux_timing::{IngestionTime, Instant, Nanos, global_clock_not_mocked};
 
 use crate::communication::queue::{Producer, Queue, QueueType};
 
@@ -104,17 +104,20 @@ impl TileMetrics {
     #[inline]
     pub fn end(&mut self, did_work: bool) {
         if did_work {
-            let duration = Instant::now().0.saturating_sub(self.latest_begin.0);
+            let ticks = Instant::now().0.saturating_sub(self.latest_begin.0);
+            // Convert TSC ticks → nanoseconds so busy_ticks is in the same
+            // unit as total_ticks() (which is derived from Nanos).
+            let nanos = global_clock_not_mocked().delta_as_nanos(0, ticks);
 
-            self.sample.busy_ticks += duration;
-            self.sample.busy_sum += duration;
+            self.sample.busy_ticks += nanos;
+            self.sample.busy_sum += nanos;
             self.sample.busy_count += 1;
 
-            if duration < self.sample.busy_min {
-                self.sample.busy_min = duration;
+            if nanos < self.sample.busy_min {
+                self.sample.busy_min = nanos;
             }
-            if duration > self.sample.busy_max {
-                self.sample.busy_max = duration;
+            if nanos > self.sample.busy_max {
+                self.sample.busy_max = nanos;
             }
         }
 
