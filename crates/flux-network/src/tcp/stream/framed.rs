@@ -1,50 +1,14 @@
 use std::{
-    collections::VecDeque,
     io::{self, IoSlice, Read, Write},
     net::SocketAddr,
 };
 
-use flux_communication::Timer;
 use flux_timing::Nanos;
 use flux_utils::{DCache, DCacheRef};
-
-enum RxBuf {
-    Heap(Vec<u8>),
-    DCache,
-}
-use mio::{Interest, Registry, Token, event::Event};
+use mio::{Registry, Token, event::Event};
 use tracing::{debug, warn};
 
-pub enum MessagePayload<'a> {
-    Raw(&'a [u8]),
-    Cached(DCacheRef),
-}
-
-/// Controls emission of network latency and alloc telemetry.
-///
-/// Has no effect on framing or message delivery.
-/// `send_ts` is always surfaced via `poll_with`.
-#[derive(Clone, Copy)]
-pub enum TcpTelemetry {
-    Disabled,
-    Enabled { app_name: &'static str },
-}
-
-/// Timers for TCP stream metrics.
-#[derive(Clone, Copy, Debug)]
-struct TcpTimers {
-    latency: Timer,
-    alloc: Timer,
-}
-
-impl TcpTimers {
-    fn new(app_name: &'static str, label: &str) -> Self {
-        Self {
-            latency: Timer::new(app_name, format!("tcp_latency_{label}")),
-            alloc: Timer::new(app_name, format!("tcp_alloc_{label}")),
-        }
-    }
-}
+use super::{ConnState, MessagePayload, ReadOutcome, SendBacklog, TcpTelemetry, TcpTimers};
 
 /// Frame length prefix.
 const LEN_HEADER_SIZE: usize = core::mem::size_of::<u32>();
@@ -55,20 +19,9 @@ const FRAME_HEADER_SIZE: usize = LEN_HEADER_SIZE + TS_HEADER_SIZE;
 // TODO: might need to tweak these
 const RX_BUF_SIZE: usize = 32 * 1024;
 
-/// Response type for all external calls.
-///
-/// `Alive` means the connection is still usable.
-/// `Disconnected` means the peer is gone and the connection must be rebuilt.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ConnState {
-    Alive,
-    Disconnected,
-}
-
-enum ReadOutcome<'a> {
-    PayloadDone { payload: MessagePayload<'a>, send_ts: Nanos },
-    WouldBlock,
-    Disconnected,
+pub(super) enum RxBuf {
+    Heap(Vec<u8>),
+    DCache,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -77,21 +30,22 @@ enum RxState {
     ReadingHeader { buf: [u8; FRAME_HEADER_SIZE], have: usize },
     ReadingPayload { msg_len: usize, offset: usize, send_ts: Nanos, dc_offset: Option<usize> },
 }
+
 impl Default for RxState {
     fn default() -> Self {
         Self::ReadingHeader { buf: [0; FRAME_HEADER_SIZE], have: 0 }
     }
 }
 
-/// Single mio-backed TCP connection.
+/// Single mio-backed TCP connection with length-prefixed framing.
 ///
-/// Frames are length-prefixed and contain the send ts:
-///   - 4-byte LE length header
-///   - 8-byte LE nanosecond ts
+/// Frame layout:
+///   - 4-byte LE length
+///   - 8-byte LE nanosecond send timestamp
 ///   - payload bytes
 ///
 /// Outbound:
-///   - `write_or_enqueue(msg)` serialises `msg` into an internal staging
+///   - `write_or_enqueue_with(msg)` serialises `msg` into an internal staging
 ///     buffer.
 ///   - Attempts to write bytes (non-blocking) to socket.
 ///   - Any unwritten remainder is queued (this path allocates).
@@ -100,43 +54,29 @@ impl Default for RxState {
 /// Inbound:
 ///   - Reads the 4-byte length prefix, then reads exactly that many bytes.
 ///   - When a full frame is assembled, `poll_with` invokes the caller callback
-///     with the deserialised T.
+///     with the payload.
 ///   - Continues reading frames until `WouldBlock` (no more messages are
 ///     ready).
 ///
-/// Recconect handling:
+/// Reconnect handling:
 ///   - If `ConnState::Disconnected` is returned caller must treat the
-///     connection as dead and rebuild the state
-pub struct TcpStream {
+///     connection as dead and rebuild the state.
+pub(super) struct FramedStream {
     stream: mio::net::TcpStream,
     peer_addr: SocketAddr,
-    token: Token,
-
     rx_state: RxState,
     rx_buf: RxBuf,
     header_buf: [u8; FRAME_HEADER_SIZE],
     send_buf: Vec<u8>,
-    /// Filled when send would block.
-    /// First entry will either be a full message or the current partially
-    /// written head.
-    send_backlog: VecDeque<Vec<u8>>,
-    /// We don't pop until the full message is written,
-    /// so we use this cursor to know what slice to write
-    send_cursor: usize,
-
-    /// True if WRITABLE interest is currently registered in `poll`.
-    /// Invariant: `writable_armed == !send_q.is_empty()`
-    writable_armed: bool,
-
-    /// Timers for network latency and alloc telemetry.
+    backlog: SendBacklog,
     timers: Option<TcpTimers>,
 }
 
-impl TcpStream {
-    pub const SEND_BUF_SIZE: usize = 32 * 1024;
+impl FramedStream {
+    pub(super) const SEND_BUF_SIZE: usize = 32 * 1024;
 
     #[inline(never)]
-    pub(crate) fn from_stream_with_telemetry(
+    pub(super) fn new(
         stream: mio::net::TcpStream,
         token: Token,
         peer_addr: SocketAddr,
@@ -148,29 +88,24 @@ impl TcpStream {
             TcpTelemetry::Enabled { app_name } => {
                 let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
                 let peer = peer_addr.to_string();
-                let steam_label = format!("{local_port}-{peer}");
-                Some(TcpTimers::new(app_name, &steam_label))
+                Some(TcpTimers::new(app_name, &format!("{local_port}-{peer}")))
             }
         };
         let rx_buf = if use_dcache { RxBuf::DCache } else { RxBuf::Heap(vec![0; RX_BUF_SIZE]) };
-
         Self {
+            backlog: SendBacklog::new(token),
             stream,
             peer_addr,
-            token,
             rx_state: Default::default(),
             rx_buf,
             header_buf: [0; FRAME_HEADER_SIZE],
             send_buf: vec![0; Self::SEND_BUF_SIZE],
-            send_backlog: VecDeque::with_capacity(64),
-            send_cursor: 0,
-            writable_armed: false,
             timers,
         }
     }
 
     #[inline]
-    pub fn reset_with_new_stream(
+    pub(super) fn reset_with_new_stream(
         &mut self,
         registry: &Registry,
         stream: mio::net::TcpStream,
@@ -178,17 +113,16 @@ impl TcpStream {
     ) -> ConnState {
         self.rx_state = Default::default();
         self.send_buf.clear();
-        self.send_cursor = 0;
         self.header_buf.fill(0);
         self.stream = stream;
-        if !self.send_backlog.is_empty() {
-            self.writable_armed = false;
+        if !self.backlog.is_empty() {
+            self.backlog.disarm();
             if let Some(message) = on_connect_msg {
                 self.serialise_frame(|bytes| bytes.extend_from_slice(message));
                 let data = self.alloc_vec(0);
-                return self.enqueue_front(registry, data);
+                return self.backlog.enqueue_front(registry, &mut self.stream, data);
             }
-            self.arm_writable(registry)
+            self.backlog.arm_writable(registry, &mut self.stream)
         } else if let Some(message) = on_connect_msg {
             self.write_or_enqueue_with(registry, |bytes| bytes.extend_from_slice(message))
         } else {
@@ -202,7 +136,7 @@ impl TcpStream {
     /// slice is only valid for the duration of the callback. When DCache is
     /// set, `payload` is [`MessagePayload::Cached`] and the ref may be kept.
     #[inline]
-    pub fn poll_with<F>(
+    pub(super) fn poll_with<F>(
         &mut self,
         registry: &Registry,
         ev: &Event,
@@ -224,7 +158,9 @@ impl TcpStream {
             }
         }
 
-        if ev.is_writable() && self.drain_backlog(registry) == ConnState::Disconnected {
+        if ev.is_writable() &&
+            self.backlog.drain(registry, &mut self.stream) == ConnState::Disconnected
+        {
             return ConnState::Disconnected;
         }
 
@@ -239,7 +175,11 @@ impl TcpStream {
     /// TODO: avoid allocation by queueing offsets into `self.send_buf` instead
     /// of Vec<u8>.
     #[inline]
-    pub fn write_or_enqueue_with<F>(&mut self, registry: &Registry, serialise: F) -> ConnState
+    pub(super) fn write_or_enqueue_with<F>(
+        &mut self,
+        registry: &Registry,
+        serialise: F,
+    ) -> ConnState
     where
         F: Fn(&mut Vec<u8>),
     {
@@ -248,13 +188,13 @@ impl TcpStream {
             return ConnState::Alive;
         }
 
-        if !self.send_backlog.is_empty() {
-            if self.drain_backlog(registry) == ConnState::Disconnected {
+        if !self.backlog.is_empty() {
+            if self.backlog.drain(registry, &mut self.stream) == ConnState::Disconnected {
                 return ConnState::Disconnected;
             }
-            if !self.send_backlog.is_empty() {
+            if !self.backlog.is_empty() {
                 let data = self.alloc_vec(0);
-                return self.enqueue_back(registry, data);
+                return self.backlog.enqueue_back(registry, &mut self.stream, data);
             }
             // backlog drained, fall through to direct write
         }
@@ -270,12 +210,12 @@ impl TcpStream {
             Ok(n) if n == self.send_buf.len() + FRAME_HEADER_SIZE => ConnState::Alive,
             Ok(n) => {
                 let data = self.alloc_vec(0);
-                self.send_cursor = n;
-                self.enqueue_back(registry, data)
+                self.backlog.cursor = n;
+                self.backlog.enqueue_back(registry, &mut self.stream, data)
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 let data = self.alloc_vec(0);
-                self.enqueue_back(registry, data)
+                self.backlog.enqueue_back(registry, &mut self.stream, data)
             }
             Err(err) => {
                 warn!(?err, "tcp: stream write fail");
@@ -284,79 +224,53 @@ impl TcpStream {
         }
     }
 
-    /// Allocate send_buf[start..end] to vec. Times the alloc if telemetry
-    /// enabled.
+    #[inline]
+    pub(super) fn has_backlog(&self) -> bool {
+        !self.backlog.is_empty()
+    }
+
+    #[inline]
+    pub(super) fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
+        self.backlog.drain(registry, &mut self.stream)
+    }
+
+    pub(super) fn close(&mut self, registry: &Registry) {
+        debug!("terminating connection");
+        let _ = registry.deregister(&mut self.stream);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub(super) fn peer(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    /// Allocate the unwritten portion of header_buf + send_buf into a Vec.
     #[inline]
     fn alloc_vec(&mut self, written: usize) -> Vec<u8> {
-        match &mut self.timers {
-            Some(timers) => {
-                let t0 = Nanos::now();
-                let mut v = Vec::with_capacity(
-                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
-                );
-                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
-                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
-                timers.alloc.emit_latency_from_nanos(t0, Nanos::now());
-                v
-            }
-            None => {
-                let mut v = Vec::with_capacity(
-                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
-                );
-                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
-                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
-                v
-            }
+        let total = FRAME_HEADER_SIZE + self.send_buf.len();
+        let t0 = self.timers.as_ref().map(|_| Nanos::now());
+        let mut v = Vec::with_capacity(total.saturating_sub(written));
+        v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
+        v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
+        if let (Some(timers), Some(t0)) = (&mut self.timers, t0) {
+            timers.alloc.emit_latency_from_nanos(t0, Nanos::now());
         }
+        v
     }
 
-    #[inline]
-    pub(crate) fn has_backlog(&self) -> bool {
-        !self.send_backlog.is_empty()
+    #[inline(always)]
+    fn serialise_frame<F>(&mut self, serialise: F)
+    where
+        F: Fn(&mut Vec<u8>),
+    {
+        self.send_buf.clear();
+        serialise(&mut self.send_buf);
+        self.header_buf[..LEN_HEADER_SIZE]
+            .copy_from_slice(&(self.send_buf.len() as u32).to_le_bytes());
+        self.header_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
+            .copy_from_slice(&Nanos::now().0.to_le_bytes());
     }
 
-    /// Flush queued data until kernel blocks, queue empty or we've written the
-    /// max bytes per iter.
-    /// returns connstate and whether it should be deregistered from writable
-    #[inline]
-    pub(crate) fn drain_backlog(&mut self, registry: &Registry) -> ConnState {
-        while let Some(front) = self.send_backlog.front() {
-            match self.stream.write(&front[self.send_cursor..]) {
-                Ok(0) => return ConnState::Disconnected,
-
-                Ok(n) => {
-                    self.send_cursor += n;
-                    if self.send_cursor == front.len() {
-                        self.send_backlog.pop_front();
-                        self.send_cursor = 0
-                    }
-                }
-
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-
-                Err(err) => {
-                    debug!(?err, "tcp: write from backlog");
-                    return ConnState::Disconnected;
-                }
-            }
-        }
-
-        // Drop WRITABLE interest only when fully drained
-        if self.send_backlog.is_empty() && self.writable_armed {
-            if let Err(err) = registry.reregister(&mut self.stream, self.token, Interest::READABLE)
-            {
-                debug!(?err, "tcp: reregister drop writable");
-                return ConnState::Disconnected;
-            }
-            self.writable_armed = false;
-        }
-
-        ConnState::Alive
-    }
-
-    /// Read a single complete frame if present.
-    /// Loops until a frame is received or we've read everything and the read
-    /// would block.
     #[inline]
     fn read_frame(&mut self, dcache: Option<&DCache>) -> ReadOutcome<'_> {
         loop {
@@ -365,7 +279,6 @@ impl TcpStream {
                     while have < FRAME_HEADER_SIZE {
                         match self.stream.read(&mut buf[have..]) {
                             Ok(0) => return ReadOutcome::Disconnected,
-
                             Ok(n) => {
                                 have += n;
                                 if have == FRAME_HEADER_SIZE {
@@ -414,12 +327,10 @@ impl TcpStream {
                                     };
                                 }
                             }
-
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 self.rx_state = RxState::ReadingHeader { buf, have };
                                 return ReadOutcome::WouldBlock;
                             }
-
                             Err(err) => {
                                 debug!(?err, "tcp: read header");
                                 return ReadOutcome::Disconnected;
@@ -484,83 +395,5 @@ impl TcpStream {
                 }
             }
         }
-    }
-
-    #[inline]
-    fn enqueue_front(&mut self, registry: &Registry, data: Vec<u8>) -> ConnState {
-        self.send_backlog.push_front(data);
-        self.arm_writable(registry)
-    }
-
-    #[inline]
-    fn enqueue_back(&mut self, registry: &Registry, data: Vec<u8>) -> ConnState {
-        self.send_backlog.push_back(data);
-        self.arm_writable(registry)
-    }
-
-    /// Arm WRITABLE notifications when transitioning from empty -> non-empty
-    /// queue. `self.poll` will start polling for writable events.
-    #[inline]
-    fn arm_writable(&mut self, registry: &Registry) -> ConnState {
-        if !self.writable_armed {
-            if let Err(err) = registry.reregister(
-                &mut self.stream,
-                self.token,
-                Interest::READABLE | Interest::WRITABLE,
-            ) {
-                debug!(?err, "tcp: poll reregister");
-                return ConnState::Disconnected;
-            }
-            self.writable_armed = true;
-        }
-        ConnState::Alive
-    }
-
-    /// Serialise payload into send buffer and prepend frame header.
-    #[inline(always)]
-    fn serialise_frame<F>(&mut self, serialise: F)
-    where
-        F: Fn(&mut Vec<u8>),
-    {
-        self.send_buf.clear();
-        serialise(&mut self.send_buf);
-        // write frame header
-        self.header_buf[..LEN_HEADER_SIZE]
-            .copy_from_slice(&(self.send_buf.len() as u32).to_le_bytes());
-        self.header_buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE]
-            .copy_from_slice(&Nanos::now().0.to_le_bytes());
-    }
-
-    pub fn close(&mut self, registry: &Registry) {
-        debug!("terminating connection");
-        let _ = registry.deregister(&mut self.stream);
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
-    }
-
-    pub(crate) fn peer(&self) -> SocketAddr {
-        self.peer_addr
-    }
-}
-
-/// Set kernel SO_SNDBUF and SO_RCVBUF on a mio TcpStream.
-pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let size = size as libc::c_int;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &size as *const _ as *const libc::c_void,
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &size as *const _ as *const libc::c_void,
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
     }
 }
