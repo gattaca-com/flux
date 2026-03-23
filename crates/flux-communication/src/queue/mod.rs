@@ -31,6 +31,27 @@ fn binary_name() -> &'static str {
     })
 }
 
+fn current_pid() -> u32 {
+    std::process::id()
+}
+
+/// Try to extract a PID from a consumer group label.
+///
+/// Labels follow the format `binary[PID].rest` — this function
+/// looks for the `[…]` segment and parses the number inside.
+fn pid_from_label(label: &str) -> Option<u32> {
+    let start = label.find('[')? + 1;
+    let end = label[start..].find(']')? + start;
+    label[start..end].parse().ok()
+}
+
+/// Check whether a process with the given PID is still alive.
+///
+/// Uses `/proc/<pid>` on Linux which avoids requiring the `libc` crate.
+fn is_pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{}", pid)).exists()
+}
+
 use flux_utils::{ArrayStr, safe_panic};
 use rand::Rng;
 use shared_memory::{ShmemConf, ShmemError};
@@ -113,15 +134,29 @@ impl QueueHeader {
         // similar to what is done in the collaborative consume
         std::thread::sleep(Duration::from_micros(rand::rng().random_range(0..10)));
 
+        // 1. Exact match — reuse the existing slot
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == key {
                 return &raw const self.group_cursors[i].cursor;
             }
         }
+
+        // 2. Empty slot
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == ArrayStr::<GROUP_LABEL_LEN>::new() {
                 self.group_labels[i] = key;
                 return &raw const self.group_cursors[i].cursor;
+            }
+        }
+
+        // 3. Slot owned by a dead process — reclaim it
+        for i in 0..MAX_GROUPS {
+            if let Some(pid) = pid_from_label(self.group_labels[i].as_str()) {
+                if !is_pid_alive(pid) {
+                    self.group_labels[i] = key;
+                    self.group_cursors[i].cursor.store(0, Ordering::Relaxed);
+                    return &raw const self.group_cursors[i].cursor;
+                }
             }
         }
 
@@ -679,8 +714,13 @@ impl<T: Copy> ConsumerBare<T> {
         let id = broadcast_id_for(self.label, std::any::type_name::<T>());
         let id = if id == 0 { "" } else { &format!(".{}", id) };
 
-        self.cursor =
-            self.queue.group_cursor(&format!("{}.{}{}.broadcast", binary_name(), self.label, id));
+        self.cursor = self.queue.group_cursor(&format!(
+            "{}[{}].{}{}.broadcast",
+            binary_name(),
+            current_pid(),
+            self.label,
+            id
+        ));
 
         // Always set current producer position without restoring value from cursor
         self.set_broadcast_pos(self.queue.count());
@@ -695,7 +735,12 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline(never)]
     fn init_collaborative(&mut self) {
-        self.cursor = self.queue.group_cursor(&format!("{}.{}.collab", binary_name(), self.label));
+        self.cursor = self.queue.group_cursor(&format!(
+            "{}[{}].{}.collab",
+            binary_name(),
+            current_pid(),
+            self.label,
+        ));
         self.acquire_next_slot();
     }
 
