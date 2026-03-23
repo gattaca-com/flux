@@ -6,11 +6,11 @@ mod standalone_producer;
 use std::path::Path;
 
 pub use adapter::SpineAdapter;
-pub use consumer::{DCacheMsg, DCacheRead, SpineConsumer};
-use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
-use flux_utils::{DCachePtr, directories::shmem_dir};
+pub use consumer::{DCacheRead, SpineConsumer, SpineDCacheConsumer};
+use flux_timing::{IngestionTime, InternalMessage, Nanos, TrackingTimestamp};
+use flux_utils::{DCacheError, DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
-pub use standalone_producer::StandaloneProducer;
+pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
 use crate::{
     communication::queue::{self},
@@ -19,6 +19,20 @@ use crate::{
 
 pub type SpineProducer<T> = queue::Producer<InternalMessage<T>>;
 pub type SpineQueue<T> = queue::Queue<InternalMessage<T>>;
+
+/// Wire type for dcache-backed queues. Internal to the spine; users see `T`
+/// and `&[u8]` at consume sites.
+#[derive(Clone, Copy, Debug)]
+pub struct DCacheMsg<T> {
+    pub data: T,
+    dref: DCacheRef,
+}
+
+impl<T: Copy> DCacheMsg<T> {
+    pub(crate) fn new(data: T, dref: Option<DCacheRef>) -> Self {
+        Self { data, dref: dref.unwrap_or(DCacheRef::NONE) }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SpineProducerWithDCache<T: 'static + Copy> {
@@ -29,6 +43,10 @@ pub struct SpineProducerWithDCache<T: 'static + Copy> {
 impl<T: 'static + Copy> SpineProducerWithDCache<T> {
     pub fn new(queue: SpineQueue<DCacheMsg<T>>, dcache: DCachePtr) -> Self {
         Self { inner: queue::Producer::from(queue), dcache }
+    }
+
+    pub fn dcache_ptr(&self) -> DCachePtr {
+        self.dcache
     }
 }
 
@@ -70,6 +88,49 @@ pub trait SpineProducers {
     {
         self.as_ref().produce_without_first(msg);
     }
+
+    fn produce_with_dcache<T: 'static + Copy, F: FnOnce(&mut [u8])>(
+        &self,
+        data: T,
+        payload: Option<(usize, F)>,
+    ) -> Result<(), DCacheError>
+    where
+        Self: AsRef<SpineProducerWithDCache<T>>,
+    {
+        let ts = self.timestamp().with_new_publish_delta();
+        let p: &SpineProducerWithDCache<T> = self.as_ref();
+        let dref = if let Some((len, f)) = payload { Some(p.dcache.write(len, f)?) } else { None };
+        let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
+        p.inner.produce_without_first(&msg);
+        Ok(())
+    }
+
+    fn produce_with_dref<T: 'static + Copy>(&self, data: T, dref: DCacheRef, send_ts: Nanos)
+    where
+        Self: AsRef<SpineProducerWithDCache<T>>,
+    {
+        let ts = self.timestamp().with_ingestion_t(send_ts.into());
+        let p: &SpineProducerWithDCache<T> = self.as_ref();
+        let msg = InternalMessage::new(ts, DCacheMsg::new(data, Some(dref)));
+        p.inner.produce_without_first(&msg);
+    }
+
+    fn produce_with_dcache_and_ingestion<T: 'static + Copy, F: FnOnce(&mut [u8])>(
+        &self,
+        data: T,
+        payload: Option<(usize, F)>,
+        ingestion_t: IngestionTime,
+    ) -> Result<(), DCacheError>
+    where
+        Self: AsRef<SpineProducerWithDCache<T>>,
+    {
+        let ts = self.timestamp().with_ingestion_t(ingestion_t);
+        let p: &SpineProducerWithDCache<T> = self.as_ref();
+        let dref = if let Some((len, f)) = payload { Some(p.dcache.write(len, f)?) } else { None };
+        let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
+        p.inner.produce_without_first(&msg);
+        Ok(())
+    }
 }
 
 pub trait FluxSpine: Sized + Send {
@@ -94,16 +155,23 @@ pub trait FluxSpine: Sized + Send {
         StandaloneProducer::new(*<Self as AsRef<SpineQueue<T>>>::as_ref(self), id)
     }
 
+    fn dcache_ptr_for<T: 'static + Copy>(&self) -> DCachePtr
+    where
+        Self: HasDCacheQueue<T>,
+    {
+        self.dcache_queue_and_ptr().1
+    }
+
     fn standalone_dcache_producer_for<T: Copy>(
         &mut self,
         name: TileName,
-    ) -> StandaloneProducer<DCacheMsg<T>>
+    ) -> StandaloneDCacheProducer<T>
     where
         Self: HasDCacheQueue<T>,
     {
         let id = self.register_tile(name);
         let (queue, dcache) = self.dcache_queue_and_ptr();
-        StandaloneProducer::new_with_dcache(queue, dcache, id)
+        StandaloneDCacheProducer::new(queue, dcache, id)
     }
 
     /// Removes all files related to a given spine. Does not clear the shared

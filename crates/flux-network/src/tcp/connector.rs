@@ -1,11 +1,12 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
+use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_timing::{Duration, Nanos, Repeater};
-use flux_utils::{DCache, safe_panic};
+use flux_utils::{DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
-use crate::tcp::{ConnState, MessagePayload, TcpStream, TcpTelemetry, stream::set_socket_buf_size};
+use crate::tcp::{ConnState, TcpStream, TcpTelemetry, stream::set_socket_buf_size};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -28,8 +29,11 @@ pub enum ConnectionVariant {
     Listener(TcpListener),
 }
 
-/// Event emitted by [`TcpConnector::poll_with`] for each notable IO occurrence.
-pub enum PollEvent<'a> {
+/// Event emitted by [`TcpConnector::poll_with`] and
+/// [`TcpConnector::poll_with_produce`] for each notable IO occurrence.
+///
+/// `Payload = &'a [u8]` for both variants.
+pub enum PollEvent<Payload> {
     /// A new connection was accepted from a listener.
     ///
     /// - `listener`: token of the listening socket that accepted
@@ -43,7 +47,7 @@ pub enum PollEvent<'a> {
     /// A connection was closed (by the remote or due to an IO error).
     Disconnect { token: Token },
     /// A complete framed message was received.
-    Message { token: Token, payload: MessagePayload<'a>, send_ts: Nanos },
+    Message { token: Token, payload: Payload, send_ts: Nanos },
 }
 
 struct ConnectionManager {
@@ -53,7 +57,7 @@ struct ConnectionManager {
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
-    dcache: Option<Arc<DCache>>,
+    dcache: Option<DCachePtr>,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
@@ -314,7 +318,7 @@ impl ConnectionManager {
     #[inline]
     fn handle_event<F>(&mut self, e: &Event, handler: &mut F)
     where
-        F: for<'a> FnMut(PollEvent<'a>),
+        F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
         let event_token = e.token();
         let Some(stream_id) = self.conns.iter().position(|(t, _)| t == &event_token) else {
@@ -330,8 +334,8 @@ impl ConnectionManager {
                         self.poll.registry(),
                         e,
                         self.dcache.as_deref(),
-                        &mut |token, payload, send_ts| {
-                            handler(PollEvent::Message { token, payload, send_ts });
+                        &mut |token, bytes, send_ts| {
+                            handler(PollEvent::Message { token, payload: bytes, send_ts });
                         },
                     ) == ConnState::Disconnected
                     {
@@ -377,6 +381,90 @@ impl ConnectionManager {
                             continue;
                         }
                         handler(PollEvent::Accept {
+                            listener: event_token,
+                            stream: token,
+                            peer_addr: addr,
+                        });
+                        self.conns.push((token, ConnectionVariant::Inbound(conn)));
+                        self.next_token += 1;
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn handle_event_produce<T, P, F>(&mut self, e: &Event, produce: &mut P, on_msg: &mut F)
+    where
+        T: 'static + Copy,
+        P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
+        F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
+    {
+        let event_token = e.token();
+        let Some(stream_id) = self.conns.iter().position(|(t, _)| t == &event_token) else {
+            safe_panic!("got event for unknown token");
+            return;
+        };
+
+        loop {
+            match &mut self.conns[stream_id].1 {
+                ConnectionVariant::Outbound(tcp_connection) |
+                ConnectionVariant::Inbound(tcp_connection) => {
+                    let dcache =
+                        self.dcache.as_deref().expect("dcache required for poll_with_produce");
+                    if tcp_connection.poll_with_produce(
+                        self.poll.registry(),
+                        e,
+                        dcache,
+                        produce,
+                        &mut |token, bytes, send_ts| {
+                            on_msg(PollEvent::Message { token, payload: bytes, send_ts })
+                        },
+                    ) == ConnState::Disconnected
+                    {
+                        let _ = on_msg(PollEvent::Disconnect { token: event_token });
+                        self.disconnect_at_index(stream_id);
+                    }
+                    return;
+                }
+                ConnectionVariant::Listener(tcp_listener) => {
+                    if let Ok((mut stream, addr)) = tcp_listener.accept() {
+                        tracing::info!(?addr, "client connected");
+                        if let Some(size) = self.socket_buf_size {
+                            set_socket_buf_size(&stream, size);
+                        }
+                        let token = Token(self.next_token);
+                        if let Err(e) =
+                            self.poll.registry().register(&mut stream, token, Interest::READABLE)
+                        {
+                            error!("couldn't register client {e}");
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            continue;
+                        };
+                        if let Err(e) = stream.set_nodelay(true) {
+                            error!("couldn't set nodelay on stream to {addr}: {e}");
+                            continue;
+                        }
+                        let mut conn = TcpStream::from_stream_with_telemetry(
+                            stream,
+                            token,
+                            addr,
+                            self.telemetry,
+                            self.dcache.is_some(),
+                        );
+                        if let Some(msg) = &self.on_connect_msg &&
+                            conn.write_or_enqueue_with(
+                                self.poll.registry(),
+                                |buf: &mut Vec<u8>| {
+                                    buf.extend_from_slice(msg);
+                                },
+                            ) == ConnState::Disconnected
+                        {
+                            continue;
+                        }
+                        let _ = on_msg(PollEvent::Accept {
                             listener: event_token,
                             stream: token,
                             peer_addr: addr,
@@ -456,9 +544,9 @@ impl TcpConnector {
         self
     }
 
-    /// Attaches a dcache writer as the shared receive buffer for all streams.
-    pub fn with_dcache(mut self, writer: Arc<DCache>) -> Self {
-        self.conn_mgr.dcache = Some(writer);
+    /// Attaches a dcache as the shared receive buffer for all streams.
+    pub fn with_dcache(mut self, dcache: DCachePtr) -> Self {
+        self.conn_mgr.dcache = Some(dcache);
         self
     }
 
@@ -486,7 +574,7 @@ impl TcpConnector {
     #[inline]
     pub fn poll_with<F>(&mut self, mut handler: F) -> bool
     where
-        F: for<'a> FnMut(PollEvent<'a>),
+        F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
         self.conn_mgr.maybe_reconnect();
         for token in self.conn_mgr.reconnected_to.drain(..) {
@@ -501,6 +589,36 @@ impl TcpConnector {
         for e in self.events.iter() {
             o = true;
             self.conn_mgr.handle_event(e, &mut handler);
+        }
+        self.conn_mgr.flush_backlogs();
+        o
+    }
+
+    /// Like [`poll_with`] but for dcache-backed streams. The handler receives
+    /// `PollEvent<&[u8]>` for all events; for `Message` events, returning
+    /// `Some(T)` produces into the spine.
+    ///
+    /// # Panics
+    /// Panics if no dcache was configured via [`with_dcache`].
+    #[inline]
+    pub fn poll_with_produce<T, P, F>(&mut self, produce: &mut P, mut on_msg: F) -> bool
+    where
+        T: 'static + Copy,
+        P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
+        F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
+    {
+        self.conn_mgr.maybe_reconnect();
+        for token in self.conn_mgr.reconnected_to.drain(..) {
+            let _ = on_msg(PollEvent::Reconnect { token });
+        }
+        if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
+            safe_panic!("got error polling {e}");
+            return false;
+        }
+        let mut o = false;
+        for e in self.events.iter() {
+            o = true;
+            self.conn_mgr.handle_event_produce(e, produce, &mut on_msg);
         }
         self.conn_mgr.flush_backlogs();
         o

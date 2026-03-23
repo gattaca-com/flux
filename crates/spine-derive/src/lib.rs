@@ -187,14 +187,14 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let dcache_ident = format_ident!("{}_dcache", field_ident);
 
                 consumer_fields.push(quote! {
-                    pub #field_ident : ::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>>
+                    pub #field_ident : ::flux::spine::SpineDCacheConsumer<#inner_ty>
                 });
                 producer_fields.push(quote! {
                     pub #field_ident : ::flux::spine::SpineProducerWithDCache<#inner_ty>
                 });
 
                 consumer_init.push(quote! {
-                    #field_ident : ::flux::spine::SpineConsumer::attach_with_dcache::<_, #struct_ident, _>(
+                    #field_ident : ::flux::spine::SpineDCacheConsumer::attach::<_, #struct_ident, _>(
                         &spine.base_dir, tile, spine.#field_ident, spine.#dcache_ident)
                 });
                 producer_init.push(quote! {
@@ -210,27 +210,27 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                             self.#field_ident.as_ref()
                         }
                     }
-                    impl AsMut<::flux::spine::SpineProducerWithDCache<#inner_ty>>
+                    impl AsRef<::flux::spine::SpineProducerWithDCache<#inner_ty>>
                         for #producers_ident
                     {
-                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineProducerWithDCache<#inner_ty> {
-                            &mut self.#field_ident
+                        fn as_ref(&self) -> &::flux::spine::SpineProducerWithDCache<#inner_ty> {
+                            &self.#field_ident
                         }
                     }
                 });
 
                 as_mut_impls.push(quote! {
-                    impl AsMut<::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>>>
+                    impl AsMut<::flux::spine::SpineDCacheConsumer<#inner_ty>>
                         for #consumers_ident
                     {
-                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>> {
+                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineDCacheConsumer<#inner_ty> {
                             &mut self.#field_ident
                         }
                     }
-                    impl AsRef<::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>>>
+                    impl AsRef<::flux::spine::SpineDCacheConsumer<#inner_ty>>
                         for #consumers_ident
                     {
-                        fn as_ref(&self) -> &::flux::spine::SpineConsumer<::flux::spine::DCacheMsg<#inner_ty>> {
+                        fn as_ref(&self) -> &::flux::spine::SpineDCacheConsumer<#inner_ty> {
                             &self.#field_ident
                         }
                     }

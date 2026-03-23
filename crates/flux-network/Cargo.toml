@@ -8,6 +8,7 @@ keywords = ["low-latency", "performance", "communication"]
 repository = "https://github.com/gattaca-com/flux"
 
 [dependencies]
+flux.workspace = true
 flux-communication.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
@@ -17,5 +18,7 @@ tracing.workspace = true
 wincode = { workspace = true, optional = true }
 
 [dev-dependencies]
+spine-derive.workspace = true
+tempfile.workspace = true
 wincode-derive = { workspace = true }
 wincode = { workspace = true }

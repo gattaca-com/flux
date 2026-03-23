@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::tcp::{MessagePayload, PollEvent, SendBehavior, TcpConnector};
+use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
@@ -40,12 +40,10 @@ fn tcp_roundtrip() {
         let mut recv = None;
         loop {
             listener.poll_with(|event| {
-                if let PollEvent::Message { token, payload, .. } = event {
+                if let PollEvent::Message { token, payload: bytes, .. } = event {
                     assert_eq!(token, stream_token);
-                    if let MessagePayload::Raw(bytes) = payload {
-                        let msg: TestMsg = wincode::deserialize(bytes).unwrap();
-                        recv = Some(msg);
-                    }
+                    let msg: TestMsg = wincode::deserialize(bytes).unwrap();
+                    recv = Some(msg);
                 }
             });
             if recv.is_some() {
@@ -77,11 +75,9 @@ fn tcp_roundtrip() {
         let mut recv = None;
         loop {
             conn.poll_with(|event| {
-                if let PollEvent::Message { payload, .. } = event {
-                    if let MessagePayload::Raw(bytes) = payload {
-                        let msg: TestMsg = wincode::deserialize(bytes).unwrap();
-                        recv = Some(msg);
-                    }
+                if let PollEvent::Message { payload: bytes, .. } = event {
+                    let msg: TestMsg = wincode::deserialize(bytes).unwrap();
+                    recv = Some(msg);
                 }
             });
             if recv.is_some() {
