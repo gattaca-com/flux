@@ -8,7 +8,7 @@ use std::path::Path;
 pub use adapter::SpineAdapter;
 pub use consumer::{DCacheRead, SpineConsumer, SpineDCacheConsumer};
 use flux_timing::{IngestionTime, InternalMessage, Nanos, TrackingTimestamp};
-use flux_utils::{DCachePtr, DCacheRef, directories::shmem_dir};
+use flux_utils::{DCacheError, DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
 pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
@@ -93,15 +93,16 @@ pub trait SpineProducers {
         &self,
         data: T,
         payload: Option<(usize, F)>,
-    ) where
+    ) -> Result<(), DCacheError>
+    where
         Self: AsRef<SpineProducerWithDCache<T>>,
     {
         let ts = self.timestamp().with_new_publish_delta();
         let p: &SpineProducerWithDCache<T> = self.as_ref();
-        let dref =
-            payload.map(|(len, write)| p.dcache.write(len, write).expect("dcache write failed"));
+        let dref = if let Some((len, f)) = payload { Some(p.dcache.write(len, f)?) } else { None };
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
         p.inner.produce_without_first(&msg);
+        Ok(())
     }
 
     fn produce_with_dref<T: 'static + Copy>(&self, data: T, dref: DCacheRef, send_ts: Nanos)
@@ -119,15 +120,16 @@ pub trait SpineProducers {
         data: T,
         payload: Option<(usize, F)>,
         ingestion_t: IngestionTime,
-    ) where
+    ) -> Result<(), DCacheError>
+    where
         Self: AsRef<SpineProducerWithDCache<T>>,
     {
         let ts = self.timestamp().with_ingestion_t(ingestion_t);
         let p: &SpineProducerWithDCache<T> = self.as_ref();
-        let dref =
-            payload.map(|(len, write)| p.dcache.write(len, write).expect("dcache write failed"));
+        let dref = if let Some((len, f)) = payload { Some(p.dcache.write(len, f)?) } else { None };
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
         p.inner.produce_without_first(&msg);
+        Ok(())
     }
 }
 

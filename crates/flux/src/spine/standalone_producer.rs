@@ -1,5 +1,5 @@
 use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
-use flux_utils::DCachePtr;
+use flux_utils::{DCacheError, DCachePtr};
 
 use super::{DCacheMsg, SpineProducer, SpineProducerWithDCache, SpineQueue};
 use crate::communication::queue;
@@ -40,11 +40,15 @@ impl<T: 'static + Copy> StandaloneDCacheProducer<T> {
         data: T,
         payload: Option<(usize, F)>,
         ingestion_t: IngestionTime,
-    ) {
+    ) -> Result<(), DCacheError> {
         let ts = self.timestamp.with_ingestion_t(ingestion_t);
-        let dref =
-            payload.map(|(len, write)| self.inner.dcache.write(len, write).expect("dcache write"));
+        let dref = if let Some((len, f)) = payload {
+            Some(self.inner.dcache.write(len, f)?)
+        } else {
+            None
+        };
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
         self.inner.inner.produce_without_first(&msg);
+        Ok(())
     }
 }

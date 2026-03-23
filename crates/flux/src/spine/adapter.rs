@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
+use flux_utils::DCacheError;
 use signal_hook::consts::SIGINT;
 
 use crate::{
@@ -98,14 +99,19 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn produce_with_dcache<T, F>(&mut self, data: T, payload: Option<(usize, F)>)
+    pub fn produce_with_dcache<T, F>(
+        &mut self,
+        data: T,
+        payload: Option<(usize, F)>,
+    ) -> Result<(), DCacheError>
     where
         T: 'static + Copy,
         S::Producers: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: FnOnce(&mut [u8]),
     {
-        self.producers.produce_with_dcache(data, payload);
+        self.producers.produce_with_dcache(data, payload)?;
         self.did_work = true;
+        Ok(())
     }
 
     #[inline]
