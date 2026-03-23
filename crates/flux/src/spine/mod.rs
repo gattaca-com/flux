@@ -155,6 +155,13 @@ pub trait FluxSpine: Sized + Send {
         StandaloneProducer::new(*<Self as AsRef<SpineQueue<T>>>::as_ref(self), id)
     }
 
+    fn dcache_ptr_for<T: 'static + Copy>(&self) -> DCachePtr
+    where
+        Self: HasDCacheQueue<T>,
+    {
+        self.dcache_queue_and_ptr().1
+    }
+
     fn standalone_dcache_producer_for<T: Copy>(
         &mut self,
         name: TileName,
