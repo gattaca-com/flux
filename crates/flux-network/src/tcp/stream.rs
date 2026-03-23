@@ -237,24 +237,23 @@ impl TcpStream {
         ConnState::Alive
     }
 
-    /// Like [`poll_with`] but for dcache-backed streams. Applies `parse` to
-    /// each payload's bytes and calls `produce(t, send_ts)` on `Ok`. Use with
-    /// dcache connectors; for raw use [`poll_with`].
+    /// Like [`poll_with`] but for dcache-backed streams. Calls `on_msg` with
+    /// each `PollEvent<&[u8]>`; for `Message` events, returning `Some(T)`
+    /// produces into the spine. Use with dcache connectors; for raw use
+    /// [`poll_with`].
     #[inline]
-    pub fn poll_with_produce<T, E, G, P, F>(
+    pub fn poll_with_produce<T, P, F>(
         &mut self,
         registry: &Registry,
         ev: &Event,
         dcache: &DCache,
-        parse: &mut G,
         produce: &mut P,
         on_msg: &mut F,
     ) -> ConnState
     where
         T: 'static + Copy,
-        G: FnMut(Token, &[u8]) -> Result<T, E>,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
-        F: FnMut(Token, Result<T, E>, Nanos),
+        F: for<'a> FnMut(Token, &'a [u8], Nanos) -> Option<T>,
     {
         if ev.is_readable() {
             loop {
@@ -265,13 +264,9 @@ impl TcpStream {
                         );
                     }
                     ReadOutcome::PayloadDone { payload: MessagePayload::Cached(dref), send_ts } => {
-                        match dcache.map(dref, |bytes| parse(self.token, bytes)) {
-                            Ok(result) => {
-                                if let Ok(t) = &result {
-                                    produce.produce_with_dref(*t, dref, send_ts);
-                                }
-                                on_msg(ev.token(), result, send_ts);
-                            }
+                        match dcache.map(dref, |bytes| on_msg(self.token, bytes, send_ts)) {
+                            Ok(Some(t)) => produce.produce_with_dref(t, dref, send_ts),
+                            Ok(None) => {}
                             Err(e) => warn!("dcache map failed: {e}"),
                         }
                     }

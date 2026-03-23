@@ -47,13 +47,10 @@ impl Tile<TcpDcacheSpine> for NetworkTile {
 
     fn loop_body(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) {
         let Some(conn) = &mut self.conn else { return };
-        conn.poll_with_produce(
-            &mut |_, bytes| -> Result<Payload, ()> {
-                Ok(Payload(bytes.try_into().map_err(|_| ())?))
-            },
-            &mut adapter.producers,
-            |_: PollEvent<_>| {},
-        );
+        conn.poll_with_produce(&mut adapter.producers, |ev| {
+            let PollEvent::Message { payload: bytes, .. } = ev else { return None };
+            bytes.try_into().ok().map(Payload)
+        });
     }
 }
 

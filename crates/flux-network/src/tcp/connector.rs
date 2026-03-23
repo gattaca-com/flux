@@ -32,8 +32,7 @@ pub enum ConnectionVariant {
 /// Event emitted by [`TcpConnector::poll_with`] and
 /// [`TcpConnector::poll_with_produce`] for each notable IO occurrence.
 ///
-/// For [`poll_with`]: `Payload = &'a [u8]`.
-/// For [`poll_with_produce`]: `Payload = Result<T, E>`.
+/// `Payload = &'a [u8]` for both variants.
 pub enum PollEvent<Payload> {
     /// A new connection was accepted from a listener.
     ///
@@ -397,17 +396,11 @@ impl ConnectionManager {
     }
 
     #[inline]
-    fn handle_event_produce<T, E, G, P, F>(
-        &mut self,
-        e: &Event,
-        parse: &mut G,
-        produce: &mut P,
-        handler: &mut F,
-    ) where
+    fn handle_event_produce<T, P, F>(&mut self, e: &Event, produce: &mut P, on_msg: &mut F)
+    where
         T: 'static + Copy,
-        G: FnMut(Token, &[u8]) -> Result<T, E>,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
-        F: FnMut(PollEvent<Result<T, E>>),
+        F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
     {
         let event_token = e.token();
         let Some(stream_id) = self.conns.iter().position(|(t, _)| t == &event_token) else {
@@ -425,14 +418,13 @@ impl ConnectionManager {
                         self.poll.registry(),
                         e,
                         dcache,
-                        parse,
                         produce,
-                        &mut |token, result, send_ts| {
-                            handler(PollEvent::Message { token, payload: result, send_ts });
+                        &mut |token, bytes, send_ts| {
+                            on_msg(PollEvent::Message { token, payload: bytes, send_ts })
                         },
                     ) == ConnState::Disconnected
                     {
-                        handler(PollEvent::Disconnect { token: event_token });
+                        let _ = on_msg(PollEvent::Disconnect { token: event_token });
                         self.disconnect_at_index(stream_id);
                     }
                     return;
@@ -472,7 +464,7 @@ impl ConnectionManager {
                         {
                             continue;
                         }
-                        handler(PollEvent::Accept {
+                        let _ = on_msg(PollEvent::Accept {
                             listener: event_token,
                             stream: token,
                             peer_addr: addr,
@@ -602,29 +594,22 @@ impl TcpConnector {
         o
     }
 
-    /// Like [`poll_with`] but for dcache-backed streams. For each received
-    /// message, applies `parse` to the payload bytes; if `Ok`, calls
-    /// `produce(t, send_ts)`. The handler receives
-    /// `PollEvent::Message { payload: Result<T, E>, .. }`.
+    /// Like [`poll_with`] but for dcache-backed streams. The handler receives
+    /// `PollEvent<&[u8]>` for all events; for `Message` events, returning
+    /// `Some(T)` produces into the spine.
     ///
     /// # Panics
     /// Panics if no dcache was configured via [`with_dcache`].
     #[inline]
-    pub fn poll_with_produce<T, E, G, P, F>(
-        &mut self,
-        parse: &mut G,
-        produce: &mut P,
-        mut handler: F,
-    ) -> bool
+    pub fn poll_with_produce<T, P, F>(&mut self, produce: &mut P, mut on_msg: F) -> bool
     where
         T: 'static + Copy,
-        G: FnMut(Token, &[u8]) -> Result<T, E>,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
-        F: FnMut(PollEvent<Result<T, E>>),
+        F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
     {
         self.conn_mgr.maybe_reconnect();
         for token in self.conn_mgr.reconnected_to.drain(..) {
-            handler(PollEvent::Reconnect { token });
+            let _ = on_msg(PollEvent::Reconnect { token });
         }
         if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
@@ -633,7 +618,7 @@ impl TcpConnector {
         let mut o = false;
         for e in self.events.iter() {
             o = true;
-            self.conn_mgr.handle_event_produce(e, parse, produce, &mut handler);
+            self.conn_mgr.handle_event_produce(e, produce, &mut on_msg);
         }
         self.conn_mgr.flush_backlogs();
         o

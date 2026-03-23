@@ -211,12 +211,12 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
         loop {
-            match c.consume(&mut self.producers, &mut read) {
-                DCacheRead::Empty => break,
-                result => {
-                    self.did_work = true;
-                    handle(result, &mut self.producers);
-                }
+            let result = c.consume(&mut self.producers, &mut read);
+            let is_empty = matches!(result, DCacheRead::Empty);
+            self.did_work |= !(is_empty || matches!(result, DCacheRead::SpedPast));
+            handle(result, &mut self.producers);
+            if is_empty {
+                break;
             }
         }
     }
@@ -231,12 +231,9 @@ impl<S: FluxSpine> SpineAdapter<S> {
         G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        match c.consume_collaborative(&mut self.producers, &mut read) {
-            result => {
-                self.did_work = true;
-                handle(result, &mut self.producers);
-            }
-        }
+        let result = c.consume_collaborative(&mut self.producers, &mut read);
+        self.did_work |= !matches!(result, DCacheRead::Empty | DCacheRead::SpedPast);
+        handle(result, &mut self.producers);
     }
 
     #[inline]
@@ -250,12 +247,12 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
         loop {
-            match c.consume_internal_message(&mut self.producers, &mut read) {
-                DCacheRead::Empty => break,
-                result => {
-                    self.did_work = true;
-                    handle(result, &mut self.producers);
-                }
+            let result = c.consume_internal_message(&mut self.producers, &mut read);
+            let is_empty = matches!(result, DCacheRead::Empty);
+            self.did_work |= !(is_empty || matches!(result, DCacheRead::SpedPast));
+            handle(result, &mut self.producers);
+            if is_empty {
+                break;
             }
         }
     }
@@ -273,12 +270,9 @@ impl<S: FluxSpine> SpineAdapter<S> {
         G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        match c.consume_collaborative_internal_message(&mut self.producers, &mut read) {
-            result => {
-                self.did_work = true;
-                handle(result, &mut self.producers);
-            }
-        }
+        let result = c.consume_collaborative_internal_message(&mut self.producers, &mut read);
+        self.did_work |= !matches!(result, DCacheRead::Empty | DCacheRead::SpedPast);
+        handle(result, &mut self.producers);
     }
 
     /// Override the collaborative group label for queue `T`. By default each
