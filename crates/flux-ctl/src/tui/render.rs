@@ -4,26 +4,31 @@ use ratatui::{prelude::*, widgets::*};
 use super::app::{App, DetailFocus, FluxTab, SelectedItem, View};
 use crate::discovery::format_bytes;
 
+/// Top-level render entry point for the standalone flux-ctl TUI.
+///
+/// Draws the tab bar, dispatches to the active view, and overlays popups.
+/// This is used by the flux-ctl binary's own event loop.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    let buf = frame.buffer_mut();
 
     // Split the terminal area into a 1-row tab bar at the top and the
     // remaining content area below.
     let [tab_bar_area, content_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
 
-    render_tab_bar(frame, app, tab_bar_area);
+    render_tab_bar(tab_bar_area, buf, app);
 
     match app.tab {
         FluxTab::Apps => match &app.view {
-            View::List | View::Tiles => render_list(frame, app, content_area),
-            View::Detail(_) => render_detail(frame, app, content_area),
+            View::List | View::Tiles => render_list(content_area, buf, app),
+            View::Detail(_) => render_detail(content_area, buf, app),
         },
-        FluxTab::Tiles => render_tiles(frame, app, content_area),
+        FluxTab::Tiles => render_tiles(content_area, buf, app),
     }
 
     if app.confirm_cleanup_all {
-        render_confirm_all_popup(frame, app, area);
+        render_confirm_all_popup(area, buf, app);
     } else {
         let confirming = match app.tab {
             FluxTab::Tiles => false,
@@ -33,16 +38,44 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             },
         };
         if confirming {
-            render_confirm_popup(frame, area);
+            render_confirm_popup(area, buf);
         }
     }
 
     if app.show_help {
-        render_help_popup(frame, area, app.tab);
+        render_help_popup(area, buf, app.tab);
     }
 }
 
-fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+/// Render the Apps view (list or detail) with popups, **without** the tab bar.
+///
+/// Suitable for embedding in an external TUI that provides its own navigation
+/// chrome. Includes help and cleanup confirmation overlays when active.
+pub fn render_apps_view(area: Rect, buf: &mut Buffer, app: &mut App) {
+    match &app.view {
+        View::List | View::Tiles => render_list(area, buf, app),
+        View::Detail(_) => render_detail(area, buf, app),
+    }
+
+    if app.confirm_cleanup_all {
+        render_confirm_all_popup(area, buf, app);
+    } else {
+        let confirming = match &app.view {
+            View::List | View::Tiles => app.confirm_cleanup,
+            View::Detail(d) => d.confirm_cleanup,
+        };
+        if confirming {
+            render_confirm_popup(area, buf);
+        }
+    }
+
+    if app.show_help {
+        render_help_popup(area, buf, app.tab);
+    }
+}
+
+/// Render the tab bar (Apps / Tiles).
+pub fn render_tab_bar(area: Rect, buf: &mut Buffer, app: &App) {
     use ratatui::style::palette::tailwind;
 
     let titles = [FluxTab::Apps, FluxTab::Tiles].map(FluxTab::title);
@@ -58,9 +91,14 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         .style(bar_style)
         .padding("", "")
         .divider(" ")
-        .render(area, frame.buffer_mut());
+        .render(area, buf);
 }
-fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
+
+/// Render the list view: title bar, segment table, and status bar.
+///
+/// This is a self-contained view that can be rendered into any `Rect` +
+/// `Buffer`, making it reusable from external crates (e.g. the overseer).
+pub fn render_list(area: Rect, buf: &mut Buffer, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
@@ -80,7 +118,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Cyan).bold())
         .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, chunks[0]);
+    title.render(chunks[0], buf);
 
     let header = Row::new(vec!["Name", "Kind", "Details", "Conns", "Status"])
         .style(Style::default().fg(Color::Cyan).bold())
@@ -180,11 +218,16 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().bg(Color::DarkGray));
 
     app.table_state.select(Some(app.selected));
-    frame.render_stateful_widget(table, chunks[1], &mut app.table_state);
+    StatefulWidget::render(table, chunks[1], buf, &mut app.table_state);
 
-    render_status_bar(frame, app, chunks[2]);
+    render_status_bar(chunks[2], buf, app);
 }
-fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
+
+/// Render the detail view: title, segment info, consumer groups / processes,
+/// and status bar.
+///
+/// Self-contained — can be rendered into any `Rect` + `Buffer` for reuse.
+pub fn render_detail(area: Rect, buf: &mut Buffer, app: &mut App) {
     // Top-level vertical layout: title | segment info | bottom panels | status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -207,10 +250,10 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Cyan).bold())
         .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, chunks[0]);
+    title.render(chunks[0], buf);
 
     if let Some(seg) = seg.cloned() {
-        render_segment_info(frame, &seg, chunks[1]);
+        render_segment_info(chunks[1], buf, &seg);
     }
 
     if let View::Detail(ref detail) = app.view {
@@ -225,17 +268,19 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             let seg = app.detail_segment();
             let write_pos = seg.and_then(|s| s.queue_writes);
             let capacity = seg.and_then(|s| s.queue_capacity);
-            render_consumer_groups(frame, detail, write_pos, capacity, bottom[0]);
-            render_pid_table(frame, detail, bottom[1]);
+            render_consumer_groups(bottom[0], buf, detail, write_pos, capacity);
+            render_pid_table(bottom[1], buf, detail);
         } else {
-            render_pid_table(frame, detail, chunks[2]);
+            render_pid_table(chunks[2], buf, detail);
         }
     }
 
-    render_status_bar(frame, app, chunks[3]);
+    render_status_bar(chunks[3], buf, app);
 }
 
-fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: Rect) {
+/// Render the segment info panel (kind, status, capacity, flink, writes,
+/// write-position bar, poison info).
+pub fn render_segment_info(area: Rect, buf: &mut Buffer, seg: &super::app::SegmentInfo) {
     let status = if seg.poison.is_some() {
         "☠ poisoned"
     } else if seg.alive {
@@ -354,15 +399,16 @@ fn render_segment_info(frame: &mut Frame, seg: &super::app::SegmentInfo, area: R
         .title(" Segment Info ")
         .title_alignment(Alignment::Left)
         .border_style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    Paragraph::new(lines).block(block).render(area, buf);
 }
 
-fn render_consumer_groups(
-    frame: &mut Frame,
+/// Render the consumer groups table with lag bars and msgs/s.
+pub fn render_consumer_groups(
+    area: Rect,
+    buf: &mut Buffer,
     detail: &super::app::DetailState,
     write_pos: Option<usize>,
     capacity: Option<usize>,
-    area: Rect,
 ) {
     let focused = detail.focus == DetailFocus::ConsumerGroups;
 
@@ -452,13 +498,14 @@ fn render_consumer_groups(
 
     if focused {
         let mut state = TableState::default().with_selected(Some(detail.selected_group));
-        frame.render_stateful_widget(table, area, &mut state);
+        StatefulWidget::render(table, area, buf, &mut state);
     } else {
-        frame.render_widget(table, area);
+        Widget::render(table, area, buf);
     }
 }
 
-fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: Rect) {
+/// Render the attached processes table.
+pub fn render_pid_table(area: Rect, buf: &mut Buffer, detail: &super::app::DetailState) {
     let focused = detail.focus == DetailFocus::Processes;
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
@@ -510,7 +557,7 @@ fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: R
             .title(title)
             .title_alignment(Alignment::Left)
             .border_style(border_style);
-        frame.render_widget(Paragraph::new("  No PIDs attached").block(block), area);
+        Paragraph::new("  No PIDs attached").block(block).render(area, buf);
     } else {
         let table = Table::new(rows, widths)
             .header(header)
@@ -525,14 +572,15 @@ fn render_pid_table(frame: &mut Frame, detail: &super::app::DetailState, area: R
 
         if focused {
             let mut state = TableState::default().with_selected(Some(detail.selected_pid));
-            frame.render_stateful_widget(table, area, &mut state);
+            StatefulWidget::render(table, area, buf, &mut state);
         } else {
-            frame.render_widget(table, area);
+            Widget::render(table, area, buf);
         }
     }
 }
 
-fn render_confirm_popup(frame: &mut Frame, area: Rect) {
+/// Render the single-segment cleanup confirmation popup.
+pub fn render_confirm_popup(area: Rect, buf: &mut Buffer) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -553,20 +601,20 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect) {
     ];
 
     let popup_area = centered_rect(50, lines.len() as u16 + 2, area);
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).block(
+    Clear.render(popup_area, buf);
+    Paragraph::new(lines)
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
                 .title(" ⚠ Confirm Cleanup ")
                 .title_alignment(Alignment::Center),
-        ),
-        popup_area,
-    );
+        )
+        .render(popup_area, buf);
 }
 
-fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
+/// Render the "destroy all dead segments" confirmation popup.
+pub fn render_confirm_all_popup(area: Rect, buf: &mut Buffer, app: &App) {
     let dead_count: usize = app.pending_cleanup_flinks.as_ref().map(|f| f.len()).unwrap_or(0);
 
     let lines = vec![
@@ -589,20 +637,20 @@ fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     let popup_area = centered_rect(52, lines.len() as u16 + 2, area);
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).block(
+    Clear.render(popup_area, buf);
+    Paragraph::new(lines)
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
                 .title(" ⚠ Confirm Destroy All ")
                 .title_alignment(Alignment::Center),
-        ),
-        popup_area,
-    );
+        )
+        .render(popup_area, buf);
 }
 
-fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
+/// Render the tile metrics view (per-tile utilisation gauges).
+pub fn render_tiles(area: Rect, buf: &mut Buffer, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
@@ -617,21 +665,19 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Magenta).bold())
         .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, chunks[0]);
+    title.render(chunks[0], buf);
 
     // Build rows — app headers + per-tile gauge rows
     let inner = chunks[1];
     let block = Block::default().borders(Borders::ALL);
     let inner_area = block.inner(inner);
-    frame.render_widget(block, inner);
+    block.render(inner, buf);
 
     if n_tiles == 0 {
-        frame.render_widget(
-            Paragraph::new("No tile metrics found. Is a flux app running?")
-                .style(Style::default().fg(Color::DarkGray)),
-            inner_area,
-        );
-        render_status_bar(frame, app, chunks[2]);
+        Paragraph::new("No tile metrics found. Is a flux app running?")
+            .style(Style::default().fg(Color::DarkGray))
+            .render(inner_area, buf);
+        render_status_bar(chunks[2], buf, app);
         return;
     }
 
@@ -704,7 +750,7 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
 
         match row {
             TileRow::AppHeader(name, count) => {
-                let area = Rect::new(
+                let rect = Rect::new(
                     inner_area.x,
                     inner_area.y + render_y,
                     inner_area.width,
@@ -715,10 +761,9 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     Style::default().fg(Color::Yellow).bold()
                 };
-                frame.render_widget(
-                    Paragraph::new(format!("▶ {} ({count} tiles)", name)).style(style),
-                    area,
-                );
+                Paragraph::new(format!("▶ {} ({count} tiles)", name))
+                    .style(style)
+                    .render(rect, buf);
             }
             TileRow::Tile(name, stats) => {
                 let lines_available = inner_area.height.saturating_sub(render_y);
@@ -753,7 +798,7 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     Style::default().fg(stats_color)
                 };
-                frame.render_widget(Paragraph::new(stats_text).style(text_style), stats_area);
+                Paragraph::new(stats_text).style(text_style).render(stats_area, buf);
 
                 // Gauge bar (if we have room)
                 if lines_available >= 2 {
@@ -768,7 +813,7 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
                         .ratio(util.clamp(0.0, 1.0))
                         .gauge_style(util_colour(util))
                         .label(format!("{:5.1}%", util * 100.0));
-                    frame.render_widget(gauge, gauge_area);
+                    gauge.render(gauge_area, buf);
                 }
             }
         }
@@ -792,10 +837,10 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
             inner_area.width,
             1,
         );
-        frame.render_widget(indicator, indicator_area);
+        indicator.render(indicator_area, buf);
     }
 
-    render_status_bar(frame, app, chunks[2]);
+    render_status_bar(chunks[2], buf, app);
 }
 
 /// Intermediate type for tile view row rendering.
@@ -814,7 +859,8 @@ fn util_colour(util: f64) -> Color {
     }
 }
 
-fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+/// Render the status bar with contextual keybinding hints.
+pub fn render_status_bar(area: Rect, buf: &mut Buffer, app: &App) {
     let confirming_single = match app.tab {
         FluxTab::Tiles => false,
         FluxTab::Apps => match &app.view {
@@ -886,9 +932,11 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    frame.render_widget(Paragraph::new(text).style(style), area);
+    Paragraph::new(text).style(style).render(area, buf);
 }
-fn render_help_popup(frame: &mut Frame, area: Rect, tab: FluxTab) {
+
+/// Render the keybindings help overlay popup.
+pub fn render_help_popup(area: Rect, buf: &mut Buffer, tab: FluxTab) {
     let key = |k: &str| Span::styled(format!("  {k:<13}"), Style::default().fg(Color::Yellow));
 
     let mut lines = vec![
@@ -914,18 +962,27 @@ fn render_help_popup(frame: &mut Frame, area: Rect, tab: FluxTab) {
                 " Apps tab ",
                 Style::default().fg(Color::Cyan).bold(),
             )));
-            lines
-                .push(Line::from(vec![key("Enter"), Span::raw("Open segment / toggle app group")]));
-            lines
-                .push(Line::from(vec![key("Esc / Bksp"), Span::raw("Back / clear filter / quit")]));
+            lines.push(Line::from(vec![
+                key("Enter"),
+                Span::raw("Open segment / toggle app group"),
+            ]));
+            lines.push(Line::from(vec![
+                key("Esc / Bksp"),
+                Span::raw("Back / clear filter / quit"),
+            ]));
             lines.push(Line::from(vec![key("/"), Span::raw("Filter segments by name")]));
             lines.push(Line::from(vec![
                 key("s"),
                 Span::raw("Cycle sort (name → kind → status → activity)"),
             ]));
-            lines.push(Line::from(vec![key("a"), Span::raw("Toggle show/hide dead segments")]));
-            lines
-                .push(Line::from(vec![key("Tab"), Span::raw("Switch focus (groups ↔ processes)")]));
+            lines.push(Line::from(vec![
+                key("a"),
+                Span::raw("Toggle show/hide dead segments"),
+            ]));
+            lines.push(Line::from(vec![
+                key("Tab"),
+                Span::raw("Switch focus (groups ↔ processes)"),
+            ]));
             lines.push(Line::from(vec![key("d"), Span::raw("Destroy dead segment")]));
             lines.push(Line::from(vec![key("D"), Span::raw("Destroy all dead segments")]));
             lines.push(Line::from(vec![key("r"), Span::raw("Force refresh")]));
@@ -950,20 +1007,20 @@ fn render_help_popup(frame: &mut Frame, area: Rect, tab: FluxTab) {
     )));
 
     let popup_area = centered_rect(52, lines.len() as u16 + 2, area);
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(
-        Paragraph::new(lines).block(
+    Clear.render(popup_area, buf);
+    Paragraph::new(lines)
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" Help ")
                 .title_alignment(Alignment::Center),
-        ),
-        popup_area,
-    );
+        )
+        .render(popup_area, buf);
 }
 
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+/// Centre a rectangle of the given size within `area`.
+pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
