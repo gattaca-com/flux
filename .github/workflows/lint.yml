@@ -1,0 +1,43 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-10-01
+          components: clippy, rustfmt
+
+      - name: Setup just
+        uses: extractions/setup-just@v2
+        with:
+          just-version: 1.5.0
+
+      - name: Check compilation
+        run: cargo check
+
+      - name: Check formatting
+        run: just fmt-check
+
+      - name: Check clippy
+        run: just clippy
