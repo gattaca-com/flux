@@ -102,11 +102,7 @@ impl TileData {
         }
 
         Some(TileStats {
-            utilisation: if total_ticks > 0 {
-                total_busy as f64 / total_ticks as f64
-            } else {
-                0.0
-            },
+            utilisation: if total_ticks > 0 { total_busy as f64 / total_ticks as f64 } else { 0.0 },
             busy_avg: if busy_count > 0 {
                 Duration(busy_sum / busy_count as u64)
             } else {
@@ -157,8 +153,7 @@ impl TileGroup {
             }
 
             // Open may panic on corrupted shmem — catch it.
-            let Ok(queue) =
-                std::panic::catch_unwind(|| Queue::<TileSample>::open_shared(&path))
+            let Ok(queue) = std::panic::catch_unwind(|| Queue::<TileSample>::open_shared(&path))
             else {
                 continue;
             };
@@ -228,7 +223,7 @@ impl TileMetricsStore {
     /// Scan base_dir for app directories containing shmem/queues.
     fn discover_apps(&mut self) {
         let shmem_root = &self.base_dir;
-        let Ok(entries) = std::fs::read_dir(&shmem_root) else {
+        let Ok(entries) = std::fs::read_dir(shmem_root) else {
             return;
         };
         for entry in entries.flatten() {

@@ -9,11 +9,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Split the terminal area into a 1-row tab bar at the top and the
     // remaining content area below.
-    let [tab_bar_area, content_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(area);
+    let [tab_bar_area, content_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
 
     render_tab_bar(frame, app, tab_bar_area);
 
@@ -64,7 +61,6 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         .render(area, frame.buffer_mut());
 }
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
@@ -189,7 +185,6 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     render_status_bar(frame, app, chunks[2]);
 }
 fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
-
     // Top-level vertical layout: title | segment info | bottom panels | status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -608,7 +603,6 @@ fn render_confirm_all_popup(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
@@ -673,10 +667,7 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
     let total_content_height = y;
 
     // Find y position of selected row
-    let selected_y = cumulative_heights
-        .get(selected)
-        .map(|(_, y)| *y)
-        .unwrap_or(0);
+    let selected_y = cumulative_heights.get(selected).map(|(_, y)| *y).unwrap_or(0);
     let selected_height = row_specs
         .get(selected)
         .map(|r| match r {
@@ -737,12 +728,8 @@ fn render_tiles(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
 
                 // Stats line
-                let stats_area = Rect::new(
-                    inner_area.x,
-                    inner_area.y + render_y,
-                    inner_area.width,
-                    1,
-                );
+                let stats_area =
+                    Rect::new(inner_area.x, inner_area.y + render_y, inner_area.width, 1);
                 let (stats_text, stats_color) = match stats {
                     Some(s) => (
                         format!(
@@ -878,21 +865,17 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 View::Detail(detail) => {
                     let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
-                    let tab_hint = if !detail.consumer_groups.is_empty() {
-                        "Tab switch panel  "
-                    } else {
-                        ""
-                    };
-                    let base = match (!alive, has_any_dead) {
-                        (true, _) => format!(
-                            " Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit"
-                        ),
+                    let tab_hint =
+                        if !detail.consumer_groups.is_empty() { "Tab switch panel  " } else { "" };
+                    match (!alive, has_any_dead) {
+                        (true, _) => {
+                            format!(" Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit")
+                        }
                         (false, true) => {
                             format!(" Esc back  {tab_hint}D destroy all  ? help  q quit")
                         }
                         _ => format!(" Esc back  {tab_hint}? help  q quit"),
-                    };
-                    base
+                    }
                 }
             },
         }
@@ -931,12 +914,18 @@ fn render_help_popup(frame: &mut Frame, area: Rect, tab: FluxTab) {
                 " Apps tab ",
                 Style::default().fg(Color::Cyan).bold(),
             )));
-            lines.push(Line::from(vec![key("Enter"), Span::raw("Open segment / toggle app group")]));
-            lines.push(Line::from(vec![key("Esc / Bksp"), Span::raw("Back / clear filter / quit")]));
+            lines
+                .push(Line::from(vec![key("Enter"), Span::raw("Open segment / toggle app group")]));
+            lines
+                .push(Line::from(vec![key("Esc / Bksp"), Span::raw("Back / clear filter / quit")]));
             lines.push(Line::from(vec![key("/"), Span::raw("Filter segments by name")]));
-            lines.push(Line::from(vec![key("s"), Span::raw("Cycle sort (name → kind → status → activity)")]));
+            lines.push(Line::from(vec![
+                key("s"),
+                Span::raw("Cycle sort (name → kind → status → activity)"),
+            ]));
             lines.push(Line::from(vec![key("a"), Span::raw("Toggle show/hide dead segments")]));
-            lines.push(Line::from(vec![key("Tab"), Span::raw("Switch focus (groups ↔ processes)")]));
+            lines
+                .push(Line::from(vec![key("Tab"), Span::raw("Switch focus (groups ↔ processes)")]));
             lines.push(Line::from(vec![key("d"), Span::raw("Destroy dead segment")]));
             lines.push(Line::from(vec![key("D"), Span::raw("Destroy all dead segments")]));
             lines.push(Line::from(vec![key("r"), Span::raw("Force refresh")]));

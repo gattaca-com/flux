@@ -207,7 +207,8 @@ fn dead_pid_slot_reclaimed() {
     let header: &mut QueueHeader =
         &mut unsafe { &mut *(q.inner as *mut super::InnerQueue<u64>) }.header;
 
-    // Fill a slot with a label referencing a PID that (almost certainly) doesn't exist.
+    // Fill a slot with a label referencing a PID that (almost certainly) doesn't
+    // exist.
     let dead_pid_label = "ghost[999999999].stream.broadcast";
     let cursor = header.find_or_insert_group(dead_pid_label);
     unsafe { &*cursor }.store(42, Ordering::Relaxed);

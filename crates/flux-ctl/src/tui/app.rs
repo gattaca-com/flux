@@ -40,9 +40,7 @@ impl RateSmoother {
         let ring = self.samples.entry(key.to_owned()).or_default();
         ring.push_back((now, rate));
         // Evict samples older than the window.
-        while ring
-            .front()
-            .is_some_and(|(t, _)| t.elapsed().as_secs() > RATE_SMOOTHING_WINDOW_SECS)
+        while ring.front().is_some_and(|(t, _)| t.elapsed().as_secs() > RATE_SMOOTHING_WINDOW_SECS)
         {
             ring.pop_front();
         }
@@ -78,7 +76,6 @@ impl SortMode {
         }
     }
 }
-
 
 /// Tabs available in the flux-ctl TUI.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -516,8 +513,7 @@ impl App {
                     let now = Instant::now();
                     for cg in &mut groups {
                         let key = format!("{}::{}", seg.entry.flink, cg.label);
-                        let history =
-                            self.consumer_cursor_history.entry(key).or_default();
+                        let history = self.consumer_cursor_history.entry(key).or_default();
                         history.push_back((cg.cursor, now));
                         // Drop entries older than 10 seconds.
                         while let Some(&(_, t)) = history.front() {
@@ -532,8 +528,7 @@ impl App {
                             let &(newest_c, _) = history.back().unwrap();
                             let dt = now.elapsed_since(oldest_t).as_secs();
                             if dt > 0.1 && newest_c >= oldest_c {
-                                cg.msgs_per_sec =
-                                    Some((newest_c - oldest_c) as f64 / dt);
+                                cg.msgs_per_sec = Some((newest_c - oldest_c) as f64 / dt);
                             }
                         }
                     }

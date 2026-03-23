@@ -9,10 +9,7 @@
 //!
 //! Press Ctrl-C in terminal 1 to stop.
 
-use std::sync::{
-    atomic::Ordering,
-    Arc,
-};
+use std::sync::{Arc, atomic::Ordering};
 
 use flux::{
     communication::{ShmemData, cleanup_shmem},
