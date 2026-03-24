@@ -520,9 +520,7 @@ impl<T: Copy> Queue<T> {
     /// panicking if the queue is invalid (e.g. poisoned, wrong element size).
     pub fn try_open_shared<P: AsRef<Path>>(shmem_file: P) -> Result<Self, QueueError> {
         let shmem_file = shmem_file.as_ref();
-        Ok(Self {
-            inner: InnerQueue::open_shared(shmem_file)?,
-        })
+        Ok(Self { inner: InnerQueue::open_shared(shmem_file)? })
     }
 
     /// Size in bytes of the queue region for `len` slots

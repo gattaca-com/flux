@@ -962,27 +962,18 @@ pub fn render_help_popup(area: Rect, buf: &mut Buffer, tab: FluxTab) {
                 " Apps tab ",
                 Style::default().fg(Color::Cyan).bold(),
             )));
-            lines.push(Line::from(vec![
-                key("Enter"),
-                Span::raw("Open segment / toggle app group"),
-            ]));
-            lines.push(Line::from(vec![
-                key("Esc / Bksp"),
-                Span::raw("Back / clear filter / quit"),
-            ]));
+            lines
+                .push(Line::from(vec![key("Enter"), Span::raw("Open segment / toggle app group")]));
+            lines
+                .push(Line::from(vec![key("Esc / Bksp"), Span::raw("Back / clear filter / quit")]));
             lines.push(Line::from(vec![key("/"), Span::raw("Filter segments by name")]));
             lines.push(Line::from(vec![
                 key("s"),
                 Span::raw("Cycle sort (name → kind → status → activity)"),
             ]));
-            lines.push(Line::from(vec![
-                key("a"),
-                Span::raw("Toggle show/hide dead segments"),
-            ]));
-            lines.push(Line::from(vec![
-                key("Tab"),
-                Span::raw("Switch focus (groups ↔ processes)"),
-            ]));
+            lines.push(Line::from(vec![key("a"), Span::raw("Toggle show/hide dead segments")]));
+            lines
+                .push(Line::from(vec![key("Tab"), Span::raw("Switch focus (groups ↔ processes)")]));
             lines.push(Line::from(vec![key("d"), Span::raw("Destroy dead segment")]));
             lines.push(Line::from(vec![key("D"), Span::raw("Destroy all dead segments")]));
             lines.push(Line::from(vec![key("r"), Span::raw("Force refresh")]));
