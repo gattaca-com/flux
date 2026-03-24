@@ -20,6 +20,17 @@ use crate::{
 pub type SpineProducer<T> = queue::Producer<InternalMessage<T>>;
 pub type SpineQueue<T> = queue::Queue<InternalMessage<T>>;
 
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+pub struct QueueParams {
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+pub struct DCacheQueueParams {
+    pub size: usize,
+    pub mtu: usize,
+}
+
 /// Wire type for dcache-backed queues. Internal to the spine; users see `T`
 /// and `&[u8]` at consume sites.
 #[derive(Clone, Copy, Debug)]
