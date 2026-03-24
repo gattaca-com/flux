@@ -401,6 +401,9 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         pub fn new(path_suffix: Option<&str>) -> Self {
             Self::new_with_base_dir(::flux::utils::directories::local_share_dir(), path_suffix)
         }
+        pub fn new_with_config(path_suffix: Option<&str>, config: #config_ident) -> Self {
+            Self::new_with_base_dir_and_config(::flux::utils::directories::local_share_dir(), path_suffix, config)
+        }
         pub fn new_with_base_dir<D: AsRef<std::path::Path>>(base_dir: D, path_suffix: Option<&str>) -> Self {
             Self::new_with_base_dir_and_config(base_dir, path_suffix, #config_ident::default())
         }
