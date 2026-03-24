@@ -318,6 +318,8 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // while non-dcache fields remain single-binding.
     let mut new_let_stmts: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut new_struct_field_names: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut config_fields: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut config_defaults: Vec<proc_macro2::TokenStream> = Vec::new();
     new_struct_field_names.push(quote! { base_dir });
 
     for field in &input.fields {
@@ -348,24 +350,36 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 if let Some(mtu_expr) = mtu_expr_opt {
                     let dcache_ident = format_ident!("{}_dcache", field_ident);
+                    config_fields.push(quote! {
+                        pub #field_ident: ::flux::spine::DCacheQueueParams
+                    });
+                    config_defaults.push(quote! {
+                        #field_ident: ::flux::spine::DCacheQueueParams { size: #size_arg, mtu: #mtu_expr }
+                    });
                     new_let_stmts.push(quote! {
                         let (#field_ident, #dcache_ident) =
                             ::flux::communication::shmem_queue_dcache_with_base_dir(
                                 &base_dir,
                                 &format!("{}{}", #app_name_tokens, path_suffix),
-                                #size_arg,
-                                #mtu_expr,
+                                config.#field_ident.size,
+                                config.#field_ident.mtu,
                                 #queue_type,
                             );
                     });
                     new_struct_field_names.push(quote! { #field_ident });
                     new_struct_field_names.push(quote! { #dcache_ident });
                 } else {
+                    config_fields.push(quote! {
+                        pub #field_ident: ::flux::spine::QueueParams
+                    });
+                    config_defaults.push(quote! {
+                        #field_ident: ::flux::spine::QueueParams { size: #size_arg }
+                    });
                     new_let_stmts.push(quote! {
                         let #field_ident = ::flux::communication::shmem_queue_with_base_dir(
                             &base_dir,
                             &format!("{}{}", #app_name_tokens, path_suffix),
-                            #size_arg,
+                            config.#field_ident.size,
                             #queue_type,
                         );
                     });
@@ -381,11 +395,20 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    let config_ident = format_ident!("{}Config", struct_ident);
+
     let generated_new_method_token_stream = quote! {
         pub fn new(path_suffix: Option<&str>) -> Self {
             Self::new_with_base_dir(::flux::utils::directories::local_share_dir(), path_suffix)
         }
         pub fn new_with_base_dir<D: AsRef<std::path::Path>>(base_dir: D, path_suffix: Option<&str>) -> Self {
+            Self::new_with_base_dir_and_config(base_dir, path_suffix, #config_ident::default())
+        }
+        pub fn new_with_base_dir_and_config<D: AsRef<std::path::Path>>(
+            base_dir: D,
+            path_suffix: Option<&str>,
+            config: #config_ident,
+        ) -> Self {
             let path_suffix = path_suffix.unwrap_or(&"");
             let base_dir = base_dir.as_ref().to_path_buf();
             #(#new_let_stmts)*
@@ -458,6 +481,17 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ─── 3. compose generated code ────────────────────────────────────────
     let expanded = quote! {
         #reconstructed_input_struct // Use the reconstructed struct instead of #input
+
+        #[derive(Clone, Debug, ::serde::Deserialize)]
+        #[serde(default)]
+        #vis struct #config_ident {
+            #(#config_fields),*
+        }
+        impl Default for #config_ident {
+            fn default() -> Self {
+                Self { #(#config_defaults),* }
+            }
+        }
 
         // generated Consumers / Producers structs
         #[derive(Clone, Copy, Debug)]
