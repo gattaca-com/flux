@@ -604,9 +604,16 @@ impl TimeKeeper {
             let name = entry.path().as_os_str().to_str().unwrap().to_string();
             if let Some((_dir, real_name)) = name.split_once("latency-") {
                 if !self.timer_data.contains(real_name) {
-                    let latency_q = Queue::open_shared(format!("{queues_dir}/latency-{real_name}"));
+                    let latency_q =
+                        match Queue::try_open_shared(format!("{queues_dir}/latency-{real_name}")) {
+                            Ok(q) => q,
+                            Err(_) => continue,
+                        };
                     let processing_q =
-                        Queue::open_shared(format!("{queues_dir}/timing-{real_name}"));
+                        match Queue::try_open_shared(format!("{queues_dir}/timing-{real_name}")) {
+                            Ok(q) => q,
+                            Err(_) => continue,
+                        };
 
                     // only display queues that have entries
                     if latency_q.count() == 0 && processing_q.count() == 0 {

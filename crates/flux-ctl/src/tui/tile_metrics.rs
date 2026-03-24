@@ -152,10 +152,9 @@ impl TileGroup {
                 continue;
             }
 
-            // Open may panic on corrupted shmem — catch it.
-            let Ok(queue) = std::panic::catch_unwind(|| Queue::<TileSample>::open_shared(&path))
-            else {
-                continue;
+            let queue = match Queue::<TileSample>::try_open_shared(&path) {
+                Ok(q) => q,
+                Err(_) => continue,
             };
 
             let consumer = Consumer::new(queue, "flux-ctl-tile").without_log();
