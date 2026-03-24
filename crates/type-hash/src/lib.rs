@@ -8,6 +8,11 @@ use core::mem;
 /// A trait for a "stable-ish" type fingerprint you control.
 pub trait TypeHash {
     const TYPE_HASH: u64;
+    /// When `true` (default), the type's textual name (via `stringify!`) is
+    /// included in the hash of any struct that contains this type as a field.
+    /// Set to `false` to make the hash depend only on the structural
+    /// `TYPE_HASH`, which resolves through type aliases.
+    const DERIVE_USES_TYPENAME: bool = true;
 }
 
 /// Const FNV-1a 64-bit over bytes.
