@@ -136,10 +136,7 @@ impl QueueHeader {
         const LOCK_TIMEOUT: Duration = Duration::from_millis(100);
         let deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
-            if self
-                .group_lock
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
+            if self.group_lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
             {
                 return;
             }
