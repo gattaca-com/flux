@@ -134,7 +134,7 @@ impl QueueHeader {
     /// up).  In that case we force-clear the lock and re-acquire it.
     fn acquire_group_lock(&self) {
         const LOCK_TIMEOUT: Duration = Duration::from_millis(100);
-        let deadline = Instant::now() + LOCK_TIMEOUT;
+        let mut deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
             if self.group_lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
             {
@@ -143,6 +143,7 @@ impl QueueHeader {
             if Instant::now() >= deadline {
                 // Previous holder crashed — clear the stale lock and try once more.
                 self.group_lock.store(0, Ordering::Release);
+                deadline = Instant::now() + LOCK_TIMEOUT;
             }
             std::hint::spin_loop();
         }
@@ -169,6 +170,7 @@ impl QueueHeader {
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == ArrayStr::<GROUP_LABEL_LEN>::new() {
                 self.group_labels[i] = key;
+                self.group_cursors[i].cursor.store(0, Ordering::Relaxed);
                 self.release_group_lock();
                 return &raw const self.group_cursors[i].cursor;
             }
@@ -179,6 +181,7 @@ impl QueueHeader {
             if let Some(pid) = pid_from_label(self.group_labels[i].as_str()) {
                 if !is_pid_alive(pid) {
                     self.group_labels[i] = key;
+                    self.group_cursors[i].cursor.store(0, Ordering::Relaxed);
                     self.release_group_lock();
                     return &raw const self.group_cursors[i].cursor;
                 }
