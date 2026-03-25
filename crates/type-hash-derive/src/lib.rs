@@ -28,9 +28,9 @@ fn has_type_hash_skip_typename(attrs: &[Attribute]) -> bool {
             return false;
         }
         let Meta::List(list) = &attr.meta else { return false };
-        let Ok(metas) = list.parse_args_with(
-            syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
-        ) else {
+        let Ok(metas) = list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
             return false;
         };
         metas.iter().any(|m| matches!(m, Meta::Path(p) if p.is_ident("skip_typename")))
