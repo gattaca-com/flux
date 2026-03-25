@@ -7,7 +7,7 @@ use std::{
     path::Path,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -53,7 +53,6 @@ fn is_pid_alive(pid: u32) -> bool {
 }
 
 use flux_utils::{ArrayStr, safe_panic};
-use rand::Rng;
 use shared_memory::{ShmemConf, ShmemError};
 
 use crate::{
@@ -83,7 +82,8 @@ pub struct AlignedCursor {
 pub struct QueueHeader {
     pub queue_type: QueueType, // 1
     is_initialized: u8,        // 2
-    _pad1: [u8; 6],            // 8
+    group_lock: AtomicU8,      // 3  — spinlock protecting group label search/insert
+    _pad1: [u8; 5],            // 8
     pub elsize: usize,         // 16
     pub mask: usize,           // 24
     pub count: AtomicUsize,    /* 32 */
@@ -127,16 +127,43 @@ impl QueueHeader {
         Ok(Self::from_ptr(ptr))
     }
 
+    /// Acquire `group_lock`, spinning until it is free.
+    ///
+    /// If the lock has been held for longer than `LOCK_TIMEOUT` the holder has
+    /// most likely crashed without releasing it (shared-memory was not cleaned
+    /// up).  In that case we force-clear the lock and re-acquire it.
+    fn acquire_group_lock(&self) {
+        const LOCK_TIMEOUT: Duration = Duration::from_millis(100);
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            if self
+                .group_lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                // Previous holder crashed — clear the stale lock and try once more.
+                self.group_lock.store(0, Ordering::Release);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn release_group_lock(&self) {
+        self.group_lock.store(0, Ordering::Release);
+    }
+
     pub fn find_or_insert_group(&mut self, key: &str) -> *const AtomicUsize {
         let key = ArrayStr::<GROUP_LABEL_LEN>::from_str_truncate(key);
 
-        // TODO: use better fix of potential data race, either spinlock or something
-        // similar to what is done in the collaborative consume
-        std::thread::sleep(Duration::from_micros(rand::rng().random_range(0..10)));
+        self.acquire_group_lock();
 
         // 1. Exact match — reuse the existing slot
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == key {
+                self.release_group_lock();
                 return &raw const self.group_cursors[i].cursor;
             }
         }
@@ -145,6 +172,7 @@ impl QueueHeader {
         for i in 0..MAX_GROUPS {
             if self.group_labels[i] == ArrayStr::<GROUP_LABEL_LEN>::new() {
                 self.group_labels[i] = key;
+                self.release_group_lock();
                 return &raw const self.group_cursors[i].cursor;
             }
         }
@@ -154,12 +182,13 @@ impl QueueHeader {
             if let Some(pid) = pid_from_label(self.group_labels[i].as_str()) {
                 if !is_pid_alive(pid) {
                     self.group_labels[i] = key;
-                    self.group_cursors[i].cursor.store(0, Ordering::Relaxed);
+                    self.release_group_lock();
                     return &raw const self.group_cursors[i].cursor;
                 }
             }
         }
 
+        self.release_group_lock();
         panic!("no group slots available (max {} groups)", MAX_GROUPS);
     }
 
