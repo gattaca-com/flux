@@ -6,7 +6,10 @@ use flux_utils::{DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
-use crate::tcp::{ConnState, TcpStream, TcpTelemetry, stream::set_socket_buf_size};
+use crate::tcp::{
+    ConnState, TcpStream, TcpTelemetry,
+    stream::{DEFAULT_TCP_USER_TIMEOUT_MS, set_socket_buf_size, set_user_timeout},
+};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -57,6 +60,7 @@ struct ConnectionManager {
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
+    user_timeout_ms: u32,
     dcache: Option<DCachePtr>,
 
     // Always only outbound/client side connection streams
@@ -73,6 +77,7 @@ impl Default for ConnectionManager {
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
+            user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             dcache: None,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
@@ -276,6 +281,7 @@ impl ConnectionManager {
                 error!("couldn't setup nodelay for tcp stream for {addr}: {e}");
             })
             .ok()?;
+        set_user_timeout(&new_stream, self.user_timeout_ms);
         Some(new_stream)
     }
 
@@ -560,6 +566,13 @@ impl TcpConnector {
     /// accepted).
     pub fn with_socket_buf_size(mut self, size: usize) -> Self {
         self.conn_mgr.socket_buf_size = Some(size);
+        self
+    }
+
+    /// Overrides the TCP_USER_TIMEOUT socket option applied to
+    /// outbound connections.
+    pub fn with_user_timeout(mut self, timeout_ms: u32) -> Self {
+        self.conn_mgr.user_timeout_ms = timeout_ms;
         self
     }
 

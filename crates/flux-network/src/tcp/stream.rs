@@ -9,6 +9,7 @@ use flux_communication::Timer;
 use flux_timing::Nanos;
 use flux_utils::{DCache, DCacheRef};
 
+pub const DEFAULT_TCP_USER_TIMEOUT_MS: u32 = 10_000;
 enum RxBuf {
     Heap(Vec<u8>),
     DCache,
@@ -591,6 +592,23 @@ impl TcpStream {
 
     pub(crate) fn peer(&self) -> SocketAddr {
         self.peer_addr
+    }
+}
+
+/// Set TCP_USER_TIMEOUT on a mio TcpStream.
+/// After this duration of unacknowledged data the kernel closes the connection,
+/// overriding the system-wide tcp_retries2 (~15 min default) for this socket.
+pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            &timeout_ms as *const _ as *const libc::c_void,
+            core::mem::size_of::<u32>() as libc::socklen_t,
+        );
     }
 }
 
