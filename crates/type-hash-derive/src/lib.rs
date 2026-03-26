@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use proc_macro_crate::{crate_name, FoundCrate};
-use quote::{quote, ToTokens};
+use quote::{quote, quote_spanned, ToTokens};
 use syn::{
     parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Fields, Lit, Meta,
     MetaNameValue,
@@ -18,6 +18,23 @@ fn runtime_crate_path() -> proc_macro2::TokenStream {
             quote!(::flux::type_hash)
         }
     }
+}
+
+/// Check for `#[type_hash(skip_typename)]` on a struct/enum.
+/// When present, the generated impl sets `DERIVE_USES_TYPENAME = false`.
+fn has_type_hash_skip_typename(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("type_hash") {
+            return false;
+        }
+        let Meta::List(list) = &attr.meta else { return false };
+        let Ok(metas) = list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
+            return false;
+        };
+        metas.iter().any(|m| matches!(m, Meta::Path(p) if p.is_ident("skip_typename")))
+    })
 }
 
 fn type_hash_literal(attrs: &[Attribute]) -> Result<Option<String>, syn::Error> {
@@ -72,6 +89,7 @@ fn derive_for_enum(
     en: &DataEnum,
 ) -> Result<proc_macro2::TokenStream, syn::Error> {
     let name = &input.ident;
+    let skip_typename = has_type_hash_skip_typename(&input.attrs);
     let generics = input.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
@@ -112,7 +130,7 @@ fn derive_for_enum(
                 }
             }
         } else {
-            // No explicit discriminant: still distinguish “implicit” vs “explicit”
+            // No explicit discriminant: still distinguish "implicit" vs "explicit"
             steps.push(quote! {
                 h = #th::fnv1a64_str(h, "<implicit_discriminant>");
                 h = #th::mix64(h);
@@ -163,7 +181,9 @@ fn derive_for_enum(
                         );
                         steps.push(quote! {
                             h = #th::fnv1a64_str(h, #idx_str);
-                            h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                            if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
+                                h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                            }
 
                             h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -210,7 +230,9 @@ fn derive_for_enum(
                         );
                         steps.push(quote! {
                             h = #th::fnv1a64_str(h, #f_name);
-                            h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                            if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
+                                h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                            }
 
                             h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -235,6 +257,8 @@ fn derive_for_enum(
 
     Ok(quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
+            const DERIVE_USES_TYPENAME: bool = !#skip_typename;
+
             const TYPE_HASH: u64 = {
                     let mut h: u64 = 0xcbf29ce484222325u64;
 
@@ -287,6 +311,7 @@ pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
 }
 fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::TokenStream {
     let name = &input.ident;
+    let skip_typename = has_type_hash_skip_typename(&input.attrs);
     let generics = input.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let mut where_clause = where_clause.cloned();
@@ -353,8 +378,9 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                     field_steps.push(quote! {
                         h = #th::fnv1a64_str(h, #field_name_str);
 
-                        // (Optional) keep literal spelling too:
-                        h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                        if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
+                            h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                        }
 
                         h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -386,7 +412,9 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
 
                 field_steps.push(quote! {
                     h = #th::fnv1a64_str(h, #field_name_str);
-                    h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                    if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
+                        h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+                    }
 
                     h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -406,6 +434,8 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
 
     let expanded = quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
+            const DERIVE_USES_TYPENAME: bool = !#skip_typename;
+
             const TYPE_HASH: u64 = {
 
                     let mut h: u64 = 0xcbf29ce484222325u64;
@@ -453,15 +483,16 @@ pub fn type_hash_lock(attr: TokenStream, item: TokenStream) -> TokenStream {
         if let Expr::Lit(ExprLit { lit: Lit::Int(li), .. }) = value {
             let hash_value = li.base10_parse::<u64>().expect("expected integer literal: hash=xxx");
             let th = runtime_crate_path();
-            let expanded = quote! {
-                #input
-
-                #[allow(unknown_lints, eq_op)]
+            let assertion = quote_spanned! { name.span() =>
                 const _: [(); 0 - {
                     const ASSERT: bool =
-                        ((<#name as #th::TypeHash>::TYPE_HASH) == #hash_value);
-                    !ASSERT as u64 * (<#name as #th::TypeHash>::TYPE_HASH)
+                        <#name as #th::TypeHash>::TYPE_HASH == #hash_value;
+                    !ASSERT as u64 * <#name as #th::TypeHash>::TYPE_HASH
                 } as usize] = [];
+            };
+            let expanded = quote! {
+                #input
+                #assertion
             };
             return expanded.into();
         }
