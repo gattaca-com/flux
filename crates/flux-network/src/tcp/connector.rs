@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
-use flux_timing::{Duration, Nanos, Repeater};
+use flux_timing::{Duration, Instant, Nanos, Repeater};
 use flux_utils::{DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
@@ -62,6 +62,10 @@ struct ConnectionManager {
     socket_buf_size: Option<usize>,
     user_timeout_ms: u32,
     dcache: Option<DCachePtr>,
+    /// When set, connections whose send backlog exceeds `max` messages for
+    /// longer than `timeout` are disconnected (outbound scheduled for
+    /// reconnection).
+    max_backlog: Option<(usize, Duration)>,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
@@ -79,6 +83,7 @@ impl Default for ConnectionManager {
             socket_buf_size: None,
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             dcache: None,
+            max_backlog: None,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
@@ -173,17 +178,41 @@ impl ConnectionManager {
     }
 
     fn flush_backlogs(&mut self) {
+        let now = Instant::now();
         let mut i = self.conns.len();
         while i != 0 {
             i -= 1;
-            let stream = match &mut self.conns[i].1 {
+            let (token, ref mut variant) = self.conns[i];
+            let stream = match variant {
                 ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
                 ConnectionVariant::Listener(_) => continue,
             };
-            if stream.has_backlog() &&
-                stream.drain_backlog(self.poll.registry()) == ConnState::Disconnected
-            {
-                self.disconnect_at_index(i);
+            if stream.has_backlog() {
+                if stream.drain_backlog(self.poll.registry()) == ConnState::Disconnected {
+                    self.disconnect_at_index(i);
+                    continue;
+                }
+                if let Some((max, timeout)) = self.max_backlog {
+                    let len = stream.backlog_len();
+                    if len > max {
+                        // Start or continue the exceeded-since timer.
+                        let since = *stream.backlog_exceeded_since.get_or_insert(now);
+                        let elapsed = now.saturating_sub(since);
+                        if elapsed >= timeout {
+                            warn!(
+                                ?token,
+                                backlog = len,
+                                max,
+                                ?elapsed,
+                                "backlog exceeded limit for too long, disconnecting"
+                            );
+                            self.disconnect_at_index(i);
+                        }
+                    } else {
+                        // Back below threshold — reset the timer.
+                        stream.backlog_exceeded_since = None;
+                    }
+                }
             }
         }
     }
@@ -573,6 +602,20 @@ impl TcpConnector {
     /// outbound connections.
     pub fn with_user_timeout(mut self, timeout_ms: u32) -> Self {
         self.conn_mgr.user_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Sets the maximum send backlog (in framed messages) and how long it must
+    /// stay exceeded before a connection is automatically disconnected.
+    ///
+    /// Checked after each `flush_backlogs` pass.  If a connection's backlog
+    /// exceeds `max` continuously for longer than `timeout`, the connection
+    /// is closed:
+    /// - **Outbound:** scheduled for automatic reconnection (backlog preserved
+    ///   for retry).  The exceeded-since timer resets on reconnect.
+    /// - **Inbound:** simply dropped (remote must reconnect).
+    pub fn with_max_backlog(mut self, max: usize, timeout: Duration) -> Self {
+        self.conn_mgr.max_backlog = Some((max, timeout));
         self
     }
 

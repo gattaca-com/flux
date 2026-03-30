@@ -6,7 +6,7 @@ use std::{
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_communication::Timer;
-use flux_timing::Nanos;
+use flux_timing::{Instant, Nanos};
 use flux_utils::{DCache, DCacheRef};
 
 pub const DEFAULT_TCP_USER_TIMEOUT_MS: u32 = 10_000;
@@ -130,6 +130,11 @@ pub struct TcpStream {
     /// Invariant: `writable_armed == !send_q.is_empty()`
     writable_armed: bool,
 
+    /// When the send backlog first exceeded the configured `max_backlog`
+    /// threshold.  Reset to `None` when the backlog drops back below the
+    /// limit or on reconnect.
+    pub(crate) backlog_exceeded_since: Option<Instant>,
+
     /// Timers for network latency and alloc telemetry.
     timers: Option<TcpTimers>,
 }
@@ -167,6 +172,7 @@ impl TcpStream {
             send_backlog: VecDeque::with_capacity(64),
             send_cursor: 0,
             writable_armed: false,
+            backlog_exceeded_since: None,
             timers,
         }
     }
@@ -182,6 +188,7 @@ impl TcpStream {
         self.send_buf.clear();
         self.send_cursor = 0;
         self.header_buf.fill(0);
+        self.backlog_exceeded_since = None;
         self.stream = stream;
         if !self.send_backlog.is_empty() {
             self.writable_armed = false;
@@ -366,6 +373,12 @@ impl TcpStream {
     #[inline]
     pub(crate) fn has_backlog(&self) -> bool {
         !self.send_backlog.is_empty()
+    }
+
+    /// Number of framed messages waiting in the send backlog.
+    #[inline]
+    pub(crate) fn backlog_len(&self) -> usize {
+        self.send_backlog.len()
     }
 
     /// Flush queued data until kernel blocks, queue empty or we've written the
