@@ -20,6 +20,7 @@ serde.workspace = true
 rand.workspace = true
 spin.workspace = true
 wincode = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
@@ -30,6 +31,7 @@ crossbeam-channel = "0.5"
 [features]
 default = []
 wincode = ["dep:wincode"]
+bytes = ["dep:bytes"]
 
 [[bench]]
 name = "arrayvec"

@@ -14,6 +14,7 @@ flux-timing.workspace = true
 flux-utils.workspace = true
 libc.workspace = true
 mio.workspace = true
+serde.workspace = true
 tracing.workspace = true
 wincode = { workspace = true, optional = true }
 
