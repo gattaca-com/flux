@@ -430,7 +430,14 @@ impl TcpStream {
                 RxState::ReadingHeader { mut buf, mut have } => {
                     while have < FRAME_HEADER_SIZE {
                         match self.stream.read(&mut buf[have..]) {
-                            Ok(0) => return ReadOutcome::Disconnected,
+                            Ok(0) => {
+                                debug!(
+                                    peer = %self.peer_addr,
+                                    have,
+                                    "tcp: connection closed by peer (reading header)",
+                                );
+                                return ReadOutcome::Disconnected;
+                            }
 
                             Ok(n) => {
                                 have += n;
@@ -511,7 +518,15 @@ impl TcpStream {
                             self.stream.read(&mut buf[offset..msg_len])
                         };
                         match result {
-                            Ok(0) => return ReadOutcome::Disconnected,
+                            Ok(0) => {
+                                debug!(
+                                    peer = %self.peer_addr,
+                                    msg_len,
+                                    offset,
+                                    "tcp: connection closed by peer (reading payload)",
+                                );
+                                return ReadOutcome::Disconnected;
+                            }
                             Ok(n) => {
                                 offset += n;
                                 if offset == msg_len {
