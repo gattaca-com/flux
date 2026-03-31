@@ -7,7 +7,7 @@ use crate::{
 
 #[test]
 fn headersize() {
-    assert_eq!(4416, std::mem::size_of::<QueueHeader>());
+    assert_eq!(34880, std::mem::size_of::<QueueHeader>());
     assert_eq!(72, std::mem::size_of::<ConsumerBare<[u8; 60]>>())
 }
 

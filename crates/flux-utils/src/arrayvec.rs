@@ -517,6 +517,36 @@ mod serde_impl {
     }
 }
 
+#[cfg(feature = "bytes")]
+mod bytes_impl {
+    use bytes::buf::UninitSlice;
+
+    use super::ArrayVec;
+
+    unsafe impl<const N: usize> bytes::BufMut for ArrayVec<u8, N> {
+        #[inline]
+        fn remaining_mut(&self) -> usize {
+            N - self.len()
+        }
+
+        #[inline]
+        fn chunk_mut(&mut self) -> &mut UninitSlice {
+            let len = self.len();
+            unsafe {
+                UninitSlice::from_raw_parts_mut(
+                    self.data.as_mut_ptr().add(len).cast::<u8>(),
+                    N - len,
+                )
+            }
+        }
+
+        #[inline]
+        unsafe fn advance_mut(&mut self, cnt: usize) {
+            self.len += cnt;
+        }
+    }
+}
+
 #[cfg(feature = "wincode")]
 mod wincode_impl {
     use std::mem::{self, MaybeUninit};
