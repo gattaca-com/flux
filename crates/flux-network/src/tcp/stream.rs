@@ -193,9 +193,17 @@ impl TcpStream {
         if !self.send_backlog.is_empty() {
             self.writable_armed = false;
             if let Some(message) = on_connect_msg {
-                self.serialise_frame(|bytes| bytes.extend_from_slice(message));
-                let data = self.alloc_vec(0);
-                return self.enqueue_front(registry, data);
+                // Skip if the first backlog entry already carries an identical
+                // payload — avoids sending a duplicate on_connect message after
+                // reconnect when the previous one is still queued.
+                let dominated = self.send_backlog.front().is_some_and(|front| {
+                    front.len() >= FRAME_HEADER_SIZE && front[FRAME_HEADER_SIZE..] == **message
+                });
+                if !dominated {
+                    self.serialise_frame(|bytes| bytes.extend_from_slice(message));
+                    let data = self.alloc_vec(0);
+                    return self.enqueue_front(registry, data);
+                }
             }
             self.arm_writable(registry)
         } else if let Some(message) = on_connect_msg {
