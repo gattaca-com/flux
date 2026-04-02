@@ -66,6 +66,8 @@ struct ConnectionManager {
     /// longer than `timeout` are disconnected (outbound scheduled for
     /// reconnection).
     max_backlog: Option<(usize, Duration)>,
+    /// Whether to set TCP_NODELAY on sockets (disables Nagle's algorithm).
+    nodelay: bool,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
@@ -84,6 +86,7 @@ impl Default for ConnectionManager {
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             dcache: None,
             max_backlog: None,
+            nodelay: true,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
@@ -304,12 +307,14 @@ impl ConnectionManager {
             error!("couldn't register tcp stream for {addr} with registry: {e}");
             return None;
         };
-        new_stream
-            .set_nodelay(true)
-            .inspect_err(|e| {
-                error!("couldn't setup nodelay for tcp stream for {addr}: {e}");
-            })
-            .ok()?;
+        if self.nodelay {
+            new_stream
+                .set_nodelay(true)
+                .inspect_err(|e| {
+                    error!("couldn't setup nodelay for tcp stream for {addr}: {e}");
+                })
+                .ok()?;
+        }
         set_user_timeout(&new_stream, self.user_timeout_ms);
         Some(new_stream)
     }
@@ -393,9 +398,11 @@ impl ConnectionManager {
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                             continue;
                         };
-                        if let Err(e) = stream.set_nodelay(true) {
-                            error!("couldn't set nodelay on stream to {addr}: {e}");
-                            continue;
+                        if self.nodelay {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                error!("couldn't set nodelay on stream to {addr}: {e}");
+                                continue;
+                            }
                         }
                         let mut conn = TcpStream::from_stream_with_telemetry(
                             stream,
@@ -478,9 +485,11 @@ impl ConnectionManager {
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                             continue;
                         };
-                        if let Err(e) = stream.set_nodelay(true) {
-                            error!("couldn't set nodelay on stream to {addr}: {e}");
-                            continue;
+                        if self.nodelay {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                error!("couldn't set nodelay on stream to {addr}: {e}");
+                                continue;
+                            }
                         }
                         let mut conn = TcpStream::from_stream_with_telemetry(
                             stream,
@@ -602,6 +611,16 @@ impl TcpConnector {
     /// outbound connections.
     pub fn with_user_timeout(mut self, timeout_ms: u32) -> Self {
         self.conn_mgr.user_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Controls whether `TCP_NODELAY` is set on sockets (default: **true**).
+    ///
+    /// When enabled, Nagle's algorithm is disabled and small writes are sent
+    /// immediately.  Set to `false` to allow the kernel to coalesce small
+    /// writes (higher throughput at the cost of up to ~40 ms latency).
+    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
+        self.conn_mgr.nodelay = nodelay;
         self
     }
 
