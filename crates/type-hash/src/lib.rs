@@ -13,6 +13,10 @@ pub trait TypeHash {
     /// Set to `false` to make the hash depend only on the structural
     /// `TYPE_HASH`, which resolves through type aliases.
     const DERIVE_USES_TYPENAME: bool = true;
+    /// Canonical type name for parent derives to hash instead of `stringify!`.
+    /// Set automatically by the derive macro; manual impls can leave the
+    /// default.
+    const TYPE_NAME: &'static str = "";
 }
 
 /// Const FNV-1a 64-bit over bytes.

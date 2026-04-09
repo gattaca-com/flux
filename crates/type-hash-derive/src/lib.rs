@@ -20,7 +20,7 @@ fn runtime_crate_path() -> proc_macro2::TokenStream {
     }
 }
 
-/// Check for `#[type_hash(skip_typename)]` on a struct/enum.
+/// Check for `#[type_hash(skip_typename_on_derive)]` on a struct/enum.
 /// When present, the generated impl sets `DERIVE_USES_TYPENAME = false`.
 fn has_type_hash_skip_typename(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
@@ -33,8 +33,35 @@ fn has_type_hash_skip_typename(attrs: &[Attribute]) -> bool {
         else {
             return false;
         };
-        metas.iter().any(|m| matches!(m, Meta::Path(p) if p.is_ident("skip_typename")))
+        metas.iter().any(|m| matches!(m, Meta::Path(p) if p.is_ident("skip_typename_on_derive")))
     })
+}
+
+/// Extract `#[type_hash(name = "...")]` from struct/enum-level attributes.
+/// When present, the given name is used instead of the struct/enum identifier
+/// in the hash computation.
+fn type_hash_name_override(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("type_hash") {
+            continue;
+        }
+        let Meta::List(list) = &attr.meta else { continue };
+        let Ok(metas) = list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
+            continue;
+        };
+        for meta in metas {
+            if let Meta::NameValue(MetaNameValue { path, value, .. }) = meta {
+                if path.is_ident("name") {
+                    if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = value {
+                        return Some(s.value());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn type_hash_literal(attrs: &[Attribute]) -> Result<Option<String>, syn::Error> {
@@ -84,12 +111,35 @@ fn type_hash_literal(attrs: &[Attribute]) -> Result<Option<String>, syn::Error> 
 }
 use syn::{DataEnum, WhereClause, WherePredicate};
 
+fn name_token_expr(name_override: &Option<String>, name: &syn::Ident) -> proc_macro2::TokenStream {
+    if let Some(n) = name_override {
+        let s = n.as_str();
+        quote! { #s }
+    } else {
+        quote! { stringify!(#name) }
+    }
+}
+
+fn emit_typename_hash(th: &proc_macro2::TokenStream, ty: &syn::Type) -> proc_macro2::TokenStream {
+    let ty_tokens = ty.to_token_stream();
+    quote! {
+        if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
+            if <#ty as #th::TypeHash>::TYPE_NAME.is_empty() {
+                h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
+            } else {
+                h = #th::fnv1a64_str(h, <#ty as #th::TypeHash>::TYPE_NAME);
+            }
+        }
+    }
+}
+
 fn derive_for_enum(
     input: &DeriveInput,
     en: &DataEnum,
 ) -> Result<proc_macro2::TokenStream, syn::Error> {
     let name = &input.ident;
     let skip_typename = has_type_hash_skip_typename(&input.attrs);
+    let name_override = type_hash_name_override(&input.attrs);
     let generics = input.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
@@ -154,7 +204,6 @@ fn derive_for_enum(
                 for (i, f) in unnamed.unnamed.iter().enumerate() {
                     let idx_str = i.to_string();
                     let ty = &f.ty;
-                    let ty_tokens = ty.to_token_stream();
 
                     let override_lit = type_hash_literal(&f.attrs)?;
 
@@ -179,11 +228,10 @@ fn derive_for_enum(
                             &mut where_clause.cloned(),
                             syn::parse_quote!(#ty: #th::TypeHash),
                         );
+                        let typename_hash = emit_typename_hash(&th, ty);
                         steps.push(quote! {
                             h = #th::fnv1a64_str(h, #idx_str);
-                            if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
-                                h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
-                            }
+                            #typename_hash
 
                             h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -205,7 +253,6 @@ fn derive_for_enum(
                     let f_ident = f.ident.as_ref().unwrap();
                     let f_name = f_ident.to_string();
                     let ty = &f.ty;
-                    let ty_tokens = ty.to_token_stream();
 
                     let override_lit = type_hash_literal(&f.attrs)?;
 
@@ -228,11 +275,10 @@ fn derive_for_enum(
                             &mut where_clause.cloned(),
                             syn::parse_quote!(#ty: #th::TypeHash),
                         );
+                        let typename_hash = emit_typename_hash(&th, ty);
                         steps.push(quote! {
                             h = #th::fnv1a64_str(h, #f_name);
-                            if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
-                                h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
-                            }
+                            #typename_hash
 
                             h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -255,15 +301,18 @@ fn derive_for_enum(
 
     let where_clause_tokens = where_clause;
 
+    let name_expr = name_token_expr(&name_override, name);
+    let has_name_override = name_override.is_some();
     Ok(quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
-            const DERIVE_USES_TYPENAME: bool = !#skip_typename;
+            const DERIVE_USES_TYPENAME: bool = #has_name_override || !#skip_typename;
+            const TYPE_NAME: &'static str = #name_expr;
 
             const TYPE_HASH: u64 = {
                     let mut h: u64 = 0xcbf29ce484222325u64;
 
-                    // Enum name
-                    h = #th::fnv1a64_str(h, stringify!(#name));
+                    // Enum name (or override via #[type_hash(name = "...")])
+                    h = #th::fnv1a64_str(h, #name_expr);
 
                     // Enum layout
                     h ^= #th::mix64(::core::mem::size_of::<Self>() as u64);
@@ -312,6 +361,7 @@ pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
 fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::TokenStream {
     let name = &input.ident;
     let skip_typename = has_type_hash_skip_typename(&input.attrs);
+    let name_override = type_hash_name_override(&input.attrs);
     let generics = input.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let mut where_clause = where_clause.cloned();
@@ -326,7 +376,6 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                 let ident = f.ident.as_ref().unwrap();
                 let field_name_str = ident.to_string();
                 let ty = &f.ty;
-                let ty_tokens = ty.to_token_stream();
 
                 // Add trait bounds: field type must be Copy + Sized + TypeHash.
                 // (TypeHash already includes Copy+Sized, but keeping the intent explicit is
@@ -375,12 +424,11 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                         .predicates
                         .push(pred);
 
+                    let typename_hash = emit_typename_hash(&th, ty);
                     field_steps.push(quote! {
                         h = #th::fnv1a64_str(h, #field_name_str);
 
-                        if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
-                            h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
-                        }
+                        #typename_hash
 
                         h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -399,7 +447,6 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                 let index = syn::Index::from(idx);
                 let field_name_str = idx.to_string(); // "0", "1", ...
                 let ty = &f.ty;
-                let ty_tokens = ty.to_token_stream();
 
                 let pred: syn::WherePredicate = syn::parse_quote! { #ty: #th::TypeHash };
                 where_clause
@@ -410,11 +457,10 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                     .predicates
                     .push(pred);
 
+                let typename_hash = emit_typename_hash(&th, ty);
                 field_steps.push(quote! {
                     h = #th::fnv1a64_str(h, #field_name_str);
-                    if <#ty as #th::TypeHash>::DERIVE_USES_TYPENAME {
-                        h = #th::fnv1a64_str(h, stringify!(#ty_tokens));
-                    }
+                    #typename_hash
 
                     h ^= #th::mix64(<#ty as #th::TypeHash>::TYPE_HASH);
 
@@ -432,16 +478,22 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
 
     let where_clause_tokens = where_clause;
 
+    // When `name` is specified the type is masquerading as the original
+    // non-versioned type, so DERIVE_USES_TYPENAME must be `true` (like the
+    // original) regardless of `skip_typename_on_derive`.
+    let name_expr = name_token_expr(&name_override, name);
+    let has_name_override = name_override.is_some();
     let expanded = quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
-            const DERIVE_USES_TYPENAME: bool = !#skip_typename;
+            const DERIVE_USES_TYPENAME: bool = #has_name_override || !#skip_typename;
+            const TYPE_NAME: &'static str = #name_expr;
 
             const TYPE_HASH: u64 = {
 
                     let mut h: u64 = 0xcbf29ce484222325u64;
 
-                    // Struct name as written (identifier)
-                    h = #th::fnv1a64_str(h, stringify!(#name));
+                    // Struct name (or override via #[type_hash(name = "...")])
+                    h = #th::fnv1a64_str(h, #name_expr);
 
                     // Struct layout
                     h ^= #th::mix64(::core::mem::size_of::<Self>() as u64);
@@ -471,7 +523,6 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
 pub fn type_hash_lock(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
-
     let meta = parse_macro_input!(attr as Meta);
     let Meta::NameValue(MetaNameValue { path, value, .. }) = &meta else {
         return syn::Error::new_spanned(&meta, "expected #[type_hash_lock(hash=xxx)]")
