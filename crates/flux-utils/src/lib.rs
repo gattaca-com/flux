@@ -4,6 +4,7 @@ mod dcache;
 pub mod directories;
 mod namespace;
 mod shared_vector;
+mod tcache;
 mod thread;
 mod vsync;
 

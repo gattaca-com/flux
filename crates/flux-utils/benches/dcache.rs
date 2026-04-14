@@ -287,6 +287,8 @@ fn run_crossbeam(n_producers: usize, msg_size: usize, per_producer: usize) -> Du
     let (tx, rx) = crossbeam_channel::bounded::<Box<[u8]>>(QUEUE_LEN);
 
     let consumer = thread::spawn(move || {
+        core_affinity::set_for_current(CoreId { id: LAST_CORE });
+        
         let mut sum = 0u64;
         let mut seen = 0usize;
         while seen < total {
@@ -305,9 +307,10 @@ fn run_crossbeam(n_producers: usize, msg_size: usize, per_producer: usize) -> Du
     thread::sleep(Duration::from_millis(100).into());
 
     let producers: Vec<_> = (0..n_producers)
-        .map(|_| {
+        .map(|i| {
             let tx = tx.clone();
             thread::spawn(move || {
+                core_affinity::set_for_current(CoreId { id: LAST_CORE - 1 - i });
                 let mut rng = now_nanos();
                 for _ in 0..per_producer {
                     let mut msg = vec![0u8; msg_size].into_boxed_slice();
