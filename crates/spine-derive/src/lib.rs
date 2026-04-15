@@ -339,10 +339,8 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
                 let (_is_persistent, size_expr_opt, is_spmc, mtu_expr_opt) =
                     get_queue_config(&field.attrs);
-                let size_arg = match size_expr_opt {
-                    Some(expr) => quote! { #expr },
-                    None => quote! { 2usize.pow(15) },
-                };
+                let size_arg = size_expr_opt
+                    .map_or_else(|| quote! { 2usize.pow(15) }, |expr| quote! { #expr });
                 let queue_type = if is_spmc {
                     quote! { ::flux::communication::queue::QueueType::SPMC }
                 } else {

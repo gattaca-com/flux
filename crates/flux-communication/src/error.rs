@@ -1,13 +1,13 @@
 use shared_memory::ShmemError;
 use thiserror::Error;
 
-#[derive(Error, Debug, Copy, Clone, PartialEq)]
+#[derive(Error, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EmptyError {
     #[error("Lock empty")]
     Empty,
 }
 
-#[derive(Error, Debug, Copy, Clone, PartialEq)]
+#[derive(Error, Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ReadError {
     #[error("Got sped past")]

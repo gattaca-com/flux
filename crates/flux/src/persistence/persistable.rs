@@ -13,7 +13,7 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
     const PERSIST_DIR: &'static str;
 
     fn filename(&self) -> String {
-        "".to_string()
+        String::new()
     }
 
     fn persist_dir<S: AsRef<Path>>(app_name: S) -> PathBuf {

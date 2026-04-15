@@ -40,3 +40,6 @@ harness = false
 [[bench]]
 name = "dcache"
 harness = false
+
+[lints]
+workspace = true

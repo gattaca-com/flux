@@ -8,7 +8,7 @@ use crate::{
 #[test]
 fn headersize() {
     assert_eq!(34880, std::mem::size_of::<QueueHeader>());
-    assert_eq!(72, std::mem::size_of::<ConsumerBare<[u8; 60]>>())
+    assert_eq!(72, std::mem::size_of::<ConsumerBare<[u8; 60]>>());
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
             }
             assert_eq!(sum, (0..tot_messages).sum::<usize>());
         });
-        readhandles.push(cons)
+        readhandles.push(cons);
     }
     let mut writehandles = Vec::new();
     for n in 0..n_writers {
@@ -88,27 +88,27 @@ fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
 
 #[test]
 fn multithread_1_2() {
-    multithread(1, 2, 100000);
+    multithread(1, 2, 100_000);
 }
 
 #[test]
 fn multithread_1_4() {
-    multithread(1, 4, 100000);
+    multithread(1, 4, 100_000);
 }
 
 #[test]
 fn multithread_2_4() {
-    multithread(2, 4, 100000);
+    multithread(2, 4, 100_000);
 }
 
 #[test]
 fn multithread_4_4() {
-    multithread(4, 4, 100000);
+    multithread(4, 4, 100_000);
 }
 
 #[test]
 fn multithread_8_8() {
-    multithread(8, 8, 100000);
+    multithread(8, 8, 100_000);
 }
 
 #[test]
@@ -148,8 +148,7 @@ fn basic_shared() {
 #[test]
 fn active_groups_round_trip() {
     let q = Queue::<u64>::new(16, QueueType::SPMC);
-    let header: &mut QueueHeader =
-        &mut unsafe { &mut *(q.inner as *mut super::InnerQueue<u64>) }.header;
+    let header: &mut QueueHeader = &mut unsafe { &mut *q.inner.cast_mut() }.header;
 
     // Initially no groups.
     assert!(header.active_groups().is_empty());
@@ -204,8 +203,7 @@ fn pid_from_label_parsing() {
 #[test]
 fn dead_pid_slot_reclaimed() {
     let q = Queue::<u64>::new(16, QueueType::SPMC);
-    let header: &mut QueueHeader =
-        &mut unsafe { &mut *(q.inner as *mut super::InnerQueue<u64>) }.header;
+    let header: &mut QueueHeader = &mut unsafe { &mut *q.inner.cast_mut() }.header;
 
     // Fill a slot with a label referencing a PID that (almost certainly) doesn't
     // exist.

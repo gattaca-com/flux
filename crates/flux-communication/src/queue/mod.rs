@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(clippy::significant_drop_tightening)]
 fn broadcast_id_for(label: &str, queue: &str) -> usize {
     static COUNTERS: OnceLock<Mutex<HashMap<(String, String), usize>>> = OnceLock::new();
     let mut map = COUNTERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -49,7 +50,7 @@ fn pid_from_label(label: &str) -> Option<u32> {
 ///
 /// Uses `/proc/<pid>` on Linux which avoids requiring the `libc` crate.
 fn is_pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{}", pid)).exists()
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 use flux_utils::{ArrayStr, safe_panic};
@@ -108,7 +109,10 @@ impl QueueHeader {
     }
 
     pub fn from_ptr(ptr: *mut u8) -> &'static mut Self {
-        unsafe { &mut *(ptr as *mut Self) }
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            &mut *ptr.cast::<Self>()
+        }
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -189,15 +193,15 @@ impl QueueHeader {
         }
 
         self.release_group_lock();
-        panic!("no group slots available (max {} groups)", MAX_GROUPS);
+        panic!("no group slots available (max {MAX_GROUPS} groups)");
     }
 
     /// Returns all non-empty consumer group slots as `(label, cursor_value)`
     /// pairs.
     ///
-    /// Queues created by older flux versions may not have the group_labels
+    /// Queues created by older flux versions may not have the `group_labels`
     /// region initialised — the raw `ArrayStr::len` field will contain
-    /// garbage.  We detect this (len > GROUP_LABEL_LEN) and bail early
+    /// garbage.  We detect this (`len > GROUP_LABEL_LEN`) and bail early
     /// with an empty vec instead of letting `from_raw_parts` abort.
     pub fn active_groups(&self) -> Vec<(&str, usize)> {
         let mut out = Vec::new();
@@ -228,19 +232,19 @@ pub(crate) fn shmem_map_create_or_open(flink_path: &Path, size: usize) -> (*mut 
             std::mem::forget(shmem);
             (ptr, true, size)
         }
-        Err(ShmemError::LinkExists) => match ShmemConf::new().flink(flink_path).open() {
-            Ok(shmem) => {
+        Err(ShmemError::LinkExists) => ShmemConf::new().flink(flink_path).open().map_or_else(
+            |_| {
+                let _ = std::fs::remove_file(flink_path);
+                shmem_map_create_or_open(flink_path, size)
+            },
+            |shmem| {
                 let mapped_size = shmem.len();
                 let ptr = shmem.as_ptr();
                 std::mem::forget(shmem);
                 (ptr, false, mapped_size)
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(flink_path);
-                shmem_map_create_or_open(flink_path, size)
-            }
-        },
-        Err(e) => panic!("shmem create failed at {flink_path:?}: {e}"),
+            },
+        ),
+        Err(e) => panic!("shmem create failed at {}: {e}", flink_path.display()),
     }
 }
 
@@ -254,8 +258,8 @@ pub struct InnerQueue<T> {
 
 impl<T: Copy> InnerQueue<T> {
     /// Allocs (unshared) memory and initializes a new queue from it.
-    ///     QueueType::MPMC = multi producer multi consumer
-    ///     QueueType::SPMC = single producer multi consumer
+    ///     `QueueType::MPMC` = multi producer multi consumer
+    ///     `QueueType::SPMC` = single producer multi consumer
     fn new(len: usize, queue_type: QueueType) -> *const Self {
         let real_len = len.next_power_of_two();
         let size = size_of::<QueueHeader>() + real_len * size_of::<Seqlock<T>>();
@@ -300,7 +304,7 @@ impl<T: Copy> InnerQueue<T> {
                 return Err(QueueError::UnInitialized);
             }
             // TODO @lopo: I think this is slightly wrong
-            Ok(std::ptr::slice_from_raw_parts_mut(ptr as *mut Seqlock<T>, len) as *const Self)
+            Ok(std::ptr::slice_from_raw_parts_mut(ptr.cast::<Seqlock<T>>(), len) as *const Self)
         }
     }
 
@@ -381,18 +385,14 @@ impl<T: Copy> InnerQueue<T> {
         for i in 1..=self.header.mask {
             let lck = self.load(i);
             let v = lck.version();
-            if v & 1 == 1 {
-                panic!("odd version at {i}: {prev_v} -> {v}");
-            }
+            assert!(v & 1 != 1, "odd version at {i}: {prev_v} -> {v}");
             if v != prev_v && v & 1 == 0 {
                 n_changes += 1;
                 println!("version change at {i}: {prev_v} -> {v}");
                 prev_v = v;
             }
         }
-        if n_changes > 1 {
-            panic!("what")
-        }
+        assert!(n_changes <= 1, "what");
     }
 
     #[inline]
@@ -451,7 +451,7 @@ impl<T: Copy> InnerQueue<T> {
         }
         if self.header.elsize != elsize {
             return Err(QueueError::ElementSizeChanged(self.header.elsize, elsize));
-        };
+        }
         if let Some(poisoned_element) = self.is_poisoned() {
             return Err(QueueError::ElementPoisoned(poisoned_element));
         }
@@ -494,7 +494,8 @@ impl<T: Copy> InnerQueue<T> {
 
     // Wait for the queue at `ptr` to finish initialising, then validate it.
     fn open_initialized(ptr: *mut u8, len: usize) -> Result<*const Self, QueueError> {
-        let header = ptr as *mut QueueHeader;
+        #[allow(clippy::cast_ptr_alignment)]
+        let header = ptr.cast::<QueueHeader>();
         let mut tries = 0;
         while unsafe { !(*header).is_initialized() } {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -571,7 +572,7 @@ impl<T: Copy> Queue<T> {
     }
 
     fn group_cursor(&self, key: &str) -> *const AtomicUsize {
-        unsafe { &mut *(self.inner as *mut InnerQueue<T>) }.header.find_or_insert_group(key)
+        unsafe { &mut *self.inner.cast_mut() }.header.find_or_insert_group(key)
     }
 }
 
@@ -598,7 +599,7 @@ impl<T> AsRef<InnerQueue<T>> for Queue<T> {
     }
 }
 
-/// Simply exists for the automatic produce_first
+/// Simply exists for the automatic `produce_first`
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Producer<T> {
@@ -635,8 +636,8 @@ impl<T: Copy> Producer<T> {
     }
 }
 
-impl<T> AsMut<Producer<T>> for Producer<T> {
-    fn as_mut(&mut self) -> &mut Producer<T> {
+impl<T> AsMut<Self> for Producer<T> {
+    fn as_mut(&mut self) -> &mut Self {
         self
     }
 }
@@ -675,7 +676,7 @@ impl<T: Copy> ConsumerBare<T> {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let label = std::boxed::Box::leak(format!("{}", id).into_boxed_str());
+        let label = std::boxed::Box::leak(format!("{id}").into_boxed_str());
 
         let mut s = Self::new(queue, label);
         s.try_init_broadcast();
@@ -748,7 +749,7 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline(never)]
     fn init_broadcast(&mut self) {
         let id = broadcast_id_for(self.label, std::any::type_name::<T>());
-        let id = if id == 0 { "" } else { &format!(".{}", id) };
+        let id = if id == 0 { "" } else { &format!(".{id}") };
 
         self.cursor = self.queue.group_cursor(&format!(
             "{}[{}].{}{}.broadcast",
@@ -780,7 +781,7 @@ impl<T: Copy> ConsumerBare<T> {
         self.acquire_next_slot();
     }
 
-    /// Nonblocking consume returning either Ok(()) or a ReadError
+    /// Nonblocking consume returning either Ok(()) or a `ReadError`
     #[inline]
     pub fn try_consume(&mut self, el: &mut T) -> Result<(), ReadError> {
         self.try_init_broadcast();
@@ -811,15 +812,14 @@ impl<T: Copy> ConsumerBare<T> {
     pub fn blocking_consume(&mut self, el: &mut T) {
         loop {
             match self.try_consume(el) {
-                Ok(_) => {
+                Ok(()) => {
                     return;
                 }
                 Err(ReadError::Empty) => {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        std::arch::x86_64::_mm_pause()
+                        std::arch::x86_64::_mm_pause();
                     };
-                    continue;
                 }
                 Err(ReadError::SpedPast) => {
                     self.recover_after_error();
@@ -833,7 +833,7 @@ impl<T: Copy> ConsumerBare<T> {
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn init_header(consumer_ptr: *mut ConsumerBare<T>, queue: Queue<T>, label: &'static str) {
+    pub fn init_header(consumer_ptr: *mut Self, queue: Queue<T>, label: &'static str) {
         unsafe {
             (*consumer_ptr).pos = usize::MAX;
             (*consumer_ptr).expected_version = 0;
@@ -863,8 +863,8 @@ impl<T: Copy> ConsumerBare<T> {
     }
 }
 
-impl<T> AsMut<ConsumerBare<T>> for ConsumerBare<T> {
-    fn as_mut(&mut self) -> &mut ConsumerBare<T> {
+impl<T> AsMut<Self> for ConsumerBare<T> {
+    fn as_mut(&mut self) -> &mut Self {
         self
     }
 }
@@ -1022,7 +1022,7 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 
     pub fn set_logging(&mut self, arg: bool) {
-        self.should_log = arg
+        self.should_log = arg;
     }
 
     pub fn set_collaborative_group(&mut self, group_label: &'static str) {

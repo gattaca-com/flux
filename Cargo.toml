@@ -65,3 +65,22 @@ url = "2.5.8"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+
+[workspace.lints.clippy]
+as_ptr_cast_mut = { level = "allow", priority = 1 }
+cast_lossless = { level = "allow", priority = 1 }
+cast_possible_truncation = { level = "allow", priority = 1 }
+cast_possible_wrap = { level = "allow", priority = 1 }
+cast_precision_loss = { level = "allow", priority = 1 }
+cast_sign_loss = { level = "allow", priority = 1 }
+collapsible_if = { level = "allow", priority = 1 }
+inline_always = { level = "allow", priority = 1 }
+missing-errors-doc = { level = "allow", priority = 1 }
+missing-panics-doc = { level = "allow", priority = 1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+missing_safety_doc = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+nursery = "warn"
+pedantic = "warn"
+redundant_pub_crate = { level = "allow", priority = 1 }
+return_self_not_must_use = { level = "allow", priority = 1 }

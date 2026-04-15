@@ -24,7 +24,7 @@ pub const fn fnv1a64_bytes(mut h: u64, bytes: &[u8]) -> u64 {
     let mut i = 0;
     while i < bytes.len() {
         h ^= bytes[i] as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(0x0100_0000_01b3);
         i += 1;
     }
     h
@@ -37,9 +37,9 @@ pub const fn fnv1a64_str(h: u64, s: &str) -> u64 {
 /// Mix helper (cheap avalanche-ish).
 pub const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 33;
-    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
     x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     x ^= x >> 33;
     x
 }
@@ -56,7 +56,7 @@ pub const fn hash_layout_of<T>(seed: u64) -> u64 {
 }
 
 /// --- Primitive impls ---
-/// Fixed constants; not derived from type_name to keep them stable.
+/// Fixed constants; not derived from `type_name` to keep them stable.
 macro_rules! impl_primitive_type_hash {
     ($($t:ty => $id:expr),* $(,)?) => {
         $(

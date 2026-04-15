@@ -28,12 +28,12 @@ impl Duration {
     }
 
     #[inline]
-    pub fn saturating_sub(self, rhs: Duration) -> Self {
+    pub fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))
     }
 
     #[inline]
-    pub fn saturating_add(self, rhs: Duration) -> Self {
+    pub fn saturating_add(self, rhs: Self) -> Self {
         Self(self.0.saturating_add(rhs.0))
     }
 
@@ -132,39 +132,39 @@ impl From<Duration> for u64 {
 }
 
 impl Add for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn add(self, rhs: Duration) -> Duration {
-        Duration(self.0.wrapping_add(rhs.0))
+    fn add(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_add(rhs.0))
     }
 }
 
 impl AddAssign for Duration {
     #[inline]
-    fn add_assign(&mut self, rhs: Duration) {
+    fn add_assign(&mut self, rhs: Self) {
         *self = *self + rhs;
     }
 }
 
 impl Sub for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn sub(self, rhs: Duration) -> Duration {
-        Duration(self.0.wrapping_sub(rhs.0))
+    fn sub(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_sub(rhs.0))
     }
 }
 
 impl SubAssign for Duration {
     #[inline]
-    fn sub_assign(&mut self, rhs: Duration) {
+    fn sub_assign(&mut self, rhs: Self) {
         *self = *self - rhs;
     }
 }
 
 impl Sub<u64> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
     fn sub(self, rhs: u64) -> Duration {

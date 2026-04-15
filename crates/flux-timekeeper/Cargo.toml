@@ -22,3 +22,6 @@ signal-hook.workspace = true
 [[bin]]
 name = "timekeeper"
 path = "bin/timekeeper.rs"
+
+[lints]
+workspace = true

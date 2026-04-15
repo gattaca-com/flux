@@ -25,3 +25,6 @@ wincode-derive = { workspace = true, optional = true }
 [features]
 default = []
 wincode = ["dep:wincode", "dep:wincode-derive"]
+
+[lints]
+workspace = true

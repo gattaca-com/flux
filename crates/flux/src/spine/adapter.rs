@@ -338,11 +338,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers),
     {
         let consumer = self.consumers.as_mut();
-        let consumed = consumer.consume_internal_message(&mut self.producers, &mut f);
-        if consumed {
+        let consumed_message = consumer.consume_internal_message(&mut self.producers, &mut f);
+        if consumed_message {
             self.did_work = true;
         }
-        consumed
+        consumed_message
     }
 
     #[inline]

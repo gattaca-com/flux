@@ -17,16 +17,13 @@ pub struct ShmemData<T> {
 }
 
 impl<T: Default> ShmemData<T> {
-    pub fn new(app_name: &str) -> Result<ShmemData<T>, ShmemError> {
+    pub fn new(app_name: &str) -> Result<Self, ShmemError> {
         Self::open_or_init(app_name, T::default)
     }
 }
 
 impl<T> ShmemData<T> {
-    pub fn open_or_init(
-        app_name: &str,
-        init_f: impl FnOnce() -> T,
-    ) -> Result<ShmemData<T>, ShmemError> {
+    pub fn open_or_init(app_name: &str, init_f: impl FnOnce() -> T) -> Result<Self, ShmemError> {
         Self::open_or_init_with_base_dir(local_share_dir(), app_name, init_f)
     }
 
@@ -34,7 +31,7 @@ impl<T> ShmemData<T> {
         dir: D,
         app_name: A,
         init_f: impl FnOnce() -> T,
-    ) -> Result<ShmemData<T>, ShmemError> {
+    ) -> Result<Self, ShmemError> {
         use shared_memory::{ShmemConf, ShmemError};
         let type_name = short_typename::<T>();
         let shmem_file = shmem_dir_data_with_base(&dir, &app_name).join(type_name.as_str());
@@ -74,7 +71,7 @@ impl<T> ShmemData<T> {
     }
 
     fn shmem_ptr(shmem: Shmem) -> NonNull<T> {
-        let shmem_ptr = shmem.as_ptr() as *mut T;
+        let shmem_ptr = shmem.as_ptr().cast::<T>();
 
         // Don't drop shmem on exit. Will just pick up same file descriptor from flink
         // on restart.
