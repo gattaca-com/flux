@@ -510,6 +510,7 @@ impl<T: Copy> InnerQueue<T> {
     }
 }
 
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl<T> Send for InnerQueue<T> {}
 unsafe impl<T> Sync for InnerQueue<T> {}
 
@@ -871,16 +872,16 @@ impl<T> AsMut<Self> for ConsumerBare<T> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Consumer<T: 'static + Copy> {
-    consumer: ConsumerBare<T>,
+    bare: ConsumerBare<T>,
     message: T,
     should_log: bool,
 }
 
 impl<T: 'static + Copy> Consumer<T> {
     #[allow(clippy::uninit_assumed_init)]
-    fn from_bare(consumer: ConsumerBare<T>) -> Self {
+    fn from_bare(bare: ConsumerBare<T>) -> Self {
         Self {
-            consumer,
+            bare,
             message: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
             should_log: true,
         }
@@ -908,7 +909,7 @@ impl<T: 'static + Copy> Consumer<T> {
         F: FnMut(&mut T),
     {
         loop {
-            match self.consumer.try_consume(&mut self.message) {
+            match self.bare.try_consume(&mut self.message) {
                 Ok(()) => {
                     f(&mut self.message);
                     return true;
@@ -926,7 +927,7 @@ impl<T: 'static + Copy> Consumer<T> {
     where
         F: FnMut(&mut T),
     {
-        match self.consumer.try_consume_last(&mut self.message) {
+        match self.bare.try_consume_last(&mut self.message) {
             Ok(()) => {
                 f(&mut self.message);
                 true
@@ -941,10 +942,10 @@ impl<T: 'static + Copy> Consumer<T> {
             safe_panic!(
                 "Consumer<{}> got sped past. Lost {} messages",
                 std::any::type_name::<T>(),
-                self.consumer.queue.len()
+                self.bare.queue.len()
             );
         }
-        self.consumer.recover_after_error();
+        self.bare.recover_after_error();
     }
 
     #[inline]
@@ -952,17 +953,17 @@ impl<T: 'static + Copy> Consumer<T> {
     where
         F: FnMut(&mut T),
     {
-        self.consumer.try_init_collaborative();
+        self.bare.try_init_collaborative();
 
         match self
-            .consumer
+            .bare
             .queue
-            .load(self.consumer.pos)
-            .read_with_version(&mut self.message, self.consumer.expected_version)
+            .load(self.bare.pos)
+            .read_with_version(&mut self.message, self.bare.expected_version)
         {
             Ok(()) => {
                 f(&mut self.message);
-                self.consumer.acquire_next_slot();
+                self.bare.acquire_next_slot();
                 true
             }
             Err(ReadError::Empty) => false,
@@ -973,7 +974,7 @@ impl<T: 'static + Copy> Consumer<T> {
                         std::any::type_name::<T>()
                     );
                 }
-                self.consumer.acquire_earliest_available_slot();
+                self.bare.acquire_earliest_available_slot();
                 false
             }
         }
@@ -982,33 +983,33 @@ impl<T: 'static + Copy> Consumer<T> {
     /// Consumes one message, returning `(&message, slot_pos, slot_ver)`.
     #[inline]
     pub fn try_consume_with_epoch(&mut self) -> Result<(&T, usize, u64), ReadError> {
-        let (pos, ver) = self.consumer.try_consume_with_epoch(&mut self.message)?;
+        let (pos, ver) = self.bare.try_consume_with_epoch(&mut self.message)?;
         Ok((&self.message, pos, ver))
     }
 
     #[inline]
     pub fn try_consume_with_epoch_collaborative(&mut self) -> Result<(&T, usize, u64), ReadError> {
-        self.consumer.try_init_collaborative();
-        let slot_pos = self.consumer.pos;
-        let slot_ver = self.consumer.expected_version;
-        self.consumer.queue.consume(&mut self.message, slot_pos, slot_ver)?;
-        self.consumer.acquire_next_slot();
+        self.bare.try_init_collaborative();
+        let slot_pos = self.bare.pos;
+        let slot_ver = self.bare.expected_version;
+        self.bare.queue.consume(&mut self.message, slot_pos, slot_ver)?;
+        self.bare.acquire_next_slot();
         Ok((&self.message, slot_pos, slot_ver))
     }
 
     #[inline]
     pub fn slot_version(&self, slot_pos: usize) -> u64 {
-        self.consumer.slot_version(slot_pos)
+        self.bare.slot_version(slot_pos)
     }
 
     #[inline]
     pub fn recover_after_error(&mut self) {
-        self.consumer.recover_after_error();
+        self.bare.recover_after_error();
     }
 
     #[inline]
     pub fn recover_collaborative_after_error(&mut self) {
-        self.consumer.acquire_earliest_available_slot();
+        self.bare.acquire_earliest_available_slot();
     }
 
     #[inline]
@@ -1018,7 +1019,7 @@ impl<T: 'static + Copy> Consumer<T> {
 
     #[inline]
     pub fn queue_message_count(&self) -> usize {
-        self.consumer.queue_message_count()
+        self.bare.queue_message_count()
     }
 
     pub fn set_logging(&mut self, arg: bool) {
@@ -1026,7 +1027,7 @@ impl<T: 'static + Copy> Consumer<T> {
     }
 
     pub fn set_collaborative_group(&mut self, group_label: &'static str) {
-        self.consumer.set_collaborative_group(group_label);
+        self.bare.set_collaborative_group(group_label);
     }
 }
 

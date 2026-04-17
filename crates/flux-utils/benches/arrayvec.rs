@@ -15,7 +15,7 @@ fn bench_push_pop(c: &mut Criterion) {
             }
             while v.pop().is_some() {}
             black_box(v);
-        })
+        });
     });
 
     group.bench_function("tinyvec::ArrayVec", |b| {
@@ -26,7 +26,7 @@ fn bench_push_pop(c: &mut Criterion) {
             }
             while v.pop().is_some() {}
             black_box(v);
-        })
+        });
     });
 
     group.finish();
@@ -53,7 +53,7 @@ fn bench_indexed_access(c: &mut Criterion) {
                 black_box(acc);
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     group.bench_function("tinyvec::ArrayVec", |b| {
@@ -73,7 +73,7 @@ fn bench_indexed_access(c: &mut Criterion) {
                 black_box(acc);
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     group.finish();
@@ -98,7 +98,7 @@ fn bench_get_mut(c: &mut Criterion) {
                 black_box(v);
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     group.bench_function("tinyvec::ArrayVec", |b| {
@@ -117,7 +117,7 @@ fn bench_get_mut(c: &mut Criterion) {
                 black_box(v);
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     group.finish();

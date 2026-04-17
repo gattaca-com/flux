@@ -2,7 +2,7 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use crate::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Repeater {
     interval: Duration,
     last_acted: Instant,
@@ -44,29 +44,29 @@ impl Repeater {
 
     #[inline]
     pub fn set_interval(&mut self, interval: Duration) {
-        self.interval = interval
+        self.interval = interval;
     }
 
     pub fn reset(&mut self) {
-        self.last_acted = Instant::now()
+        self.last_acted = Instant::now();
     }
 
     pub fn force_fire(&mut self) {
-        self.last_acted = Instant::ZERO
+        self.last_acted = Instant::ZERO;
     }
 }
 
 impl Add<Duration> for Repeater {
-    type Output = Repeater;
+    type Output = Self;
     fn add(self, rhs: Duration) -> Self::Output {
-        Repeater { interval: self.interval.saturating_add(rhs), ..self }
+        Self { interval: self.interval.saturating_add(rhs), ..self }
     }
 }
 
 impl Sub<Duration> for Repeater {
-    type Output = Repeater;
+    type Output = Self;
     fn sub(self, rhs: Duration) -> Self::Output {
-        Repeater { interval: self.interval.saturating_sub(rhs), ..self }
+        Self { interval: self.interval.saturating_sub(rhs), ..self }
     }
 }
 

@@ -18,8 +18,8 @@ impl PublishDelta {
 
     #[inline]
     pub fn from_ingestion_and_publish_t(&self, origin_t: Instant, publish_t: Instant) -> Self {
-        let delta = (publish_t.0 - origin_t.0) & 0x0000ffffffffffff;
-        Self(delta | self.0 & 0xffff000000000000)
+        let delta = (publish_t.0 - origin_t.0) & 0x0000_ffff_ffff_ffff;
+        Self(delta | self.0 & 0xffff_0000_0000_0000)
     }
 
     #[inline]
@@ -34,7 +34,7 @@ impl PublishDelta {
 
     #[inline]
     pub fn delta(&self) -> Instant {
-        Instant(self.0 & 0x0000ffffffffffff)
+        Instant(self.0 & 0x0000_ffff_ffff_ffff)
     }
 
     #[inline]

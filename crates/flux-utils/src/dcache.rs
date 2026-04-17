@@ -68,6 +68,7 @@ impl DCache {
         (queue_depth + 1) * Self::next_multiple_of_64(mtu)
     }
 
+    #[allow(clippy::cast_ptr_alignment)]
     pub fn from_ptr(ptr: *mut u8, n: usize) -> *const Self {
         assert!(n.is_power_of_two() && n.is_multiple_of(CACHELINE));
         std::ptr::slice_from_raw_parts_mut(ptr, n) as *const Self
@@ -81,6 +82,7 @@ impl DCache {
             if ptr.is_null() {
                 alloc::handle_alloc_error(layout);
             }
+            #[allow(clippy::cast_ptr_alignment)]
             Arc::from(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n) as *mut Self))
         }
     }
@@ -137,7 +139,7 @@ impl DCache {
         if offset > r.len {
             return Err(DCacheError::InvalidWriteIntoOffset(offset, r.len));
         }
-        let base = self.data.get() as *mut u8;
+        let base = self.data.get().cast::<u8>();
         let offset_ix = r.offset & (self.capacity() - 1);
         let buf =
             unsafe { std::slice::from_raw_parts_mut(base.add(offset_ix + offset), r.len - offset) };
@@ -172,7 +174,7 @@ impl DCache {
     #[inline]
     fn deref(&self, r: DCacheRef) -> Result<(*mut u8, usize), DCacheError> {
         let n = self.capacity();
-        let base = self.data.get() as *mut u8;
+        let base = self.data.get().cast::<u8>();
         let offset_ix = r.offset & (n - 1);
         if r.len > n - offset_ix {
             return Err(DCacheError::DataLenExceedsCapacity(r.len, n));
@@ -285,7 +287,7 @@ mod tests {
     fn roundtrip() {
         let dc = DCache::new(64);
         let r = dc.write(5, |s| s.copy_from_slice(b"hello")).unwrap();
-        let reader = dc.clone();
+        let reader = dc;
         let mut buf = [0u8; 5];
         reader.read(r, &mut buf).unwrap();
         assert_eq!(&buf, b"hello");
@@ -310,8 +312,8 @@ mod tests {
     fn map_contiguous() {
         let dc = DCache::new(64);
         let r = dc.write(5, |s| s.copy_from_slice(b"hello")).unwrap();
-        let reader = dc.clone();
-        let got = reader.map(r, |s| s.to_vec()).unwrap();
+        let reader = dc;
+        let got = reader.map(r, <[u8]>::to_vec).unwrap();
         assert_eq!(got, b"hello");
     }
 
@@ -322,7 +324,7 @@ mod tests {
         let _ = dc.write(10, |s| s.fill(0xAA)).unwrap();
         let r = dc.write(80, |s| s.fill(0xBB)).unwrap();
         assert_eq!(r.offset, 128);
-        let got = reader.map(r, |s| s.to_vec()).unwrap();
+        let got = reader.map(r, <[u8]>::to_vec).unwrap();
         assert!(got.iter().all(|&b| b == 0xBB));
     }
 
@@ -331,7 +333,7 @@ mod tests {
         let dc = DCache::new(64);
         assert!(matches!(dc.write(65, |_| {}), Err(DCacheError::DataLenExceedsCapacity(65, 64))));
         let r = dc.write(2, |s| s.copy_from_slice(b"AB")).unwrap();
-        let reader = dc.clone();
+        let reader = dc;
         let mut small = [0u8; 1];
         assert!(matches!(reader.read(r, &mut small), Err(DCacheError::BufferTooSmall(1, 2))));
     }

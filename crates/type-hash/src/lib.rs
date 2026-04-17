@@ -85,7 +85,7 @@ impl_primitive_type_hash! {
 
 impl<T: TypeHash, const N: usize> TypeHash for [T; N] {
     const TYPE_HASH: u64 = {
-        let mut h = 0xcbf29ce484222325u64;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
         h = fnv1a64_str(h, "[T;N]");
         h = hash_u64(h, T::TYPE_HASH);
         h = hash_u64(h, N as u64);
@@ -96,17 +96,17 @@ impl<T: TypeHash, const N: usize> TypeHash for [T; N] {
 
 impl<T: TypeHash> TypeHash for Option<T> {
     const TYPE_HASH: u64 = {
-        let mut h = 0xcbf29ce484222325u64;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
         h = fnv1a64_str(h, "Option");
         h = hash_u64(h, T::TYPE_HASH);
-        h = hash_layout_of::<Option<T>>(h);
+        h = hash_layout_of::<Self>(h);
         h
     };
 }
 
 impl TypeHash for &[u8] {
     const TYPE_HASH: u64 = {
-        let mut h = 0xcbf29ce484222325u64;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
         h = fnv1a64_str(h, "&[u8]");
         h = hash_layout_of::<&[u8]>(h);
         h
@@ -115,23 +115,23 @@ impl TypeHash for &[u8] {
 
 #[cfg(feature = "std")]
 mod std_impls {
-    use super::*;
+    use super::{fnv1a64_str, hash_layout_of, hash_u64, std, TypeHash};
 
     impl TypeHash for std::string::String {
         const TYPE_HASH: u64 = {
-            let mut h = 0xcbf29ce484222325u64;
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
             h = fnv1a64_str(h, "String");
-            h = hash_layout_of::<std::string::String>(h);
+            h = hash_layout_of::<Self>(h);
             h
         };
     }
 
     impl<T: TypeHash> TypeHash for std::vec::Vec<T> {
         const TYPE_HASH: u64 = {
-            let mut h = 0xcbf29ce484222325u64;
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
             h = fnv1a64_str(h, "Vec");
             h = hash_u64(h, T::TYPE_HASH);
-            h = hash_layout_of::<std::vec::Vec<T>>(h);
+            h = hash_layout_of::<Self>(h);
             h
         };
     }
