@@ -2,7 +2,7 @@
 //! `TileMetrics`, so you can observe them in the flux-ctl Tiles tab.
 //!
 //! Terminal 1 — run the app:
-//!   cargo run --example tile_smoke -p flux-ctl
+//!   `cargo run --example tile_smoke -p flux-ctl`
 //!
 //! Terminal 2 — open flux-ctl and press → or 2 to switch to the Tiles tab:
 //!   cargo run -p flux-ctl -- --base-dir /tmp/flux-tile-smoke watch
@@ -114,7 +114,7 @@ fn main() {
     let _ = std::fs::create_dir_all(base);
 
     // Clean up any leftover segments from a previous run.
-    let _ = cleanup_shmem(base);
+    cleanup_shmem(base);
 
     let mut spine = SmokeSpine::new_with_base_dir(base, None);
 
@@ -154,6 +154,6 @@ fn main() {
     });
 
     println!("Cleaning up shmem…");
-    let _ = cleanup_shmem(base);
+    cleanup_shmem(base);
     println!("Done.");
 }

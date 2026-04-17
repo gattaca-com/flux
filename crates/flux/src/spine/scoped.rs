@@ -44,7 +44,7 @@ fn setup_panic_hook(
     std::panic::set_hook(Box::new(move |panic_info| {
         stop_flag.store(SIGINT as usize, Ordering::Relaxed);
         if let Some(on_panic) = &on_panic {
-            on_panic(panic_info)
+            on_panic(panic_info);
         }
         original_hook(panic_info);
     }));
@@ -61,10 +61,10 @@ impl<'a, 'b: 'a, S> ScopedSpine<'a, 'b, S> {
         on_panic: Option<Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send>>,
         custom_signal_handler: Option<Duration>,
     ) -> Self {
-        let stop_flag = Arc::new(AtomicUsize::new(0));
         const SIGTERM_U: usize = SIGTERM as usize;
         const SIGINT_U: usize = SIGINT as usize;
         const SIGQUIT_U: usize = SIGQUIT as usize;
+        let stop_flag = Arc::new(AtomicUsize::new(0));
         signal_flag::register_usize(SIGTERM, Arc::clone(&stop_flag), SIGTERM_U)
             .expect("register SIGTERM");
         signal_flag::register_usize(SIGINT, Arc::clone(&stop_flag), SIGINT_U)

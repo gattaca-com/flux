@@ -60,19 +60,19 @@ pub enum SortMode {
 impl SortMode {
     pub fn next(self) -> Self {
         match self {
-            SortMode::Name => SortMode::Kind,
-            SortMode::Kind => SortMode::Status,
-            SortMode::Status => SortMode::Activity,
-            SortMode::Activity => SortMode::Name,
+            Self::Name => Self::Kind,
+            Self::Kind => Self::Status,
+            Self::Status => Self::Activity,
+            Self::Activity => Self::Name,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            SortMode::Name => "name",
-            SortMode::Kind => "kind",
-            SortMode::Status => "status",
-            SortMode::Activity => "activity",
+            Self::Name => "name",
+            Self::Kind => "kind",
+            Self::Status => "status",
+            Self::Activity => "activity",
         }
     }
 }
@@ -153,8 +153,8 @@ pub enum DetailFocus {
 impl DetailFocus {
     pub fn toggle(self) -> Self {
         match self {
-            DetailFocus::ConsumerGroups => DetailFocus::Processes,
-            DetailFocus::Processes => DetailFocus::ConsumerGroups,
+            Self::ConsumerGroups => Self::Processes,
+            Self::Processes => Self::ConsumerGroups,
         }
     }
 }
@@ -177,6 +177,7 @@ pub enum SelectedItem<'a> {
     Segment(usize, usize, &'a SegmentInfo),
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub groups: Vec<AppGroup>,
     pub selected: usize,
@@ -207,9 +208,9 @@ pub struct App {
     write_history: HashMap<String, VecDeque<(usize, Instant)>>,
     /// Smooths raw per-tick msgs/s over a 30-second rolling window.
     rate_smoother: RateSmoother,
-    /// Cached result of scan_proc_fds() with TTL.
+    /// Cached result of `scan_proc_fds()` with TTL.
     cached_proc_map: HashMap<PathBuf, Vec<u32>>,
-    /// Last time proc_map was scanned.
+    /// Last time `proc_map` was scanned.
     proc_map_last_scan: Option<Instant>,
     /// Persistent shmem cache — segments stay mapped across ticks so reading
     /// headers is a plain pointer dereference (zero syscalls).
@@ -296,15 +297,10 @@ impl App {
         app
     }
 
-    pub fn refresh(&mut self) {
-        if let Err(e) = self.try_refresh() {
-            self.status_msg = Some((format!("Refresh error: {e}"), Instant::now()));
-        }
-    }
-
     /// Inner refresh that returns errors instead of panicking, so the TUI
     /// stays alive and shows a status message on failure.
-    fn try_refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    #[allow(clippy::too_many_lines)]
+    pub fn refresh(&mut self) {
         // Preserve collapsed state across refreshes.
         let prev_expanded: HashMap<String, bool> =
             self.groups.iter().map(|g| (g.name.clone(), g.expanded)).collect();
@@ -484,7 +480,6 @@ impl App {
         self.recount_rows();
         self.refresh_detail_pids();
         self.last_refresh = Instant::now();
-        Ok(())
     }
 
     pub fn recount_rows(&mut self) {

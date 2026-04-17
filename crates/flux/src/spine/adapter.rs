@@ -55,7 +55,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         }
     }
 
-    /// Called by attach_tile before each loop_body.
+    /// Called by `attach_tile` before each `loop_body`.
     #[inline]
     pub fn begin_loop(&mut self, ingestion_t: IngestionTime) {
         self.set_ingestion_time(ingestion_t);

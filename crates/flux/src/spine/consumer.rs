@@ -53,7 +53,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m.into_data(), producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
         })
     }
 
@@ -68,7 +68,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             self.timer.start();
             if f(m.into_data(), producers) {
                 self.timer
-                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
             }
         })
     }
@@ -92,7 +92,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m.into_data(), producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
         })
     }
 
@@ -106,7 +106,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m.into_data(), producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
         })
     }
 
@@ -120,7 +120,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m.into_data(), producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
         })
     }
 
@@ -134,7 +134,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m, producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
         })
     }
 
@@ -153,7 +153,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             self.timer.start();
             if f(m, producers) {
                 self.timer
-                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
             }
         })
     }
@@ -177,7 +177,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m, producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
         })
     }
 
@@ -191,7 +191,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
             self.timer.start();
             f(m, producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
         })
     }
 
@@ -210,7 +210,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             self.timer.start();
             if f(m, producers) {
                 self.timer
-                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into())
+                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
             }
         })
     }

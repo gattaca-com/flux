@@ -84,3 +84,4 @@ nursery = "warn"
 pedantic = "warn"
 redundant_pub_crate = { level = "allow", priority = 1 }
 return_self_not_must_use = { level = "allow", priority = 1 }
+redundant_closure_for_method_calls = { level = "allow", priority = 1 }  # only allowed because otherwise I was getting an ICE on cargo clippy

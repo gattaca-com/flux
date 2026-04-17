@@ -549,7 +549,10 @@ mod bytes_impl {
 
 #[cfg(feature = "wincode")]
 mod wincode_impl {
-    use std::mem::{self, MaybeUninit};
+    use std::{
+        mem::{self, MaybeUninit},
+        ptr,
+    };
 
     use wincode::{TypeMeta, io::Writer, len::SeqLen};
 
@@ -563,9 +566,8 @@ mod wincode_impl {
         matches!(T::TYPE_META, TypeMeta::Static { size: _, zero_copy: true })
     }
 
-    impl<T: Copy, const N: usize> wincode::SchemaWrite for ArrayVec<T, N>
-    where
-        T: wincode::SchemaWrite<Src = T>,
+    impl<T: Copy + wincode::SchemaWrite<Src = T>, const N: usize> wincode::SchemaWrite
+        for ArrayVec<T, N>
     {
         type Src = Self;
 
@@ -609,9 +611,11 @@ mod wincode_impl {
         }
     }
 
-    impl<'de, T: Copy, const N: usize> wincode::SchemaRead<'de> for ArrayVec<T, N>
-    where
-        T: wincode::SchemaRead<'de, Dst = T> + wincode::SchemaWrite<Src = T>,
+    impl<
+        'de,
+        T: Copy + wincode::SchemaRead<'de, Dst = T> + wincode::SchemaWrite<Src = T>,
+        const N: usize,
+    > wincode::SchemaRead<'de> for ArrayVec<T, N>
     {
         type Dst = Self;
 
@@ -624,7 +628,7 @@ mod wincode_impl {
                 return Err(wincode::ReadError::LengthEncodingOverflow("too many values"));
             }
 
-            let mut arr = ArrayVec::<T, N>::new();
+            let mut arr = Self::new();
             if is_pod::<T>() {
                 unsafe {
                     let dst_slice: &mut [MaybeUninit<T>] =
@@ -670,7 +674,8 @@ mod wincode_impl {
             dst: &mut MaybeUninit<Self::Dst>,
         ) -> wincode::ReadResult<()> {
             let buf_dst = unsafe {
-                &mut *(dst as *mut MaybeUninit<Self::Dst>).cast::<MaybeUninit<ArrayVec<u8, N>>>()
+                &mut *(ptr::from_mut::<MaybeUninit<Self::Dst>>(dst))
+                    .cast::<MaybeUninit<ArrayVec<u8, N>>>()
             };
             <ArrayVec<u8, N> as wincode::SchemaRead>::read(reader, buf_dst)
         }
