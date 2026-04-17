@@ -223,7 +223,7 @@ fn format_stats_line(name: &str, max_name: usize, range_stats: Option<TileStats>
     let display_name = if name.len() > max_name {
         format!("{}…", &name[..max_name - 1])
     } else {
-        format!("{name:<width$}", width = max_name)
+        format!("{name:<max_name$}")
     };
 
     let (stats_str, stats_color) = range_stats.map_or_else(

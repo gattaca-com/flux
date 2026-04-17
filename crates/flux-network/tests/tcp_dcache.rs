@@ -81,6 +81,7 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
 
 /// Two TCP streams into the same dcache-backed spine queue.
 /// Verifies dcache bytes match the queue message (same shmem region).
+#[allow(clippy::significant_drop_tightening)]
 #[test]
 fn dcache_multi_stream() {
     const MSG_A: &[u8; 8] = b"stream-a";

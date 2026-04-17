@@ -26,7 +26,7 @@ impl BucketedData {
         self.bucketed.clear();
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::float_cmp)]
     pub fn maybe_rebucket<'a, T: 'a, E, A, D>(
         &mut self,
         data: &D,

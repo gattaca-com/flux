@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Basically a ringbuffer to be used with data that gets streamed in.
+#[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircularBuffer<T> {
     data: Vec<T>,

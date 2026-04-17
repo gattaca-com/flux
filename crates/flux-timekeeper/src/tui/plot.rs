@@ -129,7 +129,7 @@ impl<T: Plottable> Plot<T> {
         }));
 
         let xaxis = Axis::default()
-            .bounds([x_min, x_max])
+            .bounds((x_min, x_max).into())
             .style(Style::default().fg(Color::LightBlue))
             .labels(plot_settings.xlabels());
         datasets.extend(self.series.iter_mut().map(|d| d.to_dataset(y_min_bound, y_max_bound)));

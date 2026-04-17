@@ -110,7 +110,7 @@ fn performance_scan_base_dir_50_segments() {
     let base = tmp.path();
 
     // Track all segments for cleanup
-    let mut all_segments: Vec<(String, Vec<(String, &str, ShmemKind)>)> = Vec::new();
+    let mut all_segments = Vec::new();
 
     // Create 10 apps with 5 segments each = 50 total segments
     for app_idx in 0..10 {
