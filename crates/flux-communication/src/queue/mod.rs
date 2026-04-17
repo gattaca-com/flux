@@ -605,13 +605,6 @@ pub struct Producer<T> {
     pub produced_first: u8, // 1
     pub queue: Queue<T>,
 }
-impl<T: Copy> Default for Producer<T> {
-    fn default() -> Self {
-        let dummy_queue = Queue::new(2, QueueType::MPMC);
-        dummy_queue.into()
-    }
-}
-
 impl<T: Copy> From<Queue<T>> for Producer<T> {
     fn from(queue: Queue<T>) -> Self {
         Self { produced_first: 0, queue }
