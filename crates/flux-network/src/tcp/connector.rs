@@ -66,7 +66,7 @@ struct ConnectionManager {
     /// longer than `timeout` are disconnected (outbound scheduled for
     /// reconnection).
     max_backlog: Option<(usize, Duration)>,
-    /// Whether to set TCP_NODELAY on sockets (disables Nagle's algorithm).
+    /// Whether to set `TCP_NODELAY` on sockets (disables Nagle's algorithm).
     nodelay: bool,
 
     // Always only outbound/client side connection streams
@@ -278,7 +278,7 @@ impl ConnectionManager {
                 self.conns.push((token, stream));
                 self.reconnected_to.push(token);
             } else {
-                self.to_be_reconnected.push((token, stream))
+                self.to_be_reconnected.push((token, stream));
             }
         }
     }
@@ -306,7 +306,7 @@ impl ConnectionManager {
         if let Err(e) = self.poll.registry().register(&mut new_stream, token, Interest::READABLE) {
             error!("couldn't register tcp stream for {addr} with registry: {e}");
             return None;
-        };
+        }
         if self.nodelay {
             new_stream
                 .set_nodelay(true)
@@ -397,7 +397,7 @@ impl ConnectionManager {
                             error!("couldn't register client {e}");
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                             continue;
-                        };
+                        }
                         if self.nodelay {
                             if let Err(e) = stream.set_nodelay(true) {
                                 error!("couldn't set nodelay on stream to {addr}: {e}");
@@ -484,7 +484,7 @@ impl ConnectionManager {
                             error!("couldn't register client {e}");
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                             continue;
-                        };
+                        }
                         if self.nodelay {
                             if let Err(e) = stream.set_nodelay(true) {
                                 error!("couldn't set nodelay on stream to {addr}: {e}");
@@ -551,7 +551,7 @@ impl ConnectionManager {
 /// after a connection is established (both outbound and newly accepted
 /// inbound).
 ///
-/// ## DCache
+/// ## `DCache`
 /// If built via [`with_dcache`], each received message payload is written
 /// into the dcache and [`PollEvent::Message`] carries
 /// [`MessagePayload::Cached`]. Otherwise it carries [`MessagePayload::Raw`].
@@ -600,14 +600,14 @@ impl TcpConnector {
         self
     }
 
-    /// Sets kernel SO_SNDBUF and SO_RCVBUF on all sockets (outbound and
+    /// Sets kernel `SO_SNDBUF` and `SO_RCVBUF` on all sockets (outbound and
     /// accepted).
     pub fn with_socket_buf_size(mut self, size: usize) -> Self {
         self.conn_mgr.socket_buf_size = Some(size);
         self
     }
 
-    /// Overrides the TCP_USER_TIMEOUT socket option applied to
+    /// Overrides the `TCP_USER_TIMEOUT` socket option applied to
     /// outbound connections.
     pub fn with_user_timeout(mut self, timeout_ms: u32) -> Self {
         self.conn_mgr.user_timeout_ms = timeout_ms;
@@ -661,7 +661,7 @@ impl TcpConnector {
         }
         let mut o = false;
 
-        for e in self.events.iter() {
+        for e in &self.events {
             o = true;
             self.conn_mgr.handle_event(e, &mut handler);
         }
@@ -691,7 +691,7 @@ impl TcpConnector {
             return false;
         }
         let mut o = false;
-        for e in self.events.iter() {
+        for e in &self.events {
             o = true;
             self.conn_mgr.handle_event_produce(e, produce, &mut on_msg);
         }

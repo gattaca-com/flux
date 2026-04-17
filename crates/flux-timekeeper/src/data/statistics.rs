@@ -179,7 +179,7 @@ impl<T: Statisticable> Statistics<T> {
     }
 
     pub fn toggle(&mut self, flags: RenderFlags) {
-        self.flags ^= flags
+        self.flags ^= flags;
     }
 }
 
@@ -220,7 +220,7 @@ impl<T: Statisticable + Default> Statistics<T> {
         _label_suffix: Option<String>,
     ) {
         let mut offsets = vec![0.0f64; self.datapoints.len()];
-        for prev_data in plot.plot_series.iter() {
+        for prev_data in &plot.series {
             for p in &prev_data.data {
                 if let Some(offset) = offsets.get_mut(p.0 as usize) {
                     *offset = (*offset).max(p.1);
@@ -258,13 +258,13 @@ impl<T: Statisticable + Default> Statistics<T> {
         let marker = marker.unwrap_or(Marker::Braille);
         if self.flags.contains(RenderFlags::ShowAverages) {
             let label = if self.flags == RenderFlags::ShowAverages {
-                label_suffix.clone().unwrap_or_default().to_string()
+                label_suffix.clone().unwrap_or_default()
             } else {
                 format!("avg{}", label_suffix.clone().unwrap_or_default())
             };
             plot.push(
                 PlotSeries::default()
-                    .label(label)
+                    .label(&label)
                     .color(color.unwrap_or_default())
                     .graph_type(GraphType::Scatter)
                     .marker(marker)
@@ -275,7 +275,7 @@ impl<T: Statisticable + Default> Statistics<T> {
         if self.flags.contains(RenderFlags::ShowMin) {
             plot.push(
                 PlotSeries::default()
-                    .label(format!("min{}", label_suffix.clone().unwrap_or_default()))
+                    .label(&format!("min{}", label_suffix.clone().unwrap_or_default()))
                     .color(Color::Green)
                     .graph_type(GraphType::Scatter)
                     .marker(marker)
@@ -286,7 +286,7 @@ impl<T: Statisticable + Default> Statistics<T> {
         if self.flags.contains(RenderFlags::ShowMax) {
             plot.push(
                 PlotSeries::default()
-                    .label(format!("max{}", label_suffix.clone().unwrap_or_default()))
+                    .label(&format!("max{}", label_suffix.clone().unwrap_or_default()))
                     .color(Color::Red)
                     .graph_type(GraphType::Scatter)
                     .marker(marker)
@@ -297,7 +297,7 @@ impl<T: Statisticable + Default> Statistics<T> {
         if self.flags.contains(RenderFlags::ShowMedian) {
             plot.push(
                 PlotSeries::default()
-                    .label(format!("med{}", label_suffix.unwrap_or_default()))
+                    .label(&format!("med{}", label_suffix.unwrap_or_default()))
                     .color(Color::Yellow)
                     .marker(marker)
                     .graph_type(GraphType::Scatter)
@@ -322,11 +322,11 @@ impl<T: Statisticable + Default> Statistics<T> {
         }
 
         let title = if name.is_empty() {
-            self.title.to_string()
+            self.title.clone()
         } else {
             format!("{} report for {name}", self.title)
         };
-        let mut plot = Plot::<T>::new(title);
+        let mut plot = Plot::<T>::new(&title);
 
         self.add_to_plot(&mut plot, None, None, None);
 
@@ -334,11 +334,11 @@ impl<T: Statisticable + Default> Statistics<T> {
     }
 
     pub fn report_msg_per_sec(&self, frame: &mut Frame, rect: Rect, plot_settings: &PlotSettings) {
-        let mut plot = Plot::<MsgPer10Sec>::new("");
+        let mut plot = Plot::<MsgPer10Sec>::new(&"");
 
         plot.push(
             PlotSeries::default()
-                .label("msg/s")
+                .label(&"msg/s")
                 .graph_type(GraphType::Line)
                 .data(self.datapoints.iter().enumerate().map(|(i, t)| (i as f64, t.rate.0 as f64))),
         );

@@ -52,7 +52,7 @@ fn tcp_roundtrip() {
             thread::sleep(Duration::from_micros(50));
         }
         listener.write_or_enqueue_with(SendBehavior::Single(stream_token), |buf| {
-            wincode_ser_into_vec(buf, &TestMsg(111))
+            wincode_ser_into_vec(buf, &TestMsg(111));
         });
         listener.poll_with(|event| {
             if let PollEvent::Message { .. } = event {
@@ -65,10 +65,10 @@ fn tcp_roundtrip() {
     let client = thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let mut conn = TcpConnector::default();
-        let _tok = conn.connect(bind_addr).unwrap();
+        let tok = conn.connect(bind_addr).unwrap();
         // Then responds
-        conn.write_or_enqueue_with(SendBehavior::Single(_tok), |buf| {
-            wincode_ser_into_vec(buf, &TestMsg(222))
+        conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
+            wincode_ser_into_vec(buf, &TestMsg(222));
         });
 
         // Client waits for server message

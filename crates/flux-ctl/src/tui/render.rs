@@ -1,5 +1,8 @@
 use flux_communication::ShmemKind;
-use ratatui::{prelude::*, widgets::*};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Tabs},
+};
 
 use super::app::{App, DetailFocus, FluxTab, SelectedItem, View};
 use crate::discovery::format_bytes;
@@ -98,6 +101,7 @@ pub fn render_tab_bar(area: Rect, buf: &mut Buffer, app: &App) {
 ///
 /// This is a self-contained view that can be rendered into any `Rect` +
 /// `Buffer`, making it reusable from external crates (e.g. the overseer).
+#[allow(clippy::too_many_lines)]
 pub fn render_list(area: Rect, buf: &mut Buffer, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -155,12 +159,12 @@ pub fn render_list(area: Rect, buf: &mut Buffer, app: &mut App) {
                         let rate = match seg.msgs_per_sec {
                             Some(r) if r >= 1_000_000.0 => format!(" {:.1}M/s", r / 1_000_000.0),
                             Some(r) if r >= 1_000.0 => format!(" {:.1}K/s", r / 1_000.0),
-                            Some(r) => format!(" {:.0}msg/s", r),
+                            Some(r) => format!(" {r:.0}msg/s"),
                             None => String::new(),
                         };
                         let lagger = match seg.max_lagger_pct {
                             Some(pct) if pct >= 100.0 => " lag:⚠>100%".to_string(),
-                            Some(pct) => format!(" lag:{:.0}%", pct),
+                            Some(pct) => format!(" lag:{pct:.0}%"),
                             None => String::new(),
                         };
                         format!(
@@ -242,11 +246,10 @@ pub fn render_detail(area: Rect, buf: &mut Buffer, app: &mut App) {
     let seg = app.detail_segment();
     let elapsed = app.last_refresh.elapsed().as_secs_u64();
     let updated = if elapsed < 2 { String::new() } else { format!(" (updated {elapsed}s ago)") };
-    let title_text = seg
-        .map(|s| {
-            format!(" {} — {}{updated} ", s.entry.app_name.as_str(), s.entry.type_name.as_str())
-        })
-        .unwrap_or_else(|| format!(" Segment Detail{updated} "));
+    let title_text = seg.map_or_else(
+        || format!(" Segment Detail{updated} "),
+        |s| format!(" {} — {}{updated} ", s.entry.app_name.as_str(), s.entry.type_name.as_str()),
+    );
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Cyan).bold())
         .block(Block::default().borders(Borders::ALL));
@@ -280,6 +283,7 @@ pub fn render_detail(area: Rect, buf: &mut Buffer, app: &mut App) {
 
 /// Render the segment info panel (kind, status, capacity, flink, writes,
 /// write-position bar, poison info).
+#[allow(clippy::too_many_lines)]
 pub fn render_segment_info(area: Rect, buf: &mut Buffer, seg: &super::app::SegmentInfo) {
     let status = if seg.poison.is_some() {
         "☠ poisoned"
@@ -323,8 +327,7 @@ pub fn render_segment_info(area: Rect, buf: &mut Buffer, seg: &super::app::Segme
             Span::styled("  Backing:    ", Style::default().fg(Color::DarkGray)),
             Span::raw(
                 crate::discovery::backing_file_size(seg.entry.flink.as_str())
-                    .map(format_bytes)
-                    .unwrap_or_else(|| "unavailable".into()),
+                    .map_or_else(|| "unavailable".into(), format_bytes),
             ),
         ]),
     ];
@@ -335,7 +338,7 @@ pub fn render_segment_info(area: Rect, buf: &mut Buffer, seg: &super::app::Segme
         let rate_str = match seg.msgs_per_sec {
             Some(r) if r >= 1_000_000.0 => format!("  ({:.1} M/s)", r / 1_000_000.0),
             Some(r) if r >= 1_000.0 => format!("  ({:.1} K/s)", r / 1_000.0),
-            Some(r) => format!("  ({:.0} msg/s)", r),
+            Some(r) => format!("  ({r:.0} msg/s)"),
             None => String::new(),
         };
         lines.push(Line::from(vec![
@@ -424,7 +427,7 @@ pub fn render_consumer_groups(
         .iter()
         .map(|cg| {
             let lag = write_pos.map(|w| w.saturating_sub(cg.cursor));
-            let lag_str = lag.map(|l| format!("{l}")).unwrap_or_else(|| "—".into());
+            let lag_str = lag.map_or_else(|| "—".into(), |l| format!("{l}"));
             let lag_style = if cap > 0 {
                 match lag {
                     Some(l) if l * 4 >= cap * 3 => Style::default().fg(Color::Red),
@@ -440,9 +443,9 @@ pub fn render_consumer_groups(
             };
 
             let rate_str = match cg.msgs_per_sec {
-                Some(r) if r >= 1_000.0 => format!("{:.1}", r),
-                Some(r) if r >= 1.0 => format!("{:.1}", r),
-                Some(r) if r > 0.0 => format!("{:.2}", r),
+                Some(r) if r >= 1_000.0 => format!("{r:.1}"),
+                Some(r) if r >= 1.0 => format!("{r:.1}"),
+                Some(r) if r > 0.0 => format!("{r:.2}"),
                 Some(_) => "0".into(),
                 None => "—".into(),
             };
@@ -450,8 +453,7 @@ pub fn render_consumer_groups(
             // Backlog bar: filled portion = lag / capacity
             let bar = if cap > 0 {
                 let filled = lag
-                    .map(|l| ((l as f64 / cap as f64) * bar_width as f64).round() as usize)
-                    .unwrap_or(0)
+                    .map_or(0, |l| ((l as f64 / cap as f64) * bar_width as f64).round() as usize)
                     .min(bar_width);
                 let empty = bar_width - filled;
                 let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
@@ -542,7 +544,7 @@ pub fn render_pid_table(area: Rect, buf: &mut Buffer, detail: &super::app::Detai
 
     let n_alive = detail.pids.iter().filter(|p| p.alive).count();
     let n_dead = detail.pids.iter().filter(|p| !p.alive).count();
-    let title = format!(" Attached Processes ({} alive, {} dead) ", n_alive, n_dead);
+    let title = format!(" Attached Processes ({n_alive} alive, {n_dead} dead) ");
 
     let widths = [
         Constraint::Length(10),
@@ -615,7 +617,7 @@ pub fn render_confirm_popup(area: Rect, buf: &mut Buffer) {
 
 /// Render the "destroy all dead segments" confirmation popup.
 pub fn render_confirm_all_popup(area: Rect, buf: &mut Buffer, app: &App) {
-    let dead_count: usize = app.pending_cleanup_flinks.as_ref().map(|f| f.len()).unwrap_or(0);
+    let dead_count: usize = app.pending_cleanup_flinks.as_ref().map_or(0, |f| f.len());
 
     let lines = vec![
         Line::from(""),
@@ -650,6 +652,7 @@ pub fn render_confirm_all_popup(area: Rect, buf: &mut Buffer, app: &App) {
 }
 
 /// Render the tile metrics view (per-tile utilisation gauges).
+#[allow(clippy::too_many_lines)]
 pub fn render_tiles(area: Rect, buf: &mut Buffer, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -713,14 +716,11 @@ pub fn render_tiles(area: Rect, buf: &mut Buffer, app: &mut App) {
     let total_content_height = y;
 
     // Find y position of selected row
-    let selected_y = cumulative_heights.get(selected).map(|(_, y)| *y).unwrap_or(0);
-    let selected_height = row_specs
-        .get(selected)
-        .map(|r| match r {
-            TileRow::AppHeader(..) => 1,
-            TileRow::Tile(..) => 2,
-        })
-        .unwrap_or(1);
+    let selected_y = cumulative_heights.get(selected).map_or(0, |(_, y)| *y);
+    let selected_height = row_specs.get(selected).map_or(1, |r| match r {
+        TileRow::AppHeader(..) => 1,
+        TileRow::Tile(..) => 2,
+    });
 
     // Simple scroll: ensure selected is visible
     let scroll_offset = if selected_y + selected_height > available_height {
@@ -761,9 +761,7 @@ pub fn render_tiles(area: Rect, buf: &mut Buffer, app: &mut App) {
                 } else {
                     Style::default().fg(Color::Yellow).bold()
                 };
-                Paragraph::new(format!("▶ {} ({count} tiles)", name))
-                    .style(style)
-                    .render(rect, buf);
+                Paragraph::new(format!("▶ {name} ({count} tiles)")).style(style).render(rect, buf);
             }
             TileRow::Tile(name, stats) => {
                 let lines_available = inner_area.height.saturating_sub(render_y);
@@ -775,24 +773,28 @@ pub fn render_tiles(area: Rect, buf: &mut Buffer, app: &mut App) {
                 // Stats line
                 let stats_area =
                     Rect::new(inner_area.x, inner_area.y + render_y, inner_area.width, 1);
-                let (stats_text, stats_color) = match stats {
-                    Some(s) => (
-                        format!(
-                            "  {:<30} util:{:5.1}%  avg:{:<10} min:{:<10} max:{:<10} loops:{}",
-                            truncate_str(name, 30),
-                            s.utilisation * 100.0,
-                            s.busy_avg,
-                            s.busy_min,
-                            s.busy_max,
-                            s.loop_count,
-                        ),
-                        Color::White,
-                    ),
-                    None => (
-                        format!("  {:<30} waiting for data…", truncate_str(name, 30)),
-                        Color::DarkGray,
-                    ),
-                };
+                let (stats_text, stats_color) = stats.as_ref().map_or_else(
+                    || {
+                        (
+                            format!("  {:<30} waiting for data…", truncate_str(name, 30)),
+                            Color::DarkGray,
+                        )
+                    },
+                    |s| {
+                        (
+                            format!(
+                                "  {:<30} util:{:5.1}%  avg:{:<10} min:{:<10} max:{:<10} loops:{}",
+                                truncate_str(name, 30),
+                                s.utilisation * 100.0,
+                                s.busy_avg,
+                                s.busy_min,
+                                s.busy_max,
+                                s.loop_count,
+                            ),
+                            Color::White,
+                        )
+                    },
+                );
                 let text_style = if is_selected {
                     Style::default().fg(stats_color).bg(Color::DarkGray)
                 } else {
@@ -878,10 +880,10 @@ pub fn render_status_bar(area: Rect, buf: &mut Buffer, app: &App) {
     } else if let Some((ref msg, _)) = app.status_msg {
         msg.clone()
     } else {
-        let filter_hint = if !app.filter_text.is_empty() {
-            format!("  [filter: {}]", app.filter_text)
-        } else {
+        let filter_hint = if app.filter_text.is_empty() {
             String::new()
+        } else {
+            format!("  [filter: {}]", app.filter_text)
         };
         match app.tab {
             FluxTab::Tiles => " ↑↓ navigate  ←→ tabs  Esc back  ? help  q quit".into(),
@@ -907,12 +909,12 @@ pub fn render_status_bar(area: Rect, buf: &mut Buffer, app: &App) {
                             " ↑↓ navigate  ←→ tabs  Enter open  {dead_toggle}  / filter  s sort  ? help  q quit"
                         ),
                     };
-                    format!("{}{}", base, filter_hint)
+                    format!("{base}{filter_hint}")
                 }
                 View::Detail(detail) => {
-                    let alive = app.detail_segment().map(|s| s.alive).unwrap_or(true);
+                    let alive = app.detail_segment().is_none_or(|s| s.alive);
                     let tab_hint =
-                        if !detail.consumer_groups.is_empty() { "Tab switch panel  " } else { "" };
+                        if detail.consumer_groups.is_empty() { "" } else { "Tab switch panel  " };
                     match (!alive, has_any_dead) {
                         (true, _) => {
                             format!(" Esc back  {tab_hint}d destroy  D destroy all  ? help  q quit")

@@ -456,13 +456,7 @@ impl App {
                     group.segments.sort_by(|a, b| {
                         // alive first, then dead, then poisoned
                         fn rank(s: &SegmentInfo) -> u8 {
-                            if s.poison.is_some() {
-                                2
-                            } else if s.alive {
-                                0
-                            } else {
-                                1
-                            }
+                            if s.poison.is_some() { 2 } else { u8::from(!s.alive) }
                         }
                         rank(a).cmp(&rank(b))
                     });
@@ -702,7 +696,6 @@ impl App {
             return;
         }
         match &self.view {
-            View::Tiles => {}
             View::List => {
                 let mut row = 0;
                 for (gi, group) in self.groups.iter_mut().enumerate() {
@@ -748,7 +741,7 @@ impl App {
                     }
                 }
             }
-            View::Detail(_) => {}
+            View::Tiles | View::Detail(_) => {}
         }
     }
 
@@ -797,12 +790,11 @@ impl App {
     }
 
     fn request_cleanup_list(&mut self) {
-        let (alive, flink) = match self.selected_item() {
-            Some(SelectedItem::Segment(_, _, seg)) => (seg.alive, seg.entry.flink.clone()),
-            _ => {
-                self.status_msg = Some(("Select a segment first".into(), Instant::now()));
-                return;
-            }
+        let (alive, flink) = if let Some(SelectedItem::Segment(_, _, seg)) = self.selected_item() {
+            (seg.alive, seg.entry.flink.clone())
+        } else {
+            self.status_msg = Some(("Select a segment first".into(), Instant::now()));
+            return;
         };
 
         if alive {
@@ -814,7 +806,7 @@ impl App {
         if self.confirm_cleanup {
             match cleanup_flink(Path::new(&flink)) {
                 Ok(()) => {
-                    self.status_msg = Some((format!("Cleaned up {}", flink), Instant::now()));
+                    self.status_msg = Some((format!("Cleaned up {flink}"), Instant::now()));
                 }
                 Err(e) => {
                     self.status_msg = Some((format!("Cleanup failed: {e}"), Instant::now()));
@@ -830,13 +822,10 @@ impl App {
     fn request_cleanup_detail(&mut self) {
         let View::Detail(ref mut detail) = self.view else { return };
 
-        let seg = match self
-            .groups
-            .get(detail.group_idx)
-            .and_then(|g| g.segments.get(detail.segment_idx))
-        {
-            Some(s) => s,
-            None => return,
+        let Some(seg) =
+            self.groups.get(detail.group_idx).and_then(|g| g.segments.get(detail.segment_idx))
+        else {
+            return
         };
 
         if seg.alive {
@@ -849,7 +838,7 @@ impl App {
             let flink = seg.entry.flink.clone();
             match cleanup_flink(Path::new(&flink)) {
                 Ok(()) => {
-                    self.status_msg = Some((format!("Cleaned up {}", flink), Instant::now()));
+                    self.status_msg = Some((format!("Cleaned up {flink}"), Instant::now()));
                 }
                 Err(e) => {
                     self.status_msg = Some((format!("Cleanup failed: {e}"), Instant::now()));
@@ -939,6 +928,7 @@ impl App {
     }
 
     /// Process a key event, returning `true` if the application should quit.
+    #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
@@ -1023,12 +1013,11 @@ impl App {
             FluxTab::Apps => match &self.view {
                 View::List => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        if !self.filter_text.is_empty() {
-                            self.filter_text.clear();
-                            self.refresh();
-                        } else {
+                        if self.filter_text.is_empty() {
                             return true;
                         }
+                        self.filter_text.clear();
+                        self.refresh();
                     }
                     KeyCode::Char('?') => self.toggle_help(),
                     KeyCode::Up | KeyCode::Char('k') => self.previous(),

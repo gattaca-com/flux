@@ -126,7 +126,7 @@ impl<T> CircularBuffer<T> {
     }
 
     #[inline]
-    pub fn nth(&mut self, id: usize) -> Option<&T> {
+    pub fn nth(&self, id: usize) -> Option<&T> {
         if id == 0 {
             return self.first();
         } else if id >= self.len() {
@@ -148,7 +148,7 @@ impl<T> CircularBuffer<T> {
 
 impl<T: Ord + Clone + Default> CircularBuffer<T> {
     #[inline]
-    pub fn percentile(&mut self, p: f64) -> T {
+    pub fn percentile(&self, p: f64) -> T {
         let l = self.len();
         if l == 0 {
             return T::default();
@@ -261,7 +261,7 @@ where
         let out = unsafe { self.buffer.data.get_unchecked_mut(self.pos & self.buffer.mask) };
         self.pos = (self.pos + 1) & self.buffer.mask;
         self.count += 1;
-        unsafe { Some(&mut *(out as *mut T)) }
+        unsafe { Some(&mut *std::ptr::from_mut::<T>(out)) }
     }
 }
 
@@ -279,7 +279,7 @@ impl<T> DoubleEndedIterator for IterMut<'_, T> {
             let out = unsafe { self.buffer.data.get_unchecked_mut(self.back & self.buffer.mask) };
             self.back = if self.back == 0 { self.buffer.mask } else { self.back - 1 };
             self.count += 1;
-            unsafe { Some(&mut *(out as *mut T)) }
+            unsafe { Some(&mut *std::ptr::from_mut::<T>(out)) }
         }
     }
 }

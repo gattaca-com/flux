@@ -12,6 +12,6 @@ bitflags::bitflags! {
 }
 impl Default for RenderFlags {
     fn default() -> Self {
-        RenderFlags::ShowMedian
+        Self::ShowMedian
     }
 }

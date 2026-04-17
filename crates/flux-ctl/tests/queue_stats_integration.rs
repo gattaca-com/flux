@@ -23,14 +23,15 @@ fn queue_stats_populated_during_discovery() {
         .unwrap();
 
     // Initialize header with test data
-    let header = unsafe { &mut *(shmem.as_ptr() as *mut QueueHeader) };
+    #[allow(clippy::cast_ptr_alignment)]
+    let header = unsafe { &mut *shmem.as_ptr().cast::<QueueHeader>() };
     header.elsize = 32;
     header.mask = 63; // capacity = 64
     header.count = AtomicUsize::new(150);
 
     // Mark as initialized (this is what flux does)
     unsafe {
-        let is_init_ptr = shmem.as_ptr().add(1) as *mut u8;
+        let is_init_ptr = shmem.as_ptr().add(1);
         *is_init_ptr = 1;
     }
 
@@ -108,14 +109,15 @@ fn consumer_groups_readable_from_shmem() {
         .unwrap();
 
     // Initialize a valid queue header.
-    let header = unsafe { &mut *(shmem.as_ptr() as *mut QueueHeader) };
+    #[allow(clippy::cast_ptr_alignment)]
+    let header = unsafe { &mut *shmem.as_ptr().cast::<QueueHeader>() };
     header.elsize = 64;
     header.mask = 127; // capacity = 128
     header.count = AtomicUsize::new(5000);
 
     // Mark initialized.
     unsafe {
-        let is_init_ptr = shmem.as_ptr().add(1) as *mut u8;
+        let is_init_ptr = shmem.as_ptr().add(1);
         *is_init_ptr = 1;
     }
 

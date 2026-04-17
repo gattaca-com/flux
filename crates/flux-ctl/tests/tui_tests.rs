@@ -52,7 +52,7 @@ fn data_entry(app: &str, type_name: &str, flink: &str, size: usize) -> Discovere
     }
 }
 
-/// Helper: render an App into a TestBackend buffer and return the buffer.
+/// Helper: render an App into a `TestBackend` buffer and return the buffer.
 fn render_to_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -76,7 +76,7 @@ fn buffer_text(buf: &Buffer) -> String {
     lines.join("\n")
 }
 
-/// Helper: create a real shmem segment via ShmemConf
+/// Helper: create a real shmem segment via `ShmemConf`
 /// and place the flink under `base_dir/<app>/shmem/<subdir>/<name>`.
 fn create_raw_shmem(base_dir: &Path, app: &str, subdir: &str, name: &str, size: usize) {
     let flink_dir = base_dir.join(app).join("shmem").join(subdir);
@@ -1570,7 +1570,7 @@ fn d14_render_long_names() {
     let entry = queue_entry(&long_app_name, &long_type_name, &long_flink, 24, 1024);
 
     let groups = vec![AppGroup {
-        name: long_app_name.clone(),
+        name: long_app_name,
         segments: vec![SegmentInfo {
             entry,
             alive: true,
@@ -1621,8 +1621,8 @@ fn d14_render_long_names() {
     assert!(text_wide.contains(&"a".repeat(20)), "wide render should show long name:\n{text_wide}");
 }
 
-/// Performance regression test: scan_base_dir with 250 segments across 40 apps
-/// should complete within a reasonable time (prevents future performance
+/// Performance regression test: `scan_base_dir` with 250 segments across 40
+/// apps should complete within a reasonable time (prevents future performance
 /// regressions).
 #[test]
 fn performance_scan_base_dir_250_segments() {
@@ -1633,13 +1633,13 @@ fn performance_scan_base_dir_250_segments() {
     let mut segment_paths = Vec::new();
 
     for app_idx in 0..40 {
-        let app_name = format!("perfapp{:03}", app_idx);
+        let app_name = format!("perfapp{app_idx:03}");
 
         // Create 6 segments for apps 0-29, 7 segments for apps 30-39 = 250 total
         let segments_per_app = if app_idx < 30 { 6 } else { 7 };
 
         for seg_idx in 0..segments_per_app {
-            let segment_name = format!("Segment{:02}", seg_idx);
+            let segment_name = format!("Segment{seg_idx:02}");
             let subdir = if seg_idx % 2 == 0 { "queues" } else { "data" };
             let size = 1024 * (seg_idx + 1); // varying sizes
 
@@ -1669,13 +1669,11 @@ fn performance_scan_base_dir_250_segments() {
     let elapsed_secs = elapsed.as_secs();
     assert!(
         elapsed_secs <= max_duration_secs,
-        "scan_base_dir took {:.2}s with 250 segments, expected <= {:.2}s (performance regression)",
-        elapsed_secs,
-        max_duration_secs
+        "scan_base_dir took {elapsed_secs:.2}s with 250 segments, expected <= {max_duration_secs:.2}s (performance regression)"
     );
 
     // Also log the actual timing for monitoring
-    println!("Performance: scan_base_dir processed 250 segments in {:.2}s", elapsed_secs);
+    println!("Performance: scan_base_dir processed 250 segments in {elapsed_secs:.2}s");
 
     // Cleanup all segments
     for (app_name, subdir, segment_name) in segment_paths {
@@ -1684,7 +1682,7 @@ fn performance_scan_base_dir_250_segments() {
 }
 
 /// D15: TUI with exactly 1 segment (edge case for off-by-one).
-/// Verifies total_rows, render, navigation, and detail view all work.
+/// Verifies `total_rows`, render, navigation, and detail view all work.
 #[test]
 fn d15_single_segment() {
     let groups = vec![AppGroup {

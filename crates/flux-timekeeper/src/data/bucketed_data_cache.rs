@@ -37,7 +37,7 @@ use crate::{
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BucketedDataCache<K: Hash + Eq, T> {
     /// Underlying data which can be rebucketed any number of times.
-    /// Ordered by [HasKey] ascending
+    /// Ordered by `[HasKey]` ascending
     data: IndexMap<K, T>,
     /// Buckets over datasets coming from the same underlying data
     cache: HashMap<String, BucketedData>,
@@ -59,7 +59,7 @@ impl<K: Hash + Eq, T> std::ops::DerefMut for BucketedDataCache<K, T> {
 
 impl<K: Hash + Eq, T> BucketedDataCache<K, T> {
     pub fn clear_bucketed(&mut self) {
-        self.cache.clear()
+        self.cache.clear();
     }
     pub fn clear(&mut self) {
         self.data.clear();
@@ -100,7 +100,7 @@ impl<K: Hash + PartialOrd + Eq, T> BucketedDataCache<K, T> {
         A: Fn(&[(f64, f64)]) -> f64,
     {
         let dataset = self.cache.entry(dataset_identifier).or_default();
-        dataset.maybe_rebucket(self.data.values(), plotsettings, extract_fn, aggregate_fn);
+        dataset.maybe_rebucket(&self.data.values(), plotsettings, extract_fn, aggregate_fn);
         let (dataset, _) = dataset.bucketed.as_slices();
         if dataset.is_empty() {
             return;
@@ -113,7 +113,7 @@ impl<K: Hash + PartialOrd + Eq, T> BucketedDataCache<K, T> {
             .graph_type(graph_type)
             .data_raw(dataset);
         if let Some(label) = label {
-            series = series.label(label)
+            series = series.label(&label);
         }
         if !plot.has_block_starts() {
             plotsettings.add_block_starts(plot);
@@ -121,7 +121,7 @@ impl<K: Hash + PartialOrd + Eq, T> BucketedDataCache<K, T> {
         plot.push(series);
     }
 
-    pub fn prune_data(&mut self, lower_cutoff: K, upper_cutoff: K) {
-        self.data.retain(|k, _| lower_cutoff < *k && *k < upper_cutoff);
+    pub fn prune_data(&mut self, lower_cutoff: &K, upper_cutoff: &K) {
+        self.data.retain(|k, _| lower_cutoff < k && k < upper_cutoff);
     }
 }

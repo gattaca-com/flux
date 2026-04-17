@@ -1,8 +1,8 @@
-//! Performance regression test for scan_base_dir function.
+//! Performance regression test for `scan_base_dir` function.
 //!
 //! This test creates ~50 mock shmem segments using tempfile dirs with properly
 //! structured shmem/{queues,data,arrays}/ layout and valid flink files pointing
-//! to real shared_memory segments. It times scan_base_dir and asserts it
+//! to real `shared_memory` segments. It times `scan_base_dir` and asserts it
 //! completes in <200ms to catch future performance regressions.
 
 use std::sync::atomic::AtomicUsize;
@@ -13,7 +13,7 @@ use flux_timing::{Duration, Instant};
 use shared_memory::ShmemConf;
 use tempfile::tempdir;
 
-/// Helper function to create a queue segment with proper QueueHeader
+/// Helper function to create a queue segment with proper `QueueHeader`
 /// initialization
 fn create_queue_segment(
     base_dir: &std::path::Path,
@@ -32,14 +32,15 @@ fn create_queue_segment(
     let mut shmem = ShmemConf::new().size(total_size).flink(&flink_path).create().unwrap();
 
     // Initialize header with realistic test data
-    let header = unsafe { &mut *(shmem.as_ptr() as *mut QueueHeader) };
+    #[allow(clippy::cast_ptr_alignment)]
+    let header = unsafe { &mut *shmem.as_ptr().cast::<QueueHeader>() };
     header.elsize = elem_size;
     header.mask = capacity - 1; // capacity must be power of 2
     header.count = AtomicUsize::new(capacity / 4); // 25% full
 
     // Mark as initialized (critical for scan_base_dir)
     unsafe {
-        let is_init_ptr = shmem.as_ptr().add(1) as *mut u8;
+        let is_init_ptr = shmem.as_ptr().add(1);
         *is_init_ptr = 1;
     }
 
@@ -48,7 +49,7 @@ fn create_queue_segment(
     drop(shmem);
 }
 
-/// Helper function to create an array segment with proper ArrayHeader
+/// Helper function to create an array segment with proper `ArrayHeader`
 /// initialization
 fn create_array_segment(
     base_dir: &std::path::Path,
@@ -67,7 +68,8 @@ fn create_array_segment(
     let mut shmem = ShmemConf::new().size(total_size).flink(&flink_path).create().unwrap();
 
     // Initialize header
-    let header = unsafe { &mut *(shmem.as_ptr() as *mut ArrayHeader) };
+    #[allow(clippy::cast_ptr_alignment)]
+    let header = unsafe { &mut *shmem.as_ptr().cast::<ArrayHeader>() };
     header.elsize = elem_size;
     header.bufsize = buf_size;
     header.is_initialized = 1;
@@ -112,19 +114,19 @@ fn performance_scan_base_dir_50_segments() {
 
     // Create 10 apps with 5 segments each = 50 total segments
     for app_idx in 0..10 {
-        let app_name = format!("app{:02}", app_idx);
+        let app_name = format!("app{app_idx:02}");
         let mut app_segments = Vec::new();
 
         // 2 queue segments per app
         for queue_idx in 0..2 {
-            let queue_name = format!("Queue{}", queue_idx);
+            let queue_name = format!("Queue{queue_idx}");
             create_queue_segment(base, &app_name, &queue_name, 64, 1024);
             app_segments.push((queue_name, "queues", ShmemKind::Queue));
         }
 
         // 2 array segments per app
         for array_idx in 0..2 {
-            let array_name = format!("Array{}", array_idx);
+            let array_name = format!("Array{array_idx}");
             create_array_segment(base, &app_name, &array_name, 32, 512);
             app_segments.push((array_name, "arrays", ShmemKind::SeqlockArray));
         }
@@ -197,17 +199,16 @@ fn performance_scan_base_dir_50_segments() {
 
     // The key performance assertion: scan_base_dir should complete in <200ms
     let elapsed_ms = elapsed.as_millis();
-    println!("scan_base_dir with 50 segments completed in {}ms", elapsed_ms);
+    println!("scan_base_dir with 50 segments completed in {elapsed_ms}ms");
 
     assert!(
         elapsed < Duration::from_millis(200),
-        "scan_base_dir took {}ms, expected <200ms - potential performance regression!",
-        elapsed_ms
+        "scan_base_dir took {elapsed_ms}ms, expected <200ms - potential performance regression!",
     );
 
     // Additional performance insights for debugging
     if elapsed_ms > 100.0 {
-        println!("WARNING: scan_base_dir took {}ms - close to the 200ms limit", elapsed_ms);
+        println!("WARNING: scan_base_dir took {elapsed_ms}ms - close to the 200ms limit",);
     }
 
     // Cleanup all segments
@@ -229,13 +230,12 @@ fn performance_baseline_empty_scan() {
     assert_eq!(entries.len(), 0, "Empty directory should return no entries");
 
     let elapsed_ms = elapsed.as_millis();
-    println!("Empty scan_base_dir completed in {}ms", elapsed_ms);
+    println!("Empty scan_base_dir completed in {elapsed_ms}ms");
 
     // Empty scan should be very fast (<10ms)
     assert!(
         elapsed < Duration::from_millis(10),
-        "Empty scan_base_dir took {}ms, expected <10ms",
-        elapsed_ms
+        "Empty scan_base_dir took {elapsed_ms}ms, expected <10ms",
     );
 }
 
@@ -256,13 +256,12 @@ fn performance_single_large_segment() {
     assert_eq!(entries[0].capacity, 4 * 1024 * 1024, "Should read correct capacity");
 
     let elapsed_ms = elapsed.as_millis();
-    println!("scan_base_dir with 1 large segment completed in {}ms", elapsed_ms);
+    println!("scan_base_dir with 1 large segment completed in {elapsed_ms}ms");
 
     // Even large segments should scan quickly since we only read headers
     assert!(
         elapsed < Duration::from_millis(50),
-        "Large segment scan took {}ms, expected <50ms",
-        elapsed_ms
+        "Large segment scan took {elapsed_ms}ms, expected <50ms",
     );
 
     // Cleanup

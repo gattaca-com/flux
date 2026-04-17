@@ -69,7 +69,7 @@ impl TileData {
 
         // Use the latest sample's window_end as "now" for the time range.
         let latest_ns = self.samples.back()?.window_end.0 as f64;
-        let cutoff = latest_ns - (window_secs * 1e9);
+        let cutoff = window_secs.mul_add(-1e9, latest_ns);
 
         let mut total_busy = 0u64;
         let mut total_ticks = 0u64;
@@ -152,10 +152,7 @@ impl TileGroup {
                 continue;
             }
 
-            let queue = match Queue::<TileSample>::try_open_shared(&path) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
+            let Ok(queue) = Queue::<TileSample>::try_open_shared(&path) else { continue };
 
             let consumer = Consumer::new(queue, "flux-ctl-tile").without_log();
             let tile_name = tile_name.to_string();
@@ -203,8 +200,7 @@ impl TileMetricsStore {
 
     /// Discover new apps + tiles and consume pending samples.
     pub fn tick(&mut self) {
-        let should_discover =
-            self.last_discover.map(|t| t.elapsed() > discover_interval()).unwrap_or(true);
+        let should_discover = self.last_discover.is_none_or(|t| t.elapsed() > discover_interval());
 
         if should_discover {
             self.discover_apps();
@@ -219,7 +215,7 @@ impl TileMetricsStore {
         }
     }
 
-    /// Scan base_dir for app directories containing shmem/queues.
+    /// Scan `base_dir` for app directories containing shmem/queues.
     fn discover_apps(&mut self) {
         let shmem_root = &self.base_dir;
         let Ok(entries) = std::fs::read_dir(shmem_root) else {

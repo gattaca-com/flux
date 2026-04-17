@@ -19,12 +19,12 @@ pub struct Plot<T> {
     title: String,
     y_min: f64,
     y_max: f64,
-    pub(crate) plot_series: Vec<PlotSeries<T>>,
+    pub(crate) series: Vec<PlotSeries<T>>,
 }
 
 impl<T> Plot<T> {
     pub fn has_block_starts(&self) -> bool {
-        self.plot_series.iter().any(|series| {
+        self.series.iter().any(|series| {
             series.data.first().is_some_and(|data| data.0 != 0.0 && data.1 == 0.0) &&
                 series.data.get(1).is_some_and(|data| data.0 != 0.0 && data.1 == 0.0)
         })
@@ -34,18 +34,13 @@ impl<T> Plot<T> {
             self.y_min = self.y_min.min(series.y_min);
             self.y_max = self.y_max.max(series.y_max);
         }
-        self.plot_series.push(series);
+        self.series.push(series);
     }
 }
 
 impl<T: Plottable> Plot<T> {
-    pub fn new<S: ToString>(title: S) -> Self {
-        Self {
-            title: title.to_string(),
-            y_min: f64::MAX,
-            y_max: 0.0,
-            plot_series: Default::default(),
-        }
+    pub fn new<S: ToString>(title: &S) -> Self {
+        Self { title: title.to_string(), y_min: f64::MAX, y_max: 0.0, series: Vec::default() }
     }
 
     pub fn render(
@@ -64,7 +59,7 @@ impl<T: Plottable> Plot<T> {
         spans.push(Span::raw(prefix));
 
         let mut first = true;
-        for s in self.plot_series.iter().filter(|s| s.last_val != 0.0) {
+        for s in self.series.iter().filter(|s| s.last_val != 0.0) {
             if !first {
                 spans.push(Span::raw(" - "));
             }
@@ -90,11 +85,11 @@ impl<T: Plottable> Plot<T> {
         let y_max = self.y_max;
 
         let y_diff = (y_max - y_min).max(y_max / 100.0);
-        let y_min_bound = y_min - 0.05 * y_diff;
-        let y_max_bound = y_max + 0.05 * y_diff;
-        let y_q1 = y_min + (0.25 * y_diff);
-        let y_q2 = y_min + (0.5 * y_diff);
-        let y_q3 = y_min + (0.75 * y_diff);
+        let y_min_bound = 0.05f64.mul_add(-y_diff, y_min);
+        let y_max_bound = 0.05f64.mul_add(y_diff, y_max);
+        let y_q1 = 0.25f64.mul_add(y_diff, y_min);
+        let y_q2 = 0.5f64.mul_add(y_diff, y_min);
+        let y_q3 = 0.75f64.mul_add(y_diff, y_min);
         let ylabels = vec![
             T::from(y_min.round() as u64).to_string(),
             format!("{}", T::from(y_q1.round() as u64)),
@@ -105,9 +100,9 @@ impl<T: Plottable> Plot<T> {
 
         let (x_min, x_max) = plot_settings.range();
         let x_diff = plot_settings.span();
-        let x_q1 = x_min + (0.25 * x_diff);
-        let x_q2 = x_min + (0.5 * x_diff);
-        let x_q3 = x_min + (0.75 * x_diff);
+        let x_q1 = 0.25f64.mul_add(x_diff, x_min);
+        let x_q2 = 0.5f64.mul_add(x_diff, x_min);
+        let x_q3 = 0.75f64.mul_add(x_diff, x_min);
 
         let vlines = [x_q1, x_q2, x_q3]
             .iter()
@@ -137,8 +132,7 @@ impl<T: Plottable> Plot<T> {
             .bounds([x_min, x_max])
             .style(Style::default().fg(Color::LightBlue))
             .labels(plot_settings.xlabels());
-        datasets
-            .extend(self.plot_series.iter_mut().map(|d| d.to_dataset(y_min_bound, y_max_bound)));
+        datasets.extend(self.series.iter_mut().map(|d| d.to_dataset(y_min_bound, y_max_bound)));
         let yaxis = Axis::default()
             .bounds([y_min_bound, y_max_bound])
             .style(Style::default().fg(Color::LightBlue))
@@ -153,8 +147,8 @@ impl<T: Plottable> Plot<T> {
     }
 
     pub fn stack_by_x(&mut self) {
-        let mut offsets = vec![0.0f64; self.plot_series.len()];
-        for prev_data in self.plot_series.iter() {
+        let mut offsets = vec![0.0f64; self.series.len()];
+        for prev_data in &self.series {
             for p in &prev_data.data {
                 if let Some(offset) = offsets.get_mut(p.0 as usize) {
                     *offset = (*offset).max(p.1);
@@ -162,7 +156,7 @@ impl<T: Plottable> Plot<T> {
             }
         }
         let data: Vec<_> = self
-            .plot_series
+            .series
             .iter()
             .enumerate()
             .map(move |(i, d)| {
@@ -173,7 +167,7 @@ impl<T: Plottable> Plot<T> {
             })
             .collect();
 
-        self.plot_series.clear();
+        self.series.clear();
 
         for d in data {
             self.push(
@@ -203,7 +197,7 @@ impl<T: Display + Into<u64> + Default + Clone> PlotSeries<T> {
         Self { color, ..self }
     }
 
-    pub fn label<S: ToString>(self, label: S) -> Self {
+    pub fn label<S: ToString>(self, label: &S) -> Self {
         Self { label: label.to_string(), ..self }
     }
 
@@ -238,12 +232,12 @@ impl<T: Display + Into<u64> + Default + Clone> PlotSeries<T> {
         let mut last_val = Default::default();
         for &(_, y) in data {
             if y_min > y {
-                y_min = y
+                y_min = y;
             }
             if y_max < y {
-                y_max = y
+                y_max = y;
             }
-            last_val = y
+            last_val = y;
         }
 
         Self { data: data.to_vec(), y_min, y_max, last_val, ..self }

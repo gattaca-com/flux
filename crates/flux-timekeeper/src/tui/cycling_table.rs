@@ -33,10 +33,9 @@ impl<K: Clone + PartialEq> CyclingTableState<K> {
             if selected >= self.keys.len() {
                 self.state.select(Some(0));
                 return;
-            } else {
-                self.state.select(Some(selected));
-                return;
             }
+            self.state.select(Some(selected));
+            return;
         }
         self.state.select_next();
     }
@@ -46,12 +45,11 @@ impl<K: Clone + PartialEq> CyclingTableState<K> {
             if selected == 0 {
                 self.state.select(Some(self.keys.len() - 1));
                 return;
-            } else {
-                selected = selected
-                    .saturating_sub(self.next_page_jump * (m == KeyModifiers::SHIFT) as usize + 1);
-                self.state.select(Some(selected));
-                return;
             }
+            selected = selected
+                .saturating_sub(self.next_page_jump * (m == KeyModifiers::SHIFT) as usize + 1);
+            self.state.select(Some(selected));
+            return;
         }
 
         self.state.select_previous();
@@ -123,7 +121,7 @@ impl<K: Clone + PartialEq> CyclingTableState<K> {
             if self.prev_selected.as_ref().is_some_and(|k| key == *k) {
                 row = row.style(Style::default().underlined().underline_color(Color::Red).bold());
                 if self.state.selected().is_none() {
-                    self.state.select(Some(i))
+                    self.state.select(Some(i));
                 }
             }
             drawable_rows.push(row);
@@ -147,10 +145,10 @@ impl<K: Clone + PartialEq> CyclingTableState<K> {
             );
 
         self.next_page_jump = (area_.height as usize).saturating_sub(5).min(self.keys.len());
-        frame.render_stateful_widget(table, area, &mut self.state)
+        frame.render_stateful_widget(table, area, &mut self.state);
     }
-    pub fn select(&mut self, key: K) {
-        let Some(id) = self.keys.iter().enumerate().find_map(|(i, k)| (*k == key).then_some(i))
+    pub fn select(&mut self, key: &K) {
+        let Some(id) = self.keys.iter().enumerate().find_map(|(i, k)| (k == key).then_some(i))
         else {
             return;
         };
@@ -161,16 +159,16 @@ impl<K: Clone + PartialEq> CyclingTableState<K> {
     }
 }
 impl<K: PartialOrd> CyclingTableState<K> {
-    pub fn select_closest_larger(&mut self, key: K) {
-        let Some(id) = self.keys.iter().enumerate().find_map(|(i, k)| (*k >= key).then_some(i))
+    pub fn select_closest_larger(&mut self, key: &K) {
+        let Some(id) = self.keys.iter().enumerate().find_map(|(i, k)| (k >= key).then_some(i))
         else {
             return;
         };
         self.state.select(Some(id));
     }
-    pub fn select_closest_smaller(&mut self, key: K) {
+    pub fn select_closest_smaller(&mut self, key: &K) {
         let Some(id) =
-            self.keys.iter().enumerate().rev().find_map(|(i, k)| (*k <= key).then_some(i))
+            self.keys.iter().enumerate().rev().find_map(|(i, k)| (k <= key).then_some(i))
         else {
             return;
         };

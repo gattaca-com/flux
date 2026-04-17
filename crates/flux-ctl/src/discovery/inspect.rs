@@ -62,7 +62,7 @@ impl PidInfo {
         pids.iter().map(|&pid| Self::gather(pid)).collect()
     }
 
-    /// Read AT_CLKTCK from /proc/self/auxv (ELF auxiliary vector).
+    /// Read `AT_CLKTCK` from /proc/self/auxv (ELF auxiliary vector).
     /// Falls back to 100 if the file can't be read.  Cached after the first
     /// call since the value never changes.
     fn clock_ticks_per_sec() -> u64 {
@@ -150,6 +150,7 @@ impl PoisonInfo {
             return None;
         }
 
+        #[allow(clippy::cast_ptr_alignment)]
         let header = unsafe { &*(base as *const QueueHeader) };
         if !header.is_initialized() || header.elsize == 0 {
             return None;
@@ -179,6 +180,7 @@ impl PoisonInfo {
             return None;
         }
 
+        #[allow(clippy::cast_ptr_alignment)]
         let header = unsafe { &*(base as *const ArrayHeader) };
         if !header.is_initialized() || header.elsize == 0 {
             return None;
@@ -208,6 +210,7 @@ impl PoisonInfo {
             return None;
         }
 
+        #[allow(clippy::cast_ptr_alignment)]
         let header = unsafe { &*(base as *const QueueHeader) };
         if !header.is_initialized() || header.elsize == 0 {
             return None;
@@ -224,6 +227,7 @@ impl PoisonInfo {
         }
 
         // Check only the slot at the write position
+        #[allow(clippy::cast_ptr_alignment)]
         let slot_ptr = unsafe { base.add(HEADER_SIZE + write_pos * elsize) } as *const AtomicU64;
         let version1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
 
@@ -249,6 +253,7 @@ impl PoisonInfo {
             return None;
         }
 
+        #[allow(clippy::cast_ptr_alignment)]
         let header = unsafe { &*(base as *const ArrayHeader) };
         if !header.is_initialized() || header.elsize == 0 {
             return None;
@@ -261,6 +266,7 @@ impl PoisonInfo {
         }
 
         // Check the first slot
+        #[allow(clippy::cast_ptr_alignment)]
         let slot_ptr = unsafe { base.add(HEADER_SIZE) } as *const AtomicU64;
         let version1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
 
@@ -296,6 +302,7 @@ impl PoisonInfo {
             if i * elsize + std::mem::size_of::<AtomicU64>() > buf_remaining {
                 break;
             }
+            #[allow(clippy::cast_ptr_alignment)]
             let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
             let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
             if v & 1 != 0 {
@@ -314,6 +321,7 @@ impl PoisonInfo {
         let mut first_slot = None;
         let mut n_poisoned = 0;
         for &i in &odd_slots {
+            #[allow(clippy::cast_ptr_alignment)]
             let version_ptr = unsafe { buf_base.add(i * elsize) } as *const AtomicU64;
             let v = unsafe { &*version_ptr }.load(Ordering::Acquire);
             if v & 1 != 0 {
@@ -402,11 +410,10 @@ pub fn scan_proc_fds() -> HashMap<PathBuf, Vec<u32>> {
 /// relative to `/dev/shm`).  Falls back to reading the flink file if no
 /// cached path is available.
 fn os_id_from_entry(entry: &DiscoveredEntry) -> Option<String> {
-    if let Some(ref bp) = entry.backing_path {
-        bp.strip_prefix("/dev/shm").ok().map(|rel| format!("/{}", rel.display()))
-    } else {
-        read_shmem_os_id(&entry.flink)
-    }
+    entry.backing_path.as_ref().map_or_else(
+        || read_shmem_os_id(&entry.flink),
+        |bp| bp.strip_prefix("/dev/shm").ok().map(|rel| format!("/{}", rel.display())),
+    )
 }
 
 impl DiscoveredEntry {
@@ -435,6 +442,8 @@ impl QueueStats {
         if shmem.len() < std::mem::size_of::<QueueHeader>() {
             return None;
         }
+
+        #[allow(clippy::cast_ptr_alignment)]
         let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
         if !header.is_initialized() {
             return None;
@@ -464,13 +473,13 @@ pub struct ConsumerGroupInfo {
 /// Returns an empty `Vec` if the segment cannot be opened or is not an
 /// initialized queue.
 pub fn read_consumer_groups(flink: &str) -> Vec<ConsumerGroupInfo> {
-    let shmem = match ShmemConf::new().flink(flink).open() {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    let Ok(shmem) = ShmemConf::new().flink(flink).open() else {
+        return Vec::new();
     };
     if shmem.len() < std::mem::size_of::<QueueHeader>() {
         return Vec::new();
     }
+    #[allow(clippy::cast_ptr_alignment)]
     let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
     if !header.is_initialized() {
         return Vec::new();

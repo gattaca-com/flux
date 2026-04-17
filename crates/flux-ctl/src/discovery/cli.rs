@@ -332,9 +332,8 @@ pub fn inspect(
             "💀 dead"
         };
 
-        let backing = backing_file_size(&entry.flink)
-            .map(format_bytes)
-            .unwrap_or_else(|| "unavailable".into());
+        let backing =
+            backing_file_size(&entry.flink).map_or_else(|| "unavailable".into(), format_bytes);
 
         println!("  Kind:       {}", entry.kind);
         println!("  Status:     {status}");
@@ -347,6 +346,7 @@ pub fn inspect(
             let Ok(shmem) = ShmemConf::new().flink(&entry.flink).open()
         {
             if shmem.len() >= std::mem::size_of::<QueueHeader>() {
+                #[allow(clippy::cast_ptr_alignment)]
                 let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
                 if header.is_initialized() {
                     println!("  Writes:     {}", header.count.load(Ordering::Relaxed));
