@@ -18,10 +18,8 @@ type-hash-derive.workspace = true
 bitcode.workspace = true
 core_affinity.workspace = true
 libc.workspace = true
-once_cell.workspace = true
 serde.workspace = true
 signal-hook.workspace = true
-tinyvec.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 wincode = { workspace = true, optional = true }
@@ -42,3 +40,6 @@ wincode = [
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["wincode"]

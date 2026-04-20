@@ -9,7 +9,6 @@ repository = "https://github.com/gattaca-com/flux"
 
 [dependencies]
 tracing.workspace = true
-once_cell.workspace = true
 serde.workspace = true
 chrono.workspace = true
 quanta.workspace = true
@@ -28,3 +27,6 @@ wincode = ["dep:wincode", "dep:wincode-derive"]
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["type-hash", "wincode"]
