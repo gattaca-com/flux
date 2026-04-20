@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io::{self, IoSlice, Read, Write},
     net::SocketAddr,
+    ptr,
 };
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
@@ -625,7 +626,7 @@ pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_USER_TIMEOUT,
-            timeout_ms as *const libc::c_void,
+            ptr::from_ref(&timeout_ms).cast::<libc::c_void>(),
             core::mem::size_of::<u32>() as libc::socklen_t,
         );
     }
@@ -641,7 +642,7 @@ pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
             fd,
             libc::SOL_SOCKET,
             libc::SO_SNDBUF,
-            size as *const libc::c_void,
+            ptr::from_ref(&size).cast::<libc::c_void>(),
             core::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
         libc::setsockopt(
