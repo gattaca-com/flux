@@ -1,10 +1,9 @@
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use governor::{clock::Clock as GovernorClock, nanos::Nanos as GovernorNanos};
-use once_cell::sync::OnceCell;
 use quanta::Mock;
 
 use crate::Nanos;
@@ -41,11 +40,11 @@ impl GovernorClock for OurClockForNanos {
     }
 }
 
-static GLOBAL_NANOS_FOR_MULTIPLIER: OnceCell<u64> = OnceCell::new();
+static GLOBAL_NANOS_FOR_MULTIPLIER: OnceLock<u64> = OnceLock::new();
 // might be mocked
-static GLOBAL_CLOCK: OnceCell<OurClockForNanos> = OnceCell::new();
+static GLOBAL_CLOCK: OnceLock<OurClockForNanos> = OnceLock::new();
 // never mocked
-static GLOBAL_CLOCK_NON_MOCKED: OnceCell<Clock> = OnceCell::new();
+static GLOBAL_CLOCK_NON_MOCKED: OnceLock<Clock> = OnceLock::new();
 
 #[inline]
 pub fn init_global_with_mock() -> Arc<Mock> {
@@ -75,9 +74,9 @@ fn nanos_for_multiplier() -> u64 {
         .get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, MULTIPLIER))
 }
 
-static TICKS_PER_SEC: OnceCell<u64> = OnceCell::new();
-static TICKS_PER_MILLI: OnceCell<u64> = OnceCell::new();
-static TICKS_PER_MICRO: OnceCell<u64> = OnceCell::new();
+static TICKS_PER_SEC: OnceLock<u64> = OnceLock::new();
+static TICKS_PER_MILLI: OnceLock<u64> = OnceLock::new();
+static TICKS_PER_MICRO: OnceLock<u64> = OnceLock::new();
 
 /// Overflow: `s * ticks_per_sec()` wraps at ~182 years.
 #[inline]
