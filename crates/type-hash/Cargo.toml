@@ -12,3 +12,6 @@ default = ["std"]
 std = []
 
 [dependencies]
+
+[lints]
+workspace = true

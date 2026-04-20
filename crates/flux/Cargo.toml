@@ -39,3 +39,6 @@ wincode = [
     "flux-utils/wincode",
     "flux-timing/wincode",
 ]
+
+[lints]
+workspace = true

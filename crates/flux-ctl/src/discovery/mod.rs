@@ -29,7 +29,7 @@ use shared_memory::{Shmem, ShmemConf};
 /// A shared-memory segment discovered by walking the filesystem.
 #[derive(Debug, Clone)]
 pub struct DiscoveredEntry {
-    /// The kind of segment (Queue, Data, SeqlockArray).
+    /// The kind of segment (Queue, Data, `SeqlockArray`).
     pub kind: ShmemKind,
     /// Application name — the immediate parent of the `shmem/` directory.
     pub app_name: String,
@@ -77,8 +77,8 @@ impl DiscoveredEntry {
 
 /// A cached open shmem handle together with its static metadata.
 ///
-/// Metadata fields (kind, app_name, …) are set once when the segment is
-/// first opened.  Dynamic fields (queue_writes, poison_quick, …) are
+/// Metadata fields `(kind, app_name, …)` are set once when the segment is
+/// first opened.  Dynamic fields `(queue_writes, poison_quick, …)` are
 /// re-read from the still-mapped memory via [`to_entry`](Self::to_entry).
 struct CachedHandle {
     shmem: Shmem,
@@ -95,7 +95,7 @@ impl CachedHandle {
     /// Try to open a shmem segment from a flink path on disk.
     ///
     /// Reads the OS shmem id from the flink file, checks the backing
-    /// `/dev/shm/` file exists (one `stat`), then opens by os_id —
+    /// `/dev/shm/` file exists (one `stat`), then opens by `os_id` —
     /// avoiding the `shared_memory` crate's 5×50 ms retry loop on stale
     /// segments.
     fn open(flink_str: &str, kind: ShmemKind, app_name: &str) -> Option<Self> {
@@ -116,6 +116,7 @@ impl CachedHandle {
                 if shmem.len() < std::mem::size_of::<QueueHeader>() {
                     return None;
                 }
+                #[allow(clippy::cast_ptr_alignment)]
                 let h = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
                 if !h.is_initialized() || h.elsize == 0 {
                     return None;
@@ -154,6 +155,7 @@ impl CachedHandle {
 
         let (queue_writes, queue_fill, poison_quick) = match self.kind {
             ShmemKind::Queue => {
+                #[allow(clippy::cast_ptr_alignment)]
                 let header = unsafe { &*(base as *const QueueHeader) };
                 let writes = header.count.load(Ordering::Relaxed);
                 let fill = writes & header.mask;
@@ -281,6 +283,7 @@ impl ShmemCache {
         if handle.shmem.len() < std::mem::size_of::<QueueHeader>() {
             return Vec::new();
         }
+        #[allow(clippy::cast_ptr_alignment)]
         let header = unsafe { &*(handle.shmem.as_ptr() as *const QueueHeader) };
         if !header.is_initialized() {
             return Vec::new();
@@ -438,6 +441,7 @@ fn read_queue_meta_with_stats(shmem: &Shmem) -> (usize, usize, Option<usize>, Op
     if shmem.len() < std::mem::size_of::<QueueHeader>() {
         return (0, 0, None, None);
     }
+    #[allow(clippy::cast_ptr_alignment)]
     let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
     if !header.is_initialized() || header.elsize == 0 {
         return (0, 0, None, None);
@@ -451,6 +455,7 @@ fn read_array_meta(shmem: &Shmem) -> (usize, usize) {
     if shmem.len() < std::mem::size_of::<ArrayHeader>() {
         return (0, 0);
     }
+    #[allow(clippy::cast_ptr_alignment)]
     let header = unsafe { &*(shmem.as_ptr() as *const ArrayHeader) };
     if !header.is_initialized() || header.elsize == 0 {
         return (0, 0);
@@ -465,7 +470,8 @@ fn quick_poison_queue(base: *const u8, shmem_len: usize) -> Option<bool> {
     if shmem_len < HEADER_SIZE {
         return None;
     }
-    let header = unsafe { &*(base as *const QueueHeader) };
+    #[allow(clippy::cast_ptr_alignment)]
+    let header = unsafe { &*base.cast::<QueueHeader>() };
     if !header.is_initialized() || header.elsize == 0 {
         return None;
     }
@@ -474,7 +480,8 @@ fn quick_poison_queue(base: *const u8, shmem_len: usize) -> Option<bool> {
     if HEADER_SIZE + write_pos * elsize + std::mem::size_of::<AtomicU64>() > shmem_len {
         return None;
     }
-    let slot_ptr = unsafe { base.add(HEADER_SIZE + write_pos * elsize) } as *const AtomicU64;
+    #[allow(clippy::cast_ptr_alignment)]
+    let slot_ptr = unsafe { base.add(HEADER_SIZE + write_pos * elsize) }.cast::<AtomicU64>();
     let v1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
     if v1 & 1 == 0 {
         return Some(false);
@@ -490,14 +497,16 @@ fn quick_poison_array(base: *const u8, shmem_len: usize) -> Option<bool> {
     if shmem_len < HEADER_SIZE {
         return None;
     }
-    let header = unsafe { &*(base as *const ArrayHeader) };
+    #[allow(clippy::cast_ptr_alignment)]
+    let header = unsafe { &*base.cast::<ArrayHeader>() };
     if !header.is_initialized() || header.elsize == 0 {
         return None;
     }
     if HEADER_SIZE + std::mem::size_of::<AtomicU64>() > shmem_len {
         return None;
     }
-    let slot_ptr = unsafe { base.add(HEADER_SIZE) } as *const AtomicU64;
+    #[allow(clippy::cast_ptr_alignment)]
+    let slot_ptr = unsafe { base.add(HEADER_SIZE) }.cast::<AtomicU64>();
     let v1 = unsafe { &*slot_ptr }.load(Ordering::Acquire);
     if v1 & 1 == 0 {
         return Some(false);

@@ -148,9 +148,8 @@ impl TileMetricsView {
                 continue;
             }
 
-            let queue = match Queue::<TileSample>::try_open_shared(&path) {
-                Ok(q) => q,
-                Err(_) => continue,
+            let Ok(queue) = Queue::<TileSample>::try_open_shared(&path) else {
+                continue;
             };
 
             let consumer = Consumer::new(queue, "tile-metrics").without_log();
@@ -224,22 +223,24 @@ fn format_stats_line(name: &str, max_name: usize, range_stats: Option<TileStats>
     let display_name = if name.len() > max_name {
         format!("{}…", &name[..max_name - 1])
     } else {
-        format!("{:<width$}", name, width = max_name)
+        format!("{name:<max_name$}")
     };
 
-    let (stats_str, stats_color) = match range_stats {
-        Some(s) => (
-            format!(
-                "util:{:5.1}%  avg:{:<10} min:{:<10} max:{:<10}",
-                s.utilisation * 100.0,
-                s.busy_avg,
-                s.busy_min,
-                s.busy_max
-            ),
-            Color::White,
-        ),
-        None => ("no data in range".to_string(), Color::DarkGray),
-    };
+    let (stats_str, stats_color) = range_stats.map_or_else(
+        || ("no data in range".to_string(), Color::DarkGray),
+        |s| {
+            (
+                format!(
+                    "util:{:5.1}%  avg:{:<10} min:{:<10} max:{:<10}",
+                    s.utilisation * 100.0,
+                    s.busy_avg,
+                    s.busy_min,
+                    s.busy_max
+                ),
+                Color::White,
+            )
+        },
+    );
 
     Line::from(vec![
         Span::styled(display_name, Style::default().bold()),

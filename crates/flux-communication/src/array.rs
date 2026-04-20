@@ -17,7 +17,10 @@ pub struct ArrayHeader {
 
 impl ArrayHeader {
     pub fn from_ptr(ptr: *mut u8) -> &'static mut Self {
-        unsafe { &mut *(ptr as *mut Self) }
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            &mut *ptr.cast::<Self>()
+        }
     }
 
     pub fn open_shared<S: AsRef<Path>>(path: S) -> Result<&'static mut Self, ShmemError> {
@@ -59,7 +62,7 @@ impl<T: Copy> InnerSeqlockArray<T> {
         unsafe {
             // why len? because the size in the fat pointer ONLY cares about the unsized
             // part of the struct i.e. the length of the buffer
-            let q = std::ptr::slice_from_raw_parts_mut(ptr as *mut Seqlock<T>, len) as *mut Self;
+            let q = std::ptr::slice_from_raw_parts_mut(ptr.cast::<Seqlock<T>>(), len) as *mut Self;
             let elsize = std::mem::size_of::<Seqlock<T>>();
             (*q).header.bufsize = len;
             (*q).header.elsize = elsize;
@@ -73,7 +76,7 @@ impl<T: Copy> InnerSeqlockArray<T> {
         unsafe {
             let len = (*ptr).bufsize;
             // TODO @lopo: I think this is slightly wrong
-            std::ptr::slice_from_raw_parts_mut(ptr as *mut Seqlock<T>, len) as *const Self
+            std::ptr::slice_from_raw_parts_mut(ptr.cast::<Seqlock<T>>(), len) as *const Self
         }
     }
 
@@ -91,7 +94,7 @@ impl<T: Copy> InnerSeqlockArray<T> {
 
     pub fn reset_lock(&self, pos: usize) {
         let lock = self.load(pos);
-        lock.reset()
+        lock.reset();
     }
 
     /// Use this to write if there are multiple producers.
@@ -185,7 +188,7 @@ impl<T: Copy> InnerSeqlockArray<T> {
 
     fn clear(&self) {
         for i in 0..self.len() {
-            self.reset_lock(i)
+            self.reset_lock(i);
         }
     }
 }
@@ -217,7 +220,7 @@ impl<T: Copy> SeqlockArray<T> {
         InnerSeqlockArray::open_shared(shmem_file).map(|inner| Self { inner })
     }
 
-    pub fn iter(&self) -> VectorIterator<'_, T> {
+    pub fn vec_iter(&self) -> VectorIterator<'_, T> {
         VectorIterator { vector: self, next_id: 0 }
     }
 

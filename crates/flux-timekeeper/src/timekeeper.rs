@@ -49,6 +49,7 @@ impl TimerDataState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn report(
         &mut self,
         data: &mut TimerData,
@@ -61,7 +62,7 @@ impl TimerDataState {
             return;
         }
         let latency_plot = (!data.data_latency.is_empty()).then(|| {
-            let mut latency = Plot::<Duration>::new("");
+            let mut latency = Plot::<Duration>::new(&"");
             if data.stats_latency.flags.contains(RenderFlags::ShowAverages) {
                 data.data_latency.add_to_plot(
                     plot_settings,
@@ -117,7 +118,7 @@ impl TimerDataState {
             latency
         });
         let processing_plot = (!data.data_processing.is_empty()).then(|| {
-            let mut processing = Plot::<Duration>::new("");
+            let mut processing = Plot::<Duration>::new(&"");
             if data.stats_processing.flags.contains(RenderFlags::ShowAverages) {
                 data.data_processing.add_to_plot(
                     plot_settings,
@@ -172,13 +173,13 @@ impl TimerDataState {
             }
             processing
         });
-        let msgs_per_sec = if !data.data_processing.is_empty() {
-            &mut data.data_processing
-        } else {
+        let msgs_per_sec = if data.data_processing.is_empty() {
             &mut data.data_latency
+        } else {
+            &mut data.data_processing
         };
 
-        let mut msgs_per_sec_plot = Plot::<MsgPer10Sec>::new("");
+        let mut msgs_per_sec_plot = Plot::<MsgPer10Sec>::new(&"");
         msgs_per_sec.add_to_plot(
             plot_settings,
             format!("msgs_per_sec_{}", data.name),
@@ -385,7 +386,7 @@ pub struct TimerDatas {
 impl TimerDatas {
     pub fn push(&mut self, data: TimerData) {
         self.data.push(data);
-        self.data.sort_unstable_by(|t1, t2| t1.name.cmp(&t2.name))
+        self.data.sort_unstable_by(|t1, t2| t1.name.cmp(&t2.name));
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -397,7 +398,7 @@ impl TimerDatas {
     }
 
     pub fn toggle_render_options(&mut self, options: RenderFlags) {
-        self.data.iter_mut().for_each(|d| d.toggle_render_options(options))
+        self.data.iter_mut().for_each(|d| d.toggle_render_options(options));
     }
 }
 
@@ -405,14 +406,14 @@ impl Persistable for TimerDatas {
     const PERSIST_DIR: &'static str = "timer_updates";
 }
 
-fn black_box<T>(dummy: T) -> T {
-    unsafe { std::ptr::read_volatile(&dummy) }
+fn black_box<T>(dummy: &T) -> T {
+    unsafe { std::ptr::read_volatile(dummy) }
 }
 
 pub fn clock_overhead() -> Duration {
     let start = Instant::now();
     for _ in 0..1_000_000 {
-        black_box(Instant::now());
+        black_box(&Instant::now());
     }
     let end = Instant::now();
     Duration((end.0 - start.0) / 1_000_000)
@@ -466,7 +467,7 @@ impl Default for TimeKeeper {
             clock_overhead: clock_overhead(),
             timer_data: TimerDatas::default(),
             tile_metrics: TileMetricsView::default(),
-            timers_list_state: Default::default(),
+            timers_list_state: ListState::default(),
             timers: HashMap::default(),
         }
     }
@@ -562,7 +563,7 @@ impl TimeKeeper {
         match self.mode {
             TimeKeeperMode::Timeline => self.render_timeline(layout[1], frame, plot_settings),
             TimeKeeperMode::Aggregate => {
-                Self::render_aggregate(&self.timer_data.data, plot_settings, layout[1], frame)
+                Self::render_aggregate(&self.timer_data.data, plot_settings, layout[1], frame);
             }
             TimeKeeperMode::TileMetrics => {
                 self.tile_metrics.render(frame, layout[1], plot_settings);
@@ -580,16 +581,16 @@ impl TimeKeeper {
             (KeyCode::Up, TimeKeeperMode::Timeline) => self.timers_list_state.select_previous(),
 
             (KeyCode::Char('l'), TimeKeeperMode::Timeline) => {
-                self.timer_data.toggle_render_options(RenderFlags::ShowMin)
+                self.timer_data.toggle_render_options(RenderFlags::ShowMin);
             }
             (KeyCode::Char('m'), TimeKeeperMode::Timeline) => {
-                self.timer_data.toggle_render_options(RenderFlags::ShowMedian)
+                self.timer_data.toggle_render_options(RenderFlags::ShowMedian);
             }
             (KeyCode::Char('M'), TimeKeeperMode::Timeline) => {
-                self.timer_data.toggle_render_options(RenderFlags::ShowMax)
+                self.timer_data.toggle_render_options(RenderFlags::ShowMax);
             }
             (KeyCode::Char('a'), TimeKeeperMode::Timeline) => {
-                self.timer_data.toggle_render_options(RenderFlags::ShowAverages)
+                self.timer_data.toggle_render_options(RenderFlags::ShowAverages);
             }
             _ => {}
         }
@@ -604,16 +605,16 @@ impl TimeKeeper {
             let name = entry.path().as_os_str().to_str().unwrap().to_string();
             if let Some((_dir, real_name)) = name.split_once("latency-") {
                 if !self.timer_data.contains(real_name) {
-                    let latency_q =
-                        match Queue::try_open_shared(format!("{queues_dir}/latency-{real_name}")) {
-                            Ok(q) => q,
-                            Err(_) => continue,
-                        };
-                    let processing_q =
-                        match Queue::try_open_shared(format!("{queues_dir}/timing-{real_name}")) {
-                            Ok(q) => q,
-                            Err(_) => continue,
-                        };
+                    let Ok(latency_q) =
+                        Queue::try_open_shared(format!("{queues_dir}/latency-{real_name}"))
+                    else {
+                        continue;
+                    };
+                    let Ok(processing_q) =
+                        Queue::try_open_shared(format!("{queues_dir}/timing-{real_name}"))
+                    else {
+                        continue;
+                    };
 
                     // only display queues that have entries
                     if latency_q.count() == 0 && processing_q.count() == 0 {

@@ -16,7 +16,7 @@ pub struct CyclingListState {
 
 impl Default for CyclingListState {
     fn default() -> Self {
-        Self { state: Default::default(), padding: 2, n: 0 }
+        Self { state: ListState::default(), padding: 2, n: 0 }
     }
 }
 
@@ -56,7 +56,7 @@ impl CyclingListState {
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
             .scroll_padding(self.padding);
         self.n = list.len();
-        frame.render_stateful_widget(list, area, &mut self.state)
+        frame.render_stateful_widget(list, area, &mut self.state);
     }
 }
 

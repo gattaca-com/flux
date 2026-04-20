@@ -34,7 +34,7 @@ impl<T: Statisticable> DataPoint<T> {
         Self { time, ..Default::default() }
     }
 
-    pub fn block_start(time: u64) -> DataPoint<T> {
+    pub fn block_start(time: u64) -> Self {
         Self { vline: true, ..Self::empty(time) }
     }
 }
@@ -48,7 +48,7 @@ impl<T: Statisticable> Default for DataPoint<T> {
             median: 0,
             n_samples: 0,
             vline: false,
-            rate: Default::default(),
+            rate: MsgPer10Sec::default(),
             _p: PhantomData {},
             tot: 0,
             time: 0,
@@ -56,7 +56,7 @@ impl<T: Statisticable> Default for DataPoint<T> {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgPer10Sec(pub u64);
 
 impl Statisticable for MsgPer10Sec {}

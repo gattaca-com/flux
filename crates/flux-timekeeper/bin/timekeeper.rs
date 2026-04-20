@@ -38,7 +38,7 @@ impl TimekeeperTUI {
     pub fn new(app_name: String) -> Self {
         Self {
             app_name,
-            timekeeper: Default::default(),
+            timekeeper: TimeKeeper::default(),
             plot_settings: PlotSettings::new(
                 Nanos::now() - Nanos::from_secs(12),
                 Nanos::now(),
@@ -50,7 +50,7 @@ impl TimekeeperTUI {
         }
     }
     pub fn update(&mut self) {
-        self.timekeeper.update(&self.app_name)
+        self.timekeeper.update(&self.app_name);
     }
     pub fn render(&mut self, frame: &mut Frame) {
         self.plot_settings.set_range_to_now();
@@ -146,7 +146,7 @@ fn main() {
             if let Err(e) = terminal.draw(|frame| {
                 timekeeper_tui.render(frame);
             }) {
-                println!("issue drawing terminal {e}")
+                println!("issue drawing terminal {e}");
             }
 
             let mut event = None;
@@ -162,7 +162,7 @@ fn main() {
                     modifiers,
                     ..
                 })) => {
-                    if let KeyCode::Char('Q') = &code {
+                    if code == KeyCode::Char('Q') {
                         return false;
                     }
                     timekeeper_tui.handle_key_events(code, modifiers);
@@ -172,7 +172,7 @@ fn main() {
             true
         }) {
             break;
-        };
+        }
     }
 
     cleanup_terminal();

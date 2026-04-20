@@ -19,7 +19,7 @@ fn get_collaborative_consumer<T: Copy + 'static>(q: &Queue<T>) -> Consumer<T> {
 #[test]
 fn collaborative_consume_race_with_write() {
     let q: Queue<usize> = Queue::new(16, QueueType::MPMC);
-    let inner: &InnerQueue<usize> = &*q;
+    let inner: &InnerQueue<usize> = &q;
     // Advance count without writing the seqlock — mirrors the gap between
     // `next_count()` (increments count) and `lock.write()` inside `produce()`.
     inner.header.count.fetch_add(1, Ordering::Release);
@@ -100,6 +100,27 @@ fn collaborative_basic() {
 
 #[test]
 fn collaborative_multiple_groups() {
+    fn drain_sum(consumers: Vec<Consumer<usize>>) -> (usize, usize) {
+        let handles: Vec<_> = consumers
+            .into_iter()
+            .map(|mut c| {
+                std::thread::spawn(move || {
+                    let mut sum = 0;
+                    let mut count = 0;
+                    while c.consume_collaborative(|x| {
+                        sum += *x;
+                        count += 1;
+                    }) {}
+                    (sum, count)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .fold((0, 0), |(s, c), (s2, c2)| (s + s2, c + c2))
+    }
+
     // Two independent collaborative groups (each with its own cursor). Each group
     // should receive every message exactly once, split among its consumers.
     const N: usize = 32;
@@ -125,27 +146,6 @@ fn collaborative_multiple_groups() {
 
     let expected_sum: usize = (0..N).sum();
 
-    fn drain_sum(consumers: Vec<Consumer<usize>>) -> (usize, usize) {
-        let handles: Vec<_> = consumers
-            .into_iter()
-            .map(|mut c| {
-                std::thread::spawn(move || {
-                    let mut sum = 0;
-                    let mut count = 0;
-                    while c.consume_collaborative(|x| {
-                        sum += *x;
-                        count += 1;
-                    }) {}
-                    (sum, count)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .fold((0, 0), |(s, c), (s2, c2)| (s + s2, c + c2))
-    }
-
     let (sum_a, count_a) = drain_sum(group_a);
     let (sum_b, count_b) = drain_sum(group_b);
 
@@ -157,6 +157,21 @@ fn collaborative_multiple_groups() {
 
 #[test]
 fn collaborative_and_broadcast_coexist() {
+    fn spawn_drain<F>(mut step: F) -> std::thread::JoinHandle<(usize, usize)>
+    where
+        F: FnMut(&mut dyn FnMut(&mut usize)) -> bool + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let mut sum = 0;
+            let mut count = 0;
+            while step(&mut |x: &mut usize| {
+                sum += *x;
+                count += 1;
+            }) {}
+            (sum, count)
+        })
+    }
+
     const N: usize = 8;
     let q: Queue<usize> = Queue::new(16, QueueType::MPMC);
     let mut p = Producer::from(q);
@@ -174,21 +189,6 @@ fn collaborative_and_broadcast_coexist() {
     }
 
     let expected_sum: usize = (0..N).sum();
-
-    fn spawn_drain<F>(mut step: F) -> std::thread::JoinHandle<(usize, usize)>
-    where
-        F: FnMut(&mut dyn FnMut(&mut usize)) -> bool + Send + 'static,
-    {
-        std::thread::spawn(move || {
-            let mut sum = 0;
-            let mut count = 0;
-            while step(&mut |x: &mut usize| {
-                sum += *x;
-                count += 1;
-            }) {}
-            (sum, count)
-        })
-    }
 
     let bt1 = spawn_drain(move |f| bc1.consume(f));
     let bt2 = spawn_drain(move |f| bc2.consume(f));
@@ -270,6 +270,6 @@ fn perf_test_collaborative_consumers() {
         .fold((0u64, 0usize), |(s, c), (s2, c2)| (s + s2, c + c2));
     producer.join().unwrap();
 
-    assert_eq!(total_count, N, "received all {} messages", N);
+    assert_eq!(total_count, N, "received all {N} messages");
     println!("latency ({total_count} msgs) — mean: {}ns", total_sum / total_count as u64);
 }

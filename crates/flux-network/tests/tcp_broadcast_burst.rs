@@ -10,8 +10,8 @@ const NUM_RECEIVERS: usize = 4;
 const BURST_SIZE: usize = 20;
 const PAYLOAD_SIZE: usize = 256 * 1024; // 256 KiB per message
 
-/// Spawns a receiver thread that connects to `addr` via TcpConnector and
-/// collects frames via poll_with until the sender disconnects.
+/// Spawns a receiver thread that connects to `addr` via `TcpConnector` and
+/// collects frames via `poll_with` until the sender disconnects.
 fn spawn_receiver(addr: SocketAddr) -> thread::JoinHandle<Vec<Vec<u8>>> {
     thread::spawn(move || {
         // 32 KiB socket buf constrains the receiver (2× smaller than the
@@ -51,7 +51,7 @@ fn pump(conn: &mut TcpConnector, for_how_long: Duration) {
 
 /// Broadcast a burst of large messages to multiple receivers.
 ///
-/// Sender listens via TcpConnector, receivers connect via TcpConnector.
+/// Sender listens via `TcpConnector`, receivers connect via `TcpConnector`.
 /// The sender uses a 4 KiB socket buffer to force backpressure and backlog
 /// queueing on the send side.  Receivers use a 32 KiB socket buffer —
 /// small enough to constrain the pipe (2× below the default 128 KiB) but
@@ -70,6 +70,7 @@ fn broadcast_burst_to_multiple_receivers() {
     let mut sender = TcpConnector::default().with_socket_buf_size(4096);
     sender.listen_at(addr).expect("failed to listen");
 
+    #[allow(clippy::needless_collect, reason = "Receivers need to be spawned at this point")]
     let handles: Vec<_> = (0..NUM_RECEIVERS).map(|_| spawn_receiver(addr)).collect();
 
     // Accept all inbound connections.

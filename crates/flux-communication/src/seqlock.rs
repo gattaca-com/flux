@@ -6,7 +6,7 @@ use std::{
 
 use crate::error::{EmptyError, ReadError};
 
-/// A sequential lock. Use a ArcSwap if you want something similar in
+/// A sequential lock. Use a `ArcSwap` if you want something similar in
 /// performance but for none copy types
 #[repr(C, align(64))]
 pub struct Seqlock<T> {
@@ -19,8 +19,8 @@ unsafe impl<T: Send> Sync for Seqlock<T> {}
 // TODO @lopo: Try 32 bit version
 impl<T: Copy> Seqlock<T> {
     #[inline]
-    pub const fn new(val: T) -> Seqlock<T> {
-        Seqlock { version: AtomicU64::new(2), data: UnsafeCell::new(val) }
+    pub const fn new(val: T) -> Self {
+        Self { version: AtomicU64::new(2), data: UnsafeCell::new(val) }
     }
 
     pub fn version(&self) -> u64 {
@@ -29,7 +29,7 @@ impl<T: Copy> Seqlock<T> {
 
     #[allow(dead_code)]
     pub fn set_version_unsafe(&self, v: u64) {
-        self.version.store(v, Ordering::Relaxed)
+        self.version.store(v, Ordering::Relaxed);
     }
 
     #[inline]
@@ -81,7 +81,7 @@ impl<T: Copy> Seqlock<T> {
             }
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                std::arch::x86_64::_mm_pause()
+                std::arch::x86_64::_mm_pause();
             };
         }
     }
@@ -89,10 +89,10 @@ impl<T: Copy> Seqlock<T> {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub fn view_unsafe(&self) -> Result<&mut T, ReadError> {
-        if !self.was_ever_written() {
-            Err(ReadError::Empty)
-        } else {
+        if self.was_ever_written() {
             Ok(unsafe { &mut *self.data.get() })
+        } else {
+            Err(ReadError::Empty)
         }
     }
 
@@ -199,7 +199,7 @@ impl<T: Copy> Seqlock<T> {
             }
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                std::arch::x86_64::_mm_pause()
+                std::arch::x86_64::_mm_pause();
             };
         }
     }
@@ -207,8 +207,8 @@ impl<T: Copy> Seqlock<T> {
 
 impl<T: Default> Default for Seqlock<T> {
     #[inline]
-    fn default() -> Seqlock<T> {
-        Seqlock { version: AtomicU64::new(0), data: UnsafeCell::new(T::default()) }
+    fn default() -> Self {
+        Self { version: AtomicU64::new(0), data: UnsafeCell::new(T::default()) }
     }
 }
 
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn lock_size() {
         assert_eq!(std::mem::size_of::<Seqlock<[u8; 48]>>(), 64);
-        assert_eq!(std::mem::size_of::<Seqlock<[u8; 61]>>(), 128)
+        assert_eq!(std::mem::size_of::<Seqlock<[u8; 61]>>(), 128);
     }
 
     fn consumer_loop<const N: usize>(lock: &Seqlock<[usize; N]>, done: &AtomicBool) {
@@ -291,44 +291,44 @@ mod tests {
 
     #[test]
     fn read_16() {
-        read_test::<16>()
+        read_test::<16>();
     }
     #[test]
     fn read_32() {
-        read_test::<32>()
+        read_test::<32>();
     }
     #[test]
     fn read_64() {
-        read_test::<64>()
+        read_test::<64>();
     }
     #[test]
     fn read_128() {
-        read_test::<128>()
+        read_test::<128>();
     }
     #[test]
     fn read_large() {
-        read_test::<8192>()
+        read_test::<8192>();
     }
 
     #[test]
     fn read_16_multi() {
-        read_test_multi::<16>()
+        read_test_multi::<16>();
     }
     #[test]
     fn read_32_multi() {
-        read_test_multi::<32>()
+        read_test_multi::<32>();
     }
     #[test]
     fn read_64_multi() {
-        read_test_multi::<64>()
+        read_test_multi::<64>();
     }
     #[test]
     fn read_128_multi() {
-        read_test_multi::<128>()
+        read_test_multi::<128>();
     }
     #[test]
     fn read_large_multi() {
-        read_test_multi::<8192>()
+        read_test_multi::<8192>();
     }
 
     #[test]

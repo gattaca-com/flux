@@ -4,7 +4,8 @@ use libc::{SCHED_FIFO, sched_param, sched_setscheduler};
 use tracing::warn;
 
 /// Any variant other than `OSDefault` requests `SCHED_FIFO` realtime scheduling
-/// if the process has permission (CAP_SYS_NICE).  
+/// if the process has permission (`CAP_SYS_NICE`).
+///
 /// If setting the policy fails, execution continues under the OS default (CFS).
 #[derive(Clone, Copy, Debug)]
 pub enum ThreadPriority {
@@ -19,11 +20,11 @@ pub enum ThreadPriority {
 impl ThreadPriority {
     fn to_sched_param(self) -> Option<sched_param> {
         let prio = match self {
-            ThreadPriority::OSDefault => return None,
-            ThreadPriority::Low => 40,
-            ThreadPriority::Medium => 60,
-            ThreadPriority::High => 75,
-            ThreadPriority::Custom(p) => p,
+            Self::OSDefault => return None,
+            Self::Low => 40,
+            Self::Medium => 60,
+            Self::High => 75,
+            Self::Custom(p) => p,
         };
         Some(sched_param { sched_priority: prio })
     }
@@ -33,7 +34,7 @@ impl ThreadPriority {
 fn set_thread_prio(prio: ThreadPriority) {
     if let Some(param) = prio.to_sched_param() {
         unsafe {
-            let code = sched_setscheduler(0, SCHED_FIFO, &param);
+            let code = sched_setscheduler(0, SCHED_FIFO, &raw const param);
             if code != 0 {
                 warn!(%code, ?param, "couldn't set thread priority");
             }

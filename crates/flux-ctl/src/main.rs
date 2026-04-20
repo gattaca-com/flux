@@ -56,7 +56,7 @@ enum Commands {
         /// Filter by app name
         #[arg(short, long)]
         app: Option<String>,
-        /// Run health_check diagnostics and print results
+        /// Run `health_check` diagnostics and print results
         #[arg(short, long)]
         verbose: bool,
     },

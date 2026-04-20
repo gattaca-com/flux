@@ -13,7 +13,7 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
     const PERSIST_DIR: &'static str;
 
     fn filename(&self) -> String {
-        "".to_string()
+        String::new()
     }
 
     fn persist_dir<S: AsRef<Path>>(app_name: S) -> PathBuf {
@@ -50,7 +50,7 @@ pub trait Persistable: for<'a> serde::Deserialize<'a> + serde::Serialize {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!("Not saving data because couldn't create persist dir ({:?}): {e}", dir);
             return;
-        };
+        }
         if let Some(override_file) = filename {
             file = override_file;
         } else if file.is_empty() {
@@ -159,7 +159,7 @@ pub fn write<T: Serialize, P: AsRef<Path> + std::fmt::Debug>(
     if let Err(e) = e.write_all(&b) {
         error!("Error writing serialized bytes {}: {e}", std::any::type_name::<T>());
         return;
-    };
+    }
     if let Err(e) = e.finish() {
         error!("Error writing serialized bytes {}: {e}", std::any::type_name::<T>());
     }

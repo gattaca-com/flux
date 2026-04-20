@@ -18,27 +18,27 @@ impl Instant {
 
     #[inline]
     pub fn now() -> Self {
-        Instant(global_clock_not_mocked().raw())
+        Self(global_clock_not_mocked().raw())
     }
 
     #[inline]
     fn remove_socket(self) -> Self {
-        Instant(self.0 & 0x3fffffffffffffff)
+        Self(self.0 & 0x3fff_ffff_ffff_ffff)
     }
 
     #[inline]
     pub fn same_socket(&self, other: &Self) -> bool {
-        (self.0 & 0xc000000000000000) == (other.0 & 0xc000000000000000)
+        (self.0 & 0xc000_0000_0000_0000) == (other.0 & 0xc000_0000_0000_0000)
     }
 
     #[inline]
     pub fn elapsed(&self) -> Duration {
-        let curt = Instant::now();
+        let curt = Self::now();
         curt.saturating_sub(*self)
     }
 
     #[inline]
-    pub fn elapsed_since(&self, since: Instant) -> Duration {
+    pub fn elapsed_since(&self, since: Self) -> Duration {
         self.saturating_sub(since)
     }
 
@@ -48,7 +48,7 @@ impl Instant {
     }
 
     #[inline]
-    pub fn saturating_sub(&self, other: Instant) -> Duration {
+    pub fn saturating_sub(&self, other: Self) -> Duration {
         Duration(self.0.saturating_sub(other.0))
     }
 }
@@ -70,53 +70,53 @@ impl Ord for Instant {
 impl Sub for Instant {
     type Output = Duration;
 
-    fn sub(self, rhs: Instant) -> Duration {
+    fn sub(self, rhs: Self) -> Duration {
         Duration(self.0.saturating_sub(rhs.0))
     }
 }
 
 impl Add<Nanos> for Instant {
-    type Output = Instant;
+    type Output = Self;
 
     fn add(self, rhs: Nanos) -> Self::Output {
-        Instant(self.0 + rhs.0 * ticks_per_micro() / 1000)
+        Self(self.0 + rhs.0 * ticks_per_micro() / 1000)
     }
 }
 
 impl Sub<Nanos> for Instant {
-    type Output = Instant;
+    type Output = Self;
 
     fn sub(self, rhs: Nanos) -> Self::Output {
-        Instant(self.0.saturating_sub(rhs.0 * ticks_per_micro() / 1000))
+        Self(self.0.saturating_sub(rhs.0 * ticks_per_micro() / 1000))
     }
 }
 
 impl Sub<Duration> for Instant {
-    type Output = Instant;
+    type Output = Self;
 
-    fn sub(self, rhs: Duration) -> Instant {
-        Instant(self.0.saturating_sub(rhs.0))
+    fn sub(self, rhs: Duration) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
     }
 }
 
 impl Add<Duration> for Instant {
-    type Output = Instant;
+    type Output = Self;
 
     fn add(self, rhs: Duration) -> Self::Output {
-        Instant(self.0 + rhs.0)
+        Self(self.0 + rhs.0)
     }
 }
 
-impl Add<Instant> for Instant {
-    type Output = Instant;
+impl Add<Self> for Instant {
+    type Output = Self;
 
-    fn add(self, rhs: Instant) -> Self::Output {
-        Instant(self.0 + rhs.0)
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
     }
 }
 
 impl AddAssign<Duration> for Instant {
     fn add_assign(&mut self, rhs: Duration) {
-        self.0 += rhs.0
+        self.0 += rhs.0;
     }
 }

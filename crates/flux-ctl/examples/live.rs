@@ -50,7 +50,7 @@ struct Trade {
     price: u64,
     quantity: u32,
     _pad: u32,
-    trade_id: u64,
+    id: u64,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -79,6 +79,8 @@ struct EngineState {
     errors: u64,
 }
 
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy)]
 struct Flags {
     no_cleanup: bool,
     reattach: bool,
@@ -110,6 +112,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_primary(flags: Flags) {
     let base_dir = local_share_dir();
     let stop = Arc::new(AtomicBool::new(false));
@@ -202,7 +205,7 @@ fn run_primary(flags: Flags) {
                     price: 42000 + (id % 200),
                     quantity: 1 + (id % 10) as u32,
                     _pad: 0,
-                    trade_id: id,
+                    id,
                 });
                 id += 1;
                 thread::sleep(Duration::from_millis(10));
@@ -222,7 +225,7 @@ fn run_primary(flags: Flags) {
                     order_id: 10000 + id,
                     filled_qty: (id % 100) as u32,
                     remaining: (100 - id % 100) as u32,
-                    status: if id % 5 == 0 { 2 } else { 1 },
+                    status: if id.is_multiple_of(5) { 2 } else { 1 },
                 });
                 id += 1;
                 thread::sleep(Duration::from_millis(100));
@@ -238,6 +241,8 @@ fn run_primary(flags: Flags) {
         let base_dir2 = base_dir.clone();
         let stop2 = stop.clone();
         thread::spawn(move || {
+            const HEADER_SIZE: usize = std::mem::size_of::<QueueHeader>();
+
             println!("\n  💉 --poison: creating poison-demo queue...");
             let q: Queue<Trade> =
                 shmem_queue_with_base_dir(&base_dir2, "poison-demo", 64, QueueType::SPMC);
@@ -251,7 +256,7 @@ fn run_primary(flags: Flags) {
                 if stop2.load(Ordering::Relaxed) {
                     return;
                 }
-                p.produce(&Trade { price: 100 + n, quantity: 1, _pad: 0, trade_id: n });
+                p.produce(&Trade { price: 100 + n, quantity: 1, _pad: 0, id: n });
                 n += 1;
                 thread::sleep(Duration::from_millis(10));
             }
@@ -270,12 +275,13 @@ fn run_primary(flags: Flags) {
                 .expect("open poison-demo shmem");
 
             let base = shmem.as_ptr();
-            const HEADER_SIZE: usize = std::mem::size_of::<QueueHeader>();
+            #[allow(clippy::cast_ptr_alignment)]
             let header = unsafe { &*(base as *const QueueHeader) };
             let count = header.count.load(Ordering::Relaxed);
             let slot = count & header.mask;
             let elsize = header.elsize;
 
+            #[allow(clippy::cast_ptr_alignment)]
             let version_ptr = unsafe { base.add(HEADER_SIZE + slot * elsize) } as *const AtomicU64;
             let v = unsafe { &*version_ptr }.fetch_add(1, Ordering::Release);
 
@@ -410,7 +416,6 @@ fn run_worker() {
 
     // Consumer on orders — steady consumer
     {
-        let stop = stop.clone();
         handles.push(thread::spawn(move || {
             let mut c = Consumer::new(order_q, "ctl-orders");
             let mut n = 0u64;

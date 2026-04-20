@@ -63,7 +63,7 @@ impl PlotSettings {
             n_intervals,
             xmin_bucket: xmin,
             xmax_bucket: xmax,
-            vlines: Default::default(),
+            vlines: Vec::default(),
         };
         o.maybe_update_bucket_bounds();
         o
@@ -125,14 +125,14 @@ impl PlotSettings {
         self.xmin_plot -= delta;
         self.xmax_plot -= delta;
 
-        self.maybe_update_bucket_bounds()
+        self.maybe_update_bucket_bounds();
     }
 
     pub fn pan_right(&mut self, factor: f64) {
         let delta = self.pan_speed * self.current_interval() * factor;
         self.xmin_plot += delta;
         self.xmax_plot += delta;
-        self.maybe_update_bucket_bounds()
+        self.maybe_update_bucket_bounds();
     }
 
     pub fn maybe_update_bucket_bounds(&mut self) {
@@ -161,7 +161,7 @@ impl PlotSettings {
     }
 
     fn zoom(&mut self, factor: f64) {
-        let centre = (self.xmax_plot + self.xmin_plot) / 2.0;
+        let centre = f64::midpoint(self.xmax_plot, self.xmin_plot);
         let scaled_half_span = (centre - self.xmin_plot) * factor;
         self.set_range(centre - scaled_half_span, centre + scaled_half_span);
     }
@@ -181,8 +181,8 @@ impl PlotSettings {
     pub fn bucket_bounds(&self, x: f64) -> (f64, f64) {
         let bucket_id = ((x - self.xmin_bucket) / self.current_interval()).floor();
         (
-            self.xmin_bucket + bucket_id * self.current_interval(),
-            self.xmin_bucket + (bucket_id + 1.0) * self.current_interval(),
+            bucket_id.mul_add(self.current_interval(), self.xmin_bucket),
+            (bucket_id + 1.0).mul_add(self.current_interval(), self.xmin_bucket),
         )
     }
 
@@ -194,9 +194,9 @@ impl PlotSettings {
     pub fn xlabels(&self) -> Vec<String> {
         let (x_min, x_max) = self.range();
         let x_diff = x_max - x_min;
-        let x_q1 = x_min + 0.25 * x_diff;
-        let x_q2 = x_min + 0.50 * x_diff;
-        let x_q3 = x_min + 0.75 * x_diff;
+        let x_q1 = 0.25f64.mul_add(x_diff, x_min);
+        let x_q2 = 0.50f64.mul_add(x_diff, x_min);
+        let x_q3 = 0.75f64.mul_add(x_diff, x_min);
 
         let xlabels: Vec<String> = match self.xaxis_spec {
             XAxisSpec::UtcTime => vec![

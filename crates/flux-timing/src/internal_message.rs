@@ -101,7 +101,7 @@ impl<T> InternalMessage<T> {
 
     #[inline]
     pub fn set_publish_delta(&mut self, publish_delta: PublishDelta) {
-        self.tracking_t.publish_delta = publish_delta
+        self.tracking_t.publish_delta = publish_delta;
     }
 
     #[inline]

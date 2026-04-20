@@ -46,7 +46,7 @@ pub trait Tile<S: FluxSpine>: Send + Sized {
     ///
     /// Work tracking is automatic via adapter.consume/produce* methods.
     /// For non-consume/produce work (e.g. business logic ticks), call
-    /// adapter.mark_work().
+    /// `adapter.mark_work()`.
     fn loop_body(&mut self, _adapter: &mut SpineAdapter<S>);
 
     /// User init before loop. State setup etc.
@@ -55,7 +55,7 @@ pub trait Tile<S: FluxSpine>: Send + Sized {
         true
     }
 
-    /// User teardown after scoped_stop_flag is flipped on.
+    /// User teardown after `scoped_stop_flag` is flipped on.
     fn teardown(self, _adapter: &mut SpineAdapter<S>) {}
 
     /// Tile name for logging, tracing, metrics. No heap allocation.
@@ -105,7 +105,7 @@ where
 
             vsync(config.min_loop_duration, || {
                 adapter.begin_loop(ingestion_t);
-                tile.loop_body(&mut adapter)
+                tile.loop_body(&mut adapter);
             });
 
             if let Some(m) = &mut metrics {

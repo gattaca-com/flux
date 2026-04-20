@@ -114,29 +114,27 @@ fn run_mp_mc(
     let dc = DCache::new(CAPACITY);
     let queue = Queue::<DCacheRef>::new(QUEUE_LEN, QueueType::MPMC);
 
-    let consumers: Vec<_> = (0..n_consumers)
-        .map(|i| {
-            let reader = dc.clone();
-            let mut c = ConsumerBare::new(queue, "bench");
-            thread::spawn(move || {
-                core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
-                let mut r = DCacheRef { offset: 0, len: 0 };
-                let mut sum = 0u64;
-                let mut seen = 0usize;
-                while seen < total {
-                    match c.try_consume(&mut r) {
-                        Ok(()) => {
-                            sum += reader.map(r, read_ts).unwrap();
-                            seen += 1;
-                        }
-                        Err(ReadError::SpedPast) => c.recover_after_error(),
-                        Err(ReadError::Empty) => {}
+    let consumers = (0..n_consumers).map(|i| {
+        let reader = dc.clone();
+        let mut c = ConsumerBare::new(queue, "bench");
+        thread::spawn(move || {
+            core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
+            let mut r = DCacheRef { offset: 0, len: 0 };
+            let mut sum = 0u64;
+            let mut seen = 0usize;
+            while seen < total {
+                match c.try_consume(&mut r) {
+                    Ok(()) => {
+                        sum += reader.map(r, read_ts).unwrap();
+                        seen += 1;
                     }
+                    Err(ReadError::SpedPast) => c.recover_after_error(),
+                    Err(ReadError::Empty) => {}
                 }
-                sum
-            })
+            }
+            sum
         })
-        .collect();
+    });
 
     thread::sleep(Duration::from_millis(100).into());
 
@@ -160,7 +158,7 @@ fn run_mp_mc(
     for p in producers {
         p.join().unwrap();
     }
-    let total_sum: u64 = consumers.into_iter().map(|c| c.join().unwrap()).sum();
+    let total_sum: u64 = consumers.map(|c| c.join().unwrap()).sum();
     Duration::from_nanos(total_sum / n_consumers as u64)
 }
 
@@ -169,7 +167,7 @@ fn run_mp_mc(
 fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration {
     let total = n_producers * per_producer;
     let dcaches: Vec<Arc<DCache>> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
-    let readers: Vec<Arc<DCache>> = dcaches.iter().map(|dc| dc.clone()).collect();
+    let readers: Vec<Arc<DCache>> = dcaches.clone();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
     let consumer = thread::spawn(move || {
@@ -227,32 +225,30 @@ fn run_sp_mc(
 ) -> Duration {
     let total = n_producers * per_producer;
     let dcaches: Vec<Arc<DCache>> = (0..n_producers).map(|_| DCache::new(CAPACITY)).collect();
-    let readers: Vec<Arc<DCache>> = dcaches.iter().map(|dc| dc.clone()).collect();
+    let readers: Vec<Arc<DCache>> = dcaches.clone();
     let queue = Queue::<Msg>::new(QUEUE_LEN, QueueType::MPMC);
 
-    let consumers: Vec<_> = (0..n_consumers)
-        .map(|i| {
-            let readers = readers.clone();
-            let mut c = ConsumerBare::new(queue, "bench");
-            thread::spawn(move || {
-                core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
-                let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
-                let mut sum = 0u64;
-                let mut seen = 0usize;
-                while seen < total {
-                    match c.try_consume(&mut slot) {
-                        Ok(()) => {
-                            sum += readers[slot.ds_ix].map(slot.r, read_ts).unwrap();
-                            seen += 1;
-                        }
-                        Err(ReadError::SpedPast) => c.recover_after_error(),
-                        Err(ReadError::Empty) => {}
+    let consumers = (0..n_consumers).map(|i| {
+        let readers = readers.clone();
+        let mut c = ConsumerBare::new(queue, "bench");
+        thread::spawn(move || {
+            core_affinity::set_for_current(CoreId { id: LAST_CORE - i });
+            let mut slot = Msg { ds_ix: 0, r: DCacheRef { offset: 0, len: 0 } };
+            let mut sum = 0u64;
+            let mut seen = 0usize;
+            while seen < total {
+                match c.try_consume(&mut slot) {
+                    Ok(()) => {
+                        sum += readers[slot.ds_ix].map(slot.r, read_ts).unwrap();
+                        seen += 1;
                     }
+                    Err(ReadError::SpedPast) => c.recover_after_error(),
+                    Err(ReadError::Empty) => {}
                 }
-                sum
-            })
+            }
+            sum
         })
-        .collect();
+    });
 
     thread::sleep(Duration::from_millis(100).into());
 
@@ -277,7 +273,7 @@ fn run_sp_mc(
     for p in producers {
         p.join().unwrap();
     }
-    let total_sum: u64 = consumers.into_iter().map(|c| c.join().unwrap()).sum();
+    let total_sum: u64 = consumers.map(|c| c.join().unwrap()).sum();
     Duration::from_nanos(total_sum / n_consumers as u64)
 }
 
@@ -359,7 +355,7 @@ fn bench_latency(c: &mut Criterion) {
                 |b, &np| {
                     b.iter_custom(|iters| {
                         measure(iters, np, max_pp, |np, pp| run_mp(np, msg_size, pp)).into()
-                    })
+                    });
                 },
             );
             group.bench_with_input(
@@ -368,7 +364,7 @@ fn bench_latency(c: &mut Criterion) {
                 |b, &np| {
                     b.iter_custom(|iters| {
                         measure(iters, np, max_pp, |np, pp| run_sp(np, msg_size, pp)).into()
-                    })
+                    });
                 },
             );
             group.bench_with_input(
@@ -377,7 +373,7 @@ fn bench_latency(c: &mut Criterion) {
                 |b, &np| {
                     b.iter_custom(|iters| {
                         measure(iters, np, max_pp, |np, pp| run_crossbeam(np, msg_size, pp)).into()
-                    })
+                    });
                 },
             );
             group.bench_with_input(
@@ -386,7 +382,7 @@ fn bench_latency(c: &mut Criterion) {
                 |b, &np| {
                     b.iter_custom(|iters| {
                         measure(iters, np, max_pp, |np, pp| run_mp_mc(np, 4, msg_size, pp)).into()
-                    })
+                    });
                 },
             );
             group.bench_with_input(
@@ -395,7 +391,7 @@ fn bench_latency(c: &mut Criterion) {
                 |b, &np| {
                     b.iter_custom(|iters| {
                         measure(iters, np, max_pp, |np, pp| run_sp_mc(np, 4, msg_size, pp)).into()
-                    })
+                    });
                 },
             );
         }

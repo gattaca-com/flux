@@ -55,7 +55,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         }
     }
 
-    /// Called by attach_tile before each loop_body.
+    /// Called by `attach_tile` before each `loop_body`.
     #[inline]
     pub fn begin_loop(&mut self, ingestion_t: IngestionTime) {
         self.set_ingestion_time(ingestion_t);
@@ -338,11 +338,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers),
     {
         let consumer = self.consumers.as_mut();
-        let consumed = consumer.consume_internal_message(&mut self.producers, &mut f);
-        if consumed {
+        let consumed_message = consumer.consume_internal_message(&mut self.producers, &mut f);
+        if consumed_message {
             self.did_work = true;
         }
-        consumed
+        consumed_message
     }
 
     #[inline]

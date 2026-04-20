@@ -81,15 +81,16 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
 
 /// Two TCP streams into the same dcache-backed spine queue.
 /// Verifies dcache bytes match the queue message (same shmem region).
+#[allow(clippy::significant_drop_tightening)]
 #[test]
 fn dcache_multi_stream() {
+    const MSG_A: &[u8; 8] = b"stream-a";
+    const MSG_B: &[u8; 8] = b"stream-b";
+
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
 
     let mut spine = TcpDcacheSpine::new_with_base_dir(base, None);
-
-    const MSG_A: &[u8; 8] = b"stream-a";
-    const MSG_B: &[u8; 8] = b"stream-b";
 
     let ready = Arc::new(AtomicBool::new(false));
     let received: Arc<Mutex<Vec<Payload>>> = Arc::new(Mutex::new(Vec::new()));

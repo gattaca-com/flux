@@ -2,8 +2,8 @@ use proc_macro::TokenStream;
 use proc_macro_crate::{crate_name, FoundCrate};
 use quote::{quote, quote_spanned, ToTokens};
 use syn::{
-    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Fields, Lit, Meta,
-    MetaNameValue,
+    parse_macro_input, punctuated::Punctuated, token::Where, Attribute, Data, DataStruct,
+    DeriveInput, Expr, ExprLit, Fields, Lit, Meta, MetaNameValue,
 };
 
 fn runtime_crate_path() -> proc_macro2::TokenStream {
@@ -111,13 +111,14 @@ fn type_hash_literal(attrs: &[Attribute]) -> Result<Option<String>, syn::Error> 
 }
 use syn::{DataEnum, WhereClause, WherePredicate};
 
-fn name_token_expr(name_override: &Option<String>, name: &syn::Ident) -> proc_macro2::TokenStream {
-    if let Some(n) = name_override {
-        let s = n.as_str();
-        quote! { #s }
-    } else {
-        quote! { stringify!(#name) }
-    }
+fn name_token_expr(name_override: Option<&String>, name: &syn::Ident) -> proc_macro2::TokenStream {
+    name_override.map_or_else(
+        || quote! { stringify!(#name) },
+        |n| {
+            let s = n.as_str();
+            quote! { #s }
+        },
+    )
 }
 
 fn emit_typename_hash(th: &proc_macro2::TokenStream, ty: &syn::Type) -> proc_macro2::TokenStream {
@@ -132,7 +133,7 @@ fn emit_typename_hash(th: &proc_macro2::TokenStream, ty: &syn::Type) -> proc_mac
         }
     }
 }
-
+#[allow(clippy::too_many_lines)]
 fn derive_for_enum(
     input: &DeriveInput,
     en: &DataEnum,
@@ -301,7 +302,7 @@ fn derive_for_enum(
 
     let where_clause_tokens = where_clause;
 
-    let name_expr = name_token_expr(&name_override, name);
+    let name_expr = name_token_expr(name_override.as_ref(), name);
     let has_name_override = name_override.is_some();
     Ok(quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
@@ -330,8 +331,8 @@ fn derive_for_enum(
 fn push_where_pred(where_clause: &mut Option<WhereClause>, pred: WherePredicate) {
     where_clause
         .get_or_insert_with(|| WhereClause {
-            where_token: Default::default(),
-            predicates: Default::default(),
+            where_token: Where::default(),
+            predicates: Punctuated::default(),
         })
         .predicates
         .push(pred);
@@ -346,7 +347,7 @@ pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
     let expanded = match &input.data {
         Data::Struct(s) => derive_for_struct(&input, s),
         Data::Enum(e) => derive_for_enum(&input, e).unwrap().to_token_stream(),
-        _ => {
+        Data::Union(_) => {
             return syn::Error::new_spanned(
                 &input.ident,
                 format!("{name}: TypeHash can only be derived for structs or enums"),
@@ -358,6 +359,7 @@ pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
 
     expanded.into()
 }
+#[allow(clippy::too_many_lines)]
 fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::TokenStream {
     let name = &input.ident;
     let skip_typename = has_type_hash_skip_typename(&input.attrs);
@@ -392,8 +394,8 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                         syn::parse_quote! { #ty: ::core::marker::Copy + ::core::marker::Sized };
                     where_clause
                         .get_or_insert_with(|| syn::WhereClause {
-                            where_token: Default::default(),
-                            predicates: Default::default(),
+                            where_token: Where::default(),
+                            predicates: Punctuated::default(),
                         })
                         .predicates
                         .push(pred);
@@ -418,8 +420,8 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                     let pred: syn::WherePredicate = syn::parse_quote! { #ty: #th::TypeHash };
                     where_clause
                         .get_or_insert_with(|| syn::WhereClause {
-                            where_token: Default::default(),
-                            predicates: Default::default(),
+                            where_token: Where::default(),
+                            predicates: Punctuated::default(),
                         })
                         .predicates
                         .push(pred);
@@ -451,8 +453,8 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                 let pred: syn::WherePredicate = syn::parse_quote! { #ty: #th::TypeHash };
                 where_clause
                     .get_or_insert_with(|| syn::WhereClause {
-                        where_token: Default::default(),
-                        predicates: Default::default(),
+                        where_token: Where::default(),
+                        predicates: Punctuated::default(),
                     })
                     .predicates
                     .push(pred);
@@ -481,7 +483,7 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
     // When `name` is specified the type is masquerading as the original
     // non-versioned type, so DERIVE_USES_TYPENAME must be `true` (like the
     // original) regardless of `skip_typename_on_derive`.
-    let name_expr = name_token_expr(&name_override, name);
+    let name_expr = name_token_expr(name_override.as_ref(), name);
     let has_name_override = name_override.is_some();
     let expanded = quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {

@@ -24,7 +24,7 @@ impl<T> SharedVector<T> {
         let real_size = capacity.next_power_of_two();
         let mut uninit_data = Box::new_uninit_slice(real_size);
 
-        for elem in uninit_data.iter_mut() {
+        for elem in &mut uninit_data {
             elem.write(spin::RwLock::new(None));
         }
 

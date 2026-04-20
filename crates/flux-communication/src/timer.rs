@@ -1,8 +1,12 @@
-use std::{collections::HashMap, fmt::Display, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    path::Path,
+    sync::{LazyLock, Mutex},
+};
 
 use flux_timing::{Duration, Instant, InternalMessage, Nanos};
 use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
-use once_cell::sync::Lazy;
 
 use crate::queue::{Producer, Queue, QueueType};
 
@@ -12,9 +16,9 @@ use crate::queue::{Producer, Queue, QueueType};
 /// and CPU socket. Cross-socket or cross-machine values are invalid.
 ///
 /// # Warning!
-/// TimingMessage may be used to display Nano deltas as 2 instants.
+/// `TimingMessage` may be used to display Nano deltas as 2 instants.
 /// Absolute values have no meaning. Only deltas are valid.
-/// Do not compare TimingMessage instances against each other.
+/// Do not compare `TimingMessage` instances against each other.
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(C)]
 pub struct TimingMessage {
@@ -25,7 +29,7 @@ pub struct TimingMessage {
 impl TimingMessage {
     #[inline(always)]
     pub fn new() -> Self {
-        Self { start_t: Instant::now(), stop_t: Default::default() }
+        Self { start_t: Instant::now(), stop_t: Instant::default() }
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -76,8 +80,8 @@ impl Timer {
         let file = format!("{dirstr}/latency-{name}");
         let latency_queue = Queue::create_or_open_shared(file, QUEUE_SIZE, QueueType::MPMC);
 
-        Timer {
-            curmsg: Default::default(),
+        Self {
+            curmsg: TimingMessage::default(),
             processing_time_producer: Producer::from(timing_queue),
             latency_producer: Producer::from(latency_queue),
         }
@@ -142,10 +146,10 @@ impl Timer {
     /// Finish processing, then emit upstream latency.
     ///
     /// Processing interval:
-    ///   [start_t, now]
+    ///   `[start_t, now]`
     ///
     /// Latency interval:
-    ///   [ingestion_t, start_t]
+    ///   `[ingestion_t, start_t]`
     #[inline]
     pub fn record_processing_and_latency_from(&mut self, ingestion_t: Instant) {
         self.record_processing();
@@ -157,10 +161,10 @@ impl Timer {
     /// Finish processing, then emit latency until now.
     ///
     /// Processing interval:
-    ///   [start_t, now]
+    ///   `[start_t, now]`
     ///
     /// Latency interval:
-    ///   [ingestion_t, now]
+    ///   `[ingestion_t, now]`
     #[inline]
     pub fn record_processing_and_latency_until_now(&mut self, ingestion_t: Instant) {
         self.record_processing();
@@ -171,7 +175,7 @@ impl Timer {
     /// Emit a pure latency measurement.
     ///
     /// Latency interval:
-    ///   [ingestion_t, now]
+    ///   `[ingestion_t, now]`
     #[inline]
     pub fn record_latency_until_now(&mut self, ingestion_t: Instant) {
         let m = TimingMessage { start_t: ingestion_t, stop_t: Instant::now() };
@@ -189,17 +193,17 @@ impl Timer {
     #[inline]
     pub fn start_accumulate(&mut self) {
         self.curmsg.start_t = Instant::ZERO;
-        self.curmsg.stop_t = Instant::ZERO
+        self.curmsg.stop_t = Instant::ZERO;
     }
 
     #[inline]
     pub fn accumulate(&mut self, duration: Duration) {
-        self.curmsg.stop_t += duration
+        self.curmsg.stop_t += duration;
     }
 
     #[inline]
     pub fn emit_accumulated_processing(&mut self) {
-        self.emit_processing()
+        self.emit_processing();
     }
 
     /// Emit a synthetic processing interval derived from a nanos delta.
@@ -246,8 +250,8 @@ impl Timer {
 
 /// Used by timeit macro
 #[allow(dead_code)]
-pub static TIMERS: Lazy<Mutex<HashMap<&'static str, Timer>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+pub static TIMERS: LazyLock<Mutex<HashMap<&'static str, Timer>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Macro to be used when quickly benchmarking some piece of code, should not
 /// remain in prod as it is not particularly performant

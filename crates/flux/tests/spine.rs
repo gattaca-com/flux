@@ -140,35 +140,23 @@ fn all_shmem_files_reside_in_base_dir() {
         queue_files
     );
 
-    let timing_files: Vec<_> = files
-        .iter()
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_string_lossy();
-            name.starts_with("timing-")
-        })
-        .collect();
-    assert!(!timing_files.is_empty(), "expected timing shmem files, found none");
+    let timing_files_exists = files.iter().any(|p| {
+        let name = p.file_name().unwrap().to_string_lossy();
+        name.starts_with("timing-")
+    });
+    assert!(timing_files_exists, "expected timing shmem files, found none");
 
-    let latency_files: Vec<_> = files
-        .iter()
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_string_lossy();
-            name.starts_with("latency-")
-        })
-        .collect();
-    assert!(!latency_files.is_empty(), "expected latency shmem files, found none");
+    let latency_files_exists = files.iter().any(|p| {
+        let name = p.file_name().unwrap().to_string_lossy();
+        name.starts_with("latency-")
+    });
+    assert!(latency_files_exists, "expected latency shmem files, found none");
 
-    let metrics_files: Vec<_> = files
-        .iter()
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_string_lossy();
-            name.starts_with("tilemetrics-")
-        })
-        .collect();
-    assert!(
-        !metrics_files.is_empty(),
-        "expected tilemetrics shmem files inside base_dir, found none"
-    );
+    let metrics_files_exists = files.iter().any(|p| {
+        let name = p.file_name().unwrap().to_string_lossy();
+        name.starts_with("tilemetrics-")
+    });
+    assert!(metrics_files_exists, "expected tilemetrics shmem files inside base_dir, found none");
 
     for f in &files {
         assert!(

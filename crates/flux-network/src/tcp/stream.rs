@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io::{self, IoSlice, Read, Write},
     net::SocketAddr,
+    ptr,
 };
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
@@ -165,7 +166,7 @@ impl TcpStream {
             stream,
             peer_addr,
             token,
-            rx_state: Default::default(),
+            rx_state: RxState::default(),
             rx_buf,
             header_buf: [0; FRAME_HEADER_SIZE],
             send_buf: vec![0; Self::SEND_BUF_SIZE],
@@ -184,7 +185,7 @@ impl TcpStream {
         stream: mio::net::TcpStream,
         on_connect_msg: Option<&Vec<u8>>,
     ) -> ConnState {
-        self.rx_state = Default::default();
+        self.rx_state = RxState::default();
         self.send_buf.clear();
         self.send_cursor = 0;
         self.header_buf.fill(0);
@@ -352,29 +353,26 @@ impl TcpStream {
         }
     }
 
-    /// Allocate send_buf[start..end] to vec. Times the alloc if telemetry
+    /// Allocate `send_buf[start..end]` to vec. Times the alloc if telemetry
     /// enabled.
     #[inline]
     fn alloc_vec(&mut self, written: usize) -> Vec<u8> {
-        match &mut self.timers {
-            Some(timers) => {
-                let t0 = Nanos::now();
-                let mut v = Vec::with_capacity(
-                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
-                );
-                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
-                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
-                timers.alloc.emit_latency_from_nanos(t0, Nanos::now());
-                v
-            }
-            None => {
-                let mut v = Vec::with_capacity(
-                    (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
-                );
-                v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
-                v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
-                v
-            }
+        if let Some(timers) = &mut self.timers {
+            let t0 = Nanos::now();
+            let mut v = Vec::with_capacity(
+                (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
+            );
+            v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
+            v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
+            timers.alloc.emit_latency_from_nanos(t0, Nanos::now());
+            v
+        } else {
+            let mut v = Vec::with_capacity(
+                (FRAME_HEADER_SIZE + self.send_buf.len()).saturating_sub(written),
+            );
+            v.extend_from_slice(&self.header_buf[written.min(FRAME_HEADER_SIZE)..]);
+            v.extend_from_slice(&self.send_buf[written.saturating_sub(FRAME_HEADER_SIZE)..]);
+            v
         }
     }
 
@@ -402,7 +400,7 @@ impl TcpStream {
                     self.send_cursor += n;
                     if self.send_cursor == front.len() {
                         self.send_backlog.pop_front();
-                        self.send_cursor = 0
+                        self.send_cursor = 0;
                     }
                 }
 
@@ -431,6 +429,7 @@ impl TcpStream {
     /// Read a single complete frame if present.
     /// Loops until a frame is received or we've read everything and the read
     /// would block.
+    #[allow(clippy::too_many_lines)]
     #[inline]
     fn read_frame(&mut self, dcache: Option<&DCache>) -> ReadOutcome<'_> {
         loop {
@@ -616,9 +615,9 @@ impl TcpStream {
     }
 }
 
-/// Set TCP_USER_TIMEOUT on a mio TcpStream.
+/// Set `TCP_USER_TIMEOUT` on a mio `TcpStream`.
 /// After this duration of unacknowledged data the kernel closes the connection,
-/// overriding the system-wide tcp_retries2 (~15 min default) for this socket.
+/// overriding the system-wide `tcp_retries2` (~15 min default) for this socket.
 pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -627,13 +626,13 @@ pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_USER_TIMEOUT,
-            &timeout_ms as *const _ as *const libc::c_void,
+            ptr::from_ref(&timeout_ms).cast::<libc::c_void>(),
             core::mem::size_of::<u32>() as libc::socklen_t,
         );
     }
 }
 
-/// Set kernel SO_SNDBUF and SO_RCVBUF on a mio TcpStream.
+/// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a mio `TcpStream`.
 pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -643,14 +642,14 @@ pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
             fd,
             libc::SOL_SOCKET,
             libc::SO_SNDBUF,
-            &size as *const _ as *const libc::c_void,
+            ptr::from_ref(&size).cast::<libc::c_void>(),
             core::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
-            &size as *const _ as *const libc::c_void,
+            ptr::from_ref(&size).cast::<libc::c_void>(),
             core::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }

@@ -2,7 +2,10 @@ use core::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
 };
-use std::ops::{Index, IndexMut, RangeFull};
+use std::{
+    fmt::Debug,
+    ops::{Index, IndexMut, RangeFull},
+};
 
 use type_hash::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};
 
@@ -190,10 +193,7 @@ impl<T: Copy, const N: usize> DerefMut for ArrayVec<T, N> {
     }
 }
 
-impl<T: Copy, const N: usize> core::fmt::Debug for ArrayVec<T, N>
-where
-    T: core::fmt::Debug,
-{
+impl<T: Copy + Debug, const N: usize> core::fmt::Debug for ArrayVec<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_list().entries(self.as_slice().iter()).finish()
     }
@@ -310,7 +310,7 @@ impl<T: Copy, const N: usize> Extend<T> for ArrayVec<T, N> {
     #[inline]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for t in iter {
-            self.push(t)
+            self.push(t);
         }
     }
 }
@@ -318,9 +318,9 @@ impl<T: Copy, const N: usize> Extend<T> for ArrayVec<T, N> {
 impl<T: Copy, const N: usize> FromIterator<T> for ArrayVec<T, N> {
     #[inline]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut a = ArrayVec::new();
+        let mut a = Self::new();
         for t in iter {
-            a.push(t)
+            a.push(t);
         }
         a
     }
@@ -390,7 +390,7 @@ impl<const N: usize> ArrayStr<N> {
     }
 }
 
-/// Error returned when string exceeds ArrayStr capacity.
+/// Error returned when string exceeds `ArrayStr` capacity.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("string length {len} exceeds capacity {capacity}; use from_str_truncate() to truncate")]
 pub struct ArrayStrTooLong {
@@ -447,11 +447,11 @@ impl<const N: usize> core::hash::Hash for ArrayStr<N> {
 
 impl<T: TypeHash + Copy, const N: usize> TypeHash for ArrayVec<T, N> {
     const TYPE_HASH: u64 = {
-        let mut h = 0xcbf29ce484222325u64;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
         h = fnv1a64_str(h, "ArrayVec");
         h = hash_u64(h, T::TYPE_HASH);
         h = hash_u64(h, N as u64);
-        h = hash_layout_of::<ArrayVec<T, N>>(h);
+        h = hash_layout_of::<Self>(h);
         h
     };
 }
@@ -495,7 +495,7 @@ mod serde_impl {
                 type Value = ArrayVec<T, N>;
 
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    write!(f, "a sequence with at most {} elements", N)
+                    write!(f, "a sequence with at most {N} elements")
                 }
 
                 fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -549,7 +549,10 @@ mod bytes_impl {
 
 #[cfg(feature = "wincode")]
 mod wincode_impl {
-    use std::mem::{self, MaybeUninit};
+    use std::{
+        mem::{self, MaybeUninit},
+        ptr,
+    };
 
     use wincode::{TypeMeta, io::Writer, len::SeqLen};
 
@@ -563,9 +566,8 @@ mod wincode_impl {
         matches!(T::TYPE_META, TypeMeta::Static { size: _, zero_copy: true })
     }
 
-    impl<T: Copy, const N: usize> wincode::SchemaWrite for ArrayVec<T, N>
-    where
-        T: wincode::SchemaWrite<Src = T>,
+    impl<T: Copy + wincode::SchemaWrite<Src = T>, const N: usize> wincode::SchemaWrite
+        for ArrayVec<T, N>
     {
         type Src = Self;
 
@@ -609,9 +611,11 @@ mod wincode_impl {
         }
     }
 
-    impl<'de, T: Copy, const N: usize> wincode::SchemaRead<'de> for ArrayVec<T, N>
-    where
-        T: wincode::SchemaRead<'de, Dst = T> + wincode::SchemaWrite<Src = T>,
+    impl<
+        'de,
+        T: Copy + wincode::SchemaRead<'de, Dst = T> + wincode::SchemaWrite<Src = T>,
+        const N: usize,
+    > wincode::SchemaRead<'de> for ArrayVec<T, N>
     {
         type Dst = Self;
 
@@ -624,7 +628,7 @@ mod wincode_impl {
                 return Err(wincode::ReadError::LengthEncodingOverflow("too many values"));
             }
 
-            let mut arr = ArrayVec::<T, N>::new();
+            let mut arr = Self::new();
             if is_pod::<T>() {
                 unsafe {
                     let dst_slice: &mut [MaybeUninit<T>] =
@@ -670,7 +674,8 @@ mod wincode_impl {
             dst: &mut MaybeUninit<Self::Dst>,
         ) -> wincode::ReadResult<()> {
             let buf_dst = unsafe {
-                &mut *(dst as *mut MaybeUninit<Self::Dst>).cast::<MaybeUninit<ArrayVec<u8, N>>>()
+                &mut *(ptr::from_mut::<MaybeUninit<Self::Dst>>(dst))
+                    .cast::<MaybeUninit<ArrayVec<u8, N>>>()
             };
             <ArrayVec<u8, N> as wincode::SchemaRead>::read(reader, buf_dst)
         }
@@ -760,7 +765,7 @@ mod tests {
         #[test]
         fn display() {
             let s = ArrayStr::<16>::from_str_truncate("test");
-            let formatted = format!("{}", s);
+            let formatted = format!("{s}");
             assert_eq!(formatted, "test");
         }
 

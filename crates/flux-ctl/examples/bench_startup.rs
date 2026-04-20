@@ -1,4 +1,4 @@
-//! Startup + per-tick benchmark — measures the ShmemCache approach.
+//! Startup + per-tick benchmark — measures the `ShmemCache` approach.
 //!
 //! Usage: `cargo run -p flux-ctl --release --example bench_startup`
 

@@ -36,7 +36,7 @@ impl Parse for FromSpineArg {
         // #[from_spine("app")]
         if input.peek(LitStr) {
             let s: LitStr = input.parse()?;
-            return Ok(FromSpineArg::Str(s));
+            return Ok(Self::Str(s));
         }
 
         // #[from_spine(name = "app")]
@@ -46,40 +46,37 @@ impl Parse for FromSpineArg {
                 input.parse::<Token![=]>()?;
                 let s: LitStr = input.parse()?;
                 if ident == "name" {
-                    return Ok(FromSpineArg::Named(s));
-                } else {
-                    return Err(syn::Error::new_spanned(ident, r#"expected `name = "..."`"#));
+                    return Ok(Self::Named(s));
                 }
-            } else {
-                // #[from_spine(path_like)]
-                // We already consumed one ident; parse the full path starting from it.
-                // Reconstruct a Path by parsing the rest (optional).
-                // Easiest: put ident back by building a Path from scratch.
-                let mut segments = syn::punctuated::Punctuated::new();
-                segments.push(syn::PathSegment::from(ident));
-                // Allow `::more::segments`
-                while input.peek(Token![::]) {
-                    input.parse::<Token![::]>()?;
-                    let seg: Ident = input.parse()?;
-                    segments.push(syn::PathSegment::from(seg));
-                }
-                let p = Path { leading_colon: None, segments };
-                return Ok(FromSpineArg::Path(p));
+                return Err(syn::Error::new_spanned(ident, r#"expected `name = "..."`"#));
             }
+            // #[from_spine(path_like)]
+            // We already consumed one ident; parse the full path starting from it.
+            // Reconstruct a Path by parsing the rest (optional).
+            // Easiest: put ident back by building a Path from scratch.
+            let mut segments = syn::punctuated::Punctuated::new();
+            segments.push(syn::PathSegment::from(ident));
+            // Allow `::more::segments`
+            while input.peek(Token![::]) {
+                input.parse::<Token![::]>()?;
+                let seg: Ident = input.parse()?;
+                segments.push(syn::PathSegment::from(seg));
+            }
+            let p = Path { leading_colon: None, segments };
+            return Ok(Self::Path(p));
         }
 
         // Fallback: a full Path (e.g., starting with ::)
         let p: Path = input.parse()?;
-        Ok(FromSpineArg::Path(p))
+        Ok(Self::Path(p))
     }
 }
 
 impl FromSpineArg {
     fn as_tokens(&self) -> proc_macro2::TokenStream {
         match self {
-            FromSpineArg::Str(s) => quote! { #s },
-            FromSpineArg::Named(s) => quote! { #s },
-            FromSpineArg::Path(p) => quote! { stringify!(#p) },
+            Self::Str(s) | Self::Named(s) => quote! { #s },
+            Self::Path(p) => quote! { stringify!(#p) },
         }
     }
 }
@@ -134,7 +131,7 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 
     (is_persistent, size_expr, is_spmc, mtu_expr)
 }
-
+#[allow(clippy::too_many_lines)]
 #[proc_macro_attribute]
 pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as FromSpineArg);
@@ -339,10 +336,8 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
                 let (_is_persistent, size_expr_opt, is_spmc, mtu_expr_opt) =
                     get_queue_config(&field.attrs);
-                let size_arg = match size_expr_opt {
-                    Some(expr) => quote! { #expr },
-                    None => quote! { 2usize.pow(15) },
-                };
+                let size_arg = size_expr_opt
+                    .map_or_else(|| quote! { 2usize.pow(15) }, |expr| quote! { #expr });
                 let queue_type = if is_spmc {
                     quote! { ::flux::communication::queue::QueueType::SPMC }
                 } else {

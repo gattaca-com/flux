@@ -23,12 +23,13 @@ impl BucketedData {
         self.tmp_buf.clear();
         self.prev_xmin_shown = 0.0;
         self.prev_xmax_shown = 0.0;
-        self.bucketed.clear()
+        self.bucketed.clear();
     }
 
+    #[allow(clippy::too_many_lines, clippy::float_cmp)]
     pub fn maybe_rebucket<'a, T: 'a, E, A, D>(
         &mut self,
-        data: D,
+        data: &D,
         plotsettings: &PlotSettings,
         extract_fn: E,
         aggregate_fn: A,
@@ -95,7 +96,7 @@ impl BucketedData {
                         })
                         .flatten()
                     {
-                        self.tmp_buf.push(data)
+                        self.tmp_buf.push(data);
                     }
                     if !self.tmp_buf.is_empty() {
                         self.bucketed.push_back((cur_x, aggregate_fn(&self.tmp_buf)));
@@ -134,7 +135,7 @@ impl BucketedData {
                         })
                         .flatten()
                     {
-                        self.tmp_buf.push(data)
+                        self.tmp_buf.push(data);
                     }
                     if !self.tmp_buf.is_empty() {
                         self.bucketed.push_front((cur_x, aggregate_fn(&self.tmp_buf)));
@@ -168,7 +169,7 @@ impl BucketedData {
                     })
                     .flatten()
                 {
-                    self.tmp_buf.push(data)
+                    self.tmp_buf.push(data);
                 }
                 if !self.tmp_buf.is_empty() {
                     self.bucketed.push_back((cur_x, aggregate_fn(&self.tmp_buf)));

@@ -24,10 +24,9 @@ impl<K: Clone + PartialEq + std::fmt::Debug> KeyedCyclingListState<K> {
             if selected >= self.keys.len() {
                 self.state.select(Some(0));
                 return;
-            } else {
-                self.state.select(Some(selected));
-                return;
             }
+            self.state.select(Some(selected));
+            return;
         }
         self.state.select_next();
     }
@@ -37,12 +36,11 @@ impl<K: Clone + PartialEq + std::fmt::Debug> KeyedCyclingListState<K> {
             if selected == 0 && !self.keys.is_empty() {
                 self.state.select(Some(self.keys.len() - 1));
                 return;
-            } else {
-                selected = selected
-                    .saturating_sub(self.next_page_jump * (m == KeyModifiers::SHIFT) as usize + 1);
-                self.state.select(Some(selected));
-                return;
             }
+            selected = selected
+                .saturating_sub(self.next_page_jump * (m == KeyModifiers::SHIFT) as usize + 1);
+            self.state.select(Some(selected));
+            return;
         }
 
         self.state.select_previous();
@@ -60,7 +58,7 @@ impl<K: Clone + PartialEq + std::fmt::Debug> KeyedCyclingListState<K> {
     ) {
         self.keys.clear();
         let mut drawable_rows = vec![];
-        for (key, row) in rows.into_iter() {
+        for (key, row) in rows {
             self.keys.push(key.clone());
             self.width = self.width.max(row.width() as u16 + 2);
             drawable_rows.push(ListItem::new(row));
@@ -72,7 +70,7 @@ impl<K: Clone + PartialEq + std::fmt::Debug> KeyedCyclingListState<K> {
 
         let table = List::new(drawable_rows).style(Style::new()).highlight_symbol(">");
         self.next_page_jump = self.keys.len().min((area.height as usize).saturating_sub(5));
-        frame.render_stateful_widget(table, area, &mut self.state)
+        frame.render_stateful_widget(table, area, &mut self.state);
     }
 
     pub fn is_last_selected(&self) -> bool {
@@ -91,8 +89,8 @@ impl<K: Clone + PartialEq + std::fmt::Debug> KeyedCyclingListState<K> {
         self.len() == 0
     }
 
-    pub fn select(&mut self, key: K) {
-        let Some(id) = self.keys.iter().enumerate().find_map(|(i, k)| (*k == key).then_some(i))
+    pub fn select(&mut self, key: &K) {
+        let Some(id) = self.keys.iter().enumerate().find_map(|(i, k)| (k == key).then_some(i))
         else {
             return;
         };

@@ -28,12 +28,12 @@ impl Duration {
     }
 
     #[inline]
-    pub fn saturating_sub(self, rhs: Duration) -> Self {
+    pub fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))
     }
 
     #[inline]
-    pub fn saturating_add(self, rhs: Duration) -> Self {
+    pub fn saturating_add(self, rhs: Self) -> Self {
         Self(self.0.saturating_add(rhs.0))
     }
 
@@ -132,43 +132,43 @@ impl From<Duration> for u64 {
 }
 
 impl Add for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn add(self, rhs: Duration) -> Duration {
-        Duration(self.0.wrapping_add(rhs.0))
+    fn add(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_add(rhs.0))
     }
 }
 
 impl AddAssign for Duration {
     #[inline]
-    fn add_assign(&mut self, rhs: Duration) {
+    fn add_assign(&mut self, rhs: Self) {
         *self = *self + rhs;
     }
 }
 
 impl Sub for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn sub(self, rhs: Duration) -> Duration {
-        Duration(self.0.wrapping_sub(rhs.0))
+    fn sub(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_sub(rhs.0))
     }
 }
 
 impl SubAssign for Duration {
     #[inline]
-    fn sub_assign(&mut self, rhs: Duration) {
+    fn sub_assign(&mut self, rhs: Self) {
         *self = *self - rhs;
     }
 }
 
 impl Sub<u64> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn sub(self, rhs: u64) -> Duration {
-        Duration(self.0.wrapping_sub(rhs))
+    fn sub(self, rhs: u64) -> Self {
+        Self(self.0.wrapping_sub(rhs))
     }
 }
 
@@ -180,20 +180,20 @@ impl SubAssign<u64> for Duration {
 }
 
 impl Mul<u32> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn mul(self, rhs: u32) -> Duration {
-        Duration(self.0 * rhs as u64)
+    fn mul(self, rhs: u32) -> Self {
+        Self(self.0 * rhs as u64)
     }
 }
 
 impl Mul<usize> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn mul(self, rhs: usize) -> Duration {
-        Duration(self.0 * rhs as u64)
+    fn mul(self, rhs: usize) -> Self {
+        Self(self.0 * rhs as u64)
     }
 }
 
@@ -214,28 +214,28 @@ impl MulAssign<u32> for Duration {
 }
 
 impl Div<u32> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn div(self, rhs: u32) -> Duration {
-        Duration(self.0 / rhs as u64)
+    fn div(self, rhs: u32) -> Self {
+        Self(self.0 / rhs as u64)
     }
 }
 
 impl Div<usize> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn div(self, rhs: usize) -> Duration {
-        Duration(self.0 / rhs as u64)
+    fn div(self, rhs: usize) -> Self {
+        Self(self.0 / rhs as u64)
     }
 }
 
-impl Div<Duration> for Duration {
+impl Div<Self> for Duration {
     type Output = u64;
 
     #[inline]
-    fn div(self, rhs: Duration) -> u64 {
+    fn div(self, rhs: Self) -> u64 {
         self.0 / rhs.0
     }
 }
@@ -248,11 +248,11 @@ impl DivAssign<u32> for Duration {
 }
 
 impl Mul<u64> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn mul(self, rhs: u64) -> Duration {
-        Duration(self.0 * rhs)
+    fn mul(self, rhs: u64) -> Self {
+        Self(self.0 * rhs)
     }
 }
 
@@ -273,11 +273,11 @@ impl MulAssign<u64> for Duration {
 }
 
 impl Div<u64> for Duration {
-    type Output = Duration;
+    type Output = Self;
 
     #[inline]
-    fn div(self, rhs: u64) -> Duration {
-        Duration(self.0 / rhs)
+    fn div(self, rhs: u64) -> Self {
+        Self(self.0 / rhs)
     }
 }
 
@@ -313,8 +313,8 @@ impl Ord for Duration {
 
 impl From<Duration> for f64 {
     #[inline]
-    fn from(value: Duration) -> f64 {
-        value.0 as f64
+    fn from(value: Duration) -> Self {
+        value.0 as Self
     }
 }
 
@@ -324,7 +324,7 @@ impl std::iter::Sum for Duration {
     where
         I: Iterator<Item = Self>,
     {
-        Duration(iter.map(|v| v.0).sum())
+        Self(iter.map(|v| v.0).sum())
     }
 }
 
@@ -334,49 +334,49 @@ impl<'a> std::iter::Sum<&'a Self> for Duration {
     where
         I: Iterator<Item = &'a Self>,
     {
-        Duration(iter.map(|v| v.0).sum())
+        Self(iter.map(|v| v.0).sum())
     }
 }
 
 impl From<u128> for Duration {
     #[inline]
     fn from(value: u128) -> Self {
-        Duration(value as u64)
+        Self(value as u64)
     }
 }
 
 impl From<u32> for Duration {
     #[inline]
     fn from(value: u32) -> Self {
-        Duration(value as u64)
+        Self(value as u64)
     }
 }
 
 impl From<i64> for Duration {
     #[inline]
     fn from(value: i64) -> Self {
-        Duration(value as u64)
+        Self(value as u64)
     }
 }
 
 impl From<i32> for Duration {
     #[inline]
     fn from(value: i32) -> Self {
-        Duration(value as u64)
+        Self(value as u64)
     }
 }
 
 impl From<Duration> for i64 {
     #[inline]
     fn from(val: Duration) -> Self {
-        val.0 as i64
+        val.0 as Self
     }
 }
 
 impl From<Duration> for std::time::Duration {
     #[inline]
     fn from(value: Duration) -> Self {
-        std::time::Duration::from_nanos(global_clock_not_mocked().delta_as_nanos(0, value.0))
+        Self::from_nanos(global_clock_not_mocked().delta_as_nanos(0, value.0))
     }
 }
 
@@ -398,14 +398,14 @@ impl From<Nanos> for Duration {
 impl DivAssign<usize> for Duration {
     #[inline]
     fn div_assign(&mut self, rhs: usize) {
-        self.0 /= rhs as u64
+        self.0 /= rhs as u64;
     }
 }
 
 impl DivAssign<i32> for Duration {
     #[inline]
     fn div_assign(&mut self, rhs: i32) {
-        self.0 /= rhs as u64
+        self.0 /= rhs as u64;
     }
 }
 
@@ -434,7 +434,7 @@ mod tests {
     }
 
     /// Assert drift < 500ppm of expected, minimum 10ns absolute.
-    /// from_nanos path uses ticks_per_micro (~3200) so truncation can reach
+    /// `from_nanos` path uses `ticks_per_micro` (~3200) so truncation can reach
     /// ~200ppm.
     fn check(ours: Duration, expected: std::time::Duration) {
         let actual_ns = to_ns(ours);
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn from_secs_matches_std() {
-        for s in [0, 1, 5, 60, 3600, 86400, 604800] {
+        for s in [0, 1, 5, 60, 3600, 86400, 604_800] {
             check(Duration::from_secs(s), std::time::Duration::from_secs(s));
         }
     }

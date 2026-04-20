@@ -104,6 +104,7 @@ pub fn list_all(
                     match ShmemConf::new().flink(&entry.flink).open() {
                         Ok(shmem) => {
                             if shmem.len() >= std::mem::size_of::<QueueHeader>() {
+                                #[allow(clippy::cast_ptr_alignment)]
                                 let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
                                 if header.is_initialized() {
                                     println!(
@@ -184,7 +185,7 @@ pub fn list_json(
 /// Print summary statistics for all registered shared memory segments.
 ///
 /// Shows counts of alive/dead/poisoned segments, a breakdown by kind
-/// (Queue, SeqlockArray, Data), total slot count, and estimated memory
+/// (Queue, `SeqlockArray`, Data), total slot count, and estimated memory
 /// usage.  Optionally filtered by `app_filter`.
 ///
 /// When `verbose` is `true`, additional per-segment detail may be shown
@@ -233,10 +234,10 @@ pub fn stats(
 
     let color = std::io::stdout().is_terminal();
 
-    let title = match app_filter {
-        Some(app) => format!("flux shmem stats (app: {app})"),
-        None => "flux shmem stats".to_string(),
-    };
+    let title = app_filter.map_or_else(
+        || "flux shmem stats".to_string(),
+        |app| format!("flux shmem stats (app: {app})"),
+    );
     if color {
         println!("{}", title.bold().underlined());
     } else {
@@ -331,9 +332,8 @@ pub fn inspect(
             "💀 dead"
         };
 
-        let backing = backing_file_size(&entry.flink)
-            .map(format_bytes)
-            .unwrap_or_else(|| "unavailable".into());
+        let backing =
+            backing_file_size(&entry.flink).map_or_else(|| "unavailable".into(), format_bytes);
 
         println!("  Kind:       {}", entry.kind);
         println!("  Status:     {status}");
@@ -346,6 +346,7 @@ pub fn inspect(
             let Ok(shmem) = ShmemConf::new().flink(&entry.flink).open()
         {
             if shmem.len() >= std::mem::size_of::<QueueHeader>() {
+                #[allow(clippy::cast_ptr_alignment)]
                 let header = unsafe { &*(shmem.as_ptr() as *const QueueHeader) };
                 if header.is_initialized() {
                     println!("  Writes:     {}", header.count.load(Ordering::Relaxed));
