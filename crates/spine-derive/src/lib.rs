@@ -11,13 +11,14 @@
 
 // spine_derive/src/lib.rs   (only the changed parts are shown)
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
 use syn::{
     Attribute, Expr, GenericArgument, Ident, ItemStruct, LitStr, Path, PathArguments, Result,
     Token, Type, parenthesized,
     parse::{Parse, ParseStream},
     parse_macro_input,
     punctuated::Punctuated,
+    spanned::Spanned,
     token::Comma,
 };
 
@@ -169,7 +170,9 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             });
 
             let check_fn = format_ident!("_ffi_check_{}", field_ident);
-            ffi_check_items.push(quote! { fn #check_fn(var: *const #inner_ty); });
+            let inner_ty_span = inner_ty.span();
+            ffi_check_items
+                .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
 
             let (is_persistent, _size_expr_opt, _is_spmc, mtu_expr) =
                 get_queue_config(&field.attrs);
@@ -317,7 +320,9 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             let Some(GenericArgument::Type(inner_ty)) = args.args.first()
         {
             let check_fn = format_ident!("_ffi_check_{}", field_ident);
-            ffi_check_items.push(quote! { fn #check_fn(var: *const #inner_ty); });
+            let inner_ty_span = inner_ty.span();
+            ffi_check_items
+                .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
         }
     }
 
