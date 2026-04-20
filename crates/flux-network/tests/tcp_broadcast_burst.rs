@@ -70,7 +70,8 @@ fn broadcast_burst_to_multiple_receivers() {
     let mut sender = TcpConnector::default().with_socket_buf_size(4096);
     sender.listen_at(addr).expect("failed to listen");
 
-    let handles = (0..NUM_RECEIVERS).map(|_| spawn_receiver(addr));
+    #[allow(clippy::needless_collect, reason = "Receivers need to be spawned at this point")]
+    let handles: Vec<_> = (0..NUM_RECEIVERS).map(|_| spawn_receiver(addr)).collect();
 
     // Accept all inbound connections.
     let mut accepted = 0;
@@ -103,7 +104,7 @@ fn broadcast_burst_to_multiple_receivers() {
     // Drop sender so receivers see disconnect.
     drop(sender);
 
-    for (i, handle) in handles.enumerate() {
+    for (i, handle) in handles.into_iter().enumerate() {
         let frames = handle.join().unwrap_or_else(|_| panic!("receiver {i} panicked"));
 
         assert_eq!(
