@@ -649,7 +649,7 @@ pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
-            size as *const libc::c_void,
+            ptr::from_ref(&size).cast::<libc::c_void>(),
             core::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
