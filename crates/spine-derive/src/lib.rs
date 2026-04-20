@@ -11,13 +11,14 @@
 
 // spine_derive/src/lib.rs   (only the changed parts are shown)
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
 use syn::{
     Attribute, Expr, GenericArgument, Ident, ItemStruct, LitStr, Path, PathArguments, Result,
     Token, Type, parenthesized,
     parse::{Parse, ParseStream},
     parse_macro_input,
     punctuated::Punctuated,
+    spanned::Spanned,
     token::Comma,
 };
 
@@ -153,6 +154,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut spine_as_ref_impls = Vec::<proc_macro2::TokenStream>::new();
     let mut persisting = Vec::<proc_macro2::TokenStream>::new();
     let mut message_types = Vec::<proc_macro2::TokenStream>::new();
+    let mut ffi_check_items = Vec::<proc_macro2::TokenStream>::new();
 
     for field in &input.fields {
         let field_ident = field.ident.as_ref().expect("named field required");
@@ -166,6 +168,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             message_types.push(quote! {
                 ::flux::utils::short_typename::<#inner_ty>().to_string()
             });
+
+            let check_fn = format_ident!("_ffi_check_{}", field_ident);
+            let inner_ty_span = inner_ty.span();
+            ffi_check_items
+                .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
 
             let (is_persistent, _size_expr_opt, _is_spmc, mtu_expr) =
                 get_queue_config(&field.attrs);
@@ -307,6 +314,15 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 );
                             });
             }
+        } else if let Type::Path(tp) = &field.ty &&
+            let Some(last_seg) = tp.path.segments.last() &&
+            let PathArguments::AngleBracketed(args) = &last_seg.arguments &&
+            let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+        {
+            let check_fn = format_ident!("_ffi_check_{}", field_ident);
+            let inner_ty_span = inner_ty.span();
+            ffi_check_items
+                .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
         }
     }
 
@@ -586,6 +602,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             }
        }
+
+        unsafe extern "C" {
+            #(#ffi_check_items)*
+        }
     };
 
     TokenStream::from(expanded)
