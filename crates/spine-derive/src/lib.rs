@@ -169,7 +169,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::flux::utils::short_typename::<#inner_ty>().to_string()
             });
 
-            let check_fn = format_ident!("_ffi_check_{}", field_ident);
+            let check_fn = format_ident!("_ffi_check_{}_{}", struct_ident, field_ident);
             let inner_ty_span = inner_ty.span();
             ffi_check_items
                 .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
@@ -319,7 +319,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             let PathArguments::AngleBracketed(args) = &last_seg.arguments &&
             let Some(GenericArgument::Type(inner_ty)) = args.args.first()
         {
-            let check_fn = format_ident!("_ffi_check_{}", field_ident);
+            let check_fn = format_ident!("_ffi_check_{}_{}", struct_ident, field_ident);
             let inner_ty_span = inner_ty.span();
             ffi_check_items
                 .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
