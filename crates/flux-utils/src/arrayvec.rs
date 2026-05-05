@@ -251,6 +251,20 @@ impl<T: Copy + PartialEq, const N: usize> PartialEq for ArrayVec<T, N> {
 
 impl<T: Copy + Eq, const N: usize> Eq for ArrayVec<T, N> {}
 
+impl<T: Copy + Ord, const N: usize> Ord for ArrayVec<T, N> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl<T: Copy + PartialOrd, const N: usize> PartialOrd for ArrayVec<T, N> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.as_slice().partial_cmp(other.as_slice())
+    }
+}
+
 impl<'a, T: Copy, const N: usize> IntoIterator for &'a ArrayVec<T, N> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
@@ -410,6 +424,16 @@ impl<const N: usize> TryFrom<&str> for ArrayStr<N> {
     }
 }
 
+impl<const N: usize> TryFrom<ArrayVec<u8, N>> for ArrayStr<N> {
+    type Error = core::str::Utf8Error;
+
+    #[inline]
+    fn try_from(buf: ArrayVec<u8, N>) -> Result<Self, Self::Error> {
+        core::str::from_utf8(buf.as_slice())?;
+        Ok(Self { buf })
+    }
+}
+
 impl<const N: usize> Deref for ArrayStr<N> {
     type Target = str;
     #[inline]
@@ -448,7 +472,7 @@ impl<const N: usize> core::hash::Hash for ArrayStr<N> {
 impl<const N: usize> Ord for ArrayStr<N> {
     #[inline]
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.as_str().cmp(other.as_str())
+        self.buf.cmp(&other.buf)
     }
 }
 
@@ -535,7 +559,7 @@ mod serde_impl {
         where
             S: Serializer,
         {
-            serializer.serialize_str(self.as_str())
+            self.buf.serialize(serializer)
         }
     }
 
@@ -544,26 +568,8 @@ mod serde_impl {
         where
             D: Deserializer<'de>,
         {
-            struct ArrayStrVisitor<const N: usize>;
-
-            impl<const N: usize> Visitor<'_> for ArrayStrVisitor<N> {
-                type Value = super::ArrayStr<N>;
-
-                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    write!(f, "a string of at most {N} bytes")
-                }
-
-                fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
-                    super::ArrayStr::<N>::try_from(v).map_err(|e| {
-                        E::custom(format_args!(
-                            "string length {} exceeds ArrayStr capacity {}",
-                            e.len, e.capacity
-                        ))
-                    })
-                }
-            }
-
-            deserializer.deserialize_str(ArrayStrVisitor::<N>)
+            ArrayVec::<u8, N>::deserialize(deserializer)
+                .and_then(|buf| super::ArrayStr::try_from(buf).map_err(D::Error::custom))
         }
     }
 }
