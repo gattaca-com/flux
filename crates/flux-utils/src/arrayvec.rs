@@ -251,6 +251,20 @@ impl<T: Copy + PartialEq, const N: usize> PartialEq for ArrayVec<T, N> {
 
 impl<T: Copy + Eq, const N: usize> Eq for ArrayVec<T, N> {}
 
+impl<T: Copy + Ord, const N: usize> Ord for ArrayVec<T, N> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl<T: Copy + PartialOrd, const N: usize> PartialOrd for ArrayVec<T, N> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.as_slice().partial_cmp(other.as_slice())
+    }
+}
+
 impl<'a, T: Copy, const N: usize> IntoIterator for &'a ArrayVec<T, N> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
@@ -410,6 +424,16 @@ impl<const N: usize> TryFrom<&str> for ArrayStr<N> {
     }
 }
 
+impl<const N: usize> TryFrom<ArrayVec<u8, N>> for ArrayStr<N> {
+    type Error = core::str::Utf8Error;
+
+    #[inline]
+    fn try_from(buf: ArrayVec<u8, N>) -> Result<Self, Self::Error> {
+        core::str::from_utf8(buf.as_slice())?;
+        Ok(Self { buf })
+    }
+}
+
 impl<const N: usize> Deref for ArrayStr<N> {
     type Target = str;
     #[inline]
@@ -442,6 +466,20 @@ impl<const N: usize> core::hash::Hash for ArrayStr<N> {
     #[inline]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.buf.hash(state);
+    }
+}
+
+impl<const N: usize> Ord for ArrayStr<N> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.buf.cmp(&other.buf)
+    }
+}
+
+impl<const N: usize> PartialOrd for ArrayStr<N> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -513,6 +551,25 @@ mod serde_impl {
             }
 
             deserializer.deserialize_seq(ArrayVecVisitor::<T, N>(core::marker::PhantomData))
+        }
+    }
+
+    impl<const N: usize> Serialize for super::ArrayStr<N> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            self.buf.serialize(serializer)
+        }
+    }
+
+    impl<'de, const N: usize> Deserialize<'de> for super::ArrayStr<N> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            ArrayVec::<u8, N>::deserialize(deserializer)
+                .and_then(|buf| super::ArrayStr::try_from(buf).map_err(D::Error::custom))
         }
     }
 }
