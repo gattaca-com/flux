@@ -445,6 +445,20 @@ impl<const N: usize> core::hash::Hash for ArrayStr<N> {
     }
 }
 
+impl<const N: usize> Ord for ArrayStr<N> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl<const N: usize> PartialOrd for ArrayStr<N> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl<T: TypeHash + Copy, const N: usize> TypeHash for ArrayVec<T, N> {
     const TYPE_HASH: u64 = {
         let mut h = 0xcbf29ce484222325u64;
@@ -513,6 +527,43 @@ mod serde_impl {
             }
 
             deserializer.deserialize_seq(ArrayVecVisitor::<T, N>(core::marker::PhantomData))
+        }
+    }
+
+    impl<const N: usize> Serialize for super::ArrayStr<N> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(self.as_str())
+        }
+    }
+
+    impl<'de, const N: usize> Deserialize<'de> for super::ArrayStr<N> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct ArrayStrVisitor<const N: usize>;
+
+            impl<const N: usize> Visitor<'_> for ArrayStrVisitor<N> {
+                type Value = super::ArrayStr<N>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a string of at most {N} bytes")
+                }
+
+                fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
+                    super::ArrayStr::<N>::try_from(v).map_err(|e| {
+                        E::custom(format_args!(
+                            "string length {} exceeds ArrayStr capacity {}",
+                            e.len, e.capacity
+                        ))
+                    })
+                }
+            }
+
+            deserializer.deserialize_str(ArrayStrVisitor::<N>)
         }
     }
 }
