@@ -569,7 +569,7 @@ mod serde_impl {
             D: Deserializer<'de>,
         {
             ArrayVec::<u8, N>::deserialize(deserializer)
-                .and_then(|buf| super::ArrayStr::try_from(buf).map_err(D::Error::custom))
+                .and_then(|buf| Self::try_from(buf).map_err(D::Error::custom))
         }
     }
 }
