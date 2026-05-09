@@ -575,6 +575,27 @@ impl<T: Copy> Queue<T> {
     fn group_cursor(&self, key: &str) -> *const AtomicUsize {
         unsafe { &mut *self.inner.cast_mut() }.header.find_or_insert_group(key)
     }
+
+    /// Advance the collaborative-group cursor for `label` to the producer's
+    /// current write count, allocating the group slot if it does not exist.
+    /// Never rewinds (uses `fetch_max`).
+    ///
+    /// Use when joining a group whose backlog is meaningless — for instance,
+    /// when queued payloads index into an external arena that has since been
+    /// recycled, so replaying the ring would only surface stale references.
+    ///
+    /// MUST be called before any consumer in the group has begun consuming.
+    /// Calling it after some members have already claimed slots can race
+    /// with concurrent `acquire_next_slot` calls and silently lose any
+    /// messages the producer wrote in the fast-forward window. Typical
+    /// pattern: invoke once from the spine owner, immediately before
+    /// attaching the group's tiles.
+    pub fn fast_forward_collaborative_group(&self, label: &str) {
+        let key = format!("{}[{}].{}.collab", binary_name(), current_pid(), label);
+        let cursor = self.group_cursor(&key);
+        let head = self.count();
+        unsafe { (*cursor).fetch_max(head, Ordering::Relaxed) };
+    }
 }
 
 unsafe impl<T> Send for Queue<T> {}

@@ -273,3 +273,71 @@ fn perf_test_collaborative_consumers() {
     assert_eq!(total_count, N, "received all {N} messages");
     println!("latency ({total_count} msgs) — mean: {}ns", total_sum / total_count as u64);
 }
+
+#[test]
+fn fast_forward_skips_backlog() {
+    const LABEL: &str = "ff_single";
+    let q: Queue<usize> = Queue::new(64, QueueType::MPMC);
+    let mut p = Producer::from(q);
+
+    for i in 0..30 {
+        p.produce(&i);
+    }
+
+    q.fast_forward_collaborative_group(LABEL);
+
+    let mut c = Consumer::new_collaborative_test(q, LABEL).without_log();
+
+    let mut received = Vec::new();
+    assert!(
+        !c.consume_collaborative(|x| received.push(*x)),
+        "post-fast-forward consumer must not see the backlog",
+    );
+    assert!(received.is_empty());
+
+    for i in 100..105 {
+        p.produce(&i);
+    }
+    while c.consume_collaborative(|x| received.push(*x)) {}
+    assert_eq!(received, vec![100, 101, 102, 103, 104]);
+}
+
+#[test]
+fn fast_forward_no_gaps_with_multiple_consumers() {
+    const LABEL: &str = "ff_multi";
+    const CONSUMERS: usize = 4;
+    const POST: usize = 16;
+
+    let q: Queue<usize> = Queue::new(64, QueueType::MPMC);
+    let mut p = Producer::from(q);
+
+    for i in 0..30 {
+        p.produce(&i);
+    }
+
+    q.fast_forward_collaborative_group(LABEL);
+
+    let mut consumers: Vec<_> =
+        (0..CONSUMERS).map(|_| Consumer::new_collaborative_test(q, LABEL).without_log()).collect();
+
+    for i in 100..(100 + POST) {
+        p.produce(&i);
+    }
+
+    let mut received = Vec::new();
+    for _ in 0..(POST * 4) {
+        for c in &mut consumers {
+            c.consume_collaborative(|x| received.push(*x));
+        }
+        if received.len() >= POST {
+            break;
+        }
+    }
+
+    received.sort_unstable();
+    assert_eq!(
+        received,
+        (100..(100 + POST)).collect::<Vec<_>>(),
+        "every post-fast-forward message must be delivered exactly once across the group",
+    );
+}
