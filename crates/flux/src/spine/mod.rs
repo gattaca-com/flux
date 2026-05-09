@@ -191,4 +191,19 @@ pub trait FluxSpine: Sized + Send {
         let _ = std::fs::remove_dir_all(shmem_dir(Self::app_name()))
             .inspect_err(|e| tracing::error!("couldn't remove spine queues {e}"));
     }
+
+    /// Fast-forward the collaborative group `label` for queue `T` to the
+    /// producer's current write head, dropping any backlog already in the
+    /// ring.
+    ///
+    /// Call once before attaching any tile in the group — see the
+    /// synchronisation note on
+    /// [`crate::communication::queue::Queue::fast_forward_collaborative_group`].
+    fn fast_forward_collaborative_group<T: 'static + Copy>(&self, label: &str)
+    where
+        Self: AsRef<SpineQueue<T>>,
+    {
+        let q: &SpineQueue<T> = self.as_ref();
+        q.fast_forward_collaborative_group(label);
+    }
 }
