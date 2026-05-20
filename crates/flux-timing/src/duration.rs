@@ -16,8 +16,6 @@ impl Duration {
     pub const MAX: Self = Self(u64::MAX);
     pub const ZERO: Self = Self(0);
     pub const MIN: Self = Self(0);
-    pub const MILLIS_10: Self = Self::from_millis_and_MHz(10, 3_200);
-    pub const MILLIS_5: Self = Self::from_millis_and_MHz(5, 3_200);
 
     /// Given millis and the base clockspeed as multiplier this generates an
     /// approximate Duration in rdtscp count
