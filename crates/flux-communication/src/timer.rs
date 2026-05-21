@@ -144,6 +144,7 @@ impl Timer {
     }
 
     #[inline]
+    #[must_use = "the returned guard records on drop; binding it to `_` drops it immediately"]
     pub fn record_scoped(&mut self) -> ScopedRecord<'_> {
         self.start();
         ScopedRecord { timer: self }
