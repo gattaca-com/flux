@@ -55,6 +55,16 @@ fn set_thread_affinity(core: usize) {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn get_tid() -> i64 {
+    unsafe { libc::gettid() as i64 }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_tid() -> i64 {
+    0
+}
+
 pub fn thread_boot(core: Option<usize>, prio: ThreadPriority) {
     if let Some(core) = core {
         set_thread_affinity(core);
