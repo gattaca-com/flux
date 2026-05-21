@@ -3,7 +3,7 @@ pub mod metrics;
 use core::sync::atomic::Ordering;
 
 use flux_timing::{Duration, IngestionTime};
-use flux_utils::{ShortTypename, ThreadPriority, short_typename, thread_boot, vsync};
+use flux_utils::{ShortTypename, ThreadPriority, get_tid, short_typename, thread_boot, vsync};
 use tracing::{Level, info, span};
 
 use crate::{
@@ -94,7 +94,7 @@ where
             }
             std::hint::spin_loop();
         }
-        info!("Tile init complete");
+        info!(tid = get_tid(), "Tile init complete");
 
         loop {
             let ingestion_t = IngestionTime::now();

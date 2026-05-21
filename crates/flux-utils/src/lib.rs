@@ -11,5 +11,5 @@ pub use arrayvec::{ArrayStr, ArrayVec};
 pub use dcache::{DCache, DCacheError, DCachePtr, DCacheRef};
 pub use namespace::{ShortTypename, short_typename};
 pub use shared_vector::SharedVector;
-pub use thread::{ThreadPriority, thread_boot};
+pub use thread::{ThreadPriority, get_tid, thread_boot};
 pub use vsync::vsync;
