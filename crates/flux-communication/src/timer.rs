@@ -143,6 +143,12 @@ impl Timer {
         self.emit_processing();
     }
 
+    #[inline]
+    pub fn record_scoped(&mut self) -> ScopedRecord<'_> {
+        self.start();
+        ScopedRecord { timer: self }
+    }
+
     /// Finish processing, then emit upstream latency.
     ///
     /// Processing interval:
@@ -245,6 +251,17 @@ impl Timer {
         let o = f();
         self.record_processing();
         o
+    }
+}
+
+pub struct ScopedRecord<'a> {
+    timer: &'a mut Timer,
+}
+
+impl Drop for ScopedRecord<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.timer.record_processing();
     }
 }
 
