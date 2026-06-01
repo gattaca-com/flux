@@ -158,8 +158,8 @@ impl ConnectionManager {
         while i != 0 {
             i -= 1;
             match &mut self.conns[i].1 {
-                ConnectionVariant::Outbound(tcp_connection)
-                | ConnectionVariant::Inbound(tcp_connection) => {
+                ConnectionVariant::Outbound(tcp_connection) |
+                ConnectionVariant::Inbound(tcp_connection) => {
                     if tcp_connection.write_or_enqueue_shared(
                         self.poll.registry(),
                         &self.bcast_header,
@@ -184,10 +184,10 @@ impl ConnectionManager {
             SendBehavior::Single(token) => {
                 if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
                     match &mut self.conns[i].1 {
-                        ConnectionVariant::Outbound(tcp_connection)
-                        | ConnectionVariant::Inbound(tcp_connection) => {
-                            if tcp_connection.write_or_enqueue_with(self.poll.registry(), serialise)
-                                == ConnState::Disconnected
+                        ConnectionVariant::Outbound(tcp_connection) |
+                        ConnectionVariant::Inbound(tcp_connection) => {
+                            if tcp_connection.write_or_enqueue_with(self.poll.registry(), serialise) ==
+                                ConnState::Disconnected
                             {
                                 tracing::warn!("issue when writing to {token:?} disconnecting");
                                 self.disconnect_at_index(i);
@@ -254,8 +254,8 @@ impl ConnectionManager {
                 self.telemetry,
                 self.dcache.is_some(),
             );
-            if let Some(msg) = &self.on_connect_msg
-                && tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+            if let Some(msg) = &self.on_connect_msg &&
+                tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
             {
@@ -392,8 +392,8 @@ impl ConnectionManager {
 
         loop {
             match &mut self.conns[stream_id].1 {
-                ConnectionVariant::Outbound(tcp_connection)
-                | ConnectionVariant::Inbound(tcp_connection) => {
+                ConnectionVariant::Outbound(tcp_connection) |
+                ConnectionVariant::Inbound(tcp_connection) => {
                     if tcp_connection.poll_with(
                         self.poll.registry(),
                         e,
@@ -436,8 +436,8 @@ impl ConnectionManager {
                             self.dcache.is_some(),
                         );
 
-                        if let Some(msg) = &self.on_connect_msg
-                            && conn.write_or_enqueue_with(
+                        if let Some(msg) = &self.on_connect_msg &&
+                            conn.write_or_enqueue_with(
                                 self.poll.registry(),
                                 |buf: &mut Vec<u8>| {
                                     buf.extend_from_slice(msg);
@@ -476,8 +476,8 @@ impl ConnectionManager {
 
         loop {
             match &mut self.conns[stream_id].1 {
-                ConnectionVariant::Outbound(tcp_connection)
-                | ConnectionVariant::Inbound(tcp_connection) => {
+                ConnectionVariant::Outbound(tcp_connection) |
+                ConnectionVariant::Inbound(tcp_connection) => {
                     let dcache =
                         self.dcache.as_deref().expect("dcache required for poll_with_produce");
                     if tcp_connection.poll_with_produce(
@@ -522,8 +522,8 @@ impl ConnectionManager {
                             self.telemetry,
                             self.dcache.is_some(),
                         );
-                        if let Some(msg) = &self.on_connect_msg
-                            && conn.write_or_enqueue_with(
+                        if let Some(msg) = &self.on_connect_msg &&
+                            conn.write_or_enqueue_with(
                                 self.poll.registry(),
                                 |buf: &mut Vec<u8>| {
                                     buf.extend_from_slice(msg);
