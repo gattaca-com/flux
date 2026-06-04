@@ -606,61 +606,77 @@ mod bytes_impl {
 
 #[cfg(feature = "wincode")]
 mod wincode_impl {
-    use std::{
-        mem::{self, MaybeUninit},
-        ptr,
-    };
+    use std::mem::{self, MaybeUninit};
 
-    use wincode::{TypeMeta, io::Writer, len::SeqLen};
+    use wincode::{
+        TypeMeta,
+        config::ConfigCore,
+        io::{Reader, Writer},
+        len::SeqLen,
+    };
 
     use super::ArrayVec;
     type BatchWireLen = wincode::len::BincodeLen;
 
-    fn is_pod<T>() -> bool
+    fn can_write_zero_copy<T, C>() -> bool
     where
-        T: wincode::SchemaWrite<Src = T>,
+        C: ConfigCore,
+        T: wincode::SchemaWrite<C, Src = T>,
     {
-        matches!(T::TYPE_META, TypeMeta::Static { size: _, zero_copy: true })
+        matches!(<T as wincode::SchemaWrite<C>>::TYPE_META, TypeMeta::Static {
+            size: _,
+            zero_copy: true
+        })
     }
 
-    impl<T: Copy + wincode::SchemaWrite<Src = T>, const N: usize> wincode::SchemaWrite
-        for ArrayVec<T, N>
+    fn can_read_zero_copy<'de, T, C>() -> bool
+    where
+        C: ConfigCore,
+        T: wincode::SchemaRead<'de, C, Dst = T>,
+    {
+        matches!(<T as wincode::SchemaRead<'de, C>>::TYPE_META, TypeMeta::Static {
+            size: _,
+            zero_copy: true
+        })
+    }
+
+    unsafe impl<T, C, const N: usize> wincode::SchemaWrite<C> for ArrayVec<T, N>
+    where
+        C: ConfigCore,
+        T: Copy + wincode::SchemaWrite<C, Src = T>,
     {
         type Src = Self;
 
         #[inline]
         fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
             let len = src.len();
-            let len_bytes = BatchWireLen::write_bytes_needed(len)?;
+            let len_bytes = <BatchWireLen as SeqLen<C>>::write_bytes_needed(len)?;
 
-            if is_pod::<T>() {
+            if can_write_zero_copy::<T, C>() {
                 return Ok(len_bytes + len * mem::size_of::<T>());
             }
 
             let mut total = len_bytes;
             for x in src.as_slice() {
-                total += <T as wincode::SchemaWrite>::size_of(x)?;
+                total += <T as wincode::SchemaWrite<C>>::size_of(x)?;
             }
             Ok(total)
         }
 
         #[inline]
-        fn write(
-            writer: &mut impl wincode::io::Writer,
-            src: &Self::Src,
-        ) -> wincode::WriteResult<()> {
+        fn write(mut writer: impl Writer, src: &Self::Src) -> wincode::WriteResult<()> {
             let total_bytes = Self::size_of(src)?;
             let mut w = unsafe { writer.as_trusted_for(total_bytes)? };
-            BatchWireLen::write(&mut w, src.len())?;
+            <BatchWireLen as SeqLen<C>>::write(w.by_ref(), src.len())?;
 
-            if is_pod::<T>() {
+            if can_write_zero_copy::<T, C>() {
                 let slice = src.as_slice();
                 unsafe {
                     w.write_slice_t(slice)?;
                 }
             } else {
                 for item in src.as_slice() {
-                    <T as wincode::SchemaWrite>::write(&mut w, item)?;
+                    <T as wincode::SchemaWrite<C>>::write(w.by_ref(), item)?;
                 }
             }
             w.finish()?;
@@ -668,25 +684,24 @@ mod wincode_impl {
         }
     }
 
-    impl<
-        'de,
-        T: Copy + wincode::SchemaRead<'de, Dst = T> + wincode::SchemaWrite<Src = T>,
-        const N: usize,
-    > wincode::SchemaRead<'de> for ArrayVec<T, N>
+    unsafe impl<'de, T, C, const N: usize> wincode::SchemaRead<'de, C> for ArrayVec<T, N>
+    where
+        C: ConfigCore,
+        T: Copy + wincode::SchemaRead<'de, C, Dst = T>,
     {
         type Dst = Self;
 
         fn read(
-            reader: &mut impl wincode::io::Reader<'de>,
+            mut reader: impl Reader<'de>,
             dst: &mut MaybeUninit<Self::Dst>,
         ) -> wincode::ReadResult<()> {
-            let len = BatchWireLen::read::<T>(reader)?;
+            let len = <BatchWireLen as SeqLen<C>>::read(reader.by_ref())?;
             if len > N {
                 return Err(wincode::ReadError::LengthEncodingOverflow("too many values"));
             }
 
             let mut arr = Self::new();
-            if is_pod::<T>() {
+            if can_read_zero_copy::<'de, T, C>() {
                 unsafe {
                     let dst_slice: &mut [MaybeUninit<T>] =
                         core::slice::from_raw_parts_mut(arr.data.as_mut_ptr(), len);
@@ -696,7 +711,7 @@ mod wincode_impl {
             } else {
                 for _ in 0..len {
                     let mut tmp = MaybeUninit::<T>::uninit();
-                    <T as wincode::SchemaRead>::read(reader, &mut tmp)?;
+                    <T as wincode::SchemaRead<'de, C>>::read(reader.by_ref(), &mut tmp)?;
                     arr.push(unsafe { tmp.assume_init() });
                 }
             }
@@ -706,35 +721,31 @@ mod wincode_impl {
         }
     }
 
-    impl<const N: usize> wincode::SchemaWrite for super::ArrayStr<N> {
+    unsafe impl<C: ConfigCore, const N: usize> wincode::SchemaWrite<C> for super::ArrayStr<N> {
         type Src = Self;
 
         #[inline]
         fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
-            <ArrayVec<u8, N> as wincode::SchemaWrite>::size_of(&src.buf)
+            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::size_of(&src.buf)
         }
 
         #[inline]
-        fn write(
-            writer: &mut impl wincode::io::Writer,
-            src: &Self::Src,
-        ) -> wincode::WriteResult<()> {
-            <ArrayVec<u8, N> as wincode::SchemaWrite>::write(writer, &src.buf)
+        fn write(writer: impl Writer, src: &Self::Src) -> wincode::WriteResult<()> {
+            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::write(writer, &src.buf)
         }
     }
 
-    impl<'de, const N: usize> wincode::SchemaRead<'de> for super::ArrayStr<N> {
+    unsafe impl<'de, C: ConfigCore, const N: usize> wincode::SchemaRead<'de, C> for super::ArrayStr<N> {
         type Dst = Self;
 
         fn read(
-            reader: &mut impl wincode::io::Reader<'de>,
+            reader: impl Reader<'de>,
             dst: &mut MaybeUninit<Self::Dst>,
         ) -> wincode::ReadResult<()> {
-            let buf_dst = unsafe {
-                &mut *(ptr::from_mut::<MaybeUninit<Self::Dst>>(dst))
-                    .cast::<MaybeUninit<ArrayVec<u8, N>>>()
-            };
-            <ArrayVec<u8, N> as wincode::SchemaRead>::read(reader, buf_dst)
+            let buf = <ArrayVec<u8, N> as wincode::SchemaRead<'de, C>>::get(reader)?;
+            let value = Self::try_from(buf).map_err(wincode::ReadError::InvalidUtf8Encoding)?;
+            dst.write(value);
+            Ok(())
         }
     }
 }
@@ -866,5 +877,24 @@ mod wincode_tests {
             contains(&bytes, &data),
             "serialized output should contain slice payload bytes; got: {bytes:?}"
         );
+    }
+
+    #[test]
+    fn arraystr() {
+        let value = ArrayStr::<16>::from_str_truncate("hello");
+
+        let bytes = wincode::serialize(&value).unwrap();
+        let decoded = wincode::deserialize::<ArrayStr<16>>(bytes.as_slice()).unwrap();
+
+        assert_eq!(decoded.as_str(), "hello");
+    }
+
+    #[test]
+    fn arraystr_rejects_invalid_utf8() {
+        let mut invalid = ArrayVec::<u8, 4>::new();
+        invalid.push(0xff);
+        let bytes = wincode::serialize(&invalid).unwrap();
+
+        assert!(wincode::deserialize::<ArrayStr<4>>(bytes.as_slice()).is_err());
     }
 }
