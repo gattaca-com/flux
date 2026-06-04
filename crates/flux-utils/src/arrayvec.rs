@@ -623,10 +623,10 @@ mod wincode_impl {
         C: ConfigCore,
         T: wincode::SchemaWrite<C, Src = T>,
     {
-        matches!(
-            <T as wincode::SchemaWrite<C>>::TYPE_META,
-            TypeMeta::Static { size: _, zero_copy: true }
-        )
+        matches!(<T as wincode::SchemaWrite<C>>::TYPE_META, TypeMeta::Static {
+            size: _,
+            zero_copy: true
+        })
     }
 
     fn can_read_zero_copy<'de, T, C>() -> bool
@@ -634,10 +634,10 @@ mod wincode_impl {
         C: ConfigCore,
         T: wincode::SchemaRead<'de, C, Dst = T>,
     {
-        matches!(
-            <T as wincode::SchemaRead<'de, C>>::TYPE_META,
-            TypeMeta::Static { size: _, zero_copy: true }
-        )
+        matches!(<T as wincode::SchemaRead<'de, C>>::TYPE_META, TypeMeta::Static {
+            size: _,
+            zero_copy: true
+        })
     }
 
     unsafe impl<T, C, const N: usize> wincode::SchemaWrite<C> for ArrayVec<T, N>
@@ -735,9 +735,7 @@ mod wincode_impl {
         }
     }
 
-    unsafe impl<'de, C: ConfigCore, const N: usize> wincode::SchemaRead<'de, C>
-        for super::ArrayStr<N>
-    {
+    unsafe impl<'de, C: ConfigCore, const N: usize> wincode::SchemaRead<'de, C> for super::ArrayStr<N> {
         type Dst = Self;
 
         fn read(
