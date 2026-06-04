@@ -12,7 +12,7 @@ struct TestMsg(u32);
 
 fn wincode_ser_into_vec<T>(buf: &mut Vec<u8>, value: &T)
 where
-    T: wincode::SchemaWrite<Src = T>,
+    T: wincode::SchemaWrite<wincode::config::DefaultConfig, Src = T>,
 {
     wincode::serialize_into(buf, value).unwrap();
 }
