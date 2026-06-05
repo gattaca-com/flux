@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     thread,
     time::Duration,
 };
@@ -90,4 +90,52 @@ fn tcp_roundtrip() {
 
     server.join().unwrap();
     client.join().unwrap();
+}
+
+#[test]
+fn backlog_disconnect_is_reported() {
+    let probe =
+        std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("probe");
+    let bind_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let mut listener = TcpConnector::default()
+        .with_socket_buf_size(1024)
+        .with_max_backlog(0, flux_timing::Duration::ZERO);
+    listener.listen_at(bind_addr).unwrap();
+
+    let client = TcpStream::connect(bind_addr).expect("failed to connect client");
+
+    let mut stream_token = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stream_token.is_none() && std::time::Instant::now() < deadline {
+        listener.poll_with(|event| {
+            if let PollEvent::Accept { stream, .. } = event {
+                stream_token = Some(stream);
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let stream_token = stream_token.expect("listener did not accept client");
+
+    let payload = vec![7_u8; 16 * 1024 * 1024];
+    listener.write_or_enqueue_with(SendBehavior::Single(stream_token), |buf| {
+        buf.extend_from_slice(&payload);
+    });
+
+    let mut disconnected = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !disconnected && std::time::Instant::now() < deadline {
+        listener.poll_with(|event| {
+            if let PollEvent::Disconnect { token } = event {
+                assert_eq!(token, stream_token);
+                disconnected = true;
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    drop(client);
+    assert!(disconnected, "backlog disconnect was not reported");
 }
