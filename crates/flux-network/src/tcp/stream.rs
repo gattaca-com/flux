@@ -147,7 +147,7 @@ pub struct TcpStream {
     /// Filled when send would block.
     /// First entry will either be a full message or the current partially
     /// written head.
-    send_backlog: VecDeque<Vec<u8>>,
+    pub(crate) send_backlog: VecDeque<Vec<u8>>,
     /// We don't pop until the full message is written,
     /// so we use this cursor to know what slice to write
     send_cursor: usize,
@@ -430,7 +430,11 @@ impl TcpStream {
     /// Backlog allocation for the shared-frame path. Mirrors [`alloc_vec`] but
     /// sources the frame from borrowed slices rather than `self.send_buf`.
     #[inline]
-    fn alloc_shared_vec(&mut self, header: &[u8; FRAME_HEADER_SIZE], payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn alloc_shared_vec(
+        &mut self,
+        header: &[u8; FRAME_HEADER_SIZE],
+        payload: &[u8],
+    ) -> Vec<u8> {
         if self.timers.is_some() {
             let t0 = Nanos::now();
             let v = build_frame_vec(header, payload);
@@ -444,7 +448,7 @@ impl TcpStream {
     /// Allocate `send_buf[start..end]` to vec. Times the alloc if telemetry
     /// enabled.
     #[inline]
-    fn alloc_vec(&mut self, written: usize) -> Vec<u8> {
+    pub(crate) fn alloc_vec(&mut self, written: usize) -> Vec<u8> {
         if let Some(timers) = &mut self.timers {
             let t0 = Nanos::now();
             let mut v = Vec::with_capacity(
@@ -685,6 +689,11 @@ impl TcpStream {
 
     pub(crate) fn peer(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    pub(crate) fn backlog_push_shared(&mut self, header: &[u8; FRAME_HEADER_SIZE], payload: &[u8]) {
+        let v = self.alloc_shared_vec(header, payload);
+        self.send_backlog.push_back(v);
     }
 }
 
