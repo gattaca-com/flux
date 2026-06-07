@@ -464,17 +464,6 @@ impl TcpStream {
         }
     }
 
-    #[inline]
-    pub(crate) fn has_backlog(&self) -> bool {
-        !self.send_backlog.is_empty()
-    }
-
-    /// Number of framed messages waiting in the send backlog.
-    #[inline]
-    pub(crate) fn backlog_len(&self) -> usize {
-        self.send_backlog.len()
-    }
-
     /// Flush queued data until kernel blocks, queue empty or we've written the
     /// max bytes per iter.
     /// returns connstate and whether it should be deregistered from writable
