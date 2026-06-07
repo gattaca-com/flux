@@ -434,7 +434,11 @@ impl TcpStream {
     /// Backlog allocation for the shared-frame path. Mirrors [`alloc_vec`] but
     /// sources the frame from borrowed slices rather than `self.send_buf`.
     #[inline]
-    pub(crate) fn alloc_shared_vec(&mut self, header: &[u8; FRAME_HEADER_SIZE], payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn alloc_shared_vec(
+        &mut self,
+        header: &[u8; FRAME_HEADER_SIZE],
+        payload: &[u8],
+    ) -> Vec<u8> {
         if self.timers.is_some() {
             let t0 = Nanos::now();
             let v = build_frame_vec(header, payload);
@@ -691,12 +695,15 @@ impl TcpStream {
         self.peer_addr
     }
 
-    pub(crate) fn backlog_push_shared(&mut self, header: &[u8; FRAME_HEADER_SIZE], payload: &[u8])  {
+    pub(crate) fn backlog_push_shared(&mut self, header: &[u8; FRAME_HEADER_SIZE], payload: &[u8]) {
         let v = self.alloc_shared_vec(header, payload);
         self.send_backlog.push_back(v);
     }
 
-    pub(crate) fn backlog_push<F>(&mut self, serialise: F) where F: Fn(&mut Vec<u8>) {
+    pub(crate) fn backlog_push<F>(&mut self, serialise: F)
+    where
+        F: Fn(&mut Vec<u8>),
+    {
         self.serialise_frame(serialise);
         let data = self.alloc_vec(0);
         self.send_backlog.push_back(data);

@@ -181,7 +181,7 @@ impl ConnectionManager {
                 ConnectionVariant::Listener(_tcp_listener) => {}
             }
         }
-        for (_, c) in &mut self.to_be_reconnected  {
+        for (_, c) in &mut self.to_be_reconnected {
             let ConnectionVariant::Outbound(tcp) = c else {
                 unreachable!("only outbound should be auto reconnected");
             };
@@ -212,7 +212,9 @@ impl ConnectionManager {
                             "cannot write to listener bound to token {token:?}, what are you doing"
                         ),
                     }
-                } else if let Some(c) = self.to_be_reconnected.iter_mut().find_map(|(t, c)| (*t == token).then_some(c)){
+                } else if let Some(c) =
+                    self.to_be_reconnected.iter_mut().find_map(|(t, c)| (*t == token).then_some(c))
+                {
                     let ConnectionVariant::Outbound(c) = c else {
                         unreachable!("only outbounds can be in to be reconnected");
                     };
