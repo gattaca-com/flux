@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
-use flux_timing::{Duration, Instant, Nanos, Repeater};
+use flux_timing::{Duration, Nanos, Repeater};
 use flux_utils::{DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
@@ -208,46 +208,6 @@ impl ConnectionManager {
                     }
                 } else {
                     error!("tcp sending: unknown token {token:?}");
-                }
-            }
-        }
-    }
-
-    fn flush_backlogs(&mut self) {
-        let now = Instant::now();
-        let mut i = self.conns.len();
-        while i != 0 {
-            i -= 1;
-            let (token, ref mut variant) = self.conns[i];
-            let stream = match variant {
-                ConnectionVariant::Outbound(s) | ConnectionVariant::Inbound(s) => s,
-                ConnectionVariant::Listener(_) => continue,
-            };
-            if stream.has_backlog() {
-                if stream.drain_backlog(self.poll.registry()) == ConnState::Disconnected {
-                    self.disconnect_at_index_pending(i);
-                    continue;
-                }
-                if let Some((max, timeout)) = self.max_backlog {
-                    let len = stream.backlog_len();
-                    if len > max {
-                        // Start or continue the exceeded-since timer.
-                        let since = *stream.backlog_exceeded_since.get_or_insert(now);
-                        let elapsed = now.saturating_sub(since);
-                        if elapsed >= timeout {
-                            warn!(
-                                ?token,
-                                backlog = len,
-                                max,
-                                ?elapsed,
-                                "backlog exceeded limit for too long, disconnecting"
-                            );
-                            self.disconnect_at_index_pending(i);
-                        }
-                    } else {
-                        // Back below threshold — reset the timer.
-                        stream.backlog_exceeded_since = None;
-                    }
                 }
             }
         }
@@ -713,7 +673,6 @@ impl TcpConnector {
             o = true;
             self.conn_mgr.handle_event(e, &mut handler);
         }
-        self.conn_mgr.flush_backlogs();
         o |= self.conn_mgr.drain_pending_disconnects(&mut handler);
         o
     }
@@ -747,7 +706,6 @@ impl TcpConnector {
             o = true;
             self.conn_mgr.handle_event_produce(e, produce, &mut on_msg);
         }
-        self.conn_mgr.flush_backlogs();
         o |= self.conn_mgr.drain_pending_disconnects(&mut |event| {
             let _ = on_msg(event);
         });
