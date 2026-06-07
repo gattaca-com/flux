@@ -211,15 +211,45 @@ fn dead_pid_slot_reclaimed() {
     let cursor = header.find_or_insert_group(dead_pid_label);
     unsafe { &*cursor }.store(42, Ordering::Relaxed);
 
-    assert_eq!(header.active_groups().len(), 1);
+    assert!(header.active_groups().is_empty());
 
-    // Requesting a new group should reclaim the dead-PID slot once all empty
-    // slots are exhausted.  But because the first 255 slots are empty, the
-    // new label will simply take one of those.  To actually test reclamation,
-    // fill ALL slots first with dead-PID labels, then insert a new key.
-    // Instead, verify that the dead-PID slot is still there (not reclaimed
-    // unnecessarily) and that a new group takes an empty slot first.
-    let new_cursor = header.find_or_insert_group("app[1].new.broadcast");
-    assert_ne!(cursor, new_cursor);
-    assert_eq!(header.active_groups().len(), 2);
+    let new_cursor = header.find_or_insert_group("app.new.broadcast");
+    assert_eq!(cursor, new_cursor);
+
+    let groups = header.active_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].0, "app.new.broadcast");
+}
+
+#[test]
+fn max_writable_msgs_matches_safe_writes_before_overwrite() {
+    for typ in [QueueType::SPMC, QueueType::MPMC] {
+        let q = Queue::new(8, typ);
+        let mut p = Producer::from(q);
+        let mut c = ConsumerBare::new_broadcast_test(q);
+        let mut m = 0;
+
+        for i in 0..5 {
+            p.produce(&i);
+        }
+        for i in 0..2 {
+            c.try_consume(&mut m).unwrap();
+            assert_eq!(m, i);
+        }
+
+        let writable = p.max_writable_msgs_without_speeding_past();
+        assert_eq!(writable, 5);
+
+        for i in 5..5 + writable {
+            p.produce(&i);
+        }
+        assert_eq!(p.max_writable_msgs_without_speeding_past(), 0);
+
+        for i in 2..10 {
+            c.try_consume(&mut m).unwrap();
+            assert_eq!(m, i);
+        }
+
+        assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
+    }
 }
