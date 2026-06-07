@@ -344,8 +344,6 @@ impl TcpStream {
 
         if !self.send_backlog.is_empty() {
             if self.drain_backlog(registry) == ConnState::Disconnected {
-                let data = self.alloc_vec(0);
-                self.enqueue_back(registry, data);
                 return ConnState::Disconnected;
             }
             if !self.send_backlog.is_empty() {
@@ -397,8 +395,6 @@ impl TcpStream {
     ) -> ConnState {
         if !self.send_backlog.is_empty() {
             if self.drain_backlog(registry) == ConnState::Disconnected {
-                let data = self.alloc_shared_vec(header, payload);
-                self.enqueue_back(registry, data);
                 return ConnState::Disconnected;
             }
             if !self.send_backlog.is_empty() {
@@ -698,15 +694,6 @@ impl TcpStream {
     pub(crate) fn backlog_push_shared(&mut self, header: &[u8; FRAME_HEADER_SIZE], payload: &[u8]) {
         let v = self.alloc_shared_vec(header, payload);
         self.send_backlog.push_back(v);
-    }
-
-    pub(crate) fn backlog_push<F>(&mut self, serialise: F)
-    where
-        F: Fn(&mut Vec<u8>),
-    {
-        self.serialise_frame(serialise);
-        let data = self.alloc_vec(0);
-        self.send_backlog.push_back(data);
     }
 }
 

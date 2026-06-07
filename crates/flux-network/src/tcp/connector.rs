@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
-use flux_timing::{Duration, Nanos, Repeater};
+use flux_timing::{Duration, Instant, Nanos, Repeater};
 use flux_utils::{DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
@@ -163,29 +163,94 @@ impl ConnectionManager {
         }
         write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
 
+        let max_backlog = self.max_backlog;
+        for (_, c) in &mut self.to_be_reconnected {
+            let ConnectionVariant::Outbound(tcp) = c else {
+                unreachable!("only outbound should be auto reconnected");
+            };
+            Self::push_reconnect_backlog_shared(
+                max_backlog,
+                tcp,
+                &self.bcast_header,
+                &self.bcast_payload,
+            );
+        }
+
         let mut i = self.conns.len();
         while i != 0 {
             i -= 1;
             match &mut self.conns[i].1 {
                 ConnectionVariant::Outbound(tcp_connection) |
                 ConnectionVariant::Inbound(tcp_connection) => {
-                    if tcp_connection.write_or_enqueue_shared(
+                    let state = tcp_connection.write_or_enqueue_shared(
                         self.poll.registry(),
                         &self.bcast_header,
                         &self.bcast_payload,
-                    ) == ConnState::Disconnected
-                    {
+                    );
+                    if state == ConnState::Disconnected {
+                        let token = self.conns[i].0;
+                        self.disconnect_at_index_pending(i);
+                        if let Some((_, ConnectionVariant::Outbound(tcp))) =
+                            self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
+                        {
+                            Self::push_reconnect_backlog_shared(
+                                max_backlog,
+                                tcp,
+                                &self.bcast_header,
+                                &self.bcast_payload,
+                            );
+                        }
+                    } else if Self::active_backlog_exceeded(max_backlog, tcp_connection) {
                         self.disconnect_at_index_pending(i);
                     }
                 }
                 ConnectionVariant::Listener(_tcp_listener) => {}
             }
         }
-        for (_, c) in &mut self.to_be_reconnected {
-            let ConnectionVariant::Outbound(tcp) = c else {
-                unreachable!("only outbound should be auto reconnected");
-            };
-            tcp.backlog_push_shared(&self.bcast_header, &self.bcast_payload);
+    }
+
+    #[inline]
+    fn backlog_exceeded(
+        max_backlog: Option<(usize, Duration)>,
+        tcp: &mut TcpStream,
+        additional_messages: usize,
+    ) -> bool {
+        let Some((max, timeout)) = max_backlog else { return false };
+        if tcp.send_backlog.len().saturating_add(additional_messages) <= max {
+            tcp.backlog_exceeded_since = None;
+            return false;
+        }
+
+        let now = Instant::now();
+        let since = tcp.backlog_exceeded_since.get_or_insert(now);
+        now.saturating_sub(*since) >= timeout
+    }
+
+    #[inline]
+    fn reconnect_backlog_accepts(
+        max_backlog: Option<(usize, Duration)>,
+        tcp: &mut TcpStream,
+    ) -> bool {
+        !Self::backlog_exceeded(max_backlog, tcp, 1)
+    }
+
+    #[inline]
+    fn active_backlog_exceeded(
+        max_backlog: Option<(usize, Duration)>,
+        tcp: &mut TcpStream,
+    ) -> bool {
+        Self::backlog_exceeded(max_backlog, tcp, 0)
+    }
+
+    #[inline]
+    fn push_reconnect_backlog_shared(
+        max_backlog: Option<(usize, Duration)>,
+        tcp: &mut TcpStream,
+        header: &[u8; FRAME_HEADER_SIZE],
+        payload: &[u8],
+    ) {
+        if Self::reconnect_backlog_accepts(max_backlog, tcp) {
+            tcp.backlog_push_shared(header, payload);
         }
     }
 
@@ -197,14 +262,39 @@ impl ConnectionManager {
         match where_to {
             SendBehavior::Broadcast => self.broadcast(&serialise),
             SendBehavior::Single(token) => {
+                self.bcast_payload.clear();
+                serialise(&mut self.bcast_payload);
+                if self.bcast_payload.is_empty() {
+                    return;
+                }
+                write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
+
                 if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
                     match &mut self.conns[i].1 {
                         ConnectionVariant::Outbound(tcp_connection) |
                         ConnectionVariant::Inbound(tcp_connection) => {
-                            if tcp_connection.write_or_enqueue_with(self.poll.registry(), serialise) ==
-                                ConnState::Disconnected
-                            {
+                            let state = tcp_connection.write_or_enqueue_shared(
+                                self.poll.registry(),
+                                &self.bcast_header,
+                                &self.bcast_payload,
+                            );
+                            if state == ConnState::Disconnected {
                                 tracing::warn!("issue when writing to {token:?} disconnecting");
+                                self.disconnect_at_index_pending(i);
+                                if let Some((_, ConnectionVariant::Outbound(tcp))) =
+                                    self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
+                                {
+                                    Self::push_reconnect_backlog_shared(
+                                        self.max_backlog,
+                                        tcp,
+                                        &self.bcast_header,
+                                        &self.bcast_payload,
+                                    );
+                                }
+                            } else if Self::active_backlog_exceeded(
+                                self.max_backlog,
+                                tcp_connection,
+                            ) {
                                 self.disconnect_at_index_pending(i);
                             }
                         }
@@ -212,13 +302,16 @@ impl ConnectionManager {
                             "cannot write to listener bound to token {token:?}, what are you doing"
                         ),
                     }
-                } else if let Some(c) =
-                    self.to_be_reconnected.iter_mut().find_map(|(t, c)| (*t == token).then_some(c))
+                } else if let Some((_, ConnectionVariant::Outbound(tcp))) =
+                    self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                 {
-                    let ConnectionVariant::Outbound(c) = c else {
-                        unreachable!("only outbounds can be in to be reconnected");
-                    };
-                    c.backlog_push(serialise);
+                    Self::push_reconnect_backlog_shared(
+                        self.max_backlog,
+                        tcp,
+                        &self.bcast_header,
+                        &self.bcast_payload,
+                    );
+                } else {
                     error!("tcp sending: unknown token {token:?}");
                 }
             }
@@ -646,12 +739,10 @@ impl TcpConnector {
     /// Sets the maximum send backlog (in framed messages) and how long it must
     /// stay exceeded before a connection is automatically disconnected.
     ///
-    /// Checked after each `flush_backlogs` pass.  If a connection's backlog
-    /// exceeds `max` continuously for longer than `timeout`, the connection
-    /// is closed:
-    /// - **Outbound:** scheduled for automatic reconnection (backlog preserved
-    ///   for retry).  The exceeded-since timer resets on reconnect.
-    /// - **Inbound:** simply dropped (remote must reconnect).
+    /// Active connections are closed once their backlog exceeds `max` for
+    /// `timeout`. If a disconnected outbound connection's backlog would exceed
+    /// that same limit, additional messages are dropped until reconnect
+    /// succeeds. The exceeded-since timer resets on reconnect.
     pub fn with_max_backlog(mut self, max: usize, timeout: Duration) -> Self {
         self.conn_mgr.max_backlog = Some((max, timeout));
         self
