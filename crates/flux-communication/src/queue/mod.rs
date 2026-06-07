@@ -162,33 +162,27 @@ impl QueueHeader {
 
         self.acquire_group_lock();
 
-        // 1. Exact match — reuse the existing slot
         for i in 0..MAX_GROUPS {
+            // 1. Exact match — reuse the existing slot
             if self.group_labels[i] == key {
                 self.release_group_lock();
                 return &raw const self.group_cursors[i].cursor;
             }
-        }
-
-        // 2. Empty slot
-        for i in 0..MAX_GROUPS {
+            // 2. Empty slot
             if self.group_labels[i] == ArrayStr::<GROUP_LABEL_LEN>::new() {
                 self.group_labels[i] = key;
                 self.group_cursors[i].cursor.store(0, Ordering::Relaxed);
                 self.release_group_lock();
                 return &raw const self.group_cursors[i].cursor;
             }
-        }
-
-        // 3. Slot owned by a dead process — reclaim it
-        for i in 0..MAX_GROUPS {
-            if let Some(pid) = pid_from_label(self.group_labels[i].as_str()) {
-                if !is_pid_alive(pid) {
-                    self.group_labels[i] = key;
-                    self.group_cursors[i].cursor.store(0, Ordering::Relaxed);
-                    self.release_group_lock();
-                    return &raw const self.group_cursors[i].cursor;
-                }
+            // 3. Slot owned by a dead process — reclaim it
+            if let Some(pid) = pid_from_label(self.group_labels[i].as_str()) &&
+                !is_pid_alive(pid)
+            {
+                self.group_labels[i] = key;
+                self.group_cursors[i].cursor.store(0, Ordering::Relaxed);
+                self.release_group_lock();
+                return &raw const self.group_cursors[i].cursor;
             }
         }
 
@@ -214,13 +208,36 @@ impl QueueHeader {
                 return out;
             }
 
-            if !label.is_empty() {
+            if !label.is_empty() &&
+                pid_from_label(self.group_labels[i].as_str()).is_none_or(is_pid_alive)
+            {
                 let label = label.as_str();
                 let cursor = self.group_cursors[i].cursor.load(Ordering::Relaxed);
                 out.push((label, cursor));
             }
         }
         out
+    }
+
+    pub fn max_writable_msgs_without_speeding_past(&self) -> usize {
+        let mut min_cursor = self.count.load(Ordering::Relaxed);
+        for i in 0..MAX_GROUPS {
+            let label = &self.group_labels[i];
+
+            // Guard: if the stored length exceeds the fixed-size buffer the
+            // memory is uninitialised / from an incompatible header layout.
+            if label.len() > GROUP_LABEL_LEN {
+                return self.len();
+            }
+
+            if !label.is_empty() &&
+                pid_from_label(self.group_labels[i].as_str()).is_none_or(is_pid_alive)
+            {
+                min_cursor =
+                    min_cursor.min(self.group_cursors[i].cursor.load(Ordering::Relaxed) - 1);
+            }
+        }
+        self.len().saturating_sub(self.count.load(Ordering::Relaxed).saturating_sub(min_cursor))
     }
 }
 
@@ -508,6 +525,9 @@ impl<T: Copy> InnerQueue<T> {
         unsafe { (&*v).validate(len) }?;
         Ok(v)
     }
+    pub fn max_writable_msgs_without_speeding_past(&self) -> usize {
+        self.header.max_writable_msgs_without_speeding_past()
+    }
 }
 
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -596,6 +616,10 @@ impl<T: Copy> Queue<T> {
         let head = self.count();
         unsafe { (*cursor).fetch_max(head, Ordering::Relaxed) };
     }
+
+    pub fn active_groups(&self) -> Vec<(&str, usize)> {
+        self.header.active_groups()
+    }
 }
 
 unsafe impl<T> Send for Queue<T> {}
@@ -643,6 +667,9 @@ impl<T: Copy> Producer<T> {
         } else {
             self.queue.produce(msg)
         }
+    }
+    pub fn max_writable_msgs_without_speeding_past(&self) -> usize {
+        self.queue.max_writable_msgs_without_speeding_past()
     }
 
     #[inline]
