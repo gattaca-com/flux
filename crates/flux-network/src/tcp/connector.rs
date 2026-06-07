@@ -181,6 +181,12 @@ impl ConnectionManager {
                 ConnectionVariant::Listener(_tcp_listener) => {}
             }
         }
+        for (_, c) in &mut self.to_be_reconnected  {
+            let ConnectionVariant::Outbound(tcp) = c else {
+                unreachable!("only outbound should be auto reconnected");
+            };
+            tcp.backlog_push_shared(&self.bcast_header, &self.bcast_payload);
+        }
     }
 
     #[inline]
@@ -206,7 +212,11 @@ impl ConnectionManager {
                             "cannot write to listener bound to token {token:?}, what are you doing"
                         ),
                     }
-                } else {
+                } else if let Some(c) = self.to_be_reconnected.iter_mut().find_map(|(t, c)| (*t == token).then_some(c)){
+                    let ConnectionVariant::Outbound(c) = c else {
+                        unreachable!("only outbounds can be in to be reconnected");
+                    };
+                    c.backlog_push(serialise);
                     error!("tcp sending: unknown token {token:?}");
                 }
             }
