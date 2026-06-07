@@ -162,12 +162,14 @@ impl QueueHeader {
 
         self.acquire_group_lock();
 
+        // 1. Exact match — reuse the existing slot
         for i in 0..MAX_GROUPS {
-            // 1. Exact match — reuse the existing slot
             if self.group_labels[i] == key {
                 self.release_group_lock();
                 return &raw const self.group_cursors[i].cursor;
             }
+        }
+        for i in 0..MAX_GROUPS {
             // 2. Empty slot
             if self.group_labels[i] == ArrayStr::<GROUP_LABEL_LEN>::new() {
                 self.group_labels[i] = key;
@@ -233,8 +235,8 @@ impl QueueHeader {
             if !label.is_empty() &&
                 pid_from_label(self.group_labels[i].as_str()).is_none_or(is_pid_alive)
             {
-                min_cursor =
-                    min_cursor.min(self.group_cursors[i].cursor.load(Ordering::Relaxed) - 1);
+                min_cursor = min_cursor
+                    .min(self.group_cursors[i].cursor.load(Ordering::Relaxed).saturating_sub(1));
             }
         }
         self.len().saturating_sub(self.count.load(Ordering::Relaxed).saturating_sub(min_cursor))
