@@ -31,6 +31,12 @@ tempfile.workspace = true
 
 [features]
 default = []
+# Per-loop instructions-retired + CPU-cycle counting via perf_event + rdpmc,
+# emitted on a separate tileperf-{tile} queue. Self-monitoring requires
+# kernel.perf_event_paranoid <= 2:
+#   sudo sysctl kernel.perf_event_paranoid=2
+# (persist via /etc/sysctl.d/). Disabled with a warn at runtime otherwise.
+instr-count = []
 wincode = [
     "dep:wincode",
     "dep:wincode-derive",

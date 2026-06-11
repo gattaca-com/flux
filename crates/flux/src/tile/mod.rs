@@ -1,3 +1,5 @@
+#[cfg(feature = "instr-count")]
+pub mod instr;
 pub mod metrics;
 
 use core::sync::atomic::Ordering;
@@ -81,10 +83,18 @@ where
     } else {
         None
     };
+    #[cfg(feature = "instr-count")]
+    let perf_file = TileMetrics::perf_file(spine.spine.base_dir(), S::app_name(), tile.name());
 
     spine.scope.spawn(move || {
         let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
         thread_boot(config.core, config.thread_prio);
+
+        // perf pid=0 events bind to the opening thread — must run here.
+        #[cfg(feature = "instr-count")]
+        if let Some(m) = &mut metrics {
+            m.init_hw_counters(&perf_file);
+        }
 
         while !tile.try_init(&mut adapter) {
             if stop_flag.load(Ordering::Relaxed) != 0 {
