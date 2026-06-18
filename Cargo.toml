@@ -55,7 +55,7 @@ bitflags = { version = "2.6.0", features = ["serde"] }
 crossterm = "0.28.1"
 strum = { features = ["derive"], version = "0.26.1" }
 indexmap = { features = ["serde"], version = "2.11.1" }
-wincode = "0.4"
+wincode = "0.5"
 wincode-derive = "0.4"
 bytes = "1"
 mio = { version = "1.1.1", features = ["net", "os-poll"] }
