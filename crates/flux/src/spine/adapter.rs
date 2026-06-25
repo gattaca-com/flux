@@ -1,6 +1,6 @@
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
@@ -59,14 +59,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
 
     #[cfg(feature = "park")]
     #[inline]
-    pub fn register_waker(&self, waker: mio::Waker) -> u64 {
+    pub fn register_waker(&self, waker: mio::Waker) {
         crate::park::SIGNAL.register_waker(waker)
-    }
-
-    #[cfg(feature = "park")]
-    #[inline]
-    pub fn unregister_waker(&self, id: u64) {
-        crate::park::SIGNAL.unregister_waker(id);
     }
 
     /// Called by `attach_tile` before each `loop_body`.

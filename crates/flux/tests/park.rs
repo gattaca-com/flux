@@ -1,10 +1,10 @@
 #[cfg(feature = "park")]
 mod tests {
-    use std::sync::Arc;
+    use flux::park::Signal;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use flux::park::Signal;
 
     #[test]
     fn test_park_unpark() {
@@ -52,7 +52,7 @@ mod tests {
         let mut poll = mio::Poll::new().unwrap();
         let waker = mio::Waker::new(poll.registry(), mio::Token(42)).unwrap();
 
-        let id = signal.register_waker(waker);
+        signal.register_waker(waker);
 
         signal.signal();
 
@@ -67,7 +67,5 @@ mod tests {
         }
 
         assert!(found, "mio waker was not woken");
-
-        signal.unregister_waker(id);
     }
 }
