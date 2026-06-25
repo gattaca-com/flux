@@ -130,6 +130,10 @@ where
         }
 
         tile.teardown(&mut adapter);
+
+        #[cfg(feature = "park")]
+        crate::park::SIGNAL.signal();
+
         info!("Tile teardown complete");
     });
 }
