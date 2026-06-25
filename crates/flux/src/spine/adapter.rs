@@ -52,7 +52,21 @@ impl<S: FluxSpine> SpineAdapter<S> {
     pub fn request_stop_scope(&self) {
         if let Some(f) = &self.stop_flag {
             f.store(SIGINT as usize, Ordering::Relaxed);
+            #[cfg(feature = "park")]
+            crate::park::SIGNAL.signal();
         }
+    }
+
+    #[cfg(feature = "park")]
+    #[inline]
+    pub fn register_waker(&self, waker: mio::Waker) -> u64 {
+        crate::park::SIGNAL.register_waker(waker)
+    }
+
+    #[cfg(feature = "park")]
+    #[inline]
+    pub fn unregister_waker(&self, id: u64) {
+        crate::park::SIGNAL.unregister_waker(id);
     }
 
     /// Called by `attach_tile` before each `loop_body`.

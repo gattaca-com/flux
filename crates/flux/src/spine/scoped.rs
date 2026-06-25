@@ -43,6 +43,8 @@ fn setup_panic_hook(
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         stop_flag.store(SIGINT as usize, Ordering::Relaxed);
+        #[cfg(feature = "park")]
+        crate::park::SIGNAL.signal();
         if let Some(on_panic) = &on_panic {
             on_panic(panic_info);
         }

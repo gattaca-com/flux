@@ -700,6 +700,7 @@ impl TcpStream {
 /// Set `TCP_USER_TIMEOUT` on a mio `TcpStream`.
 /// After this duration of unacknowledged data the kernel closes the connection,
 /// overriding the system-wide `tcp_retries2` (~15 min default) for this socket.
+#[cfg(target_os = "linux")]
 pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -712,6 +713,12 @@ pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
             core::mem::size_of::<u32>() as libc::socklen_t,
         );
     }
+}
+
+/// Set `TCP_USER_TIMEOUT` on a mio `TcpStream`. Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_user_timeout(_stream: &mio::net::TcpStream, _timeout_ms: u32) {
+    // TCP_USER_TIMEOUT is not supported on non-Linux platforms.
 }
 
 /// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a mio `TcpStream`.

@@ -5,6 +5,9 @@ pub mod spine;
 pub mod tile;
 mod timer;
 
+#[cfg(feature = "park")]
+pub mod park;
+
 pub use core_affinity;
 pub use flux_communication as communication;
 pub use flux_timing as timing;
