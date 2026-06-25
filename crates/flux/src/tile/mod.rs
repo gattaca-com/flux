@@ -122,7 +122,7 @@ where
 
             #[cfg(feature = "park")]
             {
-                if !worked {
+                if !worked && !adapter.waker_registered() {
                     crate::park::SIGNAL.park(expected);
                 }
                 expected = crate::park::SIGNAL.read_counter();
