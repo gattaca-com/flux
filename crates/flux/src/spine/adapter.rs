@@ -129,6 +129,21 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
+    pub fn consume_n<T, F>(&mut self, mut n: usize, mut f: F)
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        S::Producers: SpineProducers,
+        F: FnMut(T, &mut S::Producers),
+    {
+        let c = self.consumers.as_mut();
+        while n > 0 && c.consume(&mut self.producers, &mut f) {
+            n -= 1;
+            self.did_work = true;
+        }
+    }
+
+    #[inline]
     pub fn consume_maybe_track<T, F>(&mut self, mut f: F)
     where
         T: 'static + Copy,
