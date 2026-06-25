@@ -24,6 +24,7 @@ tracing.workspace = true
 zstd.workspace = true
 wincode = { workspace = true, optional = true }
 wincode-derive = { workspace = true, optional = true }
+mio = { workspace = true, optional = true }
 
 [dev-dependencies]
 shared_memory.workspace = true
@@ -36,6 +37,9 @@ wincode = [
     "dep:wincode-derive",
     "flux-utils/wincode",
     "flux-timing/wincode",
+]
+park = [
+    "dep:mio",
 ]
 
 [lints]

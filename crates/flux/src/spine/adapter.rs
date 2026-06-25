@@ -1,6 +1,6 @@
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use flux_timing::{IngestionTime, InternalMessage};
@@ -21,6 +21,8 @@ pub struct SpineAdapter<S: FluxSpine> {
     pub producers: S::Producers,
     pub stop_flag: Option<Arc<AtomicUsize>>,
     did_work: bool,
+    #[cfg(feature = "park")]
+    waker_registered: bool,
 }
 
 impl<S: FluxSpine> SpineAdapter<S> {
@@ -31,6 +33,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
             producers: spine.attach_producers(tile),
             stop_flag: None,
             did_work: false,
+            #[cfg(feature = "park")]
+            waker_registered: false,
         }
     }
 
@@ -45,6 +49,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
             producers: spine.attach_producers(tile),
             stop_flag: Some(stop_flag),
             did_work: false,
+            #[cfg(feature = "park")]
+            waker_registered: false,
         }
     }
 
@@ -52,7 +58,22 @@ impl<S: FluxSpine> SpineAdapter<S> {
     pub fn request_stop_scope(&self) {
         if let Some(f) = &self.stop_flag {
             f.store(SIGINT as usize, Ordering::Relaxed);
+            #[cfg(feature = "park")]
+            crate::park::SIGNAL.signal();
         }
+    }
+
+    #[cfg(feature = "park")]
+    #[inline]
+    pub fn register_waker(&mut self, waker: mio::Waker) {
+        self.waker_registered = true;
+        crate::park::SIGNAL.register_waker(waker)
+    }
+
+    #[cfg(feature = "park")]
+    #[inline]
+    pub fn waker_registered(&self) -> bool {
+        self.waker_registered
     }
 
     /// Called by `attach_tile` before each `loop_body`.

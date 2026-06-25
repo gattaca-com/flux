@@ -96,6 +96,9 @@ where
         }
         info!(tid = get_tid(), "Tile init complete");
 
+        #[cfg(feature = "park")]
+        let mut expected = crate::park::SIGNAL.read_counter();
+
         loop {
             let ingestion_t = IngestionTime::now();
 
@@ -108,16 +111,29 @@ where
                 tile.loop_body(&mut adapter);
             });
 
+            let worked = adapter.did_work();
             if let Some(m) = &mut metrics {
-                m.end(adapter.did_work());
+                m.end(worked);
             }
 
             if stop_flag.load(Ordering::Relaxed) != 0 {
                 break;
             }
+
+            #[cfg(feature = "park")]
+            {
+                if !worked && !adapter.waker_registered() {
+                    crate::park::SIGNAL.park(expected);
+                }
+                expected = crate::park::SIGNAL.read_counter();
+            }
         }
 
         tile.teardown(&mut adapter);
+
+        #[cfg(feature = "park")]
+        crate::park::SIGNAL.signal();
+
         info!("Tile teardown complete");
     });
 }
