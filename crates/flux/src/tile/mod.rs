@@ -1,6 +1,7 @@
 pub mod metrics;
 
 use core::sync::atomic::Ordering;
+use std::thread::Builder;
 
 use flux_timing::{Duration, IngestionTime};
 use flux_utils::{ShortTypename, ThreadPriority, get_tid, short_typename, thread_boot, vsync};
@@ -82,60 +83,63 @@ where
         None
     };
 
-    spine.scope.spawn(move || {
-        let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
-        thread_boot(config.core, config.thread_prio);
+    Builder::new()
+        .name(tile.name().to_string())
+        .spawn_scoped(&spine.scope, move || {
+            let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
+            thread_boot(config.core, config.thread_prio);
 
-        while !tile.try_init(&mut adapter) {
-            if stop_flag.load(Ordering::Relaxed) != 0 {
-                tile.teardown(&mut adapter);
-                info!("Tile exited before initialisation. teardown complete");
-                return;
+            while !tile.try_init(&mut adapter) {
+                if stop_flag.load(Ordering::Relaxed) != 0 {
+                    tile.teardown(&mut adapter);
+                    info!("Tile exited before initialisation. teardown complete");
+                    return;
+                }
+                std::hint::spin_loop();
             }
-            std::hint::spin_loop();
-        }
-        info!(tid = get_tid(), "Tile init complete");
-
-        #[cfg(feature = "park")]
-        let mut expected = crate::park::SIGNAL.read_counter();
-
-        loop {
-            let ingestion_t = IngestionTime::now();
-
-            if let Some(m) = &mut metrics {
-                m.begin(ingestion_t);
-            }
-
-            vsync(config.min_loop_duration, || {
-                adapter.begin_loop(ingestion_t);
-                tile.loop_body(&mut adapter);
-            });
-
-            let worked = adapter.did_work();
-            if let Some(m) = &mut metrics {
-                m.end(worked);
-            }
-
-            if stop_flag.load(Ordering::Relaxed) != 0 {
-                break;
-            }
+            info!(tid = get_tid(), "Tile init complete");
 
             #[cfg(feature = "park")]
-            {
-                if !worked && !adapter.waker_registered() {
-                    crate::park::SIGNAL.park(expected);
+            let mut expected = crate::park::SIGNAL.read_counter();
+
+            loop {
+                let ingestion_t = IngestionTime::now();
+
+                if let Some(m) = &mut metrics {
+                    m.begin(ingestion_t);
                 }
-                expected = crate::park::SIGNAL.read_counter();
+
+                vsync(config.min_loop_duration, || {
+                    adapter.begin_loop(ingestion_t);
+                    tile.loop_body(&mut adapter);
+                });
+
+                let worked = adapter.did_work();
+                if let Some(m) = &mut metrics {
+                    m.end(worked);
+                }
+
+                if stop_flag.load(Ordering::Relaxed) != 0 {
+                    break;
+                }
+
+                #[cfg(feature = "park")]
+                {
+                    if !worked && !adapter.waker_registered() {
+                        crate::park::SIGNAL.park(expected);
+                    }
+                    expected = crate::park::SIGNAL.read_counter();
+                }
             }
-        }
 
-        tile.teardown(&mut adapter);
+            tile.teardown(&mut adapter);
 
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
+            #[cfg(feature = "park")]
+            crate::park::SIGNAL.signal();
 
-        info!("Tile teardown complete");
-    });
+            info!("Tile teardown complete");
+        })
+        .expect("failed to spawn scoped tile thread");
 }
 
 #[derive(Clone, Copy, Debug)]

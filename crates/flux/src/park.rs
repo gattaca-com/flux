@@ -1,9 +1,11 @@
-use std::cell::UnsafeCell;
-use std::hint::spin_loop;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 #[cfg(not(target_os = "linux"))]
 use std::sync::Mutex;
+use std::{
+    cell::UnsafeCell,
+    hint::spin_loop,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+};
 
 use mio::Waker;
 
@@ -13,8 +15,8 @@ struct WakerSlot {
     waker: UnsafeCell<MaybeUninit<Waker>>,
 }
 
-// SAFETY: a slot is written at most once before publication, then only read through shared
-// references until `Signal` is dropped with exclusive access.
+// SAFETY: a slot is written at most once before publication, then only read
+// through shared references until `Signal` is dropped with exclusive access.
 unsafe impl Sync for WakerSlot {}
 
 impl WakerSlot {
@@ -30,8 +32,8 @@ impl WakerSlot {
     }
 
     unsafe fn get(&self) -> &Waker {
-        // SAFETY: callers only read slots below `published_wakers`, which are initialized and
-        // never mutated again.
+        // SAFETY: callers only read slots below `published_wakers`, which are
+        // initialized and never mutated again.
         unsafe { &*(*self.waker.get()).as_ptr() }
     }
 
@@ -76,8 +78,9 @@ impl Signal {
         self.counter.load(Ordering::Acquire)
     }
 
-    /// Signal the sticky event. Increment the counter, wake all parked threads via
-    /// FUTEX_WAKE (on Linux) or Condvar (on non-Linux), and wake all registered mio Wakers.
+    /// Signal the sticky event. Increment the counter, wake all parked threads
+    /// via FUTEX_WAKE (on Linux) or Condvar (on non-Linux), and wake all
+    /// registered mio Wakers.
     pub fn signal(&self) {
         self.counter.fetch_add(1, Ordering::Release);
 
@@ -105,8 +108,9 @@ impl Signal {
 
         let published_wakers = self.published_wakers.load(Ordering::Acquire);
         for slot in &self.wakers[..published_wakers] {
-            // SAFETY: `published_wakers` is only advanced after slots in the initialized prefix
-            // have been written, and initialized slots are never mutated again.
+            // SAFETY: `published_wakers` is only advanced after slots in the initialized
+            // prefix have been written, and initialized slots are never mutated
+            // again.
             let waker = unsafe { slot.get() };
             if let Err(e) = waker.wake() {
                 tracing::warn!("Failed to wake mio waker: {e}");
@@ -114,7 +118,8 @@ impl Signal {
         }
     }
 
-    /// Park the current thread if the atomic counter is still equal to `expected`.
+    /// Park the current thread if the atomic counter is still equal to
+    /// `expected`.
     pub fn park(&self, expected: u32) {
         #[cfg(target_os = "linux")]
         {
@@ -140,7 +145,8 @@ impl Signal {
         }
     }
 
-    /// Register a `mio::Waker` instance. It will be woken whenever `signal` is called.
+    /// Register a `mio::Waker` instance. It will be woken whenever `signal` is
+    /// called.
     ///
     /// # Panics
     ///
