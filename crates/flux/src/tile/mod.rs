@@ -82,7 +82,8 @@ where
         None
     };
 
-    spine.scope.spawn(move || {
+    let name = tile.name();
+    let run = move || {
         let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
         thread_boot(config.core, config.thread_prio);
 
@@ -135,7 +136,16 @@ where
         crate::park::SIGNAL.signal();
 
         info!("Tile teardown complete");
-    });
+    };
+
+    if name.as_str().is_empty() {
+        spine.scope.spawn(run);
+    } else {
+        std::thread::Builder::new()
+            .name(name.as_str().to_owned())
+            .spawn_scoped(spine.scope, run)
+            .expect("spawn tile thread");
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
