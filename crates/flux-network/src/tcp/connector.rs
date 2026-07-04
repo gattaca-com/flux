@@ -69,6 +69,7 @@ struct ConnectionManager {
     /// longer than `timeout` are disconnected (outbound scheduled for
     /// reconnection).
     max_backlog: Option<(usize, Duration)>,
+    drop_outbound_backlog_on_disconnect: bool,
     /// Whether to set `TCP_NODELAY` on sockets (disables Nagle's algorithm).
     nodelay: bool,
 
@@ -97,6 +98,7 @@ impl Default for ConnectionManager {
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             dcache: None,
             max_backlog: None,
+            drop_outbound_backlog_on_disconnect: false,
             nodelay: true,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
@@ -125,6 +127,9 @@ impl ConnectionManager {
         match stream {
             ConnectionVariant::Outbound(mut tcp_connection) => {
                 tcp_connection.close(self.poll.registry());
+                if self.drop_outbound_backlog_on_disconnect {
+                    tcp_connection.clear_send_backlog();
+                }
                 self.to_be_reconnected.push((token, ConnectionVariant::Outbound(tcp_connection)));
             }
             ConnectionVariant::Inbound(mut tcp_connection) => {
@@ -164,24 +169,26 @@ impl ConnectionManager {
         write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
 
         let max_backlog = self.max_backlog;
-        for (_, c) in &mut self.to_be_reconnected {
-            let ConnectionVariant::Outbound(tcp) = c else {
-                unreachable!("only outbound should be auto reconnected");
-            };
-            Self::push_reconnect_backlog_shared(
-                max_backlog,
-                tcp,
-                &self.bcast_header,
-                &self.bcast_payload,
-            );
+        if !self.drop_outbound_backlog_on_disconnect {
+            for (_, c) in &mut self.to_be_reconnected {
+                let ConnectionVariant::Outbound(tcp) = c else {
+                    unreachable!("only outbound should be auto reconnected");
+                };
+                Self::push_reconnect_backlog_shared(
+                    max_backlog,
+                    tcp,
+                    &self.bcast_header,
+                    &self.bcast_payload,
+                );
+            }
         }
 
         let mut i = self.conns.len();
         while i != 0 {
             i -= 1;
             match &mut self.conns[i].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
+                ConnectionVariant::Outbound(tcp_connection)
+                | ConnectionVariant::Inbound(tcp_connection) => {
                     let state = tcp_connection.write_or_enqueue_shared(
                         self.poll.registry(),
                         &self.bcast_header,
@@ -190,8 +197,9 @@ impl ConnectionManager {
                     if state == ConnState::Disconnected {
                         let token = self.conns[i].0;
                         self.disconnect_at_index_pending(i);
-                        if let Some((_, ConnectionVariant::Outbound(tcp))) =
-                            self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
+                        if !self.drop_outbound_backlog_on_disconnect
+                            && let Some((_, ConnectionVariant::Outbound(tcp))) =
+                                self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                         {
                             Self::push_reconnect_backlog_shared(
                                 max_backlog,
@@ -271,8 +279,8 @@ impl ConnectionManager {
 
                 if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
                     match &mut self.conns[i].1 {
-                        ConnectionVariant::Outbound(tcp_connection) |
-                        ConnectionVariant::Inbound(tcp_connection) => {
+                        ConnectionVariant::Outbound(tcp_connection)
+                        | ConnectionVariant::Inbound(tcp_connection) => {
                             let state = tcp_connection.write_or_enqueue_shared(
                                 self.poll.registry(),
                                 &self.bcast_header,
@@ -281,8 +289,9 @@ impl ConnectionManager {
                             if state == ConnState::Disconnected {
                                 tracing::warn!("issue when writing to {token:?} disconnecting");
                                 self.disconnect_at_index_pending(i);
-                                if let Some((_, ConnectionVariant::Outbound(tcp))) =
-                                    self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
+                                if !self.drop_outbound_backlog_on_disconnect
+                                    && let Some((_, ConnectionVariant::Outbound(tcp))) =
+                                        self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                                 {
                                     Self::push_reconnect_backlog_shared(
                                         self.max_backlog,
@@ -305,12 +314,14 @@ impl ConnectionManager {
                 } else if let Some((_, ConnectionVariant::Outbound(tcp))) =
                     self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                 {
-                    Self::push_reconnect_backlog_shared(
-                        self.max_backlog,
-                        tcp,
-                        &self.bcast_header,
-                        &self.bcast_payload,
-                    );
+                    if !self.drop_outbound_backlog_on_disconnect {
+                        Self::push_reconnect_backlog_shared(
+                            self.max_backlog,
+                            tcp,
+                            &self.bcast_header,
+                            &self.bcast_payload,
+                        );
+                    }
                 } else {
                     error!("tcp sending: unknown token {token:?}");
                 }
@@ -328,8 +339,8 @@ impl ConnectionManager {
                 self.telemetry,
                 self.dcache.is_some(),
             );
-            if let Some(msg) = &self.on_connect_msg &&
-                tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+            if let Some(msg) = &self.on_connect_msg
+                && tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
             {
@@ -478,8 +489,8 @@ impl ConnectionManager {
 
         loop {
             match &mut self.conns[stream_id].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
+                ConnectionVariant::Outbound(tcp_connection)
+                | ConnectionVariant::Inbound(tcp_connection) => {
                     if tcp_connection.poll_with(
                         self.poll.registry(),
                         e,
@@ -523,8 +534,8 @@ impl ConnectionManager {
                             self.dcache.is_some(),
                         );
 
-                        if let Some(msg) = &self.on_connect_msg &&
-                            conn.write_or_enqueue_with(
+                        if let Some(msg) = &self.on_connect_msg
+                            && conn.write_or_enqueue_with(
                                 self.poll.registry(),
                                 |buf: &mut Vec<u8>| {
                                     buf.extend_from_slice(msg);
@@ -563,8 +574,8 @@ impl ConnectionManager {
 
         loop {
             match &mut self.conns[stream_id].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
+                ConnectionVariant::Outbound(tcp_connection)
+                | ConnectionVariant::Inbound(tcp_connection) => {
                     let dcache =
                         self.dcache.as_deref().expect("dcache required for poll_with_produce");
                     if tcp_connection.poll_with_produce(
@@ -610,8 +621,8 @@ impl ConnectionManager {
                             self.telemetry,
                             self.dcache.is_some(),
                         );
-                        if let Some(msg) = &self.on_connect_msg &&
-                            conn.write_or_enqueue_with(
+                        if let Some(msg) = &self.on_connect_msg
+                            && conn.write_or_enqueue_with(
                                 self.poll.registry(),
                                 |buf: &mut Vec<u8>| {
                                     buf.extend_from_slice(msg);
@@ -745,6 +756,15 @@ impl TcpConnector {
     /// succeeds. The exceeded-since timer resets on reconnect.
     pub fn with_max_backlog(mut self, max: usize, timeout: Duration) -> Self {
         self.conn_mgr.max_backlog = Some((max, timeout));
+        self
+    }
+
+    /// Drops queued outbound messages when a connection is moved to reconnect.
+    ///
+    /// While that outbound connection is disconnected, sends to it are also
+    /// dropped instead of being queued for replay after reconnect.
+    pub fn with_drop_outbound_backlog_on_disconnect(mut self, enabled: bool) -> Self {
+        self.conn_mgr.drop_outbound_backlog_on_disconnect = enabled;
         self
     }
 

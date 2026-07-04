@@ -687,6 +687,15 @@ impl TcpStream {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
+    pub(crate) fn clear_send_backlog(&mut self) {
+        self.send_backlog.clear();
+        self.send_buf.clear();
+        self.send_cursor = 0;
+        self.header_buf.fill(0);
+        self.writable_armed = false;
+        self.backlog_exceeded_since = None;
+    }
+
     pub(crate) fn peer(&self) -> SocketAddr {
         self.peer_addr
     }
