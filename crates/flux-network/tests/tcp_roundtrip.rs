@@ -139,3 +139,61 @@ fn backlog_disconnect_is_reported() {
     drop(client);
     assert!(disconnected, "backlog disconnect was not reported");
 }
+
+fn receive_after_reconnect(drop_backlog: bool) -> Option<TestMsg> {
+    let probe =
+        std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("probe");
+    let bind_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let mut listener = TcpConnector::default();
+    listener.listen_at(bind_addr).unwrap();
+
+    let mut client = TcpConnector::default()
+        .with_drop_outbound_backlog_on_disconnect(drop_backlog)
+        .with_reconnect_interval(flux_timing::Duration::from_millis(1));
+    let token = client.connect(bind_addr).unwrap();
+
+    let mut accepted = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while accepted == 0 && std::time::Instant::now() < deadline {
+        listener.poll_with(|event| {
+            if let PollEvent::Accept { .. } = event {
+                accepted += 1;
+            }
+        });
+        client.poll_with(|_| {});
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(accepted, 1, "listener did not accept initial client");
+
+    client.disconnect(token);
+    client.write_or_enqueue_with(SendBehavior::Single(token), |buf| {
+        wincode_ser_into_vec(buf, &TestMsg(333));
+    });
+    client.force_reconnect();
+
+    let mut recv = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while recv.is_none() && std::time::Instant::now() < deadline {
+        listener.poll_with(|event| {
+            if let PollEvent::Message { payload: bytes, .. } = event {
+                recv = Some(wincode::deserialize(bytes).unwrap());
+            }
+        });
+        client.poll_with(|_| {});
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    recv
+}
+
+#[test]
+fn disconnected_outbound_replays_backlog_by_default() {
+    assert_eq!(receive_after_reconnect(false), Some(TestMsg(333)));
+}
+
+#[test]
+fn disconnected_outbound_can_drop_backlog() {
+    assert_eq!(receive_after_reconnect(true), None);
+}
