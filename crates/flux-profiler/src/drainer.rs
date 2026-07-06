@@ -101,6 +101,10 @@ impl EventsDrainer {
         &self.meta
     }
 
+    pub fn retained_bytes(&self) -> usize {
+        self.threads.values().map(|t| t.events.retained_bytes()).sum()
+    }
+
     pub fn fxt_trace(&self) -> Vec<u8> {
         fxt::trace(self.threads(), &self.meta)
     }
@@ -125,6 +129,12 @@ impl EventsData {
 
     fn last_samples(&self) -> (Option<PerfSample>, Option<AllocSample>) {
         (self.perf.last().copied(), self.alloc.last().copied())
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.marks.capacity() * size_of::<Mark>() +
+            self.perf.capacity() * size_of::<PerfSample>() +
+            self.alloc.capacity() * size_of::<AllocSample>()
     }
 }
 

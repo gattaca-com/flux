@@ -47,11 +47,19 @@ If exactly one instrumented app is live, the profiler attaches automatically.
 Otherwise pass `--pid <pid>`:
 
 ```
-flux-profiler [--pid <pid>] [--out <path.fxt>]
+flux-profiler [--pid <pid>] [--out <path.fxt>] [--duration <30s|5m|1h>] [--max-mem <512MB|2GB>]
 ```
 
 Press **Ctrl-C** (or let the app exit) to write the `.fxt` trace. The default
 output is `<app>-trace-<pid>.fxt`.
+
+To stop automatically instead of waiting for Ctrl-C, cap the run by wall-clock
+time (`--duration`, e.g. `30s`/`5m`/`1h`) or by the reader's retained-event
+footprint (`--max-mem`, e.g. `512MB`/`2GB`). Whichever fires first — that,
+Ctrl-C, or the app exiting — stops the capture and exports the trace.
+
+`--max-mem` defaults to `1GB` so a forgotten profiler can't grow unbounded;
+raise it for longer captures.
 
 ### 3. Open the trace
 

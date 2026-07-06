@@ -7,12 +7,11 @@ use std::{
     process::ExitCode,
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use clap::Parser;
 use flux_profiler::{CrossProcessReader, live_apps, published_pid};
-
-const USAGE: &str = "usage: flux-profiler [--pid <pid>] [--out <path.fxt>]";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -20,38 +19,22 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Release);
 }
 
-#[derive(Default)]
+#[derive(Parser)]
+#[command(about = "Attach to a #[timed] producer and export its marks as an FXT trace")]
 struct Args {
+    /// Producer pid; needed only when multiple instrumented apps are live.
+    #[arg(long)]
     pid: Option<u32>,
+    /// Trace output path (default: `<app>-trace-<pid>.fxt`).
+    #[arg(long)]
     out: Option<PathBuf>,
-}
-
-impl Args {
-    /// Accepts both `--flag value` and `--flag=value`.
-    fn parse() -> Result<Self, String> {
-        let mut parsed = Self::default();
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            let (flag, inline) = match arg.split_once('=') {
-                Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
-                None => (arg, None),
-            };
-            let mut value = || {
-                inline
-                    .clone()
-                    .or_else(|| args.next())
-                    .ok_or_else(|| format!("{flag} needs a value"))
-            };
-            match flag.as_str() {
-                "--pid" => {
-                    parsed.pid = Some(value()?.parse().map_err(|e| format!("--pid: {e}"))?);
-                }
-                "--out" => parsed.out = Some(value()?.into()),
-                _ => return Err(format!("unknown argument: {flag}")),
-            }
-        }
-        Ok(parsed)
-    }
+    /// Stop and export after this much capture time, e.g. `30s`, `5m`, `1h`.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    duration: Option<Duration>,
+    /// Stop and export once the reader's retained events exceed this, e.g.
+    /// `512MB`, `2GB`. Guards against an unbounded capture.
+    #[arg(long, default_value = "1GB")]
+    max_mem: bytesize::ByteSize,
 }
 
 /// The producer to attach to: the one matching `--pid`, or the sole live one
@@ -75,13 +58,7 @@ fn resolve(pid: Option<u32>) -> Result<(String, u32), String> {
 }
 
 fn main() -> ExitCode {
-    let args = match Args::parse() {
-        Ok(args) => args,
-        Err(e) => {
-            eprintln!("{e}\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let args = Args::parse();
 
     let (app, pid) = match resolve(args.pid) {
         Ok(target) => target,
@@ -104,10 +81,21 @@ fn main() -> ExitCode {
     // Observe stop before polling so the final poll flushes the ring tails;
     // the rings and pid file outlive the producer, so this also holds when it
     // exits between iterations.
+    let start = Instant::now();
     let mut iterations = 0u32;
     loop {
-        let stopping = STOP.load(Ordering::Acquire);
+        let mut stopping = STOP.load(Ordering::Acquire);
         reader.poll();
+        if let Some(limit) = args.duration {
+            if start.elapsed() >= limit {
+                eprintln!("reached --duration limit");
+                stopping = true;
+            }
+        }
+        if reader.events().retained_bytes() as u64 >= args.max_mem.as_u64() {
+            eprintln!("reached --max-mem limit ({})", args.max_mem);
+            stopping = true;
+        }
         if stopping {
             break;
         }

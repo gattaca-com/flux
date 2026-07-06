@@ -22,6 +22,9 @@ flux-timing.workspace = true
 flux-utils.workspace = true
 flux-profiler-macros.workspace = true
 
+bytesize.workspace = true
+clap.workspace = true
+humantime.workspace = true
 libc.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true

@@ -1,10 +1,15 @@
 #[cfg(feature = "park")]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
     use flux::park::Signal;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_park_unpark() {
