@@ -1,0 +1,19 @@
+[package]
+name = "flux-profiler-macros"
+version = "0.0.1"
+description = "Attribute macro `#[timed]` for the flux profiler."
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+keywords = ["low-latency", "performance", "profiling"]
+repository = "https://github.com/gattaca-com/flux"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1"
+syn = { version = "2.0.101", features = ["full"] }
+
+[lints]
+workspace = true

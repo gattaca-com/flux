@@ -1,0 +1,42 @@
+[package]
+name = "flux-profiler"
+version = "0.0.1"
+description = "Cross-process `#[timed]` flamegraph profiler: shmem rings, FXT export, hardware counters."
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+keywords = ["low-latency", "performance", "profiling"]
+repository = "https://github.com/gattaca-com/flux"
+
+[lib]
+name = "flux_profiler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flux-profiler"
+path = "src/bin/flux_profiler.rs"
+
+[dependencies]
+flux-communication.workspace = true
+flux-timing.workspace = true
+flux-utils.workspace = true
+flux-profiler-macros.workspace = true
+
+libc.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[features]
+# Per-call hardware counters (instructions, cycles, branch/cache misses) via
+# rdpmc, emitted on perf-{fn} queues. Needs kernel.perf_event_paranoid <= 2 at
+# runtime (<= 1 to include kernel-mode work).
+perf = []
+# Wrap the global allocator to ride per-thread allocated/freed byte counts
+# alongside each `#[timed]` mark.
+alloc-profile = []
+# Expose the test producer harness to downstream crates' tests.
+test-util = []
+
+[lints]
+workspace = true
