@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use flux_communication::queue::Producer;
+use flux_utils::get_tid;
 
 #[cfg(feature = "alloc-profile")]
 use super::allocator::{self, AllocSample};
@@ -46,7 +47,8 @@ impl Producers {
 
 fn thread_token() -> String {
     let thread = std::thread::current();
-    thread.name().map_or_else(|| format!("{:?}", thread.id()), ToOwned::to_owned)
+    let name = thread.name().map_or_else(|| format!("{:?}", thread.id()), ToOwned::to_owned);
+    format!("{name}-{}", get_tid())
 }
 
 #[inline]

@@ -60,6 +60,13 @@ pub struct ThreadEvents<'a> {
     pub loss: Loss,
 }
 
+fn display_name(token: &str) -> &str {
+    match token.rsplit_once('-') {
+        Some((name, tid)) if tid.parse::<i64>().is_ok() => name,
+        _ => token,
+    }
+}
+
 pub struct EventsDrainer {
     dir: QueueDir,
     threads: FxHashMap<String, Option<ThreadDrainer>>,
@@ -90,10 +97,10 @@ impl EventsDrainer {
     }
 
     pub fn threads(&self) -> impl Iterator<Item = ThreadEvents<'_>> {
-        self.threads.iter().filter_map(|(name, t)| {
+        self.threads.iter().filter_map(|(token, t)| {
             let t = t.as_ref()?;
             Some(ThreadEvents {
-                name,
+                name: display_name(token),
                 marks: &t.events.marks,
                 perf: &t.events.perf,
                 alloc: &t.events.alloc,

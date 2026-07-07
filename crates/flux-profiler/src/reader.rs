@@ -141,6 +141,40 @@ mod tests {
     }
 
     #[test]
+    fn same_named_threads_do_not_share_a_ring() {
+        use std::sync::{Arc, Barrier};
+
+        let _guard = ShmemGuard::new();
+        let reader = InProcessReader::start();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |reps: usize| {
+            let barrier = barrier.clone();
+            thread::Builder::new()
+                .name("dup".to_owned())
+                .spawn(move || {
+                    for _ in 0..reps {
+                        record_open("work");
+                        record_close("work");
+                    }
+                    barrier.wait();
+                })
+                .unwrap()
+        };
+
+        let a = spawn(3);
+        let b = spawn(5);
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let events = reader.collect();
+        assert!(!lossy(&events));
+        assert_eq!(events.threads().count(), 2, "one ring per thread despite the shared name");
+        assert!(events.threads().all(|t| t.name == "dup"), "tid is stripped back off for display");
+        assert_eq!(open_frames(&events, "work"), 8, "3 + 5 opens across both rings");
+    }
+
+    #[test]
     fn flamegraph_reader_resolves_names_cross_process() {
         let guard = ShmemGuard::new();
         enable_profiler("test");
