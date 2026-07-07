@@ -71,8 +71,8 @@ pub(super) fn trace<'a>(
         // Each thread is its own FXT process so its counters (which the
         // Fuchsia importer can only scope to a process, never a thread) group
         // under the same collapsible node as its timer track.
-        let thread_koid = if t.tid != 0 { t.tid } else { i as u64 * 2 + 2 };
-        let process_koid = thread_koid | (1u64 << 63);
+        let process_koid = i as u64 * 2 + 1;
+        let thread_koid = if t.tid != 0 { t.tid } else { process_koid + 1 };
         let index = i as u64 + 1; // 1-based thread-table index
         let name = fxt.intern(t.name);
         fxt.kernel_object(OBJ_PROCESS, process_koid, name, None);
