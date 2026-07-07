@@ -54,17 +54,18 @@ impl Loss {
 /// when its ring is absent).
 pub struct ThreadEvents<'a> {
     pub name: &'a str,
+    pub tid: u64,
     pub marks: &'a [Mark],
     pub perf: &'a [PerfSample],
     pub alloc: &'a [AllocSample],
     pub loss: Loss,
 }
 
-fn display_name(token: &str) -> &str {
-    match token.rsplit_once('-') {
-        Some((name, tid)) if tid.parse::<i64>().is_ok() => name,
-        _ => token,
-    }
+fn split_token(token: &str) -> (&str, u64) {
+    token
+        .rsplit_once('-')
+        .and_then(|(name, tid)| tid.parse::<u64>().ok().map(|tid| (name, tid)))
+        .unwrap_or((token, 0))
 }
 
 pub struct EventsDrainer {
@@ -99,8 +100,10 @@ impl EventsDrainer {
     pub fn threads(&self) -> impl Iterator<Item = ThreadEvents<'_>> {
         self.threads.iter().filter_map(|(token, t)| {
             let t = t.as_ref()?;
+            let (name, tid) = split_token(token);
             Some(ThreadEvents {
-                name: display_name(token),
+                name,
+                tid,
                 marks: &t.events.marks,
                 perf: &t.events.perf,
                 alloc: &t.events.alloc,

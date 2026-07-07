@@ -171,6 +171,10 @@ mod tests {
         assert!(!lossy(&events));
         assert_eq!(events.threads().count(), 2, "one ring per thread despite the shared name");
         assert!(events.threads().all(|t| t.name == "dup"), "tid is stripped back off for display");
+        let mut tids: Vec<u64> = events.threads().map(|t| t.tid).collect();
+        tids.sort_unstable();
+        tids.dedup();
+        assert_eq!(tids.len(), 2, "each ring carries its own tid");
         assert_eq!(open_frames(&events, "work"), 8, "3 + 5 opens across both rings");
     }
 

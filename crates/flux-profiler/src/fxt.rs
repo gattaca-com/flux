@@ -47,7 +47,7 @@ pub(super) fn trace<'a>(
 ) -> Vec<u8> {
     let FlamegraphMeta { names, schema } = meta;
     let mut threads: Vec<_> = threads.collect();
-    threads.sort_by(|a, b| a.name.cmp(b.name));
+    threads.sort_by(|a, b| a.name.cmp(b.name).then(a.tid.cmp(&b.tid)));
     debug_assert!(threads.len() < 256, "thread ref is 8-bit");
     let now_tsc = Instant::now().0 & TSC_MASK;
     let now_epoch_ns =
@@ -71,8 +71,8 @@ pub(super) fn trace<'a>(
         // Each thread is its own FXT process so its counters (which the
         // Fuchsia importer can only scope to a process, never a thread) group
         // under the same collapsible node as its timer track.
-        let process_koid = i as u64 * 2 + 1;
-        let thread_koid = process_koid + 1;
+        let thread_koid = if t.tid != 0 { t.tid } else { i as u64 * 2 + 2 };
+        let process_koid = thread_koid | (1u64 << 63);
         let index = i as u64 + 1; // 1-based thread-table index
         let name = fxt.intern(t.name);
         fxt.kernel_object(OBJ_PROCESS, process_koid, name, None);
@@ -255,7 +255,7 @@ mod tests {
         perf: &[PerfSample],
         schema: Schema,
     ) -> Vec<u8> {
-        let thread = ThreadEvents { name: "t", marks, alloc, perf, loss: Loss::default() };
+        let thread = ThreadEvents { name: "t", tid: 0, marks, alloc, perf, loss: Loss::default() };
         trace([thread].into_iter(), &FlamegraphMeta { names: names(), schema })
     }
 
