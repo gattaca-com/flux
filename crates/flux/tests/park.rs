@@ -65,7 +65,7 @@ mod tests {
         poll.poll(&mut events, Some(Duration::from_millis(500))).unwrap();
 
         let mut found = false;
-        for event in events.iter() {
+        for event in &events {
             if event.token() == mio::Token(42) {
                 found = true;
             }
