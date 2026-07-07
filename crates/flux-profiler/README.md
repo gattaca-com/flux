@@ -7,6 +7,14 @@ in [magic-trace](https://magic-trace.org) or [Perfetto](https://ui.perfetto.dev)
 Marks are written to per-thread shared-memory rings, so the profiler reads them
 from a **separate process** with zero involvement from your app after startup.
 
+## Install
+
+Build and install the `flux-profiler` CLI binary:
+
+```bash
+cargo install --git https://github.com/gattaca-com/flux flux-profiler
+```
+
 ## Quick start
 
 ### 1. Instrument your app
@@ -36,15 +44,11 @@ fn main() {
 ### 2. Run your app, then attach the profiler
 
 ```bash
-# terminal 1 — your app (prints its pid)
 cargo run -p my-app
-
-# terminal 2 — attach, then Ctrl-C to stop and export the trace
-cargo run -p flux-profiler --bin flux-profiler
 ```
 
-If exactly one instrumented app is live, the profiler attaches automatically.
-Otherwise pass `--pid <pid>`:
+Then attach the profiler in a second terminal. If exactly one instrumented app
+is live it attaches automatically; otherwise pass `--pid <pid>`:
 
 ```
 flux-profiler [--pid <pid>] [--out <path.fxt>] [--duration <30s|5m|1h>] [--max-mem <512MB|2GB>]
@@ -74,7 +78,7 @@ A minimal producer example is included:
 cargo run -p flux-profiler --example timed_producer
 
 # terminal 2
-cargo run -p flux-profiler --bin flux-profiler
+flux-profiler
 ```
 
 ## Optional features
@@ -84,9 +88,33 @@ cargo run -p flux-profiler --bin flux-profiler
 | `perf` | Per-call hardware counters (instructions, cycles, branch/cache misses) via rdpmc. Requires `kernel.perf_event_paranoid <= 2` at runtime (`<= 1` to include kernel-mode work). |
 | `alloc-profile` | Per-thread allocated/freed byte counts recorded alongside each `#[timed]` mark. Wraps the global allocator. |
 
+`perf` works out of the box — enable it and the counters ride every `#[timed]`
+mark:
+
 ```bash
 cargo run -p flux-profiler --example timed_producer --features perf
 ```
+
+`alloc-profile` additionally requires you to install the counting allocator as
+your app's global allocator, so it can tally bytes. Gate it behind your own
+feature flag (chained to `flux-profiler/alloc-profile`) so normal builds keep
+the plain allocator untouched:
+
+```rust
+use std::alloc::System;
+use flux_profiler::allocator::CountingAllocator;
+
+#[cfg(not(feature = "alloc-profile"))]
+#[global_allocator]
+static GLOBAL: System = System;
+
+#[cfg(feature = "alloc-profile")]
+#[global_allocator]
+static GLOBAL: CountingAllocator<System> = CountingAllocator(System);
+```
+
+`CountingAllocator` wraps any base allocator — swap `System` for `MiMalloc/Jemalloc` or
+whatever you run in production.
 
 ## License
 
