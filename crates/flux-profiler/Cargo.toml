@@ -29,6 +29,7 @@ libc.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 # Per-call hardware counters (instructions, cycles, branch/cache misses) via

@@ -9,9 +9,9 @@
 //! cross-process reader reads them from the live producer's binary, which may
 //! be gone by then.
 
-use std::collections::hash_map::Entry;
-
+use flux_communication::QueueError;
 use rustc_hash::FxHashMap;
+use tracing::warn;
 
 use super::{
     allocator::AllocSample,
@@ -62,7 +62,7 @@ pub struct ThreadEvents<'a> {
 
 pub struct EventsDrainer {
     dir: QueueDir,
-    threads: FxHashMap<String, ThreadDrainer>,
+    threads: FxHashMap<String, Option<ThreadDrainer>>,
     meta: FlamegraphMeta,
 }
 
@@ -76,24 +76,29 @@ impl EventsDrainer {
 
     pub(super) fn poll(&mut self, resolver: &impl FrameResolver) {
         for thread in self.dir.event_threads() {
-            if let Entry::Vacant(slot) = self.threads.entry(thread) {
-                if let Some(thread) = ThreadDrainer::open(&self.dir, slot.key()) {
-                    slot.insert(thread);
-                }
-            }
+            self.threads.entry(thread).or_insert_with_key(|token| {
+                ThreadDrainer::open(&self.dir, token)
+                    .inspect_err(
+                        |e| warn!(%token, %e, "event ring present but unreadable; skipped"),
+                    )
+                    .ok()
+            });
         }
-        for thread in self.threads.values_mut() {
+        for thread in self.threads.values_mut().flatten() {
             thread.poll(&mut self.meta.names, resolver);
         }
     }
 
     pub fn threads(&self) -> impl Iterator<Item = ThreadEvents<'_>> {
-        self.threads.iter().map(|(name, t)| ThreadEvents {
-            name,
-            marks: &t.events.marks,
-            perf: &t.events.perf,
-            alloc: &t.events.alloc,
-            loss: t.loss(),
+        self.threads.iter().filter_map(|(name, t)| {
+            let t = t.as_ref()?;
+            Some(ThreadEvents {
+                name,
+                marks: &t.events.marks,
+                perf: &t.events.perf,
+                alloc: &t.events.alloc,
+                loss: t.loss(),
+            })
         })
     }
 
@@ -102,7 +107,7 @@ impl EventsDrainer {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.threads.values().map(|t| t.events.retained_bytes()).sum()
+        self.threads.values().flatten().map(|t| t.events.retained_bytes()).sum()
     }
 
     pub fn fxt_trace(&self) -> Vec<u8> {
@@ -148,8 +153,8 @@ struct ThreadDrainer {
 }
 
 impl ThreadDrainer {
-    fn open(dir: &QueueDir, token: &str) -> Option<Self> {
-        Some(Self {
+    fn open(dir: &QueueDir, token: &str) -> Result<Self, QueueError> {
+        Ok(Self {
             rings: Rings::open(dir, token)?,
             events: EventsData::default(),
             open_ids: Vec::new(),

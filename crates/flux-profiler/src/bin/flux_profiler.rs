@@ -58,6 +58,14 @@ fn resolve(pid: Option<u32>) -> Result<(String, u32), String> {
 }
 
 fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+
     let args = Args::parse();
 
     let (app, pid) = match resolve(args.pid) {

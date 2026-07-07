@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use flux_communication::{
-    ReadError,
+    QueueError, ReadError,
     queue::{ConsumerBare, Queue},
 };
 
@@ -20,14 +20,14 @@ pub(super) struct RingDrainer<T: RingEntry> {
 }
 
 impl<T: RingEntry> RingDrainer<T> {
-    fn open(dir: &QueueDir, token: &str) -> Option<Self> {
-        let queue = Queue::<T>::try_open_shared(dir.path::<T>(token)).ok()?;
+    fn open(dir: &QueueDir, token: &str) -> Result<Self, QueueError> {
+        let queue = Queue::<T>::try_open_shared(dir.path::<T>(token))?;
         let mut consumer = ConsumerBare::new(queue, T::PREFIX);
 
         // Collaborative so the cursor starts at the beginning of the ring, `next_seq`
         // at 0
         consumer.try_init_collaborative();
-        Some(Self { consumer, pending: VecDeque::new(), next_seq: 0, missed: 0 })
+        Ok(Self { consumer, pending: VecDeque::new(), next_seq: 0, missed: 0 })
     }
 
     fn drain(&mut self) {
@@ -82,11 +82,11 @@ pub(super) struct Rings {
 }
 
 impl Rings {
-    pub(super) fn open(dir: &QueueDir, token: &str) -> Option<Self> {
-        Some(Self {
+    pub(super) fn open(dir: &QueueDir, token: &str) -> Result<Self, QueueError> {
+        Ok(Self {
             marks: RingDrainer::<Mark>::open(dir, token)?,
-            perf: RingDrainer::<PerfSample>::open(dir, token),
-            alloc: RingDrainer::<AllocSample>::open(dir, token),
+            perf: RingDrainer::<PerfSample>::open(dir, token).ok(),
+            alloc: RingDrainer::<AllocSample>::open(dir, token).ok(),
         })
     }
 
