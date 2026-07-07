@@ -67,7 +67,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     #[inline]
     pub fn register_waker(&mut self, waker: mio::Waker) {
         self.waker_registered = true;
-        crate::park::SIGNAL.register_waker(waker)
+        crate::park::SIGNAL.register_waker(waker);
     }
 
     #[cfg(feature = "park")]

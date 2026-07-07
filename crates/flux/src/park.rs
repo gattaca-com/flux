@@ -58,6 +58,12 @@ pub struct Signal {
 
 pub static SIGNAL: Signal = Signal::new();
 
+impl Default for Signal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Signal {
     pub const fn new() -> Self {
         Self {
@@ -79,7 +85,7 @@ impl Signal {
     }
 
     /// Signal the sticky event. Increment the counter, wake all parked threads
-    /// via FUTEX_WAKE (on Linux) or Condvar (on non-Linux), and wake all
+    /// via `FUTEX_WAKE` (on Linux) or Condvar (on non-Linux), and wake all
     /// registered mio Wakers.
     pub fn signal(&self) {
         self.counter.fetch_add(1, Ordering::Release);
