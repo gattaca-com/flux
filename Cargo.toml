@@ -10,6 +10,8 @@ members = [
   "crates/type-hash",
   "crates/type-hash-derive",
   "crates/flux-network",
+  "crates/flux-profiler",
+  "crates/flux-profiler-macros",
 ]
 resolver = "2"
 
@@ -29,6 +31,8 @@ flux-overseer = { path = "crates/flux-overseer", version = "0.0.11" }
 flux-timekeeper = { path = "crates/flux-timekeeper", version = "0.0.29" }
 type-hash = { path = "crates/type-hash", version = "0.0.1" }
 type-hash-derive = { path = "crates/type-hash-derive", version = "0.0.4" }
+flux-profiler = { path = "crates/flux-profiler", version = "0.0.1" }
+flux-profiler-macros = { path = "crates/flux-profiler-macros", version = "0.0.1" }
 
 
 auto_impl = "1.2.0"
@@ -36,6 +40,7 @@ shared_memory = "^0.12"
 core_affinity = "0.8.1"
 directories = "5.0.1"
 libc = "0.2.177"
+rustc-hash = "2"
 serde = { features = ["derive"], version = "=1.0.228" }
 chrono = { features = ["serde"], version = "0.4.38" }
 quanta = "0.12.3"
@@ -46,6 +51,7 @@ rand = "0.9.0"
 spin = "0.10"
 signal-hook = "0.3.18"
 tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 thiserror = "1.0.58"
 tinyvec = "1.9.0"
 humantime = "2.1"
@@ -61,6 +67,7 @@ bytes = "1"
 mio = { version = "1.1.1", features = ["net", "os-poll"] }
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
+bytesize = "1.3"
 ctrlc = "3"
 
 [workspace.lints.clippy]

@@ -12,3 +12,4 @@ The framework is built around pinned workers assigned to physical cores, and det
 - **[`seqlock.rs`](crates/flux-communication/src/seqlock.rs)** — seqlock impl that handles synchronisation.
 - **[`flux-timing`](crates/flux-timing/)** — custom time types. Instant wraps rdtsc, Nanos is wall clock, IngestionTime links the two at message arrival.
 - **[`spine-derive`](crates/spine-derive/src/lib.rs)** — generates consumer/producer structs, trait wiring, and persistence plumbing from a struct definition.
+- **[`flux-profiler`](crates/flux-profiler/README.md)** — cross-process flamegraph profiler. Annotate functions with `#[timed]`, attach the CLI, and open the trace in magic-trace or Perfetto.

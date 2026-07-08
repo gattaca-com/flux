@@ -506,9 +506,12 @@ impl<T: Copy> InnerQueue<T> {
         }
         let shmem = ShmemConf::new().flink(path).open()?;
         let ptr = shmem.as_ptr();
-        std::mem::forget(shmem);
         // len=0: skip floor check, still validates elsize + poisoned slots.
-        Self::open_initialized(ptr, 0)
+        let opened = Self::open_initialized(ptr, 0);
+        if opened.is_ok() {
+            std::mem::forget(shmem);
+        }
+        opened
     }
 
     // Wait for the queue at `ptr` to finish initialising, then validate it.

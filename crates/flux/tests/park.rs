@@ -1,10 +1,15 @@
 #[cfg(feature = "park")]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
     use flux::park::Signal;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_park_unpark() {
@@ -60,7 +65,7 @@ mod tests {
         poll.poll(&mut events, Some(Duration::from_millis(500))).unwrap();
 
         let mut found = false;
-        for event in events.iter() {
+        for event in &events {
             if event.token() == mio::Token(42) {
                 found = true;
             }
