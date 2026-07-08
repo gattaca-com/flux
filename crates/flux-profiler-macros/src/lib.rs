@@ -35,7 +35,8 @@ use syn::{ItemFn, LitStr, parse_macro_input};
 pub fn timed(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
 
-    // Profiling disabled: macro expands to just the function body, no guard generated
+    // Profiling disabled: macro expands to just the function body, no guard
+    // generated
     if cfg!(feature = "disable-profiling") {
         drop(attr);
         return quote! { #input }.into();
