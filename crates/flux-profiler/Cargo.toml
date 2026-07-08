@@ -32,6 +32,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
+# Compile every `#[timed]` out to a plain function call — zero overhead, no
+# guard, no atomic load. `#[timed]` is compiled in otherwise.
+disable-profiling = ["flux-profiler-macros/disable-profiling"]
 # Per-call hardware counters (instructions, cycles, branch/cache misses) via
 # rdpmc, emitted on perf-{fn} queues. Needs kernel.perf_event_paranoid <= 2 at
 # runtime (<= 1 to include kernel-mode work).

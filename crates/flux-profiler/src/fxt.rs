@@ -7,12 +7,9 @@
 //! pair and a thread record, followed by that thread's duration begin/end
 //! events. See the Fuchsia Trace Format spec for the records.
 
-use std::{
-    borrow::Cow,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::borrow::Cow;
 
-use flux_timing::{Duration, Instant};
+use flux_timing::{Duration, IngestionTime};
 use rustc_hash::FxHashMap;
 
 use super::drainer::{FlamegraphMeta, ThreadEvents};
@@ -49,9 +46,9 @@ pub(super) fn trace<'a>(
     let mut threads: Vec<_> = threads.collect();
     threads.sort_by(|a, b| a.name.cmp(b.name).then(a.tid.cmp(&b.tid)));
     debug_assert!(threads.len() < 256, "thread ref is 8-bit");
-    let now_tsc = Instant::now().0 & TSC_MASK;
-    let now_epoch_ns =
-        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let now = IngestionTime::now();
+    let now_tsc = now.internal().0 & TSC_MASK;
+    let now_epoch_ns = now.real().0;
     let base_tsc = threads
         .iter()
         .filter_map(|t| t.marks.first().map(|m| m.ts & TSC_MASK))

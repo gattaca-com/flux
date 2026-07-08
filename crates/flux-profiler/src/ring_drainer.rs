@@ -31,8 +31,10 @@ impl<T: RingEntry> RingDrainer<T> {
     }
 
     fn drain(&mut self) {
+        const DRAIN_BATCH: usize = 512;
+
         let mut scratch = T::default();
-        loop {
+        for _ in 0..DRAIN_BATCH {
             match self.consumer.try_consume(&mut scratch) {
                 Ok(()) => {
                     self.pending.push_back(scratch);

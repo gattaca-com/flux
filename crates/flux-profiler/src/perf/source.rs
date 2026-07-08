@@ -2,28 +2,31 @@
 //! per thread via rdpmc, then [`read`] a snapshot to ride alongside each
 //! mark.
 
-use super::{PerfSample, Schema, raw::HwCounter, sample::MAX_EVENTS};
+use super::{PerfSample, Schema, raw::HwCounter};
 
-/// Per-thread counters, one slot per [`Schema`] entry (`None` where the
-/// event couldn't be opened — over budget or unsupported).
+/// Per-thread counters that opened, each paired with its [`Schema`] slot
+/// (index into [`PerfSample::vals`]). Events that couldn't open — over budget
+/// or unsupported — are dropped here rather than left as holes.
 struct Counters {
-    opened: Vec<Option<HwCounter>>,
+    opened: Vec<(usize, HwCounter)>,
 }
 
 impl Counters {
     fn open() -> Option<Self> {
-        let opened: Vec<_> =
-            Schema::local().iter().map(|e| HwCounter::event(e.type_, e.config)).collect();
-        opened.iter().any(Option::is_some).then_some(Self { opened })
+        let opened: Vec<_> = Schema::local()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| Some((i, HwCounter::event(e.type_, e.config)?)))
+            .collect();
+        (!opened.is_empty()).then_some(Self { opened })
     }
 
     #[inline]
     fn read(&self) -> PerfSample {
         let mut s = PerfSample::default();
-        for (i, c) in self.opened.iter().enumerate().take(MAX_EVENTS) {
-            if let Some(c) = c {
-                s.vals[i] = c.read();
-            }
+        // Schema::local limited to MAX_EVENTS, so write is safe
+        for (i, c) in &self.opened {
+            s.vals[*i] = c.read();
         }
         s
     }

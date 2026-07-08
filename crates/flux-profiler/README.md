@@ -1,6 +1,6 @@
 # flux-profiler
 
-A cross-process flamegraph profiler for flux. Annotate functions with `#[timed]`,
+A cross-process tracing profiler for flux. Annotate functions with `#[timed]`,
 run your app, then attach the `flux-profiler` CLI to capture a trace you can open
 in [magic-trace](https://magic-trace.org) or [Perfetto](https://ui.perfetto.dev).
 
@@ -85,8 +85,20 @@ flux-profiler
 
 | Feature | What it adds |
 |---|---|
+| `disable-profiling` | Compiles every `#[timed]` out to a plain function call — zero overhead, no guard, no atomic load. |
 | `perf` | Per-call hardware counters (instructions, cycles, branch/cache misses) via rdpmc. Requires `kernel.perf_event_paranoid <= 2` at runtime (`<= 1` to include kernel-mode work). |
 | `alloc-profile` | Per-thread allocated/freed byte counts recorded alongside each `#[timed]` mark. Wraps the global allocator. |
+
+### Zero overhead when not profiling
+
+`#[timed]` is near-free until you call `enable_profiler` (one atomic load per
+call). To strip it out entirely, build with `disable-profiling` — every
+`#[timed]` collapses to just the function body, so annotations can stay in the
+source and vanish from production builds:
+
+```bash
+cargo run -p my-app --release --features flux-profiler/disable-profiling
+```
 
 `perf` works out of the box — enable it and the counters ride every `#[timed]`
 mark:

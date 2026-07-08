@@ -34,6 +34,13 @@ use syn::{ItemFn, LitStr, parse_macro_input};
 #[proc_macro_attribute]
 pub fn timed(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
+
+    // Profiling disabled: macro expands to just the function body, no guard generated
+    if cfg!(feature = "disable-profiling") {
+        drop(attr);
+        return quote! { #input }.into();
+    }
+
     let name = if attr.is_empty() { None } else { Some(parse_macro_input!(attr as LitStr)) };
     let func_name_str = input.sig.ident.to_string();
 

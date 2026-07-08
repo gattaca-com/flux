@@ -15,5 +15,9 @@ proc-macro = true
 quote = "1"
 syn = { version = "2.0.101", features = ["full"] }
 
+[features]
+# Compile `#[timed]` out to a no-op. Driven by `flux-profiler`'s `disable-profiling`.
+disable-profiling = []
+
 [lints]
 workspace = true
