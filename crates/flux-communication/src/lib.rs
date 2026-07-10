@@ -1,6 +1,8 @@
 pub mod array;
 pub mod cleanup;
 mod error;
+#[cfg(feature = "park")]
+pub mod park;
 pub mod queue;
 mod seqlock;
 mod shmem_data;

@@ -18,8 +18,6 @@ impl<T: 'static + Copy> StandaloneProducer<T> {
     pub fn produce_with_ingestion(&self, d: T, ingestion_t: IngestionTime) {
         let msg = InternalMessage::new(self.timestamp.with_ingestion_t(ingestion_t), d);
         self.producer.produce_without_first(&msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
     }
 }
 
@@ -51,8 +49,6 @@ impl<T: 'static + Copy> StandaloneDCacheProducer<T> {
         };
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
         self.inner.inner.produce_without_first(&msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
         Ok(())
     }
 }

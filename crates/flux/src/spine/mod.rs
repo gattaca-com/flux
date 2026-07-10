@@ -83,8 +83,6 @@ pub trait SpineProducers {
     {
         let msg = InternalMessage::new(self.timestamp().with_new_publish_delta(), d);
         self.as_ref().produce_without_first(&msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
     }
 
     fn produce_with_ingestion<T: Copy>(&self, d: T, ingestion_t: IngestionTime)
@@ -93,8 +91,6 @@ pub trait SpineProducers {
     {
         let msg = InternalMessage::new(self.timestamp().with_ingestion_t(ingestion_t), d);
         self.as_ref().produce_without_first(&msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
     }
 
     fn forward<T: Copy>(&self, msg: &InternalMessage<T>)
@@ -102,8 +98,6 @@ pub trait SpineProducers {
         Self: AsRef<SpineProducer<T>>,
     {
         self.as_ref().produce_without_first(msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
     }
 
     fn produce_with_dcache<T: 'static + Copy, F: FnOnce(&mut [u8])>(
@@ -119,8 +113,6 @@ pub trait SpineProducers {
         let dref = if let Some((len, f)) = payload { Some(p.dcache.write(len, f)?) } else { None };
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
         p.inner.produce_without_first(&msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
         Ok(())
     }
 
@@ -132,8 +124,6 @@ pub trait SpineProducers {
         let p: &SpineProducerWithDCache<T> = self.as_ref();
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, Some(dref)));
         p.inner.produce_without_first(&msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
     }
 
     fn produce_with_dcache_and_ingestion<T: 'static + Copy, F: FnOnce(&mut [u8])>(
@@ -150,8 +140,6 @@ pub trait SpineProducers {
         let dref = if let Some((len, f)) = payload { Some(p.dcache.write(len, f)?) } else { None };
         let msg = InternalMessage::new(ts, DCacheMsg::new(data, dref));
         p.inner.produce_without_first(&msg);
-        #[cfg(feature = "park")]
-        crate::park::SIGNAL.signal();
         Ok(())
     }
 }

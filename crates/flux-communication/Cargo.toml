@@ -12,6 +12,8 @@ flux-timing.workspace = true
 flux-utils.workspace = true
 
 directories.workspace = true
+libc.workspace = true
+mio = { workspace = true, optional = true }
 shared_memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -19,3 +21,8 @@ rand.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+park = [
+    "dep:mio",
+]

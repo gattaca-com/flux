@@ -679,7 +679,12 @@ impl<T: Copy> Producer<T> {
 
     #[inline]
     pub fn produce_without_first(&self, msg: &T) -> usize {
-        self.queue.produce(msg)
+        let next_count = self.queue.produce(msg);
+
+        #[cfg(feature = "park")]
+        crate::park::SIGNAL.signal();
+
+        next_count
     }
 }
 
