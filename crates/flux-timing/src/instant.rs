@@ -8,30 +8,20 @@ use crate::{
     global_clock::{global_clock_not_mocked, ticks_per_micro},
 };
 
-/// Bit position of the socket tag inside an [`Instant`] word.
 pub const SOCKET_SHIFT: u32 = 62;
-/// Low 62 bits: the invariant-TSC counter.
 pub const TSC_MASK: u64 = (1 << SOCKET_SHIFT) - 1;
-/// Top 2 bits: the producing socket (NUMA node) id.
 pub const SOCKET_MASK: u64 = !TSC_MASK;
 
-/// Reads the invariant TSC and the calling core's NUMA node in one `rdtscp`,
-/// both raw — the caller decides how to pack/mask them.
-///
-/// Linux programs `IA32_TSC_AUX` as `(numa_node << 12) | cpu`, so the node
-/// falls out of the same instruction. Nodes nest within a socket and share its
-/// TSC, so the node is a safe (finer) proxy for the TSC coherence domain.
+/// Linux sets IA32_TSC_AUX to `(numa_node << 12) | cpu`, so one rdtscp reads
+/// both the TSC and the NUMA node of the calling core.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn read_tsc_and_node() -> (u64, u16) {
     let mut aux: u32 = 0;
-    // SAFETY: rdtscp is present on every x86_64 part carrying the invariant TSC
-    // this crate's clock already depends on; `aux` is a valid out pointer.
     let tsc = unsafe { core::arch::x86_64::__rdtscp(&raw mut aux) };
     (tsc, (aux >> 12) as u16)
 }
 
-/// Portable fallback: no per-core node tag, counter from the calibrated clock.
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 pub fn read_tsc_and_node() -> (u64, u16) {
