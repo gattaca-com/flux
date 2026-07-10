@@ -13,6 +13,7 @@ mod producer;
 mod queue_dir;
 mod reader;
 mod ring_drainer;
+mod socket_clock;
 mod symbols;
 mod timing;
 

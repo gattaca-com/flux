@@ -1,4 +1,22 @@
-use flux_timing::Instant;
+use std::sync::LazyLock;
+
+use flux_timing::{Instant, SOCKET_SHIFT, TSC_MASK, read_tsc_and_node};
+
+use crate::socket_clock::MAX_NODES;
+
+pub(crate) static MULTI_NODE: LazyLock<bool> = LazyLock::new(|| {
+    !std::fs::read_to_string("/sys/devices/system/node/online").is_ok_and(|s| s.trim() == "0")
+});
+
+#[inline]
+fn stamped_now() -> u64 {
+    if *MULTI_NODE {
+        let (tsc, node) = read_tsc_and_node();
+        (tsc & TSC_MASK) | ((node as u64 & (MAX_NODES as u64 - 1)) << SOCKET_SHIFT)
+    } else {
+        Instant::now().0
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -22,13 +40,13 @@ impl Mark {
         debug_assert!(name.len() < OPEN_BIT as usize, "timed name exceeds 15-bit length");
         Self {
             id: name.as_ptr() as u64,
-            ts: Instant::now().0,
+            ts: stamped_now(),
             len_and_open: name.len() as u16 | OPEN_BIT,
         }
     }
 
     pub(crate) fn close(name: &'static str) -> Self {
-        Self { id: name.as_ptr() as u64, ts: Instant::now().0, len_and_open: 0 }
+        Self { id: name.as_ptr() as u64, ts: stamped_now(), len_and_open: 0 }
     }
 
     pub fn is_open(&self) -> bool {

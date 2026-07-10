@@ -114,6 +114,7 @@ impl QueueDir {
 }
 
 pub fn enable_profiler(app_name: &str) {
+    std::sync::LazyLock::force(&super::mark::MULTI_NODE);
     let dir = QUEUE_DIR.get_or_init(|| {
         let dir = QueueDir::new(app_name);
         dir.clear_stale();

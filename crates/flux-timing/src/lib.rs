@@ -13,7 +13,7 @@ pub use global_clock::{
     Clock, OurClockForNanos, global_clock, global_clock_not_mocked, init_global_with_mock,
 };
 pub use ingestion_time::IngestionTime;
-pub use instant::Instant;
+pub use instant::{Instant, SOCKET_SHIFT, TSC_MASK, read_tsc_and_node};
 pub use internal_message::InternalMessage;
 pub use nanos::Nanos;
 pub use publish_delta::PublishDelta;

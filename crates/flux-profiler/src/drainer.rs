@@ -20,6 +20,7 @@ use super::{
     perf::{PerfSample, Schema},
     queue_dir::QueueDir,
     ring_drainer::Rings,
+    socket_clock::SocketClocks,
     symbols::FrameResolver,
 };
 
@@ -72,6 +73,7 @@ pub struct EventsDrainer {
     dir: QueueDir,
     threads: FxHashMap<String, Option<ThreadDrainer>>,
     meta: FlamegraphMeta,
+    clocks: SocketClocks,
 }
 
 impl EventsDrainer {
@@ -79,7 +81,7 @@ impl EventsDrainer {
         let mut names = FxHashMap::default();
         names.insert(MISSED_ID, "<missed>".to_string());
         let meta = FlamegraphMeta { names, schema };
-        Self { dir, threads: FxHashMap::default(), meta }
+        Self { dir, threads: FxHashMap::default(), meta, clocks: SocketClocks::calibrate() }
     }
 
     pub(super) fn poll(&mut self, resolver: &impl FrameResolver) {
@@ -121,7 +123,7 @@ impl EventsDrainer {
     }
 
     pub fn fxt_trace(&self) -> Vec<u8> {
-        fxt::trace(self.threads(), &self.meta)
+        fxt::trace(self.threads(), &self.meta, &self.clocks)
     }
 }
 
