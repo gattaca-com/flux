@@ -12,7 +12,7 @@ pub const SOCKET_SHIFT: u32 = 62;
 pub const TSC_MASK: u64 = (1 << SOCKET_SHIFT) - 1;
 pub const SOCKET_MASK: u64 = !TSC_MASK;
 
-/// Linux sets IA32_TSC_AUX to `(numa_node << 12) | cpu`, so one rdtscp reads
+/// Linux sets `IA32_TSC_AUX` to `(numa_node << 12) | cpu`, so one rdtscp reads
 /// both the TSC and the NUMA node of the calling core.
 #[cfg(target_arch = "x86_64")]
 #[inline]
