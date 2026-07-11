@@ -340,6 +340,7 @@ impl ConnectionManager {
                 addr,
                 self.telemetry,
                 self.dcache.is_some(),
+                false,
             );
             if let Some(msg) = &self.on_connect_msg &&
                 tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
@@ -534,6 +535,7 @@ impl ConnectionManager {
                             addr,
                             self.telemetry,
                             self.dcache.is_some(),
+                            true,
                         );
 
                         if let Some(msg) = &self.on_connect_msg &&
@@ -622,6 +624,7 @@ impl ConnectionManager {
                             addr,
                             self.telemetry,
                             self.dcache.is_some(),
+                            true,
                         );
                         if let Some(msg) = &self.on_connect_msg &&
                             conn.write_or_enqueue_with(

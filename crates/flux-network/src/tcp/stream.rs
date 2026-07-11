@@ -1,8 +1,9 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{self, IoSlice, Read, Write},
     net::SocketAddr,
     ptr,
+    sync::{LazyLock, Mutex},
 };
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
@@ -40,12 +41,26 @@ struct TcpTimers {
     alloc: Timer,
 }
 
+/// One `TcpTimers` per label, shared across connections and reconnects. Each
+/// `Timer` maps 2 shm queues that are never unmapped or unlinked, so creating
+/// them per-connection leaks /dev/shm under reconnect churn.
+static TCP_TIMERS: LazyLock<Mutex<HashMap<String, TcpTimers>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl TcpTimers {
     fn new(app_name: &'static str, label: &str) -> Self {
         Self {
             latency: Timer::new(app_name, format!("tcp_latency_{label}")),
             alloc: Timer::new(app_name, format!("tcp_alloc_{label}")),
         }
+    }
+
+    fn get_or_create(app_name: &'static str, label: String) -> Self {
+        *TCP_TIMERS
+            .lock()
+            .unwrap()
+            .entry(label)
+            .or_insert_with_key(|label| Self::new(app_name, label))
     }
 }
 
@@ -175,14 +190,20 @@ impl TcpStream {
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
         use_dcache: bool,
+        inbound: bool,
     ) -> Self {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
             TcpTelemetry::Enabled { app_name } => {
-                let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
-                let peer = peer_addr.to_string();
-                let steam_label = format!("{local_port}-{peer}");
-                Some(TcpTimers::new(app_name, &steam_label))
+                // Ephemeral ports excluded: the label must be stable across
+                // reconnects so the timers are reused via TCP_TIMERS.
+                let label = if inbound {
+                    let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+                    format!("{local_port}-{}", peer_addr.ip())
+                } else {
+                    peer_addr.to_string()
+                };
+                Some(TcpTimers::get_or_create(app_name, label))
             }
         };
         let rx_buf = if use_dcache { RxBuf::DCache } else { RxBuf::Heap(vec![0; RX_BUF_SIZE]) };
