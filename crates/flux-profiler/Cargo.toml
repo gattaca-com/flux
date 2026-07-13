@@ -44,6 +44,11 @@ perf = []
 alloc-profile = []
 # Expose the test producer harness to downstream crates' tests.
 test-util = []
+# Tag every mark with its NUMA node (rdtscp) so the reader aligns timestamps
+# across sockets with unsynchronized TSCs even as threads migrate. Off by
+# default: marks are plain rdtsc reads with zero extra overhead, correct
+# whenever TSCs agree across sockets (the common case).
+unpinned-threads = []
 
 [lints]
 workspace = true

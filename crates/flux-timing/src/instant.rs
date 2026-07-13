@@ -8,6 +8,26 @@ use crate::{
     global_clock::{global_clock_not_mocked, ticks_per_micro},
 };
 
+pub const SOCKET_SHIFT: u32 = 62;
+pub const TSC_MASK: u64 = (1 << SOCKET_SHIFT) - 1;
+pub const SOCKET_MASK: u64 = !TSC_MASK;
+
+/// Linux sets `IA32_TSC_AUX` to `(numa_node << 12) | cpu`, so one rdtscp reads
+/// both the TSC and the NUMA node of the calling core.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn read_tsc_and_node() -> (u64, u16) {
+    let mut aux: u32 = 0;
+    let tsc = unsafe { core::arch::x86_64::__rdtscp(&raw mut aux) };
+    (tsc, (aux >> 12) as u16)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn read_tsc_and_node() -> (u64, u16) {
+    (global_clock_not_mocked().raw(), 0)
+}
+
 // Socket is in the top 2 bits, rdtscp counter in lower 62
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, Hash, PartialEq, TypeHash)]
 #[repr(C)]
@@ -23,12 +43,12 @@ impl Instant {
 
     #[inline]
     fn remove_socket(self) -> Self {
-        Self(self.0 & 0x3fff_ffff_ffff_ffff)
+        Self(self.0 & TSC_MASK)
     }
 
     #[inline]
     pub fn same_socket(&self, other: &Self) -> bool {
-        (self.0 & 0xc000_0000_0000_0000) == (other.0 & 0xc000_0000_0000_0000)
+        (self.0 & SOCKET_MASK) == (other.0 & SOCKET_MASK)
     }
 
     #[inline]

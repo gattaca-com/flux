@@ -1,4 +1,25 @@
-use flux_timing::Instant;
+/// A thread can be rescheduled onto another socket between any two marks, so
+/// every mark carries its own socket: one rdtscp reads the counter and NUMA
+/// node together, and the reader resolves each mark with that node's clock.
+#[cfg(feature = "unpinned-threads")]
+#[inline]
+fn stamped_now() -> u64 {
+    use flux_timing::{SOCKET_SHIFT, TSC_MASK, read_tsc_and_node};
+
+    use crate::socket_clock::MAX_NODES;
+
+    let (tsc, node) = read_tsc_and_node();
+    (tsc & TSC_MASK) | ((node as u64 & (MAX_NODES as u64 - 1)) << SOCKET_SHIFT)
+}
+
+/// Default: a plain counter read, no socket tag. Correct whenever TSCs agree
+/// across sockets (single socket, or synchronized TSCs — the common case);
+/// per-thread durations are exact regardless.
+#[cfg(not(feature = "unpinned-threads"))]
+#[inline]
+fn stamped_now() -> u64 {
+    flux_timing::Instant::now().0
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -22,13 +43,13 @@ impl Mark {
         debug_assert!(name.len() < OPEN_BIT as usize, "timed name exceeds 15-bit length");
         Self {
             id: name.as_ptr() as u64,
-            ts: Instant::now().0,
+            ts: stamped_now(),
             len_and_open: name.len() as u16 | OPEN_BIT,
         }
     }
 
     pub(crate) fn close(name: &'static str) -> Self {
-        Self { id: name.as_ptr() as u64, ts: Instant::now().0, len_and_open: 0 }
+        Self { id: name.as_ptr() as u64, ts: stamped_now(), len_and_open: 0 }
     }
 
     pub fn is_open(&self) -> bool {

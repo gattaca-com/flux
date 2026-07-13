@@ -9,10 +9,12 @@
 
 use std::borrow::Cow;
 
-use flux_timing::{Duration, IngestionTime};
 use rustc_hash::FxHashMap;
 
-use super::drainer::{FlamegraphMeta, ThreadEvents};
+use super::{
+    drainer::{FlamegraphMeta, ThreadEvents},
+    socket_clock::SocketClocks,
+};
 
 /// Strip the `__TimedTy` method-marker plumbing from a resolved frame name,
 /// keeping the full path verbatim.
@@ -25,8 +27,6 @@ fn untimed(qualified: &str) -> Cow<'_, str> {
     }
 }
 
-/// `Instant`'s top 2 bits hold the socket id, low 62 the rdtscp counter.
-const TSC_MASK: u64 = 0x3fff_ffff_ffff_ffff;
 /// Perfetto sniffs these 8 bytes to pick its Fuchsia importer; `FxT` sits
 /// between the record's fixed framing bytes.
 const MAGIC_NUMBER_RECORD: &[u8] = b"\x10\x00\x04FxT\x16\x00";
@@ -41,23 +41,21 @@ const ARG_KOID: u64 = 8;
 pub(super) fn trace<'a>(
     threads: impl Iterator<Item = ThreadEvents<'a>>,
     meta: &FlamegraphMeta,
+    clocks: &SocketClocks,
 ) -> Vec<u8> {
     let FlamegraphMeta { names, schema } = meta;
     let mut threads: Vec<_> = threads.collect();
     threads.sort_by(|a, b| a.name.cmp(b.name).then(a.tid.cmp(&b.tid)));
     debug_assert!(threads.len() < 256, "thread ref is 8-bit");
-    let now = IngestionTime::now();
-    let now_tsc = now.internal().0 & TSC_MASK;
-    let now_epoch_ns = now.real().0;
-    let base_tsc = threads
+    let base_ns = threads
         .iter()
-        .filter_map(|t| t.marks.first().map(|m| m.ts & TSC_MASK))
+        .filter_map(|t| t.marks.first())
+        .map(|m| clocks.resolve_ns(m.ts))
         .min()
-        .unwrap_or(now_tsc);
-    // Wall-clock of tick 0 (the earliest mark): now minus how long ago it was.
-    let anchor_ns =
-        now_epoch_ns.saturating_sub(Duration(now_tsc.saturating_sub(base_tsc)).as_nanos() as u64);
-    let ns = |tsc: u64| Duration((tsc & TSC_MASK).saturating_sub(base_tsc)).as_nanos() as u64;
+        .unwrap_or(0);
+    // Wall-clock at tick 0 (the earliest mark), the FXT realtime anchor.
+    let anchor_ns = base_ns;
+    let ns = |tsc: u64| clocks.resolve_ns(tsc).saturating_sub(base_ns);
 
     let mut fxt = Fxt::default();
     fxt.buf.extend_from_slice(MAGIC_NUMBER_RECORD);
@@ -223,6 +221,7 @@ mod tests {
         allocator::AllocSample,
         mark::Mark,
         perf::{PerfSample, Schema},
+        socket_clock::SocketClocks,
     };
 
     fn names() -> FxHashMap<u64, String> {
@@ -253,7 +252,11 @@ mod tests {
         schema: Schema,
     ) -> Vec<u8> {
         let thread = ThreadEvents { name: "t", tid: 0, marks, alloc, perf, loss: Loss::default() };
-        trace([thread].into_iter(), &FlamegraphMeta { names: names(), schema })
+        trace(
+            [thread].into_iter(),
+            &FlamegraphMeta { names: names(), schema },
+            &SocketClocks::identity(),
+        )
     }
 
     #[test]
