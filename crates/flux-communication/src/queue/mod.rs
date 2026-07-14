@@ -81,13 +81,14 @@ pub struct AlignedCursor {
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct QueueHeader {
-    pub queue_type: QueueType, // 1
-    is_initialized: u8,        // 2
-    group_lock: AtomicU8,      // 3  — spinlock protecting group label search/insert
-    _pad1: [u8; 5],            // 8
-    pub elsize: usize,         // 16
-    pub mask: usize,           // 24
-    pub count: AtomicUsize,    /* 32 */
+    pub queue_type: QueueType,   // 1
+    is_initialized: u8,          // 2
+    group_lock: AtomicU8,        // 3  — spinlock protecting group label search/insert
+    signal_on_produce: AtomicU8, // 4 — produces wake parked tile threads (`park` feature)
+    _pad1: [u8; 4],              // 8
+    pub elsize: usize,           // 16
+    pub mask: usize,             // 24
+    pub count: AtomicUsize,      /* 32 */
 
     group_labels: [ArrayStr<GROUP_LABEL_LEN>; MAX_GROUPS],
     group_cursors: [AlignedCursor; MAX_GROUPS],
@@ -439,6 +440,20 @@ impl<T: Copy> InnerQueue<T> {
         self.header.len()
     }
 
+    /// Whether produces on this queue wake parked tile threads. Spine queues
+    /// set this at creation; side-channel queues (profiler, metrics, timers)
+    /// leave it off so high-rate produces don't turn into per-message
+    /// futex/waker syscalls.
+    #[inline]
+    pub fn signal_on_produce(&self) -> bool {
+        self.header.signal_on_produce.load(Ordering::Relaxed) != 0
+    }
+
+    #[inline]
+    pub fn set_signal_on_produce(&self, enabled: bool) {
+        self.header.signal_on_produce.store(enabled as u8, Ordering::Relaxed);
+    }
+
     fn is_poisoned(&self) -> Option<usize> {
         // We assume that nothing would take longer than 10 micros to be written.
         // If it does that means that nothing will actually be written and the queue is
@@ -666,12 +681,19 @@ impl<T: Copy> From<Queue<T>> for Producer<T> {
 impl<T: Copy> Producer<T> {
     #[inline]
     pub fn produce(&mut self, msg: &T) -> usize {
-        if self.produced_first == 0 {
+        let next_count = if self.produced_first == 0 {
             self.produced_first = 1;
             self.queue.produce_first(msg)
         } else {
             self.queue.produce(msg)
+        };
+
+        #[cfg(feature = "park")]
+        if self.queue.signal_on_produce() {
+            crate::park::SIGNAL.signal();
         }
+
+        next_count
     }
     pub fn max_writable_msgs_without_speeding_past(&self) -> usize {
         self.queue.max_writable_msgs_without_speeding_past()
@@ -679,7 +701,14 @@ impl<T: Copy> Producer<T> {
 
     #[inline]
     pub fn produce_without_first(&self, msg: &T) -> usize {
-        self.queue.produce(msg)
+        let next_count = self.queue.produce(msg);
+
+        #[cfg(feature = "park")]
+        if self.queue.signal_on_produce() {
+            crate::park::SIGNAL.signal();
+        }
+
+        next_count
     }
 }
 

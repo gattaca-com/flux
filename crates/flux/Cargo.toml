@@ -40,6 +40,7 @@ wincode = [
 ]
 park = [
     "dep:mio",
+    "flux-communication/park",
 ]
 
 [lints]

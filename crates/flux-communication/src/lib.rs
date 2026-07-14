@@ -1,6 +1,8 @@
 pub mod array;
 pub mod cleanup;
 mod error;
+#[cfg(feature = "park")]
+pub mod park;
 pub mod queue;
 mod seqlock;
 mod shmem_data;
@@ -84,7 +86,11 @@ pub fn shmem_queue_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy>(
 ) -> queue::Queue<T> {
     let queue_name = short_typename::<T>();
     let flink_path = shmem_dir_queues_with_base(&base_dir, &app_name).join(queue_name.as_str());
-    queue::Queue::create_or_open_shared(&flink_path, len, typ)
+    let q = queue::Queue::create_or_open_shared(&flink_path, len, typ);
+    // Spine queues feed tiles that may be parked; set unconditionally since
+    // another process may have created the queue without the flag.
+    q.set_signal_on_produce(true);
+    q
 }
 
 /// Allocates a spine queue and its dcache contiguously in a single shmem
@@ -150,6 +156,8 @@ where
             }
         }
     };
+
+    q.set_signal_on_produce(true);
 
     let dcache_ptr = unsafe { ptr.add(queue_bytes_aligned) };
     let dc = unsafe { DCachePtr::from_raw(DCache::from_ptr(dcache_ptr, dcache_cap)) };
