@@ -81,14 +81,14 @@ pub struct AlignedCursor {
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct QueueHeader {
-    pub queue_type: QueueType, // 1
-    is_initialized: u8,        // 2
-    group_lock: AtomicU8,      // 3  — spinlock protecting group label search/insert
+    pub queue_type: QueueType,   // 1
+    is_initialized: u8,          // 2
+    group_lock: AtomicU8,        // 3  — spinlock protecting group label search/insert
     signal_on_produce: AtomicU8, // 4 — produces wake parked tile threads (`park` feature)
-    _pad1: [u8; 4],            // 8
-    pub elsize: usize,         // 16
-    pub mask: usize,           // 24
-    pub count: AtomicUsize,    /* 32 */
+    _pad1: [u8; 4],              // 8
+    pub elsize: usize,           // 16
+    pub mask: usize,             // 24
+    pub count: AtomicUsize,      /* 32 */
 
     group_labels: [ArrayStr<GROUP_LABEL_LEN>; MAX_GROUPS],
     group_cursors: [AlignedCursor; MAX_GROUPS],
