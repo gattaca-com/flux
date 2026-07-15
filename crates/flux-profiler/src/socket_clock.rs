@@ -15,21 +15,37 @@ pub struct SocketClocks {
 }
 
 impl SocketClocks {
-    pub fn identity() -> Self {
-        Self { nodes: [Node { tsc: 0, wall_ns: 0 }; MAX_NODES] }
+    fn single_socket() -> Self {
+        let (wall_ns, tsc, _) = sample();
+        Self { nodes: [Node { tsc, wall_ns }; MAX_NODES] }
     }
 
+    /// Per-CPU calibration; needs Linux thread-affinity to pin onto each core.
+    #[cfg(target_os = "linux")]
     pub fn calibrate() -> Self {
         // Do in a different thread to avoid changing the caller's CPU affinity
         std::thread::Builder::new()
             .name("socket-clock-calib".to_owned())
             .spawn(Self::calibrate_per_cpu)
             .map_or_else(
-                |_| Self::identity(),
-                |handle| handle.join().unwrap_or_else(|_| Self::identity()),
+                |_| Self::single_socket(),
+                |handle| handle.join().unwrap_or_else(|_| Self::single_socket()),
             )
     }
 
+    /// Single-socket machines (e.g. macOS) have no cross-socket skew to
+    /// correct.
+    #[cfg(not(target_os = "linux"))]
+    pub fn calibrate() -> Self {
+        Self::single_socket()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity() -> Self {
+        Self { nodes: [Node { tsc: 0, wall_ns: 0 }; MAX_NODES] }
+    }
+
+    #[cfg(target_os = "linux")]
     fn calibrate_per_cpu() -> Self {
         let (wall_ns, tsc, _) = sample();
         let mut nodes = [Node { tsc, wall_ns }; MAX_NODES];
@@ -71,6 +87,7 @@ fn sample() -> (u64, u64, usize) {
 }
 
 /// CPUs from the current thread's affinity mask. Empty if the query fails.
+#[cfg(target_os = "linux")]
 fn allowed_cpus() -> impl Iterator<Item = usize> {
     let set = unsafe {
         let mut set: libc::cpu_set_t = mem::zeroed();
@@ -80,6 +97,7 @@ fn allowed_cpus() -> impl Iterator<Item = usize> {
     (0..libc::CPU_SETSIZE as usize).filter(move |&c| unsafe { libc::CPU_ISSET(c, &set) })
 }
 
+#[cfg(target_os = "linux")]
 fn pin_to(cpu: usize) {
     unsafe {
         let mut set: libc::cpu_set_t = mem::zeroed();
