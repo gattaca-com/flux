@@ -30,7 +30,7 @@ impl<T: RingEntry> RingDrainer<T> {
         Ok(Self { consumer, pending: VecDeque::new(), next_seq: 0, missed: 0 })
     }
 
-    fn drain(&mut self) {
+    fn drain(&mut self) -> bool {
         const DRAIN_BATCH: usize = 512;
 
         let mut scratch = T::default();
@@ -40,7 +40,7 @@ impl<T: RingEntry> RingDrainer<T> {
                     self.pending.push_back(scratch);
                     self.next_seq += 1;
                 }
-                Err(ReadError::Empty) => break,
+                Err(ReadError::Empty) => return false,
                 Err(ReadError::SpedPast) => {
                     self.consumer.recover_after_error();
                     let head = self.consumer.queue_message_count() as u64;
@@ -50,6 +50,7 @@ impl<T: RingEntry> RingDrainer<T> {
                 }
             }
         }
+        true
     }
 
     fn first_seq(&self) -> u64 {
@@ -92,14 +93,15 @@ impl Rings {
         })
     }
 
-    pub(super) fn drain(&mut self) {
-        self.marks.drain();
+    pub(super) fn drain(&mut self) -> bool {
+        let mut more = self.marks.drain();
         if let Some(perf) = &mut self.perf {
-            perf.drain();
+            more |= perf.drain();
         }
         if let Some(alloc) = &mut self.alloc {
-            alloc.drain();
+            more |= alloc.drain();
         }
+        more
     }
 
     pub(super) fn slowest_cursor(&self) -> u64 {

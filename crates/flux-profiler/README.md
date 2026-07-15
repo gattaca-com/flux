@@ -81,6 +81,41 @@ cargo run -p flux-profiler --example timed_producer
 flux-profiler
 ```
 
+## Overhead
+
+Per-call cost of one `#[timed]` frame (open + close), measured with the bundled
+`timed_overhead` example on a release build, producer and reader pinned to a
+separate core each:
+
+| State | Overhead | + while a reader drains |
+|---|---|---|
+| Disabled (`enable_profiler` never called) | ~1 ns | — |
+| Enabled | ~12 ns | ~14 ns |
+| Enabled + `alloc-profile` | ~15 ns | ~19 ns |
+| Enabled + `perf` | ~62 ns | ~67 ns |
+
+A timed frame is two shared-memory ring writes (open + close) plus two TSC
+reads. The optional features stack on top:
+
+- **`alloc-profile`** adds two more ring writes (~+4 ns).
+- **`perf`** reads the hardware counters via `rdpmc` on every mark — several
+  reads per mark, so **~+50 ns**, by far the dominant cost. Only enable it when
+  you actually want per-frame instruction/cycle/miss counts.
+
+The extra cost *while a reader drains* is cache-line contention on the rings —
+~2 ns for a normal timed site, but it grows if you instrument something hot
+enough that the reader can't keep up (a sub-10 ns leaf called tens of millions
+of times per second). Disabled, a `#[timed]` call is a single atomic load;
+strip it out entirely with `disable-profiling`.
+
+Reproduce (numbers depend on your CPU; `perf` needs `perf_event_paranoid <= 2`):
+
+```bash
+taskset -c 2,3 cargo run -p flux-profiler --example timed_overhead --release
+taskset -c 2,3 cargo run -p flux-profiler --example timed_overhead --release --features alloc-profile
+taskset -c 2,3 cargo run -p flux-profiler --example timed_overhead --release --features perf
+```
+
 ## Optional features
 
 | Feature | What it adds |

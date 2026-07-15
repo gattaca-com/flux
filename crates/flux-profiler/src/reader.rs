@@ -76,12 +76,14 @@ impl InProcessReader {
     fn run(stop: &AtomicBool, dir: QueueDir) -> EventsDrainer {
         let mut drainer = EventsDrainer::new(dir, Schema::local().clone());
         loop {
+            let more = drainer.poll(&InProcessSymbolsResolver);
             let stopping = stop.load(Ordering::Acquire);
-            drainer.poll(&InProcessSymbolsResolver);
-            if stopping {
+            if stopping && !more {
                 break;
             }
-            thread::sleep(Duration::from_millis(1));
+            if !more {
+                thread::sleep(Duration::from_millis(1));
+            }
         }
         drainer
     }
@@ -93,11 +95,15 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::{
-        producer::{record_close, record_open},
-        queue_dir::RING_CAPACITY,
-        test_shmem::ShmemGuard,
-    };
+    use crate::{mark::Mark, producer, queue_dir::RING_CAPACITY, test_shmem::ShmemGuard};
+
+    fn record_open(name: &'static str) {
+        producer::thread_producers().expect("profiler enabled").push(Mark::open(name));
+    }
+
+    fn record_close(name: &'static str) {
+        producer::thread_producers().expect("profiler enabled").push(Mark::close(name));
+    }
 
     fn open_frames(events: &EventsDrainer, name: &str) -> usize {
         events
