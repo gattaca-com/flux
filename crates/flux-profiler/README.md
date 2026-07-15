@@ -88,7 +88,7 @@ flux-profiler
 | `disable-profiling` | Compiles every `#[timed]` out to a plain function call — zero overhead, no guard, no atomic load. |
 | `perf` | Per-call hardware counters (instructions, cycles, branch/cache misses) via rdpmc. Requires `kernel.perf_event_paranoid <= 2` at runtime (`<= 1` to include kernel-mode work). |
 | `alloc-profile` | Per-thread allocated/freed byte counts recorded alongside each `#[timed]` mark. Wraps the global allocator. |
-| `unpinned-threads` | Tags every mark with its socket (rdtscp) so timestamps stay aligned on machines with drifted per-socket TSCs. |
+| `unpinned-threads` | Tags every mark with its socket (rdtscp) so timestamps stay aligned on machines with drifted per-socket TSCs (Linux only). See [Multi-socket machines](#multi-socket-machines). |
 
 ### Zero overhead when not profiling
 
@@ -141,6 +141,11 @@ sockets land on shifted timelines. Build with `unpinned-threads` to tag every
 mark with its socket (one rdtscp per mark, in place of rdtsc); the reader then
 calibrates a per-socket clock and places all marks on one wall-clock timeline,
 correct even as threads migrate between sockets mid-capture.
+
+Per-socket calibration is **Linux-only** — it pins the sampling thread to each
+core via thread-affinity APIs that have no portable equivalent (e.g. macOS).
+Other platforms fall back to a single-socket clock, which is correct for
+single-socket machines (all Macs) but does not correct cross-socket TSC skew.
 
 ## License
 
