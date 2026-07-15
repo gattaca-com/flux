@@ -33,7 +33,8 @@ impl SocketClocks {
             )
     }
 
-    /// Single-socket machines (e.g. macOS) have no cross-socket skew to correct.
+    /// Single-socket machines (e.g. macOS) have no cross-socket skew to
+    /// correct.
     #[cfg(not(target_os = "linux"))]
     pub fn calibrate() -> Self {
         Self::single_socket()
