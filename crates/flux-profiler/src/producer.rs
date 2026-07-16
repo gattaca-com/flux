@@ -13,7 +13,7 @@ thread_local! {
     static PRODUCERS: OnceLock<Producers> = const { OnceLock::new() };
 }
 
-struct Producers {
+pub(crate) struct Producers {
     marks: Producer<Mark>,
     #[cfg(feature = "perf")]
     perf: Producer<PerfSample>,
@@ -34,7 +34,8 @@ impl Producers {
         }
     }
 
-    fn push(&self, mark: Mark) {
+    #[inline]
+    pub(crate) fn push(&self, mark: Mark) {
         // Rings arrive freshly created (never adopted from a crashed writer),
         // so the per-call unpoison pass of plain `produce` is unnecessary.
         self.marks.produce_without_first(&mark);
@@ -52,16 +53,10 @@ fn thread_token() -> String {
 }
 
 #[inline]
-fn record(mark: Mark) {
-    PRODUCERS.with(|cell| cell.get_or_init(Producers::for_current_thread).push(mark));
-}
-
-#[inline]
-pub(crate) fn record_open(name: &'static str) {
-    record(Mark::open(name));
-}
-
-#[inline]
-pub(crate) fn record_close(name: &'static str) {
-    record(Mark::close(name));
+pub(crate) fn thread_producers() -> Option<&'static Producers> {
+    QUEUE_DIR.get()?;
+    PRODUCERS.with(|cell| {
+        let producers = cell.get_or_init(Producers::for_current_thread);
+        Some(unsafe { &*std::ptr::from_ref(producers) })
+    })
 }

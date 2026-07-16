@@ -39,6 +39,7 @@ const OPEN_BIT: u16 = 1 << 15;
 pub(crate) const MISSED_ID: u64 = 0;
 
 impl Mark {
+    #[inline]
     pub(crate) fn open(name: &'static str) -> Self {
         debug_assert!(name.len() < OPEN_BIT as usize, "timed name exceeds 15-bit length");
         Self {
@@ -48,18 +49,22 @@ impl Mark {
         }
     }
 
+    #[inline]
     pub(crate) fn close(name: &'static str) -> Self {
         Self { id: name.as_ptr() as u64, ts: stamped_now(), len_and_open: 0 }
     }
 
+    #[inline]
     pub fn is_open(&self) -> bool {
         self.len_and_open & OPEN_BIT != 0
     }
 
+    #[inline]
     pub(crate) fn name_len(&self) -> u16 {
         self.len_and_open & !OPEN_BIT
     }
 
+    #[inline]
     pub const fn from_parts(id: u64, ts: u64, open: bool) -> Self {
         Self { id, ts, len_and_open: if open { OPEN_BIT } else { 0 } }
     }

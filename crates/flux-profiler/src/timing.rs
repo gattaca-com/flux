@@ -4,31 +4,35 @@
 //! open/close into the cross-process per-thread profiler rings; hardware
 //! counters (with the `perf` feature) ride alongside each mark there.
 
-use super::{producer, queue_dir::QUEUE_DIR};
+use super::{
+    mark::Mark,
+    producer::{self, Producers},
+};
 
 /// Drop-based timer scope used by the `#[timed]` macro expansion. Records a
 /// frame open on construction and a close on every exit path — normal return,
 /// `?`, early `return`, panic-unwind.
 #[doc(hidden)]
 pub struct TimerGuard {
-    close: Option<&'static str>,
+    open: Option<(&'static Producers, &'static str)>,
 }
 
 impl TimerGuard {
     #[inline]
     pub fn new(name: &'static str) -> Self {
-        let close = QUEUE_DIR.get().is_some().then_some(name);
-        if let Some(name) = close {
-            producer::record_open(name);
-        }
-        Self { close }
+        let open = producer::thread_producers().map(|producers| {
+            producers.push(Mark::open(name));
+            (producers, name)
+        });
+        Self { open }
     }
 }
 
 impl Drop for TimerGuard {
+    #[inline]
     fn drop(&mut self) {
-        if let Some(name) = self.close {
-            producer::record_close(name);
+        if let Some((producers, name)) = self.open {
+            producers.push(Mark::close(name));
         }
     }
 }

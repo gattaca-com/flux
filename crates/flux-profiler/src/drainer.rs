@@ -84,7 +84,7 @@ impl EventsDrainer {
         Self { dir, threads: FxHashMap::default(), meta, clocks: SocketClocks::calibrate() }
     }
 
-    pub(super) fn poll(&mut self, resolver: &impl FrameResolver) {
+    pub(super) fn poll(&mut self, resolver: &impl FrameResolver) -> bool {
         for thread in self.dir.event_threads() {
             self.threads.entry(thread).or_insert_with_key(|token| {
                 ThreadDrainer::open(&self.dir, token)
@@ -94,9 +94,11 @@ impl EventsDrainer {
                     .ok()
             });
         }
+        let mut more = false;
         for thread in self.threads.values_mut().flatten() {
-            thread.poll(&mut self.meta.names, resolver);
+            more |= thread.poll(&mut self.meta.names, resolver);
         }
+        more
     }
 
     pub fn threads(&self) -> impl Iterator<Item = ThreadEvents<'_>> {
@@ -175,8 +177,8 @@ impl ThreadDrainer {
         })
     }
 
-    fn poll(&mut self, names: &mut FxHashMap<u64, String>, resolver: &impl FrameResolver) {
-        self.rings.drain();
+    fn poll(&mut self, names: &mut FxHashMap<u64, String>, resolver: &impl FrameResolver) -> bool {
+        let more = self.rings.drain();
         let slowest_cursor = self.rings.slowest_cursor();
 
         while let Some((seq, mark)) = self.rings.marks.pop_ready(slowest_cursor) {
@@ -201,6 +203,7 @@ impl ThreadDrainer {
                 self.unmatched_closes += 1;
             }
         }
+        more
     }
 
     /// The samples pushed with mark `seq`, or the last retained ones if a
