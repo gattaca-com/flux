@@ -23,14 +23,22 @@ cargo install --git https://github.com/gattaca-com/flux flux-profiler
 use flux_profiler::{enable_profiler, timed};
 
 #[timed]
-fn do_work() {
-    // ...
+fn handle_request() {
+    parse_input();
+    run_computation();
 }
+
+#[timed]
+fn parse_input() { /* ... */ }
+
+#[timed]
+fn run_computation() { /* ... */ }
 
 fn main() {
     enable_profiler("my-app"); // publishes the shmem rings under this app name
-    loop {
-        do_work();
+
+    for _ in 0..1_000_000 {
+        handle_request();
     }
 }
 ```
