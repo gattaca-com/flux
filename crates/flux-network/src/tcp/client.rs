@@ -12,8 +12,8 @@ use tracing::{debug, error, warn};
 use crate::tcp::{
     ConnState, SendBehavior, TcpStream, TcpTelemetry,
     stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, build_frame_vec, set_socket_buf_size,
-        set_user_timeout, write_frame_header,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, TcpTimers, build_frame_vec,
+        set_socket_buf_size, set_user_timeout, write_frame_header,
     },
 };
 
@@ -30,6 +30,7 @@ struct Endpoint {
     token: Token,
     peer_addr: SocketAddr,
     state: EndpointState,
+    timers: Option<TcpTimers>,
     send_backlog: VecDeque<Vec<u8>>,
     backlog_exceeded_since: Option<Instant>,
 }
@@ -87,10 +88,12 @@ impl ClientManager {
     fn connect(&mut self, peer_addr: SocketAddr) -> Token {
         let token = Token(self.next_token);
         self.next_token += 1;
+        let timers = TcpTimers::new_client(self.telemetry, token, peer_addr);
         self.endpoints.push(Endpoint {
             token,
             peer_addr,
             state: EndpointState::Disconnected,
+            timers,
             send_backlog: VecDeque::with_capacity(64),
             backlog_exceeded_since: None,
         });
@@ -187,8 +190,8 @@ impl ClientManager {
             return;
         }
 
-        let mut stream =
-            TcpStream::from_client_stream_with_telemetry(socket, token, peer_addr, self.telemetry);
+        let timers = self.endpoints[index].timers.take();
+        let mut stream = TcpStream::from_client_stream(socket, token, peer_addr, timers);
         let backlog = std::mem::take(&mut self.endpoints[index].send_backlog);
         if stream.install_send_backlog(self.poll.registry(), backlog, self.on_connect_msg.as_ref()) ==
             ConnState::Disconnected
@@ -250,6 +253,7 @@ impl ClientManager {
                 let _ = socket.shutdown(Shutdown::Both);
             }
             EndpointState::Connected(mut stream) => {
+                self.endpoints[index].timers = stream.take_timers();
                 if self.drop_backlog_on_disconnect {
                     self.endpoints[index].send_backlog.clear();
                 } else {

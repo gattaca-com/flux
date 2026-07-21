@@ -35,7 +35,7 @@ pub enum TcpTelemetry {
 
 /// Timers for TCP stream metrics.
 #[derive(Clone, Copy, Debug)]
-struct TcpTimers {
+pub(crate) struct TcpTimers {
     latency: Timer,
     alloc: Timer,
 }
@@ -46,6 +46,16 @@ impl TcpTimers {
             latency: Timer::new(app_name, format!("tcp_latency_{label}")),
             alloc: Timer::new(app_name, format!("tcp_alloc_{label}")),
         }
+    }
+
+    pub(crate) fn new_client(
+        telemetry: TcpTelemetry,
+        token: Token,
+        peer_addr: SocketAddr,
+    ) -> Option<Self> {
+        let TcpTelemetry::Enabled { app_name } = telemetry else { return None };
+        let label = format!("client-{}-{peer_addr}", token.0);
+        Some(Self::new(app_name, &label))
     }
 }
 
@@ -203,23 +213,15 @@ impl TcpStream {
         }
     }
 
-    /// Constructs a client-managed stream with telemetry keyed by its stable
-    /// endpoint token rather than the socket's ephemeral local port.
+    /// Constructs a client-managed stream using timers owned by its persistent
+    /// endpoint and reused across replacement sockets.
     #[inline(never)]
-    pub(crate) fn from_client_stream_with_telemetry(
+    pub(crate) fn from_client_stream(
         stream: mio::net::TcpStream,
         token: Token,
         peer_addr: SocketAddr,
-        telemetry: TcpTelemetry,
+        timers: Option<TcpTimers>,
     ) -> Self {
-        let timers = match telemetry {
-            TcpTelemetry::Disabled => None,
-            TcpTelemetry::Enabled { app_name } => {
-                let label = format!("client-{}-{peer_addr}", token.0);
-                Some(TcpTimers::new(app_name, &label))
-            }
-        };
-
         Self {
             stream,
             peer_addr,
@@ -272,6 +274,12 @@ impl TcpStream {
         self.writable_armed = false;
         self.backlog_exceeded_since = None;
         std::mem::take(&mut self.send_backlog)
+    }
+
+    /// Returns client telemetry to the persistent endpoint before this socket
+    /// is replaced.
+    pub(crate) fn take_timers(&mut self) -> Option<TcpTimers> {
+        self.timers.take()
     }
 
     #[inline]
