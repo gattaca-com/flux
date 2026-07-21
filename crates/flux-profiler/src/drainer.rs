@@ -74,6 +74,7 @@ pub struct EventsDrainer {
     threads: FxHashMap<String, Option<ThreadDrainer>>,
     meta: FlamegraphMeta,
     clocks: SocketClocks,
+    min_frame_ns: u64,
 }
 
 impl EventsDrainer {
@@ -81,7 +82,21 @@ impl EventsDrainer {
         let mut names = FxHashMap::default();
         names.insert(MISSED_ID, "<missed>".to_string());
         let meta = FlamegraphMeta { names, schema };
-        Self { dir, threads: FxHashMap::default(), meta, clocks: SocketClocks::calibrate() }
+        Self {
+            dir,
+            threads: FxHashMap::default(),
+            meta,
+            clocks: SocketClocks::calibrate(),
+            min_frame_ns: 0,
+        }
+    }
+
+    /// Discard a completed top-level frame (the close that empties the stack)
+    /// as it is drained when it spans less than `min` — assumed to be an idle
+    /// poll rather than a trace of interest. Frames still open at export and
+    /// `<missed>` gap spans are always kept.
+    pub fn filter_short_frames(&mut self, min: std::time::Duration) {
+        self.min_frame_ns = min.as_nanos().try_into().unwrap_or(u64::MAX);
     }
 
     pub(super) fn poll(&mut self, resolver: &impl FrameResolver) -> bool {
@@ -96,7 +111,7 @@ impl EventsDrainer {
         }
         let mut more = false;
         for thread in self.threads.values_mut().flatten() {
-            more |= thread.poll(&mut self.meta.names, resolver);
+            more |= thread.poll(&mut self.meta.names, resolver, &self.clocks, self.min_frame_ns);
         }
         more
     }
@@ -150,6 +165,12 @@ impl EventsData {
         (self.perf.last().copied(), self.alloc.last().copied())
     }
 
+    fn truncate(&mut self, len: usize) {
+        self.marks.truncate(len);
+        self.perf.truncate(len);
+        self.alloc.truncate(len);
+    }
+
     fn retained_bytes(&self) -> usize {
         self.marks.capacity() * size_of::<Mark>() +
             self.perf.capacity() * size_of::<PerfSample>() +
@@ -162,6 +183,9 @@ struct ThreadDrainer {
     events: EventsData,
     /// Stack of opens whose close hasn't arrived yet.
     open_ids: Vec<u64>,
+    /// Retained index of the current top-level frame's open, the truncation
+    /// point when the frame closes below the short-frame threshold.
+    frame_start: usize,
     unmatched_closes: u64,
     expected_seq: u64,
 }
@@ -172,12 +196,19 @@ impl ThreadDrainer {
             rings: Rings::open(dir, token)?,
             events: EventsData::default(),
             open_ids: Vec::new(),
+            frame_start: 0,
             unmatched_closes: 0,
             expected_seq: 0,
         })
     }
 
-    fn poll(&mut self, names: &mut FxHashMap<u64, String>, resolver: &impl FrameResolver) -> bool {
+    fn poll(
+        &mut self,
+        names: &mut FxHashMap<u64, String>,
+        resolver: &impl FrameResolver,
+        clocks: &SocketClocks,
+        min_frame_ns: u64,
+    ) -> bool {
         let more = self.rings.drain();
         let slowest_cursor = self.rings.slowest_cursor();
 
@@ -194,16 +225,33 @@ impl ThreadDrainer {
                 names.entry(id).or_insert_with(|| {
                     resolver.resolve(id, mark.name_len()).unwrap_or_else(|| format!("unknown_{id}"))
                 });
+                if self.open_ids.is_empty() {
+                    self.frame_start = self.events.marks.len();
+                }
                 self.open_ids.push(id);
                 self.events.push(mark, perf, alloc);
             } else if let Some(open_id) = self.open_ids.pop() {
                 debug_assert_eq!(open_id, mark.id, "timed close under a non-matching open");
                 self.events.push(mark, perf, alloc);
+                self.filter_short_frame(mark.ts, clocks, min_frame_ns);
             } else {
                 self.unmatched_closes += 1;
             }
         }
         more
+    }
+
+    /// Discard the just-closed frame if it completed the top-level span (the
+    /// stack is empty again) in less than `min_frame_ns`: truncate the
+    /// retained events back to its open.
+    fn filter_short_frame(&mut self, close_ts: u64, clocks: &SocketClocks, min_frame_ns: u64) {
+        if min_frame_ns == 0 || !self.open_ids.is_empty() {
+            return;
+        }
+        let open_ts = self.events.marks[self.frame_start].ts;
+        if clocks.resolve_ns(close_ts).saturating_sub(clocks.resolve_ns(open_ts)) < min_frame_ns {
+            self.events.truncate(self.frame_start);
+        }
     }
 
     /// The samples pushed with mark `seq`, or the last retained ones if a
@@ -279,21 +327,21 @@ mod tests {
 
         push(Mark::from_parts(1, 10, true), 100);
         push(Mark::from_parts(2, 20, true), 200);
-        thread.poll(&mut names, &NoResolver);
+        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 0);
 
         // Lap both rings, then recover: everything produced so far after the
         // two retained opens — including close(2)/close(1) — is a hole.
         for _ in 0..RING_CAPACITY as u64 + 5 {
             push(Mark::from_parts(3, 30, true), 300);
         }
-        thread.poll(&mut names, &NoResolver);
+        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 0);
 
         // First post-hole events: an unmatched close (its open was lost), then
         // a clean frame.
         push(Mark::from_parts(9, 40, false), 900);
         push(Mark::from_parts(4, 50, true), 1000);
         push(Mark::from_parts(4, 60, false), 1100);
-        thread.poll(&mut names, &NoResolver);
+        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 0);
 
         let events: Vec<_> =
             thread.events.marks.iter().map(|m| (m.id, m.is_open(), m.ts)).collect();
@@ -317,5 +365,50 @@ mod tests {
         assert_eq!(thread.unmatched_closes, 1, "only the unmatched close is discarded");
         assert!(thread.loss().missed > 0);
         assert!(thread.open_ids.is_empty());
+    }
+
+    #[test]
+    fn short_top_level_frames_are_discarded() {
+        const SHORT: u64 = 100;
+        const LONG: u64 = 10_000_000;
+
+        let guard = ShmemGuard::new();
+        let dir = QueueDir::new(guard.app());
+        let mut mark_producer = Producer::from(dir.ring::<Mark>("filter-test"));
+        let mut alloc_producer = Producer::from(dir.ring::<AllocSample>("filter-test"));
+        let mut thread = ThreadDrainer::open(&dir, "filter-test").unwrap();
+        let mut names = FxHashMap::default();
+
+        let mut push = |mark: Mark, allocated: u64| {
+            mark_producer.produce(&mark);
+            alloc_producer.produce(&AllocSample { allocated, freed: 0 });
+        };
+
+        // Short top-level frame with a nested frame: discarded whole.
+        push(Mark::from_parts(1, 1000, true), 100);
+        push(Mark::from_parts(2, 1010, true), 200);
+        push(Mark::from_parts(2, 1020, false), 300);
+        push(Mark::from_parts(1, 1000 + SHORT, false), 400);
+        // Long top-level frame with a short nested frame: kept whole.
+        push(Mark::from_parts(1, 2000, true), 500);
+        push(Mark::from_parts(2, 2010, true), 600);
+        push(Mark::from_parts(2, 2020, false), 700);
+        push(Mark::from_parts(1, 2000 + LONG, false), 800);
+        // Trailing frame with no close yet: kept.
+        push(Mark::from_parts(3, 3_000_000_000, true), 900);
+        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 1000);
+
+        let events: Vec<_> =
+            thread.events.marks.iter().map(|m| (m.id, m.is_open(), m.ts)).collect();
+        assert_eq!(events, [
+            (1, true, 2000),
+            (2, true, 2010),
+            (2, false, 2020),
+            (1, false, 2000 + LONG),
+            (3, true, 3_000_000_000),
+        ]);
+        let allocated: Vec<_> = thread.events.alloc.iter().map(|a| a.allocated).collect();
+        assert_eq!(allocated, [500, 600, 700, 800, 900], "samples truncate with their marks");
+        assert!(!thread.loss().is_lossy(), "filtering is not loss");
     }
 }

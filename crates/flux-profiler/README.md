@@ -59,7 +59,7 @@ Then attach the profiler in a second terminal. If exactly one instrumented app
 is live it attaches automatically; otherwise pass `--pid <pid>`:
 
 ```
-flux-profiler [--pid <pid>] [--out <path.fxt>] [--duration <30s|5m|1h>] [--max-mem <512MB|2GB>]
+flux-profiler [--pid <pid>] [--out <path.fxt>] [--duration <30s|5m|1h>] [--max-mem <512MB|2GB>] [--filter-short-frames <100ns|5us>]
 ```
 
 Press **Ctrl-C** (or let the app exit) to write the `.fxt` trace. The default
@@ -72,6 +72,12 @@ Ctrl-C, or the app exiting — stops the capture and exports the trace.
 
 `--max-mem` defaults to `1GB` so a forgotten profiler can't grow unbounded;
 raise it for longer captures.
+
+If your app spins on a hot loop, most of the capture ends up being idle
+iterations that do nothing interesting. `--filter-short-frames=100ns` drops
+every top-level frame that completes in under 100ns (including everything
+nested inside it), so only the slow iterations survive. Filtering happens
+while draining, so discarded frames don't count against `--max-mem` either.
 
 ### 3. Open the trace
 

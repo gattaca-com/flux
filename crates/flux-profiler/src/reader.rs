@@ -36,6 +36,10 @@ impl CrossProcessReader {
         self.pid
     }
 
+    pub fn filter_short_frames(&mut self, min: Duration) {
+        self.drainer.filter_short_frames(min);
+    }
+
     pub fn poll(&mut self) {
         self.drainer.poll(&self.resolver);
     }

@@ -35,6 +35,11 @@ struct Args {
     /// `512MB`, `2GB`. Guards against an unbounded capture.
     #[arg(long, default_value = "1GB")]
     max_mem: bytesize::ByteSize,
+    /// Discard a completed top-level frame (its close empties the stack) when
+    /// it spans less than this, e.g. `100ns`, `5us` — throws away idle polls
+    /// so only traces of interest are retained.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    filter_short_frames: Option<Duration>,
 }
 
 /// The producer to attach to: the one matching `--pid`, or the sole live one
@@ -79,6 +84,9 @@ fn main() -> ExitCode {
         eprintln!("no live producer published under app '{app}'");
         return ExitCode::FAILURE;
     };
+    if let Some(min) = args.filter_short_frames {
+        reader.filter_short_frames(min);
+    }
 
     unsafe {
         libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
