@@ -76,7 +76,7 @@ pub(crate) fn write_frame_header(
 /// Only hit when a socket blocks; the happy path writes `header` and `payload`
 /// as separate `IoSlice`s and never concatenates.
 #[inline]
-fn build_frame_vec(header: &[u8; FRAME_HEADER_SIZE], payload: &[u8]) -> Vec<u8> {
+pub(crate) fn build_frame_vec(header: &[u8; FRAME_HEADER_SIZE], payload: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
     v.extend_from_slice(header);
     v.extend_from_slice(payload);
@@ -201,6 +201,77 @@ impl TcpStream {
             backlog_exceeded_since: None,
             timers,
         }
+    }
+
+    /// Constructs a client-managed stream with telemetry keyed by its stable
+    /// endpoint token rather than the socket's ephemeral local port.
+    #[inline(never)]
+    pub(crate) fn from_client_stream_with_telemetry(
+        stream: mio::net::TcpStream,
+        token: Token,
+        peer_addr: SocketAddr,
+        telemetry: TcpTelemetry,
+    ) -> Self {
+        let timers = match telemetry {
+            TcpTelemetry::Disabled => None,
+            TcpTelemetry::Enabled { app_name } => {
+                let label = format!("client-{}-{peer_addr}", token.0);
+                Some(TcpTimers::new(app_name, &label))
+            }
+        };
+
+        Self {
+            stream,
+            peer_addr,
+            token,
+            rx_state: RxState::default(),
+            rx_buf: RxBuf::Heap(vec![0; RX_BUF_SIZE]),
+            header_buf: [0; FRAME_HEADER_SIZE],
+            send_buf: vec![0; Self::SEND_BUF_SIZE],
+            send_backlog: VecDeque::with_capacity(64),
+            send_cursor: 0,
+            writable_armed: false,
+            backlog_exceeded_since: None,
+            timers,
+        }
+    }
+
+    /// Installs frames retained by [`TcpClient`](super::TcpClient) while this
+    /// endpoint was disconnected and schedules them after the on-connect
+    /// message.
+    pub(crate) fn install_send_backlog(
+        &mut self,
+        registry: &Registry,
+        backlog: VecDeque<Vec<u8>>,
+        on_connect_msg: Option<&Vec<u8>>,
+    ) -> ConnState {
+        debug_assert!(self.send_backlog.is_empty());
+        self.send_backlog = backlog;
+        if !self.send_backlog.is_empty() {
+            if let Some(message) = on_connect_msg {
+                let already_queued = self.send_backlog.front().is_some_and(|front| {
+                    front.len() >= FRAME_HEADER_SIZE && front[FRAME_HEADER_SIZE..] == **message
+                });
+                if !already_queued {
+                    self.serialise_frame(|bytes| bytes.extend_from_slice(message));
+                    let data = self.alloc_vec(0);
+                    return self.enqueue_front(registry, data);
+                }
+            }
+            self.arm_writable(registry)
+        } else if let Some(message) = on_connect_msg {
+            self.write_or_enqueue_with(registry, |bytes| bytes.extend_from_slice(message))
+        } else {
+            ConnState::Alive
+        }
+    }
+
+    /// Moves queued frames out before a client-managed socket is replaced.
+    pub(crate) fn take_send_backlog(&mut self) -> VecDeque<Vec<u8>> {
+        self.send_cursor = 0;
+        self.writable_armed = false;
+        self.backlog_exceeded_since = None;
+        std::mem::take(&mut self.send_backlog)
     }
 
     #[inline]
