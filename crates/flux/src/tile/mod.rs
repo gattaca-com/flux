@@ -3,7 +3,7 @@ pub mod metrics;
 use core::sync::atomic::Ordering;
 
 use flux_timing::{Duration, IngestionTime};
-use flux_utils::{ShortTypename, get_tid, short_typename, thread_boot, vsync};
+use flux_utils::{ShortTypename, ThreadNiceness, get_tid, short_typename, thread_boot, vsync};
 use tracing::{Level, info, span};
 
 use crate::{
@@ -17,13 +17,13 @@ pub type TileName = ShortTypename;
 #[derive(Clone, Copy, Debug)]
 pub struct TileConfig {
     core: Option<usize>,
-    thread_niceness: Option<i32>,
+    thread_niceness: Option<ThreadNiceness>,
     min_loop_duration: Option<Duration>,
     metrics: bool,
 }
 
 impl TileConfig {
-    pub fn new(core: usize, thread_niceness: Option<i32>) -> Self {
+    pub fn new(core: usize, thread_niceness: Option<ThreadNiceness>) -> Self {
         Self { core: Some(core), thread_niceness, min_loop_duration: None, metrics: true }
     }
 
