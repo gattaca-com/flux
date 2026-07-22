@@ -6,7 +6,7 @@ The framework is built around pinned workers assigned to physical cores, and det
 
 ## where to look
 
-- **[`tile/mod.rs`](crates/flux/src/tile/mod.rs)** — core execution unit. One per physical core, pinned with affinity + SCHED_FIFO.
+- **[`tile/mod.rs`](crates/flux/src/tile/mod.rs)** — core execution unit. One per physical core, pinned with affinity and optionally assigned a Linux nice value while retaining the default scheduler.
 - **[`spine/mod.rs`](crates/flux/src/spine/mod.rs)** — wiring & dataflow layer. Single struct holding all queues and shared data. Tiles read and write through a SpineAdapter that tracks work and stamps timing metadata automatically.
 - **[`queue.rs`](crates/flux-communication/src/queue.rs)** — seqlock-based broadcast queue. SPMC or MPMC. Shared-memory backed. No coordination between consumers — they track their own position and recover if lapped by the producers.
 - **[`seqlock.rs`](crates/flux-communication/src/seqlock.rs)** — seqlock impl that handles synchronisation.

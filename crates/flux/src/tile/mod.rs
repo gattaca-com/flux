@@ -3,7 +3,7 @@ pub mod metrics;
 use core::sync::atomic::Ordering;
 
 use flux_timing::{Duration, IngestionTime};
-use flux_utils::{ShortTypename, ThreadPriority, get_tid, short_typename, thread_boot, vsync};
+use flux_utils::{ShortTypename, get_tid, short_typename, thread_boot, vsync};
 use tracing::{Level, info, span};
 
 use crate::{
@@ -17,20 +17,20 @@ pub type TileName = ShortTypename;
 #[derive(Clone, Copy, Debug)]
 pub struct TileConfig {
     core: Option<usize>,
-    thread_prio: ThreadPriority,
+    thread_niceness: Option<i32>,
     min_loop_duration: Option<Duration>,
     metrics: bool,
 }
 
 impl TileConfig {
-    pub fn new(core: usize, thread_prio: ThreadPriority) -> Self {
-        Self { core: Some(core), thread_prio, min_loop_duration: None, metrics: true }
+    pub fn new(core: usize, thread_niceness: Option<i32>) -> Self {
+        Self { core: Some(core), thread_niceness, min_loop_duration: None, metrics: true }
     }
 
     /// Boot a tile with a background (non-hot-path) config.
-    /// Supports optional vsync pacing and relaxed scheduling.
+    /// Supports optional vsync pacing and inherits the process niceness.
     pub fn background(core: Option<usize>, min_loop_duration: Option<Duration>) -> Self {
-        Self { core, thread_prio: ThreadPriority::OSDefault, min_loop_duration, metrics: true }
+        Self { core, thread_niceness: None, min_loop_duration, metrics: true }
     }
 
     pub fn without_metrics(mut self) -> Self {
@@ -65,7 +65,7 @@ pub trait Tile<S: FluxSpine>: Send + Sized {
 }
 
 /// Boot and run a tile thread.
-/// Configures affinity and priority, then executes the tile lifecycle.
+/// Configures affinity and niceness, then executes the tile lifecycle.
 /// Does not exit until the global stop flag is set.
 pub fn attach_tile<'a, S, T>(mut tile: T, spine: &mut ScopedSpine<'a, '_, S>, config: TileConfig)
 where
@@ -85,7 +85,7 @@ where
     let name = tile.name();
     let run = move || {
         let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
-        thread_boot(config.core, config.thread_prio);
+        thread_boot(config.core, config.thread_niceness);
 
         while !tile.try_init(&mut adapter) {
             if stop_flag.load(Ordering::Relaxed) != 0 {
