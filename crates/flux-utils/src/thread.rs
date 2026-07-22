@@ -1,51 +1,49 @@
 use core_affinity::CoreId;
-#[cfg(target_os = "linux")]
-use libc::{SCHED_FIFO, sched_param, sched_setscheduler};
 use tracing::warn;
 
-/// Any variant other than `OSDefault` requests `SCHED_FIFO` realtime scheduling
-/// if the process has permission (`CAP_SYS_NICE`).
-///
-/// If setting the policy fails, execution continues under the OS default (CFS).
 #[derive(Clone, Copy, Debug)]
-pub enum ThreadPriority {
-    OSDefault,
+pub enum ThreadNiceness {
     Low,
     Medium,
     High,
+    Highest,
     Custom(i32),
 }
 
-#[cfg(target_os = "linux")]
-impl ThreadPriority {
-    fn to_sched_param(self) -> Option<sched_param> {
-        let prio = match self {
-            Self::OSDefault => return None,
-            Self::Low => 40,
-            Self::Medium => 60,
-            Self::High => 75,
-            Self::Custom(p) => p,
-        };
-        Some(sched_param { sched_priority: prio })
+impl ThreadNiceness {
+    const fn value(self) -> i32 {
+        match self {
+            Self::Low => 10,
+            Self::Medium => 0,
+            Self::High => -10,
+            Self::Highest => -20,
+            Self::Custom(niceness) => niceness,
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn set_thread_prio(prio: ThreadPriority) {
-    if let Some(param) = prio.to_sched_param() {
-        unsafe {
-            let code = sched_setscheduler(0, SCHED_FIFO, &raw const param);
-            if code != 0 {
-                warn!(%code, ?param, "couldn't set thread priority");
-            }
+const fn validate_thread_niceness(niceness: i32) {
+    assert!(niceness >= -20 && niceness <= 19, "thread niceness must be between -20 and 19");
+}
+
+#[cfg(target_os = "linux")]
+fn set_thread_niceness(niceness: Option<ThreadNiceness>) {
+    if let Some(niceness) = niceness {
+        let niceness = niceness.value();
+        validate_thread_niceness(niceness);
+        let code = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, niceness) };
+        if code != 0 {
+            let error = std::io::Error::last_os_error();
+            warn!(niceness, %error, "couldn't set thread niceness");
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_thread_prio(prio: ThreadPriority) {
-    if !matches!(prio, ThreadPriority::OSDefault) {
-        warn!(?prio, "thread priority setting only supported on linux");
+fn set_thread_niceness(niceness: Option<ThreadNiceness>) {
+    if let Some(niceness) = niceness {
+        warn!(?niceness, "thread niceness setting only supported on linux");
     }
 }
 
@@ -65,10 +63,10 @@ pub fn get_tid() -> i64 {
     0
 }
 
-pub fn thread_boot(core: Option<usize>, prio: ThreadPriority) {
+pub fn thread_boot(core: Option<usize>, niceness: Option<ThreadNiceness>) {
     if let Some(core) = core {
         set_thread_affinity(core);
     }
 
-    set_thread_prio(prio);
+    set_thread_niceness(niceness);
 }
