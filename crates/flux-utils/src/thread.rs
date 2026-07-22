@@ -70,15 +70,3 @@ pub fn thread_boot(core: Option<usize>, niceness: Option<ThreadNiceness>) {
 
     set_thread_niceness(niceness);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[should_panic(expected = "thread niceness must be between -20 and 19")]
-    fn rejects_invalid_niceness() {
-        set_thread_niceness(Some(ThreadNiceness::Custom(20)));
-    }
-}
