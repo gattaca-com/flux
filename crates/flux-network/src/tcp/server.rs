@@ -7,7 +7,7 @@ use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{error, info, warn};
 
 use crate::tcp::{
-    ConnState, SendBehavior, TcpStream, TcpTelemetry,
+    ConnState, HANDSHAKE_ACCEPTED, HANDSHAKE_REJECTED, SendBehavior, TcpStream, TcpTelemetry,
     stream::{
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_socket_buf_size, set_user_timeout,
         write_frame_header,
@@ -25,10 +25,46 @@ pub enum ServerEvent<Payload> {
     Message { token: Token, payload: Payload, send_ts: Nanos },
 }
 
+type HandshakeHandler = Box<dyn FnMut(&[u8]) -> bool + Send>;
+
+#[allow(clippy::large_enum_variant)]
+enum EndpointState {
+    WaitHandshake { stream: TcpStream, accepted_at: Instant },
+    SendHandshakeReject { stream: TcpStream, accepted_at: Instant },
+    Connected(TcpStream),
+}
+
+impl EndpointState {
+    fn stream_mut(&mut self) -> &mut TcpStream {
+        match self {
+            Self::WaitHandshake { stream, .. } |
+            Self::SendHandshakeReject { stream, .. } |
+            Self::Connected(stream) => stream,
+        }
+    }
+
+    fn pending_since(&self) -> Option<Instant> {
+        match self {
+            Self::WaitHandshake { accepted_at, .. } |
+            Self::SendHandshakeReject { accepted_at, .. } => Some(*accepted_at),
+            Self::Connected(_) => None,
+        }
+    }
+}
+
+struct Endpoint {
+    listener: Token,
+    peer_addr: SocketAddr,
+    state: EndpointState,
+}
+
 struct ServerManager {
     poll: Poll,
     listeners: Vec<(Token, TcpListener)>,
-    streams: Vec<(Token, TcpStream)>,
+    endpoints: Vec<(Token, Endpoint)>,
+    oldest_pending_handshake: Option<Instant>,
+    handshake_handler: Option<HandshakeHandler>,
+    handshake_timeout: Duration,
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
@@ -47,7 +83,10 @@ impl Default for ServerManager {
         Self {
             poll: Poll::new().expect("couldn't set up a poll for tcp server"),
             listeners: Vec::with_capacity(2),
-            streams: Vec::with_capacity(8),
+            endpoints: Vec::with_capacity(8),
+            oldest_pending_handshake: None,
+            handshake_handler: None,
+            handshake_timeout: Duration::ZERO,
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
@@ -64,6 +103,20 @@ impl Default for ServerManager {
 }
 
 impl ServerManager {
+    fn push_endpoint(&mut self, token: Token, endpoint: Endpoint) {
+        if let Some(accepted_at) = endpoint.state.pending_since() {
+            self.oldest_pending_handshake = Some(
+                self.oldest_pending_handshake.map_or(accepted_at, |oldest| oldest.min(accepted_at)),
+            );
+        }
+        debug_assert!(self.endpoint_index(token).is_none());
+        self.endpoints.push((token, endpoint));
+    }
+
+    fn endpoint_index(&self, token: Token) -> Option<usize> {
+        self.endpoints.iter().position(|(candidate, _)| *candidate == token)
+    }
+
     fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
         let mut listener = TcpListener::bind(addr)
             .inspect_err(|err| warn!(?err, %addr, "couldn't start tcp listener"))
@@ -109,13 +162,34 @@ impl ServerManager {
             }
             set_user_timeout(&socket, self.user_timeout_ms);
 
-            let mut stream = TcpStream::from_stream_with_telemetry(
-                socket,
-                token,
-                peer_addr,
-                self.telemetry,
-                self.dcache.is_some(),
-            );
+            let mut stream = if self.handshake_handler.is_some() {
+                TcpStream::from_stream_for_handshake(
+                    socket,
+                    token,
+                    peer_addr,
+                    self.telemetry,
+                    self.dcache.is_some(),
+                )
+            } else {
+                TcpStream::from_stream_with_telemetry(
+                    socket,
+                    token,
+                    peer_addr,
+                    self.telemetry,
+                    self.dcache.is_some(),
+                )
+            };
+            self.next_token += 1;
+            if self.handshake_handler.is_some() {
+                let accepted_at = Instant::now();
+                self.push_endpoint(token, Endpoint {
+                    listener: listener_token,
+                    peer_addr,
+                    state: EndpointState::WaitHandshake { stream, accepted_at },
+                });
+                continue;
+            }
+
             if let Some(message) = &self.on_connect_msg &&
                 stream.write_or_enqueue_with(self.poll.registry(), |buf| {
                     buf.extend_from_slice(message);
@@ -125,9 +199,130 @@ impl ServerManager {
                 continue;
             }
 
-            self.next_token += 1;
             handler(ServerEvent::Accept { listener: listener_token, stream: token, peer_addr });
-            self.streams.push((token, stream));
+            self.push_endpoint(token, Endpoint {
+                listener: listener_token,
+                peer_addr,
+                state: EndpointState::Connected(stream),
+            });
+        }
+    }
+
+    fn take_endpoint_at(&mut self, index: usize) -> Endpoint {
+        let (_, endpoint) = self.endpoints.swap_remove(index);
+        if endpoint
+            .state
+            .pending_since()
+            .is_some_and(|accepted_at| self.oldest_pending_handshake == Some(accepted_at))
+        {
+            self.oldest_pending_handshake = self
+                .endpoints
+                .iter()
+                .filter_map(|(_, endpoint)| endpoint.state.pending_since())
+                .min();
+        }
+        endpoint
+    }
+
+    fn handle_pending_handshake<F>(&mut self, token: Token, event: &Event, handler: &mut F) -> bool
+    where
+        F: for<'a> FnMut(ServerEvent<&'a [u8]>),
+    {
+        let Some(index) = self.endpoint_index(token) else {
+            safe_panic!("tcp server got event for unknown token");
+            return false;
+        };
+        if matches!(self.endpoints[index].1.state, EndpointState::SendHandshakeReject { .. }) {
+            let (state, backlog_empty) = {
+                let endpoint = &mut self.endpoints[index].1;
+                let EndpointState::SendHandshakeReject { stream, .. } = &mut endpoint.state else {
+                    unreachable!();
+                };
+                let state = stream.poll_writable(self.poll.registry(), event);
+                (state, stream.send_backlog.is_empty())
+            };
+            if state == ConnState::Disconnected || backlog_empty {
+                self.disconnect_index(index);
+            }
+            return false;
+        }
+
+        let mut accepted = None;
+        let state = {
+            let endpoint = &mut self.endpoints[index].1;
+            let EndpointState::WaitHandshake { stream, .. } = &mut endpoint.state else {
+                safe_panic!("tcp server handled handshake for connected endpoint");
+                return true;
+            };
+            let handshake_handler =
+                self.handshake_handler.as_mut().expect("pending handshake without handler");
+            stream.poll_handshake(self.poll.registry(), event, &mut |message| {
+                accepted = Some(handshake_handler(message));
+            })
+        };
+
+        if accepted == Some(true) && state == ConnState::Alive {
+            let mut endpoint = self.take_endpoint_at(index);
+            let EndpointState::WaitHandshake { mut stream, .. } = endpoint.state else {
+                unreachable!();
+            };
+            if stream.write_or_enqueue_with(self.poll.registry(), |buf| {
+                buf.extend_from_slice(HANDSHAKE_ACCEPTED);
+            }) == ConnState::Disconnected
+            {
+                stream.close(self.poll.registry());
+                return false;
+            }
+            if let Some(message) = &self.on_connect_msg &&
+                stream.write_or_enqueue_with(self.poll.registry(), |buf| {
+                    buf.extend_from_slice(message);
+                }) == ConnState::Disconnected
+            {
+                stream.close(self.poll.registry());
+                return false;
+            }
+            if self.dcache.is_some() {
+                stream.enable_dcache();
+            }
+            handler(ServerEvent::Accept {
+                listener: endpoint.listener,
+                stream: token,
+                peer_addr: endpoint.peer_addr,
+            });
+            endpoint.state = EndpointState::Connected(stream);
+            self.push_endpoint(token, endpoint);
+            true
+        } else if accepted == Some(false) {
+            info!(
+                peer_addr = %self.endpoints[index].1.peer_addr,
+                "tcp server rejected handshake"
+            );
+            let (send_state, backlog_empty) = {
+                let endpoint = &mut self.endpoints[index].1;
+                let EndpointState::WaitHandshake { stream, .. } = &mut endpoint.state else {
+                    unreachable!();
+                };
+                let send_state = stream.write_or_enqueue_with(self.poll.registry(), |buf| {
+                    buf.extend_from_slice(HANDSHAKE_REJECTED);
+                });
+                (send_state, stream.send_backlog.is_empty())
+            };
+            if send_state == ConnState::Disconnected || backlog_empty {
+                self.disconnect_index(index);
+            } else {
+                let mut endpoint = self.take_endpoint_at(index);
+                let EndpointState::WaitHandshake { stream, accepted_at } = endpoint.state else {
+                    unreachable!();
+                };
+                endpoint.state = EndpointState::SendHandshakeReject { stream, accepted_at };
+                self.push_endpoint(token, endpoint);
+            }
+            false
+        } else if state == ConnState::Disconnected {
+            self.disconnect_index(index);
+            false
+        } else {
+            false
         }
     }
 
@@ -136,15 +331,31 @@ impl ServerManager {
         F: for<'a> FnMut(ServerEvent<&'a [u8]>),
     {
         let token = event.token();
-        if let Some(index) = self.listeners.iter().position(|(candidate, _)| *candidate == token) {
-            self.accept_connections(index, handler);
+        if let Some(listener_index) =
+            self.listeners.iter().position(|(candidate, _)| *candidate == token)
+        {
+            self.accept_connections(listener_index, handler);
             return;
         }
-        let Some(index) = self.streams.iter().position(|(candidate, _)| *candidate == token) else {
+        let Some(mut index) = self.endpoint_index(token) else {
             safe_panic!("tcp server got event for unknown token");
             return;
         };
-        if self.streams[index].1.poll_with(
+        if !matches!(self.endpoints[index].1.state, EndpointState::Connected(_)) {
+            if !self.handle_pending_handshake(token, event, handler) {
+                return;
+            }
+            let Some(admitted_index) = self.endpoint_index(token) else {
+                safe_panic!("tcp server got event for unknown token");
+                return;
+            };
+            index = admitted_index;
+        }
+        let EndpointState::Connected(stream) = &mut self.endpoints[index].1.state else {
+            safe_panic!("tcp server admitted endpoint did not transition to connected");
+            return;
+        };
+        if stream.poll_with(
             self.poll.registry(),
             event,
             self.dcache.as_deref(),
@@ -165,18 +376,37 @@ impl ServerManager {
         F: for<'a> FnMut(ServerEvent<&'a [u8]>) -> Option<T>,
     {
         let token = event.token();
-        if let Some(index) = self.listeners.iter().position(|(candidate, _)| *candidate == token) {
-            self.accept_connections(index, &mut |event| {
+        if let Some(listener_index) =
+            self.listeners.iter().position(|(candidate, _)| *candidate == token)
+        {
+            self.accept_connections(listener_index, &mut |event| {
                 let _ = handler(event);
             });
             return;
         }
-        let Some(index) = self.streams.iter().position(|(candidate, _)| *candidate == token) else {
+        let Some(mut index) = self.endpoint_index(token) else {
             safe_panic!("tcp server got event for unknown token");
             return;
         };
+        if !matches!(self.endpoints[index].1.state, EndpointState::Connected(_)) {
+            let admitted = self.handle_pending_handshake(token, event, &mut |event| {
+                let _ = handler(event);
+            });
+            if !admitted {
+                return;
+            }
+            let Some(admitted_index) = self.endpoint_index(token) else {
+                safe_panic!("tcp server got event for unknown token");
+                return;
+            };
+            index = admitted_index;
+        }
         let dcache = self.dcache.as_deref().expect("dcache required for poll_with_produce");
-        if self.streams[index].1.poll_with_produce(
+        let EndpointState::Connected(stream) = &mut self.endpoints[index].1.state else {
+            safe_panic!("tcp server admitted endpoint did not transition to connected");
+            return;
+        };
+        if stream.poll_with_produce(
             self.poll.registry(),
             event,
             dcache,
@@ -192,20 +422,57 @@ impl ServerManager {
     }
 
     fn disconnect_index(&mut self, index: usize) {
-        let (_, mut stream) = self.streams.swap_remove(index);
-        stream.close(self.poll.registry());
+        let mut endpoint = self.take_endpoint_at(index);
+        endpoint.state.stream_mut().close(self.poll.registry());
+    }
+
+    fn expire_pending_handshakes(&mut self) -> bool {
+        let Some(oldest) = self.oldest_pending_handshake else {
+            return false;
+        };
+        debug_assert!(self.handshake_timeout != Duration::ZERO);
+        if oldest.elapsed() < self.handshake_timeout {
+            return false;
+        }
+
+        let now = Instant::now();
+        let mut expired = false;
+        let mut index = self.endpoints.len();
+        while index != 0 {
+            index -= 1;
+            let should_expire =
+                self.endpoints[index].1.state.pending_since().is_some_and(|accepted_at| {
+                    now.saturating_sub(accepted_at) >= self.handshake_timeout
+                });
+            if should_expire {
+                let mut endpoint = self.take_endpoint_at(index);
+                info!(
+                    peer_addr = %endpoint.peer_addr,
+                    timeout = %self.handshake_timeout,
+                    "tcp server handshake timed out"
+                );
+                endpoint.state.stream_mut().close(self.poll.registry());
+                expired = true;
+            }
+        }
+        self.oldest_pending_handshake =
+            self.endpoints.iter().filter_map(|(_, endpoint)| endpoint.state.pending_since()).min();
+        expired
     }
 
     fn disconnect(&mut self, token: Token) {
-        if let Some(index) = self.streams.iter().position(|(candidate, _)| *candidate == token) {
+        if let Some(index) = self.endpoint_index(token) &&
+            matches!(self.endpoints[index].1.state, EndpointState::Connected(_))
+        {
             self.disconnect_index(index);
         }
     }
 
     fn disconnect_all(&mut self) {
-        while !self.streams.is_empty() {
-            self.disconnect_index(self.streams.len() - 1);
+        while !self.endpoints.is_empty() {
+            self.disconnect_index(self.endpoints.len() - 1);
         }
+        self.oldest_pending_handshake = None;
     }
 
     fn remove_listener(&mut self, token: Token) {
@@ -250,18 +517,24 @@ impl ServerManager {
         }
         write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
 
-        let mut index = self.streams.len();
+        let mut index = self.endpoints.len();
         while index != 0 {
             index -= 1;
-            let state = self.streams[index].1.write_or_enqueue_shared(
-                self.poll.registry(),
-                &self.bcast_header,
-                &self.bcast_payload,
-            );
-            let backlog_exceeded =
-                Self::backlog_exceeded(self.max_backlog, &mut self.streams[index].1);
+            let (state, backlog_exceeded) = {
+                let endpoint = &mut self.endpoints[index].1;
+                let EndpointState::Connected(stream) = &mut endpoint.state else {
+                    continue;
+                };
+                let state = stream.write_or_enqueue_shared(
+                    self.poll.registry(),
+                    &self.bcast_header,
+                    &self.bcast_payload,
+                );
+                let backlog_exceeded = Self::backlog_exceeded(self.max_backlog, stream);
+                (state, backlog_exceeded)
+            };
             if state == ConnState::Disconnected || backlog_exceeded {
-                let token = self.streams[index].0;
+                let token = self.endpoints[index].0;
                 self.disconnect_index(index);
                 self.pending_disconnects.push(token);
             }
@@ -276,14 +549,18 @@ impl ServerManager {
             self.broadcast(&serialise);
             return;
         };
-        let Some(index) = self.streams.iter().position(|(candidate, _)| *candidate == token) else {
+        let Some(index) = self.endpoint_index(token) else {
             error!(?token, "tcp server send to unknown stream");
             return;
         };
-        if self.streams[index].1.write_or_enqueue_with(self.poll.registry(), serialise) ==
+        let EndpointState::Connected(stream) = &mut self.endpoints[index].1.state else {
+            error!(?token, "tcp server send to endpoint before handshake completed");
+            return;
+        };
+        let disconnect = stream.write_or_enqueue_with(self.poll.registry(), serialise) ==
             ConnState::Disconnected ||
-            Self::backlog_exceeded(self.max_backlog, &mut self.streams[index].1)
-        {
+            Self::backlog_exceeded(self.max_backlog, stream);
+        if disconnect {
             self.disconnect_index(index);
             self.pending_disconnects.push(token);
         }
@@ -303,6 +580,34 @@ impl Default for TcpServer {
 }
 
 impl TcpServer {
+    /// Validates the first frame received from each accepted socket.
+    ///
+    /// Connections are not surfaced through [`ServerEvent::Accept`] until the
+    /// handler returns `true`. The handshake frame is consumed internally and
+    /// is never emitted as [`ServerEvent::Message`]. The result is returned to
+    /// a handshake-enabled [`TcpClient`](super::TcpClient); returning `false`
+    /// closes the socket without emitting a server event.
+    pub fn with_handshake_handler<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(&[u8]) -> bool + Send + 'static,
+    {
+        if self.manager.handshake_timeout == Duration::ZERO {
+            self.manager.handshake_timeout = Duration::from_secs(5);
+        }
+        self.manager.handshake_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Sets the maximum time an accepted socket may spend waiting for its
+    /// complete handshake. The default is five seconds.
+    ///
+    /// Expired sockets are closed without emitting a [`ServerEvent`].
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        assert!(timeout.0 != 0, "handshake timeout cannot be zero");
+        self.manager.handshake_timeout = timeout;
+        self
+    }
+
     pub fn with_on_connect_msg(mut self, msg: Vec<u8>) -> Self {
         assert!(msg.len() <= TcpStream::SEND_BUF_SIZE, "on_connect_msg exceeds send buffer size");
         self.manager.on_connect_msg = Some(msg);
@@ -347,7 +652,8 @@ impl TcpServer {
     where
         F: for<'a> FnMut(ServerEvent<&'a [u8]>),
     {
-        let mut worked = self.manager.drain_pending_disconnects(&mut handler);
+        let mut worked = self.manager.expire_pending_handshakes();
+        worked |= self.manager.drain_pending_disconnects(&mut handler);
         if let Err(err) = self.manager.poll.poll(&mut self.events, Some(std::time::Duration::ZERO))
         {
             safe_panic!("tcp server poll failed: {err}");
@@ -367,7 +673,8 @@ impl TcpServer {
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: for<'a> FnMut(ServerEvent<&'a [u8]>) -> Option<T>,
     {
-        let mut worked = self.manager.drain_pending_disconnects(&mut |event| {
+        let mut worked = self.manager.expire_pending_handshakes();
+        worked |= self.manager.drain_pending_disconnects(&mut |event| {
             let _ = handler(event);
         });
         if let Err(err) = self.manager.poll.poll(&mut self.events, Some(std::time::Duration::ZERO))

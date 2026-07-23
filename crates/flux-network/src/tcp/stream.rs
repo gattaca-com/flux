@@ -186,6 +186,37 @@ impl TcpStream {
         telemetry: TcpTelemetry,
         use_dcache: bool,
     ) -> Self {
+        let rx_buf = if use_dcache { RxBuf::DCache } else { RxBuf::Heap(vec![0; RX_BUF_SIZE]) };
+        Self::from_stream_with_rx_buf(stream, token, peer_addr, telemetry, rx_buf)
+    }
+
+    /// Constructs a stream that receives its handshake on the heap before
+    /// switching to the configured application receive buffer.
+    pub(crate) fn from_stream_for_handshake(
+        stream: mio::net::TcpStream,
+        token: Token,
+        peer_addr: SocketAddr,
+        telemetry: TcpTelemetry,
+        use_dcache_after_handshake: bool,
+    ) -> Self {
+        // Dcache-backed streams only need enough heap for the handshake.
+        // Starting empty avoids allocating the regular 32 KiB heap receive
+        // buffer just to discard it immediately after admission.
+        let rx_buf = if use_dcache_after_handshake {
+            RxBuf::Heap(Vec::new())
+        } else {
+            RxBuf::Heap(vec![0; RX_BUF_SIZE])
+        };
+        Self::from_stream_with_rx_buf(stream, token, peer_addr, telemetry, rx_buf)
+    }
+
+    fn from_stream_with_rx_buf(
+        stream: mio::net::TcpStream,
+        token: Token,
+        peer_addr: SocketAddr,
+        telemetry: TcpTelemetry,
+        rx_buf: RxBuf,
+    ) -> Self {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
             TcpTelemetry::Enabled { app_name } => {
@@ -195,7 +226,6 @@ impl TcpStream {
                 Some(TcpTimers::new(app_name, &steam_label))
             }
         };
-        let rx_buf = if use_dcache { RxBuf::DCache } else { RxBuf::Heap(vec![0; RX_BUF_SIZE]) };
 
         Self {
             stream,
@@ -245,15 +275,48 @@ impl TcpStream {
         &mut self,
         registry: &Registry,
         backlog: VecDeque<Vec<u8>>,
+        handshake: Option<&Vec<u8>>,
         on_connect_msg: Option<&Vec<u8>>,
     ) -> ConnState {
         debug_assert!(self.send_backlog.is_empty());
         self.send_backlog = backlog;
+        if let Some(handshake) = handshake {
+            // A disconnected socket can leave connection-initialisation
+            // frames in the retained backlog. Remove those stale frames and
+            // prepend fresh ones so every new transport starts with exactly
+            // one handshake followed by the optional on-connect message.
+            if self
+                .send_backlog
+                .front()
+                .is_some_and(|frame| Self::frame_has_payload(frame, handshake))
+            {
+                self.send_backlog.pop_front();
+            }
+            if let Some(message) = on_connect_msg &&
+                self.send_backlog
+                    .front()
+                    .is_some_and(|frame| Self::frame_has_payload(frame, message))
+            {
+                self.send_backlog.pop_front();
+            }
+
+            if let Some(message) = on_connect_msg {
+                self.serialise_frame(|bytes| bytes.extend_from_slice(message));
+                let data = self.alloc_vec(0);
+                self.send_backlog.push_front(data);
+            }
+            self.serialise_frame(|bytes| bytes.extend_from_slice(handshake));
+            let data = self.alloc_vec(0);
+            self.send_backlog.push_front(data);
+            return self.arm_writable(registry);
+        }
+
         if !self.send_backlog.is_empty() {
             if let Some(message) = on_connect_msg {
-                let already_queued = self.send_backlog.front().is_some_and(|front| {
-                    front.len() >= FRAME_HEADER_SIZE && front[FRAME_HEADER_SIZE..] == **message
-                });
+                let already_queued = self
+                    .send_backlog
+                    .front()
+                    .is_some_and(|front| Self::frame_has_payload(front, message));
                 if !already_queued {
                     self.serialise_frame(|bytes| bytes.extend_from_slice(message));
                     let data = self.alloc_vec(0);
@@ -266,6 +329,11 @@ impl TcpStream {
         } else {
             ConnState::Alive
         }
+    }
+
+    #[inline]
+    fn frame_has_payload(frame: &[u8], payload: &[u8]) -> bool {
+        frame.len() >= FRAME_HEADER_SIZE && frame[FRAME_HEADER_SIZE..] == *payload
     }
 
     /// Moves queued frames out before a client-managed socket is replaced.
@@ -356,6 +424,50 @@ impl TcpStream {
         }
 
         ConnState::Alive
+    }
+
+    /// Polls at most one received frame into a heap buffer.
+    ///
+    /// Used while a server-side stream is waiting for its handshake. Leaving
+    /// any subsequent frames unread lets the server switch the admitted
+    /// stream to its configured receive buffer before delivering application
+    /// messages.
+    pub(crate) fn poll_handshake<F>(
+        &mut self,
+        registry: &Registry,
+        ev: &Event,
+        on_msg: &mut F,
+    ) -> ConnState
+    where
+        F: for<'a> FnMut(&'a [u8]),
+    {
+        if ev.is_readable() {
+            match self.read_frame(None) {
+                ReadOutcome::PayloadDone { payload: MessagePayload::Raw(bytes), .. } => {
+                    on_msg(bytes);
+                }
+                ReadOutcome::PayloadDone { payload: MessagePayload::Cached(_), .. } => {
+                    unreachable!("pending handshake stream must use a heap receive buffer");
+                }
+                ReadOutcome::WouldBlock => {}
+                ReadOutcome::Disconnected => return ConnState::Disconnected,
+            }
+        }
+
+        if ev.is_writable() && self.drain_backlog(registry) == ConnState::Disconnected {
+            return ConnState::Disconnected;
+        }
+
+        ConnState::Alive
+    }
+
+    pub(crate) fn poll_writable(&mut self, registry: &Registry, ev: &Event) -> ConnState {
+        if ev.is_writable() { self.drain_backlog(registry) } else { ConnState::Alive }
+    }
+
+    pub(crate) fn enable_dcache(&mut self) {
+        debug_assert!(matches!(self.rx_state, RxState::ReadingHeader { have: 0, .. }));
+        self.rx_buf = RxBuf::DCache;
     }
 
     /// Like [`poll_with`] but for dcache-backed streams. Calls `on_msg` with

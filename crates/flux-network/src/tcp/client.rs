@@ -10,7 +10,7 @@ use mio::{Events, Interest, Poll, Token, event::Event};
 use tracing::{debug, error, warn};
 
 use crate::tcp::{
-    ConnState, SendBehavior, TcpStream, TcpTelemetry,
+    ConnState, HANDSHAKE_ACCEPTED, HANDSHAKE_REJECTED, SendBehavior, TcpStream, TcpTelemetry,
     stream::{
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, TcpTimers, build_frame_vec,
         set_socket_buf_size, set_user_timeout, write_frame_header,
@@ -23,7 +23,30 @@ use crate::tcp::{
 enum EndpointState {
     Disconnected,
     Connecting(mio::net::TcpStream),
+    WaitHandshakeAccept(crate::tcp::TcpStream),
     Connected(crate::tcp::TcpStream),
+}
+
+impl EndpointState {
+    fn stream(&self) -> Option<&TcpStream> {
+        match self {
+            Self::Connected(stream) => Some(stream),
+            Self::Disconnected | Self::Connecting(_) | Self::WaitHandshakeAccept(_) => None,
+        }
+    }
+
+    fn stream_mut(&mut self) -> Option<&mut TcpStream> {
+        match self {
+            Self::Connected(stream) => Some(stream),
+            Self::Disconnected | Self::Connecting(_) | Self::WaitHandshakeAccept(_) => None,
+        }
+    }
+}
+
+enum HandshakeResponse {
+    Accepted,
+    Rejected,
+    Invalid,
 }
 
 struct Endpoint {
@@ -37,8 +60,13 @@ struct Endpoint {
 
 /// Event emitted by [`TcpClient::poll_with`].
 pub enum ClientEvent<Payload> {
-    /// A persistent endpoint established a TCP connection.
+    /// A persistent endpoint established a usable connection. For a client
+    /// configured with a handshake, this is emitted only after server
+    /// acceptance.
     Connected { token: Token, peer_addr: SocketAddr },
+    /// The server explicitly rejected this endpoint's handshake. The endpoint
+    /// remains managed and will be retried.
+    HandshakeRejected { token: Token, peer_addr: SocketAddr },
     /// An established connection was lost. The endpoint remains managed and
     /// will be retried until it is removed.
     Disconnect { token: Token, peer_addr: SocketAddr },
@@ -50,6 +78,7 @@ struct ClientManager {
     poll: Poll,
     endpoints: Vec<Endpoint>,
     reconnector: Repeater,
+    handshake: Option<Vec<u8>>,
     on_connect_msg: Option<Vec<u8>>,
     telemetry: TcpTelemetry,
     socket_buf_size: Option<usize>,
@@ -69,6 +98,7 @@ impl Default for ClientManager {
             poll: Poll::new().expect("couldn't set up a poll for tcp client"),
             endpoints: Vec::with_capacity(5),
             reconnector: Repeater::every(Duration::from_secs(2)),
+            handshake: None,
             on_connect_msg: None,
             telemetry: TcpTelemetry::Disabled,
             socket_buf_size: None,
@@ -192,9 +222,31 @@ impl ClientManager {
 
         let timers = self.endpoints[index].timers.take();
         let mut stream = TcpStream::from_client_stream(socket, token, peer_addr, timers);
+        if let Some(handshake) = self.handshake.as_ref() {
+            let state = stream.install_send_backlog(
+                self.poll.registry(),
+                VecDeque::new(),
+                Some(handshake),
+                None,
+            );
+            self.endpoints[index].state = EndpointState::WaitHandshakeAccept(stream);
+            if state == ConnState::Disconnected {
+                self.disconnect_at_index(index);
+                return;
+            }
+
+            self.endpoints[index].backlog_exceeded_since = None;
+            debug!(%peer_addr, "tcp client awaiting handshake response");
+            return;
+        }
+
         let backlog = std::mem::take(&mut self.endpoints[index].send_backlog);
-        if stream.install_send_backlog(self.poll.registry(), backlog, self.on_connect_msg.as_ref()) ==
-            ConnState::Disconnected
+        if stream.install_send_backlog(
+            self.poll.registry(),
+            backlog,
+            None,
+            self.on_connect_msg.as_ref(),
+        ) == ConnState::Disconnected
         {
             self.endpoints[index].state = EndpointState::Connected(stream);
             self.disconnect_at_index(index);
@@ -205,6 +257,90 @@ impl ClientManager {
         self.endpoints[index].state = EndpointState::Connected(stream);
         debug!(%peer_addr, "tcp client connected");
         handler(ClientEvent::Connected { token, peer_addr });
+    }
+
+    fn handle_handshake_response<F>(&mut self, index: usize, event: &Event, handler: &mut F)
+    where
+        F: for<'a> FnMut(ClientEvent<&'a [u8]>),
+    {
+        let token = self.endpoints[index].token;
+        let peer_addr = self.endpoints[index].peer_addr;
+        let mut response = None;
+        let state = {
+            let EndpointState::WaitHandshakeAccept(stream) = &mut self.endpoints[index].state
+            else {
+                unreachable!();
+            };
+            stream.poll_handshake(self.poll.registry(), event, &mut |message| {
+                response = Some(if message == HANDSHAKE_ACCEPTED {
+                    HandshakeResponse::Accepted
+                } else if message == HANDSHAKE_REJECTED {
+                    HandshakeResponse::Rejected
+                } else {
+                    HandshakeResponse::Invalid
+                });
+            })
+        };
+
+        if state == ConnState::Disconnected {
+            handler(ClientEvent::Disconnect { token, peer_addr });
+            self.disconnect_at_index(index);
+            return;
+        }
+
+        match response {
+            None => {}
+            Some(HandshakeResponse::Rejected) => {
+                handler(ClientEvent::HandshakeRejected { token, peer_addr });
+                self.disconnect_at_index(index);
+            }
+            Some(HandshakeResponse::Invalid) => {
+                warn!(%peer_addr, "tcp client received invalid handshake response");
+                handler(ClientEvent::Disconnect { token, peer_addr });
+                self.disconnect_at_index(index);
+            }
+            Some(HandshakeResponse::Accepted) => {
+                let EndpointState::WaitHandshakeAccept(mut stream) = std::mem::replace(
+                    &mut self.endpoints[index].state,
+                    EndpointState::Disconnected,
+                ) else {
+                    unreachable!();
+                };
+                let backlog = std::mem::take(&mut self.endpoints[index].send_backlog);
+                let install_state = stream.install_send_backlog(
+                    self.poll.registry(),
+                    backlog,
+                    None,
+                    self.on_connect_msg.as_ref(),
+                );
+                self.endpoints[index].state = EndpointState::Connected(stream);
+                self.endpoints[index].backlog_exceeded_since = None;
+                if install_state == ConnState::Disconnected {
+                    handler(ClientEvent::Disconnect { token, peer_addr });
+                    self.disconnect_at_index(index);
+                    return;
+                }
+
+                debug!(%peer_addr, "tcp client handshake accepted");
+                handler(ClientEvent::Connected { token, peer_addr });
+
+                let EndpointState::Connected(stream) = &mut self.endpoints[index].state else {
+                    unreachable!();
+                };
+                if stream.poll_with(
+                    self.poll.registry(),
+                    event,
+                    None,
+                    &mut |token, payload, send_ts| {
+                        handler(ClientEvent::Message { token, payload, send_ts });
+                    },
+                ) == ConnState::Disconnected
+                {
+                    handler(ClientEvent::Disconnect { token, peer_addr });
+                    self.disconnect_at_index(index);
+                }
+            }
+        }
     }
 
     fn handle_event<F>(&mut self, event: &Event, handler: &mut F)
@@ -219,6 +355,9 @@ impl ClientManager {
 
         match self.endpoints[index].state {
             EndpointState::Connecting(_) => self.finish_connect(index, handler),
+            EndpointState::WaitHandshakeAccept(_) => {
+                self.handle_handshake_response(index, event, handler);
+            }
             EndpointState::Connected(_) => {
                 let peer_addr = self.endpoints[index].peer_addr;
                 let EndpointState::Connected(stream) = &mut self.endpoints[index].state else {
@@ -251,6 +390,13 @@ impl ClientManager {
             EndpointState::Connecting(mut socket) => {
                 let _ = self.poll.registry().deregister(&mut socket);
                 let _ = socket.shutdown(Shutdown::Both);
+            }
+            EndpointState::WaitHandshakeAccept(mut stream) => {
+                self.endpoints[index].timers = stream.take_timers();
+                if self.drop_backlog_on_disconnect {
+                    self.endpoints[index].send_backlog.clear();
+                }
+                stream.close(self.poll.registry());
             }
             EndpointState::Connected(mut stream) => {
                 self.endpoints[index].timers = stream.take_timers();
@@ -320,12 +466,10 @@ impl ClientManager {
     }
 
     fn backlog_len(endpoint: &Endpoint) -> usize {
-        match &endpoint.state {
-            EndpointState::Connected(stream) => stream.send_backlog.len(),
-            EndpointState::Disconnected | EndpointState::Connecting(_) => {
-                endpoint.send_backlog.len()
-            }
-        }
+        endpoint
+            .state
+            .stream()
+            .map_or_else(|| endpoint.send_backlog.len(), |stream| stream.send_backlog.len())
     }
 
     fn backlog_exceeded(
@@ -366,7 +510,7 @@ impl ClientManager {
         write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
 
         for index in 0..self.endpoints.len() {
-            if !matches!(self.endpoints[index].state, EndpointState::Connected(_)) {
+            if self.endpoints[index].state.stream().is_none() {
                 if !self.drop_backlog_on_disconnect {
                     Self::push_disconnected_frame(
                         self.max_backlog,
@@ -379,9 +523,7 @@ impl ClientManager {
             }
 
             let state = {
-                let EndpointState::Connected(stream) = &mut self.endpoints[index].state else {
-                    unreachable!();
-                };
+                let stream = self.endpoints[index].state.stream_mut().unwrap();
                 stream.write_or_enqueue_shared(
                     self.poll.registry(),
                     &self.bcast_header,
@@ -426,7 +568,7 @@ impl ClientManager {
         }
         write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
 
-        if !matches!(self.endpoints[index].state, EndpointState::Connected(_)) {
+        if self.endpoints[index].state.stream().is_none() {
             if !self.drop_backlog_on_disconnect {
                 Self::push_disconnected_frame(
                     self.max_backlog,
@@ -439,9 +581,7 @@ impl ClientManager {
         }
 
         let state = {
-            let EndpointState::Connected(stream) = &mut self.endpoints[index].state else {
-                unreachable!();
-            };
+            let stream = self.endpoints[index].state.stream_mut().unwrap();
             stream.write_or_enqueue_shared(
                 self.poll.registry(),
                 &self.bcast_header,
@@ -485,6 +625,26 @@ impl Default for TcpClient {
 impl TcpClient {
     pub fn with_reconnect_interval(mut self, interval: Duration) -> Self {
         self.manager.reconnector = Repeater::every(interval);
+        self
+    }
+
+    /// Sends `message` as the first frame on every connection attempt.
+    ///
+    /// A [`TcpServer`] configured with
+    /// [`TcpServer::with_handshake_handler`](super::TcpServer::with_handshake_handler)
+    /// consumes this frame before admitting the connection. The handshake is
+    /// sent before the on-connect message and any queued application messages.
+    /// Application writes remain in the client backlog until the server
+    /// accepts the handshake.
+    /// [`ClientEvent::Connected`] is delayed until the server accepts it;
+    /// rejection emits [`ClientEvent::HandshakeRejected`].
+    pub fn with_handshake(mut self, message: Vec<u8>) -> Self {
+        assert!(!message.is_empty(), "handshake message cannot be empty");
+        assert!(
+            message.len() <= TcpStream::SEND_BUF_SIZE,
+            "handshake message exceeds send buffer size"
+        );
+        self.manager.handshake = Some(message);
         self
     }
 

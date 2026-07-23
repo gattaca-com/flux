@@ -105,6 +105,9 @@ fn new_client_is_wire_compatible_with_legacy_server() {
         });
         client.poll_with(|event| match event {
             ClientEvent::Connected { token, peer_addr } => connected = Some((token, peer_addr)),
+            ClientEvent::HandshakeRejected { .. } => {
+                panic!("client did not configure a handshake")
+            }
             ClientEvent::Message { payload, .. } => client_messages.push(payload.to_vec()),
             ClientEvent::Disconnect { .. } => panic!("new client disconnected unexpectedly"),
         });
