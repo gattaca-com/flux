@@ -809,10 +809,9 @@ pub(crate) fn set_user_timeout(_stream: &mio::net::TcpStream, _timeout_ms: u32) 
     // TCP_USER_TIMEOUT is not supported on non-Linux platforms.
 }
 
-/// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a mio `TcpStream`.
-pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
+/// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a socket.
+pub(crate) fn set_socket_buf_size(socket: &impl std::os::fd::AsRawFd, size: usize) {
+    let fd = socket.as_raw_fd();
     let size = size as libc::c_int;
     unsafe {
         libc::setsockopt(

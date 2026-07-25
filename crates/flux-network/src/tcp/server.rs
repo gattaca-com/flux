@@ -1,4 +1,7 @@
-use std::net::{Shutdown, SocketAddr};
+use std::{
+    io,
+    net::{Shutdown, SocketAddr},
+};
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_timing::{Duration, Instant, Nanos};
@@ -35,6 +38,7 @@ struct ServerManager {
     user_timeout_ms: u32,
     dcache: Option<DCachePtr>,
     max_backlog: Option<(usize, Duration)>,
+    drop_backlog_on_disconnect: bool,
     nodelay: bool,
     pending_disconnects: Vec<Token>,
     next_token: usize,
@@ -54,6 +58,7 @@ impl Default for ServerManager {
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             dcache: None,
             max_backlog: None,
+            drop_backlog_on_disconnect: false,
             nodelay: true,
             pending_disconnects: Vec::with_capacity(10),
             next_token: 0,
@@ -64,19 +69,26 @@ impl Default for ServerManager {
 }
 
 impl ServerManager {
-    fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
-        let mut listener = TcpListener::bind(addr)
-            .inspect_err(|err| warn!(?err, %addr, "couldn't start tcp listener"))
-            .ok()?;
+    fn try_listen_at(&mut self, addr: SocketAddr) -> io::Result<Token> {
+        let listener = TcpListener::bind(addr)?;
+        self.register_listener(listener)
+    }
+
+    fn register_listener(&mut self, mut listener: TcpListener) -> io::Result<Token> {
         let token = Token(self.next_token);
-        self.poll
-            .registry()
-            .register(&mut listener, token, Interest::READABLE)
-            .inspect_err(|err| warn!(?err, %addr, "couldn't register tcp listener"))
-            .ok()?;
+        self.poll.registry().register(&mut listener, token, Interest::READABLE)?;
         self.next_token += 1;
         self.listeners.push((token, listener));
-        Some(token)
+        Ok(token)
+    }
+
+    fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
+        let listener = TcpListener::bind(addr)
+            .inspect_err(|err| warn!(?err, %addr, "couldn't start tcp listener"))
+            .ok()?;
+        self.register_listener(listener)
+            .inspect_err(|err| warn!(?err, %addr, "couldn't register tcp listener"))
+            .ok()
     }
 
     fn accept_connections<F>(&mut self, listener_index: usize, handler: &mut F)
@@ -193,6 +205,9 @@ impl ServerManager {
 
     fn disconnect_index(&mut self, index: usize) {
         let (_, mut stream) = self.streams.swap_remove(index);
+        if self.drop_backlog_on_disconnect {
+            stream.clear_send_backlog();
+        }
         stream.close(self.poll.registry());
     }
 
@@ -339,8 +354,17 @@ impl TcpServer {
         self
     }
 
+    pub fn with_drop_backlog_on_disconnect(mut self, enabled: bool) -> Self {
+        self.manager.drop_backlog_on_disconnect = enabled;
+        self
+    }
+
     pub fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
         self.manager.listen_at(addr)
+    }
+
+    pub(crate) fn try_listen_at(&mut self, addr: SocketAddr) -> io::Result<Token> {
+        self.manager.try_listen_at(addr)
     }
 
     pub fn poll_with<F>(&mut self, mut handler: F) -> bool
