@@ -85,7 +85,10 @@ impl UdpPublisher {
         let payload = &mut self.history[index];
         payload.clear();
         serialise(payload);
-        assert!(payload.len() < u32::MAX as usize, "payload too big");
+        assert!(
+            payload.len() <= self.config.max_message_size,
+            "payload exceeds configured maximum UDP message size"
+        );
 
         self.next_sequence += 1;
         if self.subscribers.is_empty() {

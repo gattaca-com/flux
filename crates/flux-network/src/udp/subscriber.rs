@@ -3,6 +3,7 @@ use std::{io, net::SocketAddr, os::fd::AsRawFd};
 use flux_timing::Nanos;
 use flux_utils::{safe_assert, safe_assert_eq};
 use mio::Token;
+use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::{
@@ -18,6 +19,16 @@ enum InsertStatus {
     Duplicate,
     Incomplete,
     Complete,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+enum InsertFragmentError {
+    #[error("message length {message_length} exceeds configured maximum {maximum}")]
+    MessageTooLarge { message_length: u32, maximum: usize },
+    #[error(
+        "inconsistent message length for sequence {sequence}: expected {expected}, got {actual}"
+    )]
+    InconsistentMessageLength { sequence: u64, expected: u32, actual: u32 },
 }
 
 /// Fixed-stride fragment reassembly for one UDP message sequence.
@@ -194,7 +205,7 @@ pub enum SubscriberEvent<'a> {
 #[derive(Clone, Copy)]
 enum SlotState {
     Empty,
-    Pending { ingest_ts: Option<Nanos>, repair_requested: bool },
+    Pending { ingest_ts: Option<Nanos>, repair_after: Nanos, repair_requested: bool },
     Done,
 }
 
@@ -209,9 +220,9 @@ impl SequenceSlot {
         Self { sequence: 0, state: SlotState::Empty, buffer: ReassemblyBuffer::default() }
     }
 
-    fn reset_pending(&mut self, sequence: u64) {
+    fn reset_pending(&mut self, sequence: u64, repair_after: Nanos) {
         self.sequence = sequence;
-        self.state = SlotState::Pending { ingest_ts: None, repair_requested: false };
+        self.state = SlotState::Pending { ingest_ts: None, repair_after, repair_requested: false };
         self.buffer.clear();
     }
 
@@ -224,6 +235,7 @@ impl SequenceSlot {
 struct SessionState {
     session_id: u32,
     fragment_payload_size: usize,
+    max_message_size: usize,
     window_start: u64,
     watermark: u64,
     slots: Vec<SequenceSlot>,
@@ -231,6 +243,8 @@ struct SessionState {
     repair_cursor: usize,
     pending_count: usize,
     requested_count: usize,
+    repair_delay: Nanos,
+    next_repair_at: Option<Nanos>,
 }
 
 impl SessionState {
@@ -239,10 +253,13 @@ impl SessionState {
         next_sequence: u64,
         sequence_window: usize,
         fragment_payload_size: usize,
+        max_message_size: usize,
+        repair_delay: Nanos,
     ) -> Self {
         Self {
             session_id,
             fragment_payload_size,
+            max_message_size,
             window_start: next_sequence,
             watermark: next_sequence,
             slots: (0..sequence_window).map(|_| SequenceSlot::new()).collect(),
@@ -250,6 +267,8 @@ impl SessionState {
             repair_cursor: 0,
             pending_count: 0,
             requested_count: 0,
+            repair_delay,
+            next_repair_at: None,
         }
     }
 
@@ -263,6 +282,7 @@ impl SessionState {
         self.repair_cursor = 0;
         self.pending_count = 0;
         self.requested_count = 0;
+        self.next_repair_at = None;
     }
 
     fn slot_index(&self, sequence: u64) -> usize {
@@ -283,7 +303,7 @@ impl SessionState {
         let ingest_ts = match state {
             SlotState::Empty => return None,
             SlotState::Done => None,
-            SlotState::Pending { ingest_ts, repair_requested } => {
+            SlotState::Pending { ingest_ts, repair_requested, .. } => {
                 self.pending_count -= 1;
                 if repair_requested {
                     self.requested_count -= 1;
@@ -295,7 +315,7 @@ impl SessionState {
         ingest_ts
     }
 
-    fn ensure_pending(&mut self, sequence: u64) -> usize {
+    fn ensure_pending(&mut self, sequence: u64, observed_at: Nanos) -> usize {
         safe_assert!(sequence >= self.window_start);
         let index = self.slot_index(sequence);
         if self.slots[index].sequence == sequence {
@@ -310,13 +330,16 @@ impl SessionState {
         if self.pending_count == self.requested_count {
             self.repair_cursor = index;
         }
-        self.slots[index].reset_pending(sequence);
+        let repair_after = Nanos(observed_at.0.saturating_add(self.repair_delay.0));
+        self.slots[index].reset_pending(sequence, repair_after);
         self.pending_count += 1;
+        self.next_repair_at =
+            Some(self.next_repair_at.map_or(repair_after, |current| current.min(repair_after)));
         index
     }
 
-    fn pending_mut(&mut self, sequence: u64) -> &mut SequenceSlot {
-        let index = self.ensure_pending(sequence);
+    fn pending_mut(&mut self, sequence: u64, observed_at: Nanos) -> &mut SequenceSlot {
+        let index = self.ensure_pending(sequence, observed_at);
         &mut self.slots[index]
     }
 
@@ -338,7 +361,7 @@ impl SessionState {
         let index = self.slot_index(sequence);
         let slot = &mut self.slots[index];
         assert_eq!(slot.sequence, sequence, "repair slot changed before request was recorded");
-        let SlotState::Pending { ingest_ts, repair_requested } = &mut slot.state else {
+        let SlotState::Pending { ingest_ts, repair_requested, .. } = &mut slot.state else {
             panic!("repair slot is not pending");
         };
         assert!(!*repair_requested, "repair was already requested");
@@ -351,19 +374,30 @@ impl SessionState {
         if self.requested_count == 0 {
             return;
         }
+        let mut next_repair_at = None;
         for slot in &mut self.slots {
-            if let SlotState::Pending { repair_requested, .. } = &mut slot.state {
+            if let SlotState::Pending { repair_after, repair_requested, .. } = &mut slot.state {
                 *repair_requested = false;
+                next_repair_at = Some(
+                    next_repair_at
+                        .map_or(*repair_after, |current: Nanos| current.min(*repair_after)),
+                );
             }
         }
         self.requested_count = 0;
+        self.next_repair_at = next_repair_at;
     }
 
-    fn next_repair(&mut self) -> Option<u64> {
+    fn next_repair(&mut self, now: Nanos) -> Option<u64> {
         if self.pending_count == self.requested_count {
+            self.next_repair_at = None;
+            return None;
+        }
+        if self.next_repair_at.is_some_and(|next| now < next) {
             return None;
         }
 
+        let mut next_repair_at = None;
         for _ in 0..self.slots.len() {
             let index = self.repair_cursor;
             self.repair_cursor += 1;
@@ -371,11 +405,17 @@ impl SessionState {
                 self.repair_cursor = 0;
             }
             let slot = &self.slots[index];
-            if matches!(slot.state, SlotState::Pending { repair_requested: false, .. }) {
-                return Some(slot.sequence);
+            if let SlotState::Pending { repair_after, repair_requested: false, .. } = slot.state {
+                if repair_after <= now {
+                    return Some(slot.sequence);
+                }
+                next_repair_at = Some(
+                    next_repair_at.map_or(repair_after, |current: Nanos| current.min(repair_after)),
+                );
             }
         }
-        unreachable!("pending repair counts disagree with sequence slots")
+        self.next_repair_at = next_repair_at;
+        None
     }
 
     fn advance_window(&mut self, new_start: u64) {
@@ -405,7 +445,7 @@ impl SessionState {
         self.advance_window(new_start);
     }
 
-    fn observe_watermark(&mut self, next_sequence: u64) {
+    fn observe_watermark(&mut self, next_sequence: u64, observed_at: Nanos) {
         if next_sequence <= self.watermark {
             return;
         }
@@ -413,7 +453,7 @@ impl SessionState {
         self.maybe_advance_window(next_sequence);
         for sequence in self.watermark..next_sequence {
             if !self.is_done(sequence) {
-                self.ensure_pending(sequence);
+                self.ensure_pending(sequence, observed_at);
             }
         }
         self.watermark = next_sequence;
@@ -424,11 +464,18 @@ impl SessionState {
         fragment: Fragment<'_>,
         recv_ts: Nanos,
         handler: &mut F,
-    ) -> Result<(), String>
+    ) -> Result<(), InsertFragmentError>
     where
         F: for<'a> FnMut(SubscriberEvent<'a>),
     {
         let sequence = fragment.header.seq;
+
+        if fragment.header.len as usize > self.max_message_size {
+            return Err(InsertFragmentError::MessageTooLarge {
+                message_length: fragment.header.len,
+                maximum: self.max_message_size,
+            });
+        }
 
         self.maybe_advance_window(sequence + 1);
         if self.is_done(sequence) {
@@ -443,14 +490,20 @@ impl SessionState {
         }
 
         let fragment_payload_size = self.fragment_payload_size;
-        let pending = self.pending_mut(sequence);
+        let pending = self.pending_mut(sequence, recv_ts);
         let SlotState::Pending { ingest_ts, .. } = &mut pending.state else {
             unreachable!("ensured sequence slot is not pending")
         };
         ingest_ts.get_or_insert(recv_ts);
-        if pending.buffer.is_initialized() && pending.buffer.message_length() != fragment.header.len
-        {
-            return Err(format!("inconsistent message length for sequence {sequence}"));
+        if pending.buffer.is_initialized() {
+            let expected = pending.buffer.message_length();
+            if expected != fragment.header.len {
+                return Err(InsertFragmentError::InconsistentMessageLength {
+                    sequence,
+                    expected,
+                    actual: fragment.header.len,
+                });
+            }
         }
         if !pending.buffer.is_initialized() {
             pending.buffer.reset(fragment.header.len, fragment_payload_size);
@@ -534,6 +587,10 @@ impl UdpSubscriber {
     where
         F: for<'a> FnMut(SubscriberEvent<'a>),
     {
+        let max_message_size = self.config.max_message_size;
+        let repair_delay = Nanos(self.config.repair_delay.as_nanos() as u64);
+        let sequence_window = self.config.sequence_window;
+        let fragment_payload_size = self.config.max_datagram_size - UDP_HEADER_SIZE;
         let can_repair = &mut self.repair_ready;
         let session = &mut self.session;
         let mut protocol_error = None;
@@ -564,7 +621,7 @@ impl UdpSubscriber {
                         Ok(PublisherMessage::State { session_id, next_sequence }) => {
                             match session {
                                 Some(current) if current.session_id == session_id => {
-                                    current.observe_watermark(next_sequence);
+                                    current.observe_watermark(next_sequence, recv_ts);
                                 }
                                 Some(current) => {
                                     current.reset(session_id, next_sequence);
@@ -573,8 +630,10 @@ impl UdpSubscriber {
                                     *session = Some(SessionState::new(
                                         session_id,
                                         next_sequence,
-                                        self.config.sequence_window,
-                                        self.config.max_datagram_size - UDP_HEADER_SIZE,
+                                        sequence_window,
+                                        fragment_payload_size,
+                                        max_message_size,
+                                        repair_delay,
                                     ));
                                 }
                             }
@@ -583,6 +642,14 @@ impl UdpSubscriber {
                         Ok(PublisherMessage::RepairData { session_id, sequence, payload }) => {
                             let Some(current) = session.as_mut() else { return };
                             if !*can_repair || current.session_id != session_id {
+                                return;
+                            }
+                            if payload.len() > max_message_size {
+                                protocol_error = Some(format!(
+                                    "repair payload length {} exceeds configured maximum {}",
+                                    payload.len(),
+                                    max_message_size
+                                ));
                                 return;
                             }
 
@@ -691,6 +758,7 @@ impl UdpSubscriber {
             return;
         }
 
+        let request_ts = Nanos::now();
         loop {
             let Some(session) = self.session.as_mut() else {
                 return;
@@ -698,12 +766,11 @@ impl UdpSubscriber {
             if session.requested_count >= self.config.max_inflight_repair_requests {
                 return;
             }
-            let Some(sequence) = session.next_repair() else {
+            let Some(sequence) = session.next_repair(request_ts) else {
                 return;
             };
             let session_id = session.session_id;
 
-            let request_ts = Nanos::now();
             let request = SubscriberMessage::Repair { session_id, sequence };
             self.repair.write_or_enqueue_with(SendBehavior::Single(self.repair_token), |output| {
                 request.encode(output);

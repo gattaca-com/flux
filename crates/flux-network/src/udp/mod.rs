@@ -11,6 +11,8 @@ pub use wire::{DEFAULT_IPV4_MAX_DATAGRAM_SIZE, DEFAULT_IPV6_MAX_DATAGRAM_SIZE};
 
 use wire::{MAX_DATAGRAM_SIZE, UDP_HEADER_SIZE, default_max_datagram_size_for};
 
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 pub(crate) struct NativeSocketAddr {
     pub(crate) address: libc::sockaddr_storage,
     pub(crate) address_length: libc::socklen_t,
@@ -62,6 +64,9 @@ pub struct UdpConfig {
     /// across the publisher and all subscribers because it defines the
     /// fragment stride.
     pub max_datagram_size: usize,
+    /// Largest complete application message accepted by either endpoint.
+    /// This bounds subscriber reassembly allocations.
+    pub max_message_size: usize,
     /// Number of recent message sequences retained by the publisher and
     /// tracked by subscribers. Must be a power of two.
     pub sequence_window: usize,
@@ -70,6 +75,9 @@ pub struct UdpConfig {
     pub socket_buf_size: Option<usize>,
     /// How often the publisher broadcasts its next sequence number.
     pub progress_interval: Duration,
+    /// Minimum time a missing or partially assembled message remains pending
+    /// before the subscriber requests full-message repair.
+    pub repair_delay: Duration,
     /// Maximum message sequences with an outstanding repair request per
     /// subscriber.
     pub max_inflight_repair_requests: usize,
@@ -81,9 +89,11 @@ impl UdpConfig {
     pub fn default_for_addr(publisher_addr: SocketAddr) -> Self {
         Self {
             max_datagram_size: default_max_datagram_size_for(publisher_addr),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             sequence_window: 65_536,
             socket_buf_size: Some(64 * 1024 * 1024),
             progress_interval: Duration::from_millis(100),
+            repair_delay: Duration::from_millis(1),
             max_inflight_repair_requests: 64,
             reconnect_interval: Duration::from_secs(1),
         }
@@ -104,6 +114,24 @@ impl UdpConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "UDP progress interval must be nonzero",
+            ));
+        }
+
+        if self.max_message_size == 0 || self.max_message_size >= u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "maximum UDP message size {} must be between 1 and {} bytes",
+                    self.max_message_size,
+                    u32::MAX as usize - 1,
+                ),
+            ));
+        }
+
+        if self.repair_delay.as_nanos() > u64::MAX as u128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP repair delay is too large",
             ));
         }
 

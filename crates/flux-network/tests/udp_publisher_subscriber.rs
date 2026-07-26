@@ -7,7 +7,8 @@ use std::{
 };
 
 use flux_network::udp::{
-    DEFAULT_IPV4_MAX_DATAGRAM_SIZE, PublisherEvent, SubscriberEvent, UdpPublisher, UdpSubscriber,
+    DEFAULT_IPV4_MAX_DATAGRAM_SIZE, PublisherEvent, SubscriberEvent, UdpConfig, UdpPublisher,
+    UdpSubscriber,
 };
 
 fn unused_addr() -> SocketAddr {
@@ -41,8 +42,10 @@ fn poll_network(
 fn publisher_subscriber_roundtrip() {
     let publisher_addr = unused_addr();
     let subscriber_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-    let mut publisher = UdpPublisher::new(publisher_addr).unwrap();
-    let mut subscriber = UdpSubscriber::new(publisher_addr, subscriber_addr).unwrap();
+    let config = UdpConfig::default_for_addr(publisher_addr);
+    let mut publisher = UdpPublisher::new_with_config(publisher_addr, config).unwrap();
+    let mut subscriber =
+        UdpSubscriber::new_with_config(publisher_addr, subscriber_addr, config).unwrap();
     let mut received = Vec::new();
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -52,8 +55,9 @@ fn publisher_subscriber_roundtrip() {
     }
     assert_eq!(publisher.active_subscribers(), 1, "subscriber did not complete subscription");
 
-    // Give the subscriber a chance to consume the publisher's initial State
-    // frame before UDP data starts arriving.
+    // The publisher can activate a subscriber before its initial State frame is
+    // consumed. UDP arriving in that accepted startup window is recovered by
+    // progress and repair; wait here so this test exercises direct UDP delivery.
     for _ in 0..10 {
         poll_network(&mut publisher, &mut subscriber, &mut received);
         thread::sleep(Duration::from_millis(1));
