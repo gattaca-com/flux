@@ -22,6 +22,7 @@ const INITIAL_LISTENER_CAPACITY: usize = 2;
 const INITIAL_RX_BUFFER_SIZE: usize = 32 * 1024;
 const INITIAL_SEND_BUFFER_SIZE: usize = 32 * 1024;
 const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_BACKLOG_WARN_BYTES: usize = 64 * 1024 * 1024;
 const BACKLOG_WARNING_INTERVAL_SECS: u64 = 10;
 
 /// Identifies a set of connections using the same application protocol and
@@ -48,6 +49,9 @@ pub struct TcpGroupConfig {
     /// Emit rate-limited warnings above this many queued bytes. The queue is
     /// allowed to continue growing.
     pub backlog_warn_bytes: Option<usize>,
+    /// Disconnect the peer before its queued bytes would exceed this limit.
+    /// `None` allows the queue to grow without a hard limit.
+    pub max_backlog_bytes: Option<usize>,
     /// Largest accepted or emitted frame payload.
     pub max_frame_size: usize,
     /// Per-connection latency and allocation telemetry.
@@ -63,7 +67,8 @@ impl Default for TcpGroupConfig {
             nodelay: true,
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             reconnect_interval: Duration::from_secs(2),
-            backlog_warn_bytes: None,
+            backlog_warn_bytes: Some(DEFAULT_BACKLOG_WARN_BYTES),
+            max_backlog_bytes: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             telemetry: TcpTelemetry::Disabled,
         }
@@ -673,6 +678,12 @@ impl TcpNetwork {
                 "on_connect_msg exceeds max_frame_size"
             );
         }
+        if let Some(max) = config.max_backlog_bytes {
+            assert!(max > 0, "max_backlog_bytes must be nonzero");
+            if let Some(warn) = config.backlog_warn_bytes {
+                assert!(warn < max, "backlog_warn_bytes must be below max_backlog_bytes");
+            }
+        }
         let group = TcpGroup(self.state.groups.len());
         let reconnector = Repeater::every(config.reconnect_interval);
         self.state.groups.push(GroupState { config, reconnector });
@@ -782,6 +793,10 @@ impl ByteQueue {
 
     fn remaining(&self) -> &[u8] {
         &self.bytes[self.head..]
+    }
+
+    fn would_exceed(&self, additional: usize, max: usize) -> bool {
+        self.len().checked_add(additional).is_none_or(|total| total > max)
     }
 
     fn consume(&mut self, bytes: usize) {
@@ -1031,6 +1046,27 @@ impl FramedStream {
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
     ) -> StreamState {
+        let frame_len = FRAME_HEADER_SIZE + payload.len();
+        if written >= frame_len {
+            flux_utils::safe_assert!(written < frame_len);
+            return StreamState::Disconnected;
+        }
+        let additional = frame_len - written;
+        if let Some(max) = config.max_backlog_bytes &&
+            self.send_queue.would_exceed(additional, max)
+        {
+            warn!(
+                group = config.name,
+                ?self.token,
+                %self.peer_addr,
+                queued_bytes = self.send_queue.len(),
+                additional_bytes = additional,
+                max_backlog_bytes = max,
+                "tcp send backlog would exceed configured maximum"
+            );
+            return StreamState::Disconnected;
+        }
+
         let started = Nanos::now();
         let allocated = self.send_queue.append_frame_remainder(header, payload, written);
         if allocated && let Some(timers) = timers {
@@ -1124,5 +1160,16 @@ mod tests {
         expected.extend_from_slice(&second_payload);
         assert_eq!(queue.remaining(), expected);
         assert_eq!(queue.head, 0);
+    }
+
+    #[test]
+    fn byte_queue_checks_hard_limit_without_overflowing() {
+        let mut queue = ByteQueue::default();
+        let header = [1; FRAME_HEADER_SIZE];
+        queue.append_frame_remainder(&header, &[2; 4], 0);
+
+        assert!(!queue.would_exceed(8, FRAME_HEADER_SIZE + 12));
+        assert!(queue.would_exceed(9, FRAME_HEADER_SIZE + 12));
+        assert!(queue.would_exceed(usize::MAX, usize::MAX));
     }
 }

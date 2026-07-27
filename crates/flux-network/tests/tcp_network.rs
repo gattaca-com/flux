@@ -221,6 +221,54 @@ fn oversized_frame_disconnects_the_peer() {
 }
 
 #[test]
+fn hard_backlog_limit_disconnects_the_peer() {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(TcpGroupConfig {
+        name: "client",
+        socket_buf_size: Some(1024),
+        backlog_warn_bytes: None,
+        max_backlog_bytes: Some(1),
+        max_frame_size: 2 * 1024 * 1024,
+        ..Default::default()
+    });
+    network.listen(server_group, addr).unwrap();
+    let client_token = network.connect(client_group, addr);
+
+    let mut connected = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !connected {
+        network
+            .poll_with(|event| {
+                if let TcpEvent::Connected { group, token, .. } = event {
+                    assert_eq!(group, client_group);
+                    assert_eq!(token, client_token);
+                    connected = true;
+                }
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(connected);
+
+    assert!(!network.send_with(client_token, |buffer| buffer.resize(1024 * 1024, 7)));
+
+    let mut disconnected = false;
+    network
+        .poll_with(|event| {
+            if let TcpEvent::Disconnected { group, token, .. } = event &&
+                group == client_group
+            {
+                assert_eq!(token, client_token);
+                disconnected = true;
+            }
+        })
+        .unwrap();
+    assert!(disconnected);
+}
+
+#[test]
 fn broadcast_serializes_once_for_multiple_connections() {
     let addr = unused_addr();
     let mut network = TcpNetwork::default();
