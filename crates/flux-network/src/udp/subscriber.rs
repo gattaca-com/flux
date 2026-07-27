@@ -103,10 +103,10 @@ struct RecvMetadata {
     messages: [libc::mmsghdr; RECV_BATCH_SIZE],
 }
 
-/// Reusable `recvmmsg` storage for up to 64 already-queued datagrams per syscall.
-/// `MSG_DONTWAIT` adds no batching delay. The payload and metadata are heap-backed
-/// because the prewired message headers contain pointers into both allocations,
-/// which must remain stable when the subscriber moves.
+/// Reusable `recvmmsg` storage for up to 64 already-queued datagrams per
+/// syscall. `MSG_DONTWAIT` adds no batching delay. The payload and metadata are
+/// heap-backed because the prewired message headers contain pointers into both
+/// allocations, which must remain stable when the subscriber moves.
 struct RecvBatch {
     buffer: Box<[u8]>,
     metadata: Box<RecvMetadata>,

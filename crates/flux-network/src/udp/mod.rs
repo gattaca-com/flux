@@ -8,7 +8,6 @@ mod wire;
 pub use publisher::{PublisherEvent, UdpPublisher};
 pub use subscriber::{SubscriberEvent, UdpSubscriber};
 pub use wire::{DEFAULT_IPV4_MAX_DATAGRAM_SIZE, DEFAULT_IPV6_MAX_DATAGRAM_SIZE};
-
 use wire::{MAX_DATAGRAM_SIZE, UDP_HEADER_SIZE, default_max_datagram_size_for};
 
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;

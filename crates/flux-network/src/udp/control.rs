@@ -178,10 +178,12 @@ mod tests {
     #[test]
     fn subscriber_message_roundtrip() {
         let mut buf = Vec::new();
-        for message in [
-            SubscriberMessage::Subscribe { udp_port: 4567 },
-            SubscriberMessage::Repair { session_id: 0xdead_beef, sequence: u64::MAX },
-        ] {
+        for message in
+            [SubscriberMessage::Subscribe { udp_port: 4567 }, SubscriberMessage::Repair {
+                session_id: 0xdead_beef,
+                sequence: u64::MAX,
+            }]
+        {
             message.encode(&mut buf);
             assert_eq!(SubscriberMessage::decode(&buf), Ok(message));
         }

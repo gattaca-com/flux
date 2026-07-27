@@ -1,5 +1,4 @@
-use std::os::fd::AsRawFd;
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, os::fd::AsRawFd};
 
 use flux_timing::Repeater;
 use mio::Token;
@@ -283,9 +282,10 @@ impl Subscribers {
         Some(sub.peer_addr)
     }
 
-    /// Batches up to 64 UDP datagrams across fragments and subscribers per `sendmmsg`.
-    /// Payloads are not copied; the fixed batch stores one `mmsghdr`, token, and
-    /// expected length per datagram, plus one shared header/iovec pair per fragment.
+    /// Batches up to 64 UDP datagrams across fragments and subscribers per
+    /// `sendmmsg`. Payloads are not copied; the fixed batch stores one
+    /// `mmsghdr`, token, and expected length per datagram, plus one shared
+    /// header/iovec pair per fragment.
     fn broadcast(
         &mut self,
         socket: &mio::net::UdpSocket,
