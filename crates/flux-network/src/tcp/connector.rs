@@ -7,10 +7,9 @@ use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
 use crate::tcp::{
-    ConnState, TcpStream, TcpTelemetry,
+    ConnState, TcpStream, TcpTelemetry, set_socket_buf_size,
     stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_socket_buf_size, set_user_timeout,
-        write_frame_header,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_user_timeout, write_frame_header,
     },
 };
 
