@@ -1,5 +1,6 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream},
     thread,
     time::{Duration, Instant},
 };
@@ -12,6 +13,7 @@ const CLIENT_HELLO: &[u8] = b"client-hello";
 const SERVER_HELLO: &[u8] = b"server-hello";
 const REQUEST: &[u8] = b"request-payload";
 const RESPONSE: &[u8] = b"response-payload";
+const FRAME_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>();
 
 fn unused_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -22,6 +24,23 @@ fn unused_addr() -> SocketAddr {
 
 fn contains(messages: &[Vec<u8>], expected: &[u8]) -> bool {
     messages.iter().any(|message| message == expected)
+}
+
+fn write_raw_frame(stream: &mut StdTcpStream, payload: &[u8]) {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&0u64.to_le_bytes());
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame).unwrap();
+}
+
+fn read_raw_frame(stream: &mut StdTcpStream) -> Vec<u8> {
+    let mut header = [0; FRAME_HEADER_SIZE];
+    stream.read_exact(&mut header).unwrap();
+    let payload_len = u32::from_le_bytes(header[..size_of::<u32>()].try_into().unwrap()) as usize;
+    let mut payload = vec![0; payload_len];
+    stream.read_exact(&mut payload).unwrap();
+    payload
 }
 
 #[test]
@@ -268,4 +287,49 @@ fn new_client_replays_disconnected_backlog_by_default() {
 #[test]
 fn new_client_can_drop_disconnected_backlog() {
     assert_eq!(receive_after_reconnect(true), (None, true));
+}
+
+#[test]
+fn server_token_lookup_survives_middle_stream_removal() {
+    let addr = unused_addr();
+    let mut server = TcpServer::default();
+    server.listen_at(addr).expect("server failed to listen");
+
+    let mut clients = Vec::new();
+    let mut server_tokens = Vec::new();
+    for _ in 0..3 {
+        let client = StdTcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        clients.push(client);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server_tokens.len() != clients.len() && Instant::now() < deadline {
+            server.poll_with(|event| {
+                if let ServerEvent::Accept { stream, .. } = event {
+                    server_tokens.push(stream);
+                }
+            });
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server_tokens.len(), clients.len());
+    }
+
+    server.disconnect(server_tokens[1]);
+    server.write_or_enqueue_with(SendBehavior::Single(server_tokens[2]), |output| {
+        output.extend_from_slice(RESPONSE);
+    });
+    assert_eq!(read_raw_frame(&mut clients[2]), RESPONSE);
+
+    write_raw_frame(&mut clients[2], REQUEST);
+    let mut received = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.is_none() && Instant::now() < deadline {
+        server.poll_with(|event| {
+            if let ServerEvent::Message { token, payload, .. } = event {
+                received = Some((token, payload.to_vec()));
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(received, Some((server_tokens[2], REQUEST.to_vec())));
 }

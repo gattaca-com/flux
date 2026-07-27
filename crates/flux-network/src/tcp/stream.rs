@@ -809,25 +809,44 @@ pub(crate) fn set_user_timeout(_stream: &mio::net::TcpStream, _timeout_ms: u32) 
     // TCP_USER_TIMEOUT is not supported on non-Linux platforms.
 }
 
-/// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a mio `TcpStream`.
-pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let size = size as libc::c_int;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            ptr::from_ref(&size).cast::<libc::c_void>(),
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            ptr::from_ref(&size).cast::<libc::c_void>(),
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+/// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a socket.
+///
+/// The kernel silently clamps requests to `net.core.wmem_max` /
+/// `net.core.rmem_max`; a warning is logged when that happens because an
+/// undersized buffer shows up as packet loss rather than an error.
+pub(crate) fn set_socket_buf_size(socket: &impl std::os::fd::AsRawFd, size: usize) {
+    let fd = socket.as_raw_fd();
+    let requested = size as libc::c_int;
+    for (option, name, limit) in [
+        (libc::SO_SNDBUF, "SO_SNDBUF", "net.core.wmem_max"),
+        (libc::SO_RCVBUF, "SO_RCVBUF", "net.core.rmem_max"),
+    ] {
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                ptr::from_ref(&requested).cast::<libc::c_void>(),
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        let mut granted: libc::c_int = 0;
+        let mut granted_length = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                ptr::from_mut(&mut granted).cast::<libc::c_void>(),
+                ptr::from_mut(&mut granted_length),
+            )
+        };
+        // The kernel stores and reports double the granted value to account
+        // for bookkeeping overhead, so an unclamped request reads back as
+        // exactly `2 * size`.
+        if result == 0 && i64::from(granted) < 2 * size as i64 {
+            warn!(requested = size, granted, "kernel clamped {name}; raise {limit}");
+        }
     }
 }
