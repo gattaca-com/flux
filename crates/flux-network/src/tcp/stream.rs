@@ -47,23 +47,13 @@ impl TcpTimers {
             alloc: Timer::new(app_name, format!("tcp_alloc_{label}")),
         }
     }
-
-    pub(crate) fn new_client(
-        telemetry: TcpTelemetry,
-        token: Token,
-        peer_addr: SocketAddr,
-    ) -> Option<Self> {
-        let TcpTelemetry::Enabled { app_name } = telemetry else { return None };
-        let label = format!("client-{}-{peer_addr}", token.0);
-        Some(Self::new(app_name, &label))
-    }
 }
 
 /// Frame length prefix.
-const LEN_HEADER_SIZE: usize = core::mem::size_of::<u32>();
+const LEN_HEADER_SIZE: usize = 4;
 /// Nanos timestamp when the sender finished serialising and handed bytes to
 /// kernel or enqueued in backlog.
-const TS_HEADER_SIZE: usize = core::mem::size_of::<Nanos>();
+const TS_HEADER_SIZE: usize = 8;
 pub(crate) const FRAME_HEADER_SIZE: usize = LEN_HEADER_SIZE + TS_HEADER_SIZE;
 // TODO: might need to tweak these
 const RX_BUF_SIZE: usize = 32 * 1024;
@@ -211,75 +201,6 @@ impl TcpStream {
             backlog_exceeded_since: None,
             timers,
         }
-    }
-
-    /// Constructs a client-managed stream using timers owned by its persistent
-    /// endpoint and reused across replacement sockets.
-    #[inline(never)]
-    pub(crate) fn from_client_stream(
-        stream: mio::net::TcpStream,
-        token: Token,
-        peer_addr: SocketAddr,
-        timers: Option<TcpTimers>,
-    ) -> Self {
-        Self {
-            stream,
-            peer_addr,
-            token,
-            rx_state: RxState::default(),
-            rx_buf: RxBuf::Heap(vec![0; RX_BUF_SIZE]),
-            header_buf: [0; FRAME_HEADER_SIZE],
-            send_buf: vec![0; Self::SEND_BUF_SIZE],
-            send_backlog: VecDeque::with_capacity(64),
-            send_cursor: 0,
-            writable_armed: false,
-            backlog_exceeded_since: None,
-            timers,
-        }
-    }
-
-    /// Installs frames retained by [`TcpClient`](super::TcpClient) while this
-    /// endpoint was disconnected and schedules them after the on-connect
-    /// message.
-    pub(crate) fn install_send_backlog(
-        &mut self,
-        registry: &Registry,
-        backlog: VecDeque<Vec<u8>>,
-        on_connect_msg: Option<&Vec<u8>>,
-    ) -> ConnState {
-        debug_assert!(self.send_backlog.is_empty());
-        self.send_backlog = backlog;
-        if !self.send_backlog.is_empty() {
-            if let Some(message) = on_connect_msg {
-                let already_queued = self.send_backlog.front().is_some_and(|front| {
-                    front.len() >= FRAME_HEADER_SIZE && front[FRAME_HEADER_SIZE..] == **message
-                });
-                if !already_queued {
-                    self.serialise_frame(|bytes| bytes.extend_from_slice(message));
-                    let data = self.alloc_vec(0);
-                    return self.enqueue_front(registry, data);
-                }
-            }
-            self.arm_writable(registry)
-        } else if let Some(message) = on_connect_msg {
-            self.write_or_enqueue_with(registry, |bytes| bytes.extend_from_slice(message))
-        } else {
-            ConnState::Alive
-        }
-    }
-
-    /// Moves queued frames out before a client-managed socket is replaced.
-    pub(crate) fn take_send_backlog(&mut self) -> VecDeque<Vec<u8>> {
-        self.send_cursor = 0;
-        self.writable_armed = false;
-        self.backlog_exceeded_since = None;
-        std::mem::take(&mut self.send_backlog)
-    }
-
-    /// Returns client telemetry to the persistent endpoint before this socket
-    /// is replaced.
-    pub(crate) fn take_timers(&mut self) -> Option<TcpTimers> {
-        self.timers.take()
     }
 
     #[inline]
@@ -809,25 +730,44 @@ pub(crate) fn set_user_timeout(_stream: &mio::net::TcpStream, _timeout_ms: u32) 
     // TCP_USER_TIMEOUT is not supported on non-Linux platforms.
 }
 
-/// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a mio `TcpStream`.
-pub(crate) fn set_socket_buf_size(stream: &mio::net::TcpStream, size: usize) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let size = size as libc::c_int;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            ptr::from_ref(&size).cast::<libc::c_void>(),
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            ptr::from_ref(&size).cast::<libc::c_void>(),
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+/// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a socket.
+///
+/// The kernel silently clamps requests to `net.core.wmem_max` /
+/// `net.core.rmem_max`; a warning is logged when that happens because an
+/// undersized buffer shows up as packet loss rather than an error.
+pub(crate) fn set_socket_buf_size(socket: &impl std::os::fd::AsRawFd, size: usize) {
+    let fd = socket.as_raw_fd();
+    let requested = size as libc::c_int;
+    for (option, name, limit) in [
+        (libc::SO_SNDBUF, "SO_SNDBUF", "net.core.wmem_max"),
+        (libc::SO_RCVBUF, "SO_RCVBUF", "net.core.rmem_max"),
+    ] {
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                ptr::from_ref(&requested).cast::<libc::c_void>(),
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        let mut granted: libc::c_int = 0;
+        let mut granted_length = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                ptr::from_mut(&mut granted).cast::<libc::c_void>(),
+                ptr::from_mut(&mut granted_length),
+            )
+        };
+        // Linux stores and reports double the granted value to account for
+        // bookkeeping overhead, so an unclamped request reads back as exactly
+        // `2 * size`.
+        if result == 0 && i64::from(granted) < 2 * size as i64 {
+            warn!(requested = size, granted, "kernel clamped {name}; raise {limit}");
+        }
     }
 }
