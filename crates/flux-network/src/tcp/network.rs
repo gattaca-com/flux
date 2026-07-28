@@ -1015,8 +1015,7 @@ impl FramedStream {
                 return StreamState::Disconnected;
             }
             if !self.send_queue.is_empty() {
-                self.enqueue_remainder(registry, header, payload, 0, config, timers);
-                return StreamState::Alive;
+                return self.enqueue_remainder(registry, header, payload, 0, config, timers);
             }
         }
 
@@ -1124,7 +1123,18 @@ impl FramedStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteQueue, FRAME_HEADER_SIZE};
+    use std::{
+        io::{self, Write},
+        net::{Ipv4Addr, TcpListener, TcpStream as StdTcpStream},
+    };
+
+    use flux_timing::Nanos;
+    use mio::{Poll, Token};
+
+    use super::{
+        ByteQueue, FRAME_HEADER_SIZE, FramedStream, StreamState, TcpGroupConfig,
+        set_socket_buf_size, write_frame_header,
+    };
 
     #[test]
     fn byte_queue_preserves_every_unwritten_suffix() {
@@ -1171,5 +1181,47 @@ mod tests {
         assert!(!queue.would_exceed(8, FRAME_HEADER_SIZE + 12));
         assert!(queue.would_exceed(9, FRAME_HEADER_SIZE + 12));
         assert!(queue.would_exceed(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn hard_limit_disconnects_when_queue_is_already_backed_up() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, peer_addr) = listener.accept().unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        let socket = mio::net::TcpStream::from_std(client);
+        set_socket_buf_size(&socket, 1024);
+        let mut stream = FramedStream::new(socket, Token(0), peer_addr, 1024);
+        let fill = [0; 4096];
+        loop {
+            match stream.socket.write(&fill) {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("failed to fill socket send buffer: {err}"),
+            }
+        }
+        stream.send_queue.bytes.extend_from_slice(&[1; 8]);
+
+        let config = TcpGroupConfig {
+            backlog_warn_bytes: None,
+            max_backlog_bytes: Some(16),
+            ..Default::default()
+        };
+        let mut header = [0; FRAME_HEADER_SIZE];
+        let payload = [2; 8];
+        write_frame_header(&mut header, payload.len(), Nanos::now());
+
+        assert_eq!(
+            stream.write_frame(
+                Poll::new().unwrap().registry(),
+                &header,
+                &payload,
+                &config,
+                &mut None
+            ),
+            StreamState::Disconnected
+        );
+        assert_eq!(stream.send_queue.len(), 8);
     }
 }
