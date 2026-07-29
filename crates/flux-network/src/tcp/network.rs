@@ -343,12 +343,11 @@ impl NetworkState {
         true
     }
 
-    fn accept_connections<F>(&mut self, listener_index: usize, handler: &mut F) -> bool
+    fn accept_connections<F>(&mut self, listener_index: usize, handler: &mut F)
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
         let group = self.listeners[listener_index].group;
-        let mut worked = false;
         loop {
             let accepted = self.listeners[listener_index].socket.accept();
             let (mut socket, peer_addr) = match accepted {
@@ -412,38 +411,31 @@ impl NetworkState {
             });
             info!(group = group_name, %peer_addr, "tcp connection accepted");
             handler(TcpEvent::Accepted { group, token, peer_addr });
-            worked = true;
         }
-        worked
     }
 
-    fn handle_event<F>(&mut self, event: &Event, handler: &mut F) -> bool
+    fn handle_event<F>(&mut self, event: &Event, handler: &mut F)
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
         let token = event.token();
         if let Some(index) = self.listeners.iter().position(|listener| listener.token == token) {
-            return self.accept_connections(index, handler);
+            self.accept_connections(index, handler);
+            return;
         }
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             debug!(?token, "ignoring stale tcp readiness event");
-            return false;
+            return;
         };
 
-        let worked = if matches!(self.connections[index].state, ConnectionState::Connecting(_)) {
-            if !self.finish_connect(index, handler) {
-                return false;
-            }
-            // A connect completion can share an edge-triggered event with
-            // readable data or a peer close, so process the rest of the event
-            // against the newly established stream below.
-            true
-        } else {
-            false
-        };
+        if matches!(self.connections[index].state, ConnectionState::Connecting(_)) &&
+            !self.finish_connect(index, handler)
+        {
+            return;
+        }
         if !matches!(self.connections[index].state, ConnectionState::Connected(_)) {
-            return false;
+            return;
         }
 
         let group = self.connections[index].group;
@@ -451,23 +443,19 @@ impl NetworkState {
         let config = &self.groups[group.0].config;
         let connection = &mut self.connections[index];
         let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
-        let mut delivered = false;
         let state = stream.poll_with(
             self.poll.registry(),
             event,
             config,
             &mut connection.timers,
             &mut |payload, send_ts| {
-                delivered = true;
                 handler(TcpEvent::Message { group, token, payload, send_ts });
             },
         );
         if state == StreamState::Disconnected {
             handler(TcpEvent::Disconnected { group, token, peer_addr });
             self.disconnect_index(index, false);
-            return true;
         }
-        worked || delivered
     }
 
     fn close_connection_socket(&mut self, index: usize) -> bool {
@@ -503,11 +491,10 @@ impl NetworkState {
         }
     }
 
-    fn drain_pending_disconnects<F>(&mut self, handler: &mut F) -> bool
+    fn drain_pending_disconnects<F>(&mut self, handler: &mut F)
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
-        let worked = !self.pending_disconnects.is_empty();
         for event in self.pending_disconnects.drain(..) {
             handler(TcpEvent::Disconnected {
                 group: event.group,
@@ -515,7 +502,6 @@ impl NetworkState {
                 peer_addr: event.peer_addr,
             });
         }
-        worked
     }
 
     fn prepare_frame<F>(&mut self, group: TcpGroup, serialise: F) -> bool
@@ -702,20 +688,22 @@ impl TcpNetwork {
         self.state.connect(group, peer_addr)
     }
 
-    /// Runs due reconnects, performs one nonblocking poll, and dispatches all
-    /// complete frames and lifecycle transitions found in that readiness batch.
-    pub fn poll_with<F>(&mut self, mut handler: F) -> io::Result<bool>
+    pub fn poll_with<F>(&mut self, mut handler: F)
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
-        let mut worked = self.state.drain_pending_disconnects(&mut handler);
+        self.state.drain_pending_disconnects(&mut handler);
         self.state.maybe_reconnect();
-        self.state.poll.poll(&mut self.events, Some(std::time::Duration::ZERO))?;
-        for event in &self.events {
-            worked |= self.state.handle_event(event, &mut handler);
+        if let Err(err) = self.state.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
+            if err.kind() != io::ErrorKind::Interrupted {
+                flux_utils::safe_panic!("couldn't poll tcp network: {err}");
+            }
+            return;
         }
-        worked |= self.state.drain_pending_disconnects(&mut handler);
-        Ok(worked)
+        for event in &self.events {
+            self.state.handle_event(event, &mut handler);
+        }
+        self.state.drain_pending_disconnects(&mut handler);
     }
 
     /// Serializes and sends one frame to a connected token. The closure is not
