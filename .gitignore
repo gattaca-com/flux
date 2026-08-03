@@ -42,3 +42,4 @@ db-tools/
 
 # Coverage report
 lcov.info
+bench-results

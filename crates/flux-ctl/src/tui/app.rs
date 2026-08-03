@@ -825,7 +825,7 @@ impl App {
         let Some(seg) =
             self.groups.get(detail.group_idx).and_then(|g| g.segments.get(detail.segment_idx))
         else {
-            return
+            return;
         };
 
         if seg.alive {

@@ -10,6 +10,7 @@ repository = "https://github.com/gattaca-com/flux"
 [dependencies]
 flux.workspace = true
 flux-communication.workspace = true
+flux-profiler = { workspace = true, optional = true }
 flux-timing.workspace = true
 flux-utils.workspace = true
 libc.workspace = true
@@ -21,7 +22,13 @@ thiserror.workspace = true
 tracing.workspace = true
 wincode = { workspace = true, optional = true }
 
+[features]
+profiling = ["dep:flux-profiler"]
+profiling-perf = ["profiling", "flux-profiler/perf"]
+
 [dev-dependencies]
+clap.workspace = true
+serde_json.workspace = true
 spine-derive.workspace = true
 tempfile.workspace = true
 wincode-derive = { workspace = true }

@@ -11,7 +11,9 @@ use std::{
 };
 
 use clap::Parser;
-use flux_profiler::{CrossProcessReader, live_apps, published_pid};
+use flux_profiler::{CrossProcessReader, EventsDrainer, live_apps, published_pid};
+use flux_timing::Duration as TscDuration;
+use rustc_hash::FxHashMap;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -40,6 +42,68 @@ struct Args {
     /// so only traces of interest are retained.
     #[arg(long, value_parser = humantime::parse_duration)]
     filter_short_frames: Option<Duration>,
+    /// Print inclusive per-frame timing quantiles after capture.
+    #[arg(long)]
+    summary: bool,
+}
+
+fn print_summary(events: &EventsDrainer) {
+    let mut samples: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    for thread in events.threads() {
+        let mut stack = Vec::new();
+        for mark in thread.marks {
+            if mark.is_open() {
+                stack.push((mark.id, mark.ts));
+                continue;
+            }
+            let Some((id, started)) = stack.pop() else { continue };
+            if id != mark.id {
+                stack.clear();
+                continue;
+            }
+            let elapsed_ns = TscDuration(mark.ts.saturating_sub(started)).as_nanos() as u64;
+            samples.entry(id).or_default().push(elapsed_ns);
+        }
+    }
+
+    let mut rows: Vec<_> = samples
+        .into_iter()
+        .filter_map(|(id, mut values)| {
+            if values.is_empty() {
+                return None;
+            }
+            values.sort_unstable();
+            let total: u128 = values.iter().map(|&value| u128::from(value)).sum();
+            let percentile = |numerator: usize, denominator: usize| {
+                let index = (values.len() - 1) * numerator / denominator;
+                values[index]
+            };
+            Some((
+                total,
+                events.meta().names.get(&id).cloned().unwrap_or_else(|| format!("unknown_{id}")),
+                values.len(),
+                total as f64 / values.len() as f64,
+                percentile(1, 2),
+                percentile(99, 100),
+                percentile(999, 1000),
+                *values.last().expect("non-empty"),
+            ))
+        })
+        .collect();
+    rows.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+
+    println!("PROFILE_SUMMARY count mean_us p50_us p99_us p999_us max_us total_ms frame");
+    for (total, name, count, mean, p50, p99, p999, max) in rows {
+        println!(
+            "PROFILE_FRAME {count} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {name}",
+            mean / 1_000.0,
+            p50 as f64 / 1_000.0,
+            p99 as f64 / 1_000.0,
+            p999 as f64 / 1_000.0,
+            max as f64 / 1_000.0,
+            total as f64 / 1_000_000.0,
+        );
+    }
 }
 
 /// The producer to attach to: the one matching `--pid`, or the sole live one
@@ -123,12 +187,15 @@ fn main() -> ExitCode {
         thread::sleep(Duration::from_millis(1));
     }
 
+    let events = reader.events();
+    if args.summary {
+        print_summary(events);
+    }
     let out = args.out.unwrap_or_else(|| PathBuf::from(format!("{app}-trace-{pid}.fxt")));
     if let Err(e) = std::fs::write(&out, reader.events().fxt_trace()) {
         eprintln!("failed to write {}: {e}", out.display());
         return ExitCode::FAILURE;
     }
-    let events = reader.events();
     println!("exported {} threads → {}", events.threads().count(), out.display());
     if events.threads().any(|t| t.loss.is_lossy()) {
         eprintln!("warning: events were lost (producer outran the reader); the trace has holes");

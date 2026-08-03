@@ -254,6 +254,7 @@ impl ServerManager {
         now.saturating_sub(*since) >= timeout
     }
 
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("tcp.broadcast"))]
     fn broadcast<F>(&mut self, serialise: &F)
     where
         F: Fn(&mut Vec<u8>),
@@ -367,6 +368,7 @@ impl TcpServer {
         self.manager.try_listen_at(addr)
     }
 
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("tcp.poll"))]
     pub fn poll_with<F>(&mut self, mut handler: F) -> bool
     where
         F: for<'a> FnMut(ServerEvent<&'a [u8]>),
@@ -409,6 +411,7 @@ impl TcpServer {
         worked
     }
 
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("tcp.publish"))]
     pub fn write_or_enqueue_with<F>(&mut self, where_to: SendBehavior, serialise: F)
     where
         F: Fn(&mut Vec<u8>),

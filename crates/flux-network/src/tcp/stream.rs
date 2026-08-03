@@ -465,6 +465,7 @@ impl TcpStream {
     /// fan-out and the identical bytes are handed to every connection. The
     /// happy path writes `header` and `payload` as two `IoSlice`s with no
     /// per-connection copy; only a blocked socket pays for a backlog copy.
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("tcp.stream_write"))]
     #[inline]
     pub(crate) fn write_or_enqueue_shared(
         &mut self,

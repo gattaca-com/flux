@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, os::fd::AsRawFd};
+use std::{
+    io,
+    mem::{size_of, size_of_val},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    os::fd::AsRawFd,
+};
 
 use flux_timing::Nanos;
 use flux_utils::{safe_assert, safe_assert_eq};
@@ -7,9 +12,9 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::{
-    NativeSocketAddr, UdpConfig,
+    NativeSocketAddr, UdpConfig, UdpMulticastConfig,
     control::{PublisherMessage, SubscriberMessage},
-    wire::{DatagramError, Fragment, UDP_HEADER_SIZE},
+    wire::{DatagramError, Fragment, MAX_DATAGRAM_SIZE, UDP_HEADER_SIZE},
 };
 use crate::tcp::{ClientEvent, SendBehavior, TcpClient, set_socket_buf_size};
 
@@ -29,6 +34,23 @@ enum InsertFragmentError {
         "inconsistent message length for sequence {sequence}: expected {expected}, got {actual}"
     )]
     InconsistentMessageLength { sequence: u64, expected: u32, actual: u32 },
+}
+
+/// Subscriber-side UDP receive and repair accounting.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UdpSubscriberStats {
+    pub recvmmsg_calls: u64,
+    pub nonempty_recvmmsg_calls: u64,
+    pub socket_messages_received: u64,
+    pub datagrams_received: u64,
+    pub max_datagrams_per_recvmmsg: usize,
+    pub gro_packets_received: u64,
+    pub gro_segments_received: u64,
+    pub max_gro_segments: usize,
+    pub udp_messages_delivered: u64,
+    pub repair_requests: u64,
+    pub repair_messages_delivered: u64,
+    pub unavailable_messages: u64,
 }
 
 /// Fixed-stride fragment reassembly for one UDP message sequence.
@@ -96,11 +118,23 @@ impl ReassemblyBuffer {
 }
 
 const RECV_BATCH_SIZE: usize = 64;
+const UDP_GRO_MAX_SEGMENTS: usize = 64;
+const UDP_GRO_CONTROL_SPACE: usize =
+    unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as _) as usize };
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UdpGroControl {
+    header: libc::cmsghdr,
+    segment_size: libc::c_int,
+    padding: [u8; UDP_GRO_CONTROL_SPACE - size_of::<libc::cmsghdr>() - size_of::<libc::c_int>()],
+}
 
 struct RecvMetadata {
     sources: [libc::sockaddr_storage; RECV_BATCH_SIZE],
     iovecs: [libc::iovec; RECV_BATCH_SIZE],
     messages: [libc::mmsghdr; RECV_BATCH_SIZE],
+    gro_controls: [UdpGroControl; RECV_BATCH_SIZE],
 }
 
 /// Reusable `recvmmsg` storage for up to 64 already-queued datagrams per
@@ -112,10 +146,11 @@ struct RecvBatch {
     metadata: Box<RecvMetadata>,
     stride: usize,
     used: usize,
+    use_udp_gro: bool,
 }
 
 impl RecvBatch {
-    fn new(stride: usize) -> Self {
+    fn new(stride: usize, use_udp_gro: bool) -> Self {
         let mut buffer = vec![0; RECV_BATCH_SIZE * stride].into_boxed_slice();
         let mut metadata: Box<RecvMetadata> = Box::new(unsafe { core::mem::zeroed() });
 
@@ -132,15 +167,25 @@ impl RecvBatch {
             metadata.messages[index].msg_hdr.msg_iov =
                 core::ptr::from_mut(&mut metadata.iovecs[index]);
             metadata.messages[index].msg_hdr.msg_iovlen = 1;
+            if use_udp_gro {
+                metadata.messages[index].msg_hdr.msg_control =
+                    core::ptr::from_mut(&mut metadata.gro_controls[index]).cast::<libc::c_void>();
+                metadata.messages[index].msg_hdr.msg_controllen = UDP_GRO_CONTROL_SPACE;
+            }
         }
 
-        Self { buffer, metadata, stride, used: 0 }
+        Self { buffer, metadata, stride, used: 0, use_udp_gro }
     }
 
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("udp.subscriber_recvmmsg"))]
     fn receive(&mut self, socket: &mio::net::UdpSocket) -> io::Result<usize> {
         for message in &mut self.metadata.messages[..self.used] {
             message.msg_hdr.msg_namelen =
                 core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            message.msg_hdr.msg_flags = 0;
+            if self.use_udp_gro {
+                message.msg_hdr.msg_controllen = UDP_GRO_CONTROL_SPACE;
+            }
         }
         self.used = 0;
 
@@ -176,7 +221,28 @@ impl RecvBatch {
     }
 
     fn is_truncated(&self, index: usize) -> bool {
-        self.metadata.messages[index].msg_hdr.msg_flags & libc::MSG_TRUNC != 0
+        self.metadata.messages[index].msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+    }
+
+    fn gro_segment_size(&self, index: usize) -> Option<usize> {
+        if !self.use_udp_gro {
+            return None;
+        }
+        let message = &self.metadata.messages[index].msg_hdr;
+        if message.msg_controllen <
+            unsafe { libc::CMSG_LEN(size_of::<libc::c_int>() as _) as usize }
+        {
+            return None;
+        }
+        let control = &self.metadata.gro_controls[index];
+        if control.header.cmsg_len <
+            unsafe { libc::CMSG_LEN(size_of::<libc::c_int>() as _) as usize } ||
+            control.header.cmsg_level != libc::SOL_UDP ||
+            control.header.cmsg_type != libc::UDP_GRO
+        {
+            return None;
+        }
+        usize::try_from(control.segment_size).ok().filter(|size| *size != 0)
     }
 
     fn datagram(&self, index: usize) -> &[u8] {
@@ -459,12 +525,13 @@ impl SessionState {
         self.watermark = next_sequence;
     }
 
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("udp.subscriber_insert_fragment"))]
     fn insert_fragment<F>(
         &mut self,
         fragment: Fragment<'_>,
         recv_ts: Nanos,
         handler: &mut F,
-    ) -> Result<(), InsertFragmentError>
+    ) -> Result<bool, InsertFragmentError>
     where
         F: for<'a> FnMut(SubscriberEvent<'a>),
     {
@@ -479,14 +546,14 @@ impl SessionState {
 
         self.maybe_advance_window(sequence + 1);
         if self.is_done(sequence) {
-            return Ok(());
+            return Ok(false);
         }
 
         if fragment.header.offset == 0 && fragment.payload.len() == fragment.header.len as usize {
             // fast path no reassembly
             let ingest_ts = self.finish(sequence).unwrap_or(recv_ts);
             handler(SubscriberEvent::Message { payload: fragment.payload, ingest_ts });
-            return Ok(());
+            return Ok(true);
         }
 
         let fragment_payload_size = self.fragment_payload_size;
@@ -520,9 +587,9 @@ impl SessionState {
                 let payload = slot.buffer.payload().expect("complete payload is available");
                 handler(SubscriberEvent::Message { payload, ingest_ts });
                 self.finish(sequence);
-                Ok(())
+                Ok(true)
             }
-            InsertStatus::Duplicate | InsertStatus::Incomplete => Ok(()),
+            InsertStatus::Duplicate | InsertStatus::Incomplete => Ok(false),
         }
     }
 }
@@ -537,6 +604,7 @@ pub struct UdpSubscriber {
     repair_token: Token,
     repair_ready: bool,
     session: Option<SessionState>,
+    stats: UdpSubscriberStats,
 }
 
 impl UdpSubscriber {
@@ -547,10 +615,22 @@ impl UdpSubscriber {
         config: UdpConfig,
     ) -> io::Result<Self> {
         config.validate()?;
+        if config.multicast.is_some() && !publisher_addr.is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP multicast publisher address must be IPv4",
+            ));
+        }
 
-        let udp_socket = mio::net::UdpSocket::bind(udp_bind_addr)?;
+        let udp_socket = match config.multicast {
+            Some(multicast) => bind_multicast_receiver(multicast)?,
+            None => mio::net::UdpSocket::bind(udp_bind_addr)?,
+        };
         if let Some(size) = config.socket_buf_size {
             set_socket_buf_size(&udp_socket, size);
+        }
+        if config.use_udp_gro {
+            enable_udp_gro(&udp_socket)?;
         }
         let udp_addr = udp_socket.local_addr()?;
         if udp_addr.port() == 0 {
@@ -570,8 +650,14 @@ impl UdpSubscriber {
         }
         let repair_token = repair.connect(publisher_addr);
 
+        let receive_stride = if config.use_udp_gro {
+            config.max_datagram_size.saturating_mul(UDP_GRO_MAX_SEGMENTS).min(MAX_DATAGRAM_SIZE)
+        } else {
+            config.max_datagram_size
+        };
+
         Ok(Self {
-            receive_batch: RecvBatch::new(config.max_datagram_size),
+            receive_batch: RecvBatch::new(receive_stride, config.use_udp_gro),
             config,
             publisher_addr,
             publisher_native_addr: NativeSocketAddr::encode(publisher_addr),
@@ -580,10 +666,55 @@ impl UdpSubscriber {
             repair_token,
             repair_ready: false,
             session: None,
+            stats: UdpSubscriberStats::default(),
         })
     }
 
+    pub const fn stats(&self) -> UdpSubscriberStats {
+        self.stats
+    }
+
+    pub fn reset_stats(&mut self) {
+        self.stats = UdpSubscriberStats::default();
+    }
+
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("udp.subscriber_poll"))]
     pub fn poll_with<F>(&mut self, mut handler: F)
+    where
+        F: for<'a> FnMut(SubscriberEvent<'a>),
+    {
+        if self.poll_control_inner(&mut handler) {
+            return;
+        }
+        self.poll_data_inner(&mut handler);
+    }
+
+    /// Polls only the TCP subscription, progress, and repair control plane.
+    ///
+    /// Latency-sensitive callers can invoke this less frequently than
+    /// [`Self::poll_data_with`] so an otherwise idle control connection does
+    /// not add an `epoll_wait` syscall to every UDP receive iteration.
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("udp.subscriber_control_poll"))]
+    pub fn poll_control_with<F>(&mut self, mut handler: F)
+    where
+        F: for<'a> FnMut(SubscriberEvent<'a>),
+    {
+        self.poll_control_inner(&mut handler);
+    }
+
+    /// Polls only UDP data and emits any repair requests made necessary by
+    /// newly observed gaps. Callers using this split API must also invoke
+    /// [`Self::poll_control_with`] periodically.
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("udp.subscriber_data_poll"))]
+    pub fn poll_data_with<F>(&mut self, mut handler: F)
+    where
+        F: for<'a> FnMut(SubscriberEvent<'a>),
+    {
+        self.poll_data_inner(&mut handler);
+    }
+
+    /// Returns true when a control-plane protocol error disconnected repair.
+    fn poll_control_inner<F>(&mut self, handler: &mut F) -> bool
     where
         F: for<'a> FnMut(SubscriberEvent<'a>),
     {
@@ -593,6 +724,7 @@ impl UdpSubscriber {
         let fragment_payload_size = self.config.max_datagram_size - UDP_HEADER_SIZE;
         let can_repair = &mut self.repair_ready;
         let session = &mut self.session;
+        let stats = &mut self.stats;
         let mut protocol_error = None;
 
         self.repair.poll_with(|event| {
@@ -658,6 +790,7 @@ impl UdpSubscriber {
                             }
 
                             let ingest_ts = current.finish(sequence).unwrap_or(recv_ts);
+                            stats.repair_messages_delivered += 1;
                             handler(SubscriberEvent::Message { payload, ingest_ts });
                         }
                         Ok(PublisherMessage::Unavailable { session_id, sequence }) => {
@@ -671,6 +804,7 @@ impl UdpSubscriber {
                             }
 
                             current.finish(sequence);
+                            stats.unavailable_messages += 1;
                             debug!(session_id, sequence, "lost message");
                         }
 
@@ -681,18 +815,26 @@ impl UdpSubscriber {
         });
 
         if let Some(error) = protocol_error {
-            self.protocol_error(&error, &mut handler);
-            return;
+            self.protocol_error(&error, handler);
+            return true;
         }
 
-        if let Some(error) = self.receive_datagrams(&mut handler) {
-            self.protocol_error(&error, &mut handler);
+        false
+    }
+
+    fn poll_data_inner<F>(&mut self, handler: &mut F)
+    where
+        F: for<'a> FnMut(SubscriberEvent<'a>),
+    {
+        if let Some(error) = self.receive_datagrams(handler) {
+            self.protocol_error(&error, handler);
             return;
         }
 
         self.request_repairs();
     }
 
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("udp.subscriber_receive"))]
     fn receive_datagrams<F>(&mut self, handler: &mut F) -> Option<String>
     where
         F: for<'a> FnMut(SubscriberEvent<'a>),
@@ -701,6 +843,7 @@ impl UdpSubscriber {
         let fragment_payload_size = self.config.max_datagram_size - UDP_HEADER_SIZE;
 
         loop {
+            self.stats.recvmmsg_calls += 1;
             let received = match self.receive_batch.receive(&self.udp_socket) {
                 Ok(0) => break,
                 Ok(received) => received,
@@ -710,9 +853,51 @@ impl UdpSubscriber {
                     break;
                 }
             };
+            self.stats.nonempty_recvmmsg_calls += 1;
+            self.stats.socket_messages_received += received as u64;
             let recv_ts = Nanos::now();
+            let mut datagrams_this_call = 0;
 
             for index in 0..received {
+                if self.receive_batch.is_truncated(index) {
+                    protocol_error =
+                        Some("UDP receive payload or control metadata was truncated".into());
+                    break;
+                }
+
+                let packet = self.receive_batch.datagram(index);
+                let gro_segment_size = self.receive_batch.gro_segment_size(index);
+                let segment_size = match gro_segment_size {
+                    Some(size) if size <= self.config.max_datagram_size => size,
+                    Some(size) => {
+                        protocol_error = Some(format!(
+                            "UDP GRO segment size {size} exceeds configured maximum {}",
+                            self.config.max_datagram_size
+                        ));
+                        break;
+                    }
+                    None if !packet.is_empty() && packet.len() <= self.config.max_datagram_size => {
+                        packet.len()
+                    }
+                    None => {
+                        protocol_error = Some(format!(
+                            "UDP datagram size {} exceeds configured maximum {}",
+                            packet.len(),
+                            self.config.max_datagram_size
+                        ));
+                        break;
+                    }
+                };
+
+                let segment_count = packet.len().div_ceil(segment_size);
+                datagrams_this_call += segment_count;
+                self.stats.datagrams_received += segment_count as u64;
+                if gro_segment_size.is_some() {
+                    self.stats.gro_packets_received += 1;
+                    self.stats.gro_segments_received += segment_count as u64;
+                    self.stats.max_gro_segments = self.stats.max_gro_segments.max(segment_count);
+                }
+
                 if !self.receive_batch.source_matches(index, &self.publisher_native_addr) {
                     continue;
                 }
@@ -720,30 +905,33 @@ impl UdpSubscriber {
                 else {
                     continue;
                 };
-                if self.receive_batch.is_truncated(index) {
-                    protocol_error =
-                        Some("UDP datagram exceeds the configured maximum size".into());
+                for datagram in packet.chunks(segment_size) {
+                    let fragment =
+                        match Fragment::decode(datagram, session_id, fragment_payload_size) {
+                            Ok(fragment) => fragment,
+                            Err(DatagramError::UnexpectedSession { .. }) => continue,
+                            Err(error) => {
+                                protocol_error = Some(error.to_string());
+                                break;
+                            }
+                        };
+                    match self
+                        .session
+                        .as_mut()
+                        .expect("current session exists")
+                        .insert_fragment(fragment, recv_ts, handler)
+                    {
+                        Ok(true) => self.stats.udp_messages_delivered += 1,
+                        Ok(false) => {}
+                        Err(error) => warn!(%error, "UDP subscriber received invalid fragment"),
+                    }
+                }
+                if protocol_error.is_some() {
                     break;
                 }
-
-                let datagram = self.receive_batch.datagram(index);
-                let fragment = match Fragment::decode(datagram, session_id, fragment_payload_size) {
-                    Ok(fragment) => fragment,
-                    Err(DatagramError::UnexpectedSession { .. }) => continue,
-                    Err(error) => {
-                        protocol_error = Some(error.to_string());
-                        break;
-                    }
-                };
-                if let Err(error) = self
-                    .session
-                    .as_mut()
-                    .expect("current session exists")
-                    .insert_fragment(fragment, recv_ts, handler)
-                {
-                    warn!(%error, "UDP subscriber received invalid fragment");
-                }
             }
+            self.stats.max_datagrams_per_recvmmsg =
+                self.stats.max_datagrams_per_recvmmsg.max(datagrams_this_call);
 
             if protocol_error.is_some() {
                 break;
@@ -753,6 +941,7 @@ impl UdpSubscriber {
         protocol_error
     }
 
+    #[cfg_attr(feature = "profiling", flux_profiler::timed("udp.subscriber_request_repairs"))]
     fn request_repairs(&mut self) {
         if !self.repair_ready {
             return;
@@ -775,6 +964,7 @@ impl UdpSubscriber {
             self.repair.write_or_enqueue_with(SendBehavior::Single(self.repair_token), |output| {
                 request.encode(output);
             });
+            self.stats.repair_requests += 1;
             self.session
                 .as_mut()
                 .expect("repair request requires a session")
@@ -794,4 +984,26 @@ impl UdpSubscriber {
         self.repair.disconnect(self.repair_token);
         handler(SubscriberEvent::Disconnect { peer_addr: self.publisher_addr });
     }
+}
+
+fn enable_udp_gro(socket: &mio::net::UdpSocket) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            core::ptr::from_ref(&enabled).cast::<libc::c_void>(),
+            size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+fn bind_multicast_receiver(config: UdpMulticastConfig) -> io::Result<mio::net::UdpSocket> {
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.group.port());
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    socket.join_multicast_v4(config.group.ip(), &config.interface)?;
+    socket.set_nonblocking(true)?;
+    Ok(mio::net::UdpSocket::from_std(socket))
 }
