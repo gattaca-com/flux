@@ -83,6 +83,12 @@ while draining, so discarded frames don't count against `--max-mem` either.
 
 Drag the `.fxt` file into <https://magic-trace.org> or <https://ui.perfetto.dev>.
 
+![A flux-profiler trace open in magic-trace](docs/magic-trace.png)
+
+Each thread gets its own flamegraph track, with `memory:allocated`/`freed`/`live`
+counters alongside it when built with `alloc-profile`. Selecting a frame shows
+every instance of it and a duration histogram across the whole capture.
+
 ## Try it end to end
 
 A minimal producer example is included:
