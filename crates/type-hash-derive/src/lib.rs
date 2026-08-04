@@ -374,7 +374,7 @@ fn derive_for_enum(
                 lock_checks.push(quote_spanned! { v_ident.span() =>
                     let actual = #hash;
                     if actual != #expected {
-                        let _ = [(); 0][actual as usize];
+                        let _: u8 = [0; 0][actual as usize];
                     }
                 });
             }

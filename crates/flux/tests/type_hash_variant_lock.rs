@@ -1,6 +1,6 @@
 use flux::{
     type_hash::TypeHash,
-    type_hash_derive::{type_hash_lock, TypeHash},
+    type_hash_derive::{TypeHash, type_hash_lock},
 };
 
 #[allow(dead_code)]
@@ -49,7 +49,17 @@ enum OpenMessage {
     Nested(NestedMessage),
 }
 
+#[allow(dead_code)]
+#[derive(TypeHash)]
+#[type_hash(name = "GenericMessage")]
+enum GenericMessage<'a> {
+    #[wincode(tag = 3)]
+    #[variant_hash_lock(hash = 2991189391632496177)]
+    Borrowed(&'a [u8]),
+}
+
 const _: u64 = OpenMessage::TYPE_HASH;
+const _: u64 = GenericMessage::<'static>::TYPE_HASH;
 
 #[test]
 fn locks_enum_variants_with_wincode_tags() {
