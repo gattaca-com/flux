@@ -9,6 +9,8 @@
 //! cross-process reader reads them from the live producer's binary, which may
 //! be gone by then.
 
+use std::io;
+
 use flux_communication::QueueError;
 use rustc_hash::FxHashMap;
 use tracing::warn;
@@ -32,7 +34,8 @@ pub struct FlamegraphMeta {
     pub schema: Schema,
 }
 
-/// How much of a thread's stream was lost.
+/// How much of a thread's stream was lost since the last
+/// [dump](EventsDrainer::dump_and_release) (ever, when none ran).
 ///
 /// `missed` events were overwritten in a ring before the reader drained them
 /// (producer outran reader), and `dropped` drained closes were discarded
@@ -142,6 +145,31 @@ impl EventsDrainer {
     pub fn fxt_trace(&self) -> Vec<u8> {
         fxt::trace(self.threads(), &self.meta, &self.clocks)
     }
+
+    pub fn dump_and_release(&mut self, out: impl io::Write) -> io::Result<()> {
+        let dumped = self.threads.iter().filter_map(|(token, t)| {
+            let t = t.as_ref()?;
+            let n = t.completed_len();
+            let loss = t.loss();
+            (n > 0 || loss.is_lossy()).then(|| {
+                let (name, tid) = split_token(token);
+                ThreadEvents {
+                    name,
+                    tid,
+                    marks: &t.events.marks[..n],
+                    perf: &t.events.perf[..n.min(t.events.perf.len())],
+                    alloc: &t.events.alloc[..n.min(t.events.alloc.len())],
+                    loss,
+                }
+            })
+        });
+        fxt::write(dumped, &self.meta, &self.clocks, out)?;
+
+        for thread in self.threads.values_mut().flatten() {
+            thread.release_dumped();
+        }
+        Ok(())
+    }
 }
 
 /// Index-aligned event vecs, appended only as a unit so an event's samples
@@ -163,6 +191,14 @@ impl EventsData {
 
     fn last_samples(&self) -> (Option<PerfSample>, Option<AllocSample>) {
         (self.perf.last().copied(), self.alloc.last().copied())
+    }
+
+    /// Remove the first `n` events, keeping the vecs' capacity for the events
+    /// of the next interval.
+    fn release(&mut self, n: usize) {
+        self.marks.drain(..n);
+        self.perf.drain(..n.min(self.perf.len()));
+        self.alloc.drain(..n.min(self.alloc.len()));
     }
 
     fn truncate(&mut self, len: usize) {
@@ -188,6 +224,9 @@ struct ThreadDrainer {
     frame_start: usize,
     unmatched_closes: u64,
     expected_seq: u64,
+    /// Loss totals already reported by earlier dumps; a dump reports the
+    /// delta so no interval's loss is reported twice.
+    dumped_loss: Loss,
 }
 
 impl ThreadDrainer {
@@ -199,6 +238,7 @@ impl ThreadDrainer {
             frame_start: 0,
             unmatched_closes: 0,
             expected_seq: 0,
+            dumped_loss: Loss::default(),
         })
     }
 
@@ -275,7 +315,6 @@ impl ThreadDrainer {
         alloc: Option<AllocSample>,
     ) {
         let Some(gap_start_ts) = self.events.marks.last().map(|mark| mark.ts) else {
-            // Nothing retained yet (attached mid-run): no gap to anchor.
             return;
         };
         let (last_perf, last_alloc) = self.events.last_samples();
@@ -287,128 +326,25 @@ impl ThreadDrainer {
     }
 
     fn loss(&self) -> Loss {
-        Loss { missed: self.rings.missed(), dropped: self.unmatched_closes }
+        Loss {
+            missed: self.rings.missed() - self.dumped_loss.missed,
+            dropped: self.unmatched_closes - self.dumped_loss.dropped,
+        }
+    }
+
+    /// Retained events forming completed top-level frames — everything except
+    /// the top-level frame still open (and its completed subframes).
+    fn completed_len(&self) -> usize {
+        if self.open_ids.is_empty() { self.events.marks.len() } else { self.frame_start }
+    }
+
+    fn release_dumped(&mut self) {
+        self.events.release(self.completed_len());
+        // The in-flight top-level frame's open (if any) is now at index 0.
+        self.frame_start = 0;
+        self.dumped_loss = Loss { missed: self.rings.missed(), dropped: self.unmatched_closes };
     }
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::significant_drop_tightening)] // RAII guards held to scope end
-    use flux_communication::queue::Producer;
-
-    use super::*;
-    use crate::{queue_dir::RING_CAPACITY, test_shmem::ShmemGuard};
-
-    struct NoResolver;
-
-    impl FrameResolver for NoResolver {
-        fn resolve(&self, _id: u64, _len: u16) -> Option<String> {
-            None
-        }
-    }
-
-    /// A hole closes the frames spanning it with synthetic closes at the last
-    /// retained mark, records the gap as a `<missed>` span carrying the gap's
-    /// counter delta, and drops closes whose open was lost — nothing already
-    /// retained is discarded.
-    #[test]
-    fn hole_closes_spanning_frames_and_records_a_missed_span() {
-        let guard = ShmemGuard::new();
-        let dir = QueueDir::new(guard.app());
-        let mut mark_producer = Producer::from(dir.ring::<Mark>("drainer-test"));
-        let mut alloc_producer = Producer::from(dir.ring::<AllocSample>("drainer-test"));
-        let mut thread = ThreadDrainer::open(&dir, "drainer-test").unwrap();
-        let mut names = FxHashMap::default();
-
-        let mut push = |mark: Mark, allocated: u64| {
-            mark_producer.produce(&mark);
-            alloc_producer.produce(&AllocSample { allocated, freed: 0 });
-        };
-
-        push(Mark::from_parts(1, 10, true), 100);
-        push(Mark::from_parts(2, 20, true), 200);
-        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 0);
-
-        // Lap both rings, then recover: everything produced so far after the
-        // two retained opens — including close(2)/close(1) — is a hole.
-        for _ in 0..RING_CAPACITY as u64 + 5 {
-            push(Mark::from_parts(3, 30, true), 300);
-        }
-        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 0);
-
-        // First post-hole events: an unmatched close (its open was lost), then
-        // a clean frame.
-        push(Mark::from_parts(9, 40, false), 900);
-        push(Mark::from_parts(4, 50, true), 1000);
-        push(Mark::from_parts(4, 60, false), 1100);
-        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 0);
-
-        let events: Vec<_> =
-            thread.events.marks.iter().map(|m| (m.id, m.is_open(), m.ts)).collect();
-        assert_eq!(events, [
-            (1, true, 10),
-            (2, true, 20),
-            (2, false, 20),
-            (1, false, 20),
-            (MISSED_ID, true, 20),
-            (MISSED_ID, false, 40),
-            (4, true, 50),
-            (4, false, 60),
-        ]);
-        let allocated: Vec<_> = thread.events.alloc.iter().map(|a| a.allocated).collect();
-        assert_eq!(
-            allocated,
-            [100, 200, 200, 200, 200, 900, 1000, 1100],
-            "closed frames carry the last pre-hole sample; the missed close carries the first \
-             post-hole one, so the gap's delta lands on <missed>"
-        );
-        assert_eq!(thread.unmatched_closes, 1, "only the unmatched close is discarded");
-        assert!(thread.loss().missed > 0);
-        assert!(thread.open_ids.is_empty());
-    }
-
-    #[test]
-    fn short_top_level_frames_are_discarded() {
-        const SHORT: u64 = 100;
-        const LONG: u64 = 10_000_000;
-
-        let guard = ShmemGuard::new();
-        let dir = QueueDir::new(guard.app());
-        let mut mark_producer = Producer::from(dir.ring::<Mark>("filter-test"));
-        let mut alloc_producer = Producer::from(dir.ring::<AllocSample>("filter-test"));
-        let mut thread = ThreadDrainer::open(&dir, "filter-test").unwrap();
-        let mut names = FxHashMap::default();
-
-        let mut push = |mark: Mark, allocated: u64| {
-            mark_producer.produce(&mark);
-            alloc_producer.produce(&AllocSample { allocated, freed: 0 });
-        };
-
-        // Short top-level frame with a nested frame: discarded whole.
-        push(Mark::from_parts(1, 1000, true), 100);
-        push(Mark::from_parts(2, 1010, true), 200);
-        push(Mark::from_parts(2, 1020, false), 300);
-        push(Mark::from_parts(1, 1000 + SHORT, false), 400);
-        // Long top-level frame with a short nested frame: kept whole.
-        push(Mark::from_parts(1, 2000, true), 500);
-        push(Mark::from_parts(2, 2010, true), 600);
-        push(Mark::from_parts(2, 2020, false), 700);
-        push(Mark::from_parts(1, 2000 + LONG, false), 800);
-        // Trailing frame with no close yet: kept.
-        push(Mark::from_parts(3, 3_000_000_000, true), 900);
-        thread.poll(&mut names, &NoResolver, &SocketClocks::identity(), 1000);
-
-        let events: Vec<_> =
-            thread.events.marks.iter().map(|m| (m.id, m.is_open(), m.ts)).collect();
-        assert_eq!(events, [
-            (1, true, 2000),
-            (2, true, 2010),
-            (2, false, 2020),
-            (1, false, 2000 + LONG),
-            (3, true, 3_000_000_000),
-        ]);
-        let allocated: Vec<_> = thread.events.alloc.iter().map(|a| a.allocated).collect();
-        assert_eq!(allocated, [500, 600, 700, 800, 900], "samples truncate with their marks");
-        assert!(!thread.loss().is_lossy(), "filtering is not loss");
-    }
-}
+mod tests;
