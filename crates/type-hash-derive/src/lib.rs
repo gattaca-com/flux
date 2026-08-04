@@ -113,14 +113,17 @@ fn type_hash_literal(attrs: &[Attribute]) -> Result<Option<String>, syn::Error> 
 fn variant_hash_lock(attrs: &[Attribute]) -> Result<Option<u64>, syn::Error> {
     let mut lock = None;
     for attr in attrs {
-        if !attr.path().is_ident("type_hash_lock") {
+        if !attr.path().is_ident("variant_hash_lock") {
             continue;
         }
         if lock.is_some() {
-            return Err(syn::Error::new_spanned(attr, "duplicate type hash lock"));
+            return Err(syn::Error::new_spanned(attr, "duplicate variant hash lock"));
         }
         let Meta::List(list) = &attr.meta else {
-            return Err(syn::Error::new_spanned(attr, "expected #[type_hash_lock(hash = 123456)]"));
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected #[variant_hash_lock(hash = 123456)]",
+            ));
         };
         let MetaNameValue { path, value, .. } = list.parse_args::<MetaNameValue>()?;
         if !path.is_ident("hash") {
@@ -371,7 +374,7 @@ fn derive_for_enum(
                 lock_checks.push(quote_spanned! { v_ident.span() =>
                     let actual = #hash;
                     if actual != #expected {
-                        let _ = [(); 0][actual as usize];
+                        let _: u8 = [0; 0][actual as usize];
                     }
                 });
             }
@@ -417,7 +420,7 @@ fn push_where_pred(where_clause: &mut Option<WhereClause>, pred: WherePredicate)
         .push(pred);
 }
 
-#[proc_macro_derive(TypeHash, attributes(type_hash, type_hash_lock, wincode))]
+#[proc_macro_derive(TypeHash, attributes(type_hash, variant_hash_lock, wincode))]
 pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 

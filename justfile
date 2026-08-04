@@ -19,3 +19,6 @@ clippy-fix:
 machete:
   cargo install cargo-machete && \
   cargo machete
+
+lint: fmt clippy machete
+  cargo test
