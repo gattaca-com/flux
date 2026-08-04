@@ -109,6 +109,51 @@ fn type_hash_literal(attrs: &[Attribute]) -> Result<Option<String>, syn::Error> 
 
     Ok(None)
 }
+
+fn variant_hash_lock(attrs: &[Attribute]) -> Result<Option<u64>, syn::Error> {
+    let mut lock = None;
+    for attr in attrs {
+        if !attr.path().is_ident("type_hash_lock") {
+            continue;
+        }
+        if lock.is_some() {
+            return Err(syn::Error::new_spanned(attr, "duplicate type hash lock"));
+        }
+        let Meta::List(list) = &attr.meta else {
+            return Err(syn::Error::new_spanned(attr, "expected #[type_hash_lock(hash = 123456)]"));
+        };
+        let MetaNameValue { path, value, .. } = list.parse_args::<MetaNameValue>()?;
+        if !path.is_ident("hash") {
+            return Err(syn::Error::new_spanned(path, "expected hash = 123456"));
+        }
+        let Expr::Lit(ExprLit { lit: Lit::Int(value), .. }) = value else {
+            return Err(syn::Error::new_spanned(value, "expected integer hash"));
+        };
+        lock = Some(value.base10_parse::<u64>()?);
+    }
+    Ok(lock)
+}
+
+fn wincode_tag(attrs: &[Attribute]) -> Result<Option<u64>, syn::Error> {
+    for attr in attrs {
+        if !attr.path().is_ident("wincode") {
+            continue;
+        }
+        let Meta::List(list) = &attr.meta else { continue };
+        let metas = list.parse_args_with(Punctuated::<Meta, syn::Token![,]>::parse_terminated)?;
+        for meta in metas {
+            let Meta::NameValue(MetaNameValue { path, value, .. }) = meta else { continue };
+            if !path.is_ident("tag") {
+                continue;
+            }
+            let Expr::Lit(ExprLit { lit: Lit::Int(value), .. }) = value else {
+                return Err(syn::Error::new_spanned(value, "expected integer Wincode tag"));
+            };
+            return Ok(Some(value.base10_parse::<u64>()?));
+        }
+    }
+    Ok(None)
+}
 use syn::{DataEnum, WhereClause, WherePredicate};
 
 fn name_token_expr(name_override: Option<&String>, name: &syn::Ident) -> proc_macro2::TokenStream {
@@ -145,14 +190,18 @@ fn derive_for_enum(
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let mut steps: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut lock_checks = Vec::new();
     let th = runtime_crate_path();
+    let name_expr = name_token_expr(name_override.as_ref(), name);
+    let use_array_diagnostic = generics.params.is_empty();
 
     for variant in &en.variants {
         let v_ident = &variant.ident;
         let v_name = v_ident.to_string();
+        let mut variant_steps = Vec::new();
 
         // Variant name
-        steps.push(quote! {
+        variant_steps.push(quote! {
             h = #th::fnv1a64_str(h, #v_name);
         });
 
@@ -166,7 +215,7 @@ fn derive_for_enum(
                     let lo = (val_u128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
                     let hi = ((val_u128 >> 64) & 0xFFFF_FFFF_FFFF_FFFF) as u64;
 
-                    steps.push(quote! {
+                    variant_steps.push(quote! {
                         h ^= #th::mix64(#lo);
                         h ^= #th::mix64(#hi);
                         h = #th::mix64(h);
@@ -174,7 +223,7 @@ fn derive_for_enum(
                 }
                 other => {
                     let tokens = other.to_token_stream();
-                    steps.push(quote! {
+                    variant_steps.push(quote! {
                         h = #th::fnv1a64_str(h, stringify!(#tokens));
                         h = #th::mix64(h);
                     });
@@ -182,7 +231,7 @@ fn derive_for_enum(
             }
         } else {
             // No explicit discriminant: still distinguish "implicit" vs "explicit"
-            steps.push(quote! {
+            variant_steps.push(quote! {
                 h = #th::fnv1a64_str(h, "<implicit_discriminant>");
                 h = #th::mix64(h);
             });
@@ -191,13 +240,13 @@ fn derive_for_enum(
         // Fields
         match &variant.fields {
             Fields::Unit => {
-                steps.push(quote! {
+                variant_steps.push(quote! {
                     h = #th::fnv1a64_str(h, "<unit>");
                     h = #th::mix64(h);
                 });
             }
             Fields::Unnamed(unnamed) => {
-                steps.push(quote! {
+                variant_steps.push(quote! {
                     h = #th::fnv1a64_str(h, "<tuple>");
                     h = #th::mix64(h);
                 });
@@ -214,7 +263,7 @@ fn derive_for_enum(
                             &mut where_clause.cloned(),
                             syn::parse_quote!(#ty: ::core::marker::Sized),
                         );
-                        steps.push(quote! {
+                        variant_steps.push(quote! {
                             h = #th::fnv1a64_str(h, #idx_str);
                             h = #th::fnv1a64_str(h, #lit);
 
@@ -230,7 +279,7 @@ fn derive_for_enum(
                             syn::parse_quote!(#ty: #th::TypeHash),
                         );
                         let typename_hash = emit_typename_hash(&th, ty);
-                        steps.push(quote! {
+                        variant_steps.push(quote! {
                             h = #th::fnv1a64_str(h, #idx_str);
                             #typename_hash
 
@@ -245,7 +294,7 @@ fn derive_for_enum(
                 }
             }
             Fields::Named(named) => {
-                steps.push(quote! {
+                variant_steps.push(quote! {
                     h = #th::fnv1a64_str(h, "<struct>");
                     h = #th::mix64(h);
                 });
@@ -262,7 +311,7 @@ fn derive_for_enum(
                             &mut where_clause.cloned(),
                             syn::parse_quote!(#ty: ::core::marker::Sized),
                         );
-                        steps.push(quote! {
+                        variant_steps.push(quote! {
                             h = #th::fnv1a64_str(h, #f_name);
                             h = #th::fnv1a64_str(h, #lit);
 
@@ -277,7 +326,7 @@ fn derive_for_enum(
                             syn::parse_quote!(#ty: #th::TypeHash),
                         );
                         let typename_hash = emit_typename_hash(&th, ty);
-                        steps.push(quote! {
+                        variant_steps.push(quote! {
                             h = #th::fnv1a64_str(h, #f_name);
                             #typename_hash
 
@@ -294,15 +343,44 @@ fn derive_for_enum(
         }
 
         // Separator per variant
-        steps.push(quote! {
+        variant_steps.push(quote! {
             h = #th::fnv1a64_str(h, "<end_variant>");
             h = #th::mix64(h);
         });
+
+        if let Some(expected) = variant_hash_lock(&variant.attrs)? {
+            let tag_step = wincode_tag(&variant.attrs)?.map(|tag| {
+                quote! {
+                    h = #th::fnv1a64_str(h, "<tag>");
+                    h ^= #th::mix64(#tag);
+                    h = #th::mix64(h);
+                }
+            });
+            let hash = quote! {{
+                let mut h = 0xcbf29ce484222325u64;
+                h = #th::fnv1a64_str(h, #name_expr);
+                #tag_step
+                #(#variant_steps)*
+                h
+            }};
+            if use_array_diagnostic {
+                lock_checks.push(quote_spanned! { v_ident.span() =>
+                    let _: [(); (#hash) as usize] = [(); #expected as usize];
+                });
+            } else {
+                lock_checks.push(quote_spanned! { v_ident.span() =>
+                    let actual = #hash;
+                    if actual != #expected {
+                        let _ = [(); 0][actual as usize];
+                    }
+                });
+            }
+        }
+        steps.extend(variant_steps);
     }
 
     let where_clause_tokens = where_clause;
 
-    let name_expr = name_token_expr(name_override.as_ref(), name);
     let has_name_override = name_override.is_some();
     Ok(quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
@@ -310,6 +388,7 @@ fn derive_for_enum(
             const TYPE_NAME: &'static str = #name_expr;
 
             const TYPE_HASH: u64 = {
+                    #(#lock_checks)*
                     let mut h: u64 = 0xcbf29ce484222325u64;
 
                     // Enum name (or override via #[type_hash(name = "...")])
@@ -338,7 +417,7 @@ fn push_where_pred(where_clause: &mut Option<WhereClause>, pred: WherePredicate)
         .push(pred);
 }
 
-#[proc_macro_derive(TypeHash, attributes(type_hash))]
+#[proc_macro_derive(TypeHash, attributes(type_hash, type_hash_lock, wincode))]
 pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
