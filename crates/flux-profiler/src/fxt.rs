@@ -7,7 +7,7 @@
 //! pair and a thread record, followed by that thread's duration begin/end
 //! events. See the Fuchsia Trace Format spec for the records.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io};
 
 use rustc_hash::FxHashMap;
 
@@ -43,6 +43,17 @@ pub(super) fn trace<'a>(
     meta: &FlamegraphMeta,
     clocks: &SocketClocks,
 ) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write(threads, meta, clocks, &mut buf).expect("a Vec sink never fails");
+    buf
+}
+
+pub(super) fn write<'a>(
+    threads: impl Iterator<Item = ThreadEvents<'a>>,
+    meta: &FlamegraphMeta,
+    clocks: &SocketClocks,
+    out: impl io::Write,
+) -> io::Result<()> {
     let FlamegraphMeta { names, schema } = meta;
     let mut threads: Vec<_> = threads.collect();
     threads.sort_by(|a, b| a.name.cmp(b.name).then(a.tid.cmp(&b.tid)));
@@ -57,7 +68,7 @@ pub(super) fn trace<'a>(
     let anchor_ns = base_ns;
     let ns = |tsc: u64| clocks.resolve_ns(tsc).saturating_sub(base_ns);
 
-    let mut fxt = Fxt::default();
+    let mut fxt = Fxt::new(out);
     fxt.buf.extend_from_slice(MAGIC_NUMBER_RECORD);
     fxt.init(anchor_ns);
     let process_arg = fxt.intern("process");
@@ -104,9 +115,12 @@ pub(super) fn trace<'a>(
                     fxt.counter(index, track, ns(mark.ts), &[(track, sample.vals[slot])]);
                 }
             }
+            if fxt.buf.len() >= FLUSH_BYTES {
+                fxt.flush()?;
+            }
         }
     }
-    fxt.buf
+    fxt.flush()
 }
 
 fn should_emit<T: PartialEq>(samples: &[T], j: usize) -> bool {
@@ -115,13 +129,25 @@ fn should_emit<T: PartialEq>(samples: &[T], j: usize) -> bool {
     changed || precedes_change
 }
 
-#[derive(Default)]
-struct Fxt {
+const FLUSH_BYTES: usize = 64 << 10;
+
+struct Fxt<W: io::Write> {
+    out: W,
     buf: Vec<u8>,
     strings: FxHashMap<String, u16>,
 }
 
-impl Fxt {
+impl<W: io::Write> Fxt<W> {
+    fn new(out: W) -> Self {
+        Self { out, buf: Vec::new(), strings: FxHashMap::default() }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.write_all(&self.buf)?;
+        self.buf.clear();
+        Ok(())
+    }
+
     fn word(&mut self, w: u64) {
         self.buf.extend_from_slice(&w.to_le_bytes());
     }
