@@ -84,8 +84,8 @@ impl InProcessReader {
     fn run(stop: &AtomicBool, dir: QueueDir) -> EventsDrainer {
         let mut drainer = EventsDrainer::new(dir, Schema::local().clone());
         loop {
-            let more = drainer.poll(&InProcessSymbolsResolver);
             let stopping = stop.load(Ordering::Acquire);
+            let more = drainer.poll(&InProcessSymbolsResolver);
             if stopping && !more {
                 break;
             }
