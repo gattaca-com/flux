@@ -3,9 +3,17 @@ use std::path::{Path, PathBuf};
 use shared_memory::ShmemConf;
 use tracing::warn;
 
-/// Check whether a process is still running via `/proc/<pid>`.
+/// Check whether a process is still running. Linux uses `/proc/<pid>`; other
+/// platforms (macOS has no /proc) fall back to `kill(pid, 0)`, which probes
+/// liveness without sending a signal.
 pub fn is_pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    #[cfg(target_os = "linux")]
+    {
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 /// Unlink the shmem backing for a flink, then remove the flink file.
 ///
