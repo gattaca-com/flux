@@ -3,22 +3,27 @@
 TOOLCHAIN_FMT := "nightly-2025-10-01"
 
 fmt:
-  rustup toolchain install {{TOOLCHAIN_FMT}} > /dev/null 2>&1 && \
+  rustup toolchain install {{TOOLCHAIN_FMT}} --component rustfmt > /dev/null 2>&1 && \
   cargo +{{TOOLCHAIN_FMT}} fmt
 
 fmt-check:
-  rustup toolchain install {{TOOLCHAIN_FMT}} > /dev/null 2>&1 && \
+  rustup toolchain install {{TOOLCHAIN_FMT}} --component rustfmt > /dev/null 2>&1 && \
   cargo +{{TOOLCHAIN_FMT}} fmt --check
 
 clippy:
-	cargo clippy --all-features --no-deps --all-targets -- -D warnings
+	cargo clippy --locked --all-features --no-deps --all-targets -- -D warnings
 
 clippy-fix:
-	cargo clippy --fix --all-features --no-deps --all-targets -- -D warnings
+	cargo clippy --fix --locked --all-features --no-deps --all-targets -- -D warnings
 
+# cargo machete finds deps a crate declares but never uses; check_workspace_deps.sh
+# finds the reverse, [workspace.dependencies] entries no crate consumes.
 machete:
-  cargo install cargo-machete && \
-  cargo machete
+  cargo install cargo-machete --locked && \
+  cargo machete && \
+  ./scripts/check_workspace_deps.sh
 
-lint: fmt clippy machete
-  cargo test
+test:
+  cargo test --workspace --all-features --locked
+
+lint: fmt clippy machete test

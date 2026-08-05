@@ -1,9 +1,9 @@
 use proc_macro::TokenStream;
-use proc_macro_crate::{crate_name, FoundCrate};
-use quote::{quote, quote_spanned, ToTokens};
+use proc_macro_crate::{FoundCrate, crate_name};
+use quote::{ToTokens, quote, quote_spanned};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, token::Where, Attribute, Data, DataStruct,
-    DeriveInput, Expr, ExprLit, Fields, Lit, Meta, MetaNameValue,
+    Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Fields, Lit, Meta, MetaNameValue,
+    parse_macro_input, punctuated::Punctuated, token::Where,
 };
 
 fn runtime_crate_path() -> proc_macro2::TokenStream {

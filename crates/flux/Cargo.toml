@@ -1,30 +1,30 @@
 [package]
-name = "flux"
-version = "0.0.38"
 edition.workspace = true
+keywords = ["communication", "low-latency", "performance"]
+license.workspace = true
+name = "flux"
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
-keywords = ["low-latency", "performance", "communication"]
-repository = "https://github.com/gattaca-com/flux"
+version.workspace = true
 
 [dependencies]
+bitcode.workspace = true
+core_affinity.workspace = true
 flux-communication.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
-spine-derive.workspace = true
-type-hash.workspace = true
-type-hash-derive.workspace = true
-
-bitcode.workspace = true
-core_affinity.workspace = true
 libc.workspace = true
+mio = { workspace = true, optional = true }
 serde.workspace = true
 signal-hook.workspace = true
+spine-derive.workspace = true
 tracing.workspace = true
-zstd.workspace = true
+type-hash.workspace = true
+type-hash-derive.workspace = true
 wincode = { workspace = true, optional = true }
 wincode-derive = { workspace = true, optional = true }
-mio = { workspace = true, optional = true }
+zstd.workspace = true
 
 [dev-dependencies]
 shared_memory.workspace = true
@@ -32,16 +32,8 @@ tempfile.workspace = true
 
 [features]
 default = []
-wincode = [
-    "dep:wincode",
-    "dep:wincode-derive",
-    "flux-utils/wincode",
-    "flux-timing/wincode",
-]
-park = [
-    "dep:mio",
-    "flux-communication/park",
-]
+park = ["dep:mio", "flux-communication/park"]
+wincode = ["dep:wincode", "dep:wincode-derive", "flux-timing/wincode", "flux-utils/wincode"]
 
 [lints]
 workspace = true

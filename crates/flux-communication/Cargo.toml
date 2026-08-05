@@ -1,28 +1,26 @@
 [package]
-name = "flux-communication"
-version = "0.0.27"
 edition.workspace = true
+keywords = ["communication", "low-latency", "performance"]
+license.workspace = true
+name = "flux-communication"
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
-keywords = ["low-latency", "performance", "communication"]
-repository = "https://github.com/gattaca-com/flux"
+version.workspace = true
 
 [dependencies]
+directories.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
-
-directories.workspace = true
 libc.workspace = true
 mio = { workspace = true, optional = true }
+rand.workspace = true
 shared_memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-rand.workspace = true
 
 [lints]
 workspace = true
 
 [features]
-park = [
-    "dep:mio",
-]
+park = ["dep:mio"]
