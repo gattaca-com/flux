@@ -58,7 +58,19 @@ pub fn get_tid() -> i64 {
     unsafe { libc::gettid() as i64 }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub fn get_tid() -> i64 {
+    // pthread_threadid_np(self) returns the calling thread's unique 64-bit id
+    // — the per-thread ring identity the profiler relies on. Without it every
+    // thread shares tid 0 and collides on one ring file.
+    let mut tid: u64 = 0;
+    unsafe {
+        libc::pthread_threadid_np(libc::pthread_self(), &mut tid);
+    }
+    tid as i64
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn get_tid() -> i64 {
     0
 }
