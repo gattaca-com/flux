@@ -1,19 +1,20 @@
 [package]
-name = "flux-profiler-macros"
-version = "0.0.1"
 description = "Attribute macro `#[timed]` for the flux profiler."
 edition.workspace = true
-rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
 keywords = ["low-latency", "performance", "profiling"]
-repository = "https://github.com/gattaca-com/flux"
+license.workspace = true
+name = "flux-profiler-macros"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [lib]
 proc-macro = true
 
 [dependencies]
-quote = "1"
-syn = { version = "2.0.101", features = ["full"] }
+quote.workspace = true
+syn.workspace = true
 
 [features]
 # Compile `#[timed]` out to a no-op. Driven by `flux-profiler`'s `disable-profiling`.

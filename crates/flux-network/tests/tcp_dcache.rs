@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -28,29 +28,36 @@ struct TcpDcacheSpine {
     pub msg: SpineQueue<Payload>,
 }
 
-const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 24713);
-
 struct NetworkTile {
     conn: Option<TcpConnector>,
     ready: Arc<AtomicBool>,
+    bind_addr: SocketAddr,
+    deadline: Instant,
 }
 
 impl Tile<TcpDcacheSpine> for NetworkTile {
     fn try_init(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) -> bool {
         let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
         let mut conn = TcpConnector::default().with_dcache(sp.dcache_ptr());
-        conn.listen_at(BIND_ADDR).unwrap();
+        conn.listen_at(self.bind_addr).unwrap();
         self.conn = Some(conn);
         self.ready.store(true, Ordering::Release);
         true
     }
 
     fn loop_body(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) {
+        if Instant::now() >= self.deadline {
+            adapter.request_stop_scope();
+            return;
+        }
         let Some(conn) = &mut self.conn else { return };
         conn.poll_with_produce(&mut adapter.producers, |ev| {
             let PollEvent::Message { payload: bytes, .. } = ev else { return None };
             bytes.try_into().ok().map(Payload)
         });
+        // TcpConnector is polled rather than registered with Flux's park waker,
+        // so keep this background tile ticking when the workspace enables `park`.
+        adapter.mark_work();
     }
 }
 
@@ -58,6 +65,7 @@ struct ReaderTile {
     received: Arc<Mutex<Vec<Payload>>>,
     count: usize,
     expected: usize,
+    deadline: Instant,
 }
 
 impl Tile<TcpDcacheSpine> for ReaderTile {
@@ -73,7 +81,7 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
                 }
             },
         );
-        if self.count >= self.expected {
+        if self.count >= self.expected || Instant::now() >= self.deadline {
             adapter.request_stop_scope();
         }
     }
@@ -89,6 +97,9 @@ fn dcache_multi_stream() {
 
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
+    let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let bind_addr = probe.local_addr().unwrap();
+    drop(probe);
 
     let mut spine = TcpDcacheSpine::new_with_base_dir(base, None);
 
@@ -103,7 +114,7 @@ fn dcache_multi_stream() {
         }
         for msg in [MSG_A, MSG_B] {
             let mut conn = TcpConnector::default();
-            let tok = conn.connect(BIND_ADDR).unwrap();
+            let tok = conn.connect(bind_addr).unwrap();
             conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
                 buf.extend_from_slice(msg);
             });
@@ -118,12 +129,22 @@ fn dcache_multi_stream() {
     thread::scope(|scope| {
         let mut scoped = ScopedSpine::new(&mut spine, scope, None, None);
         attach_tile(
-            NetworkTile { conn: None, ready: ready.clone() },
+            NetworkTile {
+                conn: None,
+                ready: ready.clone(),
+                bind_addr,
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
             &mut scoped,
             TileConfig::background(None, Some(flux::timing::Duration::from_millis(1))),
         );
         attach_tile(
-            ReaderTile { received: received.clone(), count: 0, expected: 2 },
+            ReaderTile {
+                received: received.clone(),
+                count: 0,
+                expected: 2,
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
             &mut scoped,
             TileConfig::background(None, None),
         );

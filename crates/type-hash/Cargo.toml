@@ -1,11 +1,12 @@
 [package]
+edition.workspace = true
+keywords = ["communication", "low-latency", "performance"]
+license.workspace = true
 name = "type-hash"
-version = "0.0.1"
-edition = "2021"
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
-keywords = ["low-latency", "performance", "communication"]
-repository = "https://github.com/gattaca-com/flux"
+version.workspace = true
 
 [features]
 default = ["std"]

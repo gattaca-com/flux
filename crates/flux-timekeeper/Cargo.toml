@@ -1,23 +1,23 @@
 [package]
 edition.workspace = true
+keywords = ["communication", "low-latency", "performance"]
+license.workspace = true
 name = "flux-timekeeper"
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-version = "0.0.29"
-license = "Apache-2.0 AND MIT"
-keywords = ["low-latency", "performance", "communication"]
-repository = "https://github.com/gattaca-com/flux"
+version.workspace = true
 
 [dependencies]
-flux.workspace = true
-
-ratatui.workspace = true
+auto_impl.workspace = true
 bitflags.workspace = true
 crossterm.workspace = true
-serde.workspace = true
-strum.workspace = true
-auto_impl.workspace = true
+flux.workspace = true
 indexmap.workspace = true
+ratatui.workspace = true
+serde.workspace = true
 signal-hook.workspace = true
+strum.workspace = true
 
 [[bin]]
 name = "timekeeper"

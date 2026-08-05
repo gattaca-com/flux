@@ -3,72 +3,81 @@ members = [
   "crates/flux",
   "crates/flux-communication",
   "crates/flux-ctl",
-  "crates/flux-timing",
-  "crates/flux-utils",
-  "crates/flux-timekeeper",
-  "crates/spine-derive",
-  "crates/type-hash",
-  "crates/type-hash-derive",
   "crates/flux-network",
   "crates/flux-profiler",
   "crates/flux-profiler-macros",
+  "crates/flux-timekeeper",
+  "crates/flux-timing",
+  "crates/flux-utils",
+  "crates/spine-derive",
+  "crates/type-hash",
+  "crates/type-hash-derive",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2024"
+license = "Apache-2.0 AND MIT"
+publish = false
+repository = "https://github.com/gattaca-com/flux"
 rust-version = "1.91.0"
 version = "0.1.0"
 
+
 [workspace.dependencies]
-flux = { path = "crates/flux", version = "0.0.38" }
-flux-communication = { path = "crates/flux-communication", version = "0.0.27" }
-flux-timing = { path = "crates/flux-timing", version = "0.0.16" }
-flux-utils = { path = "crates/flux-utils", version = "0.0.23" }
-flux-network = { path = "crates/flux-network", version = "0.0.8" }
-spine-derive = { path = "crates/spine-derive", version = "0.0.10" }
-flux-overseer = { path = "crates/flux-overseer", version = "0.0.11" }
-flux-timekeeper = { path = "crates/flux-timekeeper", version = "0.0.29" }
-type-hash = { path = "crates/type-hash", version = "0.0.1" }
-type-hash-derive = { path = "crates/type-hash-derive", version = "0.0.4" }
-flux-profiler = { path = "crates/flux-profiler", version = "0.0.1" }
-flux-profiler-macros = { path = "crates/flux-profiler-macros", version = "0.0.1" }
+flux = { path = "crates/flux" }
+flux-communication = { path = "crates/flux-communication" }
+flux-network = { path = "crates/flux-network" }
+flux-profiler = { path = "crates/flux-profiler" }
+flux-profiler-macros = { path = "crates/flux-profiler-macros" }
+flux-timekeeper = { path = "crates/flux-timekeeper" }
+flux-timing = { path = "crates/flux-timing" }
+flux-utils = { path = "crates/flux-utils" }
+spine-derive = { path = "crates/spine-derive" }
+type-hash = { path = "crates/type-hash" }
+type-hash-derive = { path = "crates/type-hash-derive" }
 
 
 auto_impl = "1.2.0"
-shared_memory = "^0.12"
+bitcode = { features = ["serde"], version = "0.6.3" }
+bitflags = { version = "2.6.0", features = ["serde"] }
+bytes = "1"
+bytesize = "1.3"
+chrono = { features = ["serde"], version = "0.4.38" }
+clap = { version = "4", features = ["derive"] }
 core_affinity = "0.8.1"
+criterion = "0.8"
+crossterm = "0.28.1"
+crossbeam-channel = "0.5"
+ctrlc = "3"
 directories = "5.0.1"
+governor = "0.6.3"
+humantime = "2.1"
+indexmap = { features = ["serde"], version = "2.11.1" }
 libc = "0.2.177"
+mio = { version = "1.1.1", features = ["net", "os-poll"] }
+proc-macro-crate = "3"
+proc-macro2 = "1"
+quanta = "0.12.3"
+quote = "1"
+rand = "0.9.0"
+ratatui = "0.29.0"
 rustc-hash = "2"
 serde = { features = ["derive"], version = "=1.0.228" }
-chrono = { features = ["serde"], version = "0.4.38" }
-quanta = "0.12.3"
-governor = "0.6.3"
-bitcode = { features = ["serde"], version = "0.6.3" }
-zstd = "0.13.2"
-rand = "0.9.0"
-spin = "0.10"
+serde_json = "1.0.135"
+shared_memory = "^0.12"
 signal-hook = "0.3.18"
+spin = "0.10"
+strum = { features = ["derive"], version = "0.26.1" }
+syn = { version = "2.0.101", features = ["full"] }
+tempfile = "3"
+thiserror = "1.0.58"
+tinyvec = "1.10.0"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-thiserror = "1.0.58"
-tinyvec = "1.9.0"
-humantime = "2.1"
-serde_json = "1.0.135"
-ratatui = "0.29.0"
-bitflags = { version = "2.6.0", features = ["serde"] }
-crossterm = "0.28.1"
-strum = { features = ["derive"], version = "0.26.1" }
-indexmap = { features = ["serde"], version = "2.11.1" }
 wincode = "0.5"
 wincode-derive = "0.4"
-bytes = "1"
-mio = { version = "1.1.1", features = ["net", "os-poll"] }
-tempfile = "3"
-clap = { version = "4", features = ["derive"] }
-bytesize = "1.3"
-ctrlc = "3"
+zstd = "0.13.2"
 
 [workspace.lints.clippy]
 as_ptr_cast_mut = { level = "allow", priority = 1 }
@@ -86,6 +95,6 @@ missing_safety_doc = { level = "allow", priority = 1 }
 must_use_candidate = { level = "allow", priority = 1 }
 nursery = "warn"
 pedantic = "warn"
+redundant_closure_for_method_calls = { level = "allow", priority = 1 } # only allowed because otherwise I was getting an ICE on cargo clippy
 redundant_pub_crate = { level = "allow", priority = 1 }
 return_self_not_must_use = { level = "allow", priority = 1 }
-redundant_closure_for_method_calls = { level = "allow", priority = 1 } # only allowed because otherwise I was getting an ICE on cargo clippy

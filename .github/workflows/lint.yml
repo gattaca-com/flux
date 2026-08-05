@@ -7,7 +7,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Overrides the `-D warnings` that setup-rust-toolchain sets by default; clippy
+  # applies `-D warnings` itself via the justfile.
   RUSTFLAGS: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -15,19 +24,14 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
+      # No toolchain input, so the version comes from rust-toolchain.toml and lives in
+      # exactly one place. Caching is built into this action.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: nightly-2025-10-01
-          components: clippy, rustfmt
+          rustflags: ""
 
       - name: Setup just
         uses: extractions/setup-just@v2
@@ -35,10 +39,28 @@ jobs:
           just-version: 1.5.0
 
       - name: Check compilation
-        run: cargo check
+        run: cargo check --workspace --all-features --locked
 
       - name: Check formatting
         run: just fmt-check
 
       - name: Check clippy
         run: just clippy
+
+      - name: Check unused dependencies
+        run: just machete
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked

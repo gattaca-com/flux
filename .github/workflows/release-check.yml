@@ -1,0 +1,40 @@
+name: release check
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Test release tooling
+        run: python3 .github/scripts/test_release.py
+
+      - name: Validate release version
+        id: release
+        run: python3 .github/scripts/release.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Check public API compatibility
+        if: steps.release.outputs.should_release == 'true' && steps.release.outputs.previous_tag != ''
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ steps.release.outputs.previous_tag }}
+          release-type: ${{ steps.release.outputs.release_type }}

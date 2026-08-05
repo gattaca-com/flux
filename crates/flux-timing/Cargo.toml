@@ -1,23 +1,24 @@
 [package]
-name = "flux-timing"
-version = "0.0.16"
 edition.workspace = true
+keywords = ["communication", "low-latency", "performance"]
+license.workspace = true
+name = "flux-timing"
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
-keywords = ["low-latency", "performance", "communication"]
-repository = "https://github.com/gattaca-com/flux"
+version.workspace = true
 
 [dependencies]
-tracing.workspace = true
-serde.workspace = true
+bitcode.workspace = true
 chrono.workspace = true
-quanta.workspace = true
 governor.workspace = true
 humantime.workspace = true
-bitcode.workspace = true
+quanta.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-type-hash-derive.workspace = true
+tracing.workspace = true
 type-hash.workspace = true
+type-hash-derive.workspace = true
 wincode = { workspace = true, optional = true }
 wincode-derive = { workspace = true, optional = true }
 

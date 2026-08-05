@@ -115,7 +115,7 @@ impl TypeHash for &[u8] {
 
 #[cfg(feature = "std")]
 mod std_impls {
-    use super::{fnv1a64_str, hash_layout_of, hash_u64, std, TypeHash};
+    use super::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64, std};
 
     impl TypeHash for std::string::String {
         const TYPE_HASH: u64 = {

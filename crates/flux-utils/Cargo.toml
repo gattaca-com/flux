@@ -1,45 +1,45 @@
 [package]
-name = "flux-utils"
-version = "0.0.23"
 edition.workspace = true
+keywords = ["communication", "low-latency", "performance"]
+license.workspace = true
+name = "flux-utils"
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
-keywords = ["low-latency", "performance", "communication"]
-repository = "https://github.com/gattaca-com/flux"
+version.workspace = true
 
 [dependencies]
-flux-timing.workspace = true
-type-hash.workspace = true
-
-thiserror.workspace = true
+bytes = { workspace = true, optional = true }
 core_affinity.workspace = true
 directories.workspace = true
+flux-timing.workspace = true
 libc.workspace = true
-tracing.workspace = true
-serde.workspace = true
 rand.workspace = true
+serde.workspace = true
 spin.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+type-hash.workspace = true
 wincode = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
-criterion = "0.8"
-tinyvec = "1.10.0"
+criterion.workspace = true
+crossbeam-channel.workspace = true
 flux-communication.workspace = true
-crossbeam-channel = "0.5"
+tinyvec.workspace = true
 
 [features]
+bytes = ["dep:bytes"]
 default = []
 wincode = ["dep:wincode"]
-bytes = ["dep:bytes"]
 
 [[bench]]
+harness = false
 name = "arrayvec"
-harness = false
 
 [[bench]]
-name = "dcache"
 harness = false
+name = "dcache"
 
 [lints]
 workspace = true

@@ -1,11 +1,12 @@
 [package]
 edition.workspace = true
+keywords = ["communication", "low-latency", "performance"]
+license.workspace = true
 name = "flux-network"
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-version = "0.0.8"
-license = "Apache-2.0 AND MIT"
-keywords = ["low-latency", "performance", "communication"]
-repository = "https://github.com/gattaca-com/flux"
+version.workspace = true
 
 [dependencies]
 flux.workspace = true
@@ -21,8 +22,8 @@ wincode = { workspace = true, optional = true }
 [dev-dependencies]
 spine-derive.workspace = true
 tempfile.workspace = true
-wincode-derive = { workspace = true }
 wincode = { workspace = true }
+wincode-derive = { workspace = true }
 
 [lints]
 workspace = true

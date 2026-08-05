@@ -1,12 +1,13 @@
 [package]
-name = "flux-profiler"
-version = "0.0.1"
 description = "Cross-process `#[timed]` flamegraph profiler: shmem rings, FXT export, hardware counters."
 edition.workspace = true
-rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
 keywords = ["low-latency", "performance", "profiling"]
-repository = "https://github.com/gattaca-com/flux"
+license.workspace = true
+name = "flux-profiler"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [lib]
 name = "flux_profiler"
@@ -17,13 +18,12 @@ name = "flux-profiler"
 path = "src/bin/flux_profiler.rs"
 
 [dependencies]
-flux-communication.workspace = true
-flux-timing.workspace = true
-flux-utils.workspace = true
-flux-profiler-macros.workspace = true
-
 bytesize.workspace = true
 clap.workspace = true
+flux-communication.workspace = true
+flux-profiler-macros.workspace = true
+flux-timing.workspace = true
+flux-utils.workspace = true
 humantime.workspace = true
 libc.workspace = true
 rustc-hash.workspace = true
