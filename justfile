@@ -3,11 +3,11 @@
 TOOLCHAIN_FMT := "nightly-2025-10-01"
 
 fmt:
-  rustup toolchain install {{TOOLCHAIN_FMT}} > /dev/null 2>&1 && \
+  rustup toolchain install {{TOOLCHAIN_FMT}} --component rustfmt > /dev/null 2>&1 && \
   cargo +{{TOOLCHAIN_FMT}} fmt
 
 fmt-check:
-  rustup toolchain install {{TOOLCHAIN_FMT}} > /dev/null 2>&1 && \
+  rustup toolchain install {{TOOLCHAIN_FMT}} --component rustfmt > /dev/null 2>&1 && \
   cargo +{{TOOLCHAIN_FMT}} fmt --check
 
 clippy:
