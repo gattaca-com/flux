@@ -1,4 +1,4 @@
-name: release
+name: release validation
 
 on:
   push:
@@ -20,9 +20,6 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    outputs:
-      should_release: ${{ steps.release.outputs.should_release }}
-      tag: ${{ steps.release.outputs.tag }}
 
     steps:
       - uses: actions/checkout@v6
@@ -55,72 +52,3 @@ jobs:
         with:
           baseline-rev: ${{ steps.release.outputs.previous_tag }}
           release-type: ${{ steps.release.outputs.release_type }}
-
-      - name: Check out released source for repair
-        if: steps.release.outputs.should_release == 'false'
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: git checkout --detach "$RELEASE_TAG"
-
-      - name: Build release binaries
-        run: cargo build --release --locked --package flux-ctl --package flux-profiler --bins
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p dist
-          install -m 755 target/release/flux-ctl dist/flux-ctl-x86_64-unknown-linux-gnu
-          install -m 755 target/release/flux-profiler dist/flux-profiler-x86_64-unknown-linux-gnu
-
-      - name: Store release assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-binaries
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 1
-
-  publish:
-    needs: validate
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Download release assets
-        uses: actions/download-artifact@v4
-        with:
-          name: release-binaries
-          path: dist
-
-      - name: Create release tag
-        if: needs.validate.outputs.should_release == 'true'
-        env:
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag --annotate "$RELEASE_TAG" --message "Release $RELEASE_TAG"
-          git push origin "refs/tags/$RELEASE_TAG"
-
-      - name: Create GitHub release if missing
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
-            echo "GitHub release $RELEASE_TAG already exists"
-          else
-            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG"
-          fi
-
-      - name: Upload release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-        run: gh release upload "$RELEASE_TAG" dist/* --clobber

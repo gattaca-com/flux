@@ -26,4 +26,8 @@ machete:
 test:
   cargo test --workspace --all-features --locked
 
+# Validate, create, and push the workspace version tag from local main.
+release:
+  python3 .github/scripts/release.py --push-tag
+
 lint: fmt clippy machete test
