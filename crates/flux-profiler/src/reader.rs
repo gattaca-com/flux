@@ -40,8 +40,8 @@ impl CrossProcessReader {
         self.drainer.filter_short_frames(min);
     }
 
-    pub fn poll(&mut self) {
-        self.drainer.poll(&self.resolver);
+    pub fn poll(&mut self) -> bool {
+        self.drainer.poll(&self.resolver)
     }
 
     pub fn events(&self) -> &EventsDrainer {
