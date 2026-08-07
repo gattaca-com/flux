@@ -242,5 +242,130 @@ class GitReleaseTests(unittest.TestCase):
             release.plan_release()
 
 
+class LocalTagTests(unittest.TestCase):
+    @staticmethod
+    def result(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=[], returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    def test_prepare_local_tag_requires_clean_main_at_origin_main(self) -> None:
+        plan = {"should_release": "true", "version": "0.2.0", "tag": "v0.2.0"}
+        with (
+            mock.patch.object(
+                release,
+                "run",
+                side_effect=[
+                    self.result(),
+                    self.result("main\n"),
+                    self.result(),
+                    self.result("abc123\n"),
+                    self.result("abc123\n"),
+                ],
+            ) as run,
+            mock.patch.object(release, "plan_release", return_value=plan),
+        ):
+            self.assertEqual(release.prepare_local_tag(), plan)
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call("git", "status", "--porcelain", check=True),
+                mock.call(
+                    "git", "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+                ),
+                mock.call("git", "fetch", "--tags", "origin", check=True),
+                mock.call("git", "rev-parse", "HEAD", check=True),
+                mock.call(
+                    "git", "rev-parse", "refs/remotes/origin/main", check=True
+                ),
+            ],
+        )
+
+    def test_prepare_local_tag_rejects_a_dirty_worktree(self) -> None:
+        with (
+            mock.patch.object(
+                release, "run", return_value=self.result(" M Cargo.toml\n")
+            ),
+            self.assertRaisesRegex(release.ReleaseError, "worktree must be clean"),
+        ):
+            release.prepare_local_tag()
+
+    def test_prepare_local_tag_rejects_detached_head(self) -> None:
+        with (
+            mock.patch.object(
+                release,
+                "run",
+                side_effect=[self.result(), self.result(returncode=1)],
+            ),
+            self.assertRaisesRegex(release.ReleaseError, "detached HEAD"),
+        ):
+            release.prepare_local_tag()
+
+    def test_prepare_local_tag_rejects_an_outdated_main(self) -> None:
+        with (
+            mock.patch.object(
+                release,
+                "run",
+                side_effect=[
+                    self.result(),
+                    self.result("main\n"),
+                    self.result(),
+                    self.result("local\n"),
+                    self.result("remote\n"),
+                ],
+            ),
+            self.assertRaisesRegex(release.ReleaseError, "exactly match origin/main"),
+        ):
+            release.prepare_local_tag()
+
+    def test_create_and_push_tag_creates_an_annotated_tag(self) -> None:
+        with mock.patch.object(release, "run", return_value=self.result()) as run:
+            release.create_and_push_tag(
+                {"should_release": "true", "version": "0.2.0", "tag": "v0.2.0"}
+            )
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    "git",
+                    "tag",
+                    "--annotate",
+                    "v0.2.0",
+                    "--message",
+                    "Release v0.2.0",
+                    check=True,
+                ),
+                mock.call(
+                    "git", "push", "origin", "refs/tags/v0.2.0", check=True
+                ),
+            ],
+        )
+
+    def test_create_and_push_tag_removes_local_tag_when_push_fails(self) -> None:
+        failure = subprocess.CalledProcessError(
+            returncode=128,
+            cmd=["git", "push"],
+            stderr="push rejected",
+        )
+        with (
+            mock.patch.object(
+                release,
+                "run",
+                side_effect=[self.result(), failure, self.result()],
+            ) as run,
+            self.assertRaisesRegex(release.ReleaseError, "push rejected"),
+        ):
+            release.create_and_push_tag(
+                {"should_release": "true", "version": "0.2.0", "tag": "v0.2.0"}
+            )
+
+        self.assertEqual(
+            run.call_args_list[-1],
+            mock.call("git", "tag", "--delete", "v0.2.0", check=False),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

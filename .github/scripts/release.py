@@ -51,6 +51,19 @@ def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run git and present command failures as release validation errors."""
+    try:
+        return run("git", *arguments, check=check)
+    except subprocess.CalledProcessError as error:
+        details = error.stderr.strip() or error.stdout.strip()
+        command = "git " + " ".join(arguments)
+        message = f"{command} failed"
+        if details:
+            message += f":\n{details}"
+        raise ReleaseError(message) from error
+
+
 def load_toml(path: Path) -> dict:
     with path.open("rb") as manifest:
         return tomllib.load(manifest)
@@ -209,6 +222,50 @@ def plan_release() -> dict[str, str]:
     }
 
 
+def prepare_local_tag() -> dict[str, str]:
+    """Validate that this checkout can safely tag the current origin/main."""
+    if run_git("status", "--porcelain").stdout:
+        raise ReleaseError("the worktree must be clean before creating a release tag")
+
+    branch = run_git(
+        "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+    ).stdout.strip()
+    if branch != "main":
+        source = branch or "detached HEAD"
+        raise ReleaseError(f"release tags must be created from main, not {source}")
+
+    run_git("fetch", "--tags", "origin")
+
+    head = run_git("rev-parse", "HEAD").stdout.strip()
+    origin_main = run_git("rev-parse", "refs/remotes/origin/main").stdout.strip()
+    if head != origin_main:
+        raise ReleaseError(
+            "local main must exactly match origin/main; update it with "
+            "`git pull --ff-only origin main`"
+        )
+
+    plan = plan_release()
+    if plan["should_release"] != "true":
+        raise ReleaseError(
+            f"version {plan['version']} is already tagged as {plan['tag']}"
+        )
+    return plan
+
+
+def create_and_push_tag(plan: dict[str, str]) -> None:
+    """Create and push the planned annotated tag, cleaning it up if push fails."""
+    tag = plan["tag"]
+    tag_created = False
+    try:
+        run_git("tag", "--annotate", tag, "--message", f"Release {tag}")
+        tag_created = True
+        run_git("push", "origin", f"refs/tags/{tag}")
+    except ReleaseError:
+        if tag_created:
+            run("git", "tag", "--delete", tag, check=False)
+        raise
+
+
 def write_github_output(path: Path, plan: dict[str, str]) -> None:
     with path.open("a", encoding="utf-8") as output:
         for key, value in plan.items():
@@ -222,17 +279,29 @@ def main() -> int:
         type=Path,
         help="append the release plan to this GitHub Actions output file",
     )
+    parser.add_argument(
+        "--push-tag",
+        action="store_true",
+        help="validate, create, and push the version tag from a clean main checkout",
+    )
     args = parser.parse_args()
 
+    if args.push_tag and args.github_output is not None:
+        parser.error("--push-tag and --github-output cannot be used together")
+
     try:
-        plan = plan_release()
+        plan = prepare_local_tag() if args.push_tag else plan_release()
+        print(json.dumps(plan, indent=2))
+        if args.push_tag:
+            create_and_push_tag(plan)
     except (ReleaseError, OSError, json.JSONDecodeError) as error:
         print(f"release validation failed: {error}", file=sys.stderr)
         return 1
 
-    print(json.dumps(plan, indent=2))
     if args.github_output is not None:
         write_github_output(args.github_output, plan)
+    if args.push_tag:
+        print(f"Created and pushed annotated tag {plan['tag']}")
     return 0
 
 

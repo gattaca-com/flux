@@ -38,18 +38,16 @@ so those changes still require an intentionally incompatible version bump.
 3. Run `cargo test --workspace --all-features --locked`.
 4. Open a pull request containing the version bump and the updated `Cargo.lock`.
 
-The release check validates the version shape, confirms every crate inherits
-the workspace package metadata, and checks public API compatibility. Once the
-change is merged to `main`, the release workflow:
+The release checks validate the version shape, confirm every crate inherits the
+workspace package metadata, and check public API compatibility. Once the change
+is merged to `main`, create the version tag from a machine whose public IP is in
+the GitHub organization allow list:
 
-1. repeats those checks against the latest `vMAJOR.MINOR.PATCH` tag;
-2. creates an annotated tag such as `v0.2.0`; and
-3. creates a GitHub release with generated release notes; then
-4. attaches Linux x86-64 builds of `flux-ctl` and `flux-profiler`.
+1. Check out `main` with a clean worktree.
+2. Run `just release`.
 
-Do not create release tags manually. The workflow never moves or recreates an
-existing version tag. For an existing release, it preserves the title and notes
-and refreshes binary assets from that tag's source. A manual `workflow_dispatch`
-run can repair a missing GitHub release for an existing tag. Manual dispatches
-must target `main`. The first run has no prior baseline and creates the initial
-`v0.1.0` release.
+The command fetches `origin` and all tags, requires local `main` to exactly match
+`origin/main`, repeats the workspace/version validation, creates an annotated
+`vMAJOR.MINOR.PATCH` tag, and pushes only that tag. It never moves or recreates
+an existing version tag. It does not create a GitHub Release or build release
+artifacts.
