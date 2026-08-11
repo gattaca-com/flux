@@ -72,6 +72,7 @@ struct ConnectionManager {
     drop_outbound_backlog_on_disconnect: bool,
     /// Whether to set `TCP_NODELAY` on sockets (disables Nagle's algorithm).
     nodelay: bool,
+    keepalive: bool,
 
     // Always only outbound/client side connection streams
     to_be_reconnected: Vec<(Token, ConnectionVariant)>,
@@ -100,6 +101,7 @@ impl Default for ConnectionManager {
             max_backlog: None,
             drop_outbound_backlog_on_disconnect: false,
             nodelay: true,
+            keepalive: false,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             pending_disconnects: Vec::with_capacity(10),
@@ -426,9 +428,11 @@ impl ConnectionManager {
                 })
                 .ok()?;
         }
-        set_keepalive(&new_stream)
-            .inspect_err(|e| error!("couldn't setup keepalive for tcp stream for {addr}: {e}"))
-            .ok()?;
+        if self.keepalive {
+            set_keepalive(&new_stream)
+                .inspect_err(|e| error!("couldn't setup keepalive for tcp stream for {addr}: {e}"))
+                .ok()?;
+        }
         set_user_timeout(&new_stream, self.user_timeout_ms);
         Some(new_stream)
     }
@@ -530,7 +534,9 @@ impl ConnectionManager {
                                 continue;
                             }
                         }
-                        if let Err(e) = set_keepalive(&stream) {
+                        if self.keepalive &&
+                            let Err(e) = set_keepalive(&stream)
+                        {
                             error!("couldn't set keepalive on stream to {addr}: {e}");
                             continue;
                         }
@@ -622,7 +628,9 @@ impl ConnectionManager {
                                 continue;
                             }
                         }
-                        if let Err(e) = set_keepalive(&stream) {
+                        if self.keepalive &&
+                            let Err(e) = set_keepalive(&stream)
+                        {
                             error!("couldn't set keepalive on stream to {addr}: {e}");
                             continue;
                         }
@@ -757,6 +765,12 @@ impl TcpConnector {
     /// writes (higher throughput at the cost of up to ~40 ms latency).
     pub fn with_nodelay(mut self, nodelay: bool) -> Self {
         self.conn_mgr.nodelay = nodelay;
+        self
+    }
+
+    /// Enables TCP keepalive on outbound and accepted connections.
+    pub fn with_keepalive(mut self) -> Self {
+        self.conn_mgr.keepalive = true;
         self
     }
 
