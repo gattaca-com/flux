@@ -11,7 +11,8 @@ use tracing::{debug, error, info, warn};
 use super::{
     TcpTelemetry, set_socket_buf_size,
     stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_user_timeout, write_frame_header,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_keepalive, set_user_timeout,
+        write_frame_header,
     },
 };
 
@@ -42,6 +43,8 @@ pub struct TcpGroupConfig {
     pub socket_buf_size: Option<usize>,
     /// Whether to enable `TCP_NODELAY`.
     pub nodelay: bool,
+    /// Whether to enable TCP keepalive.
+    pub keepalive: bool,
     /// Linux `TCP_USER_TIMEOUT`, in milliseconds.
     pub user_timeout_ms: u32,
     /// Retry interval for persistent outbound endpoints.
@@ -65,6 +68,7 @@ impl Default for TcpGroupConfig {
             on_connect_msg: None,
             socket_buf_size: None,
             nodelay: true,
+            keepalive: false,
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             reconnect_interval: Duration::from_secs(2),
             backlog_warn_bytes: Some(DEFAULT_BACKLOG_WARN_BYTES),
@@ -72,6 +76,14 @@ impl Default for TcpGroupConfig {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             telemetry: TcpTelemetry::Disabled,
         }
+    }
+}
+
+impl TcpGroupConfig {
+    /// Enables TCP keepalive for every connection in this group.
+    pub fn with_keepalive(mut self) -> Self {
+        self.keepalive = true;
+        self
     }
 }
 
@@ -316,6 +328,14 @@ impl NetworkState {
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
+        if config.keepalive &&
+            let Err(err) = set_keepalive(&socket)
+        {
+            warn!(?err, %peer_addr, "couldn't set keepalive on tcp stream");
+            let _ = self.poll.registry().deregister(&mut socket);
+            let _ = socket.shutdown(Shutdown::Both);
+            return false;
+        }
         set_user_timeout(&socket, config.user_timeout_ms);
         if let Err(err) = self.poll.registry().reregister(&mut socket, token, Interest::READABLE) {
             warn!(?err, %peer_addr, "couldn't register connected tcp stream");
@@ -368,6 +388,13 @@ impl NetworkState {
                     let Err(err) = socket.set_nodelay(true)
                 {
                     warn!(?err, %peer_addr, "couldn't set nodelay on accepted tcp stream");
+                    let _ = socket.shutdown(Shutdown::Both);
+                    continue;
+                }
+                if config.keepalive &&
+                    let Err(err) = set_keepalive(&socket)
+                {
+                    warn!(?err, %peer_addr, "couldn't set keepalive on accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
                 }

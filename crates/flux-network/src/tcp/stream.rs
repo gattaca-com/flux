@@ -11,6 +11,9 @@ use flux_timing::{Instant, Nanos};
 use flux_utils::{DCache, DCacheRef};
 
 pub const DEFAULT_TCP_USER_TIMEOUT_MS: u32 = 10_000;
+const DEFAULT_TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 5;
+const DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS: libc::c_int = 2;
+const DEFAULT_TCP_KEEPALIVE_PROBES: libc::c_int = 3;
 enum RxBuf {
     Heap(Vec<u8>),
     DCache,
@@ -728,6 +731,39 @@ pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn set_user_timeout(_stream: &mio::net::TcpStream, _timeout_ms: u32) {
     // TCP_USER_TIMEOUT is not supported on non-Linux platforms.
+}
+
+/// Enable TCP keepalive with short failure detection for silent connections.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_keepalive(stream: &mio::net::TcpStream) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    for (level, option, value) in [
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, DEFAULT_TCP_KEEPALIVE_IDLE_SECS),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, DEFAULT_TCP_KEEPALIVE_PROBES),
+    ] {
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                option,
+                ptr::from_ref(&value).cast::<libc::c_void>(),
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_keepalive(_stream: &mio::net::TcpStream) -> io::Result<()> {
+    Ok(())
 }
 
 /// Set kernel `SO_SNDBUF` and `SO_RCVBUF` on a socket.
