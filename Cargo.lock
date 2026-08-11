@@ -576,7 +576,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitcode",
  "core_affinity",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "flux-communication"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "flux-timing",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "flux-ctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "crossterm",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "flux-network"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flux",
  "flux-communication",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "flux-profiler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytesize",
  "clap",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "flux-profiler-macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "quote",
  "syn",
@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "flux-timekeeper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "auto_impl",
  "bitflags 2.10.0",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "flux-timing"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitcode",
  "chrono",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "flux-utils"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "spine-derive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1964,11 +1964,11 @@ dependencies = [
 
 [[package]]
 name = "type-hash"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "type-hash-derive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
