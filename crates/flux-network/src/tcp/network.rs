@@ -11,7 +11,8 @@ use tracing::{debug, error, info, warn};
 use super::{
     TcpTelemetry, set_socket_buf_size,
     stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_user_timeout, write_frame_header,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_keepalive, set_user_timeout,
+        write_frame_header,
     },
 };
 
@@ -316,6 +317,12 @@ impl NetworkState {
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
+        if let Err(err) = set_keepalive(&socket) {
+            warn!(?err, %peer_addr, "couldn't set keepalive on tcp stream");
+            let _ = self.poll.registry().deregister(&mut socket);
+            let _ = socket.shutdown(Shutdown::Both);
+            return false;
+        }
         set_user_timeout(&socket, config.user_timeout_ms);
         if let Err(err) = self.poll.registry().reregister(&mut socket, token, Interest::READABLE) {
             warn!(?err, %peer_addr, "couldn't register connected tcp stream");
@@ -368,6 +375,11 @@ impl NetworkState {
                     let Err(err) = socket.set_nodelay(true)
                 {
                     warn!(?err, %peer_addr, "couldn't set nodelay on accepted tcp stream");
+                    let _ = socket.shutdown(Shutdown::Both);
+                    continue;
+                }
+                if let Err(err) = set_keepalive(&socket) {
+                    warn!(?err, %peer_addr, "couldn't set keepalive on accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
                 }

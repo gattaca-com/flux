@@ -9,7 +9,8 @@ use tracing::{debug, error, warn};
 use crate::tcp::{
     ConnState, TcpStream, TcpTelemetry, set_socket_buf_size,
     stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_user_timeout, write_frame_header,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_keepalive, set_user_timeout,
+        write_frame_header,
     },
 };
 
@@ -425,6 +426,9 @@ impl ConnectionManager {
                 })
                 .ok()?;
         }
+        set_keepalive(&new_stream)
+            .inspect_err(|e| error!("couldn't setup keepalive for tcp stream for {addr}: {e}"))
+            .ok()?;
         set_user_timeout(&new_stream, self.user_timeout_ms);
         Some(new_stream)
     }
@@ -526,6 +530,10 @@ impl ConnectionManager {
                                 continue;
                             }
                         }
+                        if let Err(e) = set_keepalive(&stream) {
+                            error!("couldn't set keepalive on stream to {addr}: {e}");
+                            continue;
+                        }
                         set_user_timeout(&stream, self.user_timeout_ms);
                         let mut conn = TcpStream::from_stream_with_telemetry(
                             stream,
@@ -613,6 +621,10 @@ impl ConnectionManager {
                                 error!("couldn't set nodelay on stream to {addr}: {e}");
                                 continue;
                             }
+                        }
+                        if let Err(e) = set_keepalive(&stream) {
+                            error!("couldn't set keepalive on stream to {addr}: {e}");
+                            continue;
                         }
                         set_user_timeout(&stream, self.user_timeout_ms);
                         let mut conn = TcpStream::from_stream_with_telemetry(
