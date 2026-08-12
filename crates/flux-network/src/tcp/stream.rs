@@ -54,7 +54,7 @@ const LEN_HEADER_SIZE: usize = core::mem::size_of::<u32>();
 /// Nanos timestamp when the sender finished serialising and handed bytes to
 /// kernel or enqueued in backlog.
 const TS_HEADER_SIZE: usize = core::mem::size_of::<Nanos>();
-pub(crate) const FRAME_HEADER_SIZE: usize = LEN_HEADER_SIZE + TS_HEADER_SIZE;
+pub const FRAME_HEADER_SIZE: usize = LEN_HEADER_SIZE + TS_HEADER_SIZE;
 // TODO: might need to tweak these
 const RX_BUF_SIZE: usize = 32 * 1024;
 
@@ -62,7 +62,7 @@ const RX_BUF_SIZE: usize = 32 * 1024;
 ///
 /// Shared by the per-stream serialise path and the broadcast path
 #[inline]
-pub(crate) fn write_frame_header(
+pub fn write_frame_header(
     header: &mut [u8; FRAME_HEADER_SIZE],
     payload_len: usize,
     ts: Nanos,
