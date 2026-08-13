@@ -58,26 +58,13 @@ cargo run -p my-app
 Then attach the profiler in a second terminal. If exactly one instrumented app
 is live it attaches automatically; otherwise pass `--pid <pid>`:
 
-```
-flux-profiler [--pid <pid>] [--out <path.fxt>] [--duration <30s|5m|1h>] [--max-mem <512MB|2GB>] [--filter-short-frames <100ns|5us>]
+```bash
+flux-profiler
 ```
 
 Press **Ctrl-C** (or let the app exit) to write the `.fxt` trace. The default
-output is `<app>-trace-<pid>.fxt`.
-
-To stop automatically instead of waiting for Ctrl-C, cap the run by wall-clock
-time (`--duration`, e.g. `30s`/`5m`/`1h`) or by the reader's retained-event
-footprint (`--max-mem`, e.g. `512MB`/`2GB`). Whichever fires first — that,
-Ctrl-C, or the app exiting — stops the capture and exports the trace.
-
-`--max-mem` defaults to `1GB` so a forgotten profiler can't grow unbounded;
-raise it for longer captures.
-
-If your app spins on a hot loop, most of the capture ends up being idle
-iterations that do nothing interesting. `--filter-short-frames=100ns` drops
-every top-level frame that completes in under 100ns (including everything
-nested inside it), so only the slow iterations survive. Filtering happens
-while draining, so discarded frames don't count against `--max-mem` either.
+output is `<app>-trace-<pid>.fxt`. [Capture options](#capture-options) covers
+capping the run, keeping memory flat, and dropping idle frames.
 
 ### 3. Open the trace
 
@@ -88,6 +75,57 @@ Drag the `.fxt` file into <https://magic-trace.org> or <https://ui.perfetto.dev>
 Each thread gets its own flamegraph track, with `memory:allocated`/`freed`/`live`
 counters alongside it when built with `alloc-profile`. Selecting a frame shows
 every instance of it and a duration histogram across the whole capture.
+
+## Capture options
+
+Every flag is optional: with none, the profiler captures until you stop it.
+
+| Flag | What it does |
+|---|---|
+| `--pid <pid>` | Which producer to attach to. Needed only when several instrumented apps are live. |
+| `--out <path.fxt>` | Where to write the trace. Defaults to `<app>-trace-<pid>.fxt`. |
+| `--duration <30s\|5m\|1h>` | Stop and export after this much capture time. |
+| `--max-mem <512MB\|2GB>` | Stop and export once the retained events exceed this. Defaults to `1GB`. |
+| `--dump-interval <10s\|1m>` | Append the completed frames to the output every interval and free them. |
+| `--filter-short-frames <100ns\|5us>` | Drop completed top-level frames shorter than this as they drain. |
+
+### Stopping the capture
+
+The capture ends on whichever comes first: **Ctrl-C**, the app exiting,
+`--duration`, or `--max-mem`. Each of them exports the same trace Ctrl-C would.
+
+`--max-mem` defaults to `1GB` so a forgotten profiler can't grow unbounded.
+Raise it for a longer capture, or keep memory flat with `--dump-interval`.
+
+### Long captures
+
+`--dump-interval=30s` writes the completed frames out every 30 seconds and frees
+them, so memory stays flat however long you run and `--max-mem` only ever sees
+one interval's events. Each dump appends to the same `--out` file, and that file
+is a complete trace at every point in between — a profiler killed mid-capture
+still leaves everything it had already written.
+
+### Merging traces
+
+Appending works because a trace is a sequence of self-contained parts sharing one
+timeline. Merging parts of one run is that same operation, so files you split up
+yourself go back together with `cat` — timestamps are absolute, so nothing needs
+rewriting:
+
+```bash
+cat part-1.fxt part-2.fxt > merged.fxt
+```
+
+Files from *different* runs don't merge: each run numbers threads from scratch,
+so unrelated threads would collide on the same track. Open those separately.
+
+### Skipping idle iterations
+
+If your app spins on a hot loop, most of the capture ends up being idle
+iterations that do nothing interesting. `--filter-short-frames=100ns` drops
+every top-level frame that completes in under 100ns (including everything
+nested inside it), so only the slow iterations survive. Filtering happens
+while draining, so discarded frames don't count against `--max-mem` either.
 
 ## Try it end to end
 
@@ -136,7 +174,7 @@ taskset -c 2,3 cargo run -p flux-profiler --example timed_overhead --release --f
 taskset -c 2,3 cargo run -p flux-profiler --example timed_overhead --release --features perf
 ```
 
-## Optional features
+## Cargo features
 
 | Feature | What it adds |
 |---|---|

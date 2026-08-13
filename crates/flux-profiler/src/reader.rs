@@ -51,6 +51,10 @@ impl CrossProcessReader {
     pub fn dump_and_release(&mut self, out: impl std::io::Write) -> std::io::Result<()> {
         self.drainer.dump_and_release(out)
     }
+
+    pub fn release(&mut self) {
+        self.drainer.release();
+    }
 }
 
 pub struct InProcessReader {

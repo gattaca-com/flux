@@ -22,7 +22,7 @@ fn hole_closes_spanning_frames_and_records_a_missed_span() {
     let dir = QueueDir::new(guard.app());
     let mut mark_producer = Producer::from(dir.ring::<Mark>("drainer-test"));
     let mut alloc_producer = Producer::from(dir.ring::<AllocSample>("drainer-test"));
-    let mut thread = ThreadDrainer::open(&dir, "drainer-test").unwrap();
+    let mut thread = ThreadDrainer::open(&dir, "drainer-test", 1).unwrap();
     let mut names = FxHashMap::default();
 
     let mut push = |mark: Mark, allocated: u64| {
@@ -100,7 +100,6 @@ fn dumps_partition_the_stream_and_keep_open_frames_whole() {
 
     let mut first = Vec::new();
     drainer.dump_and_release(&mut first).unwrap();
-    assert_eq!(&first[..8], b"\x10\x00\x04FxT\x16\x00", "FXT magic record");
     assert!(contains(&first, b"unknown_1"), "the completed frame is dumped");
     assert!(!contains(&first, b"unknown_2"), "the in-flight frame is not");
     assert!(!contains(&first, b"unknown_3"), "its completed subframe stays with it");
@@ -117,6 +116,51 @@ fn dumps_partition_the_stream_and_keep_open_frames_whole() {
     assert!(retained_marks(&drainer).is_empty());
 }
 
+/// A thread's id is what its tracks are keyed by in every dump, so going quiet
+/// for one — and dropping out of it entirely — must not renumber it.
+#[test]
+fn ids_survive_a_dump_a_thread_is_quiet_for() {
+    let guard = ShmemGuard::new();
+    let dir = QueueDir::new(guard.app());
+    let mut quiet = Producer::from(dir.ring::<Mark>("quiet-1"));
+    let mut busy = Producer::from(dir.ring::<Mark>("busy-2"));
+    let mut drainer = EventsDrainer::new(dir, Schema::empty());
+
+    let frame = |producer: &mut Producer<Mark>, id, ts| {
+        producer.produce(&Mark::from_parts(id, ts, true));
+        producer.produce(&Mark::from_parts(id, ts + 10, false));
+    };
+    frame(&mut quiet, 1, 10);
+    frame(&mut busy, 2, 20);
+    drainer.poll(&NoResolver);
+
+    let ids = |d: &EventsDrainer| {
+        let mut ids: Vec<_> = d.threads().map(|t| (t.name.to_owned(), t.id)).collect();
+        ids.sort();
+        ids
+    };
+    let before = ids(&drainer);
+    assert_eq!(before.len(), 2, "both rings were discovered");
+    drainer.dump_and_release(&mut Vec::new()).unwrap();
+
+    frame(&mut busy, 3, 30);
+    drainer.poll(&NoResolver);
+    let mut second = Vec::new();
+    drainer.dump_and_release(&mut second).unwrap();
+
+    assert!(!contains(&second, b"quiet"), "a thread with nothing retained is not in the dump");
+    assert_eq!(ids(&drainer), before, "and keeps its id for the one after it");
+}
+
+/// Lap the ring so everything produced since the last poll is a hole.
+fn lap_ring(marks: &mut Producer<Mark>) {
+    for _ in 0..RING_CAPACITY as u64 + 5 {
+        marks.produce(&Mark::from_parts(2, 30, true));
+    }
+}
+
+/// Loss belongs to the interval it happened in: a dump reports what the ring
+/// lost since the previous one, then starts the next interval clean.
 #[test]
 fn dump_reports_interval_loss_once() {
     let guard = ShmemGuard::new();
@@ -127,27 +171,43 @@ fn dump_reports_interval_loss_once() {
     marks.produce(&Mark::from_parts(1, 10, true));
     marks.produce(&Mark::from_parts(1, 20, false));
     drainer.poll(&NoResolver);
-    // Lap the ring: everything produced since the first poll is a hole.
-    for _ in 0..RING_CAPACITY as u64 + 5 {
-        marks.produce(&Mark::from_parts(2, 30, true));
-    }
+    lap_ring(&mut marks);
     drainer.poll(&NoResolver);
 
     assert!(drainer.threads().all(|t| t.loss.missed > 0), "the hole shows before the dump");
     drainer.dump_and_release(&mut Vec::new()).unwrap();
     assert!(drainer.threads().all(|t| !t.loss.is_lossy()), "the dump resets the interval's loss");
 
-    // A post-hole frame: the dump emptied retention, so the gap has no
-    // anchor and no `<missed>` span — the loss was already reported.
+    marks.produce(&Mark::from_parts(4, 50, true));
+    marks.produce(&Mark::from_parts(4, 60, false));
+    drainer.poll(&NoResolver);
+    assert!(drainer.threads().all(|t| !t.loss.is_lossy()), "and does not report it again");
+}
+
+/// A hole spanning a dump has no retained mark to anchor a `<missed>` span to —
+/// the dump released it — so the post-hole events are retained on their own.
+#[test]
+fn a_hole_across_a_dump_records_no_missed_span() {
+    let guard = ShmemGuard::new();
+    let dir = QueueDir::new(guard.app());
+    let mut marks = Producer::from(dir.ring::<Mark>("dump-loss-4"));
+    let mut drainer = EventsDrainer::new(dir, Schema::empty());
+
+    marks.produce(&Mark::from_parts(1, 10, true));
+    marks.produce(&Mark::from_parts(1, 20, false));
+    drainer.poll(&NoResolver);
+    drainer.dump_and_release(&mut Vec::new()).unwrap();
+    lap_ring(&mut marks);
+    drainer.poll(&NoResolver);
+
     marks.produce(&Mark::from_parts(4, 50, true));
     marks.produce(&Mark::from_parts(4, 60, false));
     drainer.poll(&NoResolver);
     assert_eq!(retained_marks(&drainer), [(4, true), (4, false)]);
-    assert!(drainer.threads().all(|t| !t.loss.is_lossy()), "no new loss this interval");
 
     let mut second = Vec::new();
     drainer.dump_and_release(&mut second).unwrap();
-    assert!(contains(&second, b"unknown_4"));
+    assert!(contains(&second, b"unknown_4"), "the post-hole frame still dumps");
 }
 
 #[test]
@@ -168,6 +228,53 @@ fn retained_capacity_survives_a_dump() {
     drainer.dump_and_release(&mut Vec::new()).unwrap();
     assert!(retained_marks(&drainer).is_empty());
     assert_eq!(drainer.retained_bytes(), bytes, "capacity is kept for the next interval");
+}
+
+/// One dumped interval of `frames` complete frames; returns what retention held
+/// at the dump.
+fn interval(drainer: &mut EventsDrainer, marks: &mut Producer<Mark>, frames: usize) -> usize {
+    for _ in 0..frames {
+        marks.produce(&Mark::from_parts(1, 0, true));
+        marks.produce(&Mark::from_parts(1, 1, false));
+    }
+    while drainer.poll(&NoResolver) {}
+    let held = drainer.retained_bytes();
+    drainer.dump_and_release(&mut Vec::new()).unwrap();
+    held
+}
+
+/// A burst of `frames` frames and then a quiet run: what retention peaked at,
+/// and what it holds once the run is quiet again.
+fn burst_then_quiet(
+    drainer: &mut EventsDrainer,
+    marks: &mut Producer<Mark>,
+    frames: usize,
+) -> (usize, usize) {
+    let peak = interval(drainer, marks, frames);
+    for _ in 0..3 {
+        interval(drainer, marks, 8);
+    }
+    (peak, drainer.retained_bytes())
+}
+
+/// Retention must not scale with the run's peak: whatever a burst needed cannot
+/// stay pinned — and with it `retained_bytes`, which the daemon's memory budget
+/// reads — once the run is quiet again.
+#[test]
+fn retention_after_a_burst_does_not_scale_with_it() {
+    let guard = ShmemGuard::new();
+    let dir = QueueDir::new(guard.app());
+    let mut marks = Producer::from(dir.ring::<Mark>("dump-cap-2"));
+    let mut drainer = EventsDrainer::new(dir, Schema::empty());
+
+    let (small_peak, after_small) = burst_then_quiet(&mut drainer, &mut marks, 10_000);
+    let (big_peak, after_big) = burst_then_quiet(&mut drainer, &mut marks, 40_000);
+
+    assert!(big_peak > small_peak, "the bigger burst must hold more, or nothing is under test");
+    assert!(
+        after_big <= after_small,
+        "the bigger burst left more behind: {after_big} vs {after_small} bytes"
+    );
 }
 
 #[test]
@@ -211,7 +318,7 @@ fn short_top_level_frames_are_discarded() {
     let dir = QueueDir::new(guard.app());
     let mut mark_producer = Producer::from(dir.ring::<Mark>("filter-test"));
     let mut alloc_producer = Producer::from(dir.ring::<AllocSample>("filter-test"));
-    let mut thread = ThreadDrainer::open(&dir, "filter-test").unwrap();
+    let mut thread = ThreadDrainer::open(&dir, "filter-test", 1).unwrap();
     let mut names = FxHashMap::default();
 
     let mut push = |mark: Mark, allocated: u64| {

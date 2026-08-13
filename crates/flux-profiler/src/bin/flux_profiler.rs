@@ -31,8 +31,15 @@ struct Args {
     /// Stop and export after this much capture time, e.g. `30s`, `5m`, `1h`.
     #[arg(long, value_parser = humantime::parse_duration)]
     duration: Option<Duration>,
+    /// Append completed frames to the output every interval, e.g. `10s`, `1m`,
+    /// instead of holding the whole capture in memory until the end. Each dump
+    /// releases what it wrote, so memory stays flat and the file is a valid
+    /// trace at any point — including if the profiler is killed mid-capture.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    dump_interval: Option<Duration>,
     /// Stop and export once the reader's retained events exceed this, e.g.
-    /// `512MB`, `2GB`. Guards against an unbounded capture.
+    /// `512MB`, `2GB`. Guards against an unbounded capture. With
+    /// `--dump-interval` this only ever sees one interval's events.
     #[arg(long, default_value = "1GB")]
     max_mem: bytesize::ByteSize,
     /// Discard a completed top-level frame (its close empties the stack) when
@@ -94,10 +101,23 @@ fn main() -> ExitCode {
     }
     eprintln!("attached to '{app}' (pid {pid}); Ctrl-C to stop and export");
 
+    // Opened up front: an interval dump appends to it as the capture runs, so
+    // whatever has been written stays readable even if this process dies.
+    let out = args.out.unwrap_or_else(|| PathBuf::from(format!("{app}-trace-{pid}.fxt")));
+    let mut file = match std::fs::File::create(&out) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("failed to create {}: {e}", out.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Observe stop before polling so the final poll flushes the ring tails;
     // the rings and pid file outlive the producer, so this also holds when it
     // exits between iterations.
     let start = Instant::now();
+    let mut last_dump = Instant::now();
+    let mut dumps = 0u32;
     let mut iterations = 0u32;
     loop {
         let mut stopping = STOP.load(Ordering::Acquire);
@@ -115,6 +135,20 @@ fn main() -> ExitCode {
         if stopping {
             break;
         }
+        // Dumps concatenate, so appending each interval to the same file leaves
+        // one trace to open. Nothing retained means nothing to say, and an empty
+        // dump would still cost a segment header every interval.
+        if let Some(every) = args.dump_interval &&
+            last_dump.elapsed() >= every &&
+            reader.events().threads().any(|t| !t.marks.is_empty())
+        {
+            if let Err(e) = reader.dump_and_release(&mut file) {
+                eprintln!("failed to write {}: {e}", out.display());
+                return ExitCode::FAILURE;
+            }
+            last_dump = Instant::now();
+            dumps += 1;
+        }
         iterations += 1;
         if iterations.is_multiple_of(1000) && published_pid(&app) != Some(pid) {
             eprintln!("producer exited");
@@ -123,13 +157,17 @@ fn main() -> ExitCode {
         thread::sleep(Duration::from_millis(1));
     }
 
-    let out = args.out.unwrap_or_else(|| PathBuf::from(format!("{app}-trace-{pid}.fxt")));
-    if let Err(e) = std::fs::write(&out, reader.events().fxt_trace()) {
+    // Everything the interval dumps left behind — the in-flight frames, or the
+    // whole capture when no interval was asked for.
+    if let Err(e) = reader.events().write_trace(&mut file) {
         eprintln!("failed to write {}: {e}", out.display());
         return ExitCode::FAILURE;
     }
     let events = reader.events();
     println!("exported {} threads → {}", events.threads().count(), out.display());
+    if dumps > 0 {
+        println!("{dumps} interval dumps preceded it in the same file");
+    }
     if events.threads().any(|t| t.loss.is_lossy()) {
         eprintln!("warning: events were lost (producer outran the reader); the trace has holes");
     }
