@@ -59,6 +59,10 @@ impl Loss {
 pub struct ThreadEvents<'a> {
     pub name: &'a str,
     pub tid: u64,
+    /// Assigned when the thread's ring is first seen and unchanged after, so a
+    /// thread keeps it across dumps even in the ones it produced nothing for —
+    /// what lets an export identify it in every segment it wrote.
+    pub id: u64,
     pub marks: &'a [Mark],
     pub perf: &'a [PerfSample],
     pub alloc: &'a [AllocSample],
@@ -104,8 +108,10 @@ impl EventsDrainer {
 
     pub(super) fn poll(&mut self, resolver: &impl FrameResolver) -> bool {
         for thread in self.dir.event_threads() {
+            // Threads are only ever added, so the count is the next free id.
+            let id = self.threads.len() as u64 + 1;
             self.threads.entry(thread).or_insert_with_key(|token| {
-                ThreadDrainer::open(&self.dir, token)
+                ThreadDrainer::open(&self.dir, token, id)
                     .inspect_err(
                         |e| warn!(%token, %e, "event ring present but unreadable; skipped"),
                     )
@@ -126,6 +132,7 @@ impl EventsDrainer {
             Some(ThreadEvents {
                 name,
                 tid,
+                id: t.id,
                 marks: &t.events.marks,
                 perf: &t.events.perf,
                 alloc: &t.events.alloc,
@@ -142,6 +149,10 @@ impl EventsDrainer {
         self.threads.values().flatten().map(|t| t.events.retained_bytes()).sum()
     }
 
+    pub fn write_trace(&self, out: impl io::Write) -> io::Result<()> {
+        fxt::write(self.threads(), &self.meta, &self.clocks, out)
+    }
+
     pub fn fxt_trace(&self) -> Vec<u8> {
         fxt::trace(self.threads(), &self.meta, &self.clocks)
     }
@@ -156,6 +167,7 @@ impl EventsDrainer {
                 ThreadEvents {
                     name,
                     tid,
+                    id: t.id,
                     marks: &t.events.marks[..n],
                     perf: &t.events.perf[..n.min(t.events.perf.len())],
                     alloc: &t.events.alloc[..n.min(t.events.alloc.len())],
@@ -164,11 +176,16 @@ impl EventsDrainer {
             })
         });
         fxt::write(dumped, &self.meta, &self.clocks, out)?;
+        self.release();
+        Ok(())
+    }
 
+    /// Loss stays a per-interval delta, so an accumulating caller sees each
+    /// loss once.
+    pub fn release(&mut self) {
         for thread in self.threads.values_mut().flatten() {
             thread.release_dumped();
         }
-        Ok(())
     }
 }
 
@@ -193,12 +210,25 @@ impl EventsData {
         (self.perf.last().copied(), self.alloc.last().copied())
     }
 
-    /// Remove the first `n` events, keeping the vecs' capacity for the events
-    /// of the next interval.
-    fn release(&mut self, n: usize) {
-        self.marks.drain(..n);
-        self.perf.drain(..n.min(self.perf.len()));
-        self.alloc.drain(..n.min(self.alloc.len()));
+    /// Remove the `dumped` events an export just wrote, keeping room for the
+    /// next interval. Shrinking every release would reallocate the retained
+    /// stream each interval, so only a peak past `MAX_OVERSHOOT` is reclaimed —
+    /// until then it pins `retained_bytes`, the daemon's memory budget.
+    fn release(&mut self, dumped: usize) {
+        const KEEP_INTERVALS: usize = 2;
+        const MIN_EVENTS: usize = 1 << 12;
+        const MAX_OVERSHOOT: usize = 4;
+
+        let target_capacity = (self.marks.len() * KEEP_INTERVALS).max(MIN_EVENTS);
+        self.marks.drain(..dumped);
+        self.perf.drain(..dumped.min(self.perf.len()));
+        self.alloc.drain(..dumped.min(self.alloc.len()));
+
+        if self.marks.capacity() > target_capacity * MAX_OVERSHOOT {
+            self.marks.shrink_to(target_capacity);
+            self.perf.shrink_to(target_capacity);
+            self.alloc.shrink_to(target_capacity);
+        }
     }
 
     fn truncate(&mut self, len: usize) {
@@ -216,6 +246,7 @@ impl EventsData {
 
 struct ThreadDrainer {
     rings: Rings,
+    id: u64,
     events: EventsData,
     /// Stack of opens whose close hasn't arrived yet.
     open_ids: Vec<u64>,
@@ -230,9 +261,10 @@ struct ThreadDrainer {
 }
 
 impl ThreadDrainer {
-    fn open(dir: &QueueDir, token: &str) -> Result<Self, QueueError> {
+    fn open(dir: &QueueDir, token: &str, id: u64) -> Result<Self, QueueError> {
         Ok(Self {
             rings: Rings::open(dir, token)?,
+            id,
             events: EventsData::default(),
             open_ids: Vec::new(),
             frame_start: 0,

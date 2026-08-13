@@ -67,7 +67,34 @@ pub trait Tile<S: FluxSpine>: Send + Sized {
 /// Boot and run a tile thread.
 /// Configures affinity and niceness, then executes the tile lifecycle.
 /// Does not exit until the global stop flag is set.
-pub fn attach_tile<'a, S, T>(mut tile: T, spine: &mut ScopedSpine<'a, '_, S>, config: TileConfig)
+pub fn attach_tile<'a, S, T>(tile: T, spine: &mut ScopedSpine<'a, '_, S>, config: TileConfig)
+where
+    S: FluxSpine,
+    T: Tile<S> + 'a,
+{
+    let name = tile.name();
+    let run = tile_runner(tile, spine, config);
+
+    if name.as_str().is_empty() {
+        spine.scope.spawn(run);
+    } else {
+        std::thread::Builder::new()
+            .name(name.as_str().to_owned())
+            .spawn_scoped(spine.scope, run)
+            .expect("spawn tile thread");
+    }
+}
+
+/// The tile's whole life as one closure.
+///
+/// Call it to run the tile on the calling thread, which is what a single-tile
+/// process wants rather than leaving that thread parked in
+/// [`start`](crate::spine::FluxSpine). [`attach_tile`] spawns it instead.
+pub fn tile_runner<'a, S, T>(
+    mut tile: T,
+    spine: &mut ScopedSpine<'a, '_, S>,
+    config: TileConfig,
+) -> impl FnOnce() + Send + use<'a, S, T>
 where
     S: FluxSpine,
     T: Tile<S> + 'a,
@@ -75,15 +102,13 @@ where
     let stop_flag = spine.stop_flag.clone();
     let mut adapter =
         SpineAdapter::connect_tile_with_stop_flag(&tile, spine.spine, stop_flag.clone());
-
     let mut metrics = if config.metrics {
         Some(TileMetrics::new(spine.spine.base_dir(), S::app_name(), tile.name()))
     } else {
         None
     };
 
-    let name = tile.name();
-    let run = move || {
+    move || {
         let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
         thread_boot(config.core, config.thread_niceness);
 
@@ -136,15 +161,6 @@ where
         crate::park::SIGNAL.signal();
 
         info!("Tile teardown complete");
-    };
-
-    if name.as_str().is_empty() {
-        spine.scope.spawn(run);
-    } else {
-        std::thread::Builder::new()
-            .name(name.as_str().to_owned())
-            .spawn_scoped(spine.scope, run)
-            .expect("spawn tile thread");
     }
 }
 
