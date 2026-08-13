@@ -233,6 +233,28 @@ impl Timer {
         self.emit_latency();
     }
 
+    /// Emit a synthetic processing interval directly to the underlying queue.
+    #[inline]
+    pub fn emit_processing_from_nanos_without_first(&self, start: Nanos, end: Nanos) {
+        let delta = end.saturating_sub(start);
+        let rdtsc_dur = Duration::from(delta);
+        self.processing_time_producer.produce_without_first(&TimingMessage {
+            start_t: Instant(0),
+            stop_t: Instant(rdtsc_dur.0),
+        });
+    }
+
+    /// Emit a synthetic latency interval directly to the underlying queue.
+    #[inline]
+    pub fn emit_latency_from_nanos_without_first(&self, start: Nanos, end: Nanos) {
+        let delta = end.saturating_sub(start);
+        let rdtsc_dur = Duration::from(delta);
+        self.latency_producer.produce_without_first(&TimingMessage {
+            start_t: Instant(0),
+            stop_t: Instant(rdtsc_dur.0),
+        });
+    }
+
     #[inline]
     pub fn process<T, R>(
         &mut self,
