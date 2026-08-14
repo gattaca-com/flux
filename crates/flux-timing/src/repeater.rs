@@ -28,9 +28,14 @@ impl Repeater {
 
     #[inline]
     pub fn fired(&mut self) -> bool {
-        let el = self.last_acted.elapsed();
+        self.fired_at(Instant::now())
+    }
+
+    #[inline]
+    pub fn fired_at(&mut self, now: Instant) -> bool {
+        let el = now.elapsed_since(self.last_acted);
         if el >= self.interval {
-            self.last_acted = Instant::now();
+            self.last_acted = now;
             true
         } else {
             false
@@ -79,5 +84,19 @@ impl AddAssign<Duration> for Repeater {
 impl SubAssign<Duration> for Repeater {
     fn sub_assign(&mut self, rhs: Duration) {
         self.interval = self.interval.saturating_sub(rhs);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Duration, Instant, Repeater};
+
+    #[test]
+    fn fired_at_uses_the_supplied_instant() {
+        let mut repeater = Repeater::every(Duration(10));
+        assert!(!repeater.fired_at(Instant(9)));
+        assert!(repeater.fired_at(Instant(10)));
+        assert!(!repeater.fired_at(Instant(19)));
+        assert!(repeater.fired_at(Instant(20)));
     }
 }
