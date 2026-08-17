@@ -7,6 +7,7 @@ use syn::{
 /// Generic macro input: optional `roll_into Name`, optional
 /// `default_attrs { ... }` block + base definition + evolution steps.
 pub(crate) struct EvolveInputGeneric<B, E> {
+    pub require_type_hash_locks: bool,
     pub roll_into: Option<Ident>,
     pub default_attrs: Vec<Attribute>,
     pub final_attrs: Vec<Attribute>,
@@ -16,6 +17,7 @@ pub(crate) struct EvolveInputGeneric<B, E> {
 
 impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
     fn parse(input: ParseStream) -> Result<Self> {
+        let require_type_hash_locks = parse_optional_flag(input, "__require_type_hash_locks")?;
         let roll_into = parse_optional_keyword(input, "roll_into")?;
 
         let mut default_attrs = Vec::new();
@@ -40,8 +42,27 @@ impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
             evolutions.push(input.parse()?);
         }
 
-        Ok(Self { roll_into, default_attrs, final_attrs, base, evolutions })
+        Ok(Self {
+            require_type_hash_locks,
+            roll_into,
+            default_attrs,
+            final_attrs,
+            base,
+            evolutions,
+        })
     }
+}
+
+fn parse_optional_flag(input: ParseStream, keyword: &str) -> Result<bool> {
+    if input.peek(Ident) {
+        let fork = input.fork();
+        let ident: Ident = fork.parse()?;
+        if ident == keyword {
+            input.parse::<Ident>()?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl<B, E> EvolveInputGeneric<B, E> {

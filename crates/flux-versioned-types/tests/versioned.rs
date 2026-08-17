@@ -19,7 +19,9 @@ versioned_enum!(Status =>
         #[repr(u8)]
     }
 
+    #[type_hash_lock(hash = 13811032913305574456)]
     StatusV1 { Ready(u32), #[default] Unknown }
+    #[type_hash_lock(hash = 1629192207022183331)]
     StatusV2 {
         modify { Ready(u64) = u64::from }
         add { Complete }

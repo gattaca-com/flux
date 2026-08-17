@@ -50,5 +50,60 @@ use syn::parse_macro_input;
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveInput);
     input.ensure_default_attrs(crate::shared::default_struct_attrs);
-    crate::shared::generate_evolving(&mut input, generate_base_struct, generate_evolution).into()
+    let require_type_hash_locks = input.require_type_hash_locks;
+    crate::shared::generate_evolving(
+        &mut input,
+        generate_base_struct,
+        generate_evolution,
+        require_type_hash_locks,
+    )
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::{EvolveInput, generate_base_struct, generate_evolution};
+
+    fn expand(input: proc_macro2::TokenStream) -> String {
+        let mut input: EvolveInput = syn::parse2(input).unwrap();
+        input.ensure_default_attrs(crate::shared::default_struct_attrs);
+        let require_type_hash_locks = input.require_type_hash_locks;
+        crate::shared::generate_evolving(
+            &mut input,
+            generate_base_struct,
+            generate_evolution,
+            require_type_hash_locks,
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn versioned_struct_requires_a_lock_on_every_version() {
+        let output = expand(quote! {
+            __require_type_hash_locks
+            roll_into Message
+            #[type_hash_lock(hash = 1)]
+            MessageV1 { pub value: u32 }
+            MessageV2 { add { pub accepted: bool = true } }
+        });
+
+        assert!(output.contains("MessageV2 is missing a type hash lock"));
+        assert!(output.contains("#[type_hash_lock(hash = 0)]"));
+    }
+
+    #[test]
+    fn versioned_struct_accepts_locked_versions() {
+        let output = expand(quote! {
+            __require_type_hash_locks
+            roll_into Message
+            #[type_hash_lock(hash = 1)]
+            MessageV1 { pub value: u32 }
+            #[type_hash_lock(hash = 2)]
+            MessageV2 { add { pub accepted: bool = true } }
+        });
+
+        assert!(!output.contains("compile_error"));
+    }
 }

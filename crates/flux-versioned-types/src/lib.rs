@@ -34,6 +34,7 @@ macro_rules! impl_versioned_deserialize {
 macro_rules! versioned_struct {
     ($name:ident => $($tokens:tt)*) => {
         $crate::evolve_struct! {
+            __require_type_hash_locks
             roll_into $name
             $($tokens)*
         }
@@ -46,6 +47,7 @@ macro_rules! versioned_struct {
 macro_rules! versioned_enum {
     ($name:ident => $($tokens:tt)*) => {
         $crate::evolve_enum! {
+            __require_type_hash_locks
             roll_into $name
             $($tokens)*
         }
