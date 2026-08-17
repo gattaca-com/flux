@@ -1,0 +1,23 @@
+[package]
+name = "flux-versioned-types-macros"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+description = "Procedural macros for defining versioned Rust structs and enums"
+repository = "https://github.com/gattaca-com/flux"
+keywords = ["schema", "versioning", "migration", "serde"]
+categories = ["data-structures", "encoding"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate = "3"
+proc-macro2 = "1"
+quote = "1"
+rustc-hash = "2"
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
+
+[lints]
+workspace = true

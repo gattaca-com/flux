@@ -1,0 +1,20 @@
+[package]
+name = "flux-versioned-types"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 AND MIT"
+description = "Type evolution and hash-directed deserialization for versioned Rust data"
+repository = "https://github.com/gattaca-com/flux"
+keywords = ["schema", "versioning", "migration", "serde"]
+categories = ["data-structures", "encoding"]
+
+[dependencies]
+bincode.workspace = true
+flux-versioned-types-macros.workspace = true
+serde.workspace = true
+type-hash.workspace = true
+type-hash-derive.workspace = true
+
+[lints]
+workspace = true
