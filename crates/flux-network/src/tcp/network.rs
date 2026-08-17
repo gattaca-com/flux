@@ -256,8 +256,9 @@ impl NetworkState {
     }
 
     fn maybe_reconnect(&mut self) {
+        let now = Instant::now();
         for group_index in 0..self.groups.len() {
-            if !self.groups[group_index].reconnector.fired() {
+            if !self.groups[group_index].reconnector.fired_at(now) {
                 continue;
             }
             let group = TcpGroup(group_index);
