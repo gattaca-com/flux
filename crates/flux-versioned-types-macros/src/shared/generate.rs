@@ -81,12 +81,9 @@ impl Parse for AttrsWrapper {
 }
 
 fn default_attrs_with_repr(repr: &TokenStream2) -> Vec<Attribute> {
-    let runtime = super::runtime_crate();
-    let serde_crate = super::serde_crate_path();
     let tokens = quote! {
         #[allow(clippy::derive_partial_eq_without_eq)]
-        #[derive(Clone, Copy, Debug, PartialEq, #runtime::__private::serde::Serialize, #runtime::__private::serde::Deserialize, #runtime::__private::type_hash_derive::TypeHash)]
-        #[serde(crate = #serde_crate)]
+        #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, flux::type_hash_derive::TypeHash)]
         #[type_hash(skip_typename_on_derive)]
         #[repr(#repr)]
     };

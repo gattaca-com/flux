@@ -1,6 +1,5 @@
-use flux_versioned_types::{
-    TypeHash, VersionedDeserialize, type_hash_lock, versioned_enum, versioned_struct,
-};
+use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
+use flux_versioned_types::{VersionedDeserialize, versioned_enum, versioned_struct};
 
 versioned_struct!(Reading =>
     #[type_hash_lock(hash = 17013878556110425249)]
@@ -15,7 +14,7 @@ versioned_struct!(Reading =>
 
 versioned_enum!(Status =>
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, flux_versioned_types::TypeHash)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, flux::type_hash_derive::TypeHash)]
         #[type_hash(skip_typename_on_derive)]
         #[repr(u8)]
     }
@@ -31,7 +30,7 @@ versioned_enum!(Status =>
 fn decodes_and_migrates_an_old_struct_vector() {
     let old = vec![ReadingV1 { value: 7 }];
     let bytes = bincode::serialize(&old).unwrap();
-    let stored_hash = ReadingV1::TYPE_HASH ^ flux_versioned_types::STORED_TYPE_HASH_XOR;
+    let stored_hash = ReadingV1::TYPE_HASH ^ 123456;
 
     let latest =
         <Reading as VersionedDeserialize>::versioned_deserialize_vec(stored_hash, &bytes).unwrap();
@@ -45,7 +44,7 @@ fn decodes_and_migrates_an_old_struct_vector() {
 fn decodes_and_migrates_an_old_enum_vector() {
     let old = vec![StatusV1::Ready(9)];
     let bytes = bincode::serialize(&old).unwrap();
-    let stored_hash = StatusV1::TYPE_HASH ^ flux_versioned_types::STORED_TYPE_HASH_XOR;
+    let stored_hash = StatusV1::TYPE_HASH ^ 123456;
 
     let latest =
         <Status as VersionedDeserialize>::versioned_deserialize_vec(stored_hash, &bytes).unwrap();

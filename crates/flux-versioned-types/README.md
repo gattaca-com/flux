@@ -9,7 +9,8 @@ telemetry metadata, register application messages, or prescribe storage. Those
 belong in downstream applications.
 
 ```rust
-use flux_versioned_types::{TypeHash, VersionedDeserialize, versioned_struct};
+use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
+use flux_versioned_types::{VersionedDeserialize, versioned_struct};
 
 versioned_struct!(Reading =>
     #[type_hash_lock(hash = 17013878556110425249)]
@@ -23,13 +24,13 @@ versioned_struct!(Reading =>
 );
 
 let old = vec![ReadingV1 { value: 7 }];
-let bytes = flux_versioned_types::__private::bincode::serialize(&old)?;
-let stored_hash = ReadingV1::TYPE_HASH ^ flux_versioned_types::STORED_TYPE_HASH_XOR;
+let bytes = bincode::serialize(&old)?;
+let stored_hash = ReadingV1::TYPE_HASH ^ 123456;
 let latest = Reading::versioned_deserialize_vec(stored_hash, &bytes)?;
 assert_eq!(latest[0].value, 7);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The bincode representation, `TypeHash` values, and
-`STORED_TYPE_HASH_XOR` value are compatibility-sensitive. Evolve a type by
+The bincode representation, `TypeHash` values, and stored type-hash XOR value
+(`123456`) are compatibility-sensitive. Evolve a type by
 adding a new version; do not rewrite an already-persisted version.

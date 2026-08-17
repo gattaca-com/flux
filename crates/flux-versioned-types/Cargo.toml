@@ -12,9 +12,10 @@ categories = ["data-structures", "encoding"]
 [dependencies]
 bincode.workspace = true
 flux-versioned-types-macros.workspace = true
+
+[dev-dependencies]
+flux.workspace = true
 serde.workspace = true
-type-hash.workspace = true
-type-hash-derive.workspace = true
 
 [lints]
 workspace = true

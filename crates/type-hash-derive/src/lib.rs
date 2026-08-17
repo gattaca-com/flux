@@ -13,15 +13,7 @@ fn runtime_crate_path() -> proc_macro2::TokenStream {
             let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
             quote!(::#ident)
         }
-        Err(_) => match crate_name("flux-versioned-types") {
-            Ok(FoundCrate::Itself) => quote!(::flux_versioned_types::__private::type_hash),
-            Ok(FoundCrate::Name(name)) => {
-                let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
-                quote!(::#ident::__private::type_hash)
-            }
-            // Backward-compatible fallback for Flux's original re-export.
-            Err(_) => quote!(::flux::type_hash),
-        },
+        Err(_) => quote!(::flux::type_hash),
     }
 }
 

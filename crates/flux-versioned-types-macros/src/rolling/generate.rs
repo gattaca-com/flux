@@ -22,7 +22,6 @@ impl<'a> RollChainContext<'a> {
 }
 
 pub(crate) fn generate_type_alias_and_codec(ctx: &RollChainContext) -> TokenStream2 {
-    let runtime = crate::shared::runtime_crate();
     let name = ctx.name;
     let last = ctx.last;
     let previous = &ctx.previous;
@@ -32,14 +31,14 @@ pub(crate) fn generate_type_alias_and_codec(ctx: &RollChainContext) -> TokenStre
 
         impl #last {
             #[inline]
-            pub fn versioned_deserialize_vec(type_hash: u64, bytes: &[u8]) -> #runtime::__private::bincode::Result<::std::vec::Vec<Self>> {
-                match type_hash ^ #runtime::STORED_TYPE_HASH_XOR {
-                    #(<#previous as #runtime::__private::type_hash::TypeHash>::TYPE_HASH => {
-                        let v: ::std::vec::Vec<#previous> = #runtime::__private::bincode::deserialize(bytes)?;
+            pub fn versioned_deserialize_vec(type_hash: u64, bytes: &[u8]) -> bincode::Result<Vec<Self>> {
+                match type_hash ^ 123456 {
+                    #(<#previous as flux::type_hash::TypeHash>::TYPE_HASH => {
+                        let v: Vec<#previous> = bincode::deserialize(bytes)?;
                         Ok(v.into_iter().map(Into::into).collect())
                     },)*
-                    <#last as #runtime::__private::type_hash::TypeHash>::TYPE_HASH => Ok(#runtime::__private::bincode::deserialize(bytes)?),
-                    _ => Err(::std::boxed::Box::new(#runtime::__private::bincode::ErrorKind::Custom(::std::format!("Invalid type hash: {}", type_hash)))),
+                    <#last as flux::type_hash::TypeHash>::TYPE_HASH => Ok(bincode::deserialize(bytes)?),
+                    _ => Err(Box::new(bincode::ErrorKind::Custom(format!("Invalid type hash: {}", type_hash)))),
                 }
             }
         }
