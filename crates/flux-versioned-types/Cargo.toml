@@ -1,11 +1,12 @@
 [package]
 name = "flux-versioned-types"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license = "Apache-2.0 AND MIT"
+license.workspace = true
+publish.workspace = true
 description = "Type evolution and hash-directed deserialization for versioned Rust data"
-repository = "https://github.com/gattaca-com/flux"
+repository.workspace = true
 keywords = ["schema", "versioning", "migration", "serde"]
 categories = ["data-structures", "encoding"]
 

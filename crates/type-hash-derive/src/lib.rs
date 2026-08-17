@@ -13,7 +13,10 @@ fn runtime_crate_path() -> proc_macro2::TokenStream {
             let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
             quote!(::#ident)
         }
-        Err(_) => quote!(::flux::type_hash),
+        Err(_) => {
+            // fallback: allow a module path used by workspace re-export patterns
+            quote!(::flux::type_hash)
+        }
     }
 }
 

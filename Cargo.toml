@@ -35,11 +35,10 @@ flux-profiler-macros = { path = "crates/flux-profiler-macros" }
 flux-timekeeper = { path = "crates/flux-timekeeper" }
 flux-timing = { path = "crates/flux-timing" }
 flux-utils = { path = "crates/flux-utils" }
+flux-versioned-types-macros = { path = "crates/flux-versioned-types-macros" }
 spine-derive = { path = "crates/spine-derive" }
 type-hash = { path = "crates/type-hash" }
 type-hash-derive = { path = "crates/type-hash-derive" }
-flux-versioned-types-macros = { path = "crates/flux-versioned-types-macros" }
-flux-versioned-types = { path = "crates/flux-versioned-types" }
 
 
 auto_impl = "1.2.0"

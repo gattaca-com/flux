@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "flux-versioned-types"
-version = "0.0.1"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "flux",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "flux-versioned-types-macros"
-version = "0.0.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
