@@ -21,7 +21,7 @@ license = "Apache-2.0 AND MIT"
 publish = false
 repository = "https://github.com/gattaca-com/flux"
 rust-version = "1.91.0"
-version = "0.1.1"
+version = "0.1.2"
 
 
 [workspace.dependencies]
@@ -47,8 +47,8 @@ chrono = { features = ["serde"], version = "0.4.38" }
 clap = { version = "4", features = ["derive"] }
 core_affinity = "0.8.1"
 criterion = "0.8"
-crossterm = "0.28.1"
 crossbeam-channel = "0.5"
+crossterm = "0.28.1"
 ctrlc = "3"
 directories = "5.0.1"
 governor = "0.6.3"
