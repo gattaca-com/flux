@@ -58,16 +58,12 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     }
 
     if require_type_hash_locks {
-        let versions = std::iter::once(&input.base as &dyn Named).chain(
-            input.evolutions.iter().map(|version| version as &dyn Named),
-        );
+        let versions = std::iter::once(&input.base as &dyn Named)
+            .chain(input.evolutions.iter().map(|version| version as &dyn Named));
         let mut errors = TokenStream2::new();
         for version in versions {
             let has_lock = version.attrs().iter().any(|attr| {
-                attr.path()
-                    .segments
-                    .last()
-                    .is_some_and(|segment| segment.ident == "type_hash_lock")
+                attr.path().segments.last().is_some_and(|segment| segment.ident == "type_hash_lock")
             });
             if !has_lock {
                 let name = version.name();
