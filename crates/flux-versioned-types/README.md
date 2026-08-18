@@ -1,12 +1,6 @@
 # flux-versioned-types
 
-`flux-versioned-types` defines Rust structs and enums as an explicit sequence of
-schema versions. It generates adjacent and transitive migrations and can decode
-a bincode vector using the `TypeHash` stored alongside it.
-
-The crate is intentionally policy-free: it does not choose directories, define
-telemetry metadata, register application messages, or prescribe storage. Those
-belong in downstream applications.
+`flux-versioned-types` defines Rust structs and enums as an explicit series of schema versions. It generates migrations and can decode a bincode vector using the `TypeHash` stored alongside it.
 
 ```rust
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
@@ -31,6 +25,25 @@ assert_eq!(latest[0].value, 7);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The bincode representation, `TypeHash` values, and stored type-hash XOR value
-(`123456`) are compatibility-sensitive. Evolve a type by
-adding a new version; do not rewrite an already-persisted version.
+The bincode representation, `TypeHash` values, and stored type-hash XOR value (`123456`) are compatibility-sensitive. Evolve a type by adding a new version; do not rewrite an already-persisted version.
+
+## Adding missing type hashes
+
+Type-hash locks make accidental schema changes fail at compile time instead of silently changing the identifiers used to deserialise data.
+
+Run the packaged script from the root of any downstream repository that depends on `flux-versioned-types` to add its missing type-hash locks:
+
+```bash
+bash "$(dirname "$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "flux-versioned-types") | .manifest_path')")/scripts/add-missing-typehashes.sh"
+```
+
+If you already use [`just`](https://just.systems/), add this recipe, it also accepts optional Cargo arguments e.g. `just typehash -p common`:
+
+```just
+# Add locks to versioned types that are missing one. Existing locks are never modified.
+typehash *cargo_args:
+  manifest="$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "flux-versioned-types") | .manifest_path')"; \
+  bash "$(dirname "$manifest")/scripts/add-missing-typehashes.sh" {{cargo_args}}
+```
+
+The script adds imports and locks only for versioned types that do not already have a lock. It does not replace an existing but incorrect hash, and it requires `jq`.
