@@ -757,7 +757,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc-hash",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
