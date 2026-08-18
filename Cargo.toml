@@ -12,6 +12,8 @@ members = [
   "crates/spine-derive",
   "crates/type-hash",
   "crates/type-hash-derive",
+  "crates/flux-versioned-types-macros",
+  "crates/flux-versioned-types",
 ]
 resolver = "3"
 
@@ -33,12 +35,14 @@ flux-profiler-macros = { path = "crates/flux-profiler-macros" }
 flux-timekeeper = { path = "crates/flux-timekeeper" }
 flux-timing = { path = "crates/flux-timing" }
 flux-utils = { path = "crates/flux-utils" }
+flux-versioned-types-macros = { path = "crates/flux-versioned-types-macros" }
 spine-derive = { path = "crates/spine-derive" }
 type-hash = { path = "crates/type-hash" }
 type-hash-derive = { path = "crates/type-hash-derive" }
 
 
 auto_impl = "1.2.0"
+bincode = "1.3.3"
 bitcode = { features = ["serde"], version = "0.6.3" }
 bitflags = { version = "2.6.0", features = ["serde"] }
 bytes = "1"

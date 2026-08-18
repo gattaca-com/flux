@@ -619,11 +619,11 @@ pub fn type_hash_lock(attr: TokenStream, item: TokenStream) -> TokenStream {
             let hash_value = li.base10_parse::<u64>().expect("expected integer literal: hash=xxx");
             let th = runtime_crate_path();
             let assertion = quote_spanned! { name.span() =>
-                const _: [(); 0 - {
-                    const ASSERT: bool =
-                        <#name as #th::TypeHash>::TYPE_HASH == #hash_value;
-                    !ASSERT as u64 * <#name as #th::TypeHash>::TYPE_HASH
-                } as usize] = [];
+                const _: () = {
+                    struct TypeHashLock<const HASH: u64>;
+                    let _: TypeHashLock<#hash_value> =
+                        TypeHashLock::<{ <#name as #th::TypeHash>::TYPE_HASH }>;
+                };
             };
             let expanded = quote! {
                 #input

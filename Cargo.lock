@@ -115,6 +115,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitcode"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,6 +738,26 @@ dependencies = [
  "tracing",
  "type-hash",
  "wincode",
+]
+
+[[package]]
+name = "flux-versioned-types"
+version = "0.1.2"
+dependencies = [
+ "bincode",
+ "flux",
+ "flux-versioned-types-macros",
+ "serde",
+]
+
+[[package]]
+name = "flux-versioned-types-macros"
+version = "0.1.2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rustc-hash",
+ "syn",
 ]
 
 [[package]]
