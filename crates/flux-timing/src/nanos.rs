@@ -12,7 +12,7 @@ use type_hash_derive::TypeHash;
 
 use crate::{
     Duration,
-    global_clock::{global_clock, global_clock_not_mocked},
+    global_clock::{global_clock, ticks_to_nanos},
 };
 
 /// Nanos since unix epoch, good till 2554 or so
@@ -480,7 +480,7 @@ impl FromStr for Nanos {
 impl From<Duration> for Nanos {
     #[inline]
     fn from(value: Duration) -> Self {
-        Self(global_clock_not_mocked().delta_as_nanos(0, value.0))
+        Self(ticks_to_nanos(value.0))
     }
 }
 

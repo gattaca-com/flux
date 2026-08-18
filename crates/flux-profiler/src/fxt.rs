@@ -89,7 +89,7 @@ pub(super) fn write<'a>(
         for (j, mark) in t.marks.iter().enumerate() {
             let ty = if mark.is_open() { DURATION_BEGIN } else { DURATION_END };
             let name = fxt.intern_frame(mark.id, names);
-            let ts = clocks.resolve_ns(mark.ts);
+            let ts = clocks.resolve_ns(mark.ts).max(t.last_written_ns);
             fxt.event(ty, index, name, ts);
 
             if let Some(&a) = t.alloc.get(j) &&
@@ -283,13 +283,52 @@ mod tests {
         perf: &[PerfSample],
         schema: Schema,
     ) -> Vec<u8> {
-        let thread =
-            ThreadEvents { name: "t", tid: 0, id: 1, marks, alloc, perf, loss: Loss::default() };
+        let thread = ThreadEvents {
+            name: "t",
+            tid: 0,
+            id: 1,
+            marks,
+            alloc,
+            perf,
+            loss: Loss::default(),
+            last_written_ns: 0,
+        };
         trace(
             [thread].into_iter(),
             &FlamegraphMeta { names: names(), schema },
             &SocketClocks::identity(),
         )
+    }
+
+    /// A new clock sample can move time back a little. Each thread keeps its
+    /// own last written time, so a busy thread cannot drag a quiet one forward.
+    #[test]
+    fn marks_never_go_before_last_written() {
+        let last_written_ns = 5_000;
+        let quiet = ThreadEvents {
+            name: "quiet",
+            tid: 0,
+            id: 1,
+            marks: &frames(),
+            alloc: &[],
+            perf: &[],
+            loss: Loss::default(),
+            last_written_ns,
+        };
+        // A busy thread far ahead in time must not drag the quiet one forward.
+        let busy =
+            ThreadEvents { name: "busy", tid: 0, id: 2, last_written_ns: 9_000_000, ..quiet };
+        let buf = trace(
+            [quiet, busy].into_iter(),
+            &FlamegraphMeta { names: names(), schema: Schema::empty() },
+            &SocketClocks::identity(),
+        );
+
+        let ts = event_timestamps(&buf);
+        assert!(!ts.is_empty());
+        let quiet_range = last_written_ns..9_000_000;
+        assert!(ts.iter().any(|&t| quiet_range.contains(&t)), "{ts:?} all dragged forward");
+        assert!(ts.iter().all(|&t| t >= last_written_ns), "{ts:?} went before the last written");
     }
 
     #[test]
@@ -343,6 +382,7 @@ mod tests {
             marks: &marks,
             alloc: &[],
             perf: &[],
+            last_written_ns: 0,
             loss: Loss::default(),
         };
         let buf = trace(

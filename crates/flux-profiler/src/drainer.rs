@@ -67,6 +67,9 @@ pub struct ThreadEvents<'a> {
     pub perf: &'a [PerfSample],
     pub alloc: &'a [AllocSample],
     pub loss: Loss,
+    /// Newest time already written for this thread. A new clock sample can move
+    /// time back a little, and each thread's events have to stay in order.
+    pub last_written_ns: u64,
 }
 
 fn split_token(token: &str) -> (&str, u64) {
@@ -137,6 +140,7 @@ impl EventsDrainer {
                 perf: &t.events.perf,
                 alloc: &t.events.alloc,
                 loss: t.loss(),
+                last_written_ns: t.last_written_ns,
             })
         })
     }
@@ -172,11 +176,13 @@ impl EventsDrainer {
                     perf: &t.events.perf[..n.min(t.events.perf.len())],
                     alloc: &t.events.alloc[..n.min(t.events.alloc.len())],
                     loss,
+                    last_written_ns: t.last_written_ns,
                 }
             })
         });
         fxt::write(dumped, &self.meta, &self.clocks, out)?;
         self.release();
+        self.clocks.recalibrate();
         Ok(())
     }
 
@@ -184,7 +190,7 @@ impl EventsDrainer {
     /// loss once.
     pub fn release(&mut self) {
         for thread in self.threads.values_mut().flatten() {
-            thread.release_dumped();
+            thread.release_dumped(&self.clocks);
         }
     }
 }
@@ -258,6 +264,9 @@ struct ThreadDrainer {
     /// Loss totals already reported by earlier dumps; a dump reports the
     /// delta so no interval's loss is reported twice.
     dumped_loss: Loss,
+    /// Newest time written for this thread, so a new clock sample cannot put a
+    /// later mark before an earlier one.
+    last_written_ns: u64,
 }
 
 impl ThreadDrainer {
@@ -271,6 +280,7 @@ impl ThreadDrainer {
             unmatched_closes: 0,
             expected_seq: 0,
             dumped_loss: Loss::default(),
+            last_written_ns: 0,
         })
     }
 
@@ -370,8 +380,12 @@ impl ThreadDrainer {
         if self.open_ids.is_empty() { self.events.marks.len() } else { self.frame_start }
     }
 
-    fn release_dumped(&mut self) {
-        self.events.release(self.completed_len());
+    fn release_dumped(&mut self, clocks: &SocketClocks) {
+        let n = self.completed_len();
+        if let Some(last) = self.events.marks[..n].last() {
+            self.last_written_ns = self.last_written_ns.max(clocks.resolve_ns(last.ts));
+        }
+        self.events.release(n);
         // The in-flight top-level frame's open (if any) is now at index 0.
         self.frame_start = 0;
         self.dumped_loss = Loss { missed: self.rings.missed(), dropped: self.unmatched_closes };
