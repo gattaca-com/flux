@@ -40,13 +40,7 @@ impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
             evolutions.push(input.parse()?);
         }
 
-        Ok(Self {
-            roll_into,
-            default_attrs,
-            final_attrs,
-            base,
-            evolutions,
-        })
+        Ok(Self { roll_into, default_attrs, final_attrs, base, evolutions })
     }
 }
 

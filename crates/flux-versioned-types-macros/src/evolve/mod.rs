@@ -50,8 +50,7 @@ use syn::parse_macro_input;
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveInput);
     input.ensure_default_attrs(crate::shared::default_struct_attrs);
-    crate::shared::generate_evolving(&mut input, generate_base_struct, generate_evolution)
-    .into()
+    crate::shared::generate_evolving(&mut input, generate_base_struct, generate_evolution).into()
 }
 
 #[cfg(test)]
@@ -64,7 +63,7 @@ mod tests {
         let mut input: EvolveInput = syn::parse2(input).unwrap();
         input.ensure_default_attrs(crate::shared::default_struct_attrs);
         crate::shared::generate_evolving(&mut input, generate_base_struct, generate_evolution)
-        .to_string()
+            .to_string()
     }
 
     #[test]

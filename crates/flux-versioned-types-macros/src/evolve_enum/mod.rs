@@ -51,6 +51,5 @@ use syn::parse_macro_input;
 pub fn evolve_enum(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveEnumInput);
     input.ensure_default_attrs(crate::shared::default_enum_attrs);
-    crate::shared::generate_evolving(&mut input, generate_base_enum, generate_evolution)
-    .into()
+    crate::shared::generate_evolving(&mut input, generate_base_enum, generate_evolution).into()
 }
