@@ -1,9 +1,11 @@
+use flux::type_hash_derive::{TypeHash, type_hash_lock};
 use flux_versioned_types::evolve_enum;
 
 // ── base-only (no evolutions) ────────────────────────────────────────────────
 
 evolve_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
+    #[type_hash_lock(hash = 14900722984128347129)]
     SimpleV1 {
         Slot(u64),
         Value(u32, u32),
@@ -26,15 +28,17 @@ fn test_base_enum() {
 
 evolve_enum! {
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
 
+    #[type_hash_lock(hash = 18033191317052006847)]
     AddTestV1 {
         Existing(u32),
         #[default]
         Uninitialized,
     }
 
+    #[type_hash_lock(hash = 7629929169986162199)]
     AddTestV2 {
         add {
             NewUnit,
@@ -62,9 +66,10 @@ fn test_add_variants() {
 
 evolve_enum! {
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
 
+    #[type_hash_lock(hash = 14807090857835838884)]
     RemoveTestV1 {
         Keep(u32),
         Remove1(u64),
@@ -73,6 +78,7 @@ evolve_enum! {
         Uninitialized,
     }
 
+    #[type_hash_lock(hash = 8453144171538280586)]
     RemoveTestV2 {
         remove { Remove1, Remove2 }
     }
@@ -94,9 +100,10 @@ fn test_remove_variants() {
 
 evolve_enum! {
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
 
+    #[type_hash_lock(hash = 12330003302444450291)]
     RenameTestV1 {
         OldName(u32),
         MultiOld(u32, u64),
@@ -105,6 +112,7 @@ evolve_enum! {
         Uninitialized,
     }
 
+    #[type_hash_lock(hash = 16728610578512612868)]
     RenameTestV2 {
         remove {
             OldName,
@@ -145,9 +153,10 @@ fn test_rename_unit() {
 
 evolve_enum! {
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
 
+    #[type_hash_lock(hash = 4557022474669647582)]
     ModifyTestV1 {
         SingleField(u32),
         MultiField(u32),
@@ -156,6 +165,7 @@ evolve_enum! {
         Uninitialized,
     }
 
+    #[type_hash_lock(hash = 12033170617617045910)]
     ModifyTestV2 {
         modify {
             SingleField(u64) = |v: u32| v as u64 * 2,
@@ -190,9 +200,10 @@ fn test_modify_unit_passthrough() {
 
 evolve_enum! {
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
 
+    #[type_hash_lock(hash = 1999265866054596663)]
     ComboV1 {
         SlotInfo(u32),
         LegacyRelay(u8),
@@ -200,6 +211,7 @@ evolve_enum! {
         Uninitialized,
     }
 
+    #[type_hash_lock(hash = 17140595624977082615)]
     ComboV2 {
         add {
             NewFeature(u64),
@@ -210,6 +222,7 @@ evolve_enum! {
         }
     }
 
+    #[type_hash_lock(hash = 6615309587295836411)]
     ComboV3 {
         add {
             #[default]
@@ -242,10 +255,11 @@ fn test_combo_v2_to_v3() {
 
 evolve_enum! {
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
         #[repr(u8)]
     }
 
+    #[type_hash_lock(hash = 9677040478237812538)]
     RelayIdV1 {
         Titan = 1,
         Flashbots = 2,
@@ -253,11 +267,13 @@ evolve_enum! {
         Unknown = 255,
     }
 
+    #[type_hash_lock(hash = 16786856570422403916)]
     RelayIdV2 {
         add { Beaver = 3 }
         remove { Titan }
     }
 
+    #[type_hash_lock(hash = 4569424087640543736)]
     RelayIdV3 {
         remove { Beaver }
         add {

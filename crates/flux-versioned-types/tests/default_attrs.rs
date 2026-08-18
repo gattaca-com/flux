@@ -1,16 +1,19 @@
+use flux::type_hash_derive::{TypeHash, type_hash_lock};
 use flux_versioned_types::evolve_struct;
 
 evolve_struct! {
     default_attrs {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
         #[repr(C)]
     }
 
+    #[type_hash_lock(hash = 17777745675860722768)]
     DefaultAttrsV1 {
         pub slot: u64,
         pub value: u32,
     }
 
+    #[type_hash_lock(hash = 2615398994427474628)]
     DefaultAttrsV2 {
         add {
             pub extra: bool = false,
@@ -18,6 +21,7 @@ evolve_struct! {
     }
 
     #[derive(Default)]  // additional attr on top of default_attrs
+    #[type_hash_lock(hash = 10268128889473454294)]
     DefaultAttrsV3 {
         add {
             pub count: usize = 0,

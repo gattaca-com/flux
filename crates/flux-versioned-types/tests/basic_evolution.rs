@@ -1,23 +1,27 @@
 #![allow(clippy::float_cmp, reason = "testing")]
 
+use flux::type_hash_derive::{TypeHash, type_hash_lock};
 use flux_versioned_types::evolve_struct;
 
 evolve_struct! {
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, TypeHash)]
+    #[type_hash_lock(hash = 11423779886791362541)]
     TestV1 {
         pub a: u32,
         pub b: String,
         pub c: bool,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, TypeHash)]
+    #[type_hash_lock(hash = 682964507060627587)]
     TestV2 {
         add {
             pub d: i64 = 0,
         }
     }
 
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, TypeHash)]
+    #[type_hash_lock(hash = 4788859044302564619)]
     TestV3 {
         remove { b }
         modify {
@@ -28,7 +32,8 @@ evolve_struct! {
         }
     }
 
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, TypeHash)]
+    #[type_hash_lock(hash = 3620685133968526778)]
     TestV4 {
         remove { c }
         modify {
@@ -37,7 +42,8 @@ evolve_struct! {
         }
     }
 
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, TypeHash)]
+    #[type_hash_lock(hash = 10719768904514489108)]
     TestV5 {
         add {
             pub f: u64 = |prev: &TestV4| prev.a as u64,
@@ -106,13 +112,15 @@ fn test_v4_to_v5_with_lambda_add() {
 }
 
 evolve_struct! {
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, TypeHash)]
+    #[type_hash_lock(hash = 10210870430544251810)]
     NonCopyV1 {
         pub name: String,
         pub value: u32,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, TypeHash)]
+    #[type_hash_lock(hash = 11578855025402271476)]
     NonCopyV2 {
         add {
             pub derived: String = |prev: &NonCopyV1| format!("{}_{}", prev.name, prev.value),

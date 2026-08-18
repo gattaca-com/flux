@@ -72,40 +72,44 @@ jq -r '
   | ($diagnostic.spans[] | select(.is_primary)) as $span
   | (($span.text[0].text // "") | capture("(?<name>[A-Za-z_][A-Za-z0-9_]*)")?) as $source
   | select($source != null)
-  | [$span.file_name, $source.name, $match.hash]
+  | [$span.file_name, ($span.line_start | tostring), $source.name, $match.hash]
   | @tsv
 ' "$hash_json" | sort -u >"$hashes_tsv"
 
 while IFS=$'\t' read -r file name; do
-  hash="$(awk -F '\t' -v file="$file" -v name="$name" '$1 == file && $2 == name { print $3; exit }' "$hashes_tsv")"
-  if [[ -z "$hash" ]]; then
-    echo "typehash: could not determine the hash for $name in $file" >&2
-    exit 1
-  fi
-
   mapfile -t lines <"$file"
   name_index=-1
   for index in "${!lines[@]}"; do
     if [[ ${lines[index]} =~ (^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|$) ]]; then
-      name_index=$index
-      break
+      lower_bound=$((index > 7 ? index - 7 : 0))
+      for ((candidate = index - 1; candidate >= lower_bound; candidate--)); do
+        if [[ ${lines[candidate]} == *'#[type_hash_lock(hash = 0)]'* ]]; then
+          name_index=$index
+          placeholder_index=$candidate
+          break 2
+        fi
+      done
     fi
   done
   if ((name_index < 0)); then
-    echo "typehash: could not relocate $name in $file" >&2
+    echo "typehash: refusing to modify an existing lock for $name in $file" >&2
     exit 1
   fi
 
-  placeholder_index=-1
-  lower_bound=$((name_index > 7 ? name_index - 7 : 0))
-  for ((index = name_index - 1; index >= lower_bound; index--)); do
-    if [[ ${lines[index]} == *'#[type_hash_lock(hash = 0)]'* ]]; then
-      placeholder_index=$index
-      break
-    fi
-  done
-  if ((placeholder_index < 0)); then
-    echo "typehash: refusing to modify an existing lock for $name in $file" >&2
+  hash="$(awk -F '\t' -v file="$file" -v line="$((name_index + 1))" -v name="$name" '
+    $1 == file && $3 == name {
+      distance = $2 - line
+      if (distance < 0) distance = -distance
+      if (!found || distance < best) {
+        found = 1
+        best = distance
+        hash = $4
+      }
+    }
+    END { if (found) print hash }
+  ' "$hashes_tsv")"
+  if [[ -z "$hash" ]]; then
+    echo "typehash: could not determine the hash for $name in $file" >&2
     exit 1
   fi
 

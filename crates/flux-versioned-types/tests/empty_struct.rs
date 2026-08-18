@@ -1,17 +1,21 @@
+use flux::type_hash_derive::{TypeHash, type_hash_lock};
 use flux_versioned_types::evolve_struct;
 
 evolve_struct! {
-    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    #[derive(Clone, Debug, PartialEq, Eq, Default, TypeHash)]
+    #[type_hash_lock(hash = 4536600054956490103)]
     EmptyV1 {}
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, TypeHash)]
+    #[type_hash_lock(hash = 4667662565370988745)]
     EmptyV2 {
         add {
             pub field: u32 = 42,
         }
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    #[derive(Clone, Debug, PartialEq, Eq, Default, TypeHash)]
+    #[type_hash_lock(hash = 4536602253979742957)]
     EmptyV3 {
         remove { field }
     }

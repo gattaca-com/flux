@@ -50,13 +50,7 @@ use syn::parse_macro_input;
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveInput);
     input.ensure_default_attrs(crate::shared::default_struct_attrs);
-    let require_type_hash_locks = input.require_type_hash_locks;
-    crate::shared::generate_evolving(
-        &mut input,
-        generate_base_struct,
-        generate_evolution,
-        require_type_hash_locks,
-    )
+    crate::shared::generate_evolving(&mut input, generate_base_struct, generate_evolution)
     .into()
 }
 
@@ -69,20 +63,13 @@ mod tests {
     fn expand(input: proc_macro2::TokenStream) -> String {
         let mut input: EvolveInput = syn::parse2(input).unwrap();
         input.ensure_default_attrs(crate::shared::default_struct_attrs);
-        let require_type_hash_locks = input.require_type_hash_locks;
-        crate::shared::generate_evolving(
-            &mut input,
-            generate_base_struct,
-            generate_evolution,
-            require_type_hash_locks,
-        )
+        crate::shared::generate_evolving(&mut input, generate_base_struct, generate_evolution)
         .to_string()
     }
 
     #[test]
-    fn versioned_struct_requires_a_lock_on_every_version() {
+    fn evolve_struct_requires_a_lock_on_every_version() {
         let output = expand(quote! {
-            __require_type_hash_locks
             roll_into Message
             #[type_hash_lock(hash = 1)]
             MessageV1 { pub value: u32 }
@@ -94,9 +81,8 @@ mod tests {
     }
 
     #[test]
-    fn versioned_struct_accepts_locked_versions() {
+    fn evolve_struct_accepts_locked_versions() {
         let output = expand(quote! {
-            __require_type_hash_locks
             roll_into Message
             #[type_hash_lock(hash = 1)]
             MessageV1 { pub value: u32 }
