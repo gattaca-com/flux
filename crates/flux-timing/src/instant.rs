@@ -5,7 +5,7 @@ use type_hash_derive::TypeHash;
 
 use crate::{
     Duration, Nanos,
-    global_clock::{global_clock_not_mocked, ticks_per_micro},
+    global_clock::{global_clock_not_mocked, nanos_to_ticks, ticks_to_nanos},
 };
 
 pub const SOCKET_SHIFT: u32 = 62;
@@ -64,7 +64,7 @@ impl Instant {
 
     #[inline]
     pub fn as_delta_nanos(&self) -> Nanos {
-        Nanos(global_clock_not_mocked().delta_as_nanos(0, self.remove_socket().0))
+        Nanos(ticks_to_nanos(self.remove_socket().0))
     }
 
     #[inline]
@@ -99,7 +99,7 @@ impl Add<Nanos> for Instant {
     type Output = Self;
 
     fn add(self, rhs: Nanos) -> Self::Output {
-        Self(self.0 + rhs.0 * ticks_per_micro() / 1000)
+        Self(self.0 + nanos_to_ticks(rhs.0))
     }
 }
 
@@ -107,7 +107,7 @@ impl Sub<Nanos> for Instant {
     type Output = Self;
 
     fn sub(self, rhs: Nanos) -> Self::Output {
-        Self(self.0.saturating_sub(rhs.0 * ticks_per_micro() / 1000))
+        Self(self.0.saturating_sub(nanos_to_ticks(rhs.0)))
     }
 }
 

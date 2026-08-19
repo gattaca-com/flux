@@ -40,7 +40,6 @@ impl GovernorClock for OurClockForNanos {
     }
 }
 
-static GLOBAL_NANOS_FOR_MULTIPLIER: OnceLock<u64> = OnceLock::new();
 // might be mocked
 static GLOBAL_CLOCK: OnceLock<OurClockForNanos> = OnceLock::new();
 // never mocked
@@ -67,32 +66,49 @@ pub fn global_clock_not_mocked() -> &'static Clock {
     GLOBAL_CLOCK_NON_MOCKED.get_or_init(Clock::new)
 }
 
-const MULTIPLIER: u64 = 100_000_000;
+static NANOS_PER_TICK: OnceLock<u64> = OnceLock::new();
+static TICKS_PER_NANO: OnceLock<u64> = OnceLock::new();
+/// A tick is a fraction of a nanosecond - 0.2330078 of one at 4.3GHz - and an
+/// integer cannot hold that, so the rate is kept multiplied by
+/// `2^FRACTION_BITS` and shifted back down after each conversion. Whatever is
+/// too small to fit in those bits is lost, and a lost fraction is a clock that
+/// runs slow:
+///
+///   whole number (old `ticks_per_micro`: 3792 of a true 3792.87)  20 s/day
+///   16 bits                                                       5.7 s/day
+///   24 bits                                                       22 ms/day
+///   32 bits                                                       86 us/day
+const FRACTION_BITS: u32 = 32;
+const ONE: u128 = 1 << FRACTION_BITS;
 
-fn nanos_for_multiplier() -> u64 {
-    *GLOBAL_NANOS_FOR_MULTIPLIER
-        .get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, MULTIPLIER))
+#[inline]
+fn nanos_per_tick() -> u64 {
+    *NANOS_PER_TICK.get_or_init(|| global_clock_not_mocked().delta_as_nanos(0, ONE as u64))
 }
 
-static TICKS_PER_SEC: OnceLock<u64> = OnceLock::new();
-static TICKS_PER_MILLI: OnceLock<u64> = OnceLock::new();
-static TICKS_PER_MICRO: OnceLock<u64> = OnceLock::new();
-
-/// Overflow: `s * ticks_per_sec()` wraps at ~182 years.
+/// Rates are stored times `ONE`, so `nanos_per_tick()` holds `0.233 * ONE`.
+/// The reverse rate has to come out stored the same way:
+///
+/// ```text
+/// ONE * ONE / (0.233 * ONE) = 4.29 * ONE
+/// ```
 #[inline]
-pub(super) fn ticks_per_sec() -> u64 {
-    *TICKS_PER_SEC.get_or_init(|| 1_000_000_000 * MULTIPLIER / nanos_for_multiplier())
+fn ticks_per_nano() -> u64 {
+    *TICKS_PER_NANO.get_or_init(|| (ONE * ONE / u128::from(nanos_per_tick())) as u64)
 }
 
-/// Overflow: `ms * ticks_per_milli()` wraps at ~182 years.
 #[inline]
-pub(super) fn ticks_per_milli() -> u64 {
-    *TICKS_PER_MILLI.get_or_init(|| 1_000_000 * MULTIPLIER / nanos_for_multiplier())
+fn scale(value: u64, rate: u64) -> u64 {
+    ((u128::from(value) * u128::from(rate)) >> FRACTION_BITS) as u64
 }
 
-/// Overflow: `us * ticks_per_micro()` wraps at ~182 years.
-/// For nanos: `ns * ticks_per_micro() / 1000` wraps at ~66 days.
 #[inline]
-pub(super) fn ticks_per_micro() -> u64 {
-    *TICKS_PER_MICRO.get_or_init(|| 1_000 * MULTIPLIER / nanos_for_multiplier())
+pub(super) fn ticks_to_nanos(ticks: u64) -> u64 {
+    scale(ticks, nanos_per_tick())
+}
+
+/// A u64 of ticks runs out after ~136 years at 4GHz, and so does this.
+#[inline]
+pub(super) fn nanos_to_ticks(nanos: u64) -> u64 {
+    scale(nanos, ticks_per_nano())
 }

@@ -5,7 +5,7 @@ use type_hash_derive::TypeHash;
 
 use crate::{
     Nanos,
-    global_clock::{global_clock_not_mocked, ticks_per_micro, ticks_per_milli, ticks_per_sec},
+    global_clock::{nanos_to_ticks, ticks_to_nanos},
 };
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, TypeHash)]
@@ -35,13 +35,11 @@ impl Duration {
         Self(self.0.saturating_add(rhs.0))
     }
 
-    /// Overflows at ~182 years.
     #[inline]
     pub fn from_secs(s: u64) -> Self {
-        Self(s * ticks_per_sec())
+        Self(nanos_to_ticks(s * 1_000_000_000))
     }
 
-    /// Overflows at ~182 years.
     #[inline]
     pub fn from_mins(s: u64) -> Self {
         Self::from_secs(s * 60)
@@ -52,68 +50,70 @@ impl Duration {
         Self::from_nanos((s * 1_000_000_000.0).round() as u64)
     }
 
-    /// Overflows at ~182 years.
     #[inline]
     pub fn from_millis(s: u64) -> Self {
-        Self(s * ticks_per_milli())
+        Self(nanos_to_ticks(s * 1_000_000))
     }
 
-    /// Overflows at ~66 days.
     #[inline]
     pub fn from_micros(s: u64) -> Self {
-        Self(s * ticks_per_milli() / 1_000)
+        Self(nanos_to_ticks(s * 1_000))
     }
 
-    /// Overflows at ~66 days.
     #[inline]
     pub fn from_nanos(s: u64) -> Self {
-        Self(s * ticks_per_micro() / 1000)
+        Self(nanos_to_ticks(s))
+    }
+
+    #[inline]
+    fn nanos(self) -> u64 {
+        ticks_to_nanos(self.0)
     }
 
     #[inline]
     pub fn as_secs(&self) -> f64 {
-        self.0 as f64 / ticks_per_sec() as f64
+        self.nanos() as f64 / 1e9
     }
 
     #[inline]
     pub fn as_secs_u64(&self) -> u64 {
-        self.0 / ticks_per_sec()
+        self.nanos() / 1_000_000_000
     }
 
     #[inline]
     pub fn as_millis(&self) -> f64 {
-        self.0 as f64 / ticks_per_milli() as f64
+        self.nanos() as f64 / 1e6
     }
 
     #[inline]
     pub fn as_millis_u64(&self) -> u64 {
-        self.0 / ticks_per_milli()
+        self.nanos() / 1_000_000
     }
 
     #[inline]
     pub fn as_micros(&self) -> f64 {
-        self.0 as f64 * 1_000.0 / ticks_per_milli() as f64
+        self.nanos() as f64 / 1e3
     }
 
     #[inline]
     pub fn as_micros_u64(&self) -> u64 {
-        self.0 / ticks_per_micro()
+        self.nanos() / 1_000
     }
 
     #[inline]
     pub fn as_micros_u128(&self) -> u128 {
-        (self.0 / ticks_per_micro()) as u128
+        u128::from(self.as_micros_u64())
     }
 
     #[inline]
     pub fn as_nanos(&self) -> f64 {
-        self.0 as f64 * 1000.0 / ticks_per_micro() as f64
+        self.nanos() as f64
     }
 }
 
 impl std::fmt::Display for Duration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Nanos(global_clock_not_mocked().delta_as_nanos(0, self.0)).fmt(f)
+        Nanos(self.nanos()).fmt(f)
     }
 }
 
@@ -374,7 +374,7 @@ impl From<Duration> for i64 {
 impl From<Duration> for std::time::Duration {
     #[inline]
     fn from(value: Duration) -> Self {
-        Self::from_nanos(global_clock_not_mocked().delta_as_nanos(0, value.0))
+        Self::from_nanos(value.nanos())
     }
 }
 
@@ -386,10 +386,9 @@ impl From<std::time::Duration> for Duration {
 }
 
 impl From<Nanos> for Duration {
-    /// Overflows at ~66 days.
     #[inline]
     fn from(value: Nanos) -> Self {
-        Self(value.0 * ticks_per_micro() / 1000)
+        Self(nanos_to_ticks(value.0))
     }
 }
 
@@ -431,18 +430,29 @@ mod tests {
         std::time::Duration::from(d).as_nanos()
     }
 
-    /// Assert drift < 500ppm of expected, minimum 10ns absolute.
-    /// `from_nanos` path uses `ticks_per_micro` (~3200) so truncation can reach
-    /// ~200ppm.
+    /// Assert drift < 1ppm of expected, minimum 10ns absolute.
     fn check(ours: Duration, expected: std::time::Duration) {
         let actual_ns = to_ns(ours);
         let expected_ns = expected.as_nanos();
         let diff = (actual_ns as i128 - expected_ns as i128).unsigned_abs();
-        let max_err = (expected_ns / 2_000).max(10); // 500ppm or 10ns
+        let max_err = (expected_ns / 1_000_000).max(10); // 1ppm or 10ns
         assert!(
             diff <= max_err,
-            "drift {diff}ns > {max_err}ns (500ppm): actual={actual_ns}ns expected={expected_ns}ns"
+            "drift {diff}ns > {max_err}ns (1ppm): actual={actual_ns}ns expected={expected_ns}ns"
         );
+    }
+
+    #[test]
+    fn as_nanos_scale_within_1ppm() {
+        for secs in [1u64, 60, 3600, 86_400, 604_800] {
+            let d = Duration::from_secs(secs);
+            let expected = secs as f64 * 1e9;
+            let ppm = (d.as_nanos() / expected - 1.0).abs() * 1e6;
+            assert!(ppm < 1.0, "{secs}s: as_nanos off by {ppm:.4}ppm ({})", d.as_nanos());
+            // one truncated microsecond on top of the 1ppm scale budget
+            let drift = (secs * 1_000_000).abs_diff(d.as_micros_u64());
+            assert!(drift <= 1 + secs, "{secs}s: as_micros_u64 off by {drift}us");
+        }
     }
 
     #[test]

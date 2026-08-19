@@ -67,6 +67,18 @@ impl SocketClocks {
         Self { nodes }
     }
 
+    /// ntpd corrects the wall clock but not the TSC, so an anchor drifts. One
+    /// sample re-anchors every node: the gaps between sockets' TSCs are fixed
+    /// at boot, so the drift is shared.
+    pub fn recalibrate(&mut self) {
+        let (wall_ns, tsc, node) = sample();
+        let now = ((node as u64) << SOCKET_SHIFT) | tsc;
+        let by = wall_ns as i64 - self.resolve_ns(now) as i64;
+        for node in &mut self.nodes {
+            node.wall_ns = node.wall_ns.saturating_add_signed(by);
+        }
+    }
+
     pub fn resolve_ns(&self, packed: u64) -> u64 {
         let node = self.nodes[(packed >> SOCKET_SHIFT) as usize & (MAX_NODES - 1)];
         let tsc = packed & TSC_MASK;
@@ -112,6 +124,8 @@ mod tests {
 
     use super::{MAX_NODES, Node, SocketClocks};
 
+    const SECOND: u64 = 1_000_000_000;
+
     fn packed(node: u64, tsc: u64) -> u64 {
         (node << SOCKET_SHIFT) | tsc
     }
@@ -137,6 +151,36 @@ mod tests {
         let adv0 = c.resolve_ns(packed(0, 1_003_000)) - 5_000;
         let adv1 = c.resolve_ns(packed(1, 9_003_000)) - 5_000;
         assert_eq!(adv0, adv1);
+    }
+
+    /// The whole point: a clock that has drifted must come back to the wall
+    /// clock. An earlier version cancelled its own correction and this caught
+    /// it.
+    #[test]
+    fn recalibrate_corrects_a_fast_clock() {
+        let (wall_ns, tsc, node) = super::sample();
+        let mut c = SocketClocks { nodes: [Node { tsc, wall_ns: wall_ns + SECOND }; MAX_NODES] };
+        let now = packed(node as u64, tsc);
+        assert!(c.resolve_ns(now).abs_diff(wall_ns) > SECOND / 2, "the clock starts wrong");
+
+        c.recalibrate();
+
+        let (wall_ns, tsc, node) = super::sample();
+        let err = c.resolve_ns(packed(node as u64, tsc)).abs_diff(wall_ns);
+        assert!(err < 1_000_000, "still {err}ns out after recalibrating");
+    }
+
+    /// Sockets differ by a fixed amount, so one sample moves them all together.
+    #[test]
+    fn recalibrate_keeps_the_gap_between_sockets() {
+        let (wall_ns, tsc, _) = super::sample();
+        let mut nodes = [Node { tsc, wall_ns: wall_ns + SECOND }; MAX_NODES];
+        nodes[1].wall_ns += 500;
+        let mut c = SocketClocks { nodes };
+
+        c.recalibrate();
+
+        assert_eq!(c.nodes[1].wall_ns - c.nodes[0].wall_ns, 500);
     }
 
     #[test]
