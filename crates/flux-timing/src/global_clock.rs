@@ -89,7 +89,9 @@ fn nanos_per_tick() -> u64 {
 /// Rates are stored times `ONE`, so `nanos_per_tick()` holds `0.233 * ONE`.
 /// The reverse rate has to come out stored the same way:
 ///
-///     ONE * ONE / (0.233 * ONE) = 4.29 * ONE
+/// ```text
+/// ONE * ONE / (0.233 * ONE) = 4.29 * ONE
+/// ```
 #[inline]
 fn ticks_per_nano() -> u64 {
     *TICKS_PER_NANO.get_or_init(|| (ONE * ONE / u128::from(nanos_per_tick())) as u64)
