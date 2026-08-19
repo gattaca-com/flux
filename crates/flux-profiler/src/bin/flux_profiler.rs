@@ -121,7 +121,7 @@ fn main() -> ExitCode {
     let mut iterations = 0u32;
     loop {
         let mut stopping = STOP.load(Ordering::Acquire);
-        reader.poll();
+        let more = reader.poll();
         if let Some(limit) = args.duration {
             if start.elapsed() >= limit {
                 eprintln!("reached --duration limit");
@@ -154,7 +154,9 @@ fn main() -> ExitCode {
             eprintln!("producer exited");
             break;
         }
-        thread::sleep(Duration::from_millis(1));
+        if !more {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     // Everything the interval dumps left behind — the in-flight frames, or the
