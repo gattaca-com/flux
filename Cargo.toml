@@ -56,6 +56,7 @@ crossterm = "0.28.1"
 ctrlc = "3"
 directories = "5.0.1"
 governor = "0.6.3"
+httparse = "1"
 humantime = "2.1"
 indexmap = { features = ["serde"], version = "2.11.1" }
 libc = "0.2.177"

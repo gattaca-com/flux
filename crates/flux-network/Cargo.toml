@@ -13,6 +13,7 @@ flux.workspace = true
 flux-communication.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
+httparse.workspace = true
 libc.workspace = true
 mio.workspace = true
 serde.workspace = true
