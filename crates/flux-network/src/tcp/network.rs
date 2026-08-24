@@ -31,6 +31,17 @@ const BACKLOG_WARNING_INTERVAL_SECS: u64 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TcpGroup(usize);
 
+/// Selects how a TCP group encodes messages on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Framing {
+    /// Messages carry Flux's length and send-timestamp header.
+    #[default]
+    LengthPrefixed,
+    /// Bytes pass through untouched. Received chunks do not preserve message
+    /// boundaries, and their event timestamp is the local receive time.
+    Raw,
+}
+
 /// Configuration shared by every listener and connection in a [`TcpGroup`].
 #[derive(Clone)]
 pub struct TcpGroupConfig {
@@ -55,8 +66,11 @@ pub struct TcpGroupConfig {
     /// Disconnect the peer before its queued bytes would exceed this limit.
     /// `None` allows the queue to grow without a hard limit.
     pub max_backlog_bytes: Option<usize>,
-    /// Largest accepted or emitted frame payload.
+    /// Largest accepted or emitted frame payload. For [`Framing::Raw`], this
+    /// caps a single send and bounds each received read chunk.
     pub max_frame_size: usize,
+    /// Wire encoding used by this group.
+    pub framing: Framing,
     /// Per-connection latency and allocation telemetry.
     pub telemetry: TcpTelemetry,
 }
@@ -74,6 +88,7 @@ impl Default for TcpGroupConfig {
             backlog_warn_bytes: Some(DEFAULT_BACKLOG_WARN_BYTES),
             max_backlog_bytes: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            framing: Framing::LengthPrefixed,
             telemetry: TcpTelemetry::Disabled,
         }
     }
@@ -93,7 +108,9 @@ pub enum TcpEvent<'a> {
     Accepted { group: TcpGroup, token: Token, peer_addr: SocketAddr },
     /// A persistent outbound endpoint established a connection.
     Connected { group: TcpGroup, token: Token, peer_addr: SocketAddr },
-    /// A complete framed message was received.
+    /// A complete length-prefixed message or a raw read chunk was received.
+    /// For raw groups, chunks do not preserve message boundaries and `send_ts`
+    /// is the local receive time.
     Message { group: TcpGroup, token: Token, payload: &'a [u8], send_ts: Nanos },
     /// An established connection was closed.
     Disconnected { group: TcpGroup, token: Token, peer_addr: SocketAddr },
@@ -129,12 +146,13 @@ struct Connection {
     peer_addr: SocketAddr,
     kind: ConnectionKind,
     state: ConnectionState,
+    close_when_drained: bool,
     timers: Option<NetworkTimers>,
 }
 
 #[derive(Clone, Copy)]
 struct NetworkTimers {
-    latency: Timer,
+    latency: Option<Timer>,
     alloc: Timer,
 }
 
@@ -144,11 +162,13 @@ impl NetworkTimers {
         group_name: &str,
         token: Token,
         peer_addr: SocketAddr,
+        framing: Framing,
     ) -> Option<Self> {
         let TcpTelemetry::Enabled { app_name } = telemetry else { return None };
         let label = format!("{group_name}-{}-{peer_addr}", token.0);
         Some(Self {
-            latency: Timer::new(app_name, format!("tcp_latency_{label}")),
+            latency: (framing == Framing::LengthPrefixed)
+                .then(|| Timer::new(app_name, format!("tcp_latency_{label}"))),
             alloc: Timer::new(app_name, format!("tcp_alloc_{label}")),
         })
     }
@@ -213,13 +233,15 @@ impl NetworkState {
         assert!(group.0 < self.groups.len(), "unknown TCP group");
         let token = self.next_token();
         let config = self.config(group);
-        let timers = NetworkTimers::new(config.telemetry, config.name, token, peer_addr);
+        let timers =
+            NetworkTimers::new(config.telemetry, config.name, token, peer_addr, config.framing);
         self.connections.push(Connection {
             token,
             group,
             peer_addr,
             kind: ConnectionKind::Outbound,
             state: ConnectionState::Disconnected,
+            close_when_drained: false,
             timers,
         });
         self.start_connect(self.connections.len() - 1);
@@ -346,10 +368,18 @@ impl NetworkState {
 
         let mut stream = FramedStream::new(socket, token, peer_addr, config.max_frame_size);
         if let Some(message) = config.on_connect_msg.as_deref() {
-            let mut header = [0; FRAME_HEADER_SIZE];
-            write_frame_header(&mut header, message.len(), Nanos::now());
-            if stream.write_frame(self.poll.registry(), &header, message, config, &mut timers) ==
-                StreamState::Disconnected
+            let header = (config.framing == Framing::LengthPrefixed).then(|| {
+                let mut header = [0; FRAME_HEADER_SIZE];
+                write_frame_header(&mut header, message.len(), Nanos::now());
+                header
+            });
+            if stream.write_frame(
+                self.poll.registry(),
+                header.as_ref(),
+                message,
+                config,
+                &mut timers,
+            ) == StreamState::Disconnected
             {
                 stream.close(self.poll.registry());
                 self.connections[index].timers = timers;
@@ -408,15 +438,23 @@ impl NetworkState {
                     continue;
                 }
 
-                let mut timers =
-                    NetworkTimers::new(config.telemetry, config.name, token, peer_addr);
+                let mut timers = NetworkTimers::new(
+                    config.telemetry,
+                    config.name,
+                    token,
+                    peer_addr,
+                    config.framing,
+                );
                 let mut stream = FramedStream::new(socket, token, peer_addr, config.max_frame_size);
                 if let Some(message) = config.on_connect_msg.as_deref() {
-                    let mut header = [0; FRAME_HEADER_SIZE];
-                    write_frame_header(&mut header, message.len(), Nanos::now());
+                    let header = (config.framing == Framing::LengthPrefixed).then(|| {
+                        let mut header = [0; FRAME_HEADER_SIZE];
+                        write_frame_header(&mut header, message.len(), Nanos::now());
+                        header
+                    });
                     if stream.write_frame(
                         self.poll.registry(),
-                        &header,
+                        header.as_ref(),
                         message,
                         config,
                         &mut timers,
@@ -435,6 +473,7 @@ impl NetworkState {
                 peer_addr,
                 kind: ConnectionKind::Accepted,
                 state: ConnectionState::Connected(stream),
+                close_when_drained: false,
                 timers,
             });
             info!(group = group_name, %peer_addr, "tcp connection accepted");
@@ -469,20 +508,25 @@ impl NetworkState {
         let group = self.connections[index].group;
         let peer_addr = self.connections[index].peer_addr;
         let config = &self.groups[group.0].config;
-        let connection = &mut self.connections[index];
-        let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
-        let state = stream.poll_with(
-            self.poll.registry(),
-            event,
-            config,
-            &mut connection.timers,
-            &mut |payload, send_ts| {
-                handler(TcpEvent::Message { group, token, payload, send_ts });
-            },
-        );
+        let (state, queue_empty) = {
+            let connection = &mut self.connections[index];
+            let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
+            let state = stream.poll_with(
+                self.poll.registry(),
+                event,
+                config,
+                &mut connection.timers,
+                &mut |payload, send_ts| {
+                    handler(TcpEvent::Message { group, token, payload, send_ts });
+                },
+            );
+            (state, stream.send_queue.is_empty())
+        };
         if state == StreamState::Disconnected {
             handler(TcpEvent::Disconnected { group, token, peer_addr });
             self.disconnect_index(index, false);
+        } else if self.connections[index].close_when_drained && queue_empty {
+            self.disconnect_index(index, true);
         }
     }
 
@@ -510,6 +554,7 @@ impl NetworkState {
             peer_addr: self.connections[index].peer_addr,
         };
         let kind = self.connections[index].kind;
+        self.connections[index].close_when_drained = false;
         let was_connected = self.close_connection_socket(index);
         if kind == ConnectionKind::Accepted {
             self.connections.swap_remove(index);
@@ -543,7 +588,8 @@ impl NetworkState {
             return false;
         }
         if self.send_payload.len() > config.max_frame_size ||
-            u32::try_from(self.send_payload.len()).is_err()
+            (config.framing == Framing::LengthPrefixed &&
+                u32::try_from(self.send_payload.len()).is_err())
         {
             error!(
                 group = config.name,
@@ -554,7 +600,9 @@ impl NetworkState {
             self.send_payload.clear();
             return false;
         }
-        write_frame_header(&mut self.send_header, self.send_payload.len(), Nanos::now());
+        if config.framing == Framing::LengthPrefixed {
+            write_frame_header(&mut self.send_header, self.send_payload.len(), Nanos::now());
+        }
         true
     }
 
@@ -563,7 +611,9 @@ impl NetworkState {
         F: FnOnce(&mut Vec<u8>),
     {
         let Some(index) = self.connections.iter().position(|connection| {
-            connection.token == token && matches!(connection.state, ConnectionState::Connected(_))
+            connection.token == token &&
+                !connection.close_when_drained &&
+                matches!(connection.state, ConnectionState::Connected(_))
         }) else {
             return false;
         };
@@ -574,9 +624,10 @@ impl NetworkState {
         let config = &self.groups[group.0].config;
         let connection = &mut self.connections[index];
         let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
+        let header = (config.framing == Framing::LengthPrefixed).then_some(&self.send_header);
         let state = stream.write_frame(
             self.poll.registry(),
-            &self.send_header,
+            header,
             &self.send_payload,
             config,
             &mut connection.timers,
@@ -596,7 +647,9 @@ impl NetworkState {
             return 0;
         }
         if !self.connections.iter().any(|connection| {
-            connection.group == group && matches!(connection.state, ConnectionState::Connected(_))
+            connection.group == group &&
+                !connection.close_when_drained &&
+                matches!(connection.state, ConnectionState::Connected(_))
         }) {
             return 0;
         }
@@ -609,6 +662,7 @@ impl NetworkState {
         while index != 0 {
             index -= 1;
             if self.connections[index].group != group ||
+                self.connections[index].close_when_drained ||
                 !matches!(self.connections[index].state, ConnectionState::Connected(_))
             {
                 continue;
@@ -620,9 +674,11 @@ impl NetworkState {
                 let ConnectionState::Connected(stream) = &mut connection.state else {
                     unreachable!()
                 };
+                let header =
+                    (config.framing == Framing::LengthPrefixed).then_some(&self.send_header);
                 stream.write_frame(
                     self.poll.registry(),
-                    &self.send_header,
+                    header,
                     &self.send_payload,
                     config,
                     &mut connection.timers,
@@ -644,6 +700,21 @@ impl NetworkState {
             return false;
         }
         self.disconnect_index(index, true);
+        true
+    }
+
+    fn disconnect_when_drained(&mut self, token: Token) -> bool {
+        let Some(index) = self.connections.iter().position(|connection| connection.token == token)
+        else {
+            return false;
+        };
+        let ConnectionState::Connected(stream) = &self.connections[index].state else {
+            return false;
+        };
+        if stream.send_queue.is_empty() {
+            return self.disconnect(token);
+        }
+        self.connections[index].close_when_drained = true;
         true
     }
 
@@ -681,10 +752,12 @@ impl TcpNetwork {
     #[must_use = "the group handle identifies listeners and outbound endpoints"]
     pub fn add_group(&mut self, config: TcpGroupConfig) -> TcpGroup {
         assert!(config.max_frame_size > 0, "max_frame_size must be nonzero");
-        assert!(
-            u32::try_from(config.max_frame_size).is_ok(),
-            "max_frame_size exceeds the TCP wire length field"
-        );
+        if config.framing == Framing::LengthPrefixed {
+            assert!(
+                u32::try_from(config.max_frame_size).is_ok(),
+                "max_frame_size exceeds the TCP wire length field"
+            );
+        }
         if let Some(message) = &config.on_connect_msg {
             assert!(!message.is_empty(), "on_connect_msg must be nonempty");
             assert!(
@@ -734,8 +807,10 @@ impl TcpNetwork {
         self.state.drain_pending_disconnects(&mut handler);
     }
 
-    /// Serializes and sends one frame to a connected token. The closure is not
-    /// called when the token is unknown or currently disconnected.
+    /// Serializes and sends one payload to a connected token. Length-prefixed
+    /// groups add a frame header; raw groups send the payload unchanged. The
+    /// closure is not called when the token is unknown or currently
+    /// disconnected.
     pub fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
     where
         F: FnOnce(&mut Vec<u8>),
@@ -743,8 +818,9 @@ impl TcpNetwork {
         self.state.send_with(token, serialise)
     }
 
-    /// Serializes one frame and sends it to every connected member of `group`.
-    /// Returns the number of recipients attempted.
+    /// Serializes one payload and sends it to every connected member of
+    /// `group`. Length-prefixed groups add a frame header; raw groups send
+    /// the payload unchanged. Returns the number of recipients attempted.
     pub fn broadcast_with<F>(&mut self, group: TcpGroup, serialise: F) -> usize
     where
         F: FnOnce(&mut Vec<u8>),
@@ -757,6 +833,14 @@ impl TcpNetwork {
     /// the token identified an active socket.
     pub fn disconnect(&mut self, token: Token) -> bool {
         self.state.disconnect(token)
+    }
+
+    /// Closes a connected socket after its queued bytes have been written.
+    /// Returns `false` for unknown or disconnected tokens; sends to a draining
+    /// token are rejected. A peer that never drains is bounded only by
+    /// `TCP_USER_TIMEOUT`.
+    pub fn disconnect_when_drained(&mut self, token: Token) -> bool {
+        self.state.disconnect_when_drained(token)
     }
 
     /// Permanently removes a connection or outbound endpoint. Returns whether
@@ -836,7 +920,23 @@ impl ByteQueue {
             flux_utils::safe_assert!(written < frame_len);
             return false;
         }
-        let additional = frame_len - written;
+        if written < FRAME_HEADER_SIZE {
+            self.append_remainder(&header[written..], payload)
+        } else {
+            self.append_remainder(&[], &payload[written - FRAME_HEADER_SIZE..])
+        }
+    }
+
+    fn append_raw_remainder(&mut self, payload: &[u8], written: usize) -> bool {
+        if written >= payload.len() {
+            flux_utils::safe_assert!(written < payload.len());
+            return false;
+        }
+        self.append_remainder(&[], &payload[written..])
+    }
+
+    fn append_remainder(&mut self, prefix: &[u8], payload: &[u8]) -> bool {
+        let additional = prefix.len() + payload.len();
         let old_capacity = self.bytes.capacity();
 
         if self.head != 0 && self.bytes.capacity() - self.bytes.len() < additional {
@@ -846,12 +946,8 @@ impl ByteQueue {
             self.head = 0;
         }
         self.bytes.reserve(additional);
-        if written < FRAME_HEADER_SIZE {
-            self.bytes.extend_from_slice(&header[written..]);
-            self.bytes.extend_from_slice(payload);
-        } else {
-            self.bytes.extend_from_slice(&payload[written - FRAME_HEADER_SIZE..]);
-        }
+        self.bytes.extend_from_slice(prefix);
+        self.bytes.extend_from_slice(payload);
         self.queued_since.get_or_insert_with(Instant::now);
         self.bytes.capacity() != old_capacity
     }
@@ -921,16 +1017,32 @@ impl FramedStream {
         F: for<'a> FnMut(&'a [u8], Nanos),
     {
         if event.is_readable() {
-            loop {
-                match self.read_frame(config.max_frame_size) {
-                    ReadOutcome::Message { payload, send_ts } => {
-                        if let Some(timers) = timers {
-                            timers.latency.emit_latency_from_nanos(send_ts, Nanos::now());
+            if config.framing == Framing::Raw {
+                loop {
+                    match self.socket.read(&mut self.rx_buffer) {
+                        Ok(0) => return StreamState::Disconnected,
+                        Ok(read) => on_message(&self.rx_buffer[..read], Nanos::now()),
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(err) => {
+                            debug!(?err, %self.peer_addr, "tcp raw read failed");
+                            return StreamState::Disconnected;
                         }
-                        on_message(payload, send_ts);
                     }
-                    ReadOutcome::WouldBlock => break,
-                    ReadOutcome::Disconnected => return StreamState::Disconnected,
+                }
+            } else {
+                loop {
+                    match self.read_frame(config.max_frame_size) {
+                        ReadOutcome::Message { payload, send_ts } => {
+                            if let Some(timers) = timers {
+                                if let Some(latency) = &mut timers.latency {
+                                    latency.emit_latency_from_nanos(send_ts, Nanos::now());
+                                }
+                            }
+                            on_message(payload, send_ts);
+                        }
+                        ReadOutcome::WouldBlock => break,
+                        ReadOutcome::Disconnected => return StreamState::Disconnected,
+                    }
                 }
             }
         }
@@ -1021,7 +1133,7 @@ impl FramedStream {
     fn write_frame(
         &mut self,
         registry: &Registry,
-        header: &[u8; FRAME_HEADER_SIZE],
+        header: Option<&[u8; FRAME_HEADER_SIZE]>,
         payload: &[u8],
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
@@ -1035,10 +1147,15 @@ impl FramedStream {
             }
         }
 
-        match self.socket.write_vectored(&[IoSlice::new(header.as_slice()), IoSlice::new(payload)])
-        {
+        let result = if let Some(header) = header {
+            self.socket.write_vectored(&[IoSlice::new(header.as_slice()), IoSlice::new(payload)])
+        } else {
+            self.socket.write(payload)
+        };
+        let total = header.map_or(payload.len(), |_| FRAME_HEADER_SIZE + payload.len());
+        match result {
             Ok(0) => StreamState::Disconnected,
-            Ok(written) if written == FRAME_HEADER_SIZE + payload.len() => StreamState::Alive,
+            Ok(written) if written == total => StreamState::Alive,
             Ok(written) => {
                 self.enqueue_remainder(registry, header, payload, written, config, timers)
             }
@@ -1055,18 +1172,18 @@ impl FramedStream {
     fn enqueue_remainder(
         &mut self,
         registry: &Registry,
-        header: &[u8; FRAME_HEADER_SIZE],
+        header: Option<&[u8; FRAME_HEADER_SIZE]>,
         payload: &[u8],
         written: usize,
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
     ) -> StreamState {
-        let frame_len = FRAME_HEADER_SIZE + payload.len();
-        if written >= frame_len {
-            flux_utils::safe_assert!(written < frame_len);
+        let total = header.map_or(payload.len(), |_| FRAME_HEADER_SIZE + payload.len());
+        if written >= total {
+            flux_utils::safe_assert!(written < total);
             return StreamState::Disconnected;
         }
-        let additional = frame_len - written;
+        let additional = total - written;
         if let Some(max) = config.max_backlog_bytes &&
             self.send_queue.would_exceed(additional, max)
         {
@@ -1083,7 +1200,11 @@ impl FramedStream {
         }
 
         let started = Nanos::now();
-        let allocated = self.send_queue.append_frame_remainder(header, payload, written);
+        let allocated = if let Some(header) = header {
+            self.send_queue.append_frame_remainder(header, payload, written)
+        } else {
+            self.send_queue.append_raw_remainder(payload, written)
+        };
         if allocated && let Some(timers) = timers {
             timers.alloc.emit_latency_from_nanos(started, Nanos::now());
         }
@@ -1167,6 +1288,17 @@ mod tests {
     }
 
     #[test]
+    fn byte_queue_preserves_raw_unwritten_suffix() {
+        let payload = [2; 16];
+
+        for written in [0, 3, 7] {
+            let mut queue = ByteQueue::default();
+            queue.append_raw_remainder(&payload, written);
+            assert_eq!(queue.remaining(), &payload[written..]);
+        }
+    }
+
+    #[test]
     fn byte_queue_compacts_consumed_prefix_before_growing() {
         let first_header = [1; FRAME_HEADER_SIZE];
         let first_payload = [2; 32];
@@ -1231,7 +1363,7 @@ mod tests {
         assert_eq!(
             stream.write_frame(
                 Poll::new().unwrap().registry(),
-                &header,
+                Some(&header),
                 &payload,
                 &config,
                 &mut None
