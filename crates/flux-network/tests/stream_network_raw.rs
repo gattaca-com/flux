@@ -9,11 +9,18 @@ use flux_network::stream::{ConnectionGroupConfig, Endpoint, Framing, StreamEvent
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
+}
+
+/// The TCP address a listener bound, port included.
+fn bound_addr(bound: Endpoint) -> SocketAddr {
+    match bound {
+        Endpoint::Tcp(addr) => addr,
+        Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
+    }
 }
 
 fn raw_group(name: &'static str) -> ConnectionGroupConfig {
@@ -23,10 +30,9 @@ fn raw_group(name: &'static str) -> ConnectionGroupConfig {
 #[test]
 fn raw_roundtrip() {
     let request = b"raw request bytes";
-    let addr = unused_addr();
     let mut network = StreamNetwork::default();
     let group = network.add_group(raw_group("raw-server"));
-    network.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -64,10 +70,9 @@ fn raw_roundtrip() {
 fn http_get_smoke() {
     let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-    let addr = unused_addr();
     let mut network = StreamNetwork::default();
     let group = network.add_group(raw_group("http"));
-    network.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -179,14 +184,12 @@ fn raw_outbound_connect() {
 
 #[test]
 fn framed_and_raw_coexist() {
-    let framed_addr = unused_addr();
-    let raw_addr = unused_addr();
     let mut server = StreamNetwork::default();
     let framed_server =
         server.add_group(ConnectionGroupConfig { name: "framed-server", ..Default::default() });
     let raw_server = server.add_group(raw_group("raw-server"));
-    server.listen(framed_server, Endpoint::Tcp(framed_addr)).unwrap();
-    server.listen(raw_server, Endpoint::Tcp(raw_addr)).unwrap();
+    let framed_addr = bound_addr(server.listen(framed_server, ephemeral()).unwrap());
+    let raw_addr = bound_addr(server.listen(raw_server, ephemeral()).unwrap());
 
     let mut framed_client = StreamNetwork::default();
     let framed_client_group = framed_client.add_group(ConnectionGroupConfig {
@@ -257,7 +260,6 @@ fn framed_and_raw_coexist() {
 
 #[test]
 fn raw_disconnect_when_drained_flushes_queue() {
-    let addr = unused_addr();
     let payload = vec![0xA5; 8 * 1024 * 1024];
     let mut network = StreamNetwork::default();
     let group = network.add_group(ConnectionGroupConfig {
@@ -267,7 +269,7 @@ fn raw_disconnect_when_drained_flushes_queue() {
         max_frame_size: payload.len(),
         ..ConnectionGroupConfig::default()
     });
-    network.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();

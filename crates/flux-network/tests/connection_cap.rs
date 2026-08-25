@@ -3,7 +3,7 @@
 
 use std::{
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr},
+    net::Ipv4Addr,
     thread,
     time::{Duration, Instant},
 };
@@ -20,21 +20,20 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST: &[u8] = b"GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
 const BODY: &[u8] = b"hello";
 
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
 }
 
-/// Runs one test body over both transports: a loopback TCP address on an
-/// ephemeral port, and a Unix-domain socket path under a temporary directory
-/// that lives for the duration of the run.
+/// Runs one test body over both transports: a loopback address whose port the
+/// listener's own bind decides, and a Unix-domain socket path under a
+/// temporary directory that lives for the duration of the run.
 macro_rules! over_both_transports {
     ($body:ident, $tcp:ident, $unix:ident) => {
         #[test]
         fn $tcp() {
-            $body(&Endpoint::Tcp(unused_addr()));
+            $body(&ephemeral());
         }
 
         #[test]
@@ -110,11 +109,16 @@ impl Server {
         }
     }
 
-    /// Adds a group and a listener for it.
-    fn listen(&mut self, config: ConnectionGroupConfig, endpoint: &Endpoint) -> ConnectionGroup {
+    /// Adds a group and a listener for it, reporting the group and the
+    /// endpoint the listener bound.
+    fn listen(
+        &mut self,
+        config: ConnectionGroupConfig,
+        endpoint: &Endpoint,
+    ) -> (ConnectionGroup, Endpoint) {
         let group = self.network.add_group(config);
-        self.network.listen(group, endpoint.clone()).unwrap();
-        group
+        let bound = self.network.listen(group, endpoint.clone()).unwrap();
+        (group, bound)
     }
 
     /// Runs one iteration of the network, recording what it delivers.
@@ -192,7 +196,8 @@ over_both_transports!(
 );
 fn a_client_arriving_at_the_cap_is_refused(endpoint: &Endpoint) {
     let mut server = Server::new();
-    let group = server.listen(capped_group("capped", 2), endpoint);
+    let (group, bound) = server.listen(capped_group("capped", 2), endpoint);
+    let endpoint = &bound;
 
     let mut first = connect_client(endpoint);
     let mut second = connect_client(endpoint);
@@ -216,7 +221,7 @@ over_both_transports!(
 fn a_draining_connection_holds_its_place(endpoint: &Endpoint) {
     let payload = vec![0x5A; 4 * 1024 * 1024];
     let mut server = Server::new();
-    let group = server.listen(
+    let (group, bound) = server.listen(
         ConnectionGroupConfig {
             socket_buf_size: Some(4096),
             max_frame_size: payload.len(),
@@ -225,6 +230,7 @@ fn a_draining_connection_holds_its_place(endpoint: &Endpoint) {
         },
         endpoint,
     );
+    let endpoint = &bound;
 
     let mut first = connect_client(endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
@@ -254,7 +260,8 @@ over_both_transports!(
 );
 fn a_half_closed_connection_holds_its_place(endpoint: &Endpoint) {
     let mut server = Server::new();
-    let group = server.listen(capped_group("half-closed", 1), endpoint);
+    let (group, bound) = server.listen(capped_group("half-closed", 1), endpoint);
+    let endpoint = &bound;
 
     let mut first = connect_client(endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
@@ -278,9 +285,8 @@ fn a_half_closed_connection_holds_its_place(endpoint: &Endpoint) {
 /// an edge-triggered listener is told about a pending connection once.
 #[test]
 fn a_refusal_leaves_none_of_the_backlog_unaccepted() {
-    let endpoint = Endpoint::Tcp(unused_addr());
     let mut server = Server::new();
-    let group = server.listen(capped_group("backlog", 1), &endpoint);
+    let (group, endpoint) = server.listen(capped_group("backlog", 1), &ephemeral());
 
     let _first = connect_client(&endpoint);
     server.wait_for_accepts(group, 1);
@@ -296,9 +302,8 @@ fn a_refusal_leaves_none_of_the_backlog_unaccepted() {
 
 #[test]
 fn a_closed_connection_frees_its_place() {
-    let endpoint = Endpoint::Tcp(unused_addr());
     let mut server = Server::new();
-    let group = server.listen(capped_group("freed", 1), &endpoint);
+    let (group, endpoint) = server.listen(capped_group("freed", 1), &ephemeral());
 
     let first = connect_client(&endpoint);
     server.wait_for_accepts(group, 1);
@@ -314,9 +319,8 @@ fn a_closed_connection_frees_its_place() {
 /// let the connection go rather than because the peer went.
 #[test]
 fn a_disconnected_connection_frees_its_place() {
-    let endpoint = Endpoint::Tcp(unused_addr());
     let mut server = Server::new();
-    let group = server.listen(capped_group("disconnected", 1), &endpoint);
+    let (group, endpoint) = server.listen(capped_group("disconnected", 1), &ephemeral());
 
     let _first = connect_client(&endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
@@ -332,9 +336,8 @@ fn a_disconnected_connection_frees_its_place() {
 /// place it held is freed by the removal itself.
 #[test]
 fn a_removed_connection_frees_its_place() {
-    let endpoint = Endpoint::Tcp(unused_addr());
     let mut server = Server::new();
-    let group = server.listen(capped_group("removed", 1), &endpoint);
+    let (group, endpoint) = server.listen(capped_group("removed", 1), &ephemeral());
 
     let _first = connect_client(&endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
@@ -348,11 +351,9 @@ fn a_removed_connection_frees_its_place() {
 
 #[test]
 fn the_cap_belongs_to_one_group() {
-    let capped_endpoint = Endpoint::Tcp(unused_addr());
-    let open_endpoint = Endpoint::Tcp(unused_addr());
     let mut server = Server::new();
-    let capped = server.listen(capped_group("capped", 1), &capped_endpoint);
-    let open = server.listen(raw_group("open"), &open_endpoint);
+    let (capped, capped_endpoint) = server.listen(capped_group("capped", 1), &ephemeral());
+    let (open, open_endpoint) = server.listen(raw_group("open"), &ephemeral());
 
     let _first = connect_client(&capped_endpoint);
     server.wait_for_accepts(capped, 1);
@@ -370,11 +371,9 @@ fn the_cap_belongs_to_one_group() {
 #[test]
 fn two_listeners_of_one_group_share_its_cap() {
     let dir = tempfile::tempdir().unwrap();
-    let tcp = Endpoint::Tcp(unused_addr());
-    let unix = Endpoint::Unix(dir.path().join("s"));
     let mut server = Server::new();
-    let group = server.listen(capped_group("shared", 1), &tcp);
-    server.network.listen(group, unix.clone()).unwrap();
+    let (group, tcp) = server.listen(capped_group("shared", 1), &ephemeral());
+    let unix = server.network.listen(group, Endpoint::Unix(dir.path().join("s"))).unwrap();
 
     let first = connect_client(&tcp);
     server.wait_for_accepts(group, 1);
@@ -393,21 +392,19 @@ fn two_listeners_of_one_group_share_its_cap() {
 
 #[test]
 fn an_outbound_endpoint_holds_no_place() {
-    let capped_endpoint = Endpoint::Tcp(unused_addr());
-    let remote_endpoint = Endpoint::Tcp(unused_addr());
     let mut server = Server::new();
-    let remote = server.listen(raw_group("remote"), &remote_endpoint);
-    let capped = server.listen(
+    let (remote, remote_endpoint) = server.listen(raw_group("remote"), &ephemeral());
+    let (capped, capped_endpoint) = server.listen(
         ConnectionGroupConfig {
             reconnect_interval: flux_timing::Duration::from_millis(1),
             ..capped_group("capped", 1)
         },
-        &capped_endpoint,
+        &ephemeral(),
     );
 
     // The capped group holds an outbound endpoint of its own: a connection
     // it made rather than accepted, which the cap counts for nothing.
-    let outbound = server.network.connect(capped, remote_endpoint.clone());
+    let outbound = server.network.connect(capped, remote_endpoint);
     server.wait_for_accepts(remote, 1);
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && !server.connected.contains(&outbound) {
@@ -446,7 +443,6 @@ fn serve(network: &mut StreamNetwork, service: &mut HttpService) {
 /// an `HttpService` never hears of the connection its group refused.
 #[test]
 fn an_http_service_serves_its_clients_while_the_cap_refuses_another() {
-    let endpoint = Endpoint::Tcp(unused_addr());
     let mut network = StreamNetwork::default();
     let group = network.add_group(ConnectionGroupConfig {
         name: "http",
@@ -456,7 +452,7 @@ fn an_http_service_serves_its_clients_while_the_cap_refuses_another() {
         ..ConnectionGroupConfig::default()
     });
     let mut service = HttpService::new(&mut network, group, HttpConfig::default());
-    service.listen(&mut network, endpoint.clone()).unwrap();
+    let endpoint = service.listen(&mut network, ephemeral()).unwrap();
 
     let mut served = [connect_client(&endpoint), connect_client(&endpoint)];
     let mut answers = [Vec::new(), Vec::new()];
@@ -520,11 +516,10 @@ fn drive_service(network: &mut StreamNetwork, service: &mut HttpService) -> bool
 /// `HttpService::close` is the public way to close a group.
 #[test]
 fn a_closed_group_frees_the_places_it_held() {
-    let endpoint = Endpoint::Tcp(unused_addr());
     let mut server = Server::new();
     let group = server.network.add_group(capped_group("closed", 1));
     let mut service = HttpService::new(&mut server.network, group, HttpConfig::default());
-    service.listen(&mut server.network, endpoint.clone()).unwrap();
+    let endpoint = service.listen(&mut server.network, ephemeral()).unwrap();
 
     let _first = connect_client(&endpoint);
     let deadline = Instant::now() + TIMEOUT;
@@ -548,8 +543,7 @@ fn a_closed_group_frees_the_places_it_held() {
 
     service.close(&mut server.network);
 
-    let reopened_endpoint = Endpoint::Tcp(unused_addr());
-    server.network.listen(group, reopened_endpoint.clone()).unwrap();
+    let reopened_endpoint = server.network.listen(group, ephemeral()).unwrap();
     let _client = connect_client(&reopened_endpoint);
     server.wait_for_accepts(group, 1);
     assert_eq!(server.refused(group), 1, "the group refused a client it had room for");

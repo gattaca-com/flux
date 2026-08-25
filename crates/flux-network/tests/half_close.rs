@@ -4,7 +4,7 @@
 use std::{
     cell::Cell,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr},
+    net::Ipv4Addr,
     thread,
     time::{Duration, Instant},
 };
@@ -19,21 +19,20 @@ const INBOUND: &[u8] = b"sent after the end of the stream";
 const BROADCAST: &[u8] = b"broadcast to the group";
 const RECONNECTED: &[u8] = b"sent after the reconnect";
 
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
 }
 
-/// Runs one test body over both transports: a loopback TCP address on an
-/// ephemeral port, and a Unix-domain socket path under a temporary directory
-/// that lives for the duration of the run.
+/// Runs one test body over both transports: a loopback address whose port the
+/// listener's own bind decides, and a Unix-domain socket path under a
+/// temporary directory that lives for the duration of the run.
 macro_rules! over_both_transports {
     ($body:ident, $tcp:ident, $unix:ident) => {
         #[test]
         fn $tcp() {
-            $body(&Endpoint::Tcp(unused_addr()));
+            $body(&ephemeral());
         }
 
         #[test]
@@ -67,12 +66,16 @@ fn raw_group(name: &'static str) -> ConnectionGroupConfig {
     ConnectionGroupConfig { name, framing: Framing::Raw, ..ConnectionGroupConfig::default() }
 }
 
-/// A listening network, and the group its connections belong to.
-fn server(endpoint: &Endpoint, config: ConnectionGroupConfig) -> (StreamNetwork, ConnectionGroup) {
+/// A listening network, the group its connections belong to, and the endpoint
+/// it bound: for a TCP request on port `0` that is where a client must dial.
+fn server(
+    endpoint: &Endpoint,
+    config: ConnectionGroupConfig,
+) -> (StreamNetwork, ConnectionGroup, Endpoint) {
     let mut network = StreamNetwork::default();
     let group = network.add_group(config);
-    network.listen(group, endpoint.clone()).unwrap();
-    (network, group)
+    let bound = network.listen(group, endpoint.clone()).unwrap();
+    (network, group, bound)
 }
 
 fn wait_for_accept(network: &mut StreamNetwork, group: ConnectionGroup) -> Token {
@@ -184,7 +187,8 @@ over_both_transports!(
     half_close_ends_the_stream_and_keeps_reading_unix
 );
 fn half_close_ends_the_stream_and_keeps_reading(endpoint: &Endpoint) {
-    let (mut network, group) = server(endpoint, raw_group("half-close"));
+    let (mut network, group, bound) = server(endpoint, raw_group("half-close"));
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = wait_for_accept(&mut network, group);
 
@@ -222,12 +226,13 @@ over_both_transports!(
 );
 fn queued_bytes_reach_the_peer_before_the_end_of_the_stream(endpoint: &Endpoint) {
     let payload = vec![0xA5; 4 * 1024 * 1024];
-    let (mut network, group) = server(endpoint, ConnectionGroupConfig {
+    let (mut network, group, bound) = server(endpoint, ConnectionGroupConfig {
         socket_buf_size: Some(4096),
         max_frame_size: payload.len(),
         backlog_warn_bytes: None,
         ..raw_group("half-close-drain")
     });
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = wait_for_accept(&mut network, group);
 
@@ -255,7 +260,8 @@ over_both_transports!(
     sends_after_the_half_close_are_refused_unix
 );
 fn sends_after_the_half_close_are_refused(endpoint: &Endpoint) {
-    let (mut network, group) = server(endpoint, raw_group("half-close-send"));
+    let (mut network, group, bound) = server(endpoint, raw_group("half-close-send"));
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = wait_for_accept(&mut network, group);
 
@@ -287,7 +293,8 @@ over_both_transports!(
     a_hard_close_after_the_half_close_ends_the_connection_unix
 );
 fn a_hard_close_after_the_half_close_ends_the_connection(endpoint: &Endpoint) {
-    let (mut network, group) = server(endpoint, raw_group("half-close-hard"));
+    let (mut network, group, bound) = server(endpoint, raw_group("half-close-hard"));
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = wait_for_accept(&mut network, group);
 
@@ -349,12 +356,13 @@ fn a_hard_close_asked_for_second_wins(endpoint: &Endpoint) {
 /// then the end of the stream, and the connection is gone.
 fn a_hard_close_wins(endpoint: &Endpoint, order: Order) {
     let payload = vec![0xC3; 4 * 1024 * 1024];
-    let (mut network, group) = server(endpoint, ConnectionGroupConfig {
+    let (mut network, group, bound) = server(endpoint, ConnectionGroupConfig {
         socket_buf_size: Some(4096),
         max_frame_size: payload.len(),
         backlog_warn_bytes: None,
         ..raw_group("both-closes")
     });
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = wait_for_accept(&mut network, group);
 
@@ -401,7 +409,8 @@ over_both_transports!(
     a_broadcast_passes_over_a_half_closed_member_unix
 );
 fn a_broadcast_passes_over_a_half_closed_member(endpoint: &Endpoint) {
-    let (mut network, group) = server(endpoint, raw_group("broadcast"));
+    let (mut network, group, bound) = server(endpoint, raw_group("broadcast"));
+    let endpoint = &bound;
     let mut open = connect_client(endpoint);
     let open_token = wait_for_accept(&mut network, group);
     let mut shut = connect_client(endpoint);
@@ -444,8 +453,8 @@ fn a_reconnect_opens_the_write_side_again(endpoint: &Endpoint) {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..raw_group("client")
     });
-    network.listen(server_group, endpoint.clone()).unwrap();
-    let outbound = network.connect(client_group, endpoint.clone());
+    let bound = network.listen(server_group, endpoint.clone()).unwrap();
+    let outbound = network.connect(client_group, bound);
 
     let mut events = Events::default();
     events.wait_until(

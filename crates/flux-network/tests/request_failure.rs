@@ -3,7 +3,7 @@
 
 use std::{
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr},
+    net::Ipv4Addr,
     os::unix::net::UnixListener,
     thread,
     time::{Duration, Instant},
@@ -17,12 +17,10 @@ use flux_network::{
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A loopback address no listener holds.
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
 }
 
 /// Runs one test body over both transports.
@@ -30,7 +28,7 @@ macro_rules! over_both_transports {
     ($body:ident, $tcp:ident, $unix:ident) => {
         #[test]
         fn $tcp() {
-            $body(&Endpoint::Tcp(unused_addr()));
+            $body(&ephemeral());
         }
 
         #[test]
@@ -58,6 +56,8 @@ impl<T: Read + Write> PeerStream for T {}
 struct Peer {
     listener: Listener,
     stream: Option<Box<dyn PeerStream>>,
+    /// The endpoint the listener bound, which is where the service dials.
+    endpoint: Endpoint,
 }
 
 enum Listener {
@@ -67,19 +67,20 @@ enum Listener {
 
 impl Peer {
     fn bind(endpoint: &Endpoint) -> Self {
-        let listener = match endpoint {
+        let (listener, endpoint) = match endpoint {
             Endpoint::Tcp(addr) => {
                 let listener = std::net::TcpListener::bind(addr).unwrap();
                 listener.set_nonblocking(true).unwrap();
-                Listener::Tcp(listener)
+                let bound = Endpoint::Tcp(listener.local_addr().unwrap());
+                (Listener::Tcp(listener), bound)
             }
             Endpoint::Unix(path) => {
                 let listener = UnixListener::bind(path).unwrap();
                 listener.set_nonblocking(true).unwrap();
-                Listener::Unix(listener)
+                (Listener::Unix(listener), Endpoint::Unix(path.clone()))
             }
         };
-        Self { listener, stream: None }
+        Self { listener, stream: None, endpoint }
     }
 
     /// Takes the connection waiting to be accepted, if there is one.
@@ -226,7 +227,7 @@ fn an_unanswered_request_times_out(endpoint: &Endpoint) {
     };
     let config = HttpConfig::default().with_request_timeout(Duration::from_millis(100).into());
     let mut peer = Peer::bind(endpoint);
-    let mut client = Client::build(endpoint, group, config);
+    let mut client = Client::build(&peer.endpoint, group, config);
     connect_and_request(&mut client, &mut peer);
 
     // The failure comes first, the close it causes second, and the endpoint
@@ -254,7 +255,7 @@ fn an_answer_within_the_deadline_clears_it(endpoint: &Endpoint) {
     let timeout = Duration::from_millis(100);
     let config = HttpConfig::default().with_request_timeout(timeout.into());
     let mut peer = Peer::bind(endpoint);
-    let mut client = Client::new(endpoint, config);
+    let mut client = Client::new(&peer.endpoint, config);
     connect_and_request(&mut client, &mut peer);
     peer.answer(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 
@@ -274,12 +275,11 @@ fn an_answer_within_the_deadline_clears_it(endpoint: &Endpoint) {
 fn the_deadline_runs_from_the_queued_request() {
     // A peer that never reads leaves the request queued behind a full socket,
     // so a clock started when the last byte left would never run at all.
-    let endpoint = Endpoint::Tcp(unused_addr());
     let group = ConnectionGroupConfig { socket_buf_size: Some(4096), ..raw_group() };
     let timeout = Duration::from_millis(150);
     let config = HttpConfig::default().with_request_timeout(timeout.into());
-    let mut peer = Peer::bind(&endpoint);
-    let mut client = Client::build(&endpoint, group, config);
+    let mut peer = Peer::bind(&ephemeral());
+    let mut client = Client::build(&peer.endpoint, group, config);
     run_until(
         &mut client,
         &mut peer,
@@ -308,7 +308,7 @@ fn assert_failure(
     reason: RequestFailure,
 ) {
     let mut peer = Peer::bind(endpoint);
-    let mut client = Client::new(endpoint, config);
+    let mut client = Client::new(&peer.endpoint, config);
     connect_and_request(&mut client, &mut peer);
     peer.answer(answer);
     if close {
@@ -379,7 +379,7 @@ over_both_transports!(
 fn an_endpoint_that_drops_with_nothing_in_flight_fails_nothing(endpoint: &Endpoint) {
     let config = HttpConfig::default().with_request_timeout(Duration::from_millis(100).into());
     let mut peer = Peer::bind(endpoint);
-    let mut client = Client::new(endpoint, config);
+    let mut client = Client::new(&peer.endpoint, config);
     run_until(
         &mut client,
         &mut peer,
@@ -409,7 +409,7 @@ fn an_answer_whose_head_is_over_the_cap_is_too_large() {
     answer.extend_from_slice(&[b'v'; 100]);
     answer.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
     assert_failure(
-        &Endpoint::Tcp(unused_addr()),
+        &ephemeral(),
         HttpConfig::default().with_max_head_bytes(64),
         &answer,
         false,
@@ -420,7 +420,7 @@ fn an_answer_whose_head_is_over_the_cap_is_too_large() {
 #[test]
 fn a_chunked_answer_over_the_cap_is_too_large() {
     assert_failure(
-        &Endpoint::Tcp(unused_addr()),
+        &ephemeral(),
         HttpConfig::default().with_max_body_bytes(8),
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n\
           xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n0\r\n\r\n",
@@ -434,7 +434,7 @@ fn an_answer_the_close_delimits_over_the_cap_is_too_large() {
     let mut answer = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
     answer.extend_from_slice(&[b'x'; 64]);
     assert_failure(
-        &Endpoint::Tcp(unused_addr()),
+        &ephemeral(),
         HttpConfig::default().with_max_body_bytes(8),
         &answer,
         true,
@@ -445,7 +445,7 @@ fn an_answer_the_close_delimits_over_the_cap_is_too_large() {
 #[test]
 fn a_chunk_the_service_cannot_size_is_malformed() {
     assert_failure(
-        &Endpoint::Tcp(unused_addr()),
+        &ephemeral(),
         HttpConfig::default(),
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nxx\r\n0\r\n\r\n",
         false,
@@ -461,7 +461,7 @@ fn an_answer_with_more_headers_than_the_parse_holds_is_malformed() {
     }
     answer.extend_from_slice(b"Content-Length: 0\r\n\r\n");
     assert_failure(
-        &Endpoint::Tcp(unused_addr()),
+        &ephemeral(),
         HttpConfig::default().with_max_headers(8),
         &answer,
         false,
@@ -472,7 +472,7 @@ fn an_answer_with_more_headers_than_the_parse_holds_is_malformed() {
 #[test]
 fn an_answer_framed_twice_over_is_malformed() {
     assert_failure(
-        &Endpoint::Tcp(unused_addr()),
+        &ephemeral(),
         HttpConfig::default(),
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         false,
@@ -482,8 +482,8 @@ fn an_answer_framed_twice_over_is_malformed() {
 
 #[test]
 fn a_blocking_drive_wakes_for_a_request_deadline() {
-    let addr = unused_addr();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
     // The peer accepts, answers nothing, and sends one byte three seconds
     // later. That byte is the test's own deadline: a drive that ignored the
     // request deadline wakes on it, well past the bound below, rather than
@@ -526,7 +526,7 @@ fn an_answer_whose_open_head_is_over_the_cap_is_too_large() {
     answer.extend_from_slice(&[b'v'; 100]);
     answer.extend_from_slice(b"\r\n");
     assert_failure(
-        &Endpoint::Tcp(unused_addr()),
+        &ephemeral(),
         HttpConfig::default().with_max_head_bytes(64),
         &answer,
         false,

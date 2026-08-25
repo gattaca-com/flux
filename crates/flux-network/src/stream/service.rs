@@ -161,11 +161,18 @@ mod tests {
         }
     }
 
-    fn unused_addr() -> SocketAddr {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        addr
+    /// A loopback endpoint whose port the kernel picks when the listener binds,
+    /// so no address is handed out before something holds it.
+    fn ephemeral() -> Endpoint {
+        Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
+    }
+
+    /// The TCP address a listener bound, port included.
+    fn bound_addr(bound: Endpoint) -> SocketAddr {
+        match bound {
+            Endpoint::Tcp(addr) => addr,
+            Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
+        }
     }
 
     fn raw_group(network: &mut StreamNetwork, name: &'static str) -> ConnectionGroup {
@@ -267,10 +274,8 @@ mod tests {
         let mut network = StreamNetwork::default();
         let owned = raw_group(&mut network, "owned");
         let raw = raw_group(&mut network, "raw");
-        let owned_addr = unused_addr();
-        let raw_addr = unused_addr();
-        network.listen(owned, Endpoint::Tcp(owned_addr)).unwrap();
-        network.listen(raw, Endpoint::Tcp(raw_addr)).unwrap();
+        let owned_addr = bound_addr(network.listen(owned, ephemeral()).unwrap());
+        let raw_addr = bound_addr(network.listen(raw, ephemeral()).unwrap());
         network.claim_group(owned);
         let mut probe = Probe::new(owned);
 
@@ -304,8 +309,7 @@ mod tests {
     fn a_disconnect_from_maintenance_reaches_the_service_before_its_tick() {
         let mut network = StreamNetwork::default();
         let group = raw_group(&mut network, "kicked");
-        let addr = unused_addr();
-        network.listen(group, Endpoint::Tcp(addr)).unwrap();
+        let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
         network.claim_group(group);
         let mut probe = Probe::new(group);
         let client = StdTcpStream::connect(addr).unwrap();
@@ -332,8 +336,7 @@ mod tests {
     fn an_external_tick_delivers_a_maintenance_disconnect_before_the_tick() {
         let (mut external, mut network) = External::build();
         let group = raw_group(&mut network, "kicked");
-        let addr = unused_addr();
-        network.listen(group, Endpoint::Tcp(addr)).unwrap();
+        let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
         network.claim_group(group);
         let mut probe = Probe::new(group);
         let client = StdTcpStream::connect(addr).unwrap();
@@ -383,8 +386,7 @@ mod tests {
     fn work_is_reported_by_services_and_by_routed_events() {
         let mut network = StreamNetwork::default();
         let group = raw_group(&mut network, "work");
-        let addr = unused_addr();
-        network.listen(group, Endpoint::Tcp(addr)).unwrap();
+        let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
         network.claim_group(group);
         let mut probe = Probe::new(group);
 
@@ -447,7 +449,7 @@ mod tests {
     fn poll_with_never_blocks() {
         let mut network = StreamNetwork::default();
         let group = raw_group(&mut network, "raw");
-        network.listen(group, Endpoint::Tcp(unused_addr())).unwrap();
+        network.listen(group, ephemeral()).unwrap();
 
         let started = std::time::Instant::now();
         network.poll_with(|_| {});
@@ -458,8 +460,7 @@ mod tests {
     fn a_service_answers_the_bytes_the_network_lends_it() {
         let mut network = StreamNetwork::default();
         let group = raw_group(&mut network, "echo");
-        let addr = unused_addr();
-        network.listen(group, Endpoint::Tcp(addr)).unwrap();
+        let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
         network.claim_group(group);
         let mut probe = Probe::new(group);
         let mut client = StdTcpStream::connect(addr).unwrap();
