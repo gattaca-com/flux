@@ -75,11 +75,15 @@
 //! instead: its write side shuts once the response drains, so the peer reads
 //! the answer and then the end of the stream, while what it is still sending
 //! is read and discarded until it stops for [`Linger::idle`], until the
-//! linger has run for [`Linger::total`], or until it closes. A client whose
-//! upload meets a reset before it has read the reply reports a server that is
-//! down rather than the status it was sent; lingering is what puts a
-//! delivered `400` or `413` in front of it instead. [`HttpConfig::linger`]
-//! sets the caps, and `None` drains every closing response.
+//! linger has run for [`Linger::total`], or until it closes. Those caps
+//! govern the reading and discarding alone: until the answer has left, the
+//! connection is held to the same [`HttpConfig::idle_timeout`] as any other,
+//! so a peer that stops reading loses it as surely as one that stops
+//! sending. A client whose upload meets a reset before it has read the reply
+//! reports a server that is down rather than the status it was sent;
+//! lingering is what puts a delivered `400` or `413` in front of it instead.
+//! [`HttpConfig::linger`] sets the caps, and `None` drains every closing
+//! response.
 //!
 //! # Limitations
 //! HTTP/1.1 and HTTP/1.0 responses are supported. Request bodies require
@@ -1320,10 +1324,13 @@ impl private::ServiceDriver for HttpService {
         }
         if let Some(timeout) = self.config.idle_timeout {
             for conn in &self.conns {
-                // A lingering connection answers to the linger's caps alone,
-                // which are what an idle one costs while it is closing.
+                // A lingering connection answers to the linger's caps once
+                // they are running. Until the answer has left it is held to
+                // the same bound as any other, a draining one included: a
+                // peer that stops reading must not hold a connection open by
+                // never taking what it asked for.
                 if matches!(conn.role, Role::Accepted) &&
-                    !matches!(conn.state.phase, Phase::Lingering { .. }) &&
+                    !matches!(conn.state.phase, Phase::Lingering { clock: Some(_) }) &&
                     now.saturating_sub(conn.last_activity) >= timeout
                 {
                     net.disconnect(conn.token);
@@ -1374,13 +1381,11 @@ impl private::ServiceDriver for HttpService {
                 continue
             }
             let at = match conn.state.phase {
-                // A linger whose clock has yet to start needs no call of its
-                // own: the write it is waiting on is what wakes the poll.
-                Phase::Lingering { clock } => {
-                    clock.zip(self.config.linger).map(|(clock, linger)| {
-                        (clock.last_inbound + linger.idle).min(clock.since + linger.total)
-                    })
-                }
+                // A linger whose clock has yet to start keeps the sweep it
+                // has yet to be excused from.
+                Phase::Lingering { clock: Some(clock) } => self.config.linger.map(|linger| {
+                    (clock.last_inbound + linger.idle).min(clock.since + linger.total)
+                }),
                 _ => self.config.idle_timeout.map(|timeout| conn.last_activity + timeout),
             };
             next = fold(next, at);

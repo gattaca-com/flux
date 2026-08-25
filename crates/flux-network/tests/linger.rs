@@ -597,3 +597,44 @@ fn a_blocking_drive_wakes_for_the_idle_cap() {
     assert!(waited < Duration::from_secs(2), "the linger cap was not folded: {waited:?}");
     server.wait_until(|server| !server.disconnected.is_empty(), "the idle cap did not fire");
 }
+
+over_both_transports!(
+    an_undelivered_answer_is_swept,
+    an_undelivered_answer_is_swept_tcp,
+    an_undelivered_answer_is_swept_unix
+);
+fn an_undelivered_answer_is_swept(endpoint: &Endpoint) {
+    let body = vec![7; 4 * 1024 * 1024];
+    let timeout = Duration::from_millis(300);
+    let group = ConnectionGroupConfig { socket_buf_size: Some(16 * 1024), ..raw_group() };
+    let config = HttpConfig::default()
+        .with_max_head_bytes(64)
+        .with_max_body_bytes(64)
+        .with_idle_timeout(timeout.into())
+        .with_linger(linger(Duration::from_secs(5), Duration::from_secs(30)));
+    let mut server = Server::build(endpoint, group, config);
+    let mut client = connect_client(endpoint);
+    let token = server.accepted_token();
+    client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    server.wait_until(|server| !server.requests.is_empty(), "the request was not delivered");
+    client.write_all(&[b'x'; 256]).unwrap();
+    server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
+    server.pump_for(Duration::from_millis(20));
+    let answered = Instant::now();
+    assert!(server.respond(token, 200, &body));
+
+    // The peer takes none of the answer and sends nothing more, so the caps
+    // that time the reading and discarding never start. The sweep that holds
+    // every other connection holds this one.
+    server.wait_until(|server| !server.disconnected.is_empty(), "the sweep left it open");
+    let waited = answered.elapsed();
+    assert!(waited >= Duration::from_millis(200), "the connection went after {waited:?}");
+    assert!(waited < Duration::from_secs(2), "the sweep did not run: {waited:?}");
+
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while !read_available(&mut *client, &mut received) {
+        assert!(Instant::now() < deadline, "the connection was not closed");
+    }
+    assert!(received.len() < body.len(), "a peer that read nothing was sent the whole answer");
+}
