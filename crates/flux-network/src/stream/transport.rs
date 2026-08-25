@@ -1,8 +1,11 @@
 use std::{
     io::{self, IoSlice, Read, Write},
     net::Shutdown,
-    os::fd::{AsRawFd, RawFd},
-    path::PathBuf,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::fs::FileTypeExt as _,
+    },
+    path::{Path, PathBuf},
 };
 
 use mio::{Interest, Registry, Token, event::Source, net};
@@ -85,11 +88,70 @@ pub(crate) struct UnixListenSocket {
 }
 
 impl UnixListenSocket {
-    /// Binds a listener at `path`.
+    /// Binds a listener at `path`, replacing a socket file that a process
+    /// which did not clean up left behind.
+    ///
+    /// See [`clear_stale_socket`] for what an occupied path does.
     fn bind(path: PathBuf) -> io::Result<Self> {
+        clear_stale_socket(&path)?;
         let socket = net::UnixListener::bind(&path)?;
         Ok(Self { socket, path })
     }
+}
+
+/// Frees `path` for a bind, removing it when it holds a socket no process
+/// listens on and erroring when it holds anything a bind must not disturb.
+///
+/// The path is inspected with `lstat` and never followed: an object that is
+/// not a socket — a regular file, a directory, a symbolic link even to a
+/// socket — stays where it is and the bind fails with `AlreadyExists`. A
+/// socket is then probed with a connect; a refused connection means no
+/// process is listening, so the file is a stale remnant and is unlinked,
+/// while a connection that succeeds means a live server owns the path and the
+/// bind fails with `AddrInUse`. The `lstat` is what makes the unlink safe:
+/// connecting to a regular file is refused too, so the probe alone says
+/// nothing about what the path holds.
+///
+/// The probe is nonblocking, so an owner that has stopped accepting is
+/// reported rather than waited for: a full accept queue answers `WouldBlock`,
+/// which is as much a live owner as a completed connection is.
+fn clear_stale_socket(path: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(about(&err, path, "couldn't inspect")),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a socket", path.display()),
+        ));
+    }
+    match net::UnixStream::connect(path) {
+        Ok(_) => Err(in_use(path)),
+        Err(err)
+            if err.kind() == io::ErrorKind::WouldBlock ||
+                err.raw_os_error() == Some(libc::EINPROGRESS) =>
+        {
+            Err(in_use(path))
+        }
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => std::fs::remove_file(path)
+            .map_err(|err| about(&err, path, "couldn't remove the stale socket")),
+        Err(err) => Err(about(&err, path, "couldn't probe")),
+    }
+}
+
+/// The error for a path a live process is listening on.
+fn in_use(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!("{} belongs to a listening process", path.display()),
+    )
+}
+
+/// Restates `err` with the path it is about, keeping its kind.
+fn about(err: &io::Error, path: &Path, doing: &str) -> io::Error {
+    io::Error::new(err.kind(), format!("{doing} {}: {err}", path.display()))
 }
 
 impl Drop for UnixListenSocket {
