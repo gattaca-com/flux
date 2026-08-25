@@ -1095,6 +1095,12 @@ impl NetworkState {
         true
     }
 
+    fn write_side_shut(&self, token: Token) -> bool {
+        self.connections
+            .iter()
+            .any(|connection| connection.token == token && connection.write_side == WriteSide::Shut)
+    }
+
     /// Shuts the write side of a connected socket, which stays registered and
     /// readable: the peer reads the end of the stream, and what it sends
     /// afterwards still arrives.
@@ -1680,6 +1686,18 @@ impl StreamNetwork {
     /// by `TCP_USER_TIMEOUT`; a Unix-domain peer has no such bound.
     pub fn shutdown_write_when_drained(&mut self, token: Token) -> bool {
         self.state.shutdown_write_when_drained(token)
+    }
+
+    /// Whether the write side of a connection has shut: the peer has the
+    /// whole of what was queued for it, and the end of the stream after it.
+    ///
+    /// A connection still writing what [`Self::shutdown_write_when_drained`]
+    /// will end — and one that never asked for a half-close, or that closed
+    /// or was never known — reports `false`. A caller timing what follows the
+    /// half-close starts its clock when this turns `true`.
+    #[must_use]
+    pub fn write_side_shut(&self, token: Token) -> bool {
+        self.state.write_side_shut(token)
     }
 
     /// How many connections `group` refused since it was added because it

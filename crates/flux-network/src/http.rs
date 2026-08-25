@@ -356,7 +356,24 @@ enum Phase {
     /// Answered with a close over a request stream cut short: the write side
     /// shuts once the response is written, and what the peer sends is read
     /// and discarded until a cap or the peer itself ends the connection.
-    Lingering { since: Instant, last_inbound: Instant },
+    ///
+    /// The clock starts where the answer ends, so it is absent while the
+    /// response is still on its way to the peer.
+    Lingering { clock: Option<LingerClock> },
+}
+
+/// When a lingering connection began reading and discarding, and when it
+/// last read anything: what [`Linger::total`] and [`Linger::idle`] measure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LingerClock {
+    since: Instant,
+    last_inbound: Instant,
+}
+
+impl LingerClock {
+    fn started(at: Instant) -> Self {
+        Self { since: at, last_inbound: at }
+    }
 }
 
 enum Role {
@@ -1208,8 +1225,10 @@ impl HttpService {
         // A lingering connection reads its peer out rather than resetting it,
         // and owes an answer to nothing it reads: the bytes are dropped where
         // they arrive, and only the moment they arrived is kept.
-        if let Phase::Lingering { last_inbound, .. } = &mut conn.state.phase {
-            *last_inbound = Instant::now();
+        if let Phase::Lingering { clock } = &mut conn.state.phase {
+            if let Some(clock) = clock {
+                clock.last_inbound = Instant::now();
+            }
             return
         }
         if conn.state.phase == Phase::Draining || conn.over_limit {
@@ -1274,6 +1293,7 @@ impl private::ServiceDriver for HttpService {
             if !conn.over_limit || conn.ready {
                 continue
             }
+            let accepted = matches!(conn.role, Role::Accepted);
             match conn.state.phase {
                 // A full buffer is no verdict on a request already delivered.
                 // The response the caller is producing still goes out, and
@@ -1285,6 +1305,12 @@ impl private::ServiceDriver for HttpService {
                     state.close = true;
                     state.framing_lost = true;
                 }
+                // The head of whatever the client is sending was dropped at
+                // the limit, which is the framing loss every other head too
+                // large for the service answers with.
+                Phase::Idle if accepted => self.error(net, index, 431),
+                // An endpoint that overruns the limit is told nothing: what
+                // the service owes it is the request it already sent.
                 Phase::Idle => {
                     self.conns[index].over_limit = false;
                     net.disconnect(self.conns[index].token);
@@ -1316,12 +1342,24 @@ impl private::ServiceDriver for HttpService {
             net.disconnect(token);
         }
         if let Some(linger) = self.config.linger {
-            for conn in &self.conns {
-                if let Phase::Lingering { since, last_inbound } = conn.state.phase &&
-                    (now.saturating_sub(last_inbound) >= linger.idle ||
-                        now.saturating_sub(since) >= linger.total)
+            for index in 0..self.conns.len() {
+                let token = self.conns[index].token;
+                let shut = net.write_side_shut(token);
+                let Phase::Lingering { clock } = &mut self.conns[index].state.phase else {
+                    continue
+                };
+                // Until the peer has the whole answer there is nothing to
+                // cap: what bounds a connection still writing is its
+                // transport, as it is for one that is draining.
+                let clock = match *clock {
+                    Some(clock) => clock,
+                    None if shut => *clock.insert(LingerClock::started(now)),
+                    None => continue,
+                };
+                if now.saturating_sub(clock.last_inbound) >= linger.idle ||
+                    now.saturating_sub(clock.since) >= linger.total
                 {
-                    net.disconnect(conn.token);
+                    net.disconnect(token);
                 }
             }
         }
@@ -1336,10 +1374,13 @@ impl private::ServiceDriver for HttpService {
                 continue
             }
             let at = match conn.state.phase {
-                Phase::Lingering { since, last_inbound } => self
-                    .config
-                    .linger
-                    .map(|linger| (last_inbound + linger.idle).min(since + linger.total)),
+                // A linger whose clock has yet to start needs no call of its
+                // own: the write it is waiting on is what wakes the poll.
+                Phase::Lingering { clock } => {
+                    clock.zip(self.config.linger).map(|(clock, linger)| {
+                        (clock.last_inbound + linger.idle).min(clock.since + linger.total)
+                    })
+                }
                 _ => self.config.idle_timeout.map(|timeout| conn.last_activity + timeout),
             };
             next = fold(next, at);
@@ -1465,9 +1506,12 @@ fn respond_to(
             // The peer is still sending a request stream this response ends.
             // Shutting the write side alone puts the answer in front of it
             // before the connection goes.
-            let now = Instant::now();
-            state.phase = Phase::Lingering { since: now, last_inbound: now };
             net.shutdown_write_when_drained(token);
+            // The caps time what follows the answer, so they start where the
+            // answer ends: here when nothing was queued behind it, and at the
+            // tick that sees the write side shut otherwise.
+            let clock = net.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
+            state.phase = Phase::Lingering { clock };
         } else {
             state.phase = Phase::Draining;
             net.disconnect_when_drained(token);

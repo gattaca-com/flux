@@ -106,6 +106,9 @@ struct Server {
     accepted: Vec<Token>,
     disconnected: Vec<Token>,
     requests: Vec<Token>,
+    /// The body every request is answered with where it is delivered,
+    /// leaving nothing for the test to answer by token.
+    inline_answer: Option<Vec<u8>>,
 }
 
 impl Server {
@@ -121,6 +124,7 @@ impl Server {
             accepted: Vec::new(),
             disconnected: Vec::new(),
             requests: Vec::new(),
+            inline_answer: None,
         }
     }
 
@@ -131,16 +135,29 @@ impl Server {
     /// One iteration: drive the network, then pull every protocol event.
     /// Requests are left for the test to answer by token.
     fn pump(&mut self) {
-        let Self { net, service, accepted, disconnected, requests, .. } = self;
+        let Self { net, service, accepted, disconnected, requests, inline_answer, .. } = self;
         net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
         while let Some(event) = service.next_event(net) {
             match event {
                 HttpEvent::Accepted { token, .. } => accepted.push(token),
                 HttpEvent::Disconnected { token } => disconnected.push(token),
-                HttpEvent::Request { token, .. } => requests.push(token),
+                HttpEvent::Request { token, responder, .. } => {
+                    requests.push(token);
+                    if let Some(body) = inline_answer {
+                        assert!(responder.respond(200, &[], body), "the inline answer was refused");
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// One iteration the poll may block in, and how long it waited.
+    fn drive_blocking(&mut self) -> Duration {
+        let Self { net, service, .. } = self;
+        let started = Instant::now();
+        net.drive(None, &mut [service.as_service()], |_| {});
+        started.elapsed()
     }
 
     /// Pumps until `done` holds, failing with `what` at the deadline.
@@ -451,4 +468,132 @@ fn without_linger_an_error_response_closes(endpoint: &Endpoint) {
 
     server.read_to_end_of_stream(&mut *client);
     server.wait_until(|server| server.disconnected == [token], "the error response did not close");
+}
+
+#[test]
+fn the_caps_wait_for_the_answer_to_reach_the_peer() {
+    let idle = Duration::from_millis(200);
+    let body = vec![7; 16 * 1024 * 1024];
+    let group = ConnectionGroupConfig { socket_buf_size: Some(16 * 1024), ..raw_group() };
+    let config = HttpConfig::default()
+        .with_max_head_bytes(64)
+        .with_max_body_bytes(64)
+        .with_linger(linger(idle, TIMEOUT * 3));
+    let endpoint = Endpoint::Tcp(unused_addr());
+    let mut server = Server::build(&endpoint, group, config);
+    let mut client = connect_client(&endpoint);
+    let token = server.accepted_token();
+    client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    server.wait_until(|server| !server.requests.is_empty(), "the request was not delivered");
+    client.write_all(&[b'x'; 256]).unwrap();
+    server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
+    server.pump_for(Duration::from_millis(20));
+    assert!(server.respond(token, 200, &body));
+
+    // An answer larger than the socket takes many writes to deliver, and the
+    // peer reads none of it for twice the idle cap.
+    server.pump_for(idle * 2);
+    assert!(server.disconnected.is_empty(), "the caps ran while the answer was still queued");
+
+    // All of it reaches the peer, and the end of the stream after it.
+    let received = server.read_to_end_of_stream(&mut *client);
+    let head = head_of(&received);
+    assert!(head.contains(&format!("Content-Length: {}", body.len())), "{head}");
+    assert!(head.contains("Connection: close"), "{head}");
+    assert_eq!(received.len(), head.len() + 4 + body.len(), "the answer was cut short");
+    assert!(received.ends_with(&body[body.len() - 1024..]), "the answer arrived corrupted");
+
+    // Only now do the caps run: the peer holds the connection open and sends
+    // nothing, and the idle cap ends it.
+    let delivered = Instant::now();
+    server.wait_until(|server| !server.disconnected.is_empty(), "the idle cap did not fire");
+    assert!(delivered.elapsed() >= idle / 2, "the cap fired after {:?}", delivered.elapsed());
+}
+
+/// A request of exactly the buffer limit: a 64-byte head and a 64-byte body,
+/// so the byte after it is the one the limit drops.
+fn request_of_the_whole_limit() -> Vec<u8> {
+    let mut request =
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 64\r\nXpad: xxxxxxxx\r\n\r\n".to_vec();
+    assert_eq!(request.len(), 64, "the head must fill its own cap");
+    request.extend_from_slice(&[b'b'; 64]);
+    request
+}
+
+#[test]
+fn an_inline_answer_at_the_limit_closes_like_a_deferred_one() {
+    assert_eq!(
+        over_the_limit_at_a_request_boundary(true),
+        over_the_limit_at_a_request_boundary(false)
+    );
+}
+
+/// Answers a request that ends exactly at the buffer limit, inline or by
+/// token, and reports what the peer read before the end of the stream.
+fn over_the_limit_at_a_request_boundary(inline: bool) -> String {
+    let config = HttpConfig::default()
+        .with_max_head_bytes(64)
+        .with_max_body_bytes(64)
+        .with_linger(linger(TIMEOUT * 3, TIMEOUT * 6));
+    let endpoint = Endpoint::Tcp(unused_addr());
+    let mut server = Server::new(&endpoint, config);
+    if inline {
+        server.inline_answer = Some(b"ok".to_vec());
+    }
+    let mut client = connect_client(&endpoint);
+    let token = server.accepted_token();
+    let mut request = request_of_the_whole_limit();
+    // The byte past the limit is dropped, so the client is mid-stream from
+    // here on however the request before it was answered.
+    request.push(b'x');
+    client.write_all(&request).unwrap();
+    server.wait_until(|server| !server.requests.is_empty(), "the request was not delivered");
+    if !inline {
+        assert!(server.respond(token, 200, b"ok"));
+    }
+
+    let received = server.read_to_end_of_stream(&mut *client);
+    // The peer is told what happened rather than reset, and the connection
+    // reads it out afterwards.
+    client.write_all(&[b'x'; 4096]).unwrap();
+    server.pump_for(Duration::from_millis(20));
+    assert!(server.disconnected.is_empty(), "the connection closed without lingering");
+    String::from_utf8(received).unwrap()
+}
+
+#[test]
+fn an_over_limit_request_boundary_is_answered() {
+    let received = over_the_limit_at_a_request_boundary(true);
+    assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+    assert!(received.contains("Connection: keep-alive\r\n"), "{received}");
+    assert!(received.contains("HTTP/1.1 431 Request Header Fields Too Large\r\n"), "{received}");
+    assert!(received.ends_with("Connection: close\r\n\r\n"), "{received}");
+}
+
+#[test]
+fn a_blocking_drive_wakes_for_the_idle_cap() {
+    let idle = Duration::from_millis(500);
+    let config = small_heads().without_idle_timeout().with_linger(linger(idle, TIMEOUT * 3));
+    let addr = unused_addr();
+    let endpoint = Endpoint::Tcp(addr);
+    let mut server = Server::new(&endpoint, config);
+    let mut client = connect_client(&endpoint);
+    server.accepted_token();
+    client.write_all(b"nope\r\n\r\n").unwrap();
+    let received = server.read_to_end_of_stream(&mut *client);
+    assert!(head_of(&received).starts_with("HTTP/1.1 400 "));
+
+    // The answer shut the write side as it was written, so the linger's clock
+    // is running and its idle cap is the only deadline the network has: an
+    // uncapped drive waits for it and no longer. The late connection is the
+    // test's own deadline: a drive that ignored the cap would wake on it
+    // instead, well past the bound below, rather than hang.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        drop(std::net::TcpStream::connect(addr));
+    });
+    let waited = server.drive_blocking();
+    assert!(waited >= Duration::from_millis(100), "returned at once: {waited:?}");
+    assert!(waited < Duration::from_secs(2), "the linger cap was not folded: {waited:?}");
+    server.wait_until(|server| !server.disconnected.is_empty(), "the idle cap did not fire");
 }
