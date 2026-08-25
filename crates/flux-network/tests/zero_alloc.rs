@@ -112,9 +112,6 @@ impl Harness {
     /// A service listening for `client` and connected to `upstream`, with both
     /// connections established.
     fn build(deadline: Instant) -> Self {
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let serve_addr = probe.local_addr().unwrap();
-        drop(probe);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let upstream_addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -128,7 +125,8 @@ impl Harness {
             ..ConnectionGroupConfig::default()
         });
         let mut service = HttpService::new(&mut net, group, HttpConfig::default());
-        service.listen(&mut net, Endpoint::Tcp(serve_addr)).unwrap();
+        let serving = service.listen(&mut net, Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into()));
+        let Endpoint::Tcp(serve_addr) = serving.unwrap() else { unreachable!("a TCP listener") };
         let upstream_token = service.connect(&mut net, Endpoint::Tcp(upstream_addr));
 
         let client = TcpStream::connect(serve_addr).unwrap();

@@ -1,8 +1,6 @@
 use std::{
-    collections::BTreeSet,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
-    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -17,25 +15,17 @@ use flux_network::{
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A loopback address no listener holds.
-///
-/// The probe binding is released before the address is handed out, so a port
-/// this run has already given away must never be given away again: the kernel
-/// reuses a released ephemeral port readily, and two tests binding one port is
-/// a failure that has nothing to do with what they test. Ports that collide
-/// stay bound until a fresh one is found, which is what makes the kernel offer
-/// another.
-fn unused_addr() -> SocketAddr {
-    static TAKEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-    let mut probes = Vec::new();
-    loop {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        if TAKEN.lock().unwrap().insert(addr.port()) {
-            return addr;
-        }
-        probes.push(listener);
-        assert!(probes.len() < 64, "no free loopback port");
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
+}
+
+/// The TCP address a listener bound, port included.
+fn bound_addr(bound: Endpoint) -> SocketAddr {
+    match bound {
+        Endpoint::Tcp(addr) => addr,
+        Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
     }
 }
 
@@ -149,8 +139,10 @@ impl Http {
         driver.iterate(net, &mut [service.as_service()], |_| {})
     }
 
-    fn listen(&mut self, endpoint: &Endpoint) {
-        self.service.listen(&mut self.net, endpoint.clone()).unwrap();
+    /// Listens, and reports the endpoint bound: for a TCP request on port
+    /// `0` that is the address a client must dial.
+    fn listen(&mut self, endpoint: &Endpoint) -> Endpoint {
+        self.service.listen(&mut self.net, endpoint.clone()).unwrap()
     }
 
     fn connect(&mut self, endpoint: Endpoint) -> Token {
@@ -197,14 +189,14 @@ impl Http {
     }
 }
 
-/// Runs one test body over both transports: a loopback TCP address on an
-/// ephemeral port, and a Unix-domain socket path under a temporary directory
-/// that lives for the duration of the run.
+/// Runs one test body over both transports: a loopback address whose port the
+/// listener's own bind decides, and a Unix-domain socket path under a
+/// temporary directory that lives for the duration of the run.
 macro_rules! over_both_transports {
     ($body:ident, $tcp:ident, $unix:ident) => {
         #[test]
         fn $tcp() {
-            $body(&Endpoint::Tcp(unused_addr()));
+            $body(&ephemeral());
         }
 
         #[test]
@@ -221,12 +213,12 @@ macro_rules! over_transports_and_modes {
     ($body:ident, $tcp:ident, $tcp_external:ident, $unix:ident, $unix_external:ident) => {
         #[test]
         fn $tcp() {
-            $body(Mode::Owned, &Endpoint::Tcp(unused_addr()));
+            $body(Mode::Owned, &ephemeral());
         }
 
         #[test]
         fn $tcp_external() {
-            $body(Mode::External, &Endpoint::Tcp(unused_addr()));
+            $body(Mode::External, &ephemeral());
         }
 
         #[test]
@@ -306,19 +298,20 @@ fn response_len(bytes: &[u8]) -> Option<usize> {
     (bytes.len() >= head + length).then_some(head + length)
 }
 
-fn server_at(endpoint: &Endpoint) -> Http {
+fn server_at(endpoint: &Endpoint) -> (Http, Endpoint) {
     server_at_in(Mode::Owned, endpoint)
 }
 
-fn server_at_in(mode: Mode, endpoint: &Endpoint) -> Http {
+fn server_at_in(mode: Mode, endpoint: &Endpoint) -> (Http, Endpoint) {
     let mut server = Http::new_in(mode);
-    server.listen(endpoint);
-    server
+    let bound = server.listen(endpoint);
+    (server, bound)
 }
 
 fn server() -> (Http, SocketAddr) {
-    let addr = unused_addr();
-    (server_at(&Endpoint::Tcp(addr)), addr)
+    let mut server = Http::new();
+    let addr = bound_addr(server.listen(&ephemeral()));
+    (server, addr)
 }
 
 over_transports_and_modes!(
@@ -329,7 +322,8 @@ over_transports_and_modes!(
     get_keepalive_two_requests_unix_external
 );
 fn get_keepalive_two_requests(mode: Mode, endpoint: &Endpoint) {
-    let mut server = server_at_in(mode, endpoint);
+    let (mut server, bound) = server_at_in(mode, endpoint);
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let deadline = Instant::now() + TIMEOUT;
     let mut first = Vec::new();
@@ -381,7 +375,8 @@ over_transports_and_modes!(
     post_echo_body_unix_external
 );
 fn post_echo_body(mode: Mode, endpoint: &Endpoint) {
-    let mut server = server_at_in(mode, endpoint);
+    let (mut server, bound) = server_at_in(mode, endpoint);
+    let endpoint = &bound;
     let body = vec![42; 4096];
     let mut client = connect_client(endpoint);
     client
@@ -462,13 +457,12 @@ fn post_binary_body_lone_lf() {
 
 #[test]
 fn connection_close_large_body() {
-    let addr = unused_addr();
     let mut server = Http::build(
         Mode::Owned,
         ConnectionGroupConfig { socket_buf_size: Some(1024), ..http_group() },
         HttpConfig::default(),
     );
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
     let body = vec![7; 256 * 1024];
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -498,11 +492,10 @@ fn limits_and_errors() {
         (b"nope\r\n\r\n".as_slice(), 400),
         (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(), 501),
     ] {
-        let addr = unused_addr();
         let mut server = Http::with_config(
             HttpConfig::default().with_max_head_bytes(64).with_max_body_bytes(8),
         );
-        server.listen(&Endpoint::Tcp(addr));
+        let addr = bound_addr(server.listen(&ephemeral()));
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client.set_nonblocking(true).unwrap();
         client.write_all(request).unwrap();
@@ -574,7 +567,7 @@ fn respond_with_frames_the_body_the_closure_writes() {
 fn a_slice_answer_after_a_composed_one_carries_only_its_own_body() {
     let dir = tempfile::tempdir().unwrap();
     let endpoint = Endpoint::Unix(dir.path().join("s"));
-    let mut server = server_at(&endpoint);
+    let (mut server, endpoint) = server_at(&endpoint);
     let mut client = connect_client(&endpoint);
     client
         .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -742,7 +735,8 @@ over_transports_and_modes!(
     pipelined_requests_unix_external
 );
 fn pipelined_requests(mode: Mode, endpoint: &Endpoint) {
-    let mut server = server_at_in(mode, endpoint);
+    let (mut server, bound) = server_at_in(mode, endpoint);
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     client
         .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -776,7 +770,8 @@ over_transports_and_modes!(
     client_server_roundtrip_unix_external
 );
 fn client_server_roundtrip(mode: Mode, endpoint: &Endpoint) {
-    let mut server = server_at_in(mode, endpoint);
+    let (mut server, bound) = server_at_in(mode, endpoint);
+    let endpoint = &bound;
     let mut client = Http::new_in(mode);
     let token = client.connect(endpoint.clone());
     let mut sent = false;
@@ -1128,11 +1123,10 @@ fn client_chunked_overflow() {
 
 #[test]
 fn idle_timeout_disconnects() {
-    let addr = unused_addr();
     let mut server = Http::with_config(
         HttpConfig::default().with_idle_timeout(Duration::from_millis(200).into()),
     );
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1176,14 +1170,13 @@ fn idle_timeout_disconnects() {
 
 #[test]
 fn pending_buffer_cap_waits_for_the_answer() {
-    let addr = unused_addr();
     let mut server = Http::with_config(
         HttpConfig::default()
             .with_max_head_bytes(64)
             .with_max_body_bytes(64)
             .with_idle_timeout(Duration::from_millis(200).into()),
     );
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -1324,9 +1317,8 @@ fn server_disconnect_kicks() {
 
 #[test]
 fn wrong_role_calls_return_false() {
-    let addr = unused_addr();
     let mut http = Http::new();
-    http.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(http.listen(&ephemeral()));
     let outbound = http.connect(Endpoint::Tcp(addr));
     let stream = std::net::TcpStream::connect(addr).unwrap();
     stream.set_nonblocking(true).unwrap();
@@ -1346,9 +1338,8 @@ fn wrong_role_calls_return_false() {
 
 #[test]
 fn single_instance_serves_itself() {
-    let addr = unused_addr();
     let mut http = Http::new();
-    http.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(http.listen(&ephemeral()));
     let outbound = http.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut sent = false;
@@ -1382,7 +1373,8 @@ over_both_transports!(
     outbound_host_header_names_the_endpoint_unix
 );
 fn outbound_host_header_names_the_endpoint(endpoint: &Endpoint) {
-    let mut server = server_at(endpoint);
+    let (mut server, bound) = server_at(endpoint);
+    let endpoint = &bound;
     let mut client = Http::new();
     let token = client.connect(endpoint.clone());
     let mut sent = false;
@@ -1418,7 +1410,8 @@ fn outbound_host_header_names_the_endpoint(endpoint: &Endpoint) {
 
 over_both_transports!(accepted_reports_peer, accepted_reports_peer_tcp, accepted_reports_peer_unix);
 fn accepted_reports_peer(endpoint: &Endpoint) {
-    let mut server = server_at(endpoint);
+    let (mut server, bound) = server_at(endpoint);
+    let endpoint = &bound;
     let _client = connect_client(endpoint);
     let mut accepted = None;
     let deadline = Instant::now() + TIMEOUT;
@@ -1487,7 +1480,7 @@ fn a_dropped_responder_answers_later_by_token() {
 fn a_refused_answer_composes_no_body() {
     let dir = tempfile::tempdir().unwrap();
     let endpoint = Endpoint::Unix(dir.path().join("s"));
-    let mut server = server_at(&endpoint);
+    let (mut server, endpoint) = server_at(&endpoint);
     let mut client = connect_client(&endpoint);
     client.write_all(b"GET /defer HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     let (token, _) = pull_deferred_request(&mut server);
@@ -1707,12 +1700,11 @@ fn a_second_response_to_one_request_is_refused() {
 
 #[test]
 fn answered_bytes_cost_the_connection_nothing() {
-    let addr = unused_addr();
     // Two of these requests together outgrow the limit; one at a time does
     // not, and an answered one costs nothing even before it is reclaimed.
     let mut server =
         Http::with_config(HttpConfig::default().with_max_head_bytes(64).with_max_body_bytes(0));
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     let request = padded_request("/first", 60);
@@ -1771,10 +1763,9 @@ fn padded_request(path: &str, size: usize) -> Vec<u8> {
 
 #[test]
 fn a_pending_request_survives_a_compaction() {
-    let addr = unused_addr();
     let mut server =
         Http::with_config(HttpConfig::default().with_max_head_bytes(256).with_max_body_bytes(0));
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     let mut pipelined = Vec::new();
@@ -1966,11 +1957,10 @@ fn a_request_split_across_reads_is_delivered_once_complete() {
 
 #[test]
 fn a_pending_request_reports_work_and_holds_off_the_sweep() {
-    let addr = unused_addr();
     let mut server = Http::with_config(
         HttpConfig::default().with_idle_timeout(Duration::from_millis(200).into()),
     );
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -2049,11 +2039,10 @@ fn work_is_reported_after_an_inline_answer_stops_the_pull() {
 
 #[test]
 fn a_blocking_drive_wakes_for_the_idle_sweep() {
-    let addr = unused_addr();
     let mut server = Http::with_config(
         HttpConfig::default().with_idle_timeout(Duration::from_millis(500).into()),
     );
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
     let _client = std::net::TcpStream::connect(addr).unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let mut accepted = false;
@@ -2080,9 +2069,8 @@ fn a_blocking_drive_wakes_for_the_idle_sweep() {
 
 #[test]
 fn a_blocking_drive_wakes_for_a_connection() {
-    let addr = unused_addr();
     let mut server = Http::with_config(HttpConfig::default().without_idle_timeout());
-    server.listen(&Endpoint::Tcp(addr));
+    let addr = bound_addr(server.listen(&ephemeral()));
 
     // Nothing is due, so an uncapped drive blocks until a client arrives. The
     // second connection is the test's own deadline: it wakes the poll even if
@@ -2182,10 +2170,8 @@ fn two_services_on_one_network_keep_their_own_events(mode: Mode) {
     let second_group = net.add_group(ConnectionGroupConfig { name: "second", ..http_group() });
     let mut first = HttpService::new(&mut net, first_group, HttpConfig::default());
     let mut second = HttpService::new(&mut net, second_group, HttpConfig::default());
-    let first_addr = unused_addr();
-    let second_addr = unused_addr();
-    first.listen(&mut net, Endpoint::Tcp(first_addr)).unwrap();
-    second.listen(&mut net, Endpoint::Tcp(second_addr)).unwrap();
+    let first_addr = bound_addr(first.listen(&mut net, ephemeral()).unwrap());
+    let second_addr = bound_addr(second.listen(&mut net, ephemeral()).unwrap());
 
     let mut to_first = std::net::TcpStream::connect(first_addr).unwrap();
     let mut to_second = std::net::TcpStream::connect(second_addr).unwrap();
@@ -2239,14 +2225,13 @@ fn close_returns_the_group_to_raw_use() {
     let other_group = net.add_group(http_group());
     let mut http = HttpService::new(&mut net, group, HttpConfig::default());
     let mut other = HttpService::new(&mut net, other_group, HttpConfig::default());
-    http.listen(&mut net, Endpoint::Tcp(unused_addr())).unwrap();
+    http.listen(&mut net, ephemeral()).unwrap();
     http.close(&mut net);
 
     // The remaining service alone passes validation.
     net.drive(Some(Duration::ZERO.into()), &mut [other.as_service()], |_| {});
 
-    let addr = unused_addr();
-    net.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(net.listen(group, ephemeral()).unwrap());
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.write_all(b"raw bytes").unwrap();
     let mut raw = Vec::new();
@@ -2316,7 +2301,7 @@ fn dropping_a_service_and_its_network_together_is_harmless() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
     let mut http = HttpService::new(&mut net, group, HttpConfig::default());
-    http.listen(&mut net, Endpoint::Tcp(unused_addr())).unwrap();
+    http.listen(&mut net, ephemeral()).unwrap();
     net.drive(Some(Duration::ZERO.into()), &mut [http.as_service()], |_| {});
     drop(http);
     drop(net);

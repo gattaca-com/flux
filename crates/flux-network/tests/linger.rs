@@ -28,12 +28,18 @@ const REJECTED: [(&[u8], u16); 4] = [
     (b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n", 413),
 ];
 
-/// A loopback address no listener holds.
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
+}
+
+/// The TCP address a listener bound, port included.
+fn bound_addr(bound: Endpoint) -> SocketAddr {
+    match bound {
+        Endpoint::Tcp(addr) => addr,
+        Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
+    }
 }
 
 /// Runs one test body over both transports.
@@ -41,7 +47,7 @@ macro_rules! over_both_transports {
     ($body:ident, $tcp:ident, $unix:ident) => {
         #[test]
         fn $tcp() {
-            $body(&Endpoint::Tcp(unused_addr()));
+            $body(&ephemeral());
         }
 
         #[test]
@@ -109,6 +115,8 @@ struct Server {
     /// The body every request is answered with where it is delivered,
     /// leaving nothing for the test to answer by token.
     inline_answer: Option<Vec<u8>>,
+    /// The endpoint the listener bound, which is where a client dials.
+    endpoint: Endpoint,
 }
 
 impl Server {
@@ -116,7 +124,7 @@ impl Server {
         let mut net = StreamNetwork::default();
         let group = net.add_group(group);
         let mut service = HttpService::new(&mut net, group, config);
-        service.listen(&mut net, endpoint.clone()).unwrap();
+        let endpoint = service.listen(&mut net, endpoint.clone()).unwrap();
         Self {
             net,
             service,
@@ -125,6 +133,7 @@ impl Server {
             disconnected: Vec::new(),
             requests: Vec::new(),
             inline_answer: None,
+            endpoint,
         }
     }
 
@@ -248,6 +257,8 @@ over_both_transports!(
 fn an_error_response_reaches_a_peer_that_is_still_sending(endpoint: &Endpoint) {
     for (request, status) in REJECTED {
         let mut server = Server::new(endpoint, small_heads());
+        let bound = server.endpoint.clone();
+        let endpoint = &bound;
         let mut client = connect_client(endpoint);
         server.accepted_token();
         client.write_all(request).unwrap();
@@ -278,6 +289,8 @@ fn a_lingering_connection_ends_at_the_peers_close(endpoint: &Endpoint) {
     // Caps far longer than the test: only the peer's close can end this.
     let config = small_heads().with_linger(linger(TIMEOUT * 3, TIMEOUT * 6));
     let mut server = Server::new(endpoint, config);
+    let bound = server.endpoint.clone();
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = server.accepted_token();
     client.write_all(b"nope\r\n\r\n").unwrap();
@@ -299,8 +312,8 @@ fn a_lingering_connection_ends_at_the_peers_close(endpoint: &Endpoint) {
 fn a_lingering_connection_ends_at_the_idle_cap() {
     let idle = Duration::from_millis(150);
     let config = small_heads().with_linger(linger(idle, TIMEOUT * 3));
-    let endpoint = Endpoint::Tcp(unused_addr());
-    let mut server = Server::new(&endpoint, config);
+    let mut server = Server::new(&ephemeral(), config);
+    let endpoint = server.endpoint.clone();
     let mut client = connect_client(&endpoint);
     server.accepted_token();
 
@@ -319,8 +332,8 @@ fn a_lingering_connection_ends_at_the_total_cap() {
     let idle = Duration::from_millis(150);
     let total = Duration::from_millis(600);
     let config = small_heads().with_linger(linger(idle, total));
-    let endpoint = Endpoint::Tcp(unused_addr());
-    let mut server = Server::new(&endpoint, config);
+    let mut server = Server::new(&ephemeral(), config);
+    let endpoint = server.endpoint.clone();
     let mut client = connect_client(&endpoint);
     server.accepted_token();
 
@@ -347,8 +360,8 @@ fn a_lingering_connection_outlives_a_shorter_idle_timeout() {
     let config = small_heads()
         .with_idle_timeout(Duration::from_millis(50).into())
         .with_linger(linger(TIMEOUT * 3, total));
-    let endpoint = Endpoint::Tcp(unused_addr());
-    let mut server = Server::new(&endpoint, config);
+    let mut server = Server::new(&ephemeral(), config);
+    let endpoint = server.endpoint.clone();
     let mut client = connect_client(&endpoint);
     server.accepted_token();
 
@@ -374,6 +387,8 @@ fn a_lingering_connection_holds_its_place(endpoint: &Endpoint) {
     let config = small_heads().with_linger(linger(TIMEOUT * 3, TIMEOUT * 6));
     let group = ConnectionGroupConfig { max_connections: Some(1), ..raw_group() };
     let mut server = Server::build(endpoint, group, config);
+    let bound = server.endpoint.clone();
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = server.accepted_token();
     client.write_all(b"nope\r\n\r\n").unwrap();
@@ -405,6 +420,8 @@ fn an_over_limit_pending_request_is_answered_before_the_linger(endpoint: &Endpoi
         .with_max_body_bytes(64)
         .with_linger(linger(TIMEOUT * 3, TIMEOUT * 6));
     let mut server = Server::new(endpoint, config);
+    let bound = server.endpoint.clone();
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = server.accepted_token();
     client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -440,6 +457,8 @@ fn a_completed_request_answered_with_close_drains(endpoint: &Endpoint) {
     // still be open when the assertion runs.
     let config = HttpConfig::default().with_linger(linger(TIMEOUT * 3, TIMEOUT * 6));
     let mut server = Server::new(endpoint, config);
+    let bound = server.endpoint.clone();
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = server.accepted_token();
     client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
@@ -460,6 +479,8 @@ over_both_transports!(
 fn an_http_1_0_request_is_answered_and_closed(endpoint: &Endpoint) {
     let config = HttpConfig::default().with_linger(linger(TIMEOUT * 3, TIMEOUT * 6));
     let mut server = Server::new(endpoint, config);
+    let bound = server.endpoint.clone();
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = server.accepted_token();
     client.write_all(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").unwrap();
@@ -479,6 +500,8 @@ over_both_transports!(
 );
 fn without_linger_an_error_response_closes(endpoint: &Endpoint) {
     let mut server = Server::new(endpoint, small_heads().without_linger());
+    let bound = server.endpoint.clone();
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = server.accepted_token();
     client.write_all(b"nope\r\n\r\n").unwrap();
@@ -496,8 +519,8 @@ fn the_caps_wait_for_the_answer_to_reach_the_peer() {
         .with_max_head_bytes(64)
         .with_max_body_bytes(64)
         .with_linger(linger(idle, TIMEOUT * 3));
-    let endpoint = Endpoint::Tcp(unused_addr());
-    let mut server = Server::build(&endpoint, group, config);
+    let mut server = Server::build(&ephemeral(), group, config);
+    let endpoint = server.endpoint.clone();
     let mut client = connect_client(&endpoint);
     let token = server.accepted_token();
     client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -558,8 +581,8 @@ fn over_the_limit_at_a_request_boundary(inline: bool, after_a_tick: bool) -> Str
         .with_max_head_bytes(64)
         .with_max_body_bytes(64)
         .with_linger(linger(TIMEOUT * 3, TIMEOUT * 6));
-    let endpoint = Endpoint::Tcp(unused_addr());
-    let mut server = Server::new(&endpoint, config);
+    let mut server = Server::new(&ephemeral(), config);
+    let endpoint = server.endpoint.clone();
     if inline {
         server.inline_answer = Some(b"ok".to_vec());
     }
@@ -600,9 +623,9 @@ fn an_over_limit_request_boundary_is_answered() {
 fn a_blocking_drive_wakes_for_the_idle_cap() {
     let idle = Duration::from_millis(500);
     let config = small_heads().without_idle_timeout().with_linger(linger(idle, TIMEOUT * 3));
-    let addr = unused_addr();
-    let endpoint = Endpoint::Tcp(addr);
-    let mut server = Server::new(&endpoint, config);
+    let mut server = Server::new(&ephemeral(), config);
+    let endpoint = server.endpoint.clone();
+    let addr = bound_addr(endpoint.clone());
     let mut client = connect_client(&endpoint);
     server.accepted_token();
     client.write_all(b"nope\r\n\r\n").unwrap();
@@ -639,6 +662,8 @@ fn an_undelivered_answer_is_swept(endpoint: &Endpoint) {
         .with_idle_timeout(timeout.into())
         .with_linger(linger(Duration::from_secs(5), Duration::from_secs(30)));
     let mut server = Server::build(endpoint, group, config);
+    let bound = server.endpoint.clone();
+    let endpoint = &bound;
     let mut client = connect_client(endpoint);
     let token = server.accepted_token();
     client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -669,14 +694,13 @@ fn an_undelivered_answer_is_swept(endpoint: &Endpoint) {
 fn the_caps_start_when_the_answer_has_left() {
     let idle = Duration::from_millis(200);
     let answer = vec![7; 256 * 1024];
-    let addr = unused_addr();
-    let endpoint = Endpoint::Tcp(addr);
     let group = ConnectionGroupConfig { socket_buf_size: Some(16 * 1024), ..raw_group() };
     let config = HttpConfig::default()
         .with_max_head_bytes(64)
         .with_max_body_bytes(64)
         .with_linger(linger(idle, TIMEOUT * 3));
-    let mut server = Server::build(&endpoint, group, config);
+    let mut server = Server::build(&ephemeral(), group, config);
+    let addr = bound_addr(server.endpoint.clone());
 
     // The peer sends more than the connection may hold and then reads nothing
     // for half a second. The answer is larger than the sockets between them

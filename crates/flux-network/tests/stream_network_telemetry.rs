@@ -13,11 +13,18 @@ use mio::Token;
 
 const APP_NAME: &str = "tcp-network-telemetry-reconnect-test";
 
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
+}
+
+/// The TCP address a listener bound, port included.
+fn bound_addr(bound: Endpoint) -> SocketAddr {
+    match bound {
+        Endpoint::Tcp(addr) => addr,
+        Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
+    }
 }
 
 fn process_mapping_count() -> usize {
@@ -55,7 +62,6 @@ fn outbound_endpoint_reuses_telemetry_mappings_across_reconnects() {
     let shmem = shmem_dir(APP_NAME);
     cleanup_shmem(&shmem);
 
-    let addr = unused_addr();
     let mut network = StreamNetwork::default();
     let server_group =
         network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
@@ -65,7 +71,7 @@ fn outbound_endpoint_reuses_telemetry_mappings_across_reconnects() {
         telemetry: TcpTelemetry::Enabled { app_name: APP_NAME },
         ..Default::default()
     });
-    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(network.listen(server_group, ephemeral()).unwrap());
     let client_token = network.connect(client_group, Endpoint::Tcp(addr));
 
     let mut server_token =

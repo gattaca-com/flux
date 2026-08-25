@@ -3,10 +3,9 @@
 //! refuses.
 
 use std::{
-    collections::BTreeSet,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -26,20 +25,17 @@ const TOKEN_BASE: Token = Token(1000);
 /// A token of the caller's own, for a source the network never sees.
 const FOREIGN: Token = Token(7);
 
-/// A loopback address no listener holds. The probe binding is released before
-/// the address is handed out, and a port this run has already given away is
-/// never given away again.
-fn unused_addr() -> SocketAddr {
-    static TAKEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-    let mut probes = Vec::new();
-    loop {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        if TAKEN.lock().unwrap().insert(addr.port()) {
-            return addr;
-        }
-        probes.push(listener);
-        assert!(probes.len() < 64, "no free loopback port");
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
+}
+
+/// The TCP address a listener bound, port included.
+fn bound_addr(bound: Endpoint) -> SocketAddr {
+    match bound {
+        Endpoint::Tcp(addr) => addr,
+        Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
     }
 }
 
@@ -120,12 +116,12 @@ fn response_len(bytes: &[u8]) -> Option<usize> {
     (bytes.len() >= head + length).then_some(head + length)
 }
 
-/// An HTTP service listening on `addr`, inside a network on the test's poll.
-fn served(ext: &mut External, addr: SocketAddr, config: HttpConfig) -> HttpService {
+/// A service serving on a port the kernel picked, and the address to dial it.
+fn served(ext: &mut External, config: HttpConfig) -> (HttpService, SocketAddr) {
     let group = ext.net.add_group(raw_group("http"));
     let mut http = HttpService::new(&mut ext.net, group, config);
-    http.listen(&mut ext.net, Endpoint::Tcp(addr)).unwrap();
-    http
+    let addr = bound_addr(http.listen(&mut ext.net, ephemeral()).unwrap());
+    (http, addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -134,8 +130,7 @@ fn served(ext: &mut External, addr: SocketAddr, config: HttpConfig) -> HttpServi
 #[test]
 fn an_external_network_serves_over_the_three_calls() {
     let mut ext = External::new();
-    let addr = unused_addr();
-    let mut http = served(&mut ext, addr, HttpConfig::default());
+    let (mut http, addr) = served(&mut ext, HttpConfig::default());
     let mut client = client_at(addr);
     client.write_all(b"GET /over-there HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
 
@@ -161,12 +156,11 @@ fn an_external_network_serves_over_the_three_calls() {
 #[test]
 fn a_foreign_source_keeps_its_events_and_its_connections() {
     let mut ext = External::new();
-    let addr = unused_addr();
-    let mut http = served(&mut ext, addr, HttpConfig::default());
+    let (mut http, addr) = served(&mut ext, HttpConfig::default());
 
     // A listener of the caller's own, on a token below the network's base.
-    let foreign_addr = unused_addr();
-    let mut foreign = mio::net::TcpListener::bind(foreign_addr).unwrap();
+    let mut foreign = mio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let foreign_addr = foreign.local_addr().unwrap();
     ext.poll.registry().register(&mut foreign, FOREIGN, Interest::READABLE).unwrap();
 
     let _to_foreign = client_at(foreign_addr);
@@ -220,8 +214,7 @@ fn a_foreign_event_is_handed_back_before_the_services_are_checked() {
 #[should_panic(expected = "service-owned group 0 has no service")]
 fn an_own_event_is_checked_against_the_services_before_it_is_routed() {
     let mut ext = External::new();
-    let addr = unused_addr();
-    let _http = served(&mut ext, addr, HttpConfig::default());
+    let (_http, addr) = served(&mut ext, HttpConfig::default());
     let _client = client_at(addr);
 
     // The listener becomes readable on a token of the network's own, and the
@@ -239,8 +232,7 @@ fn an_own_event_is_checked_against_the_services_before_it_is_routed() {
 #[test]
 fn a_tick_reports_a_request_no_one_pulled() {
     let mut ext = External::new();
-    let addr = unused_addr();
-    let mut http = served(&mut ext, addr, HttpConfig::default());
+    let (mut http, addr) = served(&mut ext, HttpConfig::default());
     let mut client = client_at(addr);
 
     let deadline = Instant::now() + TIMEOUT;
@@ -313,8 +305,7 @@ fn a_tick_attempts_the_reconnect_that_is_due() {
 fn a_late_event_for_a_gone_connection_is_still_ours() {
     let mut ext = External::new();
     let group = ext.net.add_group(raw_group("stale"));
-    let addr = unused_addr();
-    ext.net.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(ext.net.listen(group, ephemeral()).unwrap());
     let mut client = client_at(addr);
 
     let deadline = Instant::now() + TIMEOUT;
@@ -357,9 +348,8 @@ fn a_late_event_for_a_gone_connection_is_still_ours() {
 #[test]
 fn next_deadline_folds_the_services_idle_sweep() {
     let mut ext = External::new();
-    let addr = unused_addr();
     let idle = flux_timing::Duration::from_millis(500);
-    let mut http = served(&mut ext, addr, HttpConfig::default().with_idle_timeout(idle));
+    let (mut http, addr) = served(&mut ext, HttpConfig::default().with_idle_timeout(idle));
     assert!(
         ext.net.next_deadline(&[http.as_service()]).is_none(),
         "nothing is due before a connection exists"
@@ -402,8 +392,7 @@ fn next_deadline_validates_before_it_folds() {
 fn a_wake_returns_from_a_blocking_drive_without_work() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(raw_group("raw"));
-    let addr = unused_addr();
-    net.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(net.listen(group, ephemeral()).unwrap());
     // A waker delivers only while it is alive, so the test holds one end of
     // it for as long as the drive it wakes.
     let waker = Arc::new(net.waker().unwrap());
@@ -556,9 +545,9 @@ fn allocation_stops_below_the_reserved_waker_token() {
     let mut net =
         StreamNetwork::with_registry(poll.registry().try_clone().unwrap(), Token(usize::MAX - 1));
     let group = net.add_group(raw_group("edge"));
-    net.listen(group, Endpoint::Tcp(unused_addr())).unwrap();
+    net.listen(group, ephemeral()).unwrap();
     // The next token would be the one the waker reserves.
-    net.listen(group, Endpoint::Tcp(unused_addr())).unwrap();
+    net.listen(group, ephemeral()).unwrap();
 }
 
 #[test]
@@ -567,8 +556,7 @@ fn handle_event_delivers_the_disconnect_it_produced() {
     let group = ext
         .net
         .add_group(ConnectionGroupConfig { socket_buf_size: Some(1024), ..raw_group("drained") });
-    let addr = unused_addr();
-    ext.net.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(ext.net.listen(group, ephemeral()).unwrap());
     let mut client = client_at(addr);
 
     // No tick runs anywhere in this test: everything the network reports has

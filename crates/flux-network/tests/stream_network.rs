@@ -17,21 +17,28 @@ const REQUEST: &[u8] = b"request-payload";
 const RESPONSE: &[u8] = b"response-payload";
 const BATCH_MESSAGES: [&[u8]; 3] = [b"batch-one", b"batch-two", b"batch-three"];
 
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
 }
 
-/// Runs one test body over both transports: a loopback TCP address on an
-/// ephemeral port, and a Unix-domain socket path under a temporary directory
-/// that lives for the duration of the run.
+/// The TCP address a listener bound, port included.
+fn bound_addr(bound: Endpoint) -> SocketAddr {
+    match bound {
+        Endpoint::Tcp(addr) => addr,
+        Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
+    }
+}
+
+/// Runs one test body over both transports: a loopback address whose port the
+/// listener's own bind decides, and a Unix-domain socket path under a
+/// temporary directory that lives for the duration of the run.
 macro_rules! over_both_transports {
     ($body:ident, $tcp:ident, $unix:ident) => {
         #[test]
         fn $tcp() {
-            $body(&Endpoint::Tcp(unused_addr()));
+            $body(&ephemeral());
         }
 
         #[test]
@@ -99,7 +106,9 @@ fn groups_route_events_and_messages(endpoint: &Endpoint) {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..ConnectionGroupConfig::default()
     });
-    network.listen(server_group, endpoint.clone()).unwrap();
+    let bound = network.listen(server_group, endpoint.clone()).unwrap();
+    // A TCP listener on port 0 binds a port of the kernel's choosing.
+    let endpoint = &bound;
     let client_token = network.connect(client_group, endpoint.clone());
 
     let mut server_token = None;
@@ -386,7 +395,9 @@ over_both_transports!(
 fn partial_header_and_payload_are_not_delivered_early(endpoint: &Endpoint) {
     let mut network = StreamNetwork::default();
     let group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
-    network.listen(group, endpoint.clone()).unwrap();
+    let bound = network.listen(group, endpoint.clone()).unwrap();
+    // A TCP listener on port 0 binds a port of the kernel's choosing.
+    let endpoint = &bound;
 
     let mut peer = raw_peer(endpoint);
     let token = wait_for_accept(&mut network, group);
@@ -432,7 +443,9 @@ fn oversized_frame_disconnects_the_peer(endpoint: &Endpoint) {
         max_frame_size: 32,
         ..Default::default()
     });
-    network.listen(group, endpoint.clone()).unwrap();
+    let bound = network.listen(group, endpoint.clone()).unwrap();
+    // A TCP listener on port 0 binds a port of the kernel's choosing.
+    let endpoint = &bound;
 
     let mut peer = raw_peer(endpoint);
     let token = wait_for_accept(&mut network, group);
@@ -461,7 +474,6 @@ fn oversized_frame_disconnects_the_peer(endpoint: &Endpoint) {
 /// arranges through `SO_SNDBUF` on a TCP socket.
 #[test]
 fn hard_backlog_limit_disconnects_the_peer() {
-    let addr = unused_addr();
     let mut network = StreamNetwork::default();
     let server_group =
         network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
@@ -473,7 +485,7 @@ fn hard_backlog_limit_disconnects_the_peer() {
         max_frame_size: 2 * 1024 * 1024,
         ..Default::default()
     });
-    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(network.listen(server_group, ephemeral()).unwrap());
     let client_token = network.connect(client_group, Endpoint::Tcp(addr));
 
     let mut connected = false;
@@ -518,7 +530,9 @@ fn broadcast_serializes_once_for_multiple_connections(endpoint: &Endpoint) {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    network.listen(server_group, endpoint.clone()).unwrap();
+    let bound = network.listen(server_group, endpoint.clone()).unwrap();
+    // A TCP listener on port 0 binds a port of the kernel's choosing.
+    let endpoint = &bound;
     let _first_client = network.connect(client_group, endpoint.clone());
     let _second_client = network.connect(client_group, endpoint.clone());
 
@@ -580,7 +594,9 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect(endpoint: &End
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    network.listen(server_group, endpoint.clone()).unwrap();
+    let bound = network.listen(server_group, endpoint.clone()).unwrap();
+    // A TCP listener on port 0 binds a port of the kernel's choosing.
+    let endpoint = &bound;
     let client_token = network.connect(client_group, endpoint.clone());
 
     let mut server_token = None;
@@ -662,14 +678,13 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect(endpoint: &End
 /// TCP only: `TcpConnector` speaks TCP alone.
 #[test]
 fn stream_network_is_wire_compatible_with_tcp_connector() {
-    let addr = unused_addr();
     let mut network = StreamNetwork::default();
     let server_group = network.add_group(ConnectionGroupConfig {
         name: "network-server",
         on_connect_msg: Some(SERVER_HELLO.to_vec()),
         ..Default::default()
     });
-    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let addr = bound_addr(network.listen(server_group, ephemeral()).unwrap());
 
     let mut connector = TcpConnector::default();
     let connector_token = connector.connect(addr).expect("connector failed to connect");
@@ -714,10 +729,20 @@ fn stream_network_is_wire_compatible_with_tcp_connector() {
     assert!(contains(&connector_messages, RESPONSE));
 }
 
+/// A loopback address for the one listener this file cannot bind through the
+/// network: `TcpConnector::listen_at` takes an address and reports none back,
+/// so the port is chosen here and bound a moment later.
+fn probed_addr() -> SocketAddr {
+    let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    addr
+}
+
 /// TCP only: `TcpConnector` speaks TCP alone.
 #[test]
 fn stream_network_client_is_wire_compatible_with_tcp_connector_server() {
-    let addr = unused_addr();
+    let addr = probed_addr();
     let mut connector = TcpConnector::default().with_on_connect_msg(SERVER_HELLO.to_vec());
     connector.listen_at(addr).expect("connector failed to listen");
 
@@ -804,7 +829,9 @@ fn accepted_peer_identifies_the_transport(endpoint: &Endpoint) {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    network.listen(server_group, endpoint.clone()).unwrap();
+    let bound = network.listen(server_group, endpoint.clone()).unwrap();
+    // A TCP listener on port 0 binds a port of the kernel's choosing.
+    let endpoint = &bound;
     let client_token = network.connect(client_group, endpoint.clone());
 
     let mut accepted = None;

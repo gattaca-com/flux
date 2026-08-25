@@ -16,12 +16,18 @@ use flux_network::{
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A loopback address no listener holds.
-fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A loopback endpoint whose port the kernel picks when the listener binds,
+/// so no address is handed out before something holds it.
+fn ephemeral() -> Endpoint {
+    Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())
+}
+
+/// The TCP address a listener bound, port included.
+fn bound_addr(bound: Endpoint) -> SocketAddr {
+    match bound {
+        Endpoint::Tcp(addr) => addr,
+        Endpoint::Unix(path) => panic!("a TCP listener bound {}", path.display()),
+    }
 }
 
 /// A listening HTTP service, and the requests it has yet to answer.
@@ -34,7 +40,6 @@ struct Server {
 impl Server {
     /// A server on a fresh address, and a client connected to it.
     fn start() -> (Self, TcpStream) {
-        let addr = unused_addr();
         let mut net = StreamNetwork::default();
         let group = net.add_group(ConnectionGroupConfig {
             name: "status",
@@ -42,7 +47,7 @@ impl Server {
             ..ConnectionGroupConfig::default()
         });
         let mut service = HttpService::new(&mut net, group, HttpConfig::default());
-        service.listen(&mut net, Endpoint::Tcp(addr)).unwrap();
+        let addr = bound_addr(service.listen(&mut net, ephemeral()).unwrap());
         let client = TcpStream::connect(addr).unwrap();
         client.set_nonblocking(true).unwrap();
         (Self { net, service, requests: Vec::new() }, client)
