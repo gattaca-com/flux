@@ -6,8 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::tcp::{
-    PollEvent, SendBehavior, TcpConnector, TcpEvent, TcpGroupConfig, TcpNetwork,
+use flux_network::stream::{
+    ConnectionGroupConfig, PollEvent, SendBehavior, StreamEvent, StreamNetwork, TcpConnector,
 };
 
 const CLIENT_HELLO: &[u8] = b"client-hello";
@@ -26,12 +26,15 @@ fn contains(messages: &[Vec<u8>], expected: &[u8]) -> bool {
     messages.iter().any(|message| message == expected)
 }
 
-fn wait_for_accept(network: &mut TcpNetwork, group: flux_network::tcp::TcpGroup) -> mio::Token {
+fn wait_for_accept(
+    network: &mut StreamNetwork,
+    group: flux_network::stream::ConnectionGroup,
+) -> mio::Token {
     let mut accepted = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && accepted.is_none() {
         network.poll_with(|event| {
-            if let TcpEvent::Accepted { group: event_group, token, .. } = event {
+            if let StreamEvent::Accepted { group: event_group, token, .. } = event {
                 assert_eq!(event_group, group);
                 accepted = Some(token);
             }
@@ -52,17 +55,17 @@ fn encoded_frame(payload: &[u8]) -> Vec<u8> {
 #[test]
 fn groups_route_events_and_messages() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let server_group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let server_group = network.add_group(ConnectionGroupConfig {
         name: "server",
         on_connect_msg: Some(SERVER_HELLO.to_vec()),
-        ..TcpGroupConfig::default()
+        ..ConnectionGroupConfig::default()
     });
-    let client_group = network.add_group(TcpGroupConfig {
+    let client_group = network.add_group(ConnectionGroupConfig {
         name: "client",
         on_connect_msg: Some(CLIENT_HELLO.to_vec()),
         reconnect_interval: flux_timing::Duration::from_millis(1),
-        ..TcpGroupConfig::default()
+        ..ConnectionGroupConfig::default()
     });
     network.listen(server_group, addr).unwrap();
     let client_token = network.connect(client_group, addr);
@@ -74,23 +77,23 @@ fn groups_route_events_and_messages() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         network.poll_with(|event| match event {
-            TcpEvent::Accepted { group, token, .. } => {
+            StreamEvent::Accepted { group, token, .. } => {
                 assert_eq!(group, server_group);
                 server_token = Some(token);
             }
-            TcpEvent::Connected { group, token, .. } => {
+            StreamEvent::Connected { group, token, .. } => {
                 assert_eq!(group, client_group);
                 assert_eq!(token, client_token);
                 connected = true;
             }
-            TcpEvent::Message { group, payload, .. } if group == server_group => {
+            StreamEvent::Message { group, payload, .. } if group == server_group => {
                 server_messages.push(payload.to_vec());
             }
-            TcpEvent::Message { group, payload, .. } if group == client_group => {
+            StreamEvent::Message { group, payload, .. } if group == client_group => {
                 client_messages.push(payload.to_vec());
             }
-            TcpEvent::Disconnected { .. } => panic!("unexpected disconnect"),
-            TcpEvent::Message { group, .. } => panic!("message for unknown group {group:?}"),
+            StreamEvent::Disconnected { .. } => panic!("unexpected disconnect"),
+            StreamEvent::Message { group, .. } => panic!("message for unknown group {group:?}"),
         });
         if connected &&
             server_token.is_some() &&
@@ -110,7 +113,7 @@ fn groups_route_events_and_messages() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !contains(&server_messages, REQUEST) {
         network.poll_with(|event| {
-            if let TcpEvent::Message { group, payload, .. } = event {
+            if let StreamEvent::Message { group, payload, .. } = event {
                 assert_eq!(group, server_group);
                 server_messages.push(payload.to_vec());
             }
@@ -123,7 +126,7 @@ fn groups_route_events_and_messages() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !contains(&client_messages, RESPONSE) {
         network.poll_with(|event| {
-            if let TcpEvent::Message { group, payload, .. } = event {
+            if let StreamEvent::Message { group, payload, .. } = event {
                 assert_eq!(group, client_group);
                 client_messages.push(payload.to_vec());
             }
@@ -136,8 +139,8 @@ fn groups_route_events_and_messages() {
 #[test]
 fn partial_header_and_payload_are_not_delivered_early() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
+    let mut network = StreamNetwork::default();
+    let group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
     network.listen(group, addr).unwrap();
 
     let mut peer = std::net::TcpStream::connect(addr).unwrap();
@@ -149,8 +152,8 @@ fn partial_header_and_payload_are_not_delivered_early() {
         peer.write_all(chunk).unwrap();
         for _ in 0..5 {
             network.poll_with(|event| match event {
-                TcpEvent::Message { payload, .. } => messages.push(payload.to_vec()),
-                TcpEvent::Disconnected { .. } => panic!("peer disconnected unexpectedly"),
+                StreamEvent::Message { payload, .. } => messages.push(payload.to_vec()),
+                StreamEvent::Disconnected { .. } => panic!("peer disconnected unexpectedly"),
                 _ => {}
             });
             thread::sleep(Duration::from_millis(1));
@@ -162,7 +165,7 @@ fn partial_header_and_payload_are_not_delivered_early() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && messages.is_empty() {
         network.poll_with(|event| {
-            if let TcpEvent::Message { token: event_token, payload, .. } = event {
+            if let StreamEvent::Message { token: event_token, payload, .. } = event {
                 assert_eq!(event_token, token);
                 messages.push(payload.to_vec());
             }
@@ -175,8 +178,8 @@ fn partial_header_and_payload_are_not_delivered_early() {
 #[test]
 fn oversized_frame_disconnects_the_peer() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let group = network.add_group(ConnectionGroupConfig {
         name: "server",
         max_frame_size: 32,
         ..Default::default()
@@ -194,11 +197,11 @@ fn oversized_frame_disconnects_the_peer() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !disconnected {
         network.poll_with(|event| match event {
-            TcpEvent::Disconnected { token: event_token, .. } => {
+            StreamEvent::Disconnected { token: event_token, .. } => {
                 assert_eq!(event_token, token);
                 disconnected = true;
             }
-            TcpEvent::Message { .. } => panic!("oversized frame was delivered"),
+            StreamEvent::Message { .. } => panic!("oversized frame was delivered"),
             _ => {}
         });
         thread::sleep(Duration::from_millis(1));
@@ -209,9 +212,10 @@ fn oversized_frame_disconnects_the_peer() {
 #[test]
 fn hard_backlog_limit_disconnects_the_peer() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
-    let client_group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(ConnectionGroupConfig {
         name: "client",
         socket_buf_size: Some(1024),
         backlog_warn_bytes: None,
@@ -226,7 +230,7 @@ fn hard_backlog_limit_disconnects_the_peer() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !connected {
         network.poll_with(|event| {
-            if let TcpEvent::Connected { group, token, .. } = event {
+            if let StreamEvent::Connected { group, token, .. } = event {
                 assert_eq!(group, client_group);
                 assert_eq!(token, client_token);
                 connected = true;
@@ -240,7 +244,7 @@ fn hard_backlog_limit_disconnects_the_peer() {
 
     let mut disconnected = false;
     network.poll_with(|event| {
-        if let TcpEvent::Disconnected { group, token, .. } = event &&
+        if let StreamEvent::Disconnected { group, token, .. } = event &&
             group == client_group
         {
             assert_eq!(token, client_token);
@@ -253,9 +257,10 @@ fn hard_backlog_limit_disconnects_the_peer() {
 #[test]
 fn broadcast_serializes_once_for_multiple_connections() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
-    let client_group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(ConnectionGroupConfig {
         name: "clients",
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
@@ -269,16 +274,16 @@ fn broadcast_serializes_once_for_multiple_connections() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && (accepted != 2 || connected != 2) {
         network.poll_with(|event| match event {
-            TcpEvent::Accepted { group, .. } => {
+            StreamEvent::Accepted { group, .. } => {
                 assert_eq!(group, server_group);
                 accepted += 1;
             }
-            TcpEvent::Connected { group, .. } => {
+            StreamEvent::Connected { group, .. } => {
                 assert_eq!(group, client_group);
                 connected += 1;
             }
-            TcpEvent::Disconnected { .. } => panic!("unexpected disconnect"),
-            TcpEvent::Message { .. } => {}
+            StreamEvent::Disconnected { .. } => panic!("unexpected disconnect"),
+            StreamEvent::Message { .. } => {}
         });
         thread::sleep(Duration::from_millis(1));
     }
@@ -297,7 +302,7 @@ fn broadcast_serializes_once_for_multiple_connections() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && received != 2 {
         network.poll_with(|event| {
-            if let TcpEvent::Message { group, payload, .. } = event {
+            if let StreamEvent::Message { group, payload, .. } = event {
                 assert_eq!(group, client_group);
                 assert_eq!(payload, RESPONSE);
                 received += 1;
@@ -311,9 +316,10 @@ fn broadcast_serializes_once_for_multiple_connections() {
 #[test]
 fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
-    let client_group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(ConnectionGroupConfig {
         name: "client",
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
@@ -326,8 +332,8 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && (server_token.is_none() || !connected) {
         network.poll_with(|event| match event {
-            TcpEvent::Accepted { token, .. } => server_token = Some(token),
-            TcpEvent::Connected { token, .. } => {
+            StreamEvent::Accepted { token, .. } => server_token = Some(token),
+            StreamEvent::Connected { token, .. } => {
                 assert_eq!(token, client_token);
                 connected = true;
             }
@@ -341,7 +347,7 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !client_disconnected {
         network.poll_with(|event| {
-            if let TcpEvent::Disconnected { group, token, .. } = event &&
+            if let StreamEvent::Disconnected { group, token, .. } = event &&
                 group == client_group
             {
                 assert_eq!(token, client_token);
@@ -365,14 +371,14 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && (!reconnected || new_server_token.is_none()) {
         network.poll_with(|event| match event {
-            TcpEvent::Accepted { group, token, .. } if group == server_group => {
+            StreamEvent::Accepted { group, token, .. } if group == server_group => {
                 new_server_token = Some(token);
             }
-            TcpEvent::Connected { group, token, .. } if group == client_group => {
+            StreamEvent::Connected { group, token, .. } if group == client_group => {
                 assert_eq!(token, client_token);
                 reconnected = true;
             }
-            TcpEvent::Message { group, payload, .. } if group == server_group => {
+            StreamEvent::Message { group, payload, .. } if group == server_group => {
                 server_messages.push(payload.to_vec());
             }
             _ => {}
@@ -386,7 +392,7 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !contains(&server_messages, RESPONSE) {
         network.poll_with(|event| {
-            if let TcpEvent::Message { group, payload, .. } = event &&
+            if let StreamEvent::Message { group, payload, .. } = event &&
                 group == server_group
             {
                 server_messages.push(payload.to_vec());
@@ -398,10 +404,10 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
 }
 
 #[test]
-fn tcp_network_is_wire_compatible_with_tcp_connector() {
+fn stream_network_is_wire_compatible_with_tcp_connector() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let server_group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let server_group = network.add_group(ConnectionGroupConfig {
         name: "network-server",
         on_connect_msg: Some(SERVER_HELLO.to_vec()),
         ..Default::default()
@@ -422,10 +428,10 @@ fn tcp_network_is_wire_compatible_with_tcp_connector() {
         (!contains(&network_messages, REQUEST) || !contains(&connector_messages, SERVER_HELLO))
     {
         network.poll_with(|event| match event {
-            TcpEvent::Accepted { token, .. } => network_token = Some(token),
-            TcpEvent::Message { payload, .. } => network_messages.push(payload.to_vec()),
-            TcpEvent::Disconnected { .. } => panic!("network disconnected unexpectedly"),
-            TcpEvent::Connected { .. } => unreachable!(),
+            StreamEvent::Accepted { token, .. } => network_token = Some(token),
+            StreamEvent::Message { payload, .. } => network_messages.push(payload.to_vec()),
+            StreamEvent::Disconnected { .. } => panic!("network disconnected unexpectedly"),
+            StreamEvent::Connected { .. } => unreachable!(),
         });
         connector.poll_with(|event| {
             if let PollEvent::Message { payload, .. } = event {
@@ -452,13 +458,13 @@ fn tcp_network_is_wire_compatible_with_tcp_connector() {
 }
 
 #[test]
-fn tcp_network_client_is_wire_compatible_with_tcp_connector_server() {
+fn stream_network_client_is_wire_compatible_with_tcp_connector_server() {
     let addr = unused_addr();
     let mut connector = TcpConnector::default().with_on_connect_msg(SERVER_HELLO.to_vec());
     connector.listen_at(addr).expect("connector failed to listen");
 
-    let mut network = TcpNetwork::default();
-    let client_group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let client_group = network.add_group(ConnectionGroupConfig {
         name: "network-client",
         on_connect_msg: Some(CLIENT_HELLO.to_vec()),
         reconnect_interval: flux_timing::Duration::from_millis(1),
@@ -483,13 +489,13 @@ fn tcp_network_client_is_wire_compatible_with_tcp_connector_server() {
             PollEvent::Reconnect { .. } => unreachable!(),
         });
         network.poll_with(|event| match event {
-            TcpEvent::Connected { token, .. } => {
+            StreamEvent::Connected { token, .. } => {
                 assert_eq!(token, client_token);
                 connected = true;
             }
-            TcpEvent::Message { payload, .. } => network_messages.push(payload.to_vec()),
-            TcpEvent::Disconnected { .. } => panic!("network disconnected unexpectedly"),
-            TcpEvent::Accepted { .. } => unreachable!(),
+            StreamEvent::Message { payload, .. } => network_messages.push(payload.to_vec()),
+            StreamEvent::Disconnected { .. } => panic!("network disconnected unexpectedly"),
+            StreamEvent::Accepted { .. } => unreachable!(),
         });
         thread::sleep(Duration::from_millis(1));
     }
@@ -517,7 +523,7 @@ fn tcp_network_client_is_wire_compatible_with_tcp_connector_server() {
     while Instant::now() < deadline && !contains(&network_messages, RESPONSE) {
         connector.poll_with(|_| {});
         network.poll_with(|event| {
-            if let TcpEvent::Message { payload, .. } = event {
+            if let StreamEvent::Message { payload, .. } = event {
                 network_messages.push(payload.to_vec());
             }
         });

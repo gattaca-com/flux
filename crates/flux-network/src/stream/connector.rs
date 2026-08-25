@@ -6,9 +6,9 @@ use flux_utils::{DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
-use crate::tcp::{
+use crate::stream::{
     ConnState, TcpStream, TcpTelemetry, set_socket_buf_size,
-    stream::{
+    tcp_stream::{
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_keepalive, set_user_timeout,
         write_frame_header,
     },

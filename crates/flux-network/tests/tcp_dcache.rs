@@ -13,7 +13,7 @@ use flux::{
     spine::{DCacheRead, ScopedSpine, SpineAdapter, SpineProducerWithDCache},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
-use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
+use flux_network::stream::{PollEvent, SendBehavior, TcpConnector};
 use spine_derive::from_spine;
 
 #[derive(Clone, Copy, Debug, Default)]

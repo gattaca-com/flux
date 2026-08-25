@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
+use flux_network::stream::{PollEvent, SendBehavior, TcpConnector};
 
 const NUM_RECEIVERS: usize = 4;
 const BURST_SIZE: usize = 20;
