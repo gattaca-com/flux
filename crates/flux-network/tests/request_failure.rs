@@ -402,3 +402,102 @@ fn an_endpoint_that_drops_with_nothing_in_flight_fails_nothing(endpoint: &Endpoi
         client.pulled
     );
 }
+
+#[test]
+fn an_answer_whose_head_is_over_the_cap_is_too_large() {
+    let mut answer = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+    answer.extend_from_slice(&[b'v'; 100]);
+    answer.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+    assert_failure(
+        &Endpoint::Tcp(unused_addr()),
+        HttpConfig::default().with_max_head_bytes(64),
+        &answer,
+        false,
+        RequestFailure::TooLarge,
+    );
+}
+
+#[test]
+fn a_chunked_answer_over_the_cap_is_too_large() {
+    assert_failure(
+        &Endpoint::Tcp(unused_addr()),
+        HttpConfig::default().with_max_body_bytes(8),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n\
+          xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n0\r\n\r\n",
+        false,
+        RequestFailure::TooLarge,
+    );
+}
+
+#[test]
+fn an_answer_the_close_delimits_over_the_cap_is_too_large() {
+    let mut answer = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+    answer.extend_from_slice(&[b'x'; 64]);
+    assert_failure(
+        &Endpoint::Tcp(unused_addr()),
+        HttpConfig::default().with_max_body_bytes(8),
+        &answer,
+        true,
+        RequestFailure::TooLarge,
+    );
+}
+
+#[test]
+fn a_chunk_the_service_cannot_size_is_malformed() {
+    assert_failure(
+        &Endpoint::Tcp(unused_addr()),
+        HttpConfig::default(),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nxx\r\n0\r\n\r\n",
+        false,
+        RequestFailure::Malformed,
+    );
+}
+
+#[test]
+fn an_answer_framed_twice_over_is_malformed() {
+    assert_failure(
+        &Endpoint::Tcp(unused_addr()),
+        HttpConfig::default(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        false,
+        RequestFailure::Malformed,
+    );
+}
+
+#[test]
+fn a_blocking_drive_wakes_for_a_request_deadline() {
+    let addr = unused_addr();
+    let listener = std::net::TcpListener::bind(addr).unwrap();
+    // The peer accepts, answers nothing, and sends one byte three seconds
+    // later. That byte is the test's own deadline: a drive that ignored the
+    // request deadline wakes on it, well past the bound below, rather than
+    // hanging.
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        thread::sleep(Duration::from_secs(3));
+        let _ = stream.write_all(b"x");
+    });
+    let config = HttpConfig::default().with_request_timeout(Duration::from_millis(500).into());
+    let mut client = Client::new(&Endpoint::Tcp(addr), config);
+    let deadline = Instant::now() + TIMEOUT;
+    while client.pulled.is_empty() {
+        assert!(Instant::now() < deadline, "the endpoint did not connect");
+        client.pump();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(client.request(b""));
+
+    // That deadline is the only one the network has, so an uncapped drive
+    // waits for it and no longer.
+    let started = Instant::now();
+    client.net.drive(None, &mut [client.service.as_service()], |_| {});
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(100), "returned at once: {waited:?}");
+    assert!(waited < Duration::from_secs(2), "the request deadline was not folded: {waited:?}");
+
+    while !client.pulled.contains(&Pulled::Failed(RequestFailure::Timeout)) {
+        assert!(Instant::now() < deadline, "the request did not fail: {:?}", client.pulled);
+        client.pump();
+        thread::sleep(Duration::from_millis(1));
+    }
+}
