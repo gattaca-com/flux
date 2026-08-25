@@ -62,8 +62,10 @@ lending the payload for the duration of the call.
 - One iteration is, in order: capture `now`; run network maintenance due at `now` (reconnect
   attempts, pending disconnects); poll (Owned) or receive the caller's events (External);
   route each event to its service or to `unclaimed_handler`; deliver the lifecycle events those
-  operations produced; tick each service once in slice order, passing `now`; return so the
-  caller pulls protocol events. Transport events produced during maintenance reach a service
+  operations produced; tick each service once in slice order, passing the time the poll wait
+  ended — the wait is where an iteration spends its time, so a timer a tick starts runs from
+  the end of the wait, and one that expired during it is due in the same iteration; return so
+  the caller pulls protocol events. Transport events produced during maintenance reach a service
   before that service's tick, so protocol state never lags transport state by an iteration.
   Slice order may affect fairness and must never affect correctness.
 - `drive`, `next_deadline` and `tick` first validate the supplied services against the groups
