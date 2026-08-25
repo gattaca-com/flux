@@ -1,8 +1,11 @@
 mod connector;
+mod endpoint;
 mod network;
 mod tcp_stream;
+mod transport;
 
 pub use connector::{PollEvent, SendBehavior, TcpConnector};
+pub use endpoint::{Endpoint, Peer};
 pub use network::{
     ConnectionGroup, ConnectionGroupConfig, Framing, PayloadBuf, StreamEvent, StreamNetwork,
 };

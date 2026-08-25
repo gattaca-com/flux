@@ -7,7 +7,8 @@ use std::{
 };
 
 use flux_network::stream::{
-    ConnectionGroupConfig, PollEvent, SendBehavior, StreamEvent, StreamNetwork, TcpConnector,
+    ConnectionGroupConfig, Endpoint, Peer, PollEvent, SendBehavior, StreamEvent, StreamNetwork,
+    TcpConnector,
 };
 
 const CLIENT_HELLO: &[u8] = b"client-hello";
@@ -21,6 +22,33 @@ fn unused_addr() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     drop(listener);
     addr
+}
+
+/// Runs one test body over both transports: a loopback TCP address on an
+/// ephemeral port, and a Unix-domain socket path under a temporary directory
+/// that lives for the duration of the run.
+macro_rules! over_both_transports {
+    ($body:ident, $tcp:ident, $unix:ident) => {
+        #[test]
+        fn $tcp() {
+            $body(&Endpoint::Tcp(unused_addr()));
+        }
+
+        #[test]
+        fn $unix() {
+            let dir = tempfile::tempdir().unwrap();
+            $body(&Endpoint::Unix(dir.path().join("s")));
+        }
+    };
+}
+
+/// Connects to `endpoint` the way an unrelated peer would, bypassing flux's
+/// framing so a test can write partial or malformed frames.
+fn raw_peer(endpoint: &Endpoint) -> Box<dyn Write> {
+    match endpoint {
+        Endpoint::Tcp(addr) => Box::new(std::net::TcpStream::connect(addr).unwrap()),
+        Endpoint::Unix(path) => Box::new(std::os::unix::net::UnixStream::connect(path).unwrap()),
+    }
 }
 
 fn contains(messages: &[Vec<u8>], expected: &[u8]) -> bool {
@@ -53,9 +81,12 @@ fn encoded_frame(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-#[test]
-fn groups_route_events_and_messages() {
-    let addr = unused_addr();
+over_both_transports!(
+    groups_route_events_and_messages,
+    groups_route_events_and_messages_tcp,
+    groups_route_events_and_messages_unix
+);
+fn groups_route_events_and_messages(endpoint: &Endpoint) {
     let mut network = StreamNetwork::default();
     let server_group = network.add_group(ConnectionGroupConfig {
         name: "server",
@@ -68,8 +99,8 @@ fn groups_route_events_and_messages() {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..ConnectionGroupConfig::default()
     });
-    network.listen(server_group, addr).unwrap();
-    let client_token = network.connect(client_group, addr);
+    network.listen(server_group, endpoint.clone()).unwrap();
+    let client_token = network.connect(client_group, endpoint.clone());
 
     let mut server_token = None;
     let mut connected = false;
@@ -143,8 +174,8 @@ fn batch_send_preserves_framed_messages() {
     let mut network = StreamNetwork::default();
     let server_group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
     let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
-    network.listen(server_group, addr).unwrap();
-    let _ = network.connect(client_group, addr);
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
 
     assert!(network.send_many_with(server_token, BATCH_MESSAGES, |buf, message| {
@@ -177,8 +208,8 @@ fn payload_buffer_is_relative_to_its_own_frame() {
     let mut network = StreamNetwork::default();
     let server_group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
     let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
-    network.listen(server_group, addr).unwrap();
-    let _ = network.connect(client_group, addr);
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
 
     // The middle serialiser rewrites its payload from scratch. Every
@@ -215,8 +246,8 @@ fn payload_buffer_is_a_wincode_writer() {
     let mut network = StreamNetwork::default();
     let server_group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
     let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
-    network.listen(server_group, addr).unwrap();
-    let _ = network.connect(client_group, addr);
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
 
     let values = [7u64, 11, 13];
@@ -250,8 +281,8 @@ fn batch_skips_oversized_payloads_and_keeps_the_rest() {
         ..Default::default()
     });
     let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
-    network.listen(server_group, addr).unwrap();
-    let _ = network.connect(client_group, addr);
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
 
     let oversized = [7u8; 64];
@@ -285,9 +316,9 @@ fn broadcast_many_serializes_each_payload_once() {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    network.listen(server_group, addr).unwrap();
-    let _first_client = network.connect(client_group, addr);
-    let _second_client = network.connect(client_group, addr);
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let _first_client = network.connect(client_group, Endpoint::Tcp(addr));
+    let _second_client = network.connect(client_group, Endpoint::Tcp(addr));
 
     let mut accepted = 0;
     let mut connected = 0;
@@ -339,14 +370,17 @@ fn broadcast_many_serializes_each_payload_once() {
     }
 }
 
-#[test]
-fn partial_header_and_payload_are_not_delivered_early() {
-    let addr = unused_addr();
+over_both_transports!(
+    partial_header_and_payload_are_not_delivered_early,
+    partial_header_and_payload_are_not_delivered_early_tcp,
+    partial_header_and_payload_are_not_delivered_early_unix
+);
+fn partial_header_and_payload_are_not_delivered_early(endpoint: &Endpoint) {
     let mut network = StreamNetwork::default();
     let group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
-    network.listen(group, addr).unwrap();
+    network.listen(group, endpoint.clone()).unwrap();
 
-    let mut peer = std::net::TcpStream::connect(addr).unwrap();
+    let mut peer = raw_peer(endpoint);
     let token = wait_for_accept(&mut network, group);
     let frame = encoded_frame(REQUEST);
     let mut messages = Vec::new();
@@ -378,18 +412,21 @@ fn partial_header_and_payload_are_not_delivered_early() {
     assert_eq!(messages, [REQUEST]);
 }
 
-#[test]
-fn oversized_frame_disconnects_the_peer() {
-    let addr = unused_addr();
+over_both_transports!(
+    oversized_frame_disconnects_the_peer,
+    oversized_frame_disconnects_the_peer_tcp,
+    oversized_frame_disconnects_the_peer_unix
+);
+fn oversized_frame_disconnects_the_peer(endpoint: &Endpoint) {
     let mut network = StreamNetwork::default();
     let group = network.add_group(ConnectionGroupConfig {
         name: "server",
         max_frame_size: 32,
         ..Default::default()
     });
-    network.listen(group, addr).unwrap();
+    network.listen(group, endpoint.clone()).unwrap();
 
-    let mut peer = std::net::TcpStream::connect(addr).unwrap();
+    let mut peer = raw_peer(endpoint);
     let token = wait_for_accept(&mut network, group);
     let mut header = Vec::with_capacity(12);
     header.extend_from_slice(&33_u32.to_le_bytes());
@@ -412,6 +449,8 @@ fn oversized_frame_disconnects_the_peer() {
     assert!(disconnected);
 }
 
+/// TCP only: the backlog only grows once a write goes short, which this test
+/// arranges through `SO_SNDBUF` on a TCP socket.
 #[test]
 fn hard_backlog_limit_disconnects_the_peer() {
     let addr = unused_addr();
@@ -426,8 +465,8 @@ fn hard_backlog_limit_disconnects_the_peer() {
         max_frame_size: 2 * 1024 * 1024,
         ..Default::default()
     });
-    network.listen(server_group, addr).unwrap();
-    let client_token = network.connect(client_group, addr);
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let client_token = network.connect(client_group, Endpoint::Tcp(addr));
 
     let mut connected = false;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -457,9 +496,12 @@ fn hard_backlog_limit_disconnects_the_peer() {
     assert!(disconnected);
 }
 
-#[test]
-fn broadcast_serializes_once_for_multiple_connections() {
-    let addr = unused_addr();
+over_both_transports!(
+    broadcast_serializes_once_for_multiple_connections,
+    broadcast_serializes_once_for_multiple_connections_tcp,
+    broadcast_serializes_once_for_multiple_connections_unix
+);
+fn broadcast_serializes_once_for_multiple_connections(endpoint: &Endpoint) {
     let mut network = StreamNetwork::default();
     let server_group =
         network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
@@ -468,9 +510,9 @@ fn broadcast_serializes_once_for_multiple_connections() {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    network.listen(server_group, addr).unwrap();
-    let _first_client = network.connect(client_group, addr);
-    let _second_client = network.connect(client_group, addr);
+    network.listen(server_group, endpoint.clone()).unwrap();
+    let _first_client = network.connect(client_group, endpoint.clone());
+    let _second_client = network.connect(client_group, endpoint.clone());
 
     let mut accepted = 0;
     let mut connected = 0;
@@ -516,9 +558,12 @@ fn broadcast_serializes_once_for_multiple_connections() {
     assert_eq!(received, 2);
 }
 
-#[test]
-fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
-    let addr = unused_addr();
+over_both_transports!(
+    disconnected_messages_are_dropped_and_token_survives_reconnect,
+    disconnected_messages_are_dropped_and_token_survives_reconnect_tcp,
+    disconnected_messages_are_dropped_and_token_survives_reconnect_unix
+);
+fn disconnected_messages_are_dropped_and_token_survives_reconnect(endpoint: &Endpoint) {
     let mut network = StreamNetwork::default();
     let server_group =
         network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
@@ -527,8 +572,8 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    network.listen(server_group, addr).unwrap();
-    let client_token = network.connect(client_group, addr);
+    network.listen(server_group, endpoint.clone()).unwrap();
+    let client_token = network.connect(client_group, endpoint.clone());
 
     let mut server_token = None;
     let mut connected = false;
@@ -606,6 +651,7 @@ fn disconnected_messages_are_dropped_and_token_survives_reconnect() {
     assert!(contains(&server_messages, RESPONSE));
 }
 
+/// TCP only: `TcpConnector` speaks TCP alone.
 #[test]
 fn stream_network_is_wire_compatible_with_tcp_connector() {
     let addr = unused_addr();
@@ -615,7 +661,7 @@ fn stream_network_is_wire_compatible_with_tcp_connector() {
         on_connect_msg: Some(SERVER_HELLO.to_vec()),
         ..Default::default()
     });
-    network.listen(server_group, addr).unwrap();
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
 
     let mut connector = TcpConnector::default();
     let connector_token = connector.connect(addr).expect("connector failed to connect");
@@ -660,6 +706,7 @@ fn stream_network_is_wire_compatible_with_tcp_connector() {
     assert!(contains(&connector_messages, RESPONSE));
 }
 
+/// TCP only: `TcpConnector` speaks TCP alone.
 #[test]
 fn stream_network_client_is_wire_compatible_with_tcp_connector_server() {
     let addr = unused_addr();
@@ -673,7 +720,7 @@ fn stream_network_client_is_wire_compatible_with_tcp_connector_server() {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    let client_token = network.connect(client_group, addr);
+    let client_token = network.connect(client_group, Endpoint::Tcp(addr));
 
     let mut connector_token = None;
     let mut connector_messages = Vec::new();
@@ -733,4 +780,106 @@ fn stream_network_client_is_wire_compatible_with_tcp_connector_server() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(contains(&network_messages, RESPONSE));
+}
+
+over_both_transports!(
+    accepted_peer_identifies_the_transport,
+    accepted_peer_identifies_the_transport_tcp,
+    accepted_peer_identifies_the_transport_unix
+);
+fn accepted_peer_identifies_the_transport(endpoint: &Endpoint) {
+    let mut network = StreamNetwork::default();
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(ConnectionGroupConfig {
+        name: "client",
+        reconnect_interval: flux_timing::Duration::from_millis(1),
+        ..Default::default()
+    });
+    network.listen(server_group, endpoint.clone()).unwrap();
+    let client_token = network.connect(client_group, endpoint.clone());
+
+    let mut accepted = None;
+    let mut connected = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && (accepted.is_none() || connected.is_none()) {
+        network.poll_with(|event| match event {
+            StreamEvent::Accepted { group, peer, .. } => {
+                assert_eq!(group, server_group);
+                accepted = Some(peer);
+            }
+            StreamEvent::Connected { token, peer, .. } => {
+                assert_eq!(token, client_token);
+                connected = Some(peer);
+            }
+            _ => {}
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    match endpoint {
+        Endpoint::Tcp(addr) => {
+            // The accepted peer is the client's ephemeral port, not the
+            // listening address; only the outbound side knows its target.
+            assert!(matches!(accepted, Some(Peer::Tcp(_))), "{accepted:?}");
+            assert_eq!(connected, Some(Peer::Tcp(*addr)));
+        }
+        Endpoint::Unix(_) => {
+            assert_eq!(accepted, Some(Peer::Unix));
+            assert_eq!(connected, Some(Peer::Unix));
+        }
+    }
+}
+
+/// A Unix-domain endpoint whose socket file does not exist yet retries at the
+/// group's interval, exactly as a refused TCP endpoint does.
+#[test]
+fn unix_endpoint_connects_once_its_listener_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = Endpoint::Unix(dir.path().join("late"));
+
+    let mut client = StreamNetwork::default();
+    let client_group = client.add_group(ConnectionGroupConfig {
+        name: "client",
+        reconnect_interval: flux_timing::Duration::from_millis(5),
+        ..Default::default()
+    });
+    let client_token = client.connect(client_group, endpoint.clone());
+
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        client.poll_with(|event| {
+            assert!(
+                !matches!(event, StreamEvent::Connected { .. }),
+                "connected before the listener existed"
+            );
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!dir.path().join("late").exists());
+
+    let mut server = StreamNetwork::default();
+    let server_group =
+        server.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    server.listen(server_group, endpoint).unwrap();
+
+    let mut accepted = false;
+    let mut connected = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !(accepted && connected) {
+        server.poll_with(|event| {
+            if matches!(event, StreamEvent::Accepted { .. }) {
+                accepted = true;
+            }
+        });
+        client.poll_with(|event| {
+            if let StreamEvent::Connected { token, .. } = event {
+                assert_eq!(token, client_token);
+                connected = true;
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(accepted);
+    assert!(connected);
 }

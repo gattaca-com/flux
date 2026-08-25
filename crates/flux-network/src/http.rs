@@ -6,9 +6,10 @@
 //! ```no_run
 //! use std::net::SocketAddr;
 //! use flux_network::http::{HttpEvent, HttpNetwork};
+//! use flux_network::stream::Endpoint;
 //! let mut http = HttpNetwork::default();
-//! http.listen("127.0.0.1:8080".parse::<SocketAddr>().unwrap())?;
-//! let peer = http.connect("127.0.0.1:8081".parse::<SocketAddr>().unwrap());
+//! http.listen(Endpoint::Tcp("127.0.0.1:8080".parse::<SocketAddr>().unwrap()))?;
+//! let peer = http.connect(Endpoint::Unix("/run/flux/upstream.sock".into()));
 //! loop {
 //!     let mut response = None;
 //!     let mut request = false;
@@ -35,18 +36,17 @@
 //! lingering-close delay. Pipelined requests are served strictly one at a time
 //! per connection.
 
-use std::{
-    io::{self, Write as _},
-    net::SocketAddr,
-};
+use std::io::{self, Write as _};
 
 use flux_timing::{Duration, Instant};
 use mio::Token;
 
-use crate::stream::{ConnectionGroup, ConnectionGroupConfig, Framing, StreamEvent, StreamNetwork};
+use crate::stream::{
+    ConnectionGroup, ConnectionGroupConfig, Endpoint, Framing, Peer, StreamEvent, StreamNetwork,
+};
 
 pub enum HttpEvent<'a> {
-    Accepted { token: Token, peer_addr: SocketAddr },
+    Accepted { token: Token, peer: Peer },
     Connected { token: Token },
     Response { token: Token, response: HttpResponse<'a> },
     Request { token: Token, request: HttpRequest<'a> },
@@ -60,7 +60,7 @@ enum State {
 }
 enum Role {
     Accepted { state: State, close: bool, continued: bool, head_request: bool },
-    Outbound { addr: SocketAddr, method: Option<String> },
+    Outbound { endpoint: Endpoint, method: Option<String> },
 }
 struct Conn {
     token: Token,
@@ -72,7 +72,7 @@ struct Conn {
 }
 #[derive(Clone, Copy)]
 enum Lifecycle {
-    Connected(Token, Option<SocketAddr>),
+    Connected(Token, Option<Peer>),
     Disconnected(Token),
 }
 pub struct HttpNetwork {
@@ -128,7 +128,7 @@ impl HttpNetwork {
         self.max_headers = max_headers;
         self
     }
-    /// Sets the TCP socket buffer size.
+    /// Sets the socket buffer size.
     pub fn with_socket_buf_size(mut self, socket_buf_size: usize) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.socket_buf_size = Some(socket_buf_size);
@@ -162,9 +162,14 @@ impl HttpNetwork {
             })
         })
     }
-    pub fn listen(&mut self, addr: SocketAddr) -> io::Result<()> {
+    /// Adds a listener.
+    ///
+    /// An [`Endpoint::Unix`] socket file is created with mode `0777` less the
+    /// umask bits and is unlinked when this instance is dropped; see
+    /// [`StreamNetwork::listen`].
+    pub fn listen(&mut self, endpoint: Endpoint) -> io::Result<()> {
         let group = self.group();
-        self.network.listen(group, addr)
+        self.network.listen(group, endpoint)
     }
     /// Immediately disconnects an accepted client.
     pub fn disconnect(&mut self, token: Token) -> bool {
@@ -188,9 +193,7 @@ impl HttpNetwork {
         let conns = &mut self.conns;
         let lifecycle = &mut self.lifecycle;
         self.network.poll_with(|event| match event {
-            StreamEvent::Accepted { group: event_group, token, peer_addr }
-                if event_group == group =>
-            {
+            StreamEvent::Accepted { group: event_group, token, peer } if event_group == group => {
                 conns.push(Conn {
                     token,
                     buf: Vec::new(),
@@ -204,7 +207,7 @@ impl HttpNetwork {
                         head_request: false,
                     },
                 });
-                lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
+                lifecycle.push(Lifecycle::Connected(token, Some(peer)));
             }
             StreamEvent::Connected { group: event_group, token, .. } if event_group == group => {
                 lifecycle.push(Lifecycle::Connected(token, None));
@@ -262,8 +265,8 @@ impl HttpNetwork {
         F: for<'a> FnMut(HttpEvent<'a>),
     {
         match event {
-            Lifecycle::Connected(token, Some(peer_addr)) => {
-                handler(HttpEvent::Accepted { token, peer_addr });
+            Lifecycle::Connected(token, Some(peer)) => {
+                handler(HttpEvent::Accepted { token, peer });
             }
             Lifecycle::Connected(token, None) => handler(HttpEvent::Connected { token }),
             Lifecycle::Disconnected(token) => {
@@ -304,16 +307,18 @@ impl HttpNetwork {
             self.parse_outbound(i, handler);
         }
     }
-    pub fn connect(&mut self, addr: SocketAddr) -> Token {
+    /// Adds a persistent outbound endpoint and immediately starts
+    /// connecting. The returned token remains stable across reconnects.
+    pub fn connect(&mut self, endpoint: Endpoint) -> Token {
         let group = self.group();
-        let token = self.network.connect(group, addr);
+        let token = self.network.connect(group, endpoint.clone());
         self.conns.push(Conn {
             token,
             buf: Vec::new(),
             dirty: false,
             over_limit: false,
             last_activity: Instant::now(),
-            role: Role::Outbound { addr, method: None },
+            role: Role::Outbound { endpoint, method: None },
         });
         token
     }
@@ -332,6 +337,10 @@ impl HttpNetwork {
         true
     }
     /// Queues one request on an outbound endpoint.
+    ///
+    /// When the caller supplies no `Host` header, a TCP endpoint sends its
+    /// socket address; a Unix-domain endpoint has no address to name and
+    /// sends `localhost`.
     pub fn request(
         &mut self,
         token: Token,
@@ -357,8 +366,11 @@ impl HttpNetwork {
         else {
             return false
         };
-        let Role::Outbound { addr, .. } = &c.role else { return false };
-        let host = addr.to_string();
+        let Role::Outbound { endpoint, .. } = &c.role else { return false };
+        let host = match endpoint {
+            Endpoint::Tcp(addr) => addr.to_string(),
+            Endpoint::Unix(_) => "localhost".to_owned(),
+        };
         let sent = self.network.send_with(token, |out| {
             write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
             let mut has_host = false;
