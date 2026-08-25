@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     TcpTelemetry, set_socket_buf_size,
-    stream::{
+    tcp_stream::{
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, frame_payload_len, set_keepalive,
         set_user_timeout, write_frame_header, write_frame_len, write_frame_ts,
     },
@@ -30,9 +30,9 @@ const BACKLOG_WARNING_INTERVAL_SECS: u64 = 10;
 /// Identifies a set of connections using the same application protocol and
 /// socket configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TcpGroup(usize);
+pub struct ConnectionGroup(usize);
 
-/// Selects how a TCP group encodes messages on the wire.
+/// Selects how a group encodes messages on the wire.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Framing {
     /// Messages carry Flux's length and send-timestamp header.
@@ -192,9 +192,10 @@ impl Write for PayloadBuf<'_> {
     }
 }
 
-/// Configuration shared by every listener and connection in a [`TcpGroup`].
+/// Configuration shared by every listener and connection in a
+/// [`ConnectionGroup`].
 #[derive(Clone)]
-pub struct TcpGroupConfig {
+pub struct ConnectionGroupConfig {
     /// Stable label used in logs and telemetry.
     pub name: &'static str,
     /// Static payload sent on every newly established connection before its
@@ -225,7 +226,7 @@ pub struct TcpGroupConfig {
     pub telemetry: TcpTelemetry,
 }
 
-impl Default for TcpGroupConfig {
+impl Default for ConnectionGroupConfig {
     fn default() -> Self {
         Self {
             name: "tcp",
@@ -244,7 +245,7 @@ impl Default for TcpGroupConfig {
     }
 }
 
-impl TcpGroupConfig {
+impl ConnectionGroupConfig {
     /// Enables TCP keepalive for every connection in this group.
     pub fn with_keepalive(mut self) -> Self {
         self.keepalive = true;
@@ -252,28 +253,28 @@ impl TcpGroupConfig {
     }
 }
 
-/// Event emitted by [`TcpNetwork::poll_with`].
-pub enum TcpEvent<'a> {
+/// Event emitted by [`StreamNetwork::poll_with`].
+pub enum StreamEvent<'a> {
     /// A listener accepted a new connection.
-    Accepted { group: TcpGroup, token: Token, peer_addr: SocketAddr },
+    Accepted { group: ConnectionGroup, token: Token, peer_addr: SocketAddr },
     /// A persistent outbound endpoint established a connection.
-    Connected { group: TcpGroup, token: Token, peer_addr: SocketAddr },
+    Connected { group: ConnectionGroup, token: Token, peer_addr: SocketAddr },
     /// A complete length-prefixed message or a raw read chunk was received.
-    /// For raw groups, chunks do not preserve message boundaries and `send_ts`
-    /// is the local receive time.
-    Message { group: TcpGroup, token: Token, payload: &'a [u8], send_ts: Nanos },
+    /// For raw-framed groups, chunks do not preserve message boundaries and
+    /// `send_ts` is the local receive time.
+    Message { group: ConnectionGroup, token: Token, payload: &'a [u8], send_ts: Nanos },
     /// An established connection was closed.
-    Disconnected { group: TcpGroup, token: Token, peer_addr: SocketAddr },
+    Disconnected { group: ConnectionGroup, token: Token, peer_addr: SocketAddr },
 }
 
 struct GroupState {
-    config: TcpGroupConfig,
+    config: ConnectionGroupConfig,
     reconnector: Repeater,
 }
 
 struct Listener {
     token: Token,
-    group: TcpGroup,
+    group: ConnectionGroup,
     socket: TcpListener,
 }
 
@@ -292,7 +293,7 @@ enum ConnectionState {
 
 struct Connection {
     token: Token,
-    group: TcpGroup,
+    group: ConnectionGroup,
     peer_addr: SocketAddr,
     kind: ConnectionKind,
     state: ConnectionState,
@@ -326,7 +327,7 @@ impl NetworkTimers {
 
 #[derive(Clone, Copy)]
 struct PendingDisconnect {
-    group: TcpGroup,
+    group: ConnectionGroup,
     token: Token,
     peer_addr: SocketAddr,
 }
@@ -365,11 +366,11 @@ impl NetworkState {
         token
     }
 
-    fn config(&self, group: TcpGroup) -> &TcpGroupConfig {
+    fn config(&self, group: ConnectionGroup) -> &ConnectionGroupConfig {
         &self.groups[group.0].config
     }
 
-    fn listen(&mut self, group: TcpGroup, addr: SocketAddr) -> io::Result<()> {
+    fn listen(&mut self, group: ConnectionGroup, addr: SocketAddr) -> io::Result<()> {
         if group.0 >= self.groups.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown TCP group"));
         }
@@ -380,7 +381,7 @@ impl NetworkState {
         Ok(())
     }
 
-    fn connect(&mut self, group: TcpGroup, peer_addr: SocketAddr) -> Token {
+    fn connect(&mut self, group: ConnectionGroup, peer_addr: SocketAddr) -> Token {
         assert!(group.0 < self.groups.len(), "unknown TCP group");
         let token = self.next_token();
         let config = self.config(group);
@@ -434,7 +435,7 @@ impl NetworkState {
             if !self.groups[group_index].reconnector.fired_at(now) {
                 continue;
             }
-            let group = TcpGroup(group_index);
+            let group = ConnectionGroup(group_index);
             for index in 0..self.connections.len() {
                 if self.connections[index].group == group &&
                     self.connections[index].kind == ConnectionKind::Outbound &&
@@ -466,7 +467,7 @@ impl NetworkState {
 
     fn finish_connect<F>(&mut self, index: usize, handler: &mut F) -> bool
     where
-        F: for<'a> FnMut(TcpEvent<'a>),
+        F: for<'a> FnMut(StreamEvent<'a>),
     {
         let ConnectionState::Connecting(socket) = &self.connections[index].state else {
             return false;
@@ -541,13 +542,13 @@ impl NetworkState {
         self.connections[index].timers = timers;
         self.connections[index].state = ConnectionState::Connected(stream);
         info!(group = group_name, %peer_addr, "tcp connection established");
-        handler(TcpEvent::Connected { group, token, peer_addr });
+        handler(StreamEvent::Connected { group, token, peer_addr });
         true
     }
 
     fn accept_connections<F>(&mut self, listener_index: usize, handler: &mut F)
     where
-        F: for<'a> FnMut(TcpEvent<'a>),
+        F: for<'a> FnMut(StreamEvent<'a>),
     {
         let group = self.listeners[listener_index].group;
         loop {
@@ -628,13 +629,13 @@ impl NetworkState {
                 timers,
             });
             info!(group = group_name, %peer_addr, "tcp connection accepted");
-            handler(TcpEvent::Accepted { group, token, peer_addr });
+            handler(StreamEvent::Accepted { group, token, peer_addr });
         }
     }
 
     fn handle_event<F>(&mut self, event: &Event, handler: &mut F)
     where
-        F: for<'a> FnMut(TcpEvent<'a>),
+        F: for<'a> FnMut(StreamEvent<'a>),
     {
         let token = event.token();
         if let Some(index) = self.listeners.iter().position(|listener| listener.token == token) {
@@ -668,13 +669,13 @@ impl NetworkState {
                 config,
                 &mut connection.timers,
                 &mut |payload, send_ts| {
-                    handler(TcpEvent::Message { group, token, payload, send_ts });
+                    handler(StreamEvent::Message { group, token, payload, send_ts });
                 },
             );
             (state, stream.send_queue.is_empty())
         };
         if state == StreamState::Disconnected {
-            handler(TcpEvent::Disconnected { group, token, peer_addr });
+            handler(StreamEvent::Disconnected { group, token, peer_addr });
             self.disconnect_index(index, false);
         } else if self.connections[index].close_when_drained && queue_empty {
             self.disconnect_index(index, true);
@@ -717,10 +718,10 @@ impl NetworkState {
 
     fn drain_pending_disconnects<F>(&mut self, handler: &mut F)
     where
-        F: for<'a> FnMut(TcpEvent<'a>),
+        F: for<'a> FnMut(StreamEvent<'a>),
     {
         for event in self.pending_disconnects.drain(..) {
-            handler(TcpEvent::Disconnected {
+            handler(StreamEvent::Disconnected {
                 group: event.group,
                 token: event.token,
                 peer_addr: event.peer_addr,
@@ -742,7 +743,7 @@ impl NetworkState {
     /// in its length here; `stamp_frames` writes the timestamp just before the
     /// socket write. Empty or oversized payloads are removed again. Returns
     /// whether the frame was kept.
-    fn append_frame<F>(&mut self, group: TcpGroup, serialise: F) -> bool
+    fn append_frame<F>(&mut self, group: ConnectionGroup, serialise: F) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
@@ -765,7 +766,7 @@ impl NetworkState {
                 group = config.name,
                 payload_len,
                 max_frame_size = config.max_frame_size,
-                "tcp payload exceeds maximum frame size"
+                "payload exceeds maximum frame size"
             );
             self.send_buffer.truncate(start);
             return false;
@@ -778,7 +779,7 @@ impl NetworkState {
 
     /// Writes `ts` into the header of every frame staged in `send_buffer`.
     /// Raw groups carry no headers and are left untouched.
-    fn stamp_frames(&mut self, group: TcpGroup, ts: Nanos) {
+    fn stamp_frames(&mut self, group: ConnectionGroup, ts: Nanos) {
         if self.groups[group.0].config.framing != Framing::LengthPrefixed {
             return;
         }
@@ -850,7 +851,7 @@ impl NetworkState {
 
     /// Whether `group` exists and has at least one member that can receive a
     /// broadcast right now.
-    fn has_broadcast_recipient(&self, group: TcpGroup) -> bool {
+    fn has_broadcast_recipient(&self, group: ConnectionGroup) -> bool {
         group.0 < self.groups.len() &&
             self.connections.iter().any(|connection| {
                 connection.group == group &&
@@ -862,7 +863,7 @@ impl NetworkState {
     /// Writes the staged frames to every connected member of `group`,
     /// disconnecting members whose write fails. Returns the number of
     /// recipients attempted.
-    fn broadcast_staged(&mut self, group: TcpGroup) -> usize {
+    fn broadcast_staged(&mut self, group: ConnectionGroup) -> usize {
         let mut attempted = 0;
         let mut index = self.connections.len();
         while index != 0 {
@@ -879,7 +880,7 @@ impl NetworkState {
         attempted
     }
 
-    fn broadcast_with<F>(&mut self, group: TcpGroup, serialise: F) -> usize
+    fn broadcast_with<F>(&mut self, group: ConnectionGroup, serialise: F) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
@@ -894,7 +895,7 @@ impl NetworkState {
         self.broadcast_staged(group)
     }
 
-    fn broadcast_many_with<I, F>(&mut self, group: TcpGroup, items: I, mut serialise: F) -> usize
+    fn broadcast_many_with<I, F>(&mut self, group: ConnectionGroup, items: I, mut serialise: F) -> usize
     where
         I: IntoIterator,
         F: FnMut(&mut PayloadBuf<'_>, I::Item),
@@ -958,21 +959,21 @@ impl NetworkState {
 /// Unlike [`super::TcpConnector`], queued bytes are never retained across a
 /// disconnected socket. Use `TcpConnector` when reconnect backlog replay is
 /// required.
-pub struct TcpNetwork {
+pub struct StreamNetwork {
     events: Events,
     state: NetworkState,
 }
 
-impl Default for TcpNetwork {
+impl Default for StreamNetwork {
     fn default() -> Self {
         Self { events: Events::with_capacity(EVENTS_CAPACITY), state: NetworkState::default() }
     }
 }
 
-impl TcpNetwork {
+impl StreamNetwork {
     /// Adds a protocol group and returns its handle.
     #[must_use = "the group handle identifies listeners and outbound endpoints"]
-    pub fn add_group(&mut self, config: TcpGroupConfig) -> TcpGroup {
+    pub fn add_group(&mut self, config: ConnectionGroupConfig) -> ConnectionGroup {
         assert!(config.max_frame_size > 0, "max_frame_size must be nonzero");
         if config.framing == Framing::LengthPrefixed {
             assert!(
@@ -993,27 +994,27 @@ impl TcpNetwork {
                 assert!(warn < max, "backlog_warn_bytes must be below max_backlog_bytes");
             }
         }
-        let group = TcpGroup(self.state.groups.len());
+        let group = ConnectionGroup(self.state.groups.len());
         let reconnector = Repeater::every(config.reconnect_interval);
         self.state.groups.push(GroupState { config, reconnector });
         group
     }
 
     /// Adds a listener to `group`.
-    pub fn listen(&mut self, group: TcpGroup, addr: SocketAddr) -> io::Result<()> {
+    pub fn listen(&mut self, group: ConnectionGroup, addr: SocketAddr) -> io::Result<()> {
         self.state.listen(group, addr)
     }
 
     /// Adds a persistent outbound endpoint and immediately starts connecting.
     /// The returned token remains stable across reconnects.
     #[must_use = "the token identifies the persistent outbound endpoint"]
-    pub fn connect(&mut self, group: TcpGroup, peer_addr: SocketAddr) -> Token {
+    pub fn connect(&mut self, group: ConnectionGroup, peer_addr: SocketAddr) -> Token {
         self.state.connect(group, peer_addr)
     }
 
     pub fn poll_with<F>(&mut self, mut handler: F)
     where
-        F: for<'a> FnMut(TcpEvent<'a>),
+        F: for<'a> FnMut(StreamEvent<'a>),
     {
         self.state.drain_pending_disconnects(&mut handler);
         self.state.maybe_reconnect();
@@ -1030,8 +1031,8 @@ impl TcpNetwork {
     }
 
     /// Serializes and sends one payload to a connected token. Length-prefixed
-    /// groups add a frame header; raw groups send the payload unchanged. The
-    /// closure is not called when the token is unknown or currently
+    /// groups add a frame header; raw-framed groups send the payload unchanged.
+    /// The closure is not called when the token is unknown or currently
     /// disconnected.
     pub fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
     where
@@ -1057,9 +1058,10 @@ impl TcpNetwork {
     }
 
     /// Serializes one payload and sends it to every connected member of
-    /// `group`. Length-prefixed groups add a frame header; raw groups send
-    /// the payload unchanged. Returns the number of recipients attempted.
-    pub fn broadcast_with<F>(&mut self, group: TcpGroup, serialise: F) -> usize
+    /// `group`. Length-prefixed groups add a frame header; raw-framed groups
+    /// send the payload unchanged. Returns the number of recipients
+    /// attempted.
+    pub fn broadcast_with<F>(&mut self, group: ConnectionGroup, serialise: F) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
@@ -1068,11 +1070,11 @@ impl TcpNetwork {
 
     /// Serializes multiple payloads once and sends the batch to every
     /// connected member of `group`. Framing, size limits, and skipping of
-    /// invalid payloads follow [`TcpNetwork::send_many_with`]; each member
+    /// invalid payloads follow [`StreamNetwork::send_many_with`]; each member
     /// receives the batch in one socket write when it has no backlog. The
     /// closure is not called when the group has no connected member. Returns
     /// the number of recipients attempted.
-    pub fn broadcast_many_with<I, F>(&mut self, group: TcpGroup, items: I, serialise: F) -> usize
+    pub fn broadcast_many_with<I, F>(&mut self, group: ConnectionGroup, items: I, serialise: F) -> usize
     where
         I: IntoIterator,
         F: FnMut(&mut PayloadBuf<'_>, I::Item),
@@ -1204,7 +1206,7 @@ impl ByteQueue {
         self.bytes.capacity() != old_capacity
     }
 
-    fn maybe_warn(&mut self, config: &TcpGroupConfig, token: Token, peer_addr: SocketAddr) {
+    fn maybe_warn(&mut self, config: &ConnectionGroupConfig, token: Token, peer_addr: SocketAddr) {
         let Some(threshold) = config.backlog_warn_bytes else { return };
         if self.len() <= threshold {
             self.last_warning = None;
@@ -1261,7 +1263,7 @@ impl FramedStream {
         &mut self,
         registry: &Registry,
         event: &Event,
-        config: &TcpGroupConfig,
+        config: &ConnectionGroupConfig,
         timers: &mut Option<NetworkTimers>,
         on_message: &mut F,
     ) -> StreamState
@@ -1387,7 +1389,7 @@ impl FramedStream {
         registry: &Registry,
         header: Option<&[u8; FRAME_HEADER_SIZE]>,
         payload: &[u8],
-        config: &TcpGroupConfig,
+        config: &ConnectionGroupConfig,
         timers: &mut Option<NetworkTimers>,
     ) -> StreamState {
         if !self.send_queue.is_empty() {
@@ -1427,7 +1429,7 @@ impl FramedStream {
         header: Option<&[u8; FRAME_HEADER_SIZE]>,
         payload: &[u8],
         written: usize,
-        config: &TcpGroupConfig,
+        config: &ConnectionGroupConfig,
         timers: &mut Option<NetworkTimers>,
     ) -> StreamState {
         let total = header.map_or(payload.len(), |_| FRAME_HEADER_SIZE + payload.len());
@@ -1464,7 +1466,7 @@ impl FramedStream {
         self.arm_writable(registry)
     }
 
-    fn drain_queue(&mut self, registry: &Registry, config: &TcpGroupConfig) -> StreamState {
+    fn drain_queue(&mut self, registry: &Registry, config: &ConnectionGroupConfig) -> StreamState {
         while !self.send_queue.is_empty() {
             match self.socket.write(self.send_queue.remaining()) {
                 Ok(0) => return StreamState::Disconnected,
@@ -1521,7 +1523,7 @@ mod tests {
     use mio::{Poll, Token};
 
     use super::{
-        ByteQueue, FRAME_HEADER_SIZE, FramedStream, PayloadBuf, StreamState, TcpGroupConfig,
+        ByteQueue, FRAME_HEADER_SIZE, FramedStream, PayloadBuf, StreamState, ConnectionGroupConfig,
         set_socket_buf_size, write_frame_header,
     };
 
@@ -1603,7 +1605,7 @@ mod tests {
         }
         stream.send_queue.bytes.extend_from_slice(&[1; 8]);
 
-        let config = TcpGroupConfig {
+        let config = ConnectionGroupConfig {
             backlog_warn_bytes: None,
             max_backlog_bytes: Some(16),
             ..Default::default()

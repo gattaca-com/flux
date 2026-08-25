@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::tcp::{Framing, TcpEvent, TcpGroupConfig, TcpNetwork};
+use flux_network::stream::{ConnectionGroupConfig, Framing, StreamEvent, StreamNetwork};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -16,15 +16,15 @@ fn unused_addr() -> SocketAddr {
     addr
 }
 
-fn raw_group(name: &'static str) -> TcpGroupConfig {
-    TcpGroupConfig { name, framing: Framing::Raw, ..TcpGroupConfig::default() }
+fn raw_group(name: &'static str) -> ConnectionGroupConfig {
+    ConnectionGroupConfig { name, framing: Framing::Raw, ..ConnectionGroupConfig::default() }
 }
 
 #[test]
 fn raw_roundtrip() {
     let request = b"raw request bytes";
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
+    let mut network = StreamNetwork::default();
     let group = network.add_group(raw_group("raw-server"));
     network.listen(group, addr).unwrap();
 
@@ -38,7 +38,7 @@ fn raw_roundtrip() {
     while Instant::now() < deadline && received.len() < request.len() {
         let mut echo = None;
         network.poll_with(|event| {
-            if let TcpEvent::Message { group: event_group, token, payload, .. } = event {
+            if let StreamEvent::Message { group: event_group, token, payload, .. } = event {
                 assert_eq!(event_group, group);
                 echo = Some((token, payload.to_vec()));
             }
@@ -63,7 +63,7 @@ fn raw_roundtrip() {
 #[test]
 fn raw_batch_concatenates_payloads() {
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
+    let mut network = StreamNetwork::default();
     let group = network.add_group(raw_group("raw-server"));
     network.listen(group, addr).unwrap();
 
@@ -74,7 +74,7 @@ fn raw_batch_concatenates_payloads() {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && accepted.is_none() {
         network.poll_with(|event| {
-            if let TcpEvent::Accepted { group: event_group, token, .. } = event {
+            if let StreamEvent::Accepted { group: event_group, token, .. } = event {
                 assert_eq!(event_group, group);
                 accepted = Some(token);
             }
@@ -108,7 +108,7 @@ fn http_get_smoke() {
     let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
+    let mut network = StreamNetwork::default();
     let group = network.add_group(raw_group("http"));
     network.listen(group, addr).unwrap();
 
@@ -123,7 +123,7 @@ fn http_get_smoke() {
     while Instant::now() < deadline && response_token.is_none() {
         let mut reply_to = None;
         network.poll_with(|event| {
-            if let TcpEvent::Message { group: event_group, token, payload, .. } = event {
+            if let StreamEvent::Message { group: event_group, token, payload, .. } = event {
                 assert_eq!(event_group, group);
                 request_bytes.extend_from_slice(payload);
                 if request_bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
@@ -166,13 +166,13 @@ fn raw_outbound_connect() {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut network = TcpNetwork::default();
-    let group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let group = network.add_group(ConnectionGroupConfig {
         name: "raw-client",
         framing: Framing::Raw,
         on_connect_msg: Some(hello.to_vec()),
         reconnect_interval: flux_timing::Duration::from_millis(1),
-        ..TcpGroupConfig::default()
+        ..ConnectionGroupConfig::default()
     });
     let token = network.connect(group, addr);
     let mut peer = None;
@@ -224,15 +224,15 @@ fn raw_outbound_connect() {
 fn framed_and_raw_coexist() {
     let framed_addr = unused_addr();
     let raw_addr = unused_addr();
-    let mut server = TcpNetwork::default();
+    let mut server = StreamNetwork::default();
     let framed_server =
-        server.add_group(TcpGroupConfig { name: "framed-server", ..Default::default() });
+        server.add_group(ConnectionGroupConfig { name: "framed-server", ..Default::default() });
     let raw_server = server.add_group(raw_group("raw-server"));
     server.listen(framed_server, framed_addr).unwrap();
     server.listen(raw_server, raw_addr).unwrap();
 
-    let mut framed_client = TcpNetwork::default();
-    let framed_client_group = framed_client.add_group(TcpGroupConfig {
+    let mut framed_client = StreamNetwork::default();
+    let framed_client_group = framed_client.add_group(ConnectionGroupConfig {
         name: "framed-client",
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
@@ -256,10 +256,10 @@ fn framed_and_raw_coexist() {
     {
         let mut echoes = Vec::new();
         server.poll_with(|event| match event {
-            TcpEvent::Accepted { group, token, .. } if group == framed_server => {
+            StreamEvent::Accepted { group, token, .. } if group == framed_server => {
                 framed_server_token = Some(token);
             }
-            TcpEvent::Message { group, token, payload, .. }
+            StreamEvent::Message { group, token, payload, .. }
                 if group == framed_server || group == raw_server =>
             {
                 echoes.push((token, payload.to_vec()));
@@ -270,11 +270,11 @@ fn framed_and_raw_coexist() {
             assert!(server.send_with(token, |buf| buf.extend_from_slice(&payload)));
         }
         framed_client.poll_with(|event| match event {
-            TcpEvent::Connected { token, .. } => {
+            StreamEvent::Connected { token, .. } => {
                 assert_eq!(token, framed_client_token);
                 framed_connected = true;
             }
-            TcpEvent::Message { payload, .. } => framed_reply.extend_from_slice(payload),
+            StreamEvent::Message { payload, .. } => framed_reply.extend_from_slice(payload),
             _ => {}
         });
         if framed_connected && framed_server_token.is_some() && !framed_sent {
@@ -301,13 +301,13 @@ fn framed_and_raw_coexist() {
 fn raw_disconnect_when_drained_flushes_queue() {
     let addr = unused_addr();
     let payload = vec![0xA5; 8 * 1024 * 1024];
-    let mut network = TcpNetwork::default();
-    let group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let group = network.add_group(ConnectionGroupConfig {
         name: "raw-drain",
         framing: Framing::Raw,
         socket_buf_size: Some(1024),
         max_frame_size: payload.len(),
-        ..TcpGroupConfig::default()
+        ..ConnectionGroupConfig::default()
     });
     network.listen(group, addr).unwrap();
 
@@ -317,7 +317,7 @@ fn raw_disconnect_when_drained_flushes_queue() {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && token.is_none() {
         network.poll_with(|event| {
-            if let TcpEvent::Accepted { group: event_group, token: accepted, .. } = event {
+            if let StreamEvent::Accepted { group: event_group, token: accepted, .. } = event {
                 assert_eq!(event_group, group);
                 token = Some(accepted);
             }

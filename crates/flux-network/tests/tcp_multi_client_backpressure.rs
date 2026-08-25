@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::tcp::{SendBehavior, TcpConnector};
+use flux_network::stream::{SendBehavior, TcpConnector};
 use mio::Token;
 
 const FRAME_HEADER_SIZE: usize = core::mem::size_of::<u32>() + core::mem::size_of::<u64>();

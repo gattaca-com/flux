@@ -5,7 +5,9 @@ use std::{
 };
 
 use flux_communication::cleanup_shmem;
-use flux_network::tcp::{TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork, TcpTelemetry};
+use flux_network::stream::{
+    ConnectionGroup, ConnectionGroupConfig, StreamEvent, StreamNetwork, TcpTelemetry,
+};
 use flux_utils::directories::shmem_dir;
 use mio::Token;
 
@@ -23,9 +25,9 @@ fn process_mapping_count() -> usize {
 }
 
 fn wait_for_connection(
-    network: &mut TcpNetwork,
-    server_group: TcpGroup,
-    client_group: TcpGroup,
+    network: &mut StreamNetwork,
+    server_group: ConnectionGroup,
+    client_group: ConnectionGroup,
     client_token: Token,
 ) -> Token {
     let mut connected = false;
@@ -33,10 +35,10 @@ fn wait_for_connection(
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && (!connected || server_token.is_none()) {
         network.poll_with(|event| match event {
-            TcpEvent::Accepted { group, token, .. } if group == server_group => {
+            StreamEvent::Accepted { group, token, .. } if group == server_group => {
                 server_token = Some(token);
             }
-            TcpEvent::Connected { group, token, .. } if group == client_group => {
+            StreamEvent::Connected { group, token, .. } if group == client_group => {
                 assert_eq!(token, client_token);
                 connected = true;
             }
@@ -54,9 +56,10 @@ fn outbound_endpoint_reuses_telemetry_mappings_across_reconnects() {
     cleanup_shmem(&shmem);
 
     let addr = unused_addr();
-    let mut network = TcpNetwork::default();
-    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
-    let client_group = network.add_group(TcpGroupConfig {
+    let mut network = StreamNetwork::default();
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(ConnectionGroupConfig {
         name: "client",
         reconnect_interval: flux_timing::Duration::from_millis(1),
         telemetry: TcpTelemetry::Enabled { app_name: APP_NAME },
@@ -76,7 +79,7 @@ fn outbound_endpoint_reuses_telemetry_mappings_across_reconnects() {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && !disconnected {
             network.poll_with(|event| {
-                if let TcpEvent::Disconnected { group, token, .. } = event &&
+                if let StreamEvent::Disconnected { group, token, .. } = event &&
                     group == client_group
                 {
                     assert_eq!(token, client_token);

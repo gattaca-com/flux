@@ -1,4 +1,4 @@
 pub mod http;
 
-pub mod tcp;
+pub mod stream;
 pub use mio::Token;

@@ -1,4 +1,4 @@
-//! Poll-driven HTTP over [`crate::tcp::TcpNetwork`].
+//! Poll-driven HTTP over [`crate::stream::StreamNetwork`].
 //!
 //! [`HttpNetwork`] can listen for requests and maintain outbound endpoints in
 //! one event loop. Events borrow parsed data only for the callback duration.
@@ -43,7 +43,7 @@ use std::{
 use flux_timing::{Duration, Instant};
 use mio::Token;
 
-use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork};
+use crate::stream::{ConnectionGroup, ConnectionGroupConfig, Framing, StreamEvent, StreamNetwork};
 
 pub enum HttpEvent<'a> {
     Accepted { token: Token, peer_addr: SocketAddr },
@@ -76,8 +76,8 @@ enum Lifecycle {
     Disconnected(Token),
 }
 pub struct HttpNetwork {
-    network: TcpNetwork,
-    group: Option<TcpGroup>,
+    network: StreamNetwork,
+    group: Option<ConnectionGroup>,
     name: &'static str,
     max_head_bytes: usize,
     max_body_bytes: usize,
@@ -90,7 +90,7 @@ pub struct HttpNetwork {
 impl Default for HttpNetwork {
     fn default() -> Self {
         Self {
-            network: TcpNetwork::default(),
+            network: StreamNetwork::default(),
             group: None,
             name: "http",
             max_head_bytes: 16 * 1024,
@@ -104,7 +104,7 @@ impl Default for HttpNetwork {
     }
 }
 impl HttpNetwork {
-    /// Sets the TCP group name.
+    /// Sets the group name.
     pub fn with_name(mut self, name: &'static str) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.name = name;
@@ -147,11 +147,11 @@ impl HttpNetwork {
         self.idle_timeout = None;
         self
     }
-    fn group(&mut self) -> TcpGroup {
+    fn group(&mut self) -> ConnectionGroup {
         let Self { network, group, name, max_head_bytes, max_body_bytes, socket_buf_size, .. } =
             self;
         *group.get_or_insert_with(|| {
-            network.add_group(TcpGroupConfig {
+            network.add_group(ConnectionGroupConfig {
                 name,
                 framing: Framing::Raw,
                 socket_buf_size: *socket_buf_size,
@@ -188,7 +188,9 @@ impl HttpNetwork {
         let conns = &mut self.conns;
         let lifecycle = &mut self.lifecycle;
         self.network.poll_with(|event| match event {
-            TcpEvent::Accepted { group: event_group, token, peer_addr } if event_group == group => {
+            StreamEvent::Accepted { group: event_group, token, peer_addr }
+                if event_group == group =>
+            {
                 conns.push(Conn {
                     token,
                     buf: Vec::new(),
@@ -204,10 +206,10 @@ impl HttpNetwork {
                 });
                 lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
-            TcpEvent::Connected { group: event_group, token, .. } if event_group == group => {
+            StreamEvent::Connected { group: event_group, token, .. } if event_group == group => {
                 lifecycle.push(Lifecycle::Connected(token, None));
             }
-            TcpEvent::Message { group: event_group, token, payload, .. }
+            StreamEvent::Message { group: event_group, token, payload, .. }
                 if event_group == group =>
             {
                 if let Some(conn) = conns.iter_mut().find(|conn| conn.token == token) &&
@@ -225,7 +227,7 @@ impl HttpNetwork {
                     conn.last_activity = Instant::now();
                 }
             }
-            TcpEvent::Disconnected { group: event_group, token, .. } if event_group == group => {
+            StreamEvent::Disconnected { group: event_group, token, .. } if event_group == group => {
                 lifecycle.push(Lifecycle::Disconnected(token));
             }
             _ => {}
