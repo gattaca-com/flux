@@ -107,8 +107,8 @@ use crate::stream::{
     ConnectionGroup, Endpoint, Framing, Peer, ServiceRef, StreamEvent, StreamNetwork, private,
 };
 
-/// The most headers one message may be parsed into, and the size of the
-/// scratch every parse borrows.
+/// The most headers one message may be parsed into, and the size of the fixed
+/// stack scratch used while parsing.
 pub const MAX_HEADERS: usize = 128;
 
 /// HTTP parsing and connection-state policy. Transport and queue policy
@@ -344,8 +344,8 @@ impl Responder<'_> {
         self.respond_with(status, headers, |out| out.extend_from_slice(body))
     }
 
-    /// Queues the response with its body written by `write_body`, and
-    /// returns whether it was written.
+    /// Queues the response with its body written by `body`, and returns
+    /// whether it was written.
     ///
     /// The closure renders into a buffer the service keeps for the next
     /// response, so a body composed here costs no allocation. Every framing
@@ -356,7 +356,7 @@ impl Responder<'_> {
         self,
         status: u16,
         headers: &[(&str, &str)],
-        write_body: impl FnOnce(&mut Vec<u8>),
+        body: impl FnOnce(&mut Vec<u8>),
     ) -> bool {
         let Self { net, state, scratch, token, linger } = self;
         if state.phase != Phase::Pending {
@@ -374,7 +374,7 @@ impl Responder<'_> {
         let suppress_body = state.head_request || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
         scratch.clear();
-        write_body(scratch);
+        body(scratch);
         let body: &[u8] = scratch;
         let ok = net.send_with(token, |out| {
             write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();

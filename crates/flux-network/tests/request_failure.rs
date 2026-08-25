@@ -454,6 +454,22 @@ fn a_chunk_the_service_cannot_size_is_malformed() {
 }
 
 #[test]
+fn an_answer_with_more_headers_than_the_parse_holds_is_malformed() {
+    let mut answer = b"HTTP/1.1 200 OK\r\n".to_vec();
+    for index in 0..8 {
+        answer.extend_from_slice(format!("h{index}: v\r\n").as_bytes());
+    }
+    answer.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+    assert_failure(
+        &Endpoint::Tcp(unused_addr()),
+        HttpConfig::default().with_max_headers(8),
+        &answer,
+        false,
+        RequestFailure::Malformed,
+    );
+}
+
+#[test]
 fn an_answer_framed_twice_over_is_malformed() {
     assert_failure(
         &Endpoint::Tcp(unused_addr()),

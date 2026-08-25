@@ -617,6 +617,65 @@ fn max_headers_of_none_is_rejected() {
     let _ = HttpConfig::default().with_max_headers(0);
 }
 
+/// A request carrying exactly `headers` headers and nothing else.
+fn request_of_headers(headers: usize) -> Vec<u8> {
+    let mut request = b"GET / HTTP/1.1\r\n".to_vec();
+    for index in 0..headers {
+        request.extend_from_slice(format!("h{index}: v\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    request
+}
+
+/// The status a server of `config` answers `request` with, answering `200`
+/// itself for every request it delivers.
+fn answered_status(config: HttpConfig, request: &[u8]) -> u16 {
+    // What a header count decides is the parse, not the transport, so this
+    // runs over a socket file rather than a loopback port.
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = Endpoint::Unix(dir.path().join("s"));
+    let mut server = Http::with_config(config);
+    server.listen(&endpoint);
+    let mut client = connect_client(&endpoint);
+    client.write_all(request).unwrap();
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && response_len(&received).is_none() {
+        let mut tokens = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, .. } = event {
+                tokens.push(token);
+            }
+        });
+        for token in tokens {
+            assert!(server.respond(token, 200, &[], b""));
+        }
+        read_available(&mut client, &mut received);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let text = std::str::from_utf8(&received).expect("no response arrived");
+    text.split(' ').nth(1).expect("no status line").parse().expect("no status code")
+}
+
+#[test]
+fn a_request_at_the_header_count_is_served_and_one_over_it_is_not() {
+    let config = HttpConfig::default().with_max_headers(8);
+    assert_eq!(answered_status(config, &request_of_headers(8)), 200);
+    // More headers than the parse was given room for is a head the service
+    // cannot read, which is the 400 every unreadable head is answered with.
+    assert_eq!(answered_status(config, &request_of_headers(9)), 400);
+}
+
+#[test]
+fn a_header_count_past_the_parse_scratch_is_held_to_it() {
+    // The field is public, so a configuration written without the builder can
+    // ask for more headers than the scratch holds; MAX_HEADERS is what it
+    // parses.
+    let config = HttpConfig { max_headers: 500, ..HttpConfig::default() };
+    assert_eq!(answered_status(config, &request_of_headers(MAX_HEADERS)), 200);
+    assert_eq!(answered_status(config, &request_of_headers(MAX_HEADERS + 1)), 400);
+}
+
 over_transports_and_modes!(
     pipelined_requests,
     pipelined_requests_tcp,
@@ -1364,6 +1423,43 @@ fn a_dropped_responder_answers_later_by_token() {
     assert!(server.respond(token, 200, &[], b"late"));
     read_until_response(&mut server, &mut client, &mut received);
     assert!(received.ends_with(b"late"), "{received:?}");
+}
+
+#[test]
+fn a_refused_answer_composes_no_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = Endpoint::Unix(dir.path().join("s"));
+    let mut server = server_at(&endpoint);
+    let mut client = connect_client(&endpoint);
+    client.write_all(b"GET /defer HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (token, _) = pull_deferred_request(&mut server);
+
+    let refused: &[(u16, &[(&str, &str)])] = &[
+        // Outside the range a response can be framed in.
+        (99, &[]),
+        (600, &[]),
+        // A name that is no token, and one the service frames itself.
+        (200, &[("bad name", "x")]),
+        (200, &[("Content-Length", "4")]),
+    ];
+    for (status, headers) in refused {
+        assert!(
+            !server.respond_with(token, *status, headers, |_| {
+                panic!("a refused answer composed its body")
+            }),
+            "{status} with {headers:?} was answered"
+        );
+    }
+
+    assert!(server.respond_with(token, 200, &[], |out| out.extend_from_slice(b"once")));
+    assert!(
+        !server.respond_with(token, 200, &[], |_| panic!("a second answer composed its body")),
+        "one request was answered twice"
+    );
+
+    let mut received = Vec::new();
+    read_until_response(&mut server, &mut client, &mut received);
+    assert!(received.ends_with(b"once"), "{received:?}");
 }
 
 #[test]

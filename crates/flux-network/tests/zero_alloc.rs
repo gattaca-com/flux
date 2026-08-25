@@ -74,8 +74,9 @@ fn allocations() -> u64 {
     ALLOCATIONS.with(Cell::get)
 }
 
-/// Round trips run before anything is counted: enough for every buffer on
-/// both paths to reach the size it keeps.
+/// Round trips run before anything is counted. One settles every buffer on
+/// both paths — a count opened after a single round trip already reads zero
+/// — and the rest are margin against a buffer that one day needs more.
 const WARM_UP: u64 = 16;
 
 /// Round trips run under the count, in each direction.
@@ -159,31 +160,31 @@ impl Harness {
         write!(upstream_response, "Content-Length: {}\r\n\r\n", RESPONSE_BODY.len()).unwrap();
         upstream_response.extend_from_slice(RESPONSE_BODY);
 
-        let mut harness = Self {
+        // The endpoint the service dialled is the only connection the
+        // listener ever accepts, so it is the one every request rides.
+        let upstream = loop {
+            assert!(Instant::now() < deadline, "the service never reached its endpoint");
+            net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
+            if let Ok((stream, _)) = listener.accept() {
+                stream.set_nonblocking(true).unwrap();
+                break stream;
+            }
+        };
+
+        Self {
             net,
             service,
             client,
             client_request,
             client_response,
-            upstream: TcpStream::connect(upstream_addr).unwrap(),
+            upstream,
             upstream_token,
             upstream_request,
             upstream_response,
             buf: [0; 8192],
             served: 0,
             answered: 0,
-        };
-        // That placeholder connection is dropped for the one the service
-        // itself dialled, which is the connection every request rides.
-        harness.upstream = loop {
-            assert!(Instant::now() < deadline, "the service never reached its endpoint");
-            harness.pump();
-            if let Ok((stream, _)) = listener.accept() {
-                stream.set_nonblocking(true).unwrap();
-                break stream;
-            }
-        };
-        harness
+        }
     }
 
     /// One iteration of the network, and every event it left to pull.
