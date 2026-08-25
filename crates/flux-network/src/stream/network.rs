@@ -324,7 +324,25 @@ struct Connection {
     endpoint: Option<Endpoint>,
     state: ConnectionState,
     close_when_drained: bool,
+    /// How far the write side has got toward the half-close a caller asked
+    /// for.
+    write_side: WriteSide,
     timers: Option<NetworkTimers>,
+}
+
+/// The write side of a connected socket: what the half-close requested
+/// through [`StreamNetwork::shutdown_write_when_drained`] is waiting for, and
+/// whether it has happened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteSide {
+    /// Open, and carrying whatever the caller sends.
+    Open,
+    /// To be shut as soon as the queued bytes reach the peer. Sends are
+    /// refused from the request onward, so the queue only shrinks.
+    ShutWhenDrained,
+    /// Shut: the peer has read the end of the stream, and what it sends still
+    /// arrives.
+    Shut,
 }
 
 #[derive(Clone, Copy)]
@@ -434,6 +452,7 @@ impl NetworkState {
             endpoint: Some(endpoint),
             state: ConnectionState::Disconnected,
             close_when_drained: false,
+            write_side: WriteSide::Open,
             timers,
         });
         self.start_connect(self.connections.len() - 1);
@@ -673,6 +692,7 @@ impl NetworkState {
                 endpoint: None,
                 state: ConnectionState::Connected(stream),
                 close_when_drained: false,
+                write_side: WriteSide::Open,
                 timers,
             });
             info!(group = group_name, %peer, "connection accepted");
@@ -724,8 +744,15 @@ impl NetworkState {
         if state == StreamState::Disconnected {
             handler(StreamEvent::Disconnected { group, token, peer });
             self.disconnect_index(index, false);
-        } else if self.connections[index].close_when_drained && queue_empty {
-            self.disconnect_index(index, true);
+        } else if queue_empty {
+            // A connection asked for both closes outright: a peer about to
+            // lose the connection gains nothing from reading the end of the
+            // stream first.
+            if self.connections[index].close_when_drained {
+                self.disconnect_index(index, true);
+            } else if self.connections[index].write_side == WriteSide::ShutWhenDrained {
+                self.shut_write(index);
+            }
         }
     }
 
@@ -754,6 +781,7 @@ impl NetworkState {
         };
         let accepted = self.connections[index].endpoint.is_none();
         self.connections[index].close_when_drained = false;
+        self.connections[index].write_side = WriteSide::Open;
         let was_connected = self.close_connection_socket(index);
         if accepted {
             self.connections.swap_remove(index);
@@ -781,6 +809,7 @@ impl NetworkState {
         self.connections.iter().position(|connection| {
             connection.token == token &&
                 !connection.close_when_drained &&
+                connection.write_side == WriteSide::Open &&
                 matches!(connection.state, ConnectionState::Connected(_))
         })
     }
@@ -903,6 +932,7 @@ impl NetworkState {
             self.connections.iter().any(|connection| {
                 connection.group == group &&
                     !connection.close_when_drained &&
+                    connection.write_side == WriteSide::Open &&
                     matches!(connection.state, ConnectionState::Connected(_))
             })
     }
@@ -917,6 +947,7 @@ impl NetworkState {
             index -= 1;
             if self.connections[index].group != group ||
                 self.connections[index].close_when_drained ||
+                self.connections[index].write_side != WriteSide::Open ||
                 !matches!(self.connections[index].state, ConnectionState::Connected(_))
             {
                 continue;
@@ -991,6 +1022,38 @@ impl NetworkState {
         }
         self.connections[index].close_when_drained = true;
         true
+    }
+
+    fn shutdown_write_when_drained(&mut self, token: Token) -> bool {
+        let Some(index) = self.connections.iter().position(|connection| connection.token == token)
+        else {
+            return false;
+        };
+        let ConnectionState::Connected(stream) = &self.connections[index].state else {
+            return false;
+        };
+        let drained = stream.send_queue.is_empty();
+        match self.connections[index].write_side {
+            WriteSide::Open if drained => self.shut_write(index),
+            WriteSide::Open => self.connections[index].write_side = WriteSide::ShutWhenDrained,
+            WriteSide::ShutWhenDrained | WriteSide::Shut => {}
+        }
+        true
+    }
+
+    /// Shuts the write side of a connected socket, which stays registered and
+    /// readable: the peer reads the end of the stream, and what it sends
+    /// afterwards still arrives.
+    fn shut_write(&mut self, index: usize) {
+        let peer = self.connections[index].peer;
+        if let ConnectionState::Connected(stream) = &self.connections[index].state &&
+            let Err(err) = stream.socket.shutdown(Shutdown::Write)
+        {
+            // A peer that has gone already refuses the shutdown, and its own
+            // end of stream is on its way here.
+            debug!(?err, %peer, "couldn't shut the write side");
+        }
+        self.connections[index].write_side = WriteSide::Shut;
     }
 
     fn remove(&mut self, token: Token) -> bool {
@@ -1534,6 +1597,25 @@ impl StreamNetwork {
     /// `TCP_USER_TIMEOUT`; a Unix-domain peer has no such bound.
     pub fn disconnect_when_drained(&mut self, token: Token) -> bool {
         self.state.disconnect_when_drained(token)
+    }
+
+    /// Shuts the write side of a connection once its queued bytes have been
+    /// written, and keeps reading it: the peer reads the end of the stream,
+    /// while the bytes it sends afterwards still arrive as
+    /// [`StreamEvent::Message`] and its own close still arrives as
+    /// [`StreamEvent::Disconnected`]. Both transports of the [`Endpoint`] set
+    /// half-close. Returns `false` for unknown or disconnected tokens; a
+    /// connection whose write side is already shut, or already waiting to be,
+    /// is left as it is.
+    ///
+    /// Sends to such a token are rejected and queue nothing, so the queue
+    /// only shrinks from the call onward. [`Self::disconnect`] still closes
+    /// the connection outright at any point, and a token that is draining as
+    /// well ([`Self::disconnect_when_drained`]) closes when its queue empties
+    /// rather than half-closing. A TCP peer that never drains is bounded only
+    /// by `TCP_USER_TIMEOUT`; a Unix-domain peer has no such bound.
+    pub fn shutdown_write_when_drained(&mut self, token: Token) -> bool {
+        self.state.shutdown_write_when_drained(token)
     }
 
     /// Permanently removes a connection or outbound endpoint. Returns whether
