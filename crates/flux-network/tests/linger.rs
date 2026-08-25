@@ -638,3 +638,73 @@ fn an_undelivered_answer_is_swept(endpoint: &Endpoint) {
     }
     assert!(received.len() < body.len(), "a peer that read nothing was sent the whole answer");
 }
+
+#[test]
+fn the_caps_start_when_the_answer_has_left() {
+    let idle = Duration::from_millis(200);
+    let answer = vec![7; 256 * 1024];
+    let addr = unused_addr();
+    let endpoint = Endpoint::Tcp(addr);
+    let group = ConnectionGroupConfig { socket_buf_size: Some(16 * 1024), ..raw_group() };
+    let config = HttpConfig::default()
+        .with_max_head_bytes(64)
+        .with_max_body_bytes(64)
+        .with_linger(linger(idle, TIMEOUT * 3));
+    let mut server = Server::build(&endpoint, group, config);
+
+    // The peer sends more than the connection may hold and then reads nothing
+    // for half a second. The answer is larger than the sockets between them
+    // can hold, so the last of it is written where the pause ends: the poll
+    // that waited it out is the one whose tick starts the caps.
+    let (delivered, read_back) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        client.write_all(&[b'x'; 256]).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let mut received = 0;
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            match client.read(&mut buffer).unwrap() {
+                0 => break,
+                read => received += read,
+            }
+        }
+        delivered.send(received).unwrap();
+        // Held open, sending nothing, so the idle cap is what ends it.
+        thread::sleep(Duration::from_secs(3));
+    });
+
+    let token = server.accepted_token();
+    server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
+    server.pump_for(Duration::from_millis(20));
+    assert!(server.respond(token, 200, &answer));
+    assert!(!server.net.write_side_shut(token), "the answer left before the peer read a byte");
+
+    // From here the server only blocks, so the poll wait is the whole of each
+    // iteration: the caps must run from where that wait ended.
+    let mut shut_at = None;
+    let ended = loop {
+        {
+            let Server { net, service, disconnected, .. } = &mut server;
+            net.drive(None, &mut [service.as_service()], |_| {});
+            while let Some(event) = service.next_event(net) {
+                if let HttpEvent::Disconnected { token } = event {
+                    disconnected.push(token);
+                }
+            }
+        }
+        if shut_at.is_none() && server.net.write_side_shut(token) {
+            shut_at = Some(Instant::now());
+        }
+        if !server.disconnected.is_empty() {
+            break Instant::now();
+        }
+    };
+
+    let ran = ended.duration_since(shut_at.expect("the write side never shut"));
+    assert!(ran >= Duration::from_millis(150), "the caps ran for {ran:?}");
+    assert!(ran < Duration::from_secs(2), "the caps did not end the linger: {ran:?}");
+    let received = read_back.recv_timeout(TIMEOUT).unwrap();
+    assert!(received >= answer.len(), "the peer was sent {received} of {}", answer.len());
+}

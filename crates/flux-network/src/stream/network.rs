@@ -1423,8 +1423,11 @@ impl StreamNetwork {
         self.state.shutdown_write_when_drained(token)
     }
 
-    /// Whether the write side of a connection has shut: the peer has the
-    /// whole of what was queued for it, and the end of the stream after it.
+    /// Whether the write side of a connection has shut: the transport has
+    /// taken everything that was queued for it, and the end of the stream
+    /// after it. Up to a socket buffer of that may still be on its way, so
+    /// this says the network has nothing left to send, not that the peer has
+    /// read it.
     ///
     /// A connection still writing what [`Self::shutdown_write_when_drained`]
     /// will end — and one that never asked for a half-close, or that closed
