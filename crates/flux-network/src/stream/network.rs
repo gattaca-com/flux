@@ -1,19 +1,17 @@
 use std::{
     io::{self, IoSlice, Read, Write},
-    net::{Shutdown, SocketAddr},
+    net::Shutdown,
 };
 
 use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos, Repeater};
-use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::TcpListener};
+use mio::{Events, Interest, Poll, Registry, Token, event::Event};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    TcpTelemetry, set_socket_buf_size,
-    tcp_stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_keepalive, set_user_timeout,
-        write_frame_header,
-    },
+    Endpoint, Peer, TcpTelemetry, set_socket_buf_size,
+    tcp_stream::{DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, write_frame_header},
+    transport::{ListenSocket, TransportStream},
 };
 
 const EVENTS_CAPACITY: usize = 128;
@@ -51,13 +49,16 @@ pub struct ConnectionGroupConfig {
     /// Static payload sent on every newly established connection before its
     /// lifecycle event is emitted.
     pub on_connect_msg: Option<Vec<u8>>,
-    /// Requested `SO_SNDBUF` and `SO_RCVBUF` size.
+    /// Requested `SO_SNDBUF` and `SO_RCVBUF` size, applied to every transport.
     pub socket_buf_size: Option<usize>,
-    /// Whether to enable `TCP_NODELAY`.
+    /// Whether to enable `TCP_NODELAY`. Unix-domain endpoints have no such
+    /// option and ignore it.
     pub nodelay: bool,
-    /// Whether to enable TCP keepalive.
+    /// Whether to enable TCP keepalive. Unix-domain endpoints have no such
+    /// option and ignore it.
     pub keepalive: bool,
-    /// Linux `TCP_USER_TIMEOUT`, in milliseconds.
+    /// Linux `TCP_USER_TIMEOUT`, in milliseconds. Unix-domain endpoints have
+    /// no such option and ignore it.
     pub user_timeout_ms: u32,
     /// Retry interval for persistent outbound endpoints.
     pub reconnect_interval: Duration,
@@ -79,7 +80,7 @@ pub struct ConnectionGroupConfig {
 impl Default for ConnectionGroupConfig {
     fn default() -> Self {
         Self {
-            name: "tcp",
+            name: "stream",
             on_connect_msg: None,
             socket_buf_size: None,
             nodelay: true,
@@ -106,15 +107,15 @@ impl ConnectionGroupConfig {
 /// Event emitted by [`StreamNetwork::poll_with`].
 pub enum StreamEvent<'a> {
     /// A listener accepted a new connection.
-    Accepted { group: ConnectionGroup, token: Token, peer_addr: SocketAddr },
+    Accepted { group: ConnectionGroup, token: Token, peer: Peer },
     /// A persistent outbound endpoint established a connection.
-    Connected { group: ConnectionGroup, token: Token, peer_addr: SocketAddr },
+    Connected { group: ConnectionGroup, token: Token, peer: Peer },
     /// A complete length-prefixed message or a raw read chunk was received.
     /// For raw-framed groups, chunks do not preserve message boundaries and
     /// `send_ts` is the local receive time.
     Message { group: ConnectionGroup, token: Token, payload: &'a [u8], send_ts: Nanos },
     /// An established connection was closed.
-    Disconnected { group: ConnectionGroup, token: Token, peer_addr: SocketAddr },
+    Disconnected { group: ConnectionGroup, token: Token, peer: Peer },
 }
 
 struct GroupState {
@@ -125,27 +126,23 @@ struct GroupState {
 struct Listener {
     token: Token,
     group: ConnectionGroup,
-    socket: TcpListener,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConnectionKind {
-    Accepted,
-    Outbound,
+    socket: ListenSocket,
 }
 
 #[allow(clippy::large_enum_variant)]
 enum ConnectionState {
     Disconnected,
-    Connecting(mio::net::TcpStream),
+    Connecting(TransportStream),
     Connected(FramedStream),
 }
 
 struct Connection {
     token: Token,
     group: ConnectionGroup,
-    peer_addr: SocketAddr,
-    kind: ConnectionKind,
+    peer: Peer,
+    /// The endpoint a persistent outbound connection reconnects to; `None`
+    /// for a connection the network accepted.
+    endpoint: Option<Endpoint>,
     state: ConnectionState,
     close_when_drained: bool,
     timers: Option<NetworkTimers>,
@@ -162,11 +159,11 @@ impl NetworkTimers {
         telemetry: TcpTelemetry,
         group_name: &str,
         token: Token,
-        peer_addr: SocketAddr,
+        peer: Peer,
         framing: Framing,
     ) -> Option<Self> {
         let TcpTelemetry::Enabled { app_name } = telemetry else { return None };
-        let label = format!("{group_name}-{}-{peer_addr}", token.0);
+        let label = format!("{group_name}-{}-{peer}", token.0);
         Some(Self {
             latency: (framing == Framing::LengthPrefixed)
                 .then(|| Timer::new(app_name, format!("tcp_latency_{label}"))),
@@ -179,7 +176,7 @@ impl NetworkTimers {
 struct PendingDisconnect {
     group: ConnectionGroup,
     token: Token,
-    peer_addr: SocketAddr,
+    peer: Peer,
 }
 
 struct NetworkState {
@@ -196,7 +193,7 @@ struct NetworkState {
 impl Default for NetworkState {
     fn default() -> Self {
         Self {
-            poll: Poll::new().expect("couldn't set up a poll for tcp network"),
+            poll: Poll::new().expect("couldn't set up a poll for the stream network"),
             groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
             listeners: Vec::with_capacity(INITIAL_LISTENER_CAPACITY),
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
@@ -211,7 +208,7 @@ impl Default for NetworkState {
 impl NetworkState {
     fn next_token(&mut self) -> Token {
         let token = Token(self.next_token);
-        self.next_token = self.next_token.checked_add(1).expect("tcp token space exhausted");
+        self.next_token = self.next_token.checked_add(1).expect("stream token space exhausted");
         token
     }
 
@@ -219,28 +216,28 @@ impl NetworkState {
         &self.groups[group.0].config
     }
 
-    fn listen(&mut self, group: ConnectionGroup, addr: SocketAddr) -> io::Result<()> {
+    fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<()> {
         if group.0 >= self.groups.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown TCP group"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown connection group"));
         }
-        let mut socket = TcpListener::bind(addr)?;
+        let mut socket = ListenSocket::bind(endpoint)?;
         let token = self.next_token();
         self.poll.registry().register(&mut socket, token, Interest::READABLE)?;
         self.listeners.push(Listener { token, group, socket });
         Ok(())
     }
 
-    fn connect(&mut self, group: ConnectionGroup, peer_addr: SocketAddr) -> Token {
-        assert!(group.0 < self.groups.len(), "unknown TCP group");
+    fn connect(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> Token {
+        assert!(group.0 < self.groups.len(), "unknown connection group");
         let token = self.next_token();
+        let peer = endpoint.peer();
         let config = self.config(group);
-        let timers =
-            NetworkTimers::new(config.telemetry, config.name, token, peer_addr, config.framing);
+        let timers = NetworkTimers::new(config.telemetry, config.name, token, peer, config.framing);
         self.connections.push(Connection {
             token,
             group,
-            peer_addr,
-            kind: ConnectionKind::Outbound,
+            peer,
+            endpoint: Some(endpoint),
             state: ConnectionState::Disconnected,
             close_when_drained: false,
             timers,
@@ -251,19 +248,18 @@ impl NetworkState {
 
     fn start_connect(&mut self, index: usize) {
         let connection = &self.connections[index];
-        if connection.kind != ConnectionKind::Outbound ||
-            !matches!(connection.state, ConnectionState::Disconnected)
-        {
+        if !matches!(connection.state, ConnectionState::Disconnected) {
             return;
         }
+        let Some(endpoint) = &connection.endpoint else { return };
 
         let token = connection.token;
         let group = connection.group;
-        let peer_addr = connection.peer_addr;
+        let peer = connection.peer;
         let socket_buf_size = self.config(group).socket_buf_size;
 
-        let Ok(mut socket) = mio::net::TcpStream::connect(peer_addr)
-            .inspect_err(|err| debug!(?err, %peer_addr, "couldn't start tcp connection"))
+        let Ok(mut socket) = TransportStream::connect(endpoint)
+            .inspect_err(|err| debug!(?err, %endpoint, "couldn't start connection"))
         else {
             return;
         };
@@ -271,7 +267,7 @@ impl NetworkState {
             set_socket_buf_size(&socket, size);
         }
         if let Err(err) = self.poll.registry().register(&mut socket, token, Interest::WRITABLE) {
-            warn!(?err, %peer_addr, "couldn't register connecting tcp stream");
+            warn!(?err, %peer, "couldn't register connecting stream");
             let _ = socket.shutdown(Shutdown::Both);
             return;
         }
@@ -287,30 +283,11 @@ impl NetworkState {
             let group = ConnectionGroup(group_index);
             for index in 0..self.connections.len() {
                 if self.connections[index].group == group &&
-                    self.connections[index].kind == ConnectionKind::Outbound &&
                     matches!(self.connections[index].state, ConnectionState::Disconnected)
                 {
                     self.start_connect(index);
                 }
             }
-        }
-    }
-
-    fn connect_complete(socket: &mio::net::TcpStream) -> io::Result<bool> {
-        if let Some(err) = socket.take_error()? {
-            return Err(err);
-        }
-        match socket.peer_addr() {
-            Ok(_) => Ok(true),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
-                ) || matches!(err.raw_os_error(), Some(libc::EINPROGRESS | libc::EALREADY)) =>
-            {
-                Ok(false)
-            }
-            Err(err) => Err(err),
         }
     }
 
@@ -321,11 +298,11 @@ impl NetworkState {
         let ConnectionState::Connecting(socket) = &self.connections[index].state else {
             return false;
         };
-        match Self::connect_complete(socket) {
+        match socket.is_connected() {
             Ok(false) => return false,
             Err(err) => {
-                let peer_addr = self.connections[index].peer_addr;
-                debug!(?err, %peer_addr, "tcp connection attempt failed");
+                let peer = self.connections[index].peer;
+                debug!(?err, %peer, "connection attempt failed");
                 self.close_connection_socket(index);
                 return false;
             }
@@ -339,35 +316,35 @@ impl NetworkState {
         };
         let token = self.connections[index].token;
         let group = self.connections[index].group;
-        let peer_addr = self.connections[index].peer_addr;
+        let peer = self.connections[index].peer;
         let mut timers = self.connections[index].timers;
         let config = self.config(group);
         let group_name = config.name;
 
         if config.nodelay &&
-            let Err(err) = socket.set_nodelay(true)
+            let Err(err) = socket.set_nodelay()
         {
-            warn!(?err, %peer_addr, "couldn't set nodelay on tcp stream");
+            warn!(?err, %peer, "couldn't set nodelay on tcp stream");
             let _ = self.poll.registry().deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
         if config.keepalive &&
-            let Err(err) = set_keepalive(&socket)
+            let Err(err) = socket.set_keepalive()
         {
-            warn!(?err, %peer_addr, "couldn't set keepalive on tcp stream");
+            warn!(?err, %peer, "couldn't set keepalive on tcp stream");
             let _ = self.poll.registry().deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
-        set_user_timeout(&socket, config.user_timeout_ms);
+        socket.set_user_timeout(config.user_timeout_ms);
         if let Err(err) = self.poll.registry().reregister(&mut socket, token, Interest::READABLE) {
-            warn!(?err, %peer_addr, "couldn't register connected tcp stream");
+            warn!(?err, %peer, "couldn't register connected stream");
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
 
-        let mut stream = FramedStream::new(socket, token, peer_addr, config.max_frame_size);
+        let mut stream = FramedStream::new(socket, token, peer, config.max_frame_size);
         if let Some(message) = config.on_connect_msg.as_deref() {
             let header = (config.framing == Framing::LengthPrefixed).then(|| {
                 let mut header = [0; FRAME_HEADER_SIZE];
@@ -390,8 +367,8 @@ impl NetworkState {
 
         self.connections[index].timers = timers;
         self.connections[index].state = ConnectionState::Connected(stream);
-        info!(group = group_name, %peer_addr, "tcp connection established");
-        handler(StreamEvent::Connected { group, token, peer_addr });
+        info!(group = group_name, %peer, "connection established");
+        handler(StreamEvent::Connected { group, token, peer });
         true
     }
 
@@ -402,11 +379,11 @@ impl NetworkState {
         let group = self.listeners[listener_index].group;
         loop {
             let accepted = self.listeners[listener_index].socket.accept();
-            let (mut socket, peer_addr) = match accepted {
+            let (mut socket, peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    warn!(?err, group = self.config(group).name, "tcp accept failed");
+                    warn!(?err, group = self.config(group).name, "accept failed");
                     break;
                 }
             };
@@ -417,36 +394,31 @@ impl NetworkState {
                     set_socket_buf_size(&socket, size);
                 }
                 if config.nodelay &&
-                    let Err(err) = socket.set_nodelay(true)
+                    let Err(err) = socket.set_nodelay()
                 {
-                    warn!(?err, %peer_addr, "couldn't set nodelay on accepted tcp stream");
+                    warn!(?err, %peer, "couldn't set nodelay on accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
                 }
                 if config.keepalive &&
-                    let Err(err) = set_keepalive(&socket)
+                    let Err(err) = socket.set_keepalive()
                 {
-                    warn!(?err, %peer_addr, "couldn't set keepalive on accepted tcp stream");
+                    warn!(?err, %peer, "couldn't set keepalive on accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
                 }
-                set_user_timeout(&socket, config.user_timeout_ms);
+                socket.set_user_timeout(config.user_timeout_ms);
                 if let Err(err) =
                     self.poll.registry().register(&mut socket, token, Interest::READABLE)
                 {
-                    warn!(?err, %peer_addr, "couldn't register accepted tcp stream");
+                    warn!(?err, %peer, "couldn't register accepted stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
                 }
 
-                let mut timers = NetworkTimers::new(
-                    config.telemetry,
-                    config.name,
-                    token,
-                    peer_addr,
-                    config.framing,
-                );
-                let mut stream = FramedStream::new(socket, token, peer_addr, config.max_frame_size);
+                let mut timers =
+                    NetworkTimers::new(config.telemetry, config.name, token, peer, config.framing);
+                let mut stream = FramedStream::new(socket, token, peer, config.max_frame_size);
                 if let Some(message) = config.on_connect_msg.as_deref() {
                     let header = (config.framing == Framing::LengthPrefixed).then(|| {
                         let mut header = [0; FRAME_HEADER_SIZE];
@@ -471,14 +443,14 @@ impl NetworkState {
             self.connections.push(Connection {
                 token,
                 group,
-                peer_addr,
-                kind: ConnectionKind::Accepted,
+                peer,
+                endpoint: None,
                 state: ConnectionState::Connected(stream),
                 close_when_drained: false,
                 timers,
             });
-            info!(group = group_name, %peer_addr, "tcp connection accepted");
-            handler(StreamEvent::Accepted { group, token, peer_addr });
+            info!(group = group_name, %peer, "connection accepted");
+            handler(StreamEvent::Accepted { group, token, peer });
         }
     }
 
@@ -493,7 +465,7 @@ impl NetworkState {
         }
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
-            debug!(?token, "ignoring stale tcp readiness event");
+            debug!(?token, "ignoring stale readiness event");
             return;
         };
 
@@ -507,7 +479,7 @@ impl NetworkState {
         }
 
         let group = self.connections[index].group;
-        let peer_addr = self.connections[index].peer_addr;
+        let peer = self.connections[index].peer;
         let config = &self.groups[group.0].config;
         let (state, queue_empty) = {
             let connection = &mut self.connections[index];
@@ -524,7 +496,7 @@ impl NetworkState {
             (state, stream.send_queue.is_empty())
         };
         if state == StreamState::Disconnected {
-            handler(StreamEvent::Disconnected { group, token, peer_addr });
+            handler(StreamEvent::Disconnected { group, token, peer });
             self.disconnect_index(index, false);
         } else if self.connections[index].close_when_drained && queue_empty {
             self.disconnect_index(index, true);
@@ -552,12 +524,12 @@ impl NetworkState {
         let event = PendingDisconnect {
             group: self.connections[index].group,
             token: self.connections[index].token,
-            peer_addr: self.connections[index].peer_addr,
+            peer: self.connections[index].peer,
         };
-        let kind = self.connections[index].kind;
+        let accepted = self.connections[index].endpoint.is_none();
         self.connections[index].close_when_drained = false;
         let was_connected = self.close_connection_socket(index);
-        if kind == ConnectionKind::Accepted {
+        if accepted {
             self.connections.swap_remove(index);
         }
         if notify && was_connected {
@@ -573,7 +545,7 @@ impl NetworkState {
             handler(StreamEvent::Disconnected {
                 group: event.group,
                 token: event.token,
-                peer_addr: event.peer_addr,
+                peer: event.peer,
             });
         }
     }
@@ -596,7 +568,7 @@ impl NetworkState {
                 group = config.name,
                 payload_len = self.send_payload.len(),
                 max_frame_size = config.max_frame_size,
-                "tcp payload exceeds maximum frame size"
+                "payload exceeds maximum frame size"
             );
             self.send_payload.clear();
             return false;
@@ -731,12 +703,18 @@ impl NetworkState {
     }
 }
 
-/// A grouped collection of TCP listeners and persistent outbound endpoints
-/// driven by one nonblocking poll.
+/// A grouped collection of listeners and persistent outbound endpoints driven
+/// by one nonblocking poll.
+///
+/// One network mixes both transports of the [`Endpoint`] set: a TCP and a
+/// Unix-domain listener can share a group.
 ///
 /// Unlike [`super::TcpConnector`], queued bytes are never retained across a
 /// disconnected socket. Use `TcpConnector` when reconnect backlog replay is
 /// required.
+///
+/// Dropping the network closes every listener, which unlinks the socket file
+/// of each [`Endpoint::Unix`] listener.
 pub struct StreamNetwork {
     events: Events,
     state: NetworkState,
@@ -756,7 +734,7 @@ impl StreamNetwork {
         if config.framing == Framing::LengthPrefixed {
             assert!(
                 u32::try_from(config.max_frame_size).is_ok(),
-                "max_frame_size exceeds the TCP wire length field"
+                "max_frame_size exceeds the wire length field"
             );
         }
         if let Some(message) = &config.on_connect_msg {
@@ -779,15 +757,22 @@ impl StreamNetwork {
     }
 
     /// Adds a listener to `group`.
-    pub fn listen(&mut self, group: ConnectionGroup, addr: SocketAddr) -> io::Result<()> {
-        self.state.listen(group, addr)
+    ///
+    /// An [`Endpoint::Unix`] listener creates its socket file with mode `0777`
+    /// less the umask bits; flux sets no mode of its own. Connecting to a
+    /// Unix-domain socket requires *write* permission on that file, so the
+    /// usual `022` umask yields `0755` and admits the owner alone. An operator
+    /// who wants group or world access sets the umask before the bind or
+    /// changes the mode after it.
+    pub fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<()> {
+        self.state.listen(group, endpoint)
     }
 
     /// Adds a persistent outbound endpoint and immediately starts connecting.
     /// The returned token remains stable across reconnects.
     #[must_use = "the token identifies the persistent outbound endpoint"]
-    pub fn connect(&mut self, group: ConnectionGroup, peer_addr: SocketAddr) -> Token {
-        self.state.connect(group, peer_addr)
+    pub fn connect(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> Token {
+        self.state.connect(group, endpoint)
     }
 
     pub fn poll_with<F>(&mut self, mut handler: F)
@@ -798,7 +783,7 @@ impl StreamNetwork {
         self.state.maybe_reconnect();
         if let Err(err) = self.state.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             if err.kind() != io::ErrorKind::Interrupted {
-                flux_utils::safe_panic!("couldn't poll tcp network: {err}");
+                flux_utils::safe_panic!("couldn't poll the stream network: {err}");
             }
             return;
         }
@@ -839,8 +824,8 @@ impl StreamNetwork {
 
     /// Closes a connected socket after its queued bytes have been written.
     /// Returns `false` for unknown or disconnected tokens; sends to a draining
-    /// token are rejected. A peer that never drains is bounded only by
-    /// `TCP_USER_TIMEOUT`.
+    /// token are rejected. A TCP peer that never drains is bounded only by
+    /// `TCP_USER_TIMEOUT`; a Unix-domain peer has no such bound.
     pub fn disconnect_when_drained(&mut self, token: Token) -> bool {
         self.state.disconnect_when_drained(token)
     }
@@ -954,7 +939,7 @@ impl ByteQueue {
         self.bytes.capacity() != old_capacity
     }
 
-    fn maybe_warn(&mut self, config: &ConnectionGroupConfig, token: Token, peer_addr: SocketAddr) {
+    fn maybe_warn(&mut self, config: &ConnectionGroupConfig, token: Token, peer: Peer) {
         let Some(threshold) = config.backlog_warn_bytes else { return };
         if self.len() <= threshold {
             self.last_warning = None;
@@ -970,19 +955,19 @@ impl ByteQueue {
         warn!(
             group = config.name,
             ?token,
-            %peer_addr,
+            %peer,
             queued_bytes = self.len(),
             %age,
-            "tcp send backlog growing"
+            "send backlog growing"
         );
         self.last_warning = Some(Instant::now());
     }
 }
 
 struct FramedStream {
-    socket: mio::net::TcpStream,
+    socket: TransportStream,
     token: Token,
-    peer_addr: SocketAddr,
+    peer: Peer,
     rx_state: RxState,
     rx_buffer: Vec<u8>,
     send_queue: ByteQueue,
@@ -990,16 +975,11 @@ struct FramedStream {
 }
 
 impl FramedStream {
-    fn new(
-        socket: mio::net::TcpStream,
-        token: Token,
-        peer_addr: SocketAddr,
-        max_frame_size: usize,
-    ) -> Self {
+    fn new(socket: TransportStream, token: Token, peer: Peer, max_frame_size: usize) -> Self {
         Self {
             socket,
             token,
-            peer_addr,
+            peer,
             rx_state: RxState::default(),
             rx_buffer: vec![0; INITIAL_RX_BUFFER_SIZE.min(max_frame_size)],
             send_queue: ByteQueue::default(),
@@ -1026,7 +1006,7 @@ impl FramedStream {
                         Ok(read) => on_message(&self.rx_buffer[..read], Nanos::now()),
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                         Err(err) => {
-                            debug!(?err, %self.peer_addr, "tcp raw read failed");
+                            debug!(?err, %self.peer, "raw read failed");
                             return StreamState::Disconnected;
                         }
                     }
@@ -1080,10 +1060,10 @@ impl FramedStream {
                                 }
                                 if length > max_frame_size {
                                     warn!(
-                                        %self.peer_addr,
+                                        %self.peer,
                                         payload_len = length,
                                         max_frame_size,
-                                        "tcp frame exceeds configured maximum"
+                                        "frame exceeds configured maximum"
                                     );
                                     return ReadOutcome::Disconnected;
                                 }
@@ -1097,7 +1077,7 @@ impl FramedStream {
                                 return ReadOutcome::WouldBlock;
                             }
                             Err(err) => {
-                                debug!(?err, %self.peer_addr, "tcp header read failed");
+                                debug!(?err, %self.peer, "header read failed");
                                 return ReadOutcome::Disconnected;
                             }
                         }
@@ -1122,7 +1102,7 @@ impl FramedStream {
                                 return ReadOutcome::WouldBlock;
                             }
                             Err(err) => {
-                                debug!(?err, %self.peer_addr, "tcp payload read failed");
+                                debug!(?err, %self.peer, "payload read failed");
                                 return ReadOutcome::Disconnected;
                             }
                         }
@@ -1165,7 +1145,7 @@ impl FramedStream {
                 self.enqueue_remainder(registry, header, payload, 0, config, timers)
             }
             Err(err) => {
-                debug!(?err, %self.peer_addr, "tcp frame write failed");
+                debug!(?err, %self.peer, "frame write failed");
                 StreamState::Disconnected
             }
         }
@@ -1192,11 +1172,11 @@ impl FramedStream {
             warn!(
                 group = config.name,
                 ?self.token,
-                %self.peer_addr,
+                %self.peer,
                 queued_bytes = self.send_queue.len(),
                 additional_bytes = additional,
                 max_backlog_bytes = max,
-                "tcp send backlog would exceed configured maximum"
+                "send backlog would exceed configured maximum"
             );
             return StreamState::Disconnected;
         }
@@ -1210,7 +1190,7 @@ impl FramedStream {
         if allocated && let Some(timers) = timers {
             timers.alloc.emit_latency_from_nanos(started, Nanos::now());
         }
-        self.send_queue.maybe_warn(config, self.token, self.peer_addr);
+        self.send_queue.maybe_warn(config, self.token, self.peer);
         self.arm_writable(registry)
     }
 
@@ -1221,16 +1201,16 @@ impl FramedStream {
                 Ok(written) => self.send_queue.consume(written),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    debug!(?err, %self.peer_addr, "tcp backlog write failed");
+                    debug!(?err, %self.peer, "backlog write failed");
                     return StreamState::Disconnected;
                 }
             }
         }
-        self.send_queue.maybe_warn(config, self.token, self.peer_addr);
+        self.send_queue.maybe_warn(config, self.token, self.peer);
         if self.send_queue.is_empty() && self.writable_armed {
             if let Err(err) = registry.reregister(&mut self.socket, self.token, Interest::READABLE)
             {
-                debug!(?err, %self.peer_addr, "couldn't disarm writable interest");
+                debug!(?err, %self.peer, "couldn't disarm writable interest");
                 return StreamState::Disconnected;
             }
             self.writable_armed = false;
@@ -1247,7 +1227,7 @@ impl FramedStream {
             self.token,
             Interest::READABLE | Interest::WRITABLE,
         ) {
-            debug!(?err, %self.peer_addr, "couldn't arm writable interest");
+            debug!(?err, %self.peer, "couldn't arm writable interest");
             return StreamState::Disconnected;
         }
         self.writable_armed = true;
@@ -1271,8 +1251,8 @@ mod tests {
     use mio::{Poll, Token};
 
     use super::{
-        ByteQueue, ConnectionGroupConfig, FRAME_HEADER_SIZE, FramedStream, StreamState,
-        set_socket_buf_size, write_frame_header,
+        ByteQueue, ConnectionGroupConfig, FRAME_HEADER_SIZE, FramedStream, Peer, StreamState,
+        TransportStream, set_socket_buf_size, write_frame_header,
     };
 
     #[test]
@@ -1340,9 +1320,9 @@ mod tests {
         let (_peer, peer_addr) = listener.accept().unwrap();
         client.set_nonblocking(true).unwrap();
 
-        let socket = mio::net::TcpStream::from_std(client);
+        let socket = TransportStream::Tcp(mio::net::TcpStream::from_std(client));
         set_socket_buf_size(&socket, 1024);
-        let mut stream = FramedStream::new(socket, Token(0), peer_addr, 1024);
+        let mut stream = FramedStream::new(socket, Token(0), Peer::Tcp(peer_addr), 1024);
         let fill = [0; 4096];
         loop {
             match stream.socket.write(&fill) {

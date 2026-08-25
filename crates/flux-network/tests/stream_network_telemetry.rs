@@ -6,7 +6,7 @@ use std::{
 
 use flux_communication::cleanup_shmem;
 use flux_network::stream::{
-    ConnectionGroup, ConnectionGroupConfig, StreamEvent, StreamNetwork, TcpTelemetry,
+    ConnectionGroup, ConnectionGroupConfig, Endpoint, StreamEvent, StreamNetwork, TcpTelemetry,
 };
 use flux_utils::directories::shmem_dir;
 use mio::Token;
@@ -65,8 +65,8 @@ fn outbound_endpoint_reuses_telemetry_mappings_across_reconnects() {
         telemetry: TcpTelemetry::Enabled { app_name: APP_NAME },
         ..Default::default()
     });
-    network.listen(server_group, addr).unwrap();
-    let client_token = network.connect(client_group, addr);
+    network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
+    let client_token = network.connect(client_group, Endpoint::Tcp(addr));
 
     let mut server_token =
         wait_for_connection(&mut network, server_group, client_group, client_token);

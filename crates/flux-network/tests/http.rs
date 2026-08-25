@@ -5,7 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::http::{HttpEvent, HttpNetwork};
+use flux_network::{
+    http::{HttpEvent, HttpNetwork},
+    stream::{Endpoint, Peer},
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -16,7 +19,44 @@ fn unused_addr() -> SocketAddr {
     addr
 }
 
-fn read_available(stream: &mut std::net::TcpStream, out: &mut Vec<u8>) -> bool {
+/// Runs one test body over both transports: a loopback TCP address on an
+/// ephemeral port, and a Unix-domain socket path under a temporary directory
+/// that lives for the duration of the run.
+macro_rules! over_both_transports {
+    ($body:ident, $tcp:ident, $unix:ident) => {
+        #[test]
+        fn $tcp() {
+            $body(&Endpoint::Tcp(unused_addr()));
+        }
+
+        #[test]
+        fn $unix() {
+            let dir = tempfile::tempdir().unwrap();
+            $body(&Endpoint::Unix(dir.path().join("s")));
+        }
+    };
+}
+
+/// A nonblocking client socket speaking raw bytes to a server under test.
+trait ClientStream: Read + Write {}
+impl<T: Read + Write> ClientStream for T {}
+
+fn connect_client(endpoint: &Endpoint) -> Box<dyn ClientStream> {
+    match endpoint {
+        Endpoint::Tcp(addr) => {
+            let stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            Box::new(stream)
+        }
+        Endpoint::Unix(path) => {
+            let stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            Box::new(stream)
+        }
+    }
+}
+
+fn read_available(stream: &mut impl Read, out: &mut Vec<u8>) -> bool {
     let mut buf = [0; 8192];
     match stream.read(&mut buf) {
         Ok(0) => true,
@@ -45,18 +85,25 @@ fn response_len(bytes: &[u8]) -> Option<usize> {
     (bytes.len() >= head + length).then_some(head + length)
 }
 
-fn server() -> (HttpNetwork, SocketAddr) {
-    let addr = unused_addr();
+fn server_at(endpoint: &Endpoint) -> HttpNetwork {
     let mut server = HttpNetwork::default();
-    server.listen(addr).unwrap();
-    (server, addr)
+    server.listen(endpoint.clone()).unwrap();
+    server
 }
 
-#[test]
-fn get_keepalive_two_requests() {
-    let (mut server, addr) = server();
-    let mut client = std::net::TcpStream::connect(addr).unwrap();
-    client.set_nonblocking(true).unwrap();
+fn server() -> (HttpNetwork, SocketAddr) {
+    let addr = unused_addr();
+    (server_at(&Endpoint::Tcp(addr)), addr)
+}
+
+over_both_transports!(
+    get_keepalive_two_requests,
+    get_keepalive_two_requests_tcp,
+    get_keepalive_two_requests_unix
+);
+fn get_keepalive_two_requests(endpoint: &Endpoint) {
+    let mut server = server_at(endpoint);
+    let mut client = connect_client(endpoint);
     let deadline = Instant::now() + TIMEOUT;
     let mut first = Vec::new();
     client.write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -99,12 +146,11 @@ fn get_keepalive_two_requests() {
     assert!(second.ends_with(b"two"));
 }
 
-#[test]
-fn post_echo_body() {
-    let (mut server, addr) = server();
+over_both_transports!(post_echo_body, post_echo_body_tcp, post_echo_body_unix);
+fn post_echo_body(endpoint: &Endpoint) {
+    let mut server = server_at(endpoint);
     let body = vec![42; 4096];
-    let mut client = std::net::TcpStream::connect(addr).unwrap();
-    client.set_nonblocking(true).unwrap();
+    let mut client = connect_client(endpoint);
     client
         .write_all(
             format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len())
@@ -185,7 +231,7 @@ fn post_binary_body_lone_lf() {
 fn connection_close_large_body() {
     let addr = unused_addr();
     let mut server = HttpNetwork::default().with_socket_buf_size(1024);
-    server.listen(addr).unwrap();
+    server.listen(Endpoint::Tcp(addr)).unwrap();
     let body = vec![7; 256 * 1024];
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -217,7 +263,7 @@ fn limits_and_errors() {
     ] {
         let addr = unused_addr();
         let mut server = HttpNetwork::default().with_max_head_bytes(64).with_max_body_bytes(8);
-        server.listen(addr).unwrap();
+        server.listen(Endpoint::Tcp(addr)).unwrap();
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client.set_nonblocking(true).unwrap();
         client.write_all(request).unwrap();
@@ -259,11 +305,10 @@ fn caller_connection_close_header_sent() {
     assert!(text.ends_with("ok"));
 }
 
-#[test]
-fn pipelined_requests() {
-    let (mut server, addr) = server();
-    let mut client = std::net::TcpStream::connect(addr).unwrap();
-    client.set_nonblocking(true).unwrap();
+over_both_transports!(pipelined_requests, pipelined_requests_tcp, pipelined_requests_unix);
+fn pipelined_requests(endpoint: &Endpoint) {
+    let mut server = server_at(endpoint);
+    let mut client = connect_client(endpoint);
     client
         .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
         .unwrap();
@@ -288,11 +333,15 @@ fn pipelined_requests() {
     assert!(received.ends_with(b"/two"));
 }
 
-#[test]
-fn client_server_roundtrip() {
-    let (mut server, addr) = server();
+over_both_transports!(
+    client_server_roundtrip,
+    client_server_roundtrip_tcp,
+    client_server_roundtrip_unix
+);
+fn client_server_roundtrip(endpoint: &Endpoint) {
+    let mut server = server_at(endpoint);
     let mut client = HttpNetwork::default();
-    let token = client.connect(addr);
+    let token = client.connect(endpoint.clone());
     let mut sent = false;
     let mut bodies = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
@@ -340,7 +389,7 @@ fn client_chunked_response() {
         s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3 \r\nhey\r\n2;ext=x\r\n!!\r\n0\r\nX: y\r\n\r\n").unwrap();
     });
     let mut client = HttpNetwork::default();
-    let token = client.connect(addr);
+    let token = client.connect(Endpoint::Tcp(addr));
     let mut sent = false;
     let mut body = None;
     let deadline = Instant::now() + TIMEOUT;
@@ -372,7 +421,7 @@ fn client_head_response_ignores_advisory_content_length() {
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999\r\n\r\n").unwrap();
     });
     let mut client = HttpNetwork::default().with_max_body_bytes(8);
-    let token = client.connect(addr);
+    let token = client.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut connected = false;
     let mut response = None;
@@ -419,7 +468,7 @@ fn client_binary_bodies() {
         s.write_all(&plain).unwrap();
     });
     let mut client = HttpNetwork::default();
-    let token = client.connect(addr);
+    let token = client.connect(Endpoint::Tcp(addr));
     let mut sent = false;
     let mut bodies = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
@@ -451,7 +500,7 @@ fn client_binary_bodies() {
 fn client_reconnect_after_close() {
     let (mut server, addr) = server();
     let mut client = HttpNetwork::default();
-    let token = client.connect(addr);
+    let token = client.connect(Endpoint::Tcp(addr));
     let mut connected = 0;
     let mut disconnected = 0;
     let mut responses = 0;
@@ -566,7 +615,7 @@ fn assert_chunked_response_disconnect(response: &'static [u8], max_headers: usiz
         stream.write_all(response).unwrap();
     });
     let mut client = HttpNetwork::default().with_max_headers(max_headers);
-    let token = client.connect(addr);
+    let token = client.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut sent = false;
     let mut disconnected = 0;
@@ -616,7 +665,7 @@ fn client_chunked_overflow() {
             stream.write_all(response).unwrap();
         });
         let mut client = HttpNetwork::default().with_max_body_bytes(16);
-        let token = client.connect(addr);
+        let token = client.connect(Endpoint::Tcp(addr));
         let deadline = Instant::now() + TIMEOUT;
         let mut sent = false;
         let mut disconnected = 0;
@@ -644,7 +693,7 @@ fn client_chunked_overflow() {
 fn idle_timeout_disconnects() {
     let addr = unused_addr();
     let mut server = HttpNetwork::default().with_idle_timeout(Duration::from_millis(200).into());
-    server.listen(addr).unwrap();
+    server.listen(Endpoint::Tcp(addr)).unwrap();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -690,7 +739,7 @@ fn idle_timeout_disconnects() {
 fn pending_buffer_cap_disconnects() {
     let addr = unused_addr();
     let mut server = HttpNetwork::default().with_max_head_bytes(64).with_max_body_bytes(64);
-    server.listen(addr).unwrap();
+    server.listen(Endpoint::Tcp(addr)).unwrap();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -758,7 +807,7 @@ fn pipelined_binary_bodies() {
 fn client_remove_stops_reconnect() {
     let (mut server, addr) = server();
     let mut client = HttpNetwork::default();
-    let token = client.connect(addr);
+    let token = client.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut connected = false;
     while Instant::now() < deadline && !connected {
@@ -821,8 +870,8 @@ fn server_disconnect_kicks() {
 fn wrong_role_calls_return_false() {
     let addr = unused_addr();
     let mut http = HttpNetwork::default();
-    http.listen(addr).unwrap();
-    let outbound = http.connect(addr);
+    http.listen(Endpoint::Tcp(addr)).unwrap();
+    let outbound = http.connect(Endpoint::Tcp(addr));
     let stream = std::net::TcpStream::connect(addr).unwrap();
     stream.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + TIMEOUT;
@@ -843,8 +892,8 @@ fn wrong_role_calls_return_false() {
 fn single_instance_serves_itself() {
     let addr = unused_addr();
     let mut http = HttpNetwork::default();
-    http.listen(addr).unwrap();
-    let outbound = http.connect(addr);
+    http.listen(Endpoint::Tcp(addr)).unwrap();
+    let outbound = http.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut sent = false;
     let mut body = None;
@@ -869,4 +918,64 @@ fn single_instance_serves_itself() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(body.as_deref(), Some(b"self".as_slice()));
+}
+
+over_both_transports!(
+    outbound_host_header_names_the_endpoint,
+    outbound_host_header_names_the_endpoint_tcp,
+    outbound_host_header_names_the_endpoint_unix
+);
+fn outbound_host_header_names_the_endpoint(endpoint: &Endpoint) {
+    let mut server = server_at(endpoint);
+    let mut client = HttpNetwork::default();
+    let token = client.connect(endpoint.clone());
+    let mut sent = false;
+    let mut host = None;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && host.is_none() {
+        let mut replies = Vec::new();
+        server.poll_with(|event| {
+            if let HttpEvent::Request { token, request } = event {
+                host = Some(request.header("Host").map(<[u8]>::to_vec));
+                replies.push(token);
+            }
+        });
+        for token in replies {
+            assert!(server.respond(token, 200, &[], b""));
+        }
+        let mut connected = false;
+        client.poll_with(|event| connected |= matches!(event, HttpEvent::Connected { .. }));
+        if connected && !sent {
+            assert!(client.request(token, "GET", "/", &[], b""));
+            sent = true;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let expected = match endpoint {
+        // A Unix-domain endpoint has no address to name.
+        Endpoint::Unix(_) => "localhost".to_owned(),
+        Endpoint::Tcp(addr) => addr.to_string(),
+    };
+    assert_eq!(host.flatten().as_deref(), Some(expected.as_bytes()));
+}
+
+over_both_transports!(accepted_reports_peer, accepted_reports_peer_tcp, accepted_reports_peer_unix);
+fn accepted_reports_peer(endpoint: &Endpoint) {
+    let mut server = server_at(endpoint);
+    let _client = connect_client(endpoint);
+    let mut accepted = None;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && accepted.is_none() {
+        server.poll_with(|event| {
+            if let HttpEvent::Accepted { peer, .. } = event {
+                accepted = Some(peer);
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    match endpoint {
+        Endpoint::Tcp(_) => assert!(matches!(accepted, Some(Peer::Tcp(_))), "{accepted:?}"),
+        Endpoint::Unix(_) => assert_eq!(accepted, Some(Peer::Unix)),
+    }
 }

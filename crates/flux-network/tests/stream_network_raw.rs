@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::stream::{ConnectionGroupConfig, Framing, StreamEvent, StreamNetwork};
+use flux_network::stream::{ConnectionGroupConfig, Endpoint, Framing, StreamEvent, StreamNetwork};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,7 +26,7 @@ fn raw_roundtrip() {
     let addr = unused_addr();
     let mut network = StreamNetwork::default();
     let group = network.add_group(raw_group("raw-server"));
-    network.listen(group, addr).unwrap();
+    network.listen(group, Endpoint::Tcp(addr)).unwrap();
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -67,7 +67,7 @@ fn http_get_smoke() {
     let addr = unused_addr();
     let mut network = StreamNetwork::default();
     let group = network.add_group(raw_group("http"));
-    network.listen(group, addr).unwrap();
+    network.listen(group, Endpoint::Tcp(addr)).unwrap();
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -131,7 +131,7 @@ fn raw_outbound_connect() {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..ConnectionGroupConfig::default()
     });
-    let token = network.connect(group, addr);
+    let token = network.connect(group, Endpoint::Tcp(addr));
     let mut peer = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && peer.is_none() {
@@ -185,8 +185,8 @@ fn framed_and_raw_coexist() {
     let framed_server =
         server.add_group(ConnectionGroupConfig { name: "framed-server", ..Default::default() });
     let raw_server = server.add_group(raw_group("raw-server"));
-    server.listen(framed_server, framed_addr).unwrap();
-    server.listen(raw_server, raw_addr).unwrap();
+    server.listen(framed_server, Endpoint::Tcp(framed_addr)).unwrap();
+    server.listen(raw_server, Endpoint::Tcp(raw_addr)).unwrap();
 
     let mut framed_client = StreamNetwork::default();
     let framed_client_group = framed_client.add_group(ConnectionGroupConfig {
@@ -194,7 +194,8 @@ fn framed_and_raw_coexist() {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
     });
-    let framed_client_token = framed_client.connect(framed_client_group, framed_addr);
+    let framed_client_token =
+        framed_client.connect(framed_client_group, Endpoint::Tcp(framed_addr));
     let mut raw_client = std::net::TcpStream::connect(raw_addr).unwrap();
     raw_client.set_nonblocking(true).unwrap();
     raw_client.write_all(b"raw").unwrap();
@@ -266,7 +267,7 @@ fn raw_disconnect_when_drained_flushes_queue() {
         max_frame_size: payload.len(),
         ..ConnectionGroupConfig::default()
     });
-    network.listen(group, addr).unwrap();
+    network.listen(group, Endpoint::Tcp(addr)).unwrap();
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
