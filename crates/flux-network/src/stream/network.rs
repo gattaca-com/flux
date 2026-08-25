@@ -237,6 +237,13 @@ pub struct ConnectionGroupConfig {
     /// Largest accepted or emitted frame payload. For [`Framing::Raw`], this
     /// caps a single send and bounds each received read chunk.
     pub max_frame_size: usize,
+    /// Most accepted connections this group holds at once. A connection it
+    /// is closing counts as one of them — draining or half-closed alike —
+    /// while the outbound endpoints and listeners of the group count for
+    /// nothing. `None` sets no limit. At the cap, a pending connection is
+    /// accepted and dropped where it stands, without registration, bytes or
+    /// an event, and counted by [`StreamNetwork::refused_connections`].
+    pub max_connections: Option<usize>,
     /// Wire encoding used by this group.
     pub framing: Framing,
     /// Per-connection latency and allocation telemetry.
@@ -256,6 +263,7 @@ impl Default for ConnectionGroupConfig {
             backlog_warn_bytes: Some(DEFAULT_BACKLOG_WARN_BYTES),
             max_backlog_bytes: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_connections: None,
             framing: Framing::LengthPrefixed,
             telemetry: TcpTelemetry::Disabled,
             tcp: TcpOptions::default(),
@@ -300,6 +308,10 @@ impl StreamEvent<'_> {
 struct GroupState {
     config: ConnectionGroupConfig,
     reconnector: Repeater,
+    /// Connections refused since the group was added because it was at its
+    /// cap, and when the last of them was warned about.
+    refused: u64,
+    last_refusal_warning: Option<Instant>,
 }
 
 struct Listener {
@@ -634,6 +646,18 @@ impl NetworkState {
                     break;
                 }
             };
+            if let Some(max) = self.config(group).max_connections &&
+                self.accepted_connections(group) >= max
+            {
+                // The refusal is all that happens to this connection: it
+                // is never registered, never read from and never written
+                // to, so the peer reads the end of the stream without ever
+                // being sent a byte. The backlog still has to be drained to
+                // `WouldBlock`, so the loop goes on.
+                let _ = socket.shutdown(Shutdown::Both);
+                self.refuse(group, peer, max);
+                continue;
+            }
             let token = self.next_token();
             let (stream, timers, group_name) = {
                 let config = self.config(group);
@@ -698,6 +722,40 @@ impl NetworkState {
             info!(group = group_name, %peer, "connection accepted");
             handler(StreamEvent::Accepted { group, token, peer });
         }
+    }
+
+    /// How many connections `group` accepted and still holds. A connection
+    /// it is closing is one of them — draining or half-closed alike — while
+    /// an outbound endpoint of the group is a connection the network made
+    /// rather than accepted, and counts for nothing.
+    fn accepted_connections(&self, group: ConnectionGroup) -> usize {
+        self.connections
+            .iter()
+            .filter(|connection| connection.group == group && connection.endpoint.is_none())
+            .count()
+    }
+
+    /// Counts one refused connection, warning about the group at most once
+    /// every [`BACKLOG_WARNING_INTERVAL_SECS`] seconds: a group at its cap
+    /// refuses as often as clients arrive, and the count is what says how
+    /// often that is.
+    fn refuse(&mut self, group: ConnectionGroup, peer: Peer, max: usize) {
+        let state = &mut self.groups[group.0];
+        state.refused += 1;
+        if state
+            .last_refusal_warning
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(BACKLOG_WARNING_INTERVAL_SECS))
+        {
+            return;
+        }
+        warn!(
+            group = state.config.name,
+            %peer,
+            max_connections = max,
+            refused = state.refused,
+            "refusing a connection: the group is at its connection cap"
+        );
+        state.last_refusal_warning = Some(Instant::now());
     }
 
     fn handle_event<F>(&mut self, event: &Event, handler: &mut F)
@@ -1177,6 +1235,7 @@ impl StreamNetwork {
                 "on_connect_msg exceeds max_frame_size"
             );
         }
+        assert!(config.max_connections != Some(0), "max_connections must be nonzero");
         if let Some(max) = config.max_backlog_bytes {
             assert!(max > 0, "max_backlog_bytes must be nonzero");
             if let Some(warn) = config.backlog_warn_bytes {
@@ -1185,7 +1244,12 @@ impl StreamNetwork {
         }
         let group = ConnectionGroup(self.state.groups.len());
         let reconnector = Repeater::every(config.reconnect_interval);
-        self.state.groups.push(GroupState { config, reconnector });
+        self.state.groups.push(GroupState {
+            config,
+            reconnector,
+            refused: 0,
+            last_refusal_warning: None,
+        });
         self.claimed.push(false);
         group
     }
@@ -1616,6 +1680,17 @@ impl StreamNetwork {
     /// by `TCP_USER_TIMEOUT`; a Unix-domain peer has no such bound.
     pub fn shutdown_write_when_drained(&mut self, token: Token) -> bool {
         self.state.shutdown_write_when_drained(token)
+    }
+
+    /// How many connections `group` refused since it was added because it
+    /// was already holding its [`ConnectionGroupConfig::max_connections`] cap.
+    ///
+    /// # Panics
+    /// The group must be one this network added.
+    #[must_use]
+    pub fn refused_connections(&self, group: ConnectionGroup) -> u64 {
+        assert!(group.0 < self.state.groups.len(), "unknown connection group");
+        self.state.groups[group.0].refused
     }
 
     /// Permanently removes a connection or outbound endpoint. Returns whether
