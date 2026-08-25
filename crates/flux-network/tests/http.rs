@@ -1,22 +1,126 @@
 use std::{
+    collections::BTreeSet,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
 use flux_network::{
-    http::{HttpEvent, HttpNetwork},
-    stream::{Endpoint, Peer},
+    Token,
+    http::{HttpConfig, HttpEvent, HttpService},
+    stream::{ConnectionGroupConfig, Endpoint, Framing, Peer, StreamEvent, StreamNetwork},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A loopback address no listener holds.
+///
+/// The probe binding is released before the address is handed out, so a port
+/// this run has already given away must never be given away again: the kernel
+/// reuses a released ephemeral port readily, and two tests binding one port is
+/// a failure that has nothing to do with what they test. Ports that collide
+/// stay bound until a fresh one is found, which is what makes the kernel offer
+/// another.
 fn unused_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+    static TAKEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    let mut probes = Vec::new();
+    loop {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        if TAKEN.lock().unwrap().insert(addr.port()) {
+            return addr;
+        }
+        probes.push(listener);
+        assert!(probes.len() < 64, "no free loopback port");
+    }
+}
+
+fn http_group() -> ConnectionGroupConfig {
+    ConnectionGroupConfig {
+        name: "http",
+        framing: Framing::Raw,
+        max_frame_size: usize::MAX,
+        backlog_warn_bytes: None,
+        ..ConnectionGroupConfig::default()
+    }
+}
+
+/// A network carrying one HTTP service, driven and pulled as one.
+struct Http {
+    net: StreamNetwork,
+    http: HttpService,
+}
+
+impl Http {
+    fn build(group: ConnectionGroupConfig, config: HttpConfig) -> Self {
+        let mut net = StreamNetwork::default();
+        let group = net.add_group(group);
+        let http = HttpService::new(&mut net, group, config);
+        Self { net, http }
+    }
+
+    fn new() -> Self {
+        Self::build(http_group(), HttpConfig::default())
+    }
+
+    fn with_config(config: HttpConfig) -> Self {
+        Self::build(http_group(), config)
+    }
+
+    /// One iteration: drive the network, then pull every protocol event.
+    fn pump(&mut self, mut handler: impl for<'a> FnMut(HttpEvent<'a>)) {
+        self.drive();
+        let mut pulled = 0;
+        while let Some(event) = self.http.next_event(&mut self.net) {
+            handler(event);
+            pulled += 1;
+            assert!(pulled < 10_000, "the pull loop delivered the same work forever");
+        }
+    }
+
+    /// One iteration of the network alone, leaving the events to be pulled.
+    fn drive(&mut self) -> bool {
+        self.net.drive(Some(Duration::ZERO.into()), &mut [self.http.as_service()], |_| {})
+    }
+
+    fn listen(&mut self, endpoint: &Endpoint) {
+        self.http.listen(&mut self.net, endpoint.clone()).unwrap();
+    }
+
+    fn connect(&mut self, endpoint: Endpoint) -> Token {
+        self.http.connect(&mut self.net, endpoint)
+    }
+
+    fn respond(
+        &mut self,
+        token: Token,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> bool {
+        self.http.respond(&mut self.net, token, status, headers, body)
+    }
+
+    fn request(
+        &mut self,
+        token: Token,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> bool {
+        self.http.request(&mut self.net, token, method, path, headers, body)
+    }
+
+    fn disconnect(&mut self, token: Token) -> bool {
+        self.http.disconnect(&mut self.net, token)
+    }
+
+    fn remove(&mut self, token: Token) -> bool {
+        self.http.remove(&mut self.net, token)
+    }
 }
 
 /// Runs one test body over both transports: a loopback TCP address on an
@@ -85,13 +189,13 @@ fn response_len(bytes: &[u8]) -> Option<usize> {
     (bytes.len() >= head + length).then_some(head + length)
 }
 
-fn server_at(endpoint: &Endpoint) -> HttpNetwork {
-    let mut server = HttpNetwork::default();
-    server.listen(endpoint.clone()).unwrap();
+fn server_at(endpoint: &Endpoint) -> Http {
+    let mut server = Http::new();
+    server.listen(endpoint);
     server
 }
 
-fn server() -> (HttpNetwork, SocketAddr) {
+fn server() -> (Http, SocketAddr) {
     let addr = unused_addr();
     (server_at(&Endpoint::Tcp(addr)), addr)
 }
@@ -109,8 +213,8 @@ fn get_keepalive_two_requests(endpoint: &Endpoint) {
     client.write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     while Instant::now() < deadline && response_len(&first).is_none() {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
+        server.pump(|e| {
+            if let HttpEvent::Request { token, request, .. } = e {
                 replies.push((
                     token,
                     if request.path == "/one" { b"one".to_vec() } else { b"two".to_vec() },
@@ -128,8 +232,8 @@ fn get_keepalive_two_requests(endpoint: &Endpoint) {
     let mut second = Vec::new();
     while Instant::now() < deadline && response_len(&second).is_none() {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
+        server.pump(|e| {
+            if let HttpEvent::Request { token, request, .. } = e {
                 replies.push((
                     token,
                     if request.path == "/one" { b"one".to_vec() } else { b"two".to_vec() },
@@ -162,8 +266,8 @@ fn post_echo_body(endpoint: &Endpoint) {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && response_len(&received).is_none() {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
+        server.pump(|e| {
+            if let HttpEvent::Request { token, request, .. } = e {
                 replies.push((token, request.body.to_vec()));
             }
         });
@@ -194,8 +298,8 @@ fn post_binary_body_lone_lf() {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && response_len(&received).is_none() {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
+        server.pump(|e| {
+            if let HttpEvent::Request { token, request, .. } = e {
                 replies.push((token, request.body.to_vec()));
             }
         });
@@ -212,8 +316,8 @@ fn post_binary_body_lone_lf() {
     let mut second = Vec::new();
     while Instant::now() < deadline && response_len(&second).is_none() {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
+        server.pump(|e| {
+            if let HttpEvent::Request { token, request, .. } = e {
                 assert_eq!(request.path, "/after");
                 replies.push(token);
             }
@@ -230,8 +334,11 @@ fn post_binary_body_lone_lf() {
 #[test]
 fn connection_close_large_body() {
     let addr = unused_addr();
-    let mut server = HttpNetwork::default().with_socket_buf_size(1024);
-    server.listen(Endpoint::Tcp(addr)).unwrap();
+    let mut server = Http::build(
+        ConnectionGroupConfig { socket_buf_size: Some(1024), ..http_group() },
+        HttpConfig::default(),
+    );
+    server.listen(&Endpoint::Tcp(addr));
     let body = vec![7; 256 * 1024];
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -240,7 +347,7 @@ fn connection_close_large_body() {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && !read_available(&mut client, &mut received) {
         let mut tokens = Vec::new();
-        server.poll_with(|e| {
+        server.pump(|e| {
             if let HttpEvent::Request { token, .. } = e {
                 tokens.push(token);
             }
@@ -262,15 +369,17 @@ fn limits_and_errors() {
         (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(), 501),
     ] {
         let addr = unused_addr();
-        let mut server = HttpNetwork::default().with_max_head_bytes(64).with_max_body_bytes(8);
-        server.listen(Endpoint::Tcp(addr)).unwrap();
+        let mut server = Http::with_config(
+            HttpConfig::default().with_max_head_bytes(64).with_max_body_bytes(8),
+        );
+        server.listen(&Endpoint::Tcp(addr));
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client.set_nonblocking(true).unwrap();
         client.write_all(request).unwrap();
         let mut received = Vec::new();
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline && !read_available(&mut client, &mut received) {
-            server.poll_with(|_| {});
+            server.pump(|_| {});
             thread::sleep(Duration::from_millis(1));
         }
         assert!(std::str::from_utf8(&received).unwrap().starts_with(&format!("HTTP/1.1 {status}")));
@@ -287,7 +396,7 @@ fn caller_connection_close_header_sent() {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && !read_available(&mut client, &mut received) {
         let mut tokens = Vec::new();
-        server.poll_with(|e| {
+        server.pump(|e| {
             if let HttpEvent::Request { token, .. } = e {
                 tokens.push(token);
             }
@@ -317,8 +426,8 @@ fn pipelined_requests(endpoint: &Endpoint) {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && paths.len() < 2 {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
+        server.pump(|e| {
+            if let HttpEvent::Request { token, request, .. } = e {
                 paths.push(request.path.to_owned());
                 replies.push(token);
             }
@@ -340,15 +449,15 @@ over_both_transports!(
 );
 fn client_server_roundtrip(endpoint: &Endpoint) {
     let mut server = server_at(endpoint);
-    let mut client = HttpNetwork::default();
+    let mut client = Http::new();
     let token = client.connect(endpoint.clone());
     let mut sent = false;
     let mut bodies = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && bodies.len() < 2 {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
+        server.pump(|e| {
+            if let HttpEvent::Request { token, request, .. } = e {
                 replies.push((token, request.body.to_vec()));
             }
         });
@@ -357,7 +466,7 @@ fn client_server_roundtrip(endpoint: &Endpoint) {
         }
         let mut send_second = false;
         let mut connected = false;
-        client.poll_with(|e| match e {
+        client.pump(|e| match e {
             HttpEvent::Connected { .. } => connected = true,
             HttpEvent::Response { response, .. } => {
                 bodies.push(response.body.to_vec());
@@ -388,14 +497,14 @@ fn client_chunked_response() {
         let _ = s.read(&mut b);
         s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3 \r\nhey\r\n2;ext=x\r\n!!\r\n0\r\nX: y\r\n\r\n").unwrap();
     });
-    let mut client = HttpNetwork::default();
+    let mut client = Http::new();
     let token = client.connect(Endpoint::Tcp(addr));
     let mut sent = false;
     let mut body = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && body.is_none() {
         let mut connected = false;
-        client.poll_with(|e| match e {
+        client.pump(|e| match e {
             HttpEvent::Connected { .. } => connected = true,
             HttpEvent::Response { response, .. } => body = Some(response.body.to_vec()),
             _ => {}
@@ -420,13 +529,13 @@ fn client_head_response_ignores_advisory_content_length() {
         let _ = stream.read(&mut request);
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999\r\n\r\n").unwrap();
     });
-    let mut client = HttpNetwork::default().with_max_body_bytes(8);
+    let mut client = Http::with_config(HttpConfig::default().with_max_body_bytes(8));
     let token = client.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut connected = false;
     let mut response = None;
     while Instant::now() < deadline && response.is_none() {
-        client.poll_with(|event| match event {
+        client.pump(|event| match event {
             HttpEvent::Connected { token: event_token } if event_token == token => connected = true,
             HttpEvent::Response { token: event_token, response: event_response }
                 if event_token == token =>
@@ -467,7 +576,7 @@ fn client_binary_bodies() {
         .unwrap();
         s.write_all(&plain).unwrap();
     });
-    let mut client = HttpNetwork::default();
+    let mut client = Http::new();
     let token = client.connect(Endpoint::Tcp(addr));
     let mut sent = false;
     let mut bodies = Vec::new();
@@ -475,7 +584,7 @@ fn client_binary_bodies() {
     while Instant::now() < deadline && bodies.len() < 2 {
         let mut connected = false;
         let mut respond_again = false;
-        client.poll_with(|e| match e {
+        client.pump(|e| match e {
             HttpEvent::Connected { .. } => connected = true,
             HttpEvent::Response { response, .. } => {
                 bodies.push(response.body.to_vec());
@@ -499,7 +608,7 @@ fn client_binary_bodies() {
 #[test]
 fn client_reconnect_after_close() {
     let (mut server, addr) = server();
-    let mut client = HttpNetwork::default();
+    let mut client = Http::new();
     let token = client.connect(Endpoint::Tcp(addr));
     let mut connected = 0;
     let mut disconnected = 0;
@@ -507,7 +616,7 @@ fn client_reconnect_after_close() {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && responses < 2 {
         let mut replies = Vec::new();
-        server.poll_with(|e| {
+        server.pump(|e| {
             if let HttpEvent::Request { token, .. } = e {
                 replies.push(token);
             }
@@ -516,7 +625,7 @@ fn client_reconnect_after_close() {
             server.respond(token, 200, &[("Connection", "close")], b"ok");
         }
         let mut request_again = false;
-        client.poll_with(|e| match e {
+        client.pump(|e| match e {
             HttpEvent::Connected { .. } => {
                 connected += 1;
                 request_again = true;
@@ -565,7 +674,7 @@ fn smuggling_rejected() {
             if accepted { response_len(&received).is_none() } else { !closed }
         {
             let mut replies = Vec::new();
-            server.poll_with(|event| {
+            server.pump(|event| {
                 if let HttpEvent::Request { token, .. } = event {
                     requests += 1;
                     replies.push(token);
@@ -597,7 +706,7 @@ fn bare_lf_head_rejected() {
     let mut received = Vec::new();
     let mut closed = false;
     while Instant::now() < deadline && !closed {
-        server.poll_with(|_| {});
+        server.pump(|_| {});
         closed = read_available(&mut client, &mut received);
         thread::sleep(Duration::from_millis(1));
     }
@@ -614,14 +723,14 @@ fn assert_chunked_response_disconnect(response: &'static [u8], max_headers: usiz
         let _ = stream.read(&mut request);
         stream.write_all(response).unwrap();
     });
-    let mut client = HttpNetwork::default().with_max_headers(max_headers);
+    let mut client = Http::with_config(HttpConfig::default().with_max_headers(max_headers));
     let token = client.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut sent = false;
     let mut disconnected = 0;
     while Instant::now() < deadline && disconnected == 0 {
         let mut connected = false;
-        client.poll_with(|event| match event {
+        client.pump(|event| match event {
             HttpEvent::Connected { .. } => connected = true,
             HttpEvent::Disconnected { token: event_token } if event_token == token => {
                 disconnected += 1;
@@ -664,14 +773,14 @@ fn client_chunked_overflow() {
             let _ = stream.read(&mut request);
             stream.write_all(response).unwrap();
         });
-        let mut client = HttpNetwork::default().with_max_body_bytes(16);
+        let mut client = Http::with_config(HttpConfig::default().with_max_body_bytes(16));
         let token = client.connect(Endpoint::Tcp(addr));
         let deadline = Instant::now() + TIMEOUT;
         let mut sent = false;
         let mut disconnected = 0;
         while Instant::now() < deadline && disconnected == 0 {
             let mut connected = false;
-            client.poll_with(|event| match event {
+            client.pump(|event| match event {
                 HttpEvent::Connected { .. } => connected = true,
                 HttpEvent::Disconnected { token: event_token } if event_token == token => {
                     disconnected += 1;
@@ -692,15 +801,17 @@ fn client_chunked_overflow() {
 #[test]
 fn idle_timeout_disconnects() {
     let addr = unused_addr();
-    let mut server = HttpNetwork::default().with_idle_timeout(Duration::from_millis(200).into());
-    server.listen(Endpoint::Tcp(addr)).unwrap();
+    let mut server = Http::with_config(
+        HttpConfig::default().with_idle_timeout(Duration::from_millis(200).into()),
+    );
+    server.listen(&Endpoint::Tcp(addr));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut bytes = Vec::new();
     let mut closed = false;
     while Instant::now() < deadline && !closed {
-        server.poll_with(|_| {});
+        server.pump(|_| {});
         closed = read_available(&mut client, &mut bytes);
         thread::sleep(Duration::from_millis(1));
     }
@@ -713,7 +824,7 @@ fn idle_timeout_disconnects() {
     let mut response = Vec::new();
     while Instant::now() < deadline && response_len(&response).is_none() {
         let mut replies = Vec::new();
-        server.poll_with(|event| {
+        server.pump(|event| {
             if let HttpEvent::Request { token, .. } = event {
                 replies.push(token);
             }
@@ -728,7 +839,7 @@ fn idle_timeout_disconnects() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut closed = false;
     while Instant::now() < deadline && !closed {
-        server.poll_with(|_| {});
+        server.pump(|_| {});
         closed = read_available(&mut client, &mut response);
         thread::sleep(Duration::from_millis(1));
     }
@@ -738,15 +849,16 @@ fn idle_timeout_disconnects() {
 #[test]
 fn pending_buffer_cap_disconnects() {
     let addr = unused_addr();
-    let mut server = HttpNetwork::default().with_max_head_bytes(64).with_max_body_bytes(64);
-    server.listen(Endpoint::Tcp(addr)).unwrap();
+    let mut server =
+        Http::with_config(HttpConfig::default().with_max_head_bytes(64).with_max_body_bytes(64));
+    server.listen(&Endpoint::Tcp(addr));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let mut accepted = false;
     while Instant::now() < deadline && !accepted {
-        server.poll_with(|event| accepted |= matches!(event, HttpEvent::Request { .. }));
+        server.pump(|event| accepted |= matches!(event, HttpEvent::Request { .. }));
         thread::sleep(Duration::from_millis(1));
     }
     assert!(accepted);
@@ -754,7 +866,7 @@ fn pending_buffer_cap_disconnects() {
     let mut received = Vec::new();
     let mut closed = false;
     while Instant::now() < deadline && !closed {
-        server.poll_with(|_| {});
+        server.pump(|_| {});
         closed = read_available(&mut client, &mut received);
         thread::sleep(Duration::from_millis(1));
     }
@@ -784,8 +896,8 @@ fn pipelined_binary_bodies() {
     let mut received = Vec::new();
     while Instant::now() < deadline && replies.len() < 2 {
         let mut pending = Vec::new();
-        server.poll_with(|event| {
-            if let HttpEvent::Request { token, request } = event {
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, .. } = event {
                 pending.push((token, request.body.to_vec()));
             }
         });
@@ -806,13 +918,13 @@ fn pipelined_binary_bodies() {
 #[test]
 fn client_remove_stops_reconnect() {
     let (mut server, addr) = server();
-    let mut client = HttpNetwork::default();
+    let mut client = Http::new();
     let token = client.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut connected = false;
     while Instant::now() < deadline && !connected {
-        server.poll_with(|_| {});
-        client.poll_with(|event| connected |= matches!(event, HttpEvent::Connected { token: event_token } if event_token == token));
+        server.pump(|_| {});
+        client.pump(|event| connected |= matches!(event, HttpEvent::Connected { token: event_token } if event_token == token));
         thread::sleep(Duration::from_millis(1));
     }
     assert!(connected);
@@ -821,8 +933,8 @@ fn client_remove_stops_reconnect() {
     let deadline = Instant::now() + Duration::from_millis(500);
     let mut reconnects = 0;
     while Instant::now() < deadline {
-        server.poll_with(|_| {});
-        client.poll_with(|event| {
+        server.pump(|_| {});
+        client.pump(|event| {
             if matches!(event, HttpEvent::Connected { token: event_token } if event_token == token)
             {
                 reconnects += 1;
@@ -841,7 +953,7 @@ fn server_disconnect_kicks() {
     let deadline = Instant::now() + TIMEOUT;
     let mut token = None;
     while Instant::now() < deadline && token.is_none() {
-        server.poll_with(|event| {
+        server.pump(|event| {
             if let HttpEvent::Accepted { token: connected, .. } = event {
                 token = Some(connected);
             }
@@ -854,7 +966,7 @@ fn server_disconnect_kicks() {
     let mut closed = false;
     let mut disconnected = 0;
     while Instant::now() < deadline && (!closed || disconnected == 0) {
-        server.poll_with(|event| {
+        server.pump(|event| {
             if matches!(event, HttpEvent::Disconnected { token: event_token } if event_token == token) {
                 disconnected += 1;
             }
@@ -869,15 +981,15 @@ fn server_disconnect_kicks() {
 #[test]
 fn wrong_role_calls_return_false() {
     let addr = unused_addr();
-    let mut http = HttpNetwork::default();
-    http.listen(Endpoint::Tcp(addr)).unwrap();
+    let mut http = Http::new();
+    http.listen(&Endpoint::Tcp(addr));
     let outbound = http.connect(Endpoint::Tcp(addr));
     let stream = std::net::TcpStream::connect(addr).unwrap();
     stream.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let mut accepted = None;
     while Instant::now() < deadline && accepted.is_none() {
-        http.poll_with(|event| {
+        http.pump(|event| {
             if let HttpEvent::Accepted { token, .. } = event {
                 accepted = Some(token);
             }
@@ -891,8 +1003,8 @@ fn wrong_role_calls_return_false() {
 #[test]
 fn single_instance_serves_itself() {
     let addr = unused_addr();
-    let mut http = HttpNetwork::default();
-    http.listen(Endpoint::Tcp(addr)).unwrap();
+    let mut http = Http::new();
+    http.listen(&Endpoint::Tcp(addr));
     let outbound = http.connect(Endpoint::Tcp(addr));
     let deadline = Instant::now() + TIMEOUT;
     let mut sent = false;
@@ -900,7 +1012,7 @@ fn single_instance_serves_itself() {
     while Instant::now() < deadline && body.is_none() {
         let mut respond = None;
         let mut request = false;
-        http.poll_with(|event| match event {
+        http.pump(|event| match event {
             HttpEvent::Connected { token } if token == outbound => request = true,
             HttpEvent::Request { token, .. } => respond = Some(token),
             HttpEvent::Response { token, response } if token == outbound => {
@@ -927,15 +1039,15 @@ over_both_transports!(
 );
 fn outbound_host_header_names_the_endpoint(endpoint: &Endpoint) {
     let mut server = server_at(endpoint);
-    let mut client = HttpNetwork::default();
+    let mut client = Http::new();
     let token = client.connect(endpoint.clone());
     let mut sent = false;
     let mut host = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && host.is_none() {
         let mut replies = Vec::new();
-        server.poll_with(|event| {
-            if let HttpEvent::Request { token, request } = event {
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, .. } = event {
                 host = Some(request.header("Host").map(<[u8]>::to_vec));
                 replies.push(token);
             }
@@ -944,7 +1056,7 @@ fn outbound_host_header_names_the_endpoint(endpoint: &Endpoint) {
             assert!(server.respond(token, 200, &[], b""));
         }
         let mut connected = false;
-        client.poll_with(|event| connected |= matches!(event, HttpEvent::Connected { .. }));
+        client.pump(|event| connected |= matches!(event, HttpEvent::Connected { .. }));
         if connected && !sent {
             assert!(client.request(token, "GET", "/", &[], b""));
             sent = true;
@@ -967,7 +1079,7 @@ fn accepted_reports_peer(endpoint: &Endpoint) {
     let mut accepted = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && accepted.is_none() {
-        server.poll_with(|event| {
+        server.pump(|event| {
             if let HttpEvent::Accepted { peer, .. } = event {
                 accepted = Some(peer);
             }
@@ -978,4 +1090,793 @@ fn accepted_reports_peer(endpoint: &Endpoint) {
         Endpoint::Tcp(_) => assert!(matches!(accepted, Some(Peer::Tcp(_))), "{accepted:?}"),
         Endpoint::Unix(_) => assert_eq!(accepted, Some(Peer::Unix)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Responder, consumption and readiness
+
+/// Pulls events until one request has been delivered, returning its token and
+/// what it said. The responder is dropped, which defers the response.
+fn pull_deferred_request(server: &mut Http) -> (Token, String) {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut request = None;
+    while Instant::now() < deadline && request.is_none() {
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request: pulled, responder } = event {
+                request = Some((token, pulled.path.to_owned()));
+                drop(responder);
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    request.expect("no request arrived")
+}
+
+fn read_until_response(server: &mut Http, client: &mut impl Read, out: &mut Vec<u8>) {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && response_len(out).is_none() {
+        server.pump(|_| {});
+        read_available(client, out);
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_dropped_responder_answers_later_by_token() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET /defer HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+
+    let (token, path) = pull_deferred_request(&mut server);
+    assert_eq!(path, "/defer");
+    let mut received = Vec::new();
+    read_available(&mut client, &mut received);
+    assert!(received.is_empty(), "a dropped responder answers nothing by itself");
+
+    assert!(server.respond(token, 200, &[], b"late"));
+    read_until_response(&mut server, &mut client, &mut received);
+    assert!(received.ends_with(b"late"), "{received:?}");
+}
+
+#[test]
+fn a_pipelined_request_waits_for_the_pending_response() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client
+        .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+
+    let (token, path) = pull_deferred_request(&mut server);
+    assert_eq!(path, "/one");
+
+    let mut paths = Vec::new();
+    for _ in 0..20 {
+        server.pump(|event| {
+            if let HttpEvent::Request { request, .. } = event {
+                paths.push(request.path.to_owned());
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(paths.is_empty(), "one request in flight per connection: {paths:?}");
+    assert_eq!(server.http.ready_len(), 0, "a connection owing a response is never queued");
+
+    assert!(server.respond(token, 200, &[], b"one"));
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && paths.is_empty() {
+        let mut replies = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, .. } = event {
+                paths.push(request.path.to_owned());
+                replies.push(token);
+            }
+        });
+        for token in replies {
+            assert!(server.respond(token, 200, &[], b"two"));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(paths, ["/two"]);
+}
+
+/// Serves two pipelined requests, answering the first inline or by token, and
+/// reports the cursors left once the second request has been pulled.
+fn cursors_after_two_requests(inline: bool) -> (usize, usize, Option<usize>) {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client
+        .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut answered = None;
+    let mut second = None;
+    while Instant::now() < deadline && second.is_none() {
+        let mut deferred = None;
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, responder } = event {
+                if answered.is_none() {
+                    assert_eq!(request.path, "/one");
+                    if inline {
+                        assert!(responder.respond(200, &[], b"one"));
+                    } else {
+                        deferred = Some(token);
+                    }
+                    answered = Some(token);
+                } else {
+                    assert_eq!(request.path, "/two");
+                    second = Some(token);
+                }
+            }
+        });
+        if let Some(token) = deferred {
+            assert!(server.respond(token, 200, &[], b"one"));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    server.http.cursors(second.expect("the second request never arrived")).unwrap()
+}
+
+#[test]
+fn inline_and_deferred_responses_consume_alike() {
+    assert_eq!(cursors_after_two_requests(true), cursors_after_two_requests(false));
+}
+
+#[test]
+fn a_refused_second_response_consumes_nothing() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET /once HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+
+    let (token, _) = pull_deferred_request(&mut server);
+    assert!(server.respond(token, 200, &[], b"first"));
+    let answered = server.http.cursors(token).unwrap();
+    assert!(!server.respond(token, 200, &[], b"second"), "a request is answered once");
+    assert_eq!(server.http.cursors(token).unwrap(), answered);
+
+    let mut received = Vec::new();
+    read_until_response(&mut server, &mut client, &mut received);
+    assert_eq!(received.windows(5).filter(|w| *w == b"first").count(), 1);
+    assert_eq!(received.windows(6).filter(|w| *w == b"second").count(), 0);
+}
+
+#[test]
+fn answered_bytes_cost_the_connection_nothing() {
+    let addr = unused_addr();
+    // Two of these requests together outgrow the limit; one at a time does
+    // not, and an answered one costs nothing even before it is reclaimed.
+    let mut server =
+        Http::with_config(HttpConfig::default().with_max_head_bytes(64).with_max_body_bytes(0));
+    server.listen(&Endpoint::Tcp(addr));
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let request = padded_request("/first", 60);
+    client.write_all(&request).unwrap();
+
+    // Answer inline and stop pulling, which leaves the answered bytes in the
+    // buffer with nothing reclaimed.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut token = None;
+    while Instant::now() < deadline && token.is_none() {
+        server.drive();
+        while let Some(event) = server.http.next_event(&mut server.net) {
+            if let HttpEvent::Request { token: pulled, responder, .. } = event {
+                assert!(responder.respond(200, &[], b""));
+                token = Some(pulled);
+                break
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let token = token.expect("no request arrived");
+    assert_eq!(server.http.cursors(token), Some((0, request.len(), None)));
+
+    // The next request arrives before the pull that would reclaim them.
+    client.write_all(&padded_request("/second", 60)).unwrap();
+    while Instant::now() < deadline && server.http.ready_len() == 0 {
+        server.drive();
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut paths = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && paths.is_empty() {
+        let mut replies = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, .. } = event {
+                paths.push(request.path.to_owned());
+                replies.push(token);
+            }
+        });
+        for token in replies {
+            assert!(server.respond(token, 200, &[], b""));
+        }
+        let mut received = Vec::new();
+        assert!(!read_available(&mut client, &mut received), "the connection stayed open");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(paths, ["/second"]);
+}
+
+/// A request of exactly `size` bytes, padded out with a header.
+fn padded_request(path: &str, size: usize) -> Vec<u8> {
+    let mut request = Vec::new();
+    write!(request, "GET {path} HTTP/1.1\r\nX-Pad: \r\n\r\n").unwrap();
+    let pad = size.checked_sub(request.len()).expect("the request outgrew its size");
+    let mut request = Vec::new();
+    write!(request, "GET {path} HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "p".repeat(pad)).unwrap();
+    assert_eq!(request.len(), size);
+    request
+}
+
+#[test]
+fn a_pending_request_survives_a_compaction() {
+    let addr = unused_addr();
+    let mut server =
+        Http::with_config(HttpConfig::default().with_max_head_bytes(256).with_max_body_bytes(0));
+    server.listen(&Endpoint::Tcp(addr));
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let mut pipelined = Vec::new();
+    for path in ["/one", "/two", "/three"] {
+        pipelined.extend_from_slice(&padded_request(path, 64));
+    }
+    client.write_all(&pipelined).unwrap();
+
+    // Answer the first request and leave the second one pending, so that the
+    // buffer holds an answered prefix, an unanswered request, and a third
+    // request behind it.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut pulled = Vec::new();
+    let mut pending = None;
+    while Instant::now() < deadline && pulled.len() < 2 {
+        server.drive();
+        while pulled.len() < 2 {
+            let Some(event) = server.http.next_event(&mut server.net) else { break };
+            if let HttpEvent::Request { token, request, responder } = event {
+                pulled.push(request.path.to_owned());
+                if pulled.len() == 1 {
+                    assert!(responder.respond(200, &[], b""));
+                } else {
+                    pending = Some(token);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pulled, ["/one", "/two"]);
+    let pending = pending.unwrap();
+    assert_eq!(server.http.cursors(pending), Some((64, 64, Some(128))));
+
+    // A fourth request would outgrow the limit, so the answered prefix goes
+    // and every cursor moves down with it, the pending request included.
+    client.write_all(&padded_request("/four", 96)).unwrap();
+    while Instant::now() < deadline && server.http.cursors(pending) != Some((0, 0, Some(64))) {
+        server.drive();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        server.http.cursors(pending),
+        Some((0, 0, Some(64))),
+        "the cursors were not rebased"
+    );
+
+    assert!(server.respond(pending, 200, &[], b""));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && pulled.len() < 4 {
+        let mut replies = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, .. } = event {
+                pulled.push(request.path.to_owned());
+                replies.push(token);
+            }
+        });
+        for token in replies {
+            assert!(server.respond(token, 200, &[], b""));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pulled, ["/one", "/two", "/three", "/four"]);
+}
+
+#[test]
+fn pipelined_requests_stay_ranged_across_a_compaction() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let mut wire = Vec::new();
+    for index in 0..3 {
+        write!(
+            wire,
+            "POST /path-{index} HTTP/1.1\r\nHost: x\r\nX-Index: {index}\r\nContent-Length: 5\r\n\r\nbody{index}"
+        )
+        .unwrap();
+    }
+    let one = wire.len() / 3;
+    client.write_all(&wire).unwrap();
+
+    let mut seen = Vec::new();
+    let mut compacted = false;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && seen.len() < 3 {
+        let mut replies = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, .. } = event {
+                seen.push((
+                    request.method.to_owned(),
+                    request.path.to_owned(),
+                    request.header("x-index").map(<[u8]>::to_vec),
+                    request.body.to_vec(),
+                ));
+                replies.push(token);
+            }
+        });
+        for token in replies {
+            // The third request is parsed from a buffer whose answered prefix
+            // has been dropped: its cursors are rebased onto what is left.
+            if seen.len() == 3 {
+                assert_eq!(server.http.cursors(token), Some((0, 0, Some(one))));
+                compacted = true;
+            }
+            assert!(server.respond(token, 200, &[], b"ok"));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(compacted, "the buffer never compacted");
+    for (index, (method, path, header, body)) in seen.iter().enumerate() {
+        assert_eq!(method, "POST");
+        assert_eq!(path, &format!("/path-{index}"));
+        assert_eq!(header.as_deref(), Some(index.to_string().as_bytes()));
+        assert_eq!(body, format!("body{index}").as_bytes());
+    }
+}
+
+#[test]
+fn a_caller_may_stop_pulling_and_resume_later() {
+    let (mut server, addr) = server();
+    let mut first = std::net::TcpStream::connect(addr).unwrap();
+    let mut second = std::net::TcpStream::connect(addr).unwrap();
+    first.set_nonblocking(true).unwrap();
+    second.set_nonblocking(true).unwrap();
+    first.write_all(b"GET /first HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    second.write_all(b"GET /second HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+
+    // Stop after the first request of the iteration, leaving the rest queued.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut deferred = None;
+    while Instant::now() < deadline && deferred.is_none() {
+        server.drive();
+        if let Some(HttpEvent::Request { token, .. }) = server.http.next_event(&mut server.net) {
+            deferred = Some(token);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let deferred = deferred.expect("no request arrived");
+
+    // The next iteration delivers what was left, and the deferred response is
+    // still available.
+    let mut paths = Vec::new();
+    while Instant::now() < deadline && paths.is_empty() {
+        let mut replies = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, request, .. } = event {
+                paths.push(request.path.to_owned());
+                replies.push(token);
+            }
+        });
+        for token in replies {
+            assert!(server.respond(token, 200, &[], b"ok"));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(paths.len(), 1, "the un-pulled request survived the iteration: {paths:?}");
+    assert!(server.respond(deferred, 200, &[], b"resumed"));
+
+    let mut received = Vec::new();
+    let mut peer = if paths[0] == "/first" { second } else { first };
+    read_until_response(&mut server, &mut peer, &mut received);
+    assert!(received.ends_with(b"resumed"), "{received:?}");
+}
+
+#[test]
+fn two_reads_queue_one_ready_connection() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET /split HTTP/1.1\r\n").unwrap();
+
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && server.http.ready_len() == 0 {
+        server.drive();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(server.http.ready_len(), 1);
+
+    client.write_all(b"Host: x\r\n\r\n").unwrap();
+    let mut drives = 0;
+    while Instant::now() < deadline && drives < 20 {
+        server.drive();
+        assert_eq!(server.http.ready_len(), 1, "one entry however many reads arrive");
+        drives += 1;
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut path = None;
+    server.pump(|event| {
+        if let HttpEvent::Request { request, responder, .. } = event {
+            path = Some(request.path.to_owned());
+            assert!(responder.respond(200, &[], b"ok"));
+        }
+    });
+    assert_eq!(path.as_deref(), Some("/split"));
+    assert_eq!(server.http.ready_len(), 0);
+}
+
+#[test]
+fn a_pending_request_reports_work_and_holds_off_the_sweep() {
+    let addr = unused_addr();
+    let mut server = Http::with_config(
+        HttpConfig::default().with_idle_timeout(Duration::from_millis(200).into()),
+    );
+    server.listen(&Endpoint::Tcp(addr));
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut arrived = false;
+    while Instant::now() < deadline && !arrived {
+        arrived = server.drive();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(arrived, "the client never reached the server");
+    // An event nobody pulled is work, iteration after iteration.
+    assert!(server.drive(), "un-pulled events must keep the caller awake");
+
+    let mut token = None;
+    while Instant::now() < deadline && token.is_none() {
+        server.drive();
+        while let Some(event) = server.http.next_event(&mut server.net) {
+            if let HttpEvent::Request { token: pulled, .. } = event {
+                token = Some(pulled);
+                break
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let token = token.expect("no request arrived");
+
+    // Inbound bytes keep resetting the idle sweep while the response is owed.
+    let until = Instant::now() + Duration::from_millis(600);
+    let mut bytes = Vec::new();
+    while Instant::now() < until {
+        client.write_all(b"X").unwrap();
+        server.pump(|_| {});
+        assert!(!read_available(&mut client, &mut bytes), "the sweep took a busy connection");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(server.respond(token, 200, &[], b"ok"));
+}
+
+#[test]
+fn work_is_reported_after_an_inline_answer_stops_the_pull() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client
+        .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+
+    // Answer the first request inline and stop pulling, which leaves the
+    // pipelined one behind it to be picked up by the tick.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut answered = false;
+    while Instant::now() < deadline && !answered {
+        server.drive();
+        while let Some(event) = server.http.next_event(&mut server.net) {
+            if let HttpEvent::Request { request, responder, .. } = event {
+                assert_eq!(request.path, "/one");
+                assert!(responder.respond(200, &[], b"one"));
+                answered = true;
+                break
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(answered, "no request arrived");
+
+    assert!(server.drive(), "the request behind the answered one is work");
+    match server.http.next_event(&mut server.net) {
+        Some(HttpEvent::Request { request, responder, .. }) => {
+            assert_eq!(request.path, "/two");
+            assert!(responder.respond(200, &[], b"two"));
+        }
+        _ => panic!("the pipelined request was not delivered"),
+    }
+}
+
+#[test]
+fn a_blocking_drive_wakes_for_the_idle_sweep() {
+    let addr = unused_addr();
+    let mut server = Http::with_config(
+        HttpConfig::default().with_idle_timeout(Duration::from_millis(500).into()),
+    );
+    server.listen(&Endpoint::Tcp(addr));
+    let _client = std::net::TcpStream::connect(addr).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut accepted = false;
+    while Instant::now() < deadline && !accepted {
+        server.pump(|event| accepted |= matches!(event, HttpEvent::Accepted { .. }));
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(accepted, "the client was never accepted");
+
+    // The sweep of that connection is the only deadline the network has, so
+    // an uncapped drive waits for it and no longer. The late connection is
+    // the test's own deadline: a drive that ignored the sweep would wake on
+    // it instead, well past the bound below, rather than hang.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        drop(std::net::TcpStream::connect(addr));
+    });
+    let started = Instant::now();
+    server.net.drive(None, &mut [server.http.as_service()], |_| {});
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(100), "returned at once: {waited:?}");
+    assert!(waited < Duration::from_secs(2), "the sweep deadline was not folded: {waited:?}");
+}
+
+#[test]
+fn a_blocking_drive_wakes_for_a_connection() {
+    let addr = unused_addr();
+    let mut server = Http::with_config(HttpConfig::default().without_idle_timeout());
+    server.listen(&Endpoint::Tcp(addr));
+
+    // Nothing is due, so an uncapped drive blocks until a client arrives. The
+    // second connection is the test's own deadline: it wakes the poll even if
+    // the first one never lands, so a regression fails instead of hanging.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        let early = std::net::TcpStream::connect(addr);
+        thread::sleep(Duration::from_secs(3));
+        let late = std::net::TcpStream::connect(addr);
+        drop((early, late));
+    });
+    let started = Instant::now();
+    let worked = server.net.drive(None, &mut [server.http.as_service()], |_| {});
+    let waited = started.elapsed();
+    assert!(worked, "an accepted connection is work");
+    assert!(waited >= Duration::from_millis(150), "the drive did not block: {waited:?}");
+    assert!(waited < Duration::from_secs(2), "the drive missed the connection: {waited:?}");
+
+    let mut accepted = false;
+    while let Some(event) = server.http.next_event(&mut server.net) {
+        accepted |= matches!(event, HttpEvent::Accepted { .. });
+    }
+    assert!(accepted, "the connection that woke the poll was not delivered");
+}
+
+#[test]
+fn a_request_from_a_client_that_left_is_dropped() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.write_all(b"GET /gone HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(client);
+    // The request and the end of stream are both queued before the server
+    // reads, so one iteration sees the whole story.
+    thread::sleep(Duration::from_millis(50));
+
+    let mut order = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !order.contains(&"disconnected") {
+        server.pump(|event| {
+            order.push(match event {
+                HttpEvent::Accepted { .. } => "accepted",
+                HttpEvent::Request { .. } => "request",
+                HttpEvent::Disconnected { .. } => "disconnected",
+                _ => "other",
+            });
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(order, ["accepted", "disconnected"], "a request nobody can answer was delivered");
+}
+
+#[test]
+#[should_panic(expected = "drive the network with StreamNetwork::drive")]
+fn polling_a_network_that_has_services_is_refused() {
+    let mut net = StreamNetwork::default();
+    let group = net.add_group(http_group());
+    let _http = HttpService::new(&mut net, group, HttpConfig::default());
+    net.poll_with(|_| {});
+}
+
+#[test]
+fn an_accepted_connection_is_announced_before_its_first_request() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET /first HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+
+    let mut order = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && order.len() < 2 {
+        let mut replies = Vec::new();
+        server.pump(|event| match event {
+            HttpEvent::Accepted { .. } => order.push("accepted"),
+            HttpEvent::Request { token, .. } => {
+                order.push("request");
+                replies.push(token);
+            }
+            _ => {}
+        });
+        for token in replies {
+            assert!(server.respond(token, 200, &[], b"ok"));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(order, ["accepted", "request"]);
+}
+
+#[test]
+fn two_services_on_one_network_keep_their_own_events() {
+    let mut net = StreamNetwork::default();
+    let first_group = net.add_group(ConnectionGroupConfig { name: "first", ..http_group() });
+    let second_group = net.add_group(ConnectionGroupConfig { name: "second", ..http_group() });
+    let mut first = HttpService::new(&mut net, first_group, HttpConfig::default());
+    let mut second = HttpService::new(&mut net, second_group, HttpConfig::default());
+    let first_addr = unused_addr();
+    let second_addr = unused_addr();
+    first.listen(&mut net, Endpoint::Tcp(first_addr)).unwrap();
+    second.listen(&mut net, Endpoint::Tcp(second_addr)).unwrap();
+
+    let mut to_first = std::net::TcpStream::connect(first_addr).unwrap();
+    let mut to_second = std::net::TcpStream::connect(second_addr).unwrap();
+    to_first.write_all(b"GET /first HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    to_second.write_all(b"GET /second HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+
+    let mut first_paths = Vec::new();
+    let mut second_paths = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && (first_paths.is_empty() || second_paths.is_empty()) {
+        net.drive(
+            Some(Duration::ZERO.into()),
+            &mut [first.as_service(), second.as_service()],
+            |event| panic!("no unclaimed group exists: {:?}", event_group(&event)),
+        );
+        while let Some(event) = first.next_event(&mut net) {
+            if let HttpEvent::Request { request, responder, .. } = event {
+                first_paths.push(request.path.to_owned());
+                assert!(responder.respond(200, &[], b"first"));
+            }
+        }
+        while let Some(event) = second.next_event(&mut net) {
+            if let HttpEvent::Request { request, responder, .. } = event {
+                second_paths.push(request.path.to_owned());
+                assert!(responder.respond(200, &[], b"second"));
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(first_paths, ["/first"]);
+    assert_eq!(second_paths, ["/second"]);
+
+    first.close(&mut net);
+    second.close(&mut net);
+}
+
+fn event_group(event: &StreamEvent<'_>) -> &'static str {
+    match event {
+        StreamEvent::Accepted { .. } => "accepted",
+        StreamEvent::Connected { .. } => "connected",
+        StreamEvent::Message { .. } => "message",
+        StreamEvent::Disconnected { .. } => "disconnected",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service lifecycle
+
+#[test]
+fn close_returns_the_group_to_raw_use() {
+    let mut net = StreamNetwork::default();
+    let group = net.add_group(http_group());
+    let other_group = net.add_group(http_group());
+    let mut http = HttpService::new(&mut net, group, HttpConfig::default());
+    let mut other = HttpService::new(&mut net, other_group, HttpConfig::default());
+    http.listen(&mut net, Endpoint::Tcp(unused_addr())).unwrap();
+    http.close(&mut net);
+
+    // The remaining service alone passes validation.
+    net.drive(Some(Duration::ZERO.into()), &mut [other.as_service()], |_| {});
+
+    let addr = unused_addr();
+    net.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.write_all(b"raw bytes").unwrap();
+    let mut raw = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && raw.is_empty() {
+        net.drive(Some(Duration::ZERO.into()), &mut [other.as_service()], |event| {
+            if let StreamEvent::Message { group: event_group, payload, .. } = event {
+                assert_eq!(event_group, group);
+                raw.push(payload.to_vec());
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(raw, [b"raw bytes".to_vec()]);
+    other.close(&mut net);
+}
+
+#[test]
+fn close_hangs_up_on_connections_and_listeners() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("closed.sock");
+    let mut net = StreamNetwork::default();
+    let group = net.add_group(http_group());
+    let mut http = HttpService::new(&mut net, group, HttpConfig::default());
+    http.listen(&mut net, Endpoint::Unix(path.clone())).unwrap();
+    assert!(path.exists());
+
+    let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+    client.write_all(b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut accepted = false;
+    while Instant::now() < deadline && !accepted {
+        net.drive(Some(Duration::ZERO.into()), &mut [http.as_service()], |_| {});
+        while let Some(event) = http.next_event(&mut net) {
+            accepted |= matches!(event, HttpEvent::Accepted { .. });
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(accepted);
+
+    http.close(&mut net);
+    assert!(!path.exists(), "the socket file outlived its listener");
+    assert!(std::os::unix::net::UnixStream::connect(&path).is_err());
+    client.set_nonblocking(true).unwrap();
+    let mut bytes = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut closed = false;
+    while Instant::now() < deadline && !closed {
+        closed = read_available(&mut client, &mut bytes);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(closed, "the peer never saw the end of the stream");
+}
+
+#[test]
+#[should_panic(expected = "call HttpService::close before dropping it")]
+fn a_service_dropped_without_closing_is_reported() {
+    let mut net = StreamNetwork::default();
+    let group = net.add_group(http_group());
+    let http = HttpService::new(&mut net, group, HttpConfig::default());
+    drop(http);
+    net.drive(Some(Duration::ZERO.into()), &mut [], |_| {});
+}
+
+#[test]
+fn dropping_a_service_and_its_network_together_is_harmless() {
+    let mut net = StreamNetwork::default();
+    let group = net.add_group(http_group());
+    let mut http = HttpService::new(&mut net, group, HttpConfig::default());
+    http.listen(&mut net, Endpoint::Tcp(unused_addr())).unwrap();
+    net.drive(Some(Duration::ZERO.into()), &mut [http.as_service()], |_| {});
+    drop(http);
+    drop(net);
+}
+
+#[test]
+#[should_panic(expected = "HTTP frames its own messages and needs a raw-framed group")]
+fn a_service_refuses_a_length_prefixed_group() {
+    let mut net = StreamNetwork::default();
+    let group = net.add_group(ConnectionGroupConfig::default());
+    let _http = HttpService::new(&mut net, group, HttpConfig::default());
 }

@@ -11,5 +11,6 @@ pub use network::{
     ConnectionGroup, ConnectionGroupConfig, Framing, StreamEvent, StreamNetwork, TcpOptions,
 };
 pub use service::ServiceRef;
+pub(crate) use service::private;
 pub(crate) use tcp_stream::set_socket_buf_size;
 pub use tcp_stream::{ConnState, TcpStream, TcpTelemetry};
