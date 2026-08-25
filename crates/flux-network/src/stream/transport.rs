@@ -30,6 +30,15 @@ impl ListenSocket {
         }
     }
 
+    /// The endpoint the socket is listening on, which differs from the one
+    /// [`Self::bind`] was given only for a TCP port of `0`.
+    pub(crate) fn endpoint(&self) -> io::Result<Endpoint> {
+        match self {
+            Self::Tcp(listener) => listener.local_addr().map(Endpoint::Tcp),
+            Self::Unix(listener) => Ok(Endpoint::Unix(listener.path.clone())),
+        }
+    }
+
     /// Accepts one pending connection, with the identity of its remote end.
     pub(crate) fn accept(&self) -> io::Result<(TransportStream, Peer)> {
         match self {

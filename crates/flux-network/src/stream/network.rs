@@ -289,15 +289,16 @@ impl NetworkState {
         &self.groups[group.0].config
     }
 
-    fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<()> {
+    fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<Endpoint> {
         if group.0 >= self.groups.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown connection group"));
         }
         let mut socket = ListenSocket::bind(endpoint)?;
+        let bound = socket.endpoint()?;
         let token = self.next_token();
         self.registry.register(&mut socket, token, Interest::READABLE)?;
         self.listeners.push(Listener { token, group, socket });
-        Ok(())
+        Ok(bound)
     }
 
     fn connect(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> Token {
@@ -1056,7 +1057,11 @@ impl StreamNetwork {
         self.release_group(group);
     }
 
-    /// Adds a listener to `group`.
+    /// Adds a listener to `group`, and reports the endpoint it bound.
+    ///
+    /// That endpoint is the one asked for, except for a TCP address whose
+    /// port is `0`: the kernel picks the port, and what comes back is the
+    /// address a peer must dial.
     ///
     /// An [`Endpoint::Unix`] listener creates its socket file with mode `0777`
     /// less the umask bits; flux sets no mode of its own. Connecting to a
@@ -1064,7 +1069,7 @@ impl StreamNetwork {
     /// usual `022` umask yields `0755` and admits the owner alone. An operator
     /// who wants group or world access sets the umask before the bind or
     /// changes the mode after it.
-    pub fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<()> {
+    pub fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<Endpoint> {
         self.state.listen(group, endpoint)
     }
 

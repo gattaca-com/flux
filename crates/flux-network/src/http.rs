@@ -719,12 +719,16 @@ impl HttpService {
         ServiceRef::new(self)
     }
 
-    /// Adds a listener.
+    /// Adds a listener, and reports the endpoint it bound.
+    ///
+    /// That endpoint is the one asked for, except for a TCP address whose
+    /// port is `0`: the kernel picks the port, and what comes back is the
+    /// address a client must dial.
     ///
     /// An [`Endpoint::Unix`] socket file is created with mode `0777` less the
     /// umask bits and is unlinked when the service is closed; see
     /// [`StreamNetwork::listen`].
-    pub fn listen(&mut self, net: &mut StreamNetwork, endpoint: Endpoint) -> io::Result<()> {
+    pub fn listen(&mut self, net: &mut StreamNetwork, endpoint: Endpoint) -> io::Result<Endpoint> {
         net.listen(self.group, endpoint)
     }
 
