@@ -1,8 +1,9 @@
 use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use flux_network::stream::{SendBehavior, TcpConnector};
@@ -10,12 +11,19 @@ use mio::Token;
 
 const FRAME_HEADER_SIZE: usize = core::mem::size_of::<u32>() + core::mem::size_of::<u64>();
 
-fn spawn_frame_collector(read_delay: Duration) -> (SocketAddr, thread::JoinHandle<Vec<Vec<u8>>>) {
+/// A collector that reads frames until the connection closes, announcing the
+/// arrival of `marker` on the channel it returns.
+fn spawn_frame_collector(
+    read_delay: Duration,
+    marker: Vec<u8>,
+) -> (SocketAddr, Receiver<()>, thread::JoinHandle<Vec<Vec<u8>>>) {
     let listener = TcpListener::bind(SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), 0)))
         .expect("failed to bind test listener");
     let addr = listener.local_addr().expect("failed to fetch listener addr");
+    let (arrived, arrival) = mpsc::channel();
 
     let handle = thread::spawn(move || {
+        let arrived: Sender<()> = arrived;
         let (mut stream, _) = listener.accept().expect("failed to accept connection");
         if !read_delay.is_zero() {
             thread::sleep(read_delay);
@@ -33,6 +41,9 @@ fn spawn_frame_collector(read_delay: Duration) -> (SocketAddr, thread::JoinHandl
                     if stream.read_exact(&mut payload).is_err() {
                         break;
                     }
+                    if payload == marker {
+                        let _ = arrived.send(());
+                    }
                     frames.push(payload);
                 }
                 Err(_) => break,
@@ -42,13 +53,26 @@ fn spawn_frame_collector(read_delay: Duration) -> (SocketAddr, thread::JoinHandl
         frames
     });
 
-    (addr, handle)
+    (addr, arrival, handle)
 }
 
-fn pump(conn: &mut TcpConnector, for_how_long: Duration) {
-    let deadline = std::time::Instant::now() + for_how_long;
-    while std::time::Instant::now() < deadline {
+/// Drives the connector until every collector has announced its marker.
+///
+/// How long the queued bytes take to drain depends on the receiver, so the
+/// arrivals are what the test waits for; the deadline is only there to fail
+/// loudly instead of hanging.
+fn pump_until_arrivals(conn: &mut TcpConnector, arrivals: &[&Receiver<()>]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut arrived = vec![false; arrivals.len()];
+    while !arrived.iter().all(|arrived| *arrived) {
+        assert!(Instant::now() < deadline, "markers never arrived: {arrived:?}");
         while conn.poll_with(|_| {}) {}
+        for (index, arrival) in arrivals.iter().enumerate() {
+            arrived[index] |= match arrival.try_recv() {
+                Ok(()) => true,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => false,
+            };
+        }
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -61,8 +85,12 @@ fn send_payload(conn: &mut TcpConnector, token: Token, payload: &[u8]) {
 
 #[test]
 fn queued_messages_flush_on_second_connection_after_backpressure() {
-    let (fast_addr, fast_handle) = spawn_frame_collector(Duration::from_millis(0));
-    let (slow_addr, slow_handle) = spawn_frame_collector(Duration::from_millis(700));
+    let marker = b"marker-after-backpressure".to_vec();
+    let keepalive = b"fast-keepalive".to_vec();
+    let (fast_addr, fast_arrival, fast_handle) =
+        spawn_frame_collector(Duration::from_millis(0), keepalive.clone());
+    let (slow_addr, slow_arrival, slow_handle) =
+        spawn_frame_collector(Duration::from_millis(700), marker.clone());
 
     let mut conn = TcpConnector::default().with_socket_buf_size(1024);
     let fast_token = conn.connect(fast_addr).expect("failed to connect to fast collector");
@@ -74,24 +102,23 @@ fn queued_messages_flush_on_second_connection_after_backpressure() {
     let big = vec![7_u8; 8 * 1024 * 1024];
     send_payload(&mut conn, slow_token, &big);
 
-    let marker = b"marker-after-backpressure".to_vec();
     send_payload(&mut conn, slow_token, &marker);
-    send_payload(&mut conn, fast_token, b"fast-keepalive");
+    send_payload(&mut conn, fast_token, &keepalive);
 
     // The slow side starts reading after the delay. If token handling is correct,
     // queued frames should eventually flush and marker should be observed.
-    pump(&mut conn, Duration::from_secs(5));
+    pump_until_arrivals(&mut conn, &[&fast_arrival, &slow_arrival]);
     drop(conn);
 
     let fast_frames = fast_handle.join().expect("fast collector thread panicked");
     let slow_frames = slow_handle.join().expect("slow collector thread panicked");
 
     assert!(
-        fast_frames.iter().any(|f| f == b"fast-keepalive"),
+        fast_frames.contains(&keepalive),
         "sanity check failed: fast collector did not receive data"
     );
     assert!(
-        slow_frames.iter().any(|f| f == &marker),
+        slow_frames.contains(&marker),
         "slow collector never received marker after backpressure was released"
     );
 }
