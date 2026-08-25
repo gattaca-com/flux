@@ -352,8 +352,8 @@ enum WriteSide {
     /// To be shut as soon as the queued bytes reach the peer. Sends are
     /// refused from the request onward, so the queue only shrinks.
     ShutWhenDrained,
-    /// Shut: the peer has read the end of the stream, and what it sends still
-    /// arrives.
+    /// Shut: the peer can read the end of the stream, and what it sends
+    /// still arrives.
     Shut,
 }
 
