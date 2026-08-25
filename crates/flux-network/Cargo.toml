@@ -21,10 +21,15 @@ tracing.workspace = true
 wincode = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion.workspace = true
 spine-derive.workspace = true
 tempfile.workspace = true
 wincode = { workspace = true }
 wincode-derive = { workspace = true }
+
+[[bench]]
+harness = false
+name = "reclaim"
 
 [lints]
 workspace = true

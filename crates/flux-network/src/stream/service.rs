@@ -36,7 +36,6 @@ pub(crate) mod private {
 pub struct ServiceRef<'a>(&'a mut dyn private::ServiceDriver);
 
 impl<'a> ServiceRef<'a> {
-    #[allow(dead_code, reason = "the services that build a carrier arrive with HttpService")]
     pub(crate) fn new(driver: &'a mut dyn private::ServiceDriver) -> Self {
         Self(driver)
     }

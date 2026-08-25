@@ -449,6 +449,26 @@ impl NetworkState {
         self.connections[index].state = ConnectionState::Connecting(socket);
     }
 
+    /// Hard-closes every listener, accepted connection and outbound endpoint
+    /// of `group`, discarding the disconnect events that produces.
+    ///
+    /// Closing an [`Endpoint::Unix`] listener unlinks its socket file.
+    fn close_group(&mut self, group: ConnectionGroup) {
+        for index in (0..self.listeners.len()).rev() {
+            if self.listeners[index].group == group {
+                let mut listener = self.listeners.swap_remove(index);
+                let _ = self.poll.registry().deregister(&mut listener.socket);
+            }
+        }
+        for index in (0..self.connections.len()).rev() {
+            if self.connections[index].group == group {
+                self.close_connection_socket(index);
+                self.connections.swap_remove(index);
+            }
+        }
+        self.pending_disconnects.retain(|event| event.group != group);
+    }
+
     /// Retries every outbound endpoint whose group is due one, reporting
     /// whether an attempt was made.
     fn maybe_reconnect(&mut self, now: Instant) -> bool {
@@ -1038,7 +1058,6 @@ impl StreamNetwork {
     }
 
     /// Marks `group` as owned by the service making the call.
-    #[allow(dead_code, reason = "the services that claim a group arrive with HttpService")]
     pub(crate) fn claim_group(&mut self, group: ConnectionGroup) {
         assert!(group.0 < self.claimed.len(), "unknown connection group");
         assert!(!self.claimed[group.0], "connection group {} already has a service", group.0);
@@ -1046,10 +1065,22 @@ impl StreamNetwork {
     }
 
     /// Returns `group` to unclaimed status.
-    #[allow(dead_code, reason = "the services that release a group arrive with HttpService")]
     pub(crate) fn release_group(&mut self, group: ConnectionGroup) {
         assert!(group.0 < self.claimed.len(), "unknown connection group");
         self.claimed[group.0] = false;
+    }
+
+    /// The wire encoding of `group`, which a service checks before claiming it.
+    pub(crate) fn framing(&self, group: ConnectionGroup) -> Framing {
+        assert!(group.0 < self.state.groups.len(), "unknown connection group");
+        self.state.config(group).framing
+    }
+
+    /// Hard-closes every listener, accepted connection and outbound endpoint
+    /// of `group` and returns it to unclaimed status, empty and reusable.
+    pub(crate) fn close_group(&mut self, group: ConnectionGroup) {
+        self.state.close_group(group);
+        self.release_group(group);
     }
 
     /// The earliest instant the network's own timers need a driver call at.
@@ -1148,12 +1179,18 @@ impl StreamNetwork {
     /// only.
     ///
     /// # Panics
-    /// Panics when a group is service-owned; such a network is driven with
-    /// [`Self::drive`].
+    /// A network with services is driven with [`Self::drive`], which is what
+    /// delivers their events; polling it without them panics.
     pub fn poll_with<F>(&mut self, handler: F)
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
+        if let Some(index) = self.claimed.iter().position(|claimed| *claimed) {
+            panic!(
+                "connection group {index} has a service — drive the network with \
+                 StreamNetwork::drive, passing every service"
+            );
+        }
         self.drive(Some(Duration::ZERO), &mut [], handler);
     }
 
