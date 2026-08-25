@@ -571,6 +571,53 @@ fn respond_with_frames_the_body_the_closure_writes() {
 }
 
 #[test]
+fn a_slice_answer_after_a_composed_one_carries_only_its_own_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = Endpoint::Unix(dir.path().join("s"));
+    let mut server = server_at(&endpoint);
+    let mut client = connect_client(&endpoint);
+    client
+        .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+
+    let composed = b"a composed body, and a long one".as_slice();
+    let slice = b"short".as_slice();
+    let mut expected = Vec::new();
+    for body in [composed, slice] {
+        expected.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        expected.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        expected.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
+        expected.extend_from_slice(body);
+    }
+
+    // The first answer is rendered into the buffer the service keeps; the
+    // second is a slice the caller holds. Nothing of the first may reach it.
+    let mut answered = 0;
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && received.len() < expected.len() {
+        let mut tokens = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, .. } = event {
+                tokens.push(token);
+            }
+        });
+        for token in tokens {
+            assert!(if answered == 0 {
+                server.respond_with(token, 200, &[], |out| out.extend_from_slice(composed))
+            } else {
+                server.respond(token, 200, &[], slice)
+            });
+            answered += 1;
+        }
+        read_available(&mut client, &mut received);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(answered, 2, "both pipelined requests were answered");
+    assert_eq!(received, expected, "{}", String::from_utf8_lossy(&received));
+}
+
+#[test]
 fn a_head_request_carries_the_length_of_the_body_it_is_not_sent() {
     let (mut server, addr) = server();
     let mut client = std::net::TcpStream::connect(addr).unwrap();

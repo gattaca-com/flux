@@ -351,7 +351,8 @@ impl Responder<'_> {
     /// are reclaimed on the next pull or network tick, after the event's
     /// borrow ends. [`HttpService::respond`] reclaims before it returns.
     pub fn respond(self, status: u16, headers: &[(&str, &str)], body: &[u8]) -> bool {
-        self.respond_with(status, headers, |out| out.extend_from_slice(body))
+        let Self { net, state, token, linger, .. } = self;
+        write_framed(net, state, token, linger, status, headers, body)
     }
 
     /// Queues the response with its body written by `body`, and returns
@@ -360,8 +361,8 @@ impl Responder<'_> {
     /// The closure renders into a buffer the service keeps for the next
     /// response, so a body composed here costs no allocation. Every framing
     /// rule of [`Self::respond`] holds, and the closure runs whatever the
-    /// request was: a `HEAD` request is answered with the `Content-Length`
-    /// of the body it is not sent.
+    /// request was — but only once the answer is one the service will send: a
+    /// refused status or header composes nothing.
     pub fn respond_with(
         self,
         status: u16,
@@ -369,73 +370,95 @@ impl Responder<'_> {
         body: impl FnOnce(&mut Vec<u8>),
     ) -> bool {
         let Self { net, state, scratch, token, linger } = self;
-        if state.phase != Phase::Pending {
+        if !answerable(state, status, headers) {
             return false
         }
-        if !(100..=599).contains(&status) ||
-            headers.iter().any(|(name, value)| invalid_header(name, value))
-        {
-            return false
-        }
-        let caller_close = headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")
-        });
-        let close = state.close || caller_close;
-        let suppress_body = state.head_request || matches!(status, 100..=199 | 204 | 304);
-        let include_length = !matches!(status, 100..=199 | 204);
         scratch.clear();
         body(scratch);
-        let body: &[u8] = scratch;
-        let ok = net.send_with(token, |out| {
-            write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
-            // Caller Connection headers only feed the close decision; exactly
-            // one canonical Connection header is always written below.
-            for (name, value) in headers {
-                if name.eq_ignore_ascii_case("connection") {
-                    continue
-                }
-                out.extend_from_slice(name.as_bytes());
-                out.extend_from_slice(b": ");
-                out.extend_from_slice(value.as_bytes());
-                out.extend_from_slice(b"\r\n");
-            }
-            if include_length {
-                write!(out, "Content-Length: {}\r\n", body.len()).unwrap();
-            }
-            out.extend_from_slice(if close {
-                b"Connection: close\r\n"
-            } else {
-                b"Connection: keep-alive\r\n"
-            });
-            out.extend_from_slice(b"\r\n");
-            if !suppress_body {
-                out.extend_from_slice(body);
-            }
-        });
-        if ok {
-            if let Some(end) = state.req_end.take() {
-                state.consumed = end;
-            }
-            if !close {
-                state.phase = Phase::Idle;
-            } else if state.framing_lost && linger.is_some() {
-                // The peer is still sending a request stream this response ends.
-                // Shutting the write side alone puts the answer in front of it
-                // before the connection goes.
-                net.shutdown_write_when_drained(token);
-                // The caps time what follows the answer, so they start where the
-                // answer ends: here when nothing was queued behind it, and at the
-                // tick that sees the write side shut otherwise.
-                let clock =
-                    net.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
-                state.phase = Phase::Lingering { clock };
-            } else {
-                state.phase = Phase::Draining;
-                net.disconnect_when_drained(token);
-            }
-        }
-        ok
+        write_framed(net, state, token, linger, status, headers, scratch)
     }
+}
+
+/// Whether this response can be written for the request `state` holds: one
+/// request is answered once, with a status HTTP frames and headers the
+/// service does not reserve for itself.
+fn answerable(state: &ConnState, status: u16, headers: &[(&str, &str)]) -> bool {
+    state.phase == Phase::Pending &&
+        (100..=599).contains(&status) &&
+        !headers.iter().any(|(name, value)| invalid_header(name, value))
+}
+
+/// Writes one response for a pending request and moves the connection on.
+///
+/// The body reaches the wire in a single copy, from wherever the caller
+/// holds it. A `HEAD` request is framed with its `Content-Length` and sent
+/// none of it.
+fn write_framed(
+    net: &mut StreamNetwork,
+    state: &mut ConnState,
+    token: Token,
+    linger: Option<Linger>,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> bool {
+    if !answerable(state, status, headers) {
+        return false
+    }
+    let caller_close = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")
+    });
+    let close = state.close || caller_close;
+    let suppress_body = state.head_request || matches!(status, 100..=199 | 204 | 304);
+    let include_length = !matches!(status, 100..=199 | 204);
+    let ok = net.send_with(token, |out| {
+        write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
+        // Caller Connection headers only feed the close decision; exactly
+        // one canonical Connection header is always written below.
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("connection") {
+                continue
+            }
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        if include_length {
+            write!(out, "Content-Length: {}\r\n", body.len()).unwrap();
+        }
+        out.extend_from_slice(if close {
+            b"Connection: close\r\n"
+        } else {
+            b"Connection: keep-alive\r\n"
+        });
+        out.extend_from_slice(b"\r\n");
+        if !suppress_body {
+            out.extend_from_slice(body);
+        }
+    });
+    if ok {
+        if let Some(end) = state.req_end.take() {
+            state.consumed = end;
+        }
+        if !close {
+            state.phase = Phase::Idle;
+        } else if state.framing_lost && linger.is_some() {
+            // The peer is still sending a request stream this response ends.
+            // Shutting the write side alone puts the answer in front of it
+            // before the connection goes.
+            net.shutdown_write_when_drained(token);
+            // The caps time what follows the answer, so they start where the
+            // answer ends: here when nothing was queued behind it, and at the
+            // tick that sees the write side shut otherwise.
+            let clock = net.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
+            state.phase = Phase::Lingering { clock };
+        } else {
+            state.phase = Phase::Draining;
+            net.disconnect_when_drained(token);
+        }
+    }
+    ok
 }
 
 /// What answering one request touches, and all a [`Responder`] may reach.
@@ -819,7 +842,7 @@ impl HttpService {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        self.respond_with(net, token, status, headers, |out| out.extend_from_slice(body))
+        self.answer(net, token, |responder| responder.respond(status, headers, body))
     }
 
     /// Answers a request whose [`Responder`] was dropped with a body `body`
@@ -839,6 +862,17 @@ impl HttpService {
         headers: &[(&str, &str)],
         body: impl FnOnce(&mut Vec<u8>),
     ) -> bool {
+        self.answer(net, token, |responder| responder.respond_with(status, headers, body))
+    }
+
+    /// Hands `answer` the responder for the request pending on an accepted
+    /// `token`, and reclaims what its response consumed.
+    fn answer(
+        &mut self,
+        net: &mut StreamNetwork,
+        token: Token,
+        answer: impl FnOnce(Responder<'_>) -> bool,
+    ) -> bool {
         let Some(index) = self.index_of(token) else { return false };
         if !matches!(self.conns[index].role, Role::Accepted) {
             return false
@@ -846,7 +880,7 @@ impl HttpService {
         let linger = self.config.linger;
         let Self { conns, scratch, .. } = self;
         let responder = Responder { net, state: &mut conns[index].state, scratch, token, linger };
-        if !responder.respond_with(status, headers, body) {
+        if !answer(responder) {
             return false
         }
         self.reclaim(index);
@@ -1294,7 +1328,7 @@ impl HttpService {
         // The request this answers was never read to its end, whether it was
         // unparseable, too large, or framed in a way the service refuses.
         state.framing_lost = true;
-        Responder { net, state, scratch, token, linger }.respond_with(status, &[], |_| {});
+        Responder { net, state, scratch, token, linger }.respond(status, &[], &[]);
     }
 
     /// Drops an outbound connection whose peer broke the protocol.
