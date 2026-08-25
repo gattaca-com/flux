@@ -1483,16 +1483,19 @@ impl private::ServiceDriver for HttpService {
         if let Some(linger) = self.config.linger {
             for index in 0..self.conns.len() {
                 let token = self.conns[index].token;
-                let shut = net.write_side_shut(token);
                 let Phase::Lingering { clock } = &mut self.conns[index].state.phase else {
                     continue
                 };
-                // Until the peer has the whole answer there is nothing to
-                // cap: what bounds a connection still writing is its
-                // transport, as it is for one that is draining.
+                // Until the transport has the whole answer there is nothing
+                // to cap: what bounds a connection still writing is its
+                // transport, as it is for one that is draining. Asking costs
+                // a walk of the network's connections, so only a linger that
+                // is still waiting on its answer asks.
                 let clock = match *clock {
                     Some(clock) => clock,
-                    None if shut => *clock.insert(LingerClock::started(now)),
+                    // `now` is the instant the poll returned, so the caps run
+                    // from the end of the wait rather than the start of it.
+                    None if net.write_side_shut(token) => *clock.insert(LingerClock::started(now)),
                     None => continue,
                 };
                 if now.saturating_sub(clock.last_inbound) >= linger.idle ||
