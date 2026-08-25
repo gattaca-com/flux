@@ -521,16 +521,22 @@ fn request_of_the_whole_limit() -> Vec<u8> {
 }
 
 #[test]
-fn an_inline_answer_at_the_limit_closes_like_a_deferred_one() {
+fn an_inline_answer_at_the_limit_matches_one_answered_before_a_tick() {
     assert_eq!(
-        over_the_limit_at_a_request_boundary(true),
-        over_the_limit_at_a_request_boundary(false)
+        over_the_limit_at_a_request_boundary(true, false),
+        over_the_limit_at_a_request_boundary(false, false)
     );
 }
 
 /// Answers a request that ends exactly at the buffer limit, inline or by
 /// token, and reports what the peer read before the end of the stream.
-fn over_the_limit_at_a_request_boundary(inline: bool) -> String {
+///
+/// Two closes are correct here, and which one the peer reads is settled by
+/// whether a tick falls between the request and its answer. Answered first,
+/// the connection is idle when the tick finds it over its limit, and the byte
+/// the limit dropped earns a `431` of its own. Answered after that tick, the
+/// answer already carries the close and there is nothing left to reject.
+fn over_the_limit_at_a_request_boundary(inline: bool, after_a_tick: bool) -> String {
     let config = HttpConfig::default()
         .with_max_head_bytes(64)
         .with_max_body_bytes(64)
@@ -548,6 +554,9 @@ fn over_the_limit_at_a_request_boundary(inline: bool) -> String {
     request.push(b'x');
     client.write_all(&request).unwrap();
     server.wait_until(|server| !server.requests.is_empty(), "the request was not delivered");
+    if after_a_tick {
+        server.pump_for(Duration::from_millis(20));
+    }
     if !inline {
         assert!(server.respond(token, 200, b"ok"));
     }
@@ -563,7 +572,7 @@ fn over_the_limit_at_a_request_boundary(inline: bool) -> String {
 
 #[test]
 fn an_over_limit_request_boundary_is_answered() {
-    let received = over_the_limit_at_a_request_boundary(true);
+    let received = over_the_limit_at_a_request_boundary(true, false);
     assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
     assert!(received.contains("Connection: keep-alive\r\n"), "{received}");
     assert!(received.contains("HTTP/1.1 431 Request Header Fields Too Large\r\n"), "{received}");
@@ -707,4 +716,16 @@ fn the_caps_start_when_the_answer_has_left() {
     assert!(ran < Duration::from_secs(2), "the caps did not end the linger: {ran:?}");
     let received = read_back.recv_timeout(TIMEOUT).unwrap();
     assert!(received >= answer.len(), "the peer was sent {received} of {}", answer.len());
+}
+
+#[test]
+fn a_deferred_answer_after_a_tick_at_the_limit_closes() {
+    // The tick that falls before the answer finds the connection over its
+    // limit with the request still pending, so the answer carries the close
+    // itself and no `431` follows it.
+    let received = over_the_limit_at_a_request_boundary(false, true);
+    assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+    assert!(!received.contains("keep-alive"), "{received}");
+    assert!(!received.contains("431"), "{received}");
+    assert!(received.ends_with("Connection: close\r\n\r\nok"), "{received}");
 }

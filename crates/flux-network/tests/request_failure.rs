@@ -501,3 +501,19 @@ fn a_blocking_drive_wakes_for_a_request_deadline() {
         thread::sleep(Duration::from_millis(1));
     }
 }
+
+#[test]
+fn an_answer_whose_open_head_is_over_the_cap_is_too_large() {
+    // The head never ends, so the cap is reached with the parse still
+    // incomplete: what is buffered is head bytes and there are too many.
+    let mut answer = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+    answer.extend_from_slice(&[b'v'; 100]);
+    answer.extend_from_slice(b"\r\n");
+    assert_failure(
+        &Endpoint::Tcp(unused_addr()),
+        HttpConfig::default().with_max_head_bytes(64),
+        &answer,
+        false,
+        RequestFailure::TooLarge,
+    );
+}
