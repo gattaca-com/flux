@@ -120,6 +120,10 @@ pub struct HttpConfig {
     /// request stream the service never read to its end; `None` closes such a
     /// connection as soon as the response is written, as it does any other.
     pub linger: Option<Linger>,
+    /// How long an outbound request may go unanswered before it fails with
+    /// [`RequestFailure::Timeout`] and its connection closes; `None` waits as
+    /// long as the endpoint holds the connection open.
+    pub request_timeout: Option<Duration>,
 }
 
 impl Default for HttpConfig {
@@ -130,6 +134,7 @@ impl Default for HttpConfig {
             max_headers: 64,
             idle_timeout: Some(Duration::from_secs(30)),
             linger: Some(Linger::default()),
+            request_timeout: None,
         }
     }
 }
@@ -196,6 +201,12 @@ impl HttpConfig {
         self
     }
 
+    /// Sets how long an outbound request may go unanswered.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = Some(request_timeout);
+        self
+    }
+
     /// The most a connection may hold unanswered: one head plus one body.
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
@@ -212,8 +223,27 @@ pub enum HttpEvent<'a> {
     Request { token: Token, request: HttpRequest<'a>, responder: Responder<'a> },
     /// An outbound endpoint answered a request.
     Response { token: Token, response: HttpResponse<'a> },
+    /// An outbound request will not be answered. The connection closes with
+    /// it, and its [`Self::Disconnected`] follows.
+    RequestFailed { token: Token, reason: RequestFailure },
     /// A connection closed.
     Disconnected { token: Token },
+}
+
+/// Why an outbound request will not be answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestFailure {
+    /// No answer arrived within [`HttpConfig::request_timeout`].
+    Timeout,
+    /// The endpoint answered with something that is not a response the
+    /// service can frame.
+    Malformed,
+    /// The answer was larger than [`HttpConfig::max_head_bytes`] or
+    /// [`HttpConfig::max_body_bytes`] allows: the caps are the operator's to
+    /// raise.
+    TooLarge,
+    /// The endpoint closed the connection with the request in flight.
+    Disconnected,
 }
 
 /// A parsed request, borrowed from the connection that sent it.
@@ -344,6 +374,8 @@ struct Conn {
     over_limit: bool,
     /// Whether the client was told to send the body it announced.
     continued: bool,
+    /// When the request in flight on an outbound connection gives up.
+    deadline: Option<Instant>,
     last_activity: Instant,
     state: ConnState,
     role: Role,
@@ -358,6 +390,7 @@ impl Conn {
             ready: false,
             over_limit: false,
             continued: false,
+            deadline: None,
             last_activity: Instant::now(),
             state: ConnState {
                 phase: Phase::Idle,
@@ -399,6 +432,7 @@ impl Conn {
         self.start = 0;
         self.over_limit = false;
         self.continued = false;
+        self.deadline = None;
         self.state.consumed = 0;
         self.state.req_end = None;
         self.state.phase = Phase::Idle;
@@ -417,6 +451,7 @@ impl Conn {
 enum Record {
     Accepted(Token, Peer),
     Connected(Token),
+    RequestFailed(Token, RequestFailure),
     Disconnected(Token),
 }
 
@@ -442,6 +477,10 @@ enum Step {
         status: u16,
         reason: Range<usize>,
         body: Body,
+    },
+    RequestFailed {
+        token: Token,
+        reason: RequestFailure,
     },
     Disconnected {
         token: Token,
@@ -571,6 +610,7 @@ impl HttpService {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
+        let timeout = self.config.request_timeout;
         if !valid_token(method) ||
             path.is_empty() ||
             path.contains(['\r', '\n', ' ']) ||
@@ -608,6 +648,9 @@ impl HttpService {
         });
         if sent {
             set_outbound_method(&mut conn.role, Some(method.to_owned()));
+            // The clock runs from here, not from the last byte reaching the
+            // wire: a request queued behind a backlog is already waiting.
+            conn.deadline = timeout.map(|timeout| Instant::now() + timeout);
         }
         sent
     }
@@ -647,6 +690,9 @@ impl HttpService {
         match self.plan(net)? {
             Step::Accepted { token, peer } => Some(HttpEvent::Accepted { token, peer }),
             Step::Connected { token } => Some(HttpEvent::Connected { token }),
+            Step::RequestFailed { token, reason } => {
+                Some(HttpEvent::RequestFailed { token, reason })
+            }
             Step::Disconnected { token } => Some(HttpEvent::Disconnected { token }),
             Step::Request { index, method, path, version, body } => {
                 let token = self.conns[index].token;
@@ -730,6 +776,10 @@ impl HttpService {
                     Record::Connected(token) => {
                         self.take_record();
                         return Some(Step::Connected { token })
+                    }
+                    Record::RequestFailed(token, reason) => {
+                        self.take_record();
+                        return Some(Step::RequestFailed { token, reason })
                     }
                     Record::Disconnected(token) => {
                         if let Some(index) = self.index_of(token) {
@@ -878,18 +928,33 @@ impl HttpService {
             outbound_method(&self.conns[index].role)?;
             self.conns[index].reclaim();
             match self.parse_response(index) {
+                ResponsePlan::Incomplete if !at_eof => return None,
+                // The stream ended: what is buffered is either a response the
+                // close delimits or a request nothing will ever answer.
                 ResponsePlan::Incomplete => {
-                    return at_eof.then(|| self.plan_eof_response(index)).flatten()
+                    return Some(match self.plan_eof_response(index) {
+                        Ok(Some(step)) => step,
+                        Ok(None) => {
+                            let token = self.abandon_request(index);
+                            Step::RequestFailed { token, reason: RequestFailure::Disconnected }
+                        }
+                        Err(reason) => {
+                            let token = self.abandon_request(index);
+                            Step::RequestFailed { token, reason }
+                        }
+                    })
                 }
-                ResponsePlan::Fail => {
+                ResponsePlan::Fail { reason } => {
+                    let token = self.conns[index].token;
                     self.fail_outbound(net, index);
-                    return None
+                    return Some(Step::RequestFailed { token, reason })
                 }
                 ResponsePlan::Informational { end } => self.conns[index].state.consumed = end,
                 ResponsePlan::Ready { version, status, reason, body, end, close } => {
                     let token = self.conns[index].token;
                     let conn = &mut self.conns[index];
                     conn.state.consumed = end;
+                    conn.deadline = None;
                     set_outbound_method(&mut conn.role, None);
                     if close {
                         net.disconnect(token);
@@ -910,16 +975,22 @@ impl HttpService {
         }
         let mut scratch = vec![httparse::EMPTY_HEADER; config.max_headers];
         let mut response = httparse::Response::new(&mut scratch);
-        let Ok(status) = response.parse(buffer) else { return ResponsePlan::Fail };
+        let Ok(status) = response.parse(buffer) else { return malformed() };
         let httparse::Status::Complete(head) = status else {
             // A partial parse means every buffered byte is still head bytes.
-            if !crlf_only(buffer) || buffer.len() > config.max_head_bytes {
-                return ResponsePlan::Fail
+            if !crlf_only(buffer) {
+                return malformed()
+            }
+            if buffer.len() > config.max_head_bytes {
+                return too_large()
             }
             return ResponsePlan::Incomplete
         };
-        if !crlf_only(&buffer[..head]) || head > config.max_head_bytes {
-            return ResponsePlan::Fail
+        if !crlf_only(&buffer[..head]) {
+            return malformed()
+        }
+        if head > config.max_head_bytes {
+            return too_large()
         }
         let code = response.code.unwrap_or(0);
         let no_body = outbound_method(&conn.role).map(String::as_str) == Some("HEAD") ||
@@ -929,11 +1000,14 @@ impl HttpService {
         if code == 101 ||
             matches!(content_length, ContentLength::Invalid) ||
             chunked.is_none() ||
-            (chunked == Some(true) && !matches!(content_length, ContentLength::Absent)) ||
-            (!no_body &&
-                matches!(content_length, ContentLength::Present(length) if length > config.max_body_bytes))
+            (chunked == Some(true) && !matches!(content_length, ContentLength::Absent))
         {
-            return ResponsePlan::Fail
+            return malformed()
+        }
+        if !no_body &&
+            matches!(content_length, ContentLength::Present(length) if length > config.max_body_bytes)
+        {
+            return too_large()
         }
         let (end, body) = if no_body {
             (head, Body::Buffer(base + head..base + head))
@@ -945,14 +1019,14 @@ impl HttpService {
                 decoded,
             ) {
                 Ok(Some(consumed)) => {
-                    let Some(end) = head.checked_add(consumed) else { return ResponsePlan::Fail };
+                    let Some(end) = head.checked_add(consumed) else { return malformed() };
                     (end, Body::Decoded)
                 }
                 Ok(None) => return ResponsePlan::Incomplete,
-                Err(()) => return ResponsePlan::Fail,
+                Err(reason) => return ResponsePlan::Fail { reason },
             }
         } else if let ContentLength::Present(length) = content_length {
-            let Some(end) = head.checked_add(length) else { return ResponsePlan::Fail };
+            let Some(end) = head.checked_add(length) else { return malformed() };
             if buffer.len() < end {
                 return ResponsePlan::Incomplete
             }
@@ -983,8 +1057,9 @@ impl HttpService {
         }
     }
 
-    /// Parses a response whose body the closing connection delimits.
-    fn plan_eof_response(&mut self, index: usize) -> Option<Step> {
+    /// Parses a response whose body the closing connection delimits,
+    /// reporting a cap it broke rather than a head it could not complete.
+    fn plan_eof_response(&mut self, index: usize) -> Result<Option<Step>, RequestFailure> {
         let plan = {
             let Self { conns, headers, config, .. } = self;
             let conn = &conns[index];
@@ -992,19 +1067,23 @@ impl HttpService {
             let buffer = &conn.buffer[base..];
             let mut scratch = vec![httparse::EMPTY_HEADER; config.max_headers];
             let mut response = httparse::Response::new(&mut scratch);
-            let Ok(httparse::Status::Complete(head)) = response.parse(buffer) else { return None };
+            let Ok(httparse::Status::Complete(head)) = response.parse(buffer) else {
+                return Ok(None)
+            };
             if !crlf_only(&buffer[..head]) || head > config.max_head_bytes {
-                return None
+                return Ok(None)
             }
             let code = response.code.unwrap_or(0);
             let no_body = outbound_method(&conn.role).map(String::as_str) == Some("HEAD") ||
                 matches!(code, 100..=199 | 204 | 304);
             if no_body ||
                 transfer_chunked(response.headers) != Some(false) ||
-                !matches!(response_content_length(response.headers), ContentLength::Absent) ||
-                buffer.len() - head > config.max_body_bytes
+                !matches!(response_content_length(response.headers), ContentLength::Absent)
             {
-                return None
+                return Ok(None)
+            }
+            if buffer.len() - head > config.max_body_bytes {
+                return Err(RequestFailure::TooLarge)
             }
             headers.clear();
             for header in response.headers.iter() {
@@ -1023,8 +1102,17 @@ impl HttpService {
         };
         let conn = &mut self.conns[index];
         conn.state.consumed = conn.buffer.len();
+        conn.deadline = None;
         set_outbound_method(&mut conn.role, None);
-        Some(plan)
+        Ok(Some(plan))
+    }
+
+    /// Gives up on the request in flight, so nothing answers or fails it
+    /// twice.
+    fn abandon_request(&mut self, index: usize) -> Token {
+        self.conns[index].deadline = None;
+        set_outbound_method(&mut self.conns[index].role, None);
+        self.conns[index].token
     }
 
     /// Answers a request the service itself rejected, and closes after it.
@@ -1151,6 +1239,13 @@ impl private::ServiceDriver for HttpService {
             StreamEvent::Connected { token, .. } => self.records.push(Record::Connected(token)),
             StreamEvent::Message { token, payload, .. } => self.buffer(token, payload),
             StreamEvent::Disconnected { token, .. } => {
+                // Whether the close delimited a response or lost the request
+                // is the pull's to say, from what the connection buffered;
+                // the deadline is over either way, and a failure queued
+                // behind this record would reach the caller out of order.
+                if let Some(index) = self.index_of(token) {
+                    self.conns[index].deadline = None;
+                }
                 self.records.push(Record::Disconnected(token));
             }
         }
@@ -1197,6 +1292,17 @@ impl private::ServiceDriver for HttpService {
                 }
             }
         }
+        for index in 0..self.conns.len() {
+            if self.conns[index].deadline.is_none_or(|deadline| now < deadline) {
+                continue
+            }
+            // A late answer would arrive against a request nothing is waiting
+            // for, so the connection goes with the deadline. The endpoint
+            // reconnects at its group's interval.
+            let token = self.abandon_request(index);
+            self.records.push(Record::RequestFailed(token, RequestFailure::Timeout));
+            net.disconnect(token);
+        }
         if let Some(linger) = self.config.linger {
             for conn in &self.conns {
                 if let Phase::Lingering { since, last_inbound } = conn.state.phase &&
@@ -1214,6 +1320,7 @@ impl private::ServiceDriver for HttpService {
         let mut next: Option<Instant> = None;
         for conn in &self.conns {
             if !matches!(conn.role, Role::Accepted) {
+                next = fold(next, conn.deadline);
                 continue
             }
             let at = match conn.state.phase {
@@ -1223,12 +1330,17 @@ impl private::ServiceDriver for HttpService {
                     .map(|linger| (last_inbound + linger.idle).min(since + linger.total)),
                 _ => self.config.idle_timeout.map(|timeout| conn.last_activity + timeout),
             };
-            next = match (next, at) {
-                (Some(next), Some(at)) => Some(next.min(at)),
-                (next, at) => next.or(at),
-            };
+            next = fold(next, at);
         }
         next
+    }
+}
+
+/// The earlier of two deadlines, either of which may be absent.
+fn fold(next: Option<Instant>, at: Option<Instant>) -> Option<Instant> {
+    match (next, at) {
+        (Some(next), Some(at)) => Some(next.min(at)),
+        (next, at) => next.or(at),
     }
 }
 
@@ -1255,8 +1367,10 @@ enum RequestPlan {
 enum ResponsePlan {
     /// Not all of it has arrived.
     Incomplete,
-    /// The peer broke the protocol.
-    Fail,
+    /// The request it answers fails, for this reason.
+    Fail {
+        reason: RequestFailure,
+    },
     /// An informational response, consumed without an event.
     Informational {
         end: usize,
@@ -1269,6 +1383,14 @@ enum ResponsePlan {
         end: usize,
         close: bool,
     },
+}
+
+fn malformed() -> ResponsePlan {
+    ResponsePlan::Fail { reason: RequestFailure::Malformed }
+}
+
+fn too_large() -> ResponsePlan {
+    ResponsePlan::Fail { reason: RequestFailure::TooLarge }
 }
 
 /// Writes one response for a pending request and moves the connection on.
@@ -1473,7 +1595,7 @@ fn decode_chunked(
     max_body_bytes: usize,
     max_headers: usize,
     out: &mut Vec<u8>,
-) -> Result<Option<usize>, ()> {
+) -> Result<Option<usize>, RequestFailure> {
     let Some((end, body_len)) = chunked_end(bytes, max_body_bytes, max_headers)? else {
         return Ok(None)
     };
@@ -1482,54 +1604,55 @@ fn decode_chunked(
     let mut at = 0;
     while at < end {
         let httparse::Status::Complete((consumed, size)) =
-            httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
+            httparse::parse_chunk_size(&bytes[at..]).map_err(|_| RequestFailure::Malformed)?
         else {
-            return Err(())
+            return Err(RequestFailure::Malformed)
         };
-        at = at.checked_add(consumed).ok_or(())?;
-        let size = usize::try_from(size).map_err(|_| ())?;
+        at = at.checked_add(consumed).ok_or(RequestFailure::Malformed)?;
+        let size = usize::try_from(size).map_err(|_| RequestFailure::Malformed)?;
         if size == 0 {
             return Ok(Some(end))
         }
         out.extend_from_slice(&bytes[at..at + size]);
-        at = at.checked_add(size + 2).ok_or(())?;
+        at = at.checked_add(size + 2).ok_or(RequestFailure::Malformed)?;
     }
-    Err(())
+    Err(RequestFailure::Malformed)
 }
 
 fn chunked_end(
     bytes: &[u8],
     max_body_bytes: usize,
     max_headers: usize,
-) -> Result<Option<(usize, usize)>, ()> {
+) -> Result<Option<(usize, usize)>, RequestFailure> {
     let mut at = 0;
     let mut body_len = 0;
     loop {
         let httparse::Status::Complete((consumed, size)) =
-            httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
+            httparse::parse_chunk_size(&bytes[at..]).map_err(|_| RequestFailure::Malformed)?
         else {
             return Ok(None)
         };
-        let size = usize::try_from(size).map_err(|_| ())?;
+        let size = usize::try_from(size).map_err(|_| RequestFailure::Malformed)?;
         if size > max_body_bytes.saturating_sub(body_len) {
-            return Err(())
+            return Err(RequestFailure::TooLarge)
         }
-        at = at.checked_add(consumed).ok_or(())?;
+        at = at.checked_add(consumed).ok_or(RequestFailure::Malformed)?;
         if size == 0 {
             let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
             let httparse::Status::Complete((consumed, _)) =
-                httparse::parse_headers(&bytes[at..], &mut headers).map_err(|_| ())?
+                httparse::parse_headers(&bytes[at..], &mut headers)
+                    .map_err(|_| RequestFailure::Malformed)?
             else {
                 return Ok(None)
             };
-            let end = at.checked_add(consumed).ok_or(())?;
+            let end = at.checked_add(consumed).ok_or(RequestFailure::Malformed)?;
             if !crlf_only(&bytes[at..end]) {
-                return Err(())
+                return Err(RequestFailure::Malformed)
             }
             return Ok(Some((end, body_len)))
         }
         let Some(chunk_end) = at.checked_add(size).and_then(|at| at.checked_add(2)) else {
-            return Err(())
+            return Err(RequestFailure::Malformed)
         };
         if bytes.len() < chunk_end || &bytes[at + size..chunk_end] != b"\r\n" {
             return Ok(None)
