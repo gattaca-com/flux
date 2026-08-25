@@ -22,12 +22,6 @@ impl Endpoint {
     }
 }
 
-impl From<SocketAddr> for Endpoint {
-    fn from(addr: SocketAddr) -> Self {
-        Self::Tcp(addr)
-    }
-}
-
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
