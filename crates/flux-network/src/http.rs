@@ -222,7 +222,7 @@ impl<'a> HttpResponse<'a> {
 
 /// The means to answer one request, scoped to its connection.
 ///
-/// Responding consumes the responder, so a request is answered exactly once.
+/// A request can be answered once, inline or later by token.
 #[must_use = "respond now, or drop it to answer later with HttpService::respond; a request never \
               answered is closed by the idle sweep"]
 pub struct Responder<'a> {
@@ -553,10 +553,8 @@ impl HttpService {
     /// Answers a request whose [`Responder`] was dropped, and returns whether
     /// the response was written.
     ///
-    /// Each call completes exactly one request for `token`.
-    ///
     /// Unlike [`Responder::respond`], this path holds no event borrow, so it
-    /// reclaims answered bytes and queues a pipelined request before returning.
+    /// reclaims answered bytes and requeues the connection before returning.
     pub fn respond(
         &mut self,
         net: &mut StreamNetwork,
@@ -629,22 +627,6 @@ impl HttpService {
                 Some(HttpEvent::Response { token, response })
             }
         }
-    }
-
-    /// Where a connection has parsed and answered up to: `start`, `consumed`
-    /// and `req_end`.
-    #[doc(hidden)]
-    pub fn cursors(&self, token: Token) -> Option<(usize, usize, Option<usize>)> {
-        self.index_of(token).map(|index| {
-            let conn = &self.conns[index];
-            (conn.start, conn.state.consumed, conn.state.req_end)
-        })
-    }
-
-    /// Connections queued as ready to parse.
-    #[doc(hidden)]
-    pub fn ready_len(&self) -> usize {
-        self.ready.len() - self.ready_cursor
     }
 
     /// Applies bookkeeping deferred by the last pulled event.
@@ -1450,7 +1432,18 @@ pub fn reason_phrase(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpRequest, span};
+    use std::{
+        io::Write as _,
+        net::{Ipv4Addr, SocketAddr, TcpStream},
+    };
+
+    use flux_timing::Duration;
+    use mio::Token;
+
+    use super::{Conn, HttpConfig, HttpEvent, HttpRequest, HttpService, Phase, Role, span};
+    use crate::stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork};
+
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[test]
     fn header_lookup_is_case_insensitive() {
@@ -1475,5 +1468,242 @@ mod tests {
         assert_eq!(span(buffer, &buffer[4..9], 0), 4..9);
         assert_eq!(span(buffer, &buffer[4..9], 100), 104..109);
         assert_eq!(span(buffer, b"", 7), 7..7);
+    }
+
+    fn unused_addr() -> SocketAddr {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    /// A service on a raw group of its own, with no listener and no
+    /// connections.
+    fn bare_service(net: &mut StreamNetwork) -> HttpService {
+        let group = net.add_group(ConnectionGroupConfig {
+            name: "http",
+            framing: Framing::Raw,
+            ..ConnectionGroupConfig::default()
+        });
+        HttpService::new(net, group, HttpConfig::default())
+    }
+
+    /// A request of exactly `size` bytes, padded out with a header.
+    fn padded_request(path: &str, size: usize) -> Vec<u8> {
+        let bare = format!("GET {path} HTTP/1.1\r\nX-Pad: \r\n\r\n");
+        let pad = size.checked_sub(bare.len()).expect("the request outgrew its size");
+        let request = format!("GET {path} HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "p".repeat(pad));
+        assert_eq!(request.len(), size);
+        request.into_bytes()
+    }
+
+    /// A connection holding `len` buffered bytes, answered up to `consumed`.
+    fn buffered_conn(len: usize, consumed: usize, req_end: Option<usize>) -> Conn {
+        let mut conn = Conn::new(Token(1), Role::Accepted);
+        conn.buffer = vec![b'x'; len];
+        conn.state.consumed = consumed;
+        conn.state.req_end = req_end;
+        conn
+    }
+
+    #[test]
+    fn an_answered_prefix_is_dropped_once_it_is_half_the_buffer() {
+        // Under half, the cursor moves onto the answered bytes and they stay.
+        let mut conn = buffered_conn(100, 40, Some(90));
+        conn.reclaim();
+        assert_eq!((conn.start, conn.state.consumed, conn.state.req_end), (40, 40, Some(90)));
+        assert_eq!(conn.buffer.len(), 100);
+        assert_eq!(conn.unconsumed(), 60);
+
+        // Half or more, the prefix goes and every cursor comes down with it.
+        let mut conn = buffered_conn(100, 60, Some(90));
+        conn.reclaim();
+        assert_eq!((conn.start, conn.state.consumed, conn.state.req_end), (0, 0, Some(30)));
+        assert_eq!(conn.buffer.len(), 40);
+        assert_eq!(conn.unconsumed(), 40);
+    }
+
+    #[test]
+    fn a_compaction_rebases_every_cursor() {
+        let mut conn = buffered_conn(200, 128, Some(160));
+        conn.buffer[128..].fill(b'y');
+        conn.start = 128;
+        conn.compact();
+        assert_eq!(conn.start, 0);
+        assert_eq!(conn.state.consumed, 0);
+        assert_eq!(conn.state.req_end, Some(32), "the pending request moved with the buffer");
+        assert_eq!(conn.buffer, vec![b'y'; 72], "the answered prefix is what went");
+    }
+
+    #[test]
+    fn a_ready_connection_is_queued_once() {
+        let mut net = StreamNetwork::default();
+        let mut http = bare_service(&mut net);
+        http.conns.push(Conn::new(Token(1), Role::Accepted));
+
+        http.mark_ready(0);
+        http.mark_ready(0);
+        assert_eq!(http.ready, [Token(1)], "one entry however many reads arrive");
+        assert!(http.conns[0].ready);
+
+        // Taking it off the queue frees it to be queued by the next read.
+        assert_eq!(http.pop_ready(), Some(0));
+        assert!(!http.conns[0].ready);
+        http.mark_ready(0);
+        assert_eq!(http.ready, [Token(1)]);
+    }
+
+    #[test]
+    fn a_connection_owing_a_response_is_never_queued() {
+        let mut net = StreamNetwork::default();
+        let mut http = bare_service(&mut net);
+        let mut conn = Conn::new(Token(1), Role::Accepted);
+        conn.state.phase = Phase::Pending;
+        http.conns.push(conn);
+
+        http.mark_ready(0);
+        assert!(http.ready.is_empty());
+        assert!(!http.conns[0].ready);
+
+        // The answer frees it to parse the request pipelined behind it.
+        http.conns[0].state.phase = Phase::Idle;
+        http.mark_ready(0);
+        assert_eq!(http.ready, [Token(1)]);
+    }
+
+    /// A service listening on loopback with one client connected to it, for
+    /// the tests that need a connection to answer on.
+    struct Harness {
+        net: StreamNetwork,
+        http: HttpService,
+        /// The client end, held open for as long as the harness lives.
+        _client: TcpStream,
+    }
+
+    impl Harness {
+        /// A service holding two pipelined requests, the second of them the
+        /// larger: an answered first request is then under half the buffer,
+        /// where reclaiming it moves the cursor without moving the bytes.
+        fn with_two_requests() -> (Self, usize) {
+            let mut net = StreamNetwork::default();
+            let mut http = bare_service(&mut net);
+            let addr = unused_addr();
+            http.listen(&mut net, Endpoint::Tcp(addr)).unwrap();
+            let mut client = TcpStream::connect(addr).unwrap();
+            let first = padded_request("/one", 64);
+            client.write_all(&[first.clone(), padded_request("/two", 192)].concat()).unwrap();
+            (Self { net, http, _client: client }, first.len())
+        }
+
+        fn drive(&mut self) -> bool {
+            self.net.drive(Some(Duration::ZERO), &mut [self.http.as_service()], |_| {})
+        }
+
+        /// Drives until a request is delivered and reports its token,
+        /// answering it through the responder it came with when `inline`.
+        fn pull_request(&mut self, inline: bool) -> Token {
+            let deadline = std::time::Instant::now() + PATIENCE;
+            while std::time::Instant::now() < deadline {
+                self.drive();
+                while let Some(event) = self.http.next_event(&mut self.net) {
+                    if let HttpEvent::Request { token, responder, .. } = event {
+                        if inline {
+                            assert!(responder.respond(200, &[], b""));
+                        }
+                        return token
+                    }
+                }
+            }
+            panic!("no request arrived")
+        }
+
+        /// Pulls one event with no driver call before it, which is what the
+        /// reclaim-timing tests are about.
+        fn pull_without_driving(&mut self) -> bool {
+            self.http.next_event(&mut self.net).is_some()
+        }
+
+        fn respond(&mut self, token: Token) -> bool {
+            self.http.respond(&mut self.net, token, 200, &[], b"")
+        }
+
+        /// Where a connection has parsed and answered up to: `start`,
+        /// `consumed` and `req_end`.
+        fn cursors(&self, token: Token) -> (usize, usize, Option<usize>) {
+            let index = self.http.index_of(token).expect("the connection went");
+            let conn = &self.http.conns[index];
+            (conn.start, conn.state.consumed, conn.state.req_end)
+        }
+
+        /// Connections queued as ready to parse.
+        fn queued(&self) -> usize {
+            self.http.ready.len() - self.http.ready_cursor
+        }
+    }
+
+    #[test]
+    fn an_inline_answer_reclaims_at_the_next_pull() {
+        let (mut harness, first) = Harness::with_two_requests();
+        let token = harness.pull_request(true);
+
+        // The event borrowed the connection, so the answer moved `consumed`
+        // and nothing else: `start` sits where the parse left it, and the
+        // connection stays out of the ready queue.
+        assert_eq!(harness.cursors(token), (0, first, None));
+        assert_eq!(harness.queued(), 0);
+
+        assert!(harness.pull_without_driving(), "the pipelined request is delivered");
+        let (start, consumed, _) = harness.cursors(token);
+        assert_eq!(start, consumed, "the pull reclaimed what the answer consumed");
+        assert_eq!(start, first, "the pipelined request holds off the compaction");
+    }
+
+    #[test]
+    fn an_inline_answer_reclaims_at_the_next_drive() {
+        let (mut harness, first) = Harness::with_two_requests();
+        let token = harness.pull_request(true);
+        assert_eq!(harness.cursors(token), (0, first, None));
+
+        harness.drive();
+        let (start, consumed, _) = harness.cursors(token);
+        assert_eq!(start, consumed, "the tick reclaimed what the answer consumed");
+        assert_eq!(start, first, "the pipelined request holds off the compaction");
+        assert_eq!(harness.queued(), 1, "and queued the request behind it");
+    }
+
+    #[test]
+    fn a_by_token_answer_reclaims_before_it_returns() {
+        let (mut harness, first) = Harness::with_two_requests();
+        let token = harness.pull_request(false);
+        assert_eq!(harness.cursors(token), (0, 0, Some(first)));
+        assert_eq!(harness.queued(), 0);
+
+        // Nothing borrows the connection, so the answer reclaims and queues
+        // with no driver call in between.
+        assert!(harness.respond(token));
+        assert_eq!(harness.cursors(token), (first, first, None));
+        assert_eq!(harness.queued(), 1, "the pipelined request is queued at once");
+
+        // A request is answered once, and the refusal consumes nothing.
+        assert!(!harness.respond(token));
+        assert_eq!(harness.cursors(token), (first, first, None));
+    }
+
+    /// Serves two pipelined requests, answering the first inline or by token,
+    /// and reports the cursors left once the second has been pulled.
+    fn cursors_after_two_requests(inline: bool) -> (usize, usize, Option<usize>) {
+        let (mut harness, _) = Harness::with_two_requests();
+        let first = harness.pull_request(inline);
+        if !inline {
+            assert!(harness.respond(first));
+        }
+        let second = harness.pull_request(false);
+        assert_eq!(second, first, "both requests came in on one connection");
+        harness.cursors(second)
+    }
+
+    #[test]
+    fn both_answer_paths_leave_the_same_cursors() {
+        assert_eq!(cursors_after_two_requests(true), cursors_after_two_requests(false));
     }
 }
