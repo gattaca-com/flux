@@ -975,10 +975,14 @@ fn idle_timeout_disconnects() {
 }
 
 #[test]
-fn pending_buffer_cap_disconnects() {
+fn pending_buffer_cap_waits_for_the_answer() {
     let addr = unused_addr();
-    let mut server =
-        Http::with_config(HttpConfig::default().with_max_head_bytes(64).with_max_body_bytes(64));
+    let mut server = Http::with_config(
+        HttpConfig::default()
+            .with_max_head_bytes(64)
+            .with_max_body_bytes(64)
+            .with_idle_timeout(Duration::from_millis(200).into()),
+    );
     server.listen(&Endpoint::Tcp(addr));
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -991,7 +995,19 @@ fn pending_buffer_cap_disconnects() {
     }
     assert!(accepted);
     client.write_all(&[b'x'; 129]).unwrap();
+
+    // The bytes over the limit are no verdict on a request already
+    // delivered: the connection holds while the answer is produced.
     let mut received = Vec::new();
+    let waiting = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < waiting {
+        server.pump(|_| {});
+        assert!(!read_available(&mut client, &mut received), "the pending request was abandoned");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // An answer that never arrives leaves the sweep to close it, as it
+    // closes any request left pending.
     let mut closed = false;
     while Instant::now() < deadline && !closed {
         server.pump(|_| {});

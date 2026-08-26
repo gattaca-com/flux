@@ -65,6 +65,22 @@
 //! connection serves no further request until it is answered, and a request
 //! never answered is closed by the idle sweep.
 //!
+//! # Closing a connection
+//! A response that closes its connection ends it in one of two ways. When the
+//! service read the request stream as far as the request it is answering, the
+//! connection *drains*: it closes as soon as the response reaches the wire.
+//! When it did not — every status the service raises itself (`400`, `413`,
+//! `431`, `501`) rejects a request mid-stream, and a connection over its
+//! buffer limit holds bytes nothing will ever read — the connection *lingers*
+//! instead: its write side shuts once the response drains, so the peer reads
+//! the answer and then the end of the stream, while what it is still sending
+//! is read and discarded until it stops for [`Linger::idle`], until the
+//! linger has run for [`Linger::total`], or until it closes. A client whose
+//! upload meets a reset before it has read the reply reports a server that is
+//! down rather than the status it was sent; lingering is what puts a
+//! delivered `400` or `413` in front of it instead. [`HttpConfig::linger`]
+//! sets the caps, and `None` drains every closing response.
+//!
 //! # Limitations
 //! HTTP/1.1 and HTTP/1.0 responses are supported. Request bodies require
 //! `Content-Length`; chunked requests are rejected with `501`. Response bodies
@@ -72,10 +88,8 @@
 //! `Expect: 100-continue` is handled automatically.
 //!
 //! TLS, HTTP/2, compression, trailer exposure, upgrades, and `WebSockets` are
-//! not supported. Valid response trailers are parsed and discarded. There is no
-//! half-close support. After an error response, the connection closes without a
-//! lingering-close delay. Pipelined requests are served strictly one at a time
-//! per connection.
+//! not supported. Valid response trailers are parsed and discarded. Pipelined
+//! requests are served strictly one at a time per connection.
 
 use std::{
     io::{self, Write as _},
@@ -102,6 +116,10 @@ pub struct HttpConfig {
     /// How long an accepted connection may sit without inbound bytes before
     /// it is closed. Outbound endpoints stay connected.
     pub idle_timeout: Option<Duration>,
+    /// The caps a connection lingers under after a response that ends a
+    /// request stream the service never read to its end; `None` closes such a
+    /// connection as soon as the response is written, as it does any other.
+    pub linger: Option<Linger>,
 }
 
 impl Default for HttpConfig {
@@ -111,7 +129,26 @@ impl Default for HttpConfig {
             max_body_bytes: 1024 * 1024,
             max_headers: 64,
             idle_timeout: Some(Duration::from_secs(30)),
+            linger: Some(Linger::default()),
         }
+    }
+}
+
+/// How long a lingering connection reads and discards before it closes.
+///
+/// The idle cap ends a peer that stops sending, the total cap one that never
+/// does.
+#[derive(Clone, Copy, Debug)]
+pub struct Linger {
+    /// How long the connection may go without inbound bytes.
+    pub idle: Duration,
+    /// How long the connection may linger, however much it sends.
+    pub total: Duration,
+}
+
+impl Default for Linger {
+    fn default() -> Self {
+        Self { idle: Duration::from_secs(5), total: Duration::from_secs(30) }
     }
 }
 
@@ -143,6 +180,19 @@ impl HttpConfig {
     /// Disables the idle connection sweep.
     pub fn without_idle_timeout(mut self) -> Self {
         self.idle_timeout = None;
+        self
+    }
+
+    /// Sets the caps a lingering connection closes under.
+    pub fn with_linger(mut self, linger: Linger) -> Self {
+        self.linger = Some(linger);
+        self
+    }
+
+    /// Closes every connection as soon as its response is written, with no
+    /// lingering close.
+    pub fn without_linger(mut self) -> Self {
+        self.linger = None;
         self
     }
 
@@ -229,6 +279,7 @@ pub struct Responder<'a> {
     net: &'a mut StreamNetwork,
     state: &'a mut ConnState,
     token: Token,
+    linger: Option<Linger>,
 }
 
 impl Responder<'_> {
@@ -242,7 +293,7 @@ impl Responder<'_> {
     /// are reclaimed on the next pull or network tick, after the event's
     /// borrow ends. [`HttpService::respond`] reclaims before it returns.
     pub fn respond(self, status: u16, headers: &[(&str, &str)], body: &[u8]) -> bool {
-        respond_to(self.net, self.state, self.token, status, headers, body)
+        respond_to(self.net, self.state, self.token, status, headers, body, self.linger)
     }
 }
 
@@ -254,6 +305,10 @@ struct ConnState {
     phase: Phase,
     close: bool,
     head_request: bool,
+    /// Whether the request stream was cut short of what the connection owes
+    /// its next response: what a closing response makes the peer read before
+    /// the end of the stream rather than through a reset.
+    framing_lost: bool,
     req_end: Option<usize>,
     consumed: usize,
 }
@@ -264,8 +319,13 @@ enum Phase {
     Idle,
     /// A request was delivered and its response is outstanding.
     Pending,
-    /// Answered with a close; the connection goes once its bytes are written.
+    /// Answered with a close over a request stream read to its end; the
+    /// connection goes once its bytes are written.
     Draining,
+    /// Answered with a close over a request stream cut short: the write side
+    /// shuts once the response is written, and what the peer sends is read
+    /// and discarded until a cap or the peer itself ends the connection.
+    Lingering { since: Instant, last_inbound: Instant },
 }
 
 enum Role {
@@ -303,6 +363,7 @@ impl Conn {
                 phase: Phase::Idle,
                 close: false,
                 head_request: false,
+                framing_lost: false,
                 req_end: None,
                 consumed: 0,
             },
@@ -342,6 +403,7 @@ impl Conn {
         self.state.req_end = None;
         self.state.phase = Phase::Idle;
         self.state.close = false;
+        self.state.framing_lost = false;
     }
 
     /// Bytes counted against the connection's limits.
@@ -567,7 +629,8 @@ impl HttpService {
         if !matches!(self.conns[index].role, Role::Accepted) {
             return false
         }
-        if !respond_to(net, &mut self.conns[index].state, token, status, headers, body) {
+        let linger = self.config.linger;
+        if !respond_to(net, &mut self.conns[index].state, token, status, headers, body, linger) {
             return false
         }
         self.reclaim(index);
@@ -587,6 +650,7 @@ impl HttpService {
             Step::Disconnected { token } => Some(HttpEvent::Disconnected { token }),
             Step::Request { index, method, path, version, body } => {
                 let token = self.conns[index].token;
+                let linger = self.config.linger;
                 self.last = Some(token);
                 let Self { conns, headers, .. } = self;
                 let headers: &[HeaderRange] = headers;
@@ -603,7 +667,7 @@ impl HttpService {
                 Some(HttpEvent::Request {
                     token,
                     request,
-                    responder: Responder { net, state, token },
+                    responder: Responder { net, state, token, linger },
                 })
             }
             Step::Response { index, version, status, reason, body } => {
@@ -627,6 +691,12 @@ impl HttpService {
                 Some(HttpEvent::Response { token, response })
             }
         }
+    }
+
+    /// How many bytes a connection holds unparsed and unreclaimed.
+    #[doc(hidden)]
+    pub fn buffered(&self, token: Token) -> Option<usize> {
+        self.index_of(token).map(|index| self.conns[index].buffer.len())
     }
 
     /// Applies bookkeeping deferred by the last pulled event.
@@ -960,11 +1030,15 @@ impl HttpService {
     /// Answers a request the service itself rejected, and closes after it.
     fn error(&mut self, net: &mut StreamNetwork, index: usize, status: u16) {
         let token = self.conns[index].token;
+        let linger = self.config.linger;
         let state = &mut self.conns[index].state;
         state.phase = Phase::Pending;
         state.close = true;
         state.head_request = false;
-        respond_to(net, state, token, status, &[], &[]);
+        // The request this answers was never read to its end, whether it was
+        // unparseable, too large, or framed in a way the service refuses.
+        state.framing_lost = true;
+        respond_to(net, state, token, status, &[], &[], linger);
     }
 
     /// Drops an outbound connection whose peer broke the protocol.
@@ -1031,6 +1105,13 @@ impl HttpService {
         let limit = self.config.buffer_limit();
         let Some(index) = self.index_of(token) else { return };
         let conn = &mut self.conns[index];
+        // A lingering connection reads its peer out rather than resetting it,
+        // and owes an answer to nothing it reads: the bytes are dropped where
+        // they arrive, and only the moment they arrived is kept.
+        if let Phase::Lingering { last_inbound, .. } = &mut conn.state.phase {
+            *last_inbound = Instant::now();
+            return
+        }
         if conn.state.phase == Phase::Draining || conn.over_limit {
             return
         }
@@ -1083,15 +1164,44 @@ impl private::ServiceDriver for HttpService {
             // A connection queued as ready is answered first: the bytes over
             // the limit may be the ones that complete a request the service
             // rejects with a status of its own.
-            if conn.over_limit && !conn.ready && conn.state.phase != Phase::Draining {
-                self.conns[index].over_limit = false;
-                net.disconnect(self.conns[index].token);
+            if !conn.over_limit || conn.ready {
+                continue
+            }
+            match conn.state.phase {
+                // A full buffer is no verdict on a request already delivered.
+                // The response the caller is producing still goes out, and
+                // takes the connection into its lingering close: the bytes
+                // dropped at the limit are the ones that would have completed
+                // whatever the peer is sending next.
+                Phase::Pending => {
+                    let state = &mut self.conns[index].state;
+                    state.close = true;
+                    state.framing_lost = true;
+                }
+                Phase::Idle => {
+                    self.conns[index].over_limit = false;
+                    net.disconnect(self.conns[index].token);
+                }
+                Phase::Draining | Phase::Lingering { .. } => {}
             }
         }
         if let Some(timeout) = self.config.idle_timeout {
             for conn in &self.conns {
+                // A lingering connection answers to the linger's caps alone,
+                // which are what an idle one costs while it is closing.
                 if matches!(conn.role, Role::Accepted) &&
+                    !matches!(conn.state.phase, Phase::Lingering { .. }) &&
                     now.saturating_sub(conn.last_activity) >= timeout
+                {
+                    net.disconnect(conn.token);
+                }
+            }
+        }
+        if let Some(linger) = self.config.linger {
+            for conn in &self.conns {
+                if let Phase::Lingering { since, last_inbound } = conn.state.phase &&
+                    (now.saturating_sub(last_inbound) >= linger.idle ||
+                        now.saturating_sub(since) >= linger.total)
                 {
                     net.disconnect(conn.token);
                 }
@@ -1101,12 +1211,24 @@ impl private::ServiceDriver for HttpService {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        let timeout = self.config.idle_timeout?;
-        self.conns
-            .iter()
-            .filter(|conn| matches!(conn.role, Role::Accepted))
-            .map(|conn| conn.last_activity + timeout)
-            .min()
+        let mut next: Option<Instant> = None;
+        for conn in &self.conns {
+            if !matches!(conn.role, Role::Accepted) {
+                continue
+            }
+            let at = match conn.state.phase {
+                Phase::Lingering { since, last_inbound } => self
+                    .config
+                    .linger
+                    .map(|linger| (last_inbound + linger.idle).min(since + linger.total)),
+                _ => self.config.idle_timeout.map(|timeout| conn.last_activity + timeout),
+            };
+            next = match (next, at) {
+                (Some(next), Some(at)) => Some(next.min(at)),
+                (next, at) => next.or(at),
+            };
+        }
+        next
     }
 }
 
@@ -1157,6 +1279,7 @@ fn respond_to(
     status: u16,
     headers: &[(&str, &str)],
     body: &[u8],
+    linger: Option<Linger>,
 ) -> bool {
     if state.phase != Phase::Pending {
         return false
@@ -1202,8 +1325,17 @@ fn respond_to(
         if let Some(end) = state.req_end.take() {
             state.consumed = end;
         }
-        state.phase = if close { Phase::Draining } else { Phase::Idle };
-        if close {
+        if !close {
+            state.phase = Phase::Idle;
+        } else if state.framing_lost && linger.is_some() {
+            // The peer is still sending a request stream this response ends.
+            // Shutting the write side alone puts the answer in front of it
+            // before the connection goes.
+            let now = Instant::now();
+            state.phase = Phase::Lingering { since: now, last_inbound: now };
+            net.shutdown_write_when_drained(token);
+        } else {
+            state.phase = Phase::Draining;
             net.disconnect_when_drained(token);
         }
     }
