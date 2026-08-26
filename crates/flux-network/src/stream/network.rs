@@ -193,6 +193,23 @@ impl Write for PayloadBuf<'_> {
     }
 }
 
+/// Socket options that exist only for TCP connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpOptions {
+    /// Whether to enable `TCP_NODELAY`.
+    pub nodelay: bool,
+    /// Whether to enable TCP keepalive.
+    pub keepalive: bool,
+    /// Linux `TCP_USER_TIMEOUT`, in milliseconds.
+    pub user_timeout_ms: u32,
+}
+
+impl Default for TcpOptions {
+    fn default() -> Self {
+        Self { nodelay: true, keepalive: false, user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS }
+    }
+}
+
 /// Configuration shared by every listener and connection in a
 /// [`ConnectionGroup`].
 #[derive(Clone)]
@@ -204,15 +221,6 @@ pub struct ConnectionGroupConfig {
     pub on_connect_msg: Option<Vec<u8>>,
     /// Requested `SO_SNDBUF` and `SO_RCVBUF` size, applied to every transport.
     pub socket_buf_size: Option<usize>,
-    /// Whether to enable `TCP_NODELAY`. Unix-domain endpoints have no such
-    /// option and ignore it.
-    pub nodelay: bool,
-    /// Whether to enable TCP keepalive. Unix-domain endpoints have no such
-    /// option and ignore it.
-    pub keepalive: bool,
-    /// Linux `TCP_USER_TIMEOUT`, in milliseconds. Unix-domain endpoints have
-    /// no such option and ignore it.
-    pub user_timeout_ms: u32,
     /// Retry interval for persistent outbound endpoints.
     pub reconnect_interval: Duration,
     /// Emit rate-limited warnings above this many queued bytes. The queue is
@@ -228,6 +236,9 @@ pub struct ConnectionGroupConfig {
     pub framing: Framing,
     /// Per-connection latency and allocation telemetry.
     pub telemetry: TcpTelemetry,
+    /// TCP socket options. Unix-domain connections have no such options and
+    /// ignore them.
+    pub tcp: TcpOptions,
 }
 
 impl Default for ConnectionGroupConfig {
@@ -236,15 +247,13 @@ impl Default for ConnectionGroupConfig {
             name: "stream",
             on_connect_msg: None,
             socket_buf_size: None,
-            nodelay: true,
-            keepalive: false,
-            user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             reconnect_interval: Duration::from_secs(2),
             backlog_warn_bytes: Some(DEFAULT_BACKLOG_WARN_BYTES),
             max_backlog_bytes: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             framing: Framing::LengthPrefixed,
             telemetry: TcpTelemetry::Disabled,
+            tcp: TcpOptions::default(),
         }
     }
 }
@@ -252,7 +261,7 @@ impl Default for ConnectionGroupConfig {
 impl ConnectionGroupConfig {
     /// Enables TCP keepalive for every connection in this group.
     pub fn with_keepalive(mut self) -> Self {
-        self.keepalive = true;
+        self.tcp.keepalive = true;
         self
     }
 }
@@ -475,7 +484,7 @@ impl NetworkState {
         let config = self.config(group);
         let group_name = config.name;
 
-        if config.nodelay &&
+        if config.tcp.nodelay &&
             let Err(err) = socket.set_nodelay()
         {
             warn!(?err, %peer, "couldn't set nodelay on tcp stream");
@@ -483,7 +492,7 @@ impl NetworkState {
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
-        if config.keepalive &&
+        if config.tcp.keepalive &&
             let Err(err) = socket.set_keepalive()
         {
             warn!(?err, %peer, "couldn't set keepalive on tcp stream");
@@ -491,7 +500,7 @@ impl NetworkState {
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
-        socket.set_user_timeout(config.user_timeout_ms);
+        socket.set_user_timeout(config.tcp.user_timeout_ms);
         if let Err(err) = self.poll.registry().reregister(&mut socket, token, Interest::READABLE) {
             warn!(?err, %peer, "couldn't register connected stream");
             let _ = socket.shutdown(Shutdown::Both);
@@ -547,21 +556,21 @@ impl NetworkState {
                 if let Some(size) = config.socket_buf_size {
                     set_socket_buf_size(&socket, size);
                 }
-                if config.nodelay &&
+                if config.tcp.nodelay &&
                     let Err(err) = socket.set_nodelay()
                 {
                     warn!(?err, %peer, "couldn't set nodelay on accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
                 }
-                if config.keepalive &&
+                if config.tcp.keepalive &&
                     let Err(err) = socket.set_keepalive()
                 {
                     warn!(?err, %peer, "couldn't set keepalive on accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
                 }
-                socket.set_user_timeout(config.user_timeout_ms);
+                socket.set_user_timeout(config.tcp.user_timeout_ms);
                 if let Err(err) =
                     self.poll.registry().register(&mut socket, token, Interest::READABLE)
                 {
@@ -870,7 +879,12 @@ impl NetworkState {
         self.broadcast_staged(group)
     }
 
-    fn broadcast_many_with<I, F>(&mut self, group: ConnectionGroup, items: I, mut serialise: F) -> usize
+    fn broadcast_many_with<I, F>(
+        &mut self,
+        group: ConnectionGroup,
+        items: I,
+        mut serialise: F,
+    ) -> usize
     where
         I: IntoIterator,
         F: FnMut(&mut PayloadBuf<'_>, I::Item),
@@ -1062,7 +1076,12 @@ impl StreamNetwork {
     /// receives the batch in one socket write when it has no backlog. The
     /// closure is not called when the group has no connected member. Returns
     /// the number of recipients attempted.
-    pub fn broadcast_many_with<I, F>(&mut self, group: ConnectionGroup, items: I, serialise: F) -> usize
+    pub fn broadcast_many_with<I, F>(
+        &mut self,
+        group: ConnectionGroup,
+        items: I,
+        serialise: F,
+    ) -> usize
     where
         I: IntoIterator,
         F: FnMut(&mut PayloadBuf<'_>, I::Item),
@@ -1506,9 +1525,20 @@ mod tests {
     use mio::{Poll, Token};
 
     use super::{
-        ByteQueue, ConnectionGroupConfig, FRAME_HEADER_SIZE, FramedStream, PayloadBuf, Peer,
-        StreamState, TransportStream, set_socket_buf_size, write_frame_header,
+        ByteQueue, ConnectionGroupConfig, DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE,
+        FramedStream, PayloadBuf, Peer, StreamState, TcpOptions, TransportStream,
+        set_socket_buf_size, write_frame_header,
     };
+
+    #[test]
+    fn tcp_options_default_to_nodelay_without_keepalive() {
+        assert_eq!(TcpOptions::default(), TcpOptions {
+            nodelay: true,
+            keepalive: false,
+            user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
+        });
+        assert_eq!(ConnectionGroupConfig::default().tcp, TcpOptions::default());
+    }
 
     #[test]
     fn byte_queue_preserves_every_unwritten_suffix() {

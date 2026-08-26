@@ -8,6 +8,7 @@ pub use connector::{PollEvent, SendBehavior, TcpConnector};
 pub use endpoint::{Endpoint, Peer};
 pub use network::{
     ConnectionGroup, ConnectionGroupConfig, Framing, PayloadBuf, StreamEvent, StreamNetwork,
+    TcpOptions,
 };
 pub(crate) use tcp_stream::set_socket_buf_size;
 pub use tcp_stream::{ConnState, TcpStream, TcpTelemetry};

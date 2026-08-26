@@ -172,8 +172,10 @@ fn groups_route_events_and_messages(endpoint: &Endpoint) {
 fn batch_send_preserves_framed_messages() {
     let addr = unused_addr();
     let mut network = StreamNetwork::default();
-    let server_group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
-    let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group =
+        network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
     network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
     let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
@@ -206,8 +208,10 @@ fn batch_send_preserves_framed_messages() {
 fn payload_buffer_is_relative_to_its_own_frame() {
     let addr = unused_addr();
     let mut network = StreamNetwork::default();
-    let server_group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
-    let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group =
+        network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
     network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
     let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
@@ -244,8 +248,10 @@ fn payload_buffer_is_relative_to_its_own_frame() {
 fn payload_buffer_is_a_wincode_writer() {
     let addr = unused_addr();
     let mut network = StreamNetwork::default();
-    let server_group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
-    let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let client_group =
+        network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
     network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
     let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
@@ -280,7 +286,8 @@ fn batch_skips_oversized_payloads_and_keeps_the_rest() {
         max_frame_size: 32,
         ..Default::default()
     });
-    let client_group = network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
+    let client_group =
+        network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() });
     network.listen(server_group, Endpoint::Tcp(addr)).unwrap();
     let _ = network.connect(client_group, Endpoint::Tcp(addr));
     let server_token = wait_for_accept(&mut network, server_group);
@@ -310,7 +317,8 @@ fn batch_skips_oversized_payloads_and_keeps_the_rest() {
 fn broadcast_many_serializes_each_payload_once() {
     let addr = unused_addr();
     let mut network = StreamNetwork::default();
-    let server_group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    let server_group =
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
     let client_group = network.add_group(ConnectionGroupConfig {
         name: "clients",
         reconnect_interval: flux_timing::Duration::from_millis(1),
