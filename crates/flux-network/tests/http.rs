@@ -1161,7 +1161,6 @@ fn a_pipelined_request_waits_for_the_pending_response() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(paths.is_empty(), "one request in flight per connection: {paths:?}");
-    assert_eq!(server.http.ready_len(), 0, "a connection owing a response is never queued");
 
     assert!(server.respond(token, 200, &[], b"one"));
     let deadline = Instant::now() + TIMEOUT;
@@ -1179,142 +1178,6 @@ fn a_pipelined_request_waits_for_the_pending_response() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(paths, ["/two"]);
-}
-
-/// Serves two pipelined requests, answering the first inline or by token, and
-/// reports the cursors left once the second request has been pulled.
-fn cursors_after_two_requests(inline: bool) -> (usize, usize, Option<usize>) {
-    let (mut server, addr) = server();
-    let mut client = std::net::TcpStream::connect(addr).unwrap();
-    client.set_nonblocking(true).unwrap();
-    client
-        .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
-        .unwrap();
-
-    let deadline = Instant::now() + TIMEOUT;
-    let mut answered = None;
-    let mut second = None;
-    while Instant::now() < deadline && second.is_none() {
-        let mut deferred = None;
-        server.pump(|event| {
-            if let HttpEvent::Request { token, request, responder } = event {
-                if answered.is_none() {
-                    assert_eq!(request.path, "/one");
-                    if inline {
-                        assert!(responder.respond(200, &[], b"one"));
-                    } else {
-                        deferred = Some(token);
-                    }
-                    answered = Some(token);
-                } else {
-                    assert_eq!(request.path, "/two");
-                    second = Some(token);
-                }
-            }
-        });
-        if let Some(token) = deferred {
-            assert!(server.respond(token, 200, &[], b"one"));
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    server.http.cursors(second.expect("the second request never arrived")).unwrap()
-}
-
-#[test]
-fn inline_and_deferred_responses_consume_alike() {
-    assert_eq!(cursors_after_two_requests(true), cursors_after_two_requests(false));
-}
-
-/// Serves two pipelined requests, answers the first inline and leaves the
-/// pull, then makes one service access and checks what it reclaimed. The
-/// second request is the larger of the two, which keeps the answered prefix
-/// under half the buffer, so a reclamation without a compaction is legible in
-/// the cursors.
-fn an_inline_answer_reclaims_at(access: impl FnOnce(&mut Http)) {
-    let (mut server, addr) = server();
-    let mut client = std::net::TcpStream::connect(addr).unwrap();
-    client.set_nonblocking(true).unwrap();
-    let first = padded_request("/one", 64);
-    let mut wire = first.clone();
-    wire.extend_from_slice(&padded_request("/two", 192));
-    client.write_all(&wire).unwrap();
-
-    let deadline = Instant::now() + TIMEOUT;
-    let mut answered = None;
-    while Instant::now() < deadline && answered.is_none() {
-        server.drive();
-        while let Some(event) = server.http.next_event(&mut server.net) {
-            if let HttpEvent::Request { token, request, responder } = event {
-                assert_eq!(request.path, "/one");
-                assert!(responder.respond(200, &[], b""));
-                answered = Some(token);
-                break
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    let token = answered.expect("no request arrived");
-
-    // The event borrowed the connection, so the answer moved `consumed` and
-    // nothing else: `start` sits where the parse left it and the connection
-    // is out of the ready queue.
-    assert_eq!(server.http.cursors(token), Some((0, first.len(), None)));
-    assert_eq!(server.http.ready_len(), 0);
-
-    access(&mut server);
-
-    let (start, consumed, _) = server.http.cursors(token).expect("the connection went");
-    assert_eq!(start, consumed, "one service access reclaims what the answer consumed");
-    assert_eq!(start, first.len(), "the pipelined request holds off the compaction");
-}
-
-#[test]
-fn an_inline_answer_reclaims_at_the_next_pull() {
-    an_inline_answer_reclaims_at(|server| {
-        // A pull applies the bookkeeping before it parses anything, so the
-        // request behind the answered one is what it delivers.
-        assert!(server.http.next_event(&mut server.net).is_some());
-    });
-}
-
-#[test]
-fn an_inline_answer_reclaims_at_the_next_drive() {
-    an_inline_answer_reclaims_at(|server| {
-        server.drive();
-    });
-}
-
-#[test]
-fn a_by_token_answer_reclaims_before_it_returns() {
-    let (mut server, addr) = server();
-    let mut client = std::net::TcpStream::connect(addr).unwrap();
-    client.set_nonblocking(true).unwrap();
-    let first = padded_request("/one", 64);
-    let mut wire = first.clone();
-    wire.extend_from_slice(&padded_request("/two", 192));
-    client.write_all(&wire).unwrap();
-
-    let (token, path) = pull_deferred_request(&mut server);
-    assert_eq!(path, "/one");
-    // Parsed and owing a response: nothing is consumed, and a connection that
-    // owes a response is never queued.
-    assert_eq!(server.http.cursors(token), Some((0, 0, Some(first.len()))));
-    assert_eq!(server.http.ready_len(), 0);
-
-    assert!(server.respond(token, 200, &[], b""));
-
-    // Nothing borrows the connection, so the answer reclaims and requeues
-    // with no driver call in between.
-    assert_eq!(
-        server.http.cursors(token),
-        Some((first.len(), first.len(), None)),
-        "a by-token answer reclaims what it consumed"
-    );
-    assert_eq!(
-        server.http.ready_len(),
-        1,
-        "the connection is queued for the pipelined request behind the answer"
-    );
 }
 
 /// Serves two pipelined requests, echoing each path back as its body and
@@ -1380,38 +1243,33 @@ fn serve_the_request_behind_an_answer(inline_first: bool) {
     client.write_all(&wire).unwrap();
 
     let deadline = Instant::now() + TIMEOUT;
-    let mut answered = None;
-    while Instant::now() < deadline && answered.is_none() {
+    let mut answered = false;
+    while Instant::now() < deadline && !answered {
         let mut deferred = None;
         server.drive();
         while let Some(event) = server.http.next_event(&mut server.net) {
             if let HttpEvent::Request { token, request, responder } = event {
                 assert_eq!(request.path, "/one", "{path}");
                 if inline_first {
-                    assert!(responder.respond(200, &[], b""));
+                    assert!(responder.respond(200, &[], b"one"));
                 } else {
                     drop(responder);
                     deferred = Some(token);
                 }
-                answered = Some(token);
+                answered = true;
                 break
             }
         }
         if let Some(token) = deferred {
-            assert!(server.respond(token, 200, &[], b""));
+            assert!(server.respond(token, 200, &[], b"one"));
         }
         thread::sleep(Duration::from_millis(1));
     }
-    let token = answered.expect("no request arrived");
+    assert!(answered, "no request arrived");
 
-    // The answer queues the connection itself, or the driver call that
-    // applies an inline answer's bookkeeping does.
-    while Instant::now() < deadline && server.http.ready_len() == 0 {
-        server.drive();
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(server.http.ready_len(), 1, "the pipelined request is queued: {path}");
-    assert!(server.drive(), "a queued request is work, iteration after iteration: {path}");
+    // A connection holding the request behind an answered one is work,
+    // whichever way the answer was given.
+    assert!(server.drive(), "the request behind the answered one is work: {path}");
 
     let mut pulled = false;
     while Instant::now() < deadline && !pulled {
@@ -1420,7 +1278,7 @@ fn serve_the_request_behind_an_answer(inline_first: bool) {
                 assert_eq!(request.method, "POST", "{path}");
                 assert_eq!(request.path, "/two", "{path}");
                 assert_eq!(request.body, b"body".as_slice(), "{path}");
-                assert!(responder.respond(200, &[], b""));
+                assert!(responder.respond(200, &[], b"two"));
                 pulled = true;
                 break
             }
@@ -1432,10 +1290,15 @@ fn serve_the_request_behind_an_answer(inline_first: bool) {
     }
     assert!(pulled, "the pipelined request was never served: {path}");
 
-    // Both answered and reclaimed, the connection holds nothing and waits.
-    server.drive();
-    assert_eq!(server.http.cursors(token), Some((0, 0, None)), "{path}");
-    assert_eq!(server.http.ready_len(), 0, "{path}");
+    // Both answers reach the client, which the connection outlives.
+    let mut received = Vec::new();
+    while Instant::now() < deadline && !received.ends_with(b"two") {
+        server.pump(|_| {});
+        assert!(!read_available(&mut client, &mut received), "the connection closed: {path}");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(received.ends_with(b"two"), "{path}: {received:?}");
+    assert_eq!(received.windows(3).filter(|w| *w == b"one").count(), 1, "{path}");
 }
 
 #[test]
@@ -1445,7 +1308,7 @@ fn a_pipelined_request_is_served_after_either_answer_path() {
 }
 
 #[test]
-fn a_refused_second_response_consumes_nothing() {
+fn a_second_response_to_one_request_is_refused() {
     let (mut server, addr) = server();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -1453,9 +1316,7 @@ fn a_refused_second_response_consumes_nothing() {
 
     let (token, _) = pull_deferred_request(&mut server);
     assert!(server.respond(token, 200, &[], b"first"));
-    let answered = server.http.cursors(token).unwrap();
     assert!(!server.respond(token, 200, &[], b"second"), "a request is answered once");
-    assert_eq!(server.http.cursors(token).unwrap(), answered);
 
     let mut received = Vec::new();
     read_until_response(&mut server, &mut client, &mut received);
@@ -1491,15 +1352,10 @@ fn answered_bytes_cost_the_connection_nothing() {
         }
         thread::sleep(Duration::from_millis(1));
     }
-    let token = token.expect("no request arrived");
-    assert_eq!(server.http.cursors(token), Some((0, request.len(), None)));
+    assert!(token.is_some(), "no request arrived");
 
     // The next request arrives before the pull that would reclaim them.
     client.write_all(&padded_request("/second", 60)).unwrap();
-    while Instant::now() < deadline && server.http.ready_len() == 0 {
-        server.drive();
-        thread::sleep(Duration::from_millis(1));
-    }
 
     let mut paths = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1569,20 +1425,16 @@ fn a_pending_request_survives_a_compaction() {
     }
     assert_eq!(pulled, ["/one", "/two"]);
     let pending = pending.unwrap();
-    assert_eq!(server.http.cursors(pending), Some((64, 64, Some(128))));
 
-    // A fourth request would outgrow the limit, so the answered prefix goes
-    // and every cursor moves down with it, the pending request included.
+    // A fourth request outgrows what the limit leaves, so it is read only
+    // once the answered prefix goes — which happens under the pending
+    // request, whose parsed bytes move down with the buffer. Answering it
+    // from rebased cursors is what lets the last two requests through.
     client.write_all(&padded_request("/four", 96)).unwrap();
-    while Instant::now() < deadline && server.http.cursors(pending) != Some((0, 0, Some(64))) {
+    for _ in 0..20 {
         server.drive();
         thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(
-        server.http.cursors(pending),
-        Some((0, 0, Some(64))),
-        "the cursors were not rebased"
-    );
 
     assert!(server.respond(pending, 200, &[], b""));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1615,11 +1467,12 @@ fn pipelined_requests_stay_ranged_across_a_compaction() {
         )
         .unwrap();
     }
-    let one = wire.len() / 3;
     client.write_all(&wire).unwrap();
 
+    // Three requests of one size: answering the first two puts the answered
+    // prefix past half the buffer, so the third is parsed from a buffer whose
+    // prefix has been dropped, and every range it carries is rebased.
     let mut seen = Vec::new();
-    let mut compacted = false;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && seen.len() < 3 {
         let mut replies = Vec::new();
@@ -1635,18 +1488,12 @@ fn pipelined_requests_stay_ranged_across_a_compaction() {
             }
         });
         for token in replies {
-            // The third request is parsed from a buffer whose answered prefix
-            // has been dropped: its cursors are rebased onto what is left.
-            if seen.len() == 3 {
-                assert_eq!(server.http.cursors(token), Some((0, 0, Some(one))));
-                compacted = true;
-            }
             assert!(server.respond(token, 200, &[], b"ok"));
         }
         thread::sleep(Duration::from_millis(1));
     }
 
-    assert!(compacted, "the buffer never compacted");
+    assert_eq!(seen.len(), 3, "not every request was served");
     for (index, (method, path, header, body)) in seen.iter().enumerate() {
         assert_eq!(method, "POST");
         assert_eq!(path, &format!("/path-{index}"));
@@ -1703,37 +1550,37 @@ fn a_caller_may_stop_pulling_and_resume_later() {
 }
 
 #[test]
-fn two_reads_queue_one_ready_connection() {
+fn a_request_split_across_reads_is_delivered_once_complete() {
     let (mut server, addr) = server();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
     client.write_all(b"GET /split HTTP/1.1\r\n").unwrap();
 
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && server.http.ready_len() == 0 {
-        server.drive();
+    // Half a head is no request, however many iterations read it.
+    for _ in 0..20 {
+        server.pump(|event| {
+            assert!(!matches!(event, HttpEvent::Request { .. }), "half a head was delivered");
+        });
         thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(server.http.ready_len(), 1);
 
     client.write_all(b"Host: x\r\n\r\n").unwrap();
-    let mut drives = 0;
-    while Instant::now() < deadline && drives < 20 {
-        server.drive();
-        assert_eq!(server.http.ready_len(), 1, "one entry however many reads arrive");
-        drives += 1;
+    let deadline = Instant::now() + TIMEOUT;
+    let mut path = None;
+    while Instant::now() < deadline && path.is_none() {
+        server.pump(|event| {
+            if let HttpEvent::Request { request, responder, .. } = event {
+                path = Some(request.path.to_owned());
+                assert!(responder.respond(200, &[], b"ok"));
+            }
+        });
         thread::sleep(Duration::from_millis(1));
     }
-
-    let mut path = None;
-    server.pump(|event| {
-        if let HttpEvent::Request { request, responder, .. } = event {
-            path = Some(request.path.to_owned());
-            assert!(responder.respond(200, &[], b"ok"));
-        }
-    });
     assert_eq!(path.as_deref(), Some("/split"));
-    assert_eq!(server.http.ready_len(), 0);
+
+    let mut received = Vec::new();
+    read_until_response(&mut server, &mut client, &mut received);
+    assert!(received.ends_with(b"ok"), "{received:?}");
 }
 
 #[test]
