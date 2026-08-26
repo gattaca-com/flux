@@ -107,6 +107,10 @@ use crate::stream::{
     ConnectionGroup, Endpoint, Framing, Peer, ServiceRef, StreamEvent, StreamNetwork, private,
 };
 
+/// The most headers one message may be parsed into, and the size of the
+/// scratch every parse borrows.
+pub const MAX_HEADERS: usize = 128;
+
 /// HTTP parsing and connection-state policy. Transport and queue policy
 /// belongs to the group the service claims.
 #[derive(Clone, Copy, Debug)]
@@ -115,7 +119,8 @@ pub struct HttpConfig {
     pub max_head_bytes: usize,
     /// Largest message body accepted before rejecting it with `413`.
     pub max_body_bytes: usize,
-    /// Largest number of headers parsed in one message.
+    /// Largest number of headers parsed in one message, itself held to
+    /// [`MAX_HEADERS`]: a larger value parses [`MAX_HEADERS`] of them.
     pub max_headers: usize,
     /// How long an accepted connection may sit without inbound bytes before
     /// it is closed. Outbound endpoints stay connected.
@@ -175,7 +180,14 @@ impl HttpConfig {
     }
 
     /// Sets the maximum number of headers parsed in one message.
+    ///
+    /// # Panics
+    /// `max_headers` must be in <code>1..=[MAX_HEADERS]</code>.
     pub fn with_max_headers(mut self, max_headers: usize) -> Self {
+        assert!(
+            (1..=MAX_HEADERS).contains(&max_headers),
+            "max_headers must be in 1..={MAX_HEADERS}"
+        );
         self.max_headers = max_headers;
         self
     }
@@ -312,6 +324,7 @@ impl<'a> HttpResponse<'a> {
 pub struct Responder<'a> {
     net: &'a mut StreamNetwork,
     state: &'a mut ConnState,
+    scratch: &'a mut Vec<u8>,
     token: Token,
     linger: Option<Linger>,
 }
@@ -328,7 +341,90 @@ impl Responder<'_> {
     /// are reclaimed on the next pull or network tick, after the event's
     /// borrow ends. [`HttpService::respond`] reclaims before it returns.
     pub fn respond(self, status: u16, headers: &[(&str, &str)], body: &[u8]) -> bool {
-        respond_to(self.net, self.state, self.token, status, headers, body, self.linger)
+        self.respond_with(status, headers, |out| out.extend_from_slice(body))
+    }
+
+    /// Queues the response with its body written by `write_body`, and
+    /// returns whether it was written.
+    ///
+    /// The closure renders into a buffer the service keeps for the next
+    /// response, so a body composed here costs no allocation. Every framing
+    /// rule of [`Self::respond`] holds, and the closure runs whatever the
+    /// request was: a `HEAD` request is answered with the `Content-Length`
+    /// of the body it is not sent.
+    pub fn respond_with(
+        self,
+        status: u16,
+        headers: &[(&str, &str)],
+        write_body: impl FnOnce(&mut Vec<u8>),
+    ) -> bool {
+        let Self { net, state, scratch, token, linger } = self;
+        if state.phase != Phase::Pending {
+            return false
+        }
+        if !(100..=599).contains(&status) ||
+            headers.iter().any(|(name, value)| invalid_header(name, value))
+        {
+            return false
+        }
+        let caller_close = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")
+        });
+        let close = state.close || caller_close;
+        let suppress_body = state.head_request || matches!(status, 100..=199 | 204 | 304);
+        let include_length = !matches!(status, 100..=199 | 204);
+        scratch.clear();
+        write_body(scratch);
+        let body: &[u8] = scratch;
+        let ok = net.send_with(token, |out| {
+            write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
+            // Caller Connection headers only feed the close decision; exactly
+            // one canonical Connection header is always written below.
+            for (name, value) in headers {
+                if name.eq_ignore_ascii_case("connection") {
+                    continue
+                }
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(value.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+            if include_length {
+                write!(out, "Content-Length: {}\r\n", body.len()).unwrap();
+            }
+            out.extend_from_slice(if close {
+                b"Connection: close\r\n"
+            } else {
+                b"Connection: keep-alive\r\n"
+            });
+            out.extend_from_slice(b"\r\n");
+            if !suppress_body {
+                out.extend_from_slice(body);
+            }
+        });
+        if ok {
+            if let Some(end) = state.req_end.take() {
+                state.consumed = end;
+            }
+            if !close {
+                state.phase = Phase::Idle;
+            } else if state.framing_lost && linger.is_some() {
+                // The peer is still sending a request stream this response ends.
+                // Shutting the write side alone puts the answer in front of it
+                // before the connection goes.
+                net.shutdown_write_when_drained(token);
+                // The caps time what follows the answer, so they start where the
+                // answer ends: here when nothing was queued behind it, and at the
+                // tick that sees the write side shut otherwise.
+                let clock =
+                    net.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
+                state.phase = Phase::Lingering { clock };
+            } else {
+                state.phase = Phase::Draining;
+                net.disconnect_when_drained(token);
+            }
+        }
+        ok
     }
 }
 
@@ -382,7 +478,15 @@ impl LingerClock {
 
 enum Role {
     Accepted,
-    Outbound { endpoint: Endpoint, method: Option<String> },
+    Outbound { endpoint: Endpoint, in_flight: Option<InFlight> },
+}
+
+/// The request an outbound connection is waiting on, and all the service
+/// needs of it once it is sent: a `HEAD` response carries no body, however
+/// it is framed.
+#[derive(Clone, Copy)]
+struct InFlight {
+    head: bool,
 }
 
 struct Conn {
@@ -538,6 +642,8 @@ pub struct HttpService {
     headers: Vec<HeaderRange>,
     /// The body of the last chunked response, decoded.
     decoded: Vec<u8>,
+    /// The body of the last response written, kept for the next one.
+    scratch: Vec<u8>,
     /// The connection awaiting bookkeeping from the last pulled event.
     last: Option<Token>,
 }
@@ -563,6 +669,7 @@ impl HttpService {
             ready_cursor: 0,
             headers: Vec::new(),
             decoded: Vec::new(),
+            scratch: Vec::new(),
             last: None,
         }
     }
@@ -591,7 +698,7 @@ impl HttpService {
     #[must_use = "the token identifies the outbound endpoint"]
     pub fn connect(&mut self, net: &mut StreamNetwork, endpoint: Endpoint) -> Token {
         let token = net.connect(self.group, endpoint.clone());
-        self.conns.push(Conn::new(token, Role::Outbound { endpoint, method: None }));
+        self.conns.push(Conn::new(token, Role::Outbound { endpoint, in_flight: None }));
         token
     }
 
@@ -643,15 +750,11 @@ impl HttpService {
         let Some(conn) = self
             .conns
             .iter_mut()
-            .find(|conn| conn.token == token && outbound_method(&conn.role).is_none())
+            .find(|conn| conn.token == token && in_flight(&conn.role).is_none())
         else {
             return false
         };
         let Role::Outbound { endpoint, .. } = &conn.role else { return false };
-        let host = match endpoint {
-            Endpoint::Tcp(addr) => addr.to_string(),
-            Endpoint::Unix(_) => "localhost".to_owned(),
-        };
         let sent = net.send_with(token, |out| {
             write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
             let mut has_host = false;
@@ -663,13 +766,16 @@ impl HttpService {
                 out.extend_from_slice(b"\r\n");
             }
             if !has_host {
-                write!(out, "Host: {host}\r\n").unwrap();
+                match endpoint {
+                    Endpoint::Tcp(addr) => write!(out, "Host: {addr}\r\n").unwrap(),
+                    Endpoint::Unix(_) => out.extend_from_slice(b"Host: localhost\r\n"),
+                }
             }
             write!(out, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
             out.extend_from_slice(body);
         });
         if sent {
-            set_outbound_method(&mut conn.role, Some(method.to_owned()));
+            set_in_flight(&mut conn.role, Some(InFlight { head: method == "HEAD" }));
             // The clock runs from here, not from the last byte reaching the
             // wire: a request queued behind a backlog is already waiting.
             conn.deadline = timeout.map(|timeout| Instant::now() + timeout);
@@ -701,12 +807,34 @@ impl HttpService {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
+        self.respond_with(net, token, status, headers, |out| out.extend_from_slice(body))
+    }
+
+    /// Answers a request whose [`Responder`] was dropped with a body `body`
+    /// writes, and returns whether the response was written.
+    ///
+    /// The closure renders into a buffer the service keeps for the next
+    /// response, so a body composed here costs no allocation. Every framing
+    /// rule of [`Self::respond`] holds, and the closure runs whatever the
+    /// request was: a `HEAD` request is answered with the `Content-Length`
+    /// of the body it is not sent. [`Responder::respond_with`] is the same
+    /// answer, given inline.
+    pub fn respond_with(
+        &mut self,
+        net: &mut StreamNetwork,
+        token: Token,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: impl FnOnce(&mut Vec<u8>),
+    ) -> bool {
         let Some(index) = self.index_of(token) else { return false };
         if !matches!(self.conns[index].role, Role::Accepted) {
             return false
         }
         let linger = self.config.linger;
-        if !respond_to(net, &mut self.conns[index].state, token, status, headers, body, linger) {
+        let Self { conns, scratch, .. } = self;
+        let responder = Responder { net, state: &mut conns[index].state, scratch, token, linger };
+        if !responder.respond_with(status, headers, body) {
             return false
         }
         self.reclaim(index);
@@ -731,7 +859,7 @@ impl HttpService {
                 let token = self.conns[index].token;
                 let linger = self.config.linger;
                 self.last = Some(token);
-                let Self { conns, headers, .. } = self;
+                let Self { conns, headers, scratch, .. } = self;
                 let headers: &[HeaderRange] = headers;
                 let Conn { buffer, state, .. } = &mut conns[index];
                 let buffer: &[u8] = buffer;
@@ -746,7 +874,7 @@ impl HttpService {
                 Some(HttpEvent::Request {
                     token,
                     request,
-                    responder: Responder { net, state, token, linger },
+                    responder: Responder { net, state, scratch, token, linger },
                 })
             }
             Step::Response { index, version, status, reason, body } => {
@@ -891,8 +1019,9 @@ impl HttpService {
         if buffer.is_empty() {
             return RequestPlan::Incomplete
         }
-        let mut scratch = vec![httparse::EMPTY_HEADER; config.max_headers];
-        let mut request = httparse::Request::new(&mut scratch);
+        let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut request =
+            httparse::Request::new(&mut scratch[..headers_parsed(config.max_headers)]);
         let Ok(status) = request.parse(buffer) else { return RequestPlan::Error(400) };
         let httparse::Status::Complete(head) = status else {
             // A partial parse means every buffered byte is still head bytes.
@@ -958,7 +1087,7 @@ impl HttpService {
         at_eof: bool,
     ) -> Option<Step> {
         loop {
-            outbound_method(&self.conns[index].role)?;
+            in_flight(&self.conns[index].role)?;
             self.conns[index].reclaim();
             match self.parse_response(index) {
                 ResponsePlan::Incomplete if !at_eof => return None,
@@ -988,7 +1117,7 @@ impl HttpService {
                     let conn = &mut self.conns[index];
                     conn.state.consumed = end;
                     conn.deadline = None;
-                    set_outbound_method(&mut conn.role, None);
+                    set_in_flight(&mut conn.role, None);
                     if close {
                         net.disconnect(token);
                     }
@@ -1006,8 +1135,9 @@ impl HttpService {
         if buffer.is_empty() {
             return ResponsePlan::Incomplete
         }
-        let mut scratch = vec![httparse::EMPTY_HEADER; config.max_headers];
-        let mut response = httparse::Response::new(&mut scratch);
+        let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut response =
+            httparse::Response::new(&mut scratch[..headers_parsed(config.max_headers)]);
         let Ok(status) = response.parse(buffer) else { return malformed() };
         let httparse::Status::Complete(head) = status else {
             // A partial parse means every buffered byte is still head bytes.
@@ -1026,7 +1156,7 @@ impl HttpService {
             return too_large()
         }
         let code = response.code.unwrap_or(0);
-        let no_body = outbound_method(&conn.role).map(String::as_str) == Some("HEAD") ||
+        let no_body = in_flight(&conn.role).is_some_and(|request| request.head) ||
             matches!(code, 100..=199 | 204 | 304);
         let chunked = transfer_chunked(response.headers);
         let content_length = response_content_length(response.headers);
@@ -1098,8 +1228,9 @@ impl HttpService {
             let conn = &conns[index];
             let base = conn.start;
             let buffer = &conn.buffer[base..];
-            let mut scratch = vec![httparse::EMPTY_HEADER; config.max_headers];
-            let mut response = httparse::Response::new(&mut scratch);
+            let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
+            let mut response =
+                httparse::Response::new(&mut scratch[..headers_parsed(config.max_headers)]);
             let Ok(httparse::Status::Complete(head)) = response.parse(buffer) else {
                 return Ok(None)
             };
@@ -1107,7 +1238,7 @@ impl HttpService {
                 return Ok(None)
             }
             let code = response.code.unwrap_or(0);
-            let no_body = outbound_method(&conn.role).map(String::as_str) == Some("HEAD") ||
+            let no_body = in_flight(&conn.role).is_some_and(|request| request.head) ||
                 matches!(code, 100..=199 | 204 | 304);
             if no_body ||
                 transfer_chunked(response.headers) != Some(false) ||
@@ -1136,7 +1267,7 @@ impl HttpService {
         let conn = &mut self.conns[index];
         conn.state.consumed = conn.buffer.len();
         conn.deadline = None;
-        set_outbound_method(&mut conn.role, None);
+        set_in_flight(&mut conn.role, None);
         Ok(Some(plan))
     }
 
@@ -1144,7 +1275,7 @@ impl HttpService {
     /// twice.
     fn abandon_request(&mut self, index: usize) -> Token {
         self.conns[index].deadline = None;
-        set_outbound_method(&mut self.conns[index].role, None);
+        set_in_flight(&mut self.conns[index].role, None);
         self.conns[index].token
     }
 
@@ -1152,21 +1283,22 @@ impl HttpService {
     fn error(&mut self, net: &mut StreamNetwork, index: usize, status: u16) {
         let token = self.conns[index].token;
         let linger = self.config.linger;
-        let state = &mut self.conns[index].state;
+        let Self { conns, scratch, .. } = self;
+        let state = &mut conns[index].state;
         state.phase = Phase::Pending;
         state.close = true;
         state.head_request = false;
         // The request this answers was never read to its end, whether it was
         // unparseable, too large, or framed in a way the service refuses.
         state.framing_lost = true;
-        respond_to(net, state, token, status, &[], &[], linger);
+        Responder { net, state, scratch, token, linger }.respond_with(status, &[], |_| {});
     }
 
     /// Drops an outbound connection whose peer broke the protocol.
     fn fail_outbound(&mut self, net: &mut StreamNetwork, index: usize) {
         let token = self.conns[index].token;
         self.conns[index].clear();
-        set_outbound_method(&mut self.conns[index].role, None);
+        set_in_flight(&mut self.conns[index].role, None);
         net.disconnect(token);
     }
 
@@ -1177,7 +1309,7 @@ impl HttpService {
             self.conns.swap_remove(index);
         } else {
             self.conns[index].clear();
-            set_outbound_method(&mut self.conns[index].role, None);
+            set_in_flight(&mut self.conns[index].role, None);
         }
     }
 
@@ -1451,80 +1583,6 @@ fn too_large() -> ResponsePlan {
     ResponsePlan::Fail { reason: RequestFailure::TooLarge }
 }
 
-/// Writes one response for a pending request and moves the connection on.
-fn respond_to(
-    net: &mut StreamNetwork,
-    state: &mut ConnState,
-    token: Token,
-    status: u16,
-    headers: &[(&str, &str)],
-    body: &[u8],
-    linger: Option<Linger>,
-) -> bool {
-    if state.phase != Phase::Pending {
-        return false
-    }
-    if !(100..=599).contains(&status) ||
-        headers.iter().any(|(name, value)| invalid_header(name, value))
-    {
-        return false
-    }
-    let caller_close = headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")
-    });
-    let close = state.close || caller_close;
-    let suppress_body = state.head_request || matches!(status, 100..=199 | 204 | 304);
-    let include_length = !matches!(status, 100..=199 | 204);
-    let ok = net.send_with(token, |out| {
-        write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
-        // Caller Connection headers only feed the close decision; exactly
-        // one canonical Connection header is always written below.
-        for (name, value) in headers {
-            if name.eq_ignore_ascii_case("connection") {
-                continue
-            }
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        if include_length {
-            write!(out, "Content-Length: {}\r\n", body.len()).unwrap();
-        }
-        out.extend_from_slice(if close {
-            b"Connection: close\r\n"
-        } else {
-            b"Connection: keep-alive\r\n"
-        });
-        out.extend_from_slice(b"\r\n");
-        if !suppress_body {
-            out.extend_from_slice(body);
-        }
-    });
-    if ok {
-        if let Some(end) = state.req_end.take() {
-            state.consumed = end;
-        }
-        if !close {
-            state.phase = Phase::Idle;
-        } else if state.framing_lost && linger.is_some() {
-            // The peer is still sending a request stream this response ends.
-            // Shutting the write side alone puts the answer in front of it
-            // before the connection goes.
-            net.shutdown_write_when_drained(token);
-            // The caps time what follows the answer, so they start where the
-            // answer ends: here when nothing was queued behind it, and at the
-            // tick that sees the write side shut otherwise.
-            let clock = net.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
-            state.phase = Phase::Lingering { clock };
-        } else {
-            state.phase = Phase::Draining;
-            net.disconnect_when_drained(token);
-        }
-    }
-    ok
-}
-
 /// The byte range of `part` inside `buffer`, offset by `base`.
 ///
 /// A parser reports an absent value as an empty string of its own, which no
@@ -1555,6 +1613,12 @@ fn headers<'a>(
     headers: &'a [HeaderRange],
 ) -> impl Iterator<Item = (&'a str, &'a [u8])> + use<'a> {
     headers.iter().map(move |(name, value)| (text(buffer, name.clone()), &buffer[value.clone()]))
+}
+
+/// How many headers a message is parsed into: what the configuration asks
+/// for, held to the scratch every parse borrows.
+fn headers_parsed(max_headers: usize) -> usize {
+    max_headers.min(MAX_HEADERS)
 }
 
 fn crlf_only(bytes: &[u8]) -> bool {
@@ -1600,16 +1664,16 @@ fn valid_token(value: &str) -> bool {
         value.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
-fn outbound_method(role: &Role) -> Option<&String> {
+fn in_flight(role: &Role) -> Option<InFlight> {
     match role {
-        Role::Outbound { method, .. } => method.as_ref(),
+        Role::Outbound { in_flight, .. } => *in_flight,
         Role::Accepted => None,
     }
 }
 
-fn set_outbound_method(role: &mut Role, method: Option<String>) {
-    if let Role::Outbound { method: current, .. } = role {
-        *current = method;
+fn set_in_flight(role: &mut Role, request: Option<InFlight>) {
+    if let Role::Outbound { in_flight, .. } = role {
+        *in_flight = request;
     }
 }
 
@@ -1699,9 +1763,9 @@ fn chunked_end(
         }
         at = at.checked_add(consumed).ok_or(RequestFailure::Malformed)?;
         if size == 0 {
-            let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
+            let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
             let httparse::Status::Complete((consumed, _)) =
-                httparse::parse_headers(&bytes[at..], &mut headers)
+                httparse::parse_headers(&bytes[at..], &mut scratch[..headers_parsed(max_headers)])
                     .map_err(|_| RequestFailure::Malformed)?
             else {
                 return Ok(None)

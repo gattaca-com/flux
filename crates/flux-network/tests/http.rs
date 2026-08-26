@@ -9,7 +9,7 @@ use std::{
 
 use flux_network::{
     Token,
-    http::{HttpConfig, HttpEvent, HttpService},
+    http::{HttpConfig, HttpEvent, HttpService, MAX_HEADERS},
     stream::{
         ConnectionGroupConfig, Endpoint, Framing, Peer, ServiceRef, StreamEvent, StreamNetwork,
     },
@@ -165,6 +165,16 @@ impl Http {
         body: &[u8],
     ) -> bool {
         self.service.respond(&mut self.net, token, status, headers, body)
+    }
+
+    fn respond_with(
+        &mut self,
+        token: Token,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: impl FnOnce(&mut Vec<u8>),
+    ) -> bool {
+        self.service.respond_with(&mut self.net, token, status, headers, body)
     }
 
     fn request(
@@ -532,6 +542,79 @@ fn caller_connection_close_header_sent() {
     assert_eq!(text.matches("Connection:").count(), 1, "{text}");
     assert!(text.contains("Connection: close\r\n"), "{text}");
     assert!(text.ends_with("ok"));
+}
+
+#[test]
+fn respond_with_frames_the_body_the_closure_writes() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET /one HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !read_available(&mut client, &mut received) {
+        server.pump(|event| {
+            if let HttpEvent::Request { request, responder, .. } = event {
+                // The request stays readable while its answer is composed.
+                let path = request.path;
+                assert!(responder.respond_with(200, &[("content-type", "text/plain")], |out| {
+                    out.extend_from_slice(b"path=");
+                    out.extend_from_slice(path.as_bytes());
+                }));
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    let text = String::from_utf8(received).unwrap();
+    assert!(text.contains("Content-Length: 9\r\n"), "{text}");
+    assert!(text.ends_with("path=/one"), "{text}");
+}
+
+#[test]
+fn a_head_request_carries_the_length_of_the_body_it_is_not_sent() {
+    let (mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let mut received = Vec::new();
+    let mut composed = 0;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !read_available(&mut client, &mut received) {
+        let mut tokens = Vec::new();
+        server.pump(|event| {
+            if let HttpEvent::Request { token, .. } = event {
+                tokens.push(token);
+            }
+        });
+        for token in tokens {
+            assert!(server.respond_with(token, 200, &[], |out| {
+                composed += 1;
+                out.extend_from_slice(b"hello");
+            }));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let text = String::from_utf8(received).unwrap();
+    assert_eq!(composed, 1, "the body is composed even though it is not sent");
+    assert!(text.contains("Content-Length: 5\r\n"), "{text}");
+    assert!(text.ends_with("\r\n\r\n"), "{text}");
+}
+
+#[test]
+fn max_headers_reaches_the_whole_parse_scratch() {
+    assert_eq!(HttpConfig::default().with_max_headers(MAX_HEADERS).max_headers, MAX_HEADERS);
+}
+
+#[test]
+#[should_panic(expected = "max_headers must be in 1..=128")]
+fn max_headers_past_the_parse_scratch_is_rejected() {
+    let _ = HttpConfig::default().with_max_headers(MAX_HEADERS + 1);
+}
+
+#[test]
+#[should_panic(expected = "max_headers must be in 1..=128")]
+fn max_headers_of_none_is_rejected() {
+    let _ = HttpConfig::default().with_max_headers(0);
 }
 
 over_transports_and_modes!(
