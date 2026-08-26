@@ -10,7 +10,9 @@ use std::{
 use flux_network::{
     Token,
     http::{HttpConfig, HttpEvent, HttpService},
-    stream::{ConnectionGroupConfig, Endpoint, Framing, Peer, StreamEvent, StreamNetwork},
+    stream::{
+        ConnectionGroupConfig, Endpoint, Framing, Peer, ServiceRef, StreamEvent, StreamNetwork,
+    },
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -47,33 +49,94 @@ fn http_group() -> ConnectionGroupConfig {
     }
 }
 
+/// Who owns the poll a network is driven from.
+#[derive(Clone, Copy)]
+enum Mode {
+    /// The network's own, driven by `drive`.
+    Owned,
+    /// The test's own, driven by the three calls it requires.
+    External,
+}
+
+/// The poll a network is driven from, and what one iteration of it is.
+struct Driver {
+    /// The test's own poll, in External mode; `None` when the network polls.
+    poll: Option<(mio::Poll, mio::Events)>,
+}
+
+impl Driver {
+    /// A network of `mode`, and the driver that runs its iterations.
+    fn build(mode: Mode) -> (Self, StreamNetwork) {
+        match mode {
+            Mode::Owned => (Self { poll: None }, StreamNetwork::default()),
+            Mode::External => {
+                let poll = mio::Poll::new().unwrap();
+                let net =
+                    StreamNetwork::with_registry(poll.registry().try_clone().unwrap(), Token(1000));
+                (Self { poll: Some((poll, mio::Events::with_capacity(64))) }, net)
+            }
+        }
+    }
+
+    /// One nonblocking iteration: one `drive`, or the three calls a
+    /// caller-held poll requires.
+    fn iterate<F>(
+        &mut self,
+        net: &mut StreamNetwork,
+        services: &mut [ServiceRef<'_>],
+        mut unclaimed_handler: F,
+    ) -> bool
+    where
+        F: for<'a> FnMut(StreamEvent<'a>),
+    {
+        let Some((poll, events)) = &mut self.poll else {
+            return net.drive(Some(Duration::ZERO.into()), services, unclaimed_handler);
+        };
+        // The fold is what an External caller turns into its poll timeout;
+        // this one polls without waiting, and calls it for the same
+        // validation every iteration owes the network.
+        let _ = net.next_deadline(services);
+        poll.poll(events, Some(Duration::ZERO)).unwrap();
+        let mut worked = false;
+        for event in &*events {
+            worked |= net.handle_event(event, services, &mut unclaimed_handler);
+        }
+        worked | net.tick(services, &mut unclaimed_handler)
+    }
+}
+
 /// A network carrying one HTTP service, driven and pulled as one.
 struct Http {
     net: StreamNetwork,
-    http: HttpService,
+    service: HttpService,
+    driver: Driver,
 }
 
 impl Http {
-    fn build(group: ConnectionGroupConfig, config: HttpConfig) -> Self {
-        let mut net = StreamNetwork::default();
+    fn build(mode: Mode, group: ConnectionGroupConfig, config: HttpConfig) -> Self {
+        let (driver, mut net) = Driver::build(mode);
         let group = net.add_group(group);
-        let http = HttpService::new(&mut net, group, config);
-        Self { net, http }
+        let service = HttpService::new(&mut net, group, config);
+        Self { net, service, driver }
     }
 
     fn new() -> Self {
-        Self::build(http_group(), HttpConfig::default())
+        Self::new_in(Mode::Owned)
+    }
+
+    fn new_in(mode: Mode) -> Self {
+        Self::build(mode, http_group(), HttpConfig::default())
     }
 
     fn with_config(config: HttpConfig) -> Self {
-        Self::build(http_group(), config)
+        Self::build(Mode::Owned, http_group(), config)
     }
 
     /// One iteration: drive the network, then pull every protocol event.
     fn pump(&mut self, mut handler: impl for<'a> FnMut(HttpEvent<'a>)) {
         self.drive();
         let mut pulled = 0;
-        while let Some(event) = self.http.next_event(&mut self.net) {
+        while let Some(event) = self.service.next_event(&mut self.net) {
             handler(event);
             pulled += 1;
             assert!(pulled < 10_000, "the pull loop delivered the same work forever");
@@ -82,15 +145,16 @@ impl Http {
 
     /// One iteration of the network alone, leaving the events to be pulled.
     fn drive(&mut self) -> bool {
-        self.net.drive(Some(Duration::ZERO.into()), &mut [self.http.as_service()], |_| {})
+        let Self { net, service, driver } = self;
+        driver.iterate(net, &mut [service.as_service()], |_| {})
     }
 
     fn listen(&mut self, endpoint: &Endpoint) {
-        self.http.listen(&mut self.net, endpoint.clone()).unwrap();
+        self.service.listen(&mut self.net, endpoint.clone()).unwrap();
     }
 
     fn connect(&mut self, endpoint: Endpoint) -> Token {
-        self.http.connect(&mut self.net, endpoint)
+        self.service.connect(&mut self.net, endpoint)
     }
 
     fn respond(
@@ -100,7 +164,7 @@ impl Http {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        self.http.respond(&mut self.net, token, status, headers, body)
+        self.service.respond(&mut self.net, token, status, headers, body)
     }
 
     fn request(
@@ -111,15 +175,15 @@ impl Http {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        self.http.request(&mut self.net, token, method, path, headers, body)
+        self.service.request(&mut self.net, token, method, path, headers, body)
     }
 
     fn disconnect(&mut self, token: Token) -> bool {
-        self.http.disconnect(&mut self.net, token)
+        self.service.disconnect(&mut self.net, token)
     }
 
     fn remove(&mut self, token: Token) -> bool {
-        self.http.remove(&mut self.net, token)
+        self.service.remove(&mut self.net, token)
     }
 }
 
@@ -137,6 +201,49 @@ macro_rules! over_both_transports {
         fn $unix() {
             let dir = tempfile::tempdir().unwrap();
             $body(&Endpoint::Unix(dir.path().join("s")));
+        }
+    };
+}
+
+/// Runs one test body over both transports and both poll-ownership modes: the
+/// four tests one behaviour has to pass however the network is driven.
+macro_rules! over_transports_and_modes {
+    ($body:ident, $tcp:ident, $tcp_external:ident, $unix:ident, $unix_external:ident) => {
+        #[test]
+        fn $tcp() {
+            $body(Mode::Owned, &Endpoint::Tcp(unused_addr()));
+        }
+
+        #[test]
+        fn $tcp_external() {
+            $body(Mode::External, &Endpoint::Tcp(unused_addr()));
+        }
+
+        #[test]
+        fn $unix() {
+            let dir = tempfile::tempdir().unwrap();
+            $body(Mode::Owned, &Endpoint::Unix(dir.path().join("s")));
+        }
+
+        #[test]
+        fn $unix_external() {
+            let dir = tempfile::tempdir().unwrap();
+            $body(Mode::External, &Endpoint::Unix(dir.path().join("s")));
+        }
+    };
+}
+
+/// Runs one test body under both poll-ownership modes.
+macro_rules! over_both_modes {
+    ($body:ident, $owned:ident, $external:ident) => {
+        #[test]
+        fn $owned() {
+            $body(Mode::Owned);
+        }
+
+        #[test]
+        fn $external() {
+            $body(Mode::External);
         }
     };
 }
@@ -190,7 +297,11 @@ fn response_len(bytes: &[u8]) -> Option<usize> {
 }
 
 fn server_at(endpoint: &Endpoint) -> Http {
-    let mut server = Http::new();
+    server_at_in(Mode::Owned, endpoint)
+}
+
+fn server_at_in(mode: Mode, endpoint: &Endpoint) -> Http {
+    let mut server = Http::new_in(mode);
     server.listen(endpoint);
     server
 }
@@ -200,13 +311,15 @@ fn server() -> (Http, SocketAddr) {
     (server_at(&Endpoint::Tcp(addr)), addr)
 }
 
-over_both_transports!(
+over_transports_and_modes!(
     get_keepalive_two_requests,
     get_keepalive_two_requests_tcp,
-    get_keepalive_two_requests_unix
+    get_keepalive_two_requests_tcp_external,
+    get_keepalive_two_requests_unix,
+    get_keepalive_two_requests_unix_external
 );
-fn get_keepalive_two_requests(endpoint: &Endpoint) {
-    let mut server = server_at(endpoint);
+fn get_keepalive_two_requests(mode: Mode, endpoint: &Endpoint) {
+    let mut server = server_at_in(mode, endpoint);
     let mut client = connect_client(endpoint);
     let deadline = Instant::now() + TIMEOUT;
     let mut first = Vec::new();
@@ -250,9 +363,15 @@ fn get_keepalive_two_requests(endpoint: &Endpoint) {
     assert!(second.ends_with(b"two"));
 }
 
-over_both_transports!(post_echo_body, post_echo_body_tcp, post_echo_body_unix);
-fn post_echo_body(endpoint: &Endpoint) {
-    let mut server = server_at(endpoint);
+over_transports_and_modes!(
+    post_echo_body,
+    post_echo_body_tcp,
+    post_echo_body_tcp_external,
+    post_echo_body_unix,
+    post_echo_body_unix_external
+);
+fn post_echo_body(mode: Mode, endpoint: &Endpoint) {
+    let mut server = server_at_in(mode, endpoint);
     let body = vec![42; 4096];
     let mut client = connect_client(endpoint);
     client
@@ -335,6 +454,7 @@ fn post_binary_body_lone_lf() {
 fn connection_close_large_body() {
     let addr = unused_addr();
     let mut server = Http::build(
+        Mode::Owned,
         ConnectionGroupConfig { socket_buf_size: Some(1024), ..http_group() },
         HttpConfig::default(),
     );
@@ -414,9 +534,15 @@ fn caller_connection_close_header_sent() {
     assert!(text.ends_with("ok"));
 }
 
-over_both_transports!(pipelined_requests, pipelined_requests_tcp, pipelined_requests_unix);
-fn pipelined_requests(endpoint: &Endpoint) {
-    let mut server = server_at(endpoint);
+over_transports_and_modes!(
+    pipelined_requests,
+    pipelined_requests_tcp,
+    pipelined_requests_tcp_external,
+    pipelined_requests_unix,
+    pipelined_requests_unix_external
+);
+fn pipelined_requests(mode: Mode, endpoint: &Endpoint) {
+    let mut server = server_at_in(mode, endpoint);
     let mut client = connect_client(endpoint);
     client
         .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -442,14 +568,16 @@ fn pipelined_requests(endpoint: &Endpoint) {
     assert!(received.ends_with(b"/two"));
 }
 
-over_both_transports!(
+over_transports_and_modes!(
     client_server_roundtrip,
     client_server_roundtrip_tcp,
-    client_server_roundtrip_unix
+    client_server_roundtrip_tcp_external,
+    client_server_roundtrip_unix,
+    client_server_roundtrip_unix_external
 );
-fn client_server_roundtrip(endpoint: &Endpoint) {
-    let mut server = server_at(endpoint);
-    let mut client = Http::new();
+fn client_server_roundtrip(mode: Mode, endpoint: &Endpoint) {
+    let mut server = server_at_in(mode, endpoint);
+    let mut client = Http::new_in(mode);
     let token = client.connect(endpoint.clone());
     let mut sent = false;
     let mut bodies = Vec::new();
@@ -1197,7 +1325,7 @@ fn serve_two_pipelined_requests(inline_first: bool) -> (Vec<String>, Vec<u8>) {
     while Instant::now() < deadline && !received.ends_with(b"/two") {
         let mut deferred = None;
         server.drive();
-        while let Some(event) = server.http.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event(&mut server.net) {
             if let HttpEvent::Request { token, request, responder } = event {
                 let path = request.path.to_owned();
                 if pulled.is_empty() && !inline_first {
@@ -1247,7 +1375,7 @@ fn serve_the_request_behind_an_answer(inline_first: bool) {
     while Instant::now() < deadline && !answered {
         let mut deferred = None;
         server.drive();
-        while let Some(event) = server.http.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event(&mut server.net) {
             if let HttpEvent::Request { token, request, responder } = event {
                 assert_eq!(request.path, "/one", "{path}");
                 if inline_first {
@@ -1273,7 +1401,7 @@ fn serve_the_request_behind_an_answer(inline_first: bool) {
 
     let mut pulled = false;
     while Instant::now() < deadline && !pulled {
-        while let Some(event) = server.http.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event(&mut server.net) {
             if let HttpEvent::Request { request, responder, .. } = event {
                 assert_eq!(request.method, "POST", "{path}");
                 assert_eq!(request.path, "/two", "{path}");
@@ -1343,7 +1471,7 @@ fn answered_bytes_cost_the_connection_nothing() {
     let mut token = None;
     while Instant::now() < deadline && token.is_none() {
         server.drive();
-        while let Some(event) = server.http.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event(&mut server.net) {
             if let HttpEvent::Request { token: pulled, responder, .. } = event {
                 assert!(responder.respond(200, &[], b""));
                 token = Some(pulled);
@@ -1411,7 +1539,7 @@ fn a_pending_request_survives_a_compaction() {
     while Instant::now() < deadline && pulled.len() < 2 {
         server.drive();
         while pulled.len() < 2 {
-            let Some(event) = server.http.next_event(&mut server.net) else { break };
+            let Some(event) = server.service.next_event(&mut server.net) else { break };
             if let HttpEvent::Request { token, request, responder } = event {
                 pulled.push(request.path.to_owned());
                 if pulled.len() == 1 {
@@ -1517,7 +1645,7 @@ fn a_caller_may_stop_pulling_and_resume_later() {
     let mut deferred = None;
     while Instant::now() < deadline && deferred.is_none() {
         server.drive();
-        if let Some(HttpEvent::Request { token, .. }) = server.http.next_event(&mut server.net) {
+        if let Some(HttpEvent::Request { token, .. }) = server.service.next_event(&mut server.net) {
             deferred = Some(token);
         }
         thread::sleep(Duration::from_millis(1));
@@ -1607,7 +1735,7 @@ fn a_pending_request_reports_work_and_holds_off_the_sweep() {
     let mut token = None;
     while Instant::now() < deadline && token.is_none() {
         server.drive();
-        while let Some(event) = server.http.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event(&mut server.net) {
             if let HttpEvent::Request { token: pulled, .. } = event {
                 token = Some(pulled);
                 break
@@ -1644,7 +1772,7 @@ fn work_is_reported_after_an_inline_answer_stops_the_pull() {
     let mut answered = false;
     while Instant::now() < deadline && !answered {
         server.drive();
-        while let Some(event) = server.http.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event(&mut server.net) {
             if let HttpEvent::Request { request, responder, .. } = event {
                 assert_eq!(request.path, "/one");
                 assert!(responder.respond(200, &[], b"one"));
@@ -1657,7 +1785,7 @@ fn work_is_reported_after_an_inline_answer_stops_the_pull() {
     assert!(answered, "no request arrived");
 
     assert!(server.drive(), "the request behind the answered one is work");
-    match server.http.next_event(&mut server.net) {
+    match server.service.next_event(&mut server.net) {
         Some(HttpEvent::Request { request, responder, .. }) => {
             assert_eq!(request.path, "/two");
             assert!(responder.respond(200, &[], b"two"));
@@ -1691,7 +1819,7 @@ fn a_blocking_drive_wakes_for_the_idle_sweep() {
         drop(std::net::TcpStream::connect(addr));
     });
     let started = Instant::now();
-    server.net.drive(None, &mut [server.http.as_service()], |_| {});
+    server.net.drive(None, &mut [server.service.as_service()], |_| {});
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(100), "returned at once: {waited:?}");
     assert!(waited < Duration::from_secs(2), "the sweep deadline was not folded: {waited:?}");
@@ -1714,14 +1842,14 @@ fn a_blocking_drive_wakes_for_a_connection() {
         drop((early, late));
     });
     let started = Instant::now();
-    let worked = server.net.drive(None, &mut [server.http.as_service()], |_| {});
+    let worked = server.net.drive(None, &mut [server.service.as_service()], |_| {});
     let waited = started.elapsed();
     assert!(worked, "an accepted connection is work");
     assert!(waited >= Duration::from_millis(150), "the drive did not block: {waited:?}");
     assert!(waited < Duration::from_secs(2), "the drive missed the connection: {waited:?}");
 
     let mut accepted = false;
-    while let Some(event) = server.http.next_event(&mut server.net) {
+    while let Some(event) = server.service.next_event(&mut server.net) {
         accepted |= matches!(event, HttpEvent::Accepted { .. });
     }
     assert!(accepted, "the connection that woke the poll was not delivered");
@@ -1790,9 +1918,13 @@ fn an_accepted_connection_is_announced_before_its_first_request() {
     assert_eq!(order, ["accepted", "request"]);
 }
 
-#[test]
-fn two_services_on_one_network_keep_their_own_events() {
-    let mut net = StreamNetwork::default();
+over_both_modes!(
+    two_services_on_one_network_keep_their_own_events,
+    two_services_on_one_network_keep_their_own_events_owned,
+    two_services_on_one_network_keep_their_own_events_external
+);
+fn two_services_on_one_network_keep_their_own_events(mode: Mode) {
+    let (mut driver, mut net) = Driver::build(mode);
     let first_group = net.add_group(ConnectionGroupConfig { name: "first", ..http_group() });
     let second_group = net.add_group(ConnectionGroupConfig { name: "second", ..http_group() });
     let mut first = HttpService::new(&mut net, first_group, HttpConfig::default());
@@ -1811,11 +1943,9 @@ fn two_services_on_one_network_keep_their_own_events() {
     let mut second_paths = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && (first_paths.is_empty() || second_paths.is_empty()) {
-        net.drive(
-            Some(Duration::ZERO.into()),
-            &mut [first.as_service(), second.as_service()],
-            |event| panic!("no unclaimed group exists: {:?}", event_group(&event)),
-        );
+        driver.iterate(&mut net, &mut [first.as_service(), second.as_service()], |event| {
+            panic!("no unclaimed group exists: {:?}", event_group(&event))
+        });
         while let Some(event) = first.next_event(&mut net) {
             if let HttpEvent::Request { request, responder, .. } = event {
                 first_paths.push(request.path.to_owned());
