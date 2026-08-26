@@ -67,7 +67,7 @@ mod tests {
     };
 
     use flux_timing::{Duration, Instant};
-    use mio::Token;
+    use mio::{Events, Poll, Token};
 
     use super::{ServiceRef, private::ServiceDriver};
     use crate::stream::{
@@ -174,6 +174,33 @@ mod tests {
             framing: Framing::Raw,
             ..ConnectionGroupConfig::default()
         })
+    }
+
+    /// A poll the test owns, and the External-mode network registered on it.
+    struct External {
+        poll: Poll,
+        events: Events,
+    }
+
+    impl External {
+        fn build() -> (Self, StreamNetwork) {
+            let poll = Poll::new().unwrap();
+            let network =
+                StreamNetwork::with_registry(poll.registry().try_clone().unwrap(), Token(100));
+            (Self { poll, events: Events::with_capacity(16) }, network)
+        }
+
+        /// One iteration of the loop a caller-held poll requires.
+        fn iterate(&mut self, network: &mut StreamNetwork, probe: &mut Probe) -> bool {
+            let mut services = [probe.as_service()];
+            let _ = network.next_deadline(&services);
+            self.poll.poll(&mut self.events, Some(std::time::Duration::from_millis(1))).unwrap();
+            let mut worked = false;
+            for event in &self.events {
+                worked |= network.handle_event(event, &mut services, |_| {});
+            }
+            worked | network.tick(&mut services, |_| {})
+        }
     }
 
     /// Drives one service until it has seen what the test waits for.
@@ -291,6 +318,37 @@ mod tests {
         // next drive delivers it as maintenance, before any tick.
         assert!(network.disconnect(accepted));
         network.drive(Some(Duration::ZERO), &mut [probe.as_service()], |_| {});
+
+        assert!(
+            matches!(probe.steps.as_slice(), [Step::Disconnected(token), Step::Tick(_)]
+                if *token == accepted),
+            "{:?}",
+            probe.steps
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn an_external_tick_delivers_a_maintenance_disconnect_before_the_tick() {
+        let (mut external, mut network) = External::build();
+        let group = raw_group(&mut network, "kicked");
+        let addr = unused_addr();
+        network.listen(group, Endpoint::Tcp(addr)).unwrap();
+        network.claim_group(group);
+        let mut probe = Probe::new(group);
+        let client = StdTcpStream::connect(addr).unwrap();
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::time::Instant::now() < deadline && probe.accepted().is_none() {
+            external.iterate(&mut network, &mut probe);
+        }
+        let accepted = probe.accepted().expect("the service never accepted the client");
+        probe.steps.clear();
+
+        // Disconnecting outside a driver call leaves the event pending, so the
+        // maintenance the next tick runs delivers it, before that tick.
+        assert!(network.disconnect(accepted));
+        assert!(network.tick(&mut [probe.as_service()], |_| {}));
 
         assert!(
             matches!(probe.steps.as_slice(), [Step::Disconnected(token), Step::Tick(_)]

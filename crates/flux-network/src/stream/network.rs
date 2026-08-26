@@ -6,7 +6,7 @@ use std::{
 
 use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos, Repeater};
-use mio::{Events, Interest, Poll, Registry, Token, event::Event};
+use mio::{Events, Interest, Poll, Registry, Token, Waker, event::Event};
 use tracing::{debug, error, info, warn};
 
 use super::{
@@ -27,6 +27,11 @@ const INITIAL_SEND_BUFFER_SIZE: usize = 32 * 1024;
 const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_BACKLOG_WARN_BYTES: usize = 64 * 1024 * 1024;
 const BACKLOG_WARNING_INTERVAL_SECS: u64 = 10;
+// Reserved for Owned-mode wakeups; allocation stops before it.
+const WAKER_TOKEN: Token = Token(usize::MAX);
+const EXTERNAL_POLLS: &str =
+    "poll this external network yourself, then call next_deadline, handle_event and tick";
+const OWNED_POLLS: &str = "this network polls itself: use StreamNetwork::drive";
 
 /// Identifies a set of connections using the same application protocol and
 /// socket configuration.
@@ -353,12 +358,17 @@ struct PendingDisconnect {
     peer: Peer,
 }
 
+/// Everything the network holds that never polls: it registers its sockets on
+/// the registry it was given, whoever owns the poll behind it.
 struct NetworkState {
-    poll: Poll,
+    registry: Registry,
     groups: Vec<GroupState>,
     listeners: Vec<Listener>,
     connections: Vec<Connection>,
     pending_disconnects: Vec<PendingDisconnect>,
+    /// The lowest token this network allocates. Every lower token belongs to
+    /// a source the caller registered on its own poll.
+    token_base: Token,
     next_token: usize,
     /// Frames staged for the next socket write, each as a contiguous
     /// `[header][payload]` for length-prefixed groups or bare bytes for raw
@@ -366,24 +376,33 @@ struct NetworkState {
     send_buffer: Vec<u8>,
 }
 
-impl Default for NetworkState {
-    fn default() -> Self {
+impl NetworkState {
+    fn new(registry: Registry, token_base: Token) -> Self {
         Self {
-            poll: Poll::new().expect("couldn't set up a poll for the stream network"),
+            registry,
             groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
             listeners: Vec::with_capacity(INITIAL_LISTENER_CAPACITY),
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             pending_disconnects: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
-            next_token: 0,
+            token_base,
+            next_token: token_base.0,
             send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
         }
     }
-}
 
-impl NetworkState {
+    /// Whether `token` is one this network allocated: at or above its base,
+    /// and below the high-water mark of its allocation. Tokens are never
+    /// reused, so anything outside that range is a source the caller
+    /// registered on its own poll — its waker included, wherever the caller
+    /// put it.
+    fn is_ours(&self, token: Token) -> bool {
+        (self.token_base.0..self.next_token).contains(&token.0)
+    }
+
     fn next_token(&mut self) -> Token {
         let token = Token(self.next_token);
-        self.next_token = self.next_token.checked_add(1).expect("stream token space exhausted");
+        assert!(token != WAKER_TOKEN, "stream token space exhausted");
+        self.next_token += 1;
         token
     }
 
@@ -397,7 +416,7 @@ impl NetworkState {
         }
         let mut socket = ListenSocket::bind(endpoint)?;
         let token = self.next_token();
-        self.poll.registry().register(&mut socket, token, Interest::READABLE)?;
+        self.registry.register(&mut socket, token, Interest::READABLE)?;
         self.listeners.push(Listener { token, group, socket });
         Ok(())
     }
@@ -441,7 +460,7 @@ impl NetworkState {
         if let Some(size) = socket_buf_size {
             set_socket_buf_size(&socket, size);
         }
-        if let Err(err) = self.poll.registry().register(&mut socket, token, Interest::WRITABLE) {
+        if let Err(err) = self.registry.register(&mut socket, token, Interest::WRITABLE) {
             warn!(?err, %peer, "couldn't register connecting stream");
             let _ = socket.shutdown(Shutdown::Both);
             return;
@@ -457,7 +476,7 @@ impl NetworkState {
         for index in (0..self.listeners.len()).rev() {
             if self.listeners[index].group == group {
                 let mut listener = self.listeners.swap_remove(index);
-                let _ = self.poll.registry().deregister(&mut listener.socket);
+                let _ = self.registry.deregister(&mut listener.socket);
             }
         }
         for index in (0..self.connections.len()).rev() {
@@ -539,7 +558,7 @@ impl NetworkState {
             let Err(err) = socket.set_nodelay()
         {
             warn!(?err, %peer, "couldn't set nodelay on tcp stream");
-            let _ = self.poll.registry().deregister(&mut socket);
+            let _ = self.registry.deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
@@ -547,12 +566,12 @@ impl NetworkState {
             let Err(err) = socket.set_keepalive()
         {
             warn!(?err, %peer, "couldn't set keepalive on tcp stream");
-            let _ = self.poll.registry().deregister(&mut socket);
+            let _ = self.registry.deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
         socket.set_user_timeout(config.tcp.user_timeout_ms);
-        if let Err(err) = self.poll.registry().reregister(&mut socket, token, Interest::READABLE) {
+        if let Err(err) = self.registry.reregister(&mut socket, token, Interest::READABLE) {
             warn!(?err, %peer, "couldn't register connected stream");
             let _ = socket.shutdown(Shutdown::Both);
             return false;
@@ -565,15 +584,10 @@ impl NetworkState {
                 write_frame_header(&mut header, message.len(), Nanos::now());
                 header
             });
-            if stream.write_frame(
-                self.poll.registry(),
-                header.as_ref(),
-                message,
-                config,
-                &mut timers,
-            ) == StreamState::Disconnected
+            if stream.write_frame(&self.registry, header.as_ref(), message, config, &mut timers) ==
+                StreamState::Disconnected
             {
-                stream.close(self.poll.registry());
+                stream.close(&self.registry);
                 self.connections[index].timers = timers;
                 return false;
             }
@@ -622,9 +636,7 @@ impl NetworkState {
                     continue;
                 }
                 socket.set_user_timeout(config.tcp.user_timeout_ms);
-                if let Err(err) =
-                    self.poll.registry().register(&mut socket, token, Interest::READABLE)
-                {
+                if let Err(err) = self.registry.register(&mut socket, token, Interest::READABLE) {
                     warn!(?err, %peer, "couldn't register accepted stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
@@ -640,14 +652,14 @@ impl NetworkState {
                         header
                     });
                     if stream.write_frame(
-                        self.poll.registry(),
+                        &self.registry,
                         header.as_ref(),
                         message,
                         config,
                         &mut timers,
                     ) == StreamState::Disconnected
                     {
-                        stream.close(self.poll.registry());
+                        stream.close(&self.registry);
                         continue;
                     }
                 }
@@ -699,7 +711,7 @@ impl NetworkState {
             let connection = &mut self.connections[index];
             let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
             let state = stream.poll_with(
-                self.poll.registry(),
+                &self.registry,
                 event,
                 config,
                 &mut connection.timers,
@@ -723,12 +735,12 @@ impl NetworkState {
         match old_state {
             ConnectionState::Disconnected => false,
             ConnectionState::Connecting(mut socket) => {
-                let _ = self.poll.registry().deregister(&mut socket);
+                let _ = self.registry.deregister(&mut socket);
                 let _ = socket.shutdown(Shutdown::Both);
                 false
             }
             ConnectionState::Connected(mut stream) => {
-                stream.close(self.poll.registry());
+                stream.close(&self.registry);
                 true
             }
         }
@@ -835,7 +847,7 @@ impl NetworkState {
         let connection = &mut self.connections[index];
         let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
         let state = stream.write_frame(
-            self.poll.registry(),
+            &self.registry,
             None,
             &self.send_buffer,
             config,
@@ -1009,24 +1021,82 @@ impl NetworkState {
 /// A group is either **service-owned** — a protocol layer claimed it and the
 /// network routes its events to that service — or an **unclaimed group**, whose
 /// events reach the handler passed to [`Self::drive`] as they arrive.
+///
+/// Who owns the poll is fixed at construction. [`StreamNetwork::default`]
+/// makes an **Owned** network, which creates its own poll, drives it in
+/// [`Self::drive`] and hands out a [`Self::waker`] for it.
+/// [`Self::with_registry`] makes an **External** one, which registers on a
+/// registry cloned from the caller's poll and never polls: the caller polls
+/// and makes the three calls [`Self::next_deadline`], [`Self::handle_event`]
+/// and [`Self::tick`]. The [`crate::stream`] module documents the External
+/// loop in full.
 pub struct StreamNetwork {
-    events: Events,
+    poll: PollMode,
     state: NetworkState,
     /// Whether a service owns the group at each index.
     claimed: Vec<bool>,
 }
 
+/// Who owns the poll the network's sockets are registered with.
+enum PollMode {
+    /// The network made the poll and drives it in [`StreamNetwork::drive`].
+    /// `waker_taken` records that its one waker has been handed out.
+    Owned { poll: Poll, events: Events, waker_taken: bool },
+    /// The caller polls; the network only registers on the registry it was
+    /// handed, and never blocks.
+    External,
+}
+
+/// Builds an Owned-mode network: it creates the poll, drives it in
+/// [`Self::drive`] and hands out a [`Self::waker`] for it.
 impl Default for StreamNetwork {
     fn default() -> Self {
+        let poll = Poll::new().expect("couldn't set up a poll for the stream network");
+        let registry = poll
+            .registry()
+            .try_clone()
+            .expect("couldn't clone the registry of the stream network poll");
         Self {
-            events: Events::with_capacity(EVENTS_CAPACITY),
-            state: NetworkState::default(),
+            poll: PollMode::Owned {
+                poll,
+                events: Events::with_capacity(EVENTS_CAPACITY),
+                waker_taken: false,
+            },
+            state: NetworkState::new(registry, Token(0)),
             claimed: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
         }
     }
 }
 
 impl StreamNetwork {
+    /// Builds a network on a poll the caller owns: External mode.
+    ///
+    /// `registry` is a `try_clone` of that poll's registry, which is where
+    /// the network registers its listeners and connections; it never polls,
+    /// so [`Self::drive`] and [`Self::waker`] are refused. The caller polls
+    /// and makes the three calls a caller-held poll requires:
+    /// [`Self::next_deadline`] to fold into its own timeout,
+    /// [`Self::handle_event`] per readiness event and [`Self::tick`] once per
+    /// iteration. The [`crate::stream`] module documents that loop in full.
+    ///
+    /// Tokens are allocated upward from `token_base`; every token the caller
+    /// uses for a source of its own — its waker included — must stay below
+    /// it, or above everything this network has allocated, which is what
+    /// makes [`Self::handle_event`] able to hand those events back.
+    ///
+    /// One External network per poll is the model. A second network's tokens
+    /// climb from a base of their own, and this one cannot tell a token above
+    /// its own high-water mark from one it will allocate next; give two
+    /// networks two polls.
+    #[must_use]
+    pub fn with_registry(registry: Registry, token_base: Token) -> Self {
+        Self {
+            poll: PollMode::External,
+            state: NetworkState::new(registry, token_base),
+            claimed: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
+        }
+    }
+
     /// Adds a protocol group and returns its handle.
     #[must_use = "the group handle identifies listeners and outbound endpoints"]
     pub fn add_group(&mut self, config: ConnectionGroupConfig) -> ConnectionGroup {
@@ -1083,11 +1153,6 @@ impl StreamNetwork {
         self.release_group(group);
     }
 
-    /// The earliest instant the network's own timers need a driver call at.
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.state.next_deadline()
-    }
-
     /// Adds a listener to `group`.
     ///
     /// An [`Endpoint::Unix`] listener creates its socket file with mode `0777`
@@ -1107,8 +1172,9 @@ impl StreamNetwork {
         self.state.connect(group, endpoint)
     }
 
-    /// Runs one iteration of the network: maintenance, one poll, event
-    /// delivery and one tick per service. Returns whether anything happened.
+    /// Runs one iteration of an Owned-mode network: maintenance, one poll,
+    /// event delivery and one tick per service. Returns whether anything
+    /// happened.
     ///
     /// The poll blocks for `max_timeout` at the longest, and for less when the
     /// network's own timers or a service's [`ServiceRef`] deadline fall sooner;
@@ -1116,7 +1182,8 @@ impl StreamNetwork {
     /// service-owned group go to that service, the rest to `unclaimed_handler`,
     /// which borrows each payload for the duration of the call. Protocol
     /// events the services produced are pulled from the services
-    /// afterwards.
+    /// afterwards. A wake from [`Self::waker`] returns from the poll and is
+    /// not work of its own.
     ///
     /// The poll wait is where an iteration spends its time, so the ticks that
     /// follow it are given the time after it: a timer a tick starts runs from
@@ -1124,9 +1191,11 @@ impl StreamNetwork {
     /// in the same iteration rather than the next.
     ///
     /// # Panics
-    /// Every service-owned group must appear exactly once among `services`. A
-    /// group whose service is missing or doubled is a configuration error and
-    /// panics before the call does anything else.
+    /// A network built with [`Self::with_registry`] is driven from the
+    /// caller's poll and refuses this call. Every service-owned group must
+    /// appear exactly once among `services`; a group whose service is missing
+    /// or doubled is a configuration error and panics before the call does
+    /// anything else.
     pub fn drive<F>(
         &mut self,
         max_timeout: Option<Duration>,
@@ -1136,30 +1205,30 @@ impl StreamNetwork {
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
+        assert!(matches!(self.poll, PollMode::Owned { .. }), "{EXTERNAL_POLLS}");
         let now = Instant::now();
         self.validate(services);
 
-        let mut routed = false;
-        {
-            let claimed = &self.claimed;
-            let mut route = |event: StreamEvent<'_>| {
-                route_event(claimed, services, &mut unclaimed_handler, &mut routed, event);
-            };
-            self.state.drain_pending_disconnects(&mut route);
-        }
-        let reconnected = self.state.maybe_reconnect(now);
-
+        let mut worked = self.maintenance(now, services, &mut unclaimed_handler);
         let timeout = self.poll_timeout(max_timeout, services, now);
-        match self.state.poll.poll(&mut self.events, timeout) {
+        let PollMode::Owned { poll, events, .. } = &mut self.poll else {
+            unreachable!("the mode is checked above");
+        };
+        match poll.poll(events, timeout) {
             Ok(()) => {
-                let claimed = &self.claimed;
-                let mut route = |event: StreamEvent<'_>| {
-                    route_event(claimed, services, &mut unclaimed_handler, &mut routed, event);
-                };
-                for event in &self.events {
-                    self.state.handle_event(event, &mut route);
+                for event in &*events {
+                    // A wake asks the poll to return and nothing more, so it
+                    // reaches neither a service nor the did-work result.
+                    if event.token() != WAKER_TOKEN {
+                        worked |= route_ready(
+                            &mut self.state,
+                            &self.claimed,
+                            event,
+                            services,
+                            &mut unclaimed_handler,
+                        );
+                    }
                 }
-                self.state.drain_pending_disconnects(&mut route);
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => flux_utils::safe_panic!("couldn't poll the stream network: {err}"),
@@ -1167,24 +1236,175 @@ impl StreamNetwork {
 
         // The instant this iteration began is older than the poll wait it has
         // just come out of, which may have been the whole of a timeout.
-        let tick_now = Instant::now();
-        let mut pullable = false;
-        for service in services.iter_mut() {
-            pullable |= service.tick(self, tick_now);
-        }
-        routed || reconnected || pullable
+        let pullable = self.tick_services(services, Instant::now());
+        worked || pullable
     }
 
-    /// Runs one nonblocking iteration of a network holding unclaimed groups
-    /// only.
+    /// The earliest instant this network or one of `services` needs a call at:
+    /// the fold of the network's own timers with every service deadline.
+    ///
+    /// An External-mode caller folds only its own timers against this and
+    /// converts the result into the timeout of its poll; `None` leaves that
+    /// poll free to block until a socket is ready.
+    ///
+    /// # Panics
+    /// An Owned-mode network folds its deadlines inside [`Self::drive`], and
+    /// refuses this call. Every service-owned group must appear exactly once
+    /// among `services`, as for [`Self::drive`] — an omitted service is a
+    /// configuration error the first call reports, not one that waits for a
+    /// deadline to be missed.
+    pub fn next_deadline(&self, services: &[ServiceRef<'_>]) -> Option<Instant> {
+        assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
+        self.validate(services);
+        self.fold_deadline(services)
+    }
+
+    /// Takes one readiness event from the caller's poll, reporting whether it
+    /// was this network's.
+    ///
+    /// The network's tokens run from the base it was built with up to the
+    /// high-water mark of its allocation. A token outside that range belongs
+    /// to a source the caller registered — its waker included — and is handed
+    /// straight back as `false`, untouched and unlogged. A token inside it is
+    /// this network's: the event is routed to the service owning its group, or
+    /// to `unclaimed_handler`, along with any disconnect that handling it
+    /// produced, and the call reports `true`. A token the network no longer
+    /// knows is one of its own that closed since the poll returned: ours,
+    /// and ignored.
+    ///
+    /// `true` means this network owns the token, not that routing produced an
+    /// event. Folding it into a did-work signal, as the [`crate::stream`] loop
+    /// does, is conservative: stale or otherwise non-producing readiness may
+    /// count as one busy iteration.
+    ///
+    /// # Panics
+    /// An Owned-mode network polls itself, and refuses this call. An event of
+    /// this network's validates `services` before it is routed, exactly as
+    /// [`Self::drive`] does; an event of the caller's is handed back without
+    /// looking at them, since [`Self::next_deadline`] and [`Self::tick`]
+    /// validate every iteration anyway.
+    pub fn handle_event<F>(
+        &mut self,
+        event: &Event,
+        services: &mut [ServiceRef<'_>],
+        mut unclaimed_handler: F,
+    ) -> bool
+    where
+        F: for<'a> FnMut(StreamEvent<'a>),
+    {
+        assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
+        if !self.state.is_ours(event.token()) {
+            return false;
+        }
+        self.validate(services);
+        route_ready(&mut self.state, &self.claimed, event, services, &mut unclaimed_handler);
+        true
+    }
+
+    /// Runs the iteration work that owns no poll: the maintenance due now —
+    /// pending disconnects, routed to their services, and reconnect attempts —
+    /// then one tick per service in slice order. Returns whether anything
+    /// happened, a service with protocol events left to pull included.
+    ///
+    /// A transport event maintenance produces reaches its service before that
+    /// service's tick, so protocol state never lags transport state by an
+    /// iteration. An External-mode caller makes this call once per iteration,
+    /// after handing over every event its poll returned.
+    ///
+    /// # Panics
+    /// An Owned-mode network runs these phases inside [`Self::drive`], and
+    /// refuses this call. Every service-owned group must appear exactly once
+    /// among `services`, as for [`Self::drive`].
+    pub fn tick<F>(&mut self, services: &mut [ServiceRef<'_>], mut unclaimed_handler: F) -> bool
+    where
+        F: for<'a> FnMut(StreamEvent<'a>),
+    {
+        assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
+        let now = Instant::now();
+        self.validate(services);
+        let worked = self.maintenance(now, services, &mut unclaimed_handler);
+        let pullable = self.tick_services(services, now);
+        worked || pullable
+    }
+
+    /// A waker for this network's own poll, on a token the event loop
+    /// swallows: waking it makes a blocked [`Self::drive`] return, and counts
+    /// as no work of its own. Under `flux/park` a tile hands this waker to
+    /// `SpineAdapter::register_waker`, after which spine work interrupts the
+    /// poll.
+    ///
+    /// A wake is delivered only while the waker that sent it is alive, so it
+    /// belongs somewhere that outlives the poll it wakes —
+    /// `register_waker` takes ownership of it, which is that somewhere.
+    ///
+    /// # Panics
+    /// A network hands out one waker: a poll takes a single one, and asking
+    /// twice panics. An External-mode network has no poll of its own, and
+    /// refuses the call: build the waker on the caller's poll instead, on one
+    /// of the caller's own tokens.
+    pub fn waker(&mut self) -> io::Result<Waker> {
+        let PollMode::Owned { poll, waker_taken, .. } = &mut self.poll else {
+            panic!(
+                "this network is driven from a caller-owned poll: build the waker on that poll, \
+                 on a token below the base the network was built with"
+            );
+        };
+        assert!(
+            !*waker_taken,
+            "a stream network hands out one waker; keep the first (SpineAdapter::register_waker \
+             stores it for the process lifetime)"
+        );
+        let waker = Waker::new(poll.registry(), WAKER_TOKEN)?;
+        *waker_taken = true;
+        Ok(waker)
+    }
+
+    /// Runs the maintenance due at `now`: the disconnects left pending by
+    /// work outside a driver call, routed to their services, and one reconnect
+    /// attempt per outbound endpoint whose group is due one.
+    fn maintenance<F>(
+        &mut self,
+        now: Instant,
+        services: &mut [ServiceRef<'_>],
+        unclaimed_handler: &mut F,
+    ) -> bool
+    where
+        F: for<'a> FnMut(StreamEvent<'a>),
+    {
+        let mut routed = false;
+        {
+            let claimed = &self.claimed;
+            let mut route = |event: StreamEvent<'_>| {
+                route_event(claimed, services, unclaimed_handler, &mut routed, event);
+            };
+            self.state.drain_pending_disconnects(&mut route);
+        }
+        let reconnected = self.state.maybe_reconnect(now);
+        routed || reconnected
+    }
+
+    /// Ticks every service once, in slice order, reporting whether any of them
+    /// has protocol events left to pull.
+    fn tick_services(&mut self, services: &mut [ServiceRef<'_>], now: Instant) -> bool {
+        let mut pullable = false;
+        for service in services.iter_mut() {
+            pullable |= service.tick(self, now);
+        }
+        pullable
+    }
+
+    /// Runs one nonblocking iteration of an Owned-mode network holding
+    /// unclaimed groups only.
     ///
     /// # Panics
     /// A network with services is driven with [`Self::drive`], which is what
-    /// delivers their events; polling it without them panics.
+    /// delivers their events; polling it without them panics. So does a
+    /// network built with [`Self::with_registry`], which owns no poll.
     pub fn poll_with<F>(&mut self, handler: F)
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
+        assert!(matches!(self.poll, PollMode::Owned { .. }), "{EXTERNAL_POLLS}");
         if let Some(index) = self.claimed.iter().position(|claimed| *claimed) {
             panic!(
                 "connection group {index} has a service — drive the network with \
@@ -1218,6 +1438,16 @@ impl StreamNetwork {
         }
     }
 
+    /// The earliest instant the network's own timers or one of `services`
+    /// needs a call at, taking the service set as given.
+    fn fold_deadline(&self, services: &[ServiceRef<'_>]) -> Option<Instant> {
+        self.state
+            .next_deadline()
+            .into_iter()
+            .chain(services.iter().filter_map(|service| service.next_deadline()))
+            .min()
+    }
+
     /// Folds the caller's cap, the network's own timers and every service's
     /// deadline into the timeout of one poll.
     fn poll_timeout(
@@ -1226,11 +1456,7 @@ impl StreamNetwork {
         services: &[ServiceRef<'_>],
         now: Instant,
     ) -> Option<std::time::Duration> {
-        let deadline = self
-            .next_deadline()
-            .into_iter()
-            .chain(services.iter().filter_map(|service| service.next_deadline()))
-            .min();
+        let deadline = self.fold_deadline(services);
         let timeout = match (max_timeout, deadline.map(|deadline| deadline.saturating_sub(now))) {
             (Some(max), Some(next)) => Some(max.min(next)),
             (max, next) => max.or(next),
@@ -1315,6 +1541,28 @@ impl StreamNetwork {
     pub fn remove(&mut self, token: Token) -> bool {
         self.state.remove(token)
     }
+}
+
+/// Routes one readiness event of a socket this network owns, together with
+/// the disconnects handling it produced, and reports whether anything reached
+/// a service or the unclaimed handler.
+fn route_ready<F>(
+    state: &mut NetworkState,
+    claimed: &[bool],
+    event: &Event,
+    services: &mut [ServiceRef<'_>],
+    unclaimed_handler: &mut F,
+) -> bool
+where
+    F: for<'a> FnMut(StreamEvent<'a>),
+{
+    let mut routed = false;
+    let mut route = |event: StreamEvent<'_>| {
+        route_event(claimed, services, unclaimed_handler, &mut routed, event);
+    };
+    state.handle_event(event, &mut route);
+    state.drain_pending_disconnects(&mut route);
+    routed
 }
 
 /// Hands one event to the service owning its group, or to the unclaimed handler
