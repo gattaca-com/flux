@@ -237,6 +237,10 @@ impl Responder<'_> {
     /// The status must be in `200..=599`; `Content-Length` and
     /// `Transfer-Encoding` are the service's to write, and a `Connection`
     /// header only feeds the close decision.
+    ///
+    /// The request stops counting against connection limits here. Its bytes
+    /// are reclaimed on the next pull or network tick, after the event's
+    /// borrow ends. [`HttpService::respond`] reclaims before it returns.
     pub fn respond(self, status: u16, headers: &[(&str, &str)], body: &[u8]) -> bool {
         respond_to(self.net, self.state, self.token, status, headers, body)
     }
@@ -244,9 +248,8 @@ impl Responder<'_> {
 
 /// What answering one request touches, and all a [`Responder`] may reach.
 ///
-/// `req_end` marks a parsed request awaiting its response; `consumed` is the
-/// accounting cursor, and bytes below it are answered and cost the connection
-/// nothing against its limits, whether or not they have been reclaimed yet.
+/// `req_end` marks a request awaiting its response. `consumed` excludes
+/// answered bytes from limits before they are reclaimed.
 struct ConnState {
     phase: Phase,
     close: bool,
@@ -412,7 +415,7 @@ pub struct HttpService {
     headers: Vec<HeaderRange>,
     /// The body of the last chunked response, decoded.
     decoded: Vec<u8>,
-    /// The connection the last pulled event left bookkeeping for.
+    /// The connection awaiting bookkeeping from the last pulled event.
     last: Option<Token>,
 }
 
@@ -551,6 +554,9 @@ impl HttpService {
     /// the response was written.
     ///
     /// Each call completes exactly one request for `token`.
+    ///
+    /// Unlike [`Responder::respond`], this path holds no event borrow, so it
+    /// reclaims answered bytes and queues a pipelined request before returning.
     pub fn respond(
         &mut self,
         net: &mut StreamNetwork,
@@ -641,8 +647,7 @@ impl HttpService {
         self.ready.len() - self.ready_cursor
     }
 
-    /// Applies what the previous event left behind: the bytes it answered are
-    /// reclaimed, and a connection with more to parse queues up again.
+    /// Applies bookkeeping deferred by the last pulled event.
     fn apply_bookkeeping(&mut self) {
         let Some(token) = self.last.take() else { return };
         let Some(index) = self.index_of(token) else { return };
@@ -1089,10 +1094,7 @@ impl private::ServiceDriver for HttpService {
     }
 
     fn tick(&mut self, net: &mut StreamNetwork, now: Instant) -> bool {
-        // No event is live inside a driver call, so what the last pull left
-        // behind is applied here rather than at the next pull: a connection
-        // holding a pipelined request is pullable work, and saying otherwise
-        // would park a caller that answered inline and stopped pulling.
+        // Apply deferred bookkeeping before reporting pullable work.
         self.apply_bookkeeping();
         for index in 0..self.conns.len() {
             let conn = &self.conns[index];
