@@ -1892,7 +1892,7 @@ pub fn reason_phrase(status: u16) -> &'static str {
 mod tests {
     use std::{
         io::Write as _,
-        net::{Ipv4Addr, SocketAddr, TcpStream},
+        net::{Ipv4Addr, TcpStream},
     };
 
     use flux_timing::{Duration, Instant};
@@ -1938,13 +1938,6 @@ mod tests {
         assert_eq!(span(buffer, &buffer[4..9], 0), 4..9);
         assert_eq!(span(buffer, &buffer[4..9], 100), 104..109);
         assert_eq!(span(buffer, b"", 7), 7..7);
-    }
-
-    fn unused_addr() -> SocketAddr {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        addr
     }
 
     /// A service on a raw group of its own, with no listener and no
@@ -2080,8 +2073,11 @@ mod tests {
         fn with_two_requests() -> (Self, usize) {
             let mut net = StreamNetwork::default();
             let mut http = bare_service(&mut net);
-            let addr = unused_addr();
-            http.listen(&mut net, Endpoint::Tcp(addr)).unwrap();
+            // Port 0 leaves the port to the kernel, and the listener reports
+            // the address a client must dial.
+            let bound =
+                http.listen(&mut net, Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())).unwrap();
+            let Endpoint::Tcp(addr) = bound else { unreachable!("the harness listens on TCP") };
             let mut client = TcpStream::connect(addr).unwrap();
             let first = padded_request("/one", 64);
             client.write_all(&[first.clone(), padded_request("/two", 192)].concat()).unwrap();
