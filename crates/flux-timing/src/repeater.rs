@@ -42,6 +42,13 @@ impl Repeater {
         }
     }
 
+    /// The instant from which the next [`Self::fired_at`] fires, for a caller
+    /// folding this repeater into a poll timeout.
+    #[inline]
+    pub fn next_fire(&self) -> Instant {
+        self.last_acted + self.interval
+    }
+
     #[inline]
     pub fn interval(&self) -> Duration {
         self.interval
@@ -98,5 +105,15 @@ mod tests {
         assert!(repeater.fired_at(Instant(10)));
         assert!(!repeater.fired_at(Instant(19)));
         assert!(repeater.fired_at(Instant(20)));
+    }
+
+    #[test]
+    fn next_fire_is_the_instant_the_next_fire_happens_at() {
+        let mut repeater = Repeater::every(Duration(10));
+        assert_eq!(repeater.next_fire(), Instant(10));
+        assert!(repeater.fired_at(Instant(12)));
+        assert_eq!(repeater.next_fire(), Instant(22));
+        assert!(!repeater.fired_at(Instant(21)));
+        assert!(repeater.fired_at(repeater.next_fire()));
     }
 }

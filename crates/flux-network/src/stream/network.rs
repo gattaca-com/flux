@@ -9,7 +9,7 @@ use mio::{Events, Interest, Poll, Registry, Token, event::Event};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    Endpoint, Peer, TcpTelemetry, set_socket_buf_size,
+    Endpoint, Peer, ServiceRef, TcpTelemetry, set_socket_buf_size,
     tcp_stream::{DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, write_frame_header},
     transport::{ListenSocket, TransportStream},
 };
@@ -113,7 +113,7 @@ impl ConnectionGroupConfig {
     }
 }
 
-/// Event emitted by [`StreamNetwork::poll_with`].
+/// Event emitted by [`StreamNetwork::drive`].
 pub enum StreamEvent<'a> {
     /// A listener accepted a new connection.
     Accepted { group: ConnectionGroup, token: Token, peer: Peer },
@@ -125,6 +125,18 @@ pub enum StreamEvent<'a> {
     Message { group: ConnectionGroup, token: Token, payload: &'a [u8], send_ts: Nanos },
     /// An established connection was closed.
     Disconnected { group: ConnectionGroup, token: Token, peer: Peer },
+}
+
+impl StreamEvent<'_> {
+    /// The group whose service, or whose unclaimed handler, this event is for.
+    pub(crate) fn group(&self) -> ConnectionGroup {
+        match *self {
+            Self::Accepted { group, .. } |
+            Self::Connected { group, .. } |
+            Self::Message { group, .. } |
+            Self::Disconnected { group, .. } => group,
+        }
+    }
 }
 
 struct GroupState {
@@ -283,8 +295,10 @@ impl NetworkState {
         self.connections[index].state = ConnectionState::Connecting(socket);
     }
 
-    fn maybe_reconnect(&mut self) {
-        let now = Instant::now();
+    /// Retries every outbound endpoint whose group is due one, reporting
+    /// whether an attempt was made.
+    fn maybe_reconnect(&mut self, now: Instant) -> bool {
+        let mut attempted = false;
         for group_index in 0..self.groups.len() {
             if !self.groups[group_index].reconnector.fired_at(now) {
                 continue;
@@ -295,9 +309,26 @@ impl NetworkState {
                     matches!(self.connections[index].state, ConnectionState::Disconnected)
                 {
                     self.start_connect(index);
+                    attempted = true;
                 }
             }
         }
+        attempted
+    }
+
+    /// The earliest instant the network's own timers need a call at: the next
+    /// retry of a group holding an outbound endpoint that is down.
+    fn next_deadline(&self) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        for connection in &self.connections {
+            if connection.endpoint.is_some() &&
+                matches!(connection.state, ConnectionState::Disconnected)
+            {
+                let fire = self.groups[connection.group.0].reconnector.next_fire();
+                next = Some(next.map_or(fire, |next: Instant| next.min(fire)));
+            }
+        }
+        next
     }
 
     fn finish_connect<F>(&mut self, index: usize, handler: &mut F) -> bool
@@ -724,14 +755,24 @@ impl NetworkState {
 ///
 /// Dropping the network closes every listener, which unlinks the socket file
 /// of each [`Endpoint::Unix`] listener.
+///
+/// A group is either **service-owned** — a protocol layer claimed it and the
+/// network routes its events to that service — or an **unclaimed group**, whose
+/// events reach the handler passed to [`Self::drive`] as they arrive.
 pub struct StreamNetwork {
     events: Events,
     state: NetworkState,
+    /// Whether a service owns the group at each index.
+    claimed: Vec<bool>,
 }
 
 impl Default for StreamNetwork {
     fn default() -> Self {
-        Self { events: Events::with_capacity(EVENTS_CAPACITY), state: NetworkState::default() }
+        Self {
+            events: Events::with_capacity(EVENTS_CAPACITY),
+            state: NetworkState::default(),
+            claimed: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
+        }
     }
 }
 
@@ -762,7 +803,28 @@ impl StreamNetwork {
         let group = ConnectionGroup(self.state.groups.len());
         let reconnector = Repeater::every(config.reconnect_interval);
         self.state.groups.push(GroupState { config, reconnector });
+        self.claimed.push(false);
         group
+    }
+
+    /// Marks `group` as owned by the service making the call.
+    #[allow(dead_code, reason = "the services that claim a group arrive with HttpService")]
+    pub(crate) fn claim_group(&mut self, group: ConnectionGroup) {
+        assert!(group.0 < self.claimed.len(), "unknown connection group");
+        assert!(!self.claimed[group.0], "connection group {} already has a service", group.0);
+        self.claimed[group.0] = true;
+    }
+
+    /// Returns `group` to unclaimed status.
+    #[allow(dead_code, reason = "the services that release a group arrive with HttpService")]
+    pub(crate) fn release_group(&mut self, group: ConnectionGroup) {
+        assert!(group.0 < self.claimed.len(), "unknown connection group");
+        self.claimed[group.0] = false;
+    }
+
+    /// The earliest instant the network's own timers need a driver call at.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.state.next_deadline()
     }
 
     /// Adds a listener to `group`.
@@ -784,22 +846,129 @@ impl StreamNetwork {
         self.state.connect(group, endpoint)
     }
 
-    pub fn poll_with<F>(&mut self, mut handler: F)
+    /// Runs one iteration of the network: maintenance, one poll, event
+    /// delivery and one tick per service. Returns whether anything happened.
+    ///
+    /// The poll blocks for `max_timeout` at the longest, and for less when the
+    /// network's own timers or a service's [`ServiceRef`] deadline fall sooner;
+    /// `None` everywhere blocks until an event arrives. Events of a
+    /// service-owned group go to that service, the rest to `unclaimed_handler`,
+    /// which borrows each payload for the duration of the call. Protocol
+    /// events the services produced are pulled from the services
+    /// afterwards.
+    ///
+    /// The poll wait is where an iteration spends its time, so the ticks that
+    /// follow it are given the time after it: a timer a tick starts runs from
+    /// the moment the wait ended, and one that expired during the wait is due
+    /// in the same iteration rather than the next.
+    ///
+    /// # Panics
+    /// Every service-owned group must appear exactly once among `services`. A
+    /// group whose service is missing or doubled is a configuration error and
+    /// panics before the call does anything else.
+    pub fn drive<F>(
+        &mut self,
+        max_timeout: Option<Duration>,
+        services: &mut [ServiceRef<'_>],
+        mut unclaimed_handler: F,
+    ) -> bool
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
-        self.state.drain_pending_disconnects(&mut handler);
-        self.state.maybe_reconnect();
-        if let Err(err) = self.state.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
-            if err.kind() != io::ErrorKind::Interrupted {
-                flux_utils::safe_panic!("couldn't poll the stream network: {err}");
+        let now = Instant::now();
+        self.validate(services);
+
+        let mut routed = false;
+        {
+            let claimed = &self.claimed;
+            let mut route = |event: StreamEvent<'_>| {
+                route_event(claimed, services, &mut unclaimed_handler, &mut routed, event);
+            };
+            self.state.drain_pending_disconnects(&mut route);
+        }
+        let reconnected = self.state.maybe_reconnect(now);
+
+        let timeout = self.poll_timeout(max_timeout, services, now);
+        match self.state.poll.poll(&mut self.events, timeout) {
+            Ok(()) => {
+                let claimed = &self.claimed;
+                let mut route = |event: StreamEvent<'_>| {
+                    route_event(claimed, services, &mut unclaimed_handler, &mut routed, event);
+                };
+                for event in &self.events {
+                    self.state.handle_event(event, &mut route);
+                }
+                self.state.drain_pending_disconnects(&mut route);
             }
-            return;
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => flux_utils::safe_panic!("couldn't poll the stream network: {err}"),
         }
-        for event in &self.events {
-            self.state.handle_event(event, &mut handler);
+
+        // The instant this iteration began is older than the poll wait it has
+        // just come out of, which may have been the whole of a timeout.
+        let tick_now = Instant::now();
+        let mut pullable = false;
+        for service in services.iter_mut() {
+            pullable |= service.tick(self, tick_now);
         }
-        self.state.drain_pending_disconnects(&mut handler);
+        routed || reconnected || pullable
+    }
+
+    /// Runs one nonblocking iteration of a network holding unclaimed groups
+    /// only.
+    ///
+    /// # Panics
+    /// Panics when a group is service-owned; such a network is driven with
+    /// [`Self::drive`].
+    pub fn poll_with<F>(&mut self, handler: F)
+    where
+        F: for<'a> FnMut(StreamEvent<'a>),
+    {
+        self.drive(Some(Duration::ZERO), &mut [], handler);
+    }
+
+    /// Panics unless `services` names every service-owned group exactly once.
+    fn validate(&self, services: &[ServiceRef<'_>]) {
+        for (position, service) in services.iter().enumerate() {
+            let group = service.group();
+            assert!(
+                self.claimed.get(group.0).copied().unwrap_or(false),
+                "no service owns connection group {} — a service claims its group when it is built",
+                group.0
+            );
+            assert!(
+                services[..position].iter().all(|other| other.group() != group),
+                "duplicate service for group {}",
+                group.0
+            );
+        }
+        for (index, claimed) in self.claimed.iter().enumerate() {
+            assert!(
+                !claimed || services.iter().any(|service| service.group().0 == index),
+                "service-owned group {index} has no service — call HttpService::close before \
+                 dropping it"
+            );
+        }
+    }
+
+    /// Folds the caller's cap, the network's own timers and every service's
+    /// deadline into the timeout of one poll.
+    fn poll_timeout(
+        &self,
+        max_timeout: Option<Duration>,
+        services: &[ServiceRef<'_>],
+        now: Instant,
+    ) -> Option<std::time::Duration> {
+        let deadline = self
+            .next_deadline()
+            .into_iter()
+            .chain(services.iter().filter_map(|service| service.next_deadline()))
+            .min();
+        let timeout = match (max_timeout, deadline.map(|deadline| deadline.saturating_sub(now))) {
+            (Some(max), Some(next)) => Some(max.min(next)),
+            (max, next) => max.or(next),
+        };
+        timeout.map(std::time::Duration::from)
     }
 
     /// Serializes and sends one payload to a connected token. Length-prefixed
@@ -843,6 +1012,31 @@ impl StreamNetwork {
     /// the token was found.
     pub fn remove(&mut self, token: Token) -> bool {
         self.state.remove(token)
+    }
+}
+
+/// Hands one event to the service owning its group, or to the unclaimed handler
+/// when no service owns it.
+fn route_event<F>(
+    claimed: &[bool],
+    services: &mut [ServiceRef<'_>],
+    unclaimed_handler: &mut F,
+    routed: &mut bool,
+    event: StreamEvent<'_>,
+) where
+    F: for<'a> FnMut(StreamEvent<'a>),
+{
+    *routed = true;
+    let group = event.group();
+    if let Some(service) = services.iter_mut().find(|service| service.group() == group) {
+        service.on_event(&event);
+    } else {
+        debug_assert!(
+            !claimed[group.0],
+            "service-owned group {} has no service to route to",
+            group.0
+        );
+        unclaimed_handler(event);
     }
 }
 
