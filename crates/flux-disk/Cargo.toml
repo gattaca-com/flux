@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+keywords = ["disk", "io-uring", "low-latency", "performance"]
+license.workspace = true
+name = "flux-disk"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flux-timing.workspace = true
+flux-utils.workspace = true
+io-uring.workspace = true
+libc.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
