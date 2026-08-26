@@ -3,6 +3,7 @@ members = [
   "crates/flux",
   "crates/flux-communication",
   "crates/flux-ctl",
+  "crates/flux-disk",
   "crates/flux-network",
   "crates/flux-profiler",
   "crates/flux-profiler-macros",
@@ -29,6 +30,7 @@ version = "0.1.3"
 [workspace.dependencies]
 flux = { path = "crates/flux" }
 flux-communication = { path = "crates/flux-communication" }
+flux-disk = { path = "crates/flux-disk" }
 flux-network = { path = "crates/flux-network" }
 flux-profiler = { path = "crates/flux-profiler" }
 flux-profiler-macros = { path = "crates/flux-profiler-macros" }
@@ -59,6 +61,7 @@ governor = "0.6.3"
 httparse = "1"
 humantime = "2.1"
 indexmap = { features = ["serde"], version = "2.11.1" }
+io-uring = "0.7.14"
 libc = "0.2.177"
 mio = { version = "1.1.1", features = ["net", "os-poll"] }
 proc-macro-crate = "3"

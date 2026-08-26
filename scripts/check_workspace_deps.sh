@@ -8,6 +8,7 @@ workspace_toml="$root/Cargo.toml"
 # Internal crates remain available through `workspace = true` even when no
 # current member depends on them.
 ignored=(
+  flux-disk
   flux-network
   flux-profiler
   flux-timekeeper
