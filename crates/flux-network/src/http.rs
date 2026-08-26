@@ -315,9 +315,10 @@ pub struct Responder<'a> {
 impl Responder<'_> {
     /// Queues the response and returns whether it was written.
     ///
-    /// The status must be in `200..=599`; `Content-Length` and
+    /// The status must be in `100..=599`; `Content-Length` and
     /// `Transfer-Encoding` are the service's to write, and a `Connection`
-    /// header only feeds the close decision.
+    /// header only feeds the close decision. Every status completes the
+    /// request, `1xx` included: see [`HttpService::respond`].
     ///
     /// The request stops counting against connection limits here. Its bytes
     /// are reclaimed on the next pull or network tick, after the event's
@@ -657,6 +658,17 @@ impl HttpService {
 
     /// Answers a request whose [`Responder`] was dropped, and returns whether
     /// the response was written.
+    ///
+    /// Each call completes exactly one request for `token`. The status must
+    /// be in `100..=599`, and one this service has no phrase for is framed
+    /// with the empty reason phrase RFC 9112 permits — `HTTP/1.1 250 `.
+    ///
+    /// A `1xx` status is *final* here: it completes the request, framed with
+    /// no `Content-Length` and no body, and the connection moves on to the
+    /// next request or its close. HTTP makes an informational response the
+    /// prelude to a final one instead, so this is a non-conformance the
+    /// caller opts into by choosing such a status — what an endpoint echoing
+    /// a status chosen elsewhere needs to pass it through untouched.
     ///
     /// Unlike [`Responder::respond`], this path holds no event borrow, so it
     /// reclaims answered bytes and requeues the connection before returning.
@@ -1406,7 +1418,7 @@ fn respond_to(
     if state.phase != Phase::Pending {
         return false
     }
-    if !(200..=599).contains(&status) ||
+    if !(100..=599).contains(&status) ||
         headers.iter().any(|(name, value)| invalid_header(name, value))
     {
         return false
@@ -1662,7 +1674,8 @@ fn chunked_end(
     }
 }
 
-/// HTTP reason phrase for common status codes.
+/// HTTP reason phrase for common status codes, and the empty phrase RFC
+/// 9112 permits for every other status.
 pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         100 => "Continue",
@@ -1681,7 +1694,7 @@ pub fn reason_phrase(status: u16) -> &'static str {
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
-        _ => "Unknown",
+        _ => "",
     }
 }
 
@@ -1695,10 +1708,21 @@ mod tests {
     use flux_timing::Duration;
     use mio::Token;
 
-    use super::{Conn, HttpConfig, HttpEvent, HttpRequest, HttpService, Phase, Role, span};
+    use super::{
+        Conn, HttpConfig, HttpEvent, HttpRequest, HttpService, Phase, Role, reason_phrase, span,
+    };
     use crate::stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork};
 
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn an_unmapped_status_has_no_reason_phrase() {
+        assert_eq!(reason_phrase(250), "");
+        assert_eq!(reason_phrase(199), "");
+        assert_eq!(reason_phrase(599), "");
+        assert_eq!(reason_phrase(200), "OK");
+        assert_eq!(reason_phrase(404), "Not Found");
+    }
 
     #[test]
     fn header_lookup_is_case_insensitive() {
