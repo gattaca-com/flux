@@ -16,10 +16,10 @@ listener unlinks its path. The socket file is created with mode `0777` less the 
 a client needs write permission on it to connect, so the usual `022` umask yields `0755` —
 owner-only connections — and an operator who wants group or world access sets the umask or
 changes the mode; flux offers no mode or ownership setting. Outbound Unix endpoints reconnect
-at the Group's interval exactly like TCP (`ENOENT` and `ECONNREFUSED` both retry). Removing the
-file on close is what nginx and Go's `net.Listen` do; a stale file after a crash must not block
-a restart; and an unconditional unlink would let a misconfigured second process silently take a
-live node's path — the probe is the cheapest guard against that.
+at the ConnectionGroup's interval exactly like TCP (`ENOENT` and `ECONNREFUSED` both retry).
+Removing the file on close is what nginx and Go's `net.Listen` do; a stale file after a crash must
+not block a restart; and an unconditional unlink would let a misconfigured second process silently
+take a live node's path — the probe is the cheapest guard against that.
 
 ## Considered options
 
@@ -29,6 +29,5 @@ live node's path — the probe is the cheapest guard against that.
   and the probe costs one connect.
 - **Bind a temporary path and rename over the target.** Rejected: atomic, but the same steal
   semantics as unconditional unlink with more code.
-- **Mode and ownership settings on the listener.** Not offered: the operator controls both
-  through the umask and the directory. An explicit setting is recorded as a speculative
-  extension, not a decision.
+- **Mode and ownership settings on the listener.** Not offered: the operator controls both through
+  the umask and the directory. An explicit setting is a speculative extension, not a decision.

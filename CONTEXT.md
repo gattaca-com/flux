@@ -34,26 +34,30 @@ unit a stream network drives. A response held open for appended writes is not a 
 sense.
 _Avoid_: socket (the OS handle, not the channel), pipe
 
-**Group**:
-A set of connections sharing one wire framing and one socket configuration inside a
-network, with limits enforced per connection.
-_Avoid_: pool, channel, protocol
+**ConnectionGroup**:
+The connections — inbound and outbound, TCP or Unix-domain — that share one configuration
+(framing, socket options, backlog and connection caps) and one owner, together with the listeners
+and outbound endpoints that produce them. Owned by one Service, or by the caller as an unclaimed
+group. A Service requires one; you never use one bare.
+_Avoid_: pool, channel, transport, stream group
 
-**Tenant**:
-A protocol layer that owns exactly one Group inside a shared network and is scheduled by
-that network; an HTTP server or client is a tenant.
-_Avoid_: instance, service, sub-network
+**Service**:
+A stateful server, client, or both, for an application-layer protocol. It owns one ConnectionGroup
+inside a shared network and is scheduled by that network. An HTTP server or client is a Service
+(`HttpService`).
+_Avoid_: tenant, handler, protocol
 
-**Raw group**:
-A Group no Tenant owns; the caller consumes its events directly as they arrive, borrowing
-each payload for the duration of the call.
-_Avoid_: unmanaged group, bare group
+**Unclaimed ConnectionGroup**:
+A ConnectionGroup no Service has claimed; the caller is its protocol layer and receives its events
+inline through the closure passed to `drive`. Claiming is a group-level decision made when a
+Service is constructed and undone by `close`, never a per-connection state.
+_Avoid_: raw group, unmanaged group, bare group
 
-**Owned mode**:
+**Owned poll**:
 A network that holds its own poll and drives it, with whatever timeout the caller passes.
 _Avoid_: standalone, embedded
 
-**External mode**:
+**External poll**:
 A network built over a poll the caller holds; the caller delivers readiness events and
 drives timers, and may register its own sources alongside.
 _Avoid_: injected, shared, hosted
@@ -86,5 +90,5 @@ _Avoid_: half-close, graceful close, linger-close
 
 **Refused**:
 An accepted connection dropped immediately, without registration or bytes, because its
-Group is at its connection cap.
+ConnectionGroup is at its connection cap.
 _Avoid_: rejected, throttled
