@@ -667,11 +667,22 @@ fn a_request_at_the_header_count_is_served_and_one_over_it_is_not() {
 }
 
 #[test]
-fn a_header_count_past_the_parse_scratch_is_held_to_it() {
-    // The field is public, so a configuration written without the builder can
-    // ask for more headers than the scratch holds; MAX_HEADERS is what it
-    // parses.
-    let config = HttpConfig { max_headers: 500, ..HttpConfig::default() };
+#[should_panic(expected = "max_headers must be in 1..=128")]
+fn a_header_count_past_the_parse_scratch_is_refused_by_the_service() {
+    // The field is public, so a configuration written without the builder
+    // reaches the service as it stands; the service holds it to the range the
+    // builder does.
+    let mut net = StreamNetwork::default();
+    let group = net.add_group(http_group());
+    let config = HttpConfig { max_headers: MAX_HEADERS + 1, ..HttpConfig::default() };
+    let _ = HttpService::new(&mut net, group, config);
+}
+
+#[test]
+fn a_header_count_at_the_parse_scratch_is_served() {
+    // The whole scratch, asked for without the builder: what it parses is the
+    // count it names, and the head past it is one the service cannot read.
+    let config = HttpConfig { max_headers: MAX_HEADERS, ..HttpConfig::default() };
     assert_eq!(answered_status(config, &request_of_headers(MAX_HEADERS)), 200);
     assert_eq!(answered_status(config, &request_of_headers(MAX_HEADERS + 1)), 400);
 }
