@@ -352,6 +352,9 @@ impl Responder<'_> {
     /// borrow ends. [`HttpService::respond`] reclaims before it returns.
     pub fn respond(self, status: u16, headers: &[(&str, &str)], body: &[u8]) -> bool {
         let Self { net, state, token, linger, .. } = self;
+        if !answerable(state, status, headers) {
+            return false
+        }
         write_framed(net, state, token, linger, status, headers, body)
     }
 
@@ -390,6 +393,8 @@ fn answerable(state: &ConnState, status: u16, headers: &[(&str, &str)]) -> bool 
 
 /// Writes one response for a pending request and moves the connection on.
 ///
+/// The caller has asked [`answerable`] already — each public path asks it
+/// once, before anything is composed — so the answer is framed as admitted.
 /// The body reaches the wire in a single copy, from wherever the caller
 /// holds it. A `HEAD` request is framed with its `Content-Length` and sent
 /// none of it.
@@ -402,9 +407,7 @@ fn write_framed(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> bool {
-    if !answerable(state, status, headers) {
-        return false
-    }
+    debug_assert!(answerable(state, status, headers), "an answer is admitted before it is framed");
     let caller_close = headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")
     });
