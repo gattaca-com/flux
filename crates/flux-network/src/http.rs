@@ -912,12 +912,6 @@ impl HttpService {
         }
     }
 
-    /// How many bytes a connection holds unparsed and unreclaimed.
-    #[doc(hidden)]
-    pub fn buffered(&self, token: Token) -> Option<usize> {
-        self.index_of(token).map(|index| self.conns[index].buffer.len())
-    }
-
     /// Applies bookkeeping deferred by the last pulled event.
     fn apply_bookkeeping(&mut self) {
         let Some(token) = self.last.take() else { return };
@@ -1863,11 +1857,12 @@ mod tests {
         net::{Ipv4Addr, SocketAddr, TcpStream},
     };
 
-    use flux_timing::Duration;
+    use flux_timing::{Duration, Instant};
     use mio::Token;
 
     use super::{
-        Conn, HttpConfig, HttpEvent, HttpRequest, HttpService, Phase, Role, reason_phrase, span,
+        Conn, HttpConfig, HttpEvent, HttpRequest, HttpService, LingerClock, Phase, Role,
+        reason_phrase, span,
     };
     use crate::stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork};
 
@@ -1988,6 +1983,29 @@ mod tests {
         assert!(!http.conns[0].ready);
         http.mark_ready(0);
         assert_eq!(http.ready, [Token(1)]);
+    }
+
+    #[test]
+    fn a_lingering_connection_drops_what_it_reads() {
+        let mut net = StreamNetwork::default();
+        let mut http = bare_service(&mut net);
+        // An instant the read is bound to fall after, so the idle cap can be
+        // seen to move to it and the total cap to stay where it is.
+        let answered = Instant(1);
+        let mut conn = Conn::new(Token(1), Role::Accepted);
+        conn.state.phase = Phase::Lingering { clock: Some(LingerClock::started(answered)) };
+        http.conns.push(conn);
+
+        http.buffer(Token(1), &[b'x'; 4096]);
+
+        assert!(http.conns[0].buffer.is_empty(), "the discarded bytes were kept");
+        assert!(!http.conns[0].over_limit, "what is dropped runs nothing over its limit");
+        assert!(http.ready.is_empty(), "a lingering connection has nothing to parse");
+        let Phase::Lingering { clock: Some(clock) } = http.conns[0].state.phase else {
+            panic!("the linger lost its clock")
+        };
+        assert_eq!(clock.since, answered, "the total cap runs from where the answer ended");
+        assert!(clock.last_inbound > answered, "the read did not clear the idle cap");
     }
 
     #[test]
