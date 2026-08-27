@@ -155,6 +155,9 @@ impl StreamEvent<'_> {
 struct GroupState {
     config: ConnectionGroupConfig,
     reconnector: Repeater,
+    /// Accepted connections this group currently holds, including those
+    /// draining or half-closed. Outbound connections do not count.
+    accepted: usize,
     /// Connections refused since the group was added because it was at its
     /// cap, and when the last of them was warned about.
     refused: u64,
@@ -362,6 +365,8 @@ impl NetworkState {
                 self.connections.swap_remove(index);
             }
         }
+        // Every accepted connection of the group was removed above.
+        self.groups[group.0].accepted = 0;
         self.pending_disconnects.retain(|event| event.group != group);
     }
 
@@ -493,7 +498,7 @@ impl NetworkState {
                 }
             };
             if let Some(max) = self.config(group).max_connections &&
-                self.accepted_connections(group) >= max
+                self.groups[group.0].accepted >= max
             {
                 // The refusal is all that happens to this connection: it
                 // is never registered, never read from and never written
@@ -565,20 +570,10 @@ impl NetworkState {
                 write_side: WriteSide::Open,
                 timers,
             });
+            self.groups[group.0].accepted += 1;
             info!(group = group_name, %peer, "connection accepted");
             handler(StreamEvent::Accepted { group, token, peer });
         }
-    }
-
-    /// How many connections `group` accepted and still holds. A connection
-    /// it is closing is one of them — draining or half-closed alike — while
-    /// an outbound endpoint of the group is a connection the network made
-    /// rather than accepted, and counts for nothing.
-    fn accepted_connections(&self, group: ConnectionGroup) -> usize {
-        self.connections
-            .iter()
-            .filter(|connection| connection.group == group && connection.endpoint.is_none())
-            .count()
     }
 
     /// Counts one refused connection, warning about the group at most once
@@ -689,6 +684,7 @@ impl NetworkState {
         let was_connected = self.close_connection_socket(index);
         if accepted {
             self.connections.swap_remove(index);
+            self.groups[event.group.0].accepted -= 1;
         }
         if notify && was_connected {
             self.pending_disconnects.push(event);
@@ -890,7 +886,10 @@ impl NetworkState {
             return false;
         };
         self.close_connection_socket(index);
-        self.connections.swap_remove(index);
+        let removed = self.connections.swap_remove(index);
+        if removed.endpoint.is_none() {
+            self.groups[removed.group.0].accepted -= 1;
+        }
         self.pending_disconnects.retain(|event| event.token != token);
         true
     }
@@ -1017,6 +1016,7 @@ impl StreamNetwork {
         self.state.groups.push(GroupState {
             config,
             reconnector,
+            accepted: 0,
             refused: 0,
             last_refusal_warning: None,
         });

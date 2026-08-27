@@ -310,6 +310,42 @@ fn a_closed_connection_frees_its_place() {
     assert_eq!(server.refused(group), 0, "the group refused a client it had room for");
 }
 
+/// The client is left where it is, so the place comes free because the network
+/// let the connection go rather than because the peer went.
+#[test]
+fn a_disconnected_connection_frees_its_place() {
+    let endpoint = Endpoint::Tcp(unused_addr());
+    let mut server = Server::new();
+    let group = server.listen(capped_group("disconnected", 1), &endpoint);
+
+    let _first = connect_client(&endpoint);
+    let token = server.wait_for_accepts(group, 1)[0];
+    assert!(server.network.disconnect(token));
+    server.wait_for_disconnects(1);
+
+    let _second = connect_client(&endpoint);
+    server.wait_for_accepts(group, 2);
+    assert_eq!(server.refused(group), 0, "the group refused a client it had room for");
+}
+
+/// A removed connection leaves no [`StreamEvent::Disconnected`] behind, so the
+/// place it held is freed by the removal itself.
+#[test]
+fn a_removed_connection_frees_its_place() {
+    let endpoint = Endpoint::Tcp(unused_addr());
+    let mut server = Server::new();
+    let group = server.listen(capped_group("removed", 1), &endpoint);
+
+    let _first = connect_client(&endpoint);
+    let token = server.wait_for_accepts(group, 1)[0];
+    assert!(server.network.remove(token));
+
+    let _second = connect_client(&endpoint);
+    server.wait_for_accepts(group, 2);
+    assert_eq!(server.refused(group), 0, "the group refused a client it had room for");
+    assert!(server.disconnected.is_empty(), "a removed connection was reported closed");
+}
+
 #[test]
 fn the_cap_belongs_to_one_group() {
     let capped_endpoint = Endpoint::Tcp(unused_addr());
@@ -327,6 +363,32 @@ fn the_cap_belongs_to_one_group() {
     server.wait_for_accepts(open, 2);
     assert_eq!(server.refused(capped), 1);
     assert_eq!(server.refused(open), 0);
+}
+
+/// The cap is the group's rather than a listener's: two listeners of one group
+/// draw on the same allowance, whichever transport each of them speaks.
+#[test]
+fn two_listeners_of_one_group_share_its_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let tcp = Endpoint::Tcp(unused_addr());
+    let unix = Endpoint::Unix(dir.path().join("s"));
+    let mut server = Server::new();
+    let group = server.listen(capped_group("shared", 1), &tcp);
+    server.network.listen(group, unix.clone()).unwrap();
+
+    let first = connect_client(&tcp);
+    server.wait_for_accepts(group, 1);
+
+    // The one place is filled, and the second listener has none of its own.
+    let mut refused = connect_client(&unix);
+    server.expect_refusal(&mut *refused);
+    assert_eq!(server.refused(group), 1);
+
+    drop(first);
+    server.wait_for_disconnects(1);
+    let _second = connect_client(&unix);
+    server.wait_for_accepts(group, 2);
+    assert_eq!(server.refused(group), 1, "the group refused a client it had room for");
 }
 
 #[test]
@@ -440,4 +502,55 @@ fn an_http_service_serves_its_clients_while_the_cap_refuses_another() {
     assert!(answers.iter().all(|answer| answer.ends_with(BODY)), "{answers:?}");
 
     service.close(&mut network);
+}
+
+/// One iteration of an HTTP server with nothing to answer, reporting whether
+/// the service accepted a client.
+fn drive_service(network: &mut StreamNetwork, service: &mut HttpService) -> bool {
+    network.drive(Some(flux_timing::Duration::ZERO), &mut [service.as_service()], |_| {});
+    let mut accepted = false;
+    while let Some(event) = service.next_event(network) {
+        accepted |= matches!(event, HttpEvent::Accepted { .. });
+    }
+    accepted
+}
+
+/// Closing a group empties it and hands it back reusable, so it listens again
+/// and admits a client: the places its connections held went with them.
+/// `HttpService::close` is the public way to close a group.
+#[test]
+fn a_closed_group_frees_the_places_it_held() {
+    let endpoint = Endpoint::Tcp(unused_addr());
+    let mut server = Server::new();
+    let group = server.network.add_group(capped_group("closed", 1));
+    let mut service = HttpService::new(&mut server.network, group, HttpConfig::default());
+    service.listen(&mut server.network, endpoint.clone()).unwrap();
+
+    let _first = connect_client(&endpoint);
+    let deadline = Instant::now() + TIMEOUT;
+    let mut accepted = false;
+    while Instant::now() < deadline && !accepted {
+        accepted = drive_service(&mut server.network, &mut service);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(accepted, "the service never accepted a client");
+
+    // The one place is filled, which is what the next client meets.
+    let mut refused = connect_client(&endpoint);
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while !read_available(&mut *refused, &mut received) {
+        assert!(Instant::now() < deadline, "the connection was not refused");
+        drive_service(&mut server.network, &mut service);
+    }
+    assert!(received.is_empty(), "a refused connection was sent bytes: {received:?}");
+    assert_eq!(server.refused(group), 1);
+
+    service.close(&mut server.network);
+
+    let reopened_endpoint = Endpoint::Tcp(unused_addr());
+    server.network.listen(group, reopened_endpoint.clone()).unwrap();
+    let _client = connect_client(&reopened_endpoint);
+    server.wait_for_accepts(group, 1);
+    assert_eq!(server.refused(group), 1, "the group refused a client it had room for");
 }
