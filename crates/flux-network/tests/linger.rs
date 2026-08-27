@@ -663,8 +663,9 @@ fn the_caps_start_when_the_answer_has_left() {
 
     // The peer sends more than the connection may hold and then reads nothing
     // for half a second. The answer is larger than the sockets between them
-    // can hold, so the last of it is written where the pause ends: the poll
-    // that waited it out is the one whose tick starts the caps.
+    // can hold, so the last of it is written where the pause ends, and the
+    // peer reads the whole answer and the end of the stream behind it: that
+    // is where the answer has left, and where the caps must start.
     let (delivered, read_back) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -679,7 +680,7 @@ fn the_caps_start_when_the_answer_has_left() {
                 read => received += read,
             }
         }
-        delivered.send(received).unwrap();
+        delivered.send((Instant::now(), received)).unwrap();
         // Held open, sending nothing, so the idle cap is what ends it.
         thread::sleep(Duration::from_secs(3));
     });
@@ -687,12 +688,11 @@ fn the_caps_start_when_the_answer_has_left() {
     let token = server.accepted_token();
     server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
     server.pump_for(Duration::from_millis(20));
+    let answered = Instant::now();
     assert!(server.respond(token, 200, &answer));
-    assert!(!server.net.write_side_shut(token), "the answer left before the peer read a byte");
 
     // From here the server only blocks, so the poll wait is the whole of each
     // iteration: the caps must run from where that wait ended.
-    let mut shut_at = None;
     let ended = loop {
         {
             let Server { net, service, disconnected, .. } = &mut server;
@@ -703,19 +703,20 @@ fn the_caps_start_when_the_answer_has_left() {
                 }
             }
         }
-        if shut_at.is_none() && server.net.write_side_shut(token) {
-            shut_at = Some(Instant::now());
-        }
         if !server.disconnected.is_empty() {
             break Instant::now();
         }
     };
 
-    let ran = ended.duration_since(shut_at.expect("the write side never shut"));
+    let (left, received) = read_back.recv_timeout(TIMEOUT).unwrap();
+    assert!(received >= answer.len(), "the peer was sent {received} of {}", answer.len());
+    // The peer took none of the answer until its pause was over, so an answer
+    // capped where it was queued would have taken the connection with it.
+    let queued = left.duration_since(answered);
+    assert!(queued >= Duration::from_millis(400), "the answer left after {queued:?}");
+    let ran = ended.duration_since(left);
     assert!(ran >= Duration::from_millis(150), "the caps ran for {ran:?}");
     assert!(ran < Duration::from_secs(2), "the caps did not end the linger: {ran:?}");
-    let received = read_back.recv_timeout(TIMEOUT).unwrap();
-    assert!(received >= answer.len(), "the peer was sent {received} of {}", answer.len());
 }
 
 #[test]

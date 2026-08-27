@@ -1696,10 +1696,10 @@ impl StreamNetwork {
     ///
     /// A connection still writing what [`Self::shutdown_write_when_drained`]
     /// will end — and one that never asked for a half-close, or that closed
-    /// or was never known — reports `false`. A caller timing what follows the
-    /// half-close starts its clock when this turns `true`.
+    /// or was never known — reports `false`. The lingering close of
+    /// [`crate::http::HttpService`] starts its caps where this turns `true`.
     #[must_use]
-    pub fn write_side_shut(&self, token: Token) -> bool {
+    pub(crate) fn write_side_shut(&self, token: Token) -> bool {
         self.state.write_side_shut(token)
     }
 
