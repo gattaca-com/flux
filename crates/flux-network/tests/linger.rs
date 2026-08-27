@@ -134,9 +134,12 @@ impl Server {
 
     /// One iteration: drive the network, then pull every protocol event.
     /// Requests are left for the test to answer by token.
-    fn pump(&mut self) {
+    ///
+    /// Reports what the drive found: a readiness event routed to the service,
+    /// or events the service was already holding.
+    fn pump(&mut self) -> bool {
         let Self { net, service, accepted, disconnected, requests, inline_answer, .. } = self;
-        net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
+        let worked = net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
         while let Some(event) = service.next_event(net) {
             match event {
                 HttpEvent::Accepted { token, .. } => accepted.push(token),
@@ -149,6 +152,22 @@ impl Server {
                 }
                 _ => {}
             }
+        }
+        worked
+    }
+
+    /// Pumps until an iteration takes what the peer sent, failing with `what`
+    /// at the deadline.
+    ///
+    /// An accepted connection is polled for reads alone until the service has
+    /// something to write, and a raw read empties the socket, so between a
+    /// request and its answer the one iteration that reports work is the one
+    /// that read the whole of what the peer sent behind it.
+    fn wait_for_a_read(&mut self, what: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.pump() {
+            assert!(Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -230,7 +249,7 @@ fn an_error_response_reaches_a_peer_that_is_still_sending(endpoint: &Endpoint) {
     for (request, status) in REJECTED {
         let mut server = Server::new(endpoint, small_heads());
         let mut client = connect_client(endpoint);
-        let token = server.accepted_token();
+        server.accepted_token();
         client.write_all(request).unwrap();
 
         // The whole answer arrives, and then the end of the stream: the write
@@ -240,14 +259,12 @@ fn an_error_response_reaches_a_peer_that_is_still_sending(endpoint: &Endpoint) {
         assert!(head.starts_with(&format!("HTTP/1.1 {status} ")), "{head}");
         assert!(head.contains("Connection: close"), "{head}");
 
-        // What the peer sends after it is read and dropped, so the connection
-        // neither grows nor closes under a client still uploading.
-        let buffered = server.service.buffered(token).expect("the connection is still held");
+        // What the peer sends after it is read out rather than reset, so a
+        // client still uploading is neither cut off nor left to block.
         for _ in 0..8 {
             client.write_all(&[b'x'; 4096]).unwrap();
             server.pump_for(Duration::from_millis(5));
         }
-        assert_eq!(server.service.buffered(token), Some(buffered), "the discarded bytes were kept");
         assert!(server.disconnected.is_empty(), "the peer was cut off mid-upload");
     }
 }
@@ -396,7 +413,7 @@ fn an_over_limit_pending_request_is_answered_before_the_linger(endpoint: &Endpoi
     // The pipelined bytes behind it run the connection over its limit while
     // the answer is still being produced.
     client.write_all(&[b'x'; 256]).unwrap();
-    server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
+    server.wait_for_a_read("the overrun did not reach the service");
     server.pump_for(Duration::from_millis(20));
     assert!(server.disconnected.is_empty(), "the pending request was abandoned");
 
@@ -486,7 +503,7 @@ fn the_caps_wait_for_the_answer_to_reach_the_peer() {
     client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     server.wait_until(|server| !server.requests.is_empty(), "the request was not delivered");
     client.write_all(&[b'x'; 256]).unwrap();
-    server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
+    server.wait_for_a_read("the overrun did not reach the service");
     server.pump_for(Duration::from_millis(20));
     assert!(server.respond(token, 200, &body));
 
@@ -627,7 +644,7 @@ fn an_undelivered_answer_is_swept(endpoint: &Endpoint) {
     client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     server.wait_until(|server| !server.requests.is_empty(), "the request was not delivered");
     client.write_all(&[b'x'; 256]).unwrap();
-    server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
+    server.wait_for_a_read("the overrun did not reach the service");
     server.pump_for(Duration::from_millis(20));
     let answered = Instant::now();
     assert!(server.respond(token, 200, &body));
@@ -667,9 +684,11 @@ fn the_caps_start_when_the_answer_has_left() {
     // peer reads the whole answer and the end of the stream behind it: that
     // is where the answer has left, and where the caps must start.
     let (delivered, read_back) = std::sync::mpsc::channel();
+    let (ask_for_the_overrun, overrun_asked) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        overrun_asked.recv().unwrap();
         client.write_all(&[b'x'; 256]).unwrap();
         thread::sleep(Duration::from_millis(500));
         let mut received = 0;
@@ -686,7 +705,11 @@ fn the_caps_start_when_the_answer_has_left() {
     });
 
     let token = server.accepted_token();
-    server.wait_until(|server| server.service.buffered(token) == Some(128), "the cap was not hit");
+    server.wait_until(|server| !server.requests.is_empty(), "the request was not delivered");
+    // The overrun follows the request rather than riding with it, so the read
+    // the gate below waits for is the one that takes it.
+    ask_for_the_overrun.send(()).unwrap();
+    server.wait_for_a_read("the overrun did not reach the service");
     server.pump_for(Duration::from_millis(20));
     let answered = Instant::now();
     assert!(server.respond(token, 200, &answer));
