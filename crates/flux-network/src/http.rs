@@ -119,8 +119,9 @@ pub struct HttpConfig {
     pub max_head_bytes: usize,
     /// Largest message body accepted before rejecting it with `413`.
     pub max_body_bytes: usize,
-    /// Largest number of headers parsed in one message, itself held to
-    /// [`MAX_HEADERS`]: a larger value parses [`MAX_HEADERS`] of them.
+    /// Largest number of headers parsed in one message, which must be in
+    /// <code>1..=[MAX_HEADERS]</code>: [`HttpService::new`] panics on a
+    /// configuration outside that range.
     pub max_headers: usize,
     /// How long an accepted connection may sit without inbound bytes before
     /// it is closed. Outbound endpoints stay connected.
@@ -184,11 +185,8 @@ impl HttpConfig {
     /// # Panics
     /// `max_headers` must be in <code>1..=[MAX_HEADERS]</code>.
     pub fn with_max_headers(mut self, max_headers: usize) -> Self {
-        assert!(
-            (1..=MAX_HEADERS).contains(&max_headers),
-            "max_headers must be in 1..={MAX_HEADERS}"
-        );
         self.max_headers = max_headers;
+        self.validate();
         self
     }
 
@@ -226,6 +224,18 @@ impl HttpConfig {
     /// The most a connection may hold unanswered: one head plus one body.
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
+    }
+
+    /// Panics unless every field holds to the range its documentation gives.
+    ///
+    /// The fields are public, so a configuration is as likely written whole
+    /// as built call by call; the builder and [`HttpService::new`] hold it to
+    /// one rule either way.
+    fn validate(&self) {
+        assert!(
+            (1..=MAX_HEADERS).contains(&self.max_headers),
+            "max_headers must be in 1..={MAX_HEADERS}"
+        );
     }
 }
 
@@ -652,12 +662,14 @@ impl HttpService {
     /// Claims `group` for HTTP.
     ///
     /// # Panics
-    /// The group must be [`Framing::Raw`] and unclaimed.
+    /// The group must be [`Framing::Raw`] and unclaimed, and `config` must
+    /// hold to the ranges its fields document.
     pub fn new(net: &mut StreamNetwork, group: ConnectionGroup, config: HttpConfig) -> Self {
         assert!(
             net.framing(group) == Framing::Raw,
             "HTTP frames its own messages and needs a raw-framed group"
         );
+        config.validate();
         net.claim_group(group);
         Self {
             group,
@@ -1020,8 +1032,7 @@ impl HttpService {
             return RequestPlan::Incomplete
         }
         let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
-        let mut request =
-            httparse::Request::new(&mut scratch[..headers_parsed(config.max_headers)]);
+        let mut request = httparse::Request::new(&mut scratch[..config.max_headers]);
         let Ok(status) = request.parse(buffer) else { return RequestPlan::Error(400) };
         let httparse::Status::Complete(head) = status else {
             // A partial parse means every buffered byte is still head bytes.
@@ -1136,8 +1147,7 @@ impl HttpService {
             return ResponsePlan::Incomplete
         }
         let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
-        let mut response =
-            httparse::Response::new(&mut scratch[..headers_parsed(config.max_headers)]);
+        let mut response = httparse::Response::new(&mut scratch[..config.max_headers]);
         let Ok(status) = response.parse(buffer) else { return malformed() };
         let httparse::Status::Complete(head) = status else {
             // A partial parse means every buffered byte is still head bytes.
@@ -1229,8 +1239,7 @@ impl HttpService {
             let base = conn.start;
             let buffer = &conn.buffer[base..];
             let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut response =
-                httparse::Response::new(&mut scratch[..headers_parsed(config.max_headers)]);
+            let mut response = httparse::Response::new(&mut scratch[..config.max_headers]);
             let Ok(httparse::Status::Complete(head)) = response.parse(buffer) else {
                 return Ok(None)
             };
@@ -1618,12 +1627,6 @@ fn headers<'a>(
     headers.iter().map(move |(name, value)| (text(buffer, name.clone()), &buffer[value.clone()]))
 }
 
-/// How many headers a message is parsed into: what the configuration asks
-/// for, held to the scratch every parse borrows.
-fn headers_parsed(max_headers: usize) -> usize {
-    max_headers.min(MAX_HEADERS)
-}
-
 fn crlf_only(bytes: &[u8]) -> bool {
     bytes.iter().enumerate().all(|(i, b)| *b != b'\n' || i > 0 && bytes[i - 1] == b'\r')
 }
@@ -1768,7 +1771,7 @@ fn chunked_end(
         if size == 0 {
             let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
             let httparse::Status::Complete((consumed, _)) =
-                httparse::parse_headers(&bytes[at..], &mut scratch[..headers_parsed(max_headers)])
+                httparse::parse_headers(&bytes[at..], &mut scratch[..max_headers])
                     .map_err(|_| RequestFailure::Malformed)?
             else {
                 return Ok(None)
