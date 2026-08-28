@@ -19,6 +19,7 @@ use std::{
     collections::VecDeque,
     ffi::CString,
     io,
+    mem::MaybeUninit,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
@@ -35,9 +36,9 @@ const PENDING_WARNING_INTERVAL_SECS: u64 = 10;
 /// and writes are transparently continued from where the previous chunk
 /// ended.
 const MAX_OP_BYTES: usize = 1 << 30;
-/// First buffer size for [`DiskIo::read_to_end`]; doubled every time it
-/// fills before end-of-file.
+/// Minimum and fallback buffer capacity for [`DiskIo::read_to_end`].
 const READ_TO_END_CHUNK: usize = 64 * 1024;
+const EMPTY_PATH: &[u8] = b"\0";
 
 /// Identifies one open (or opening) file. Tokens are never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -196,6 +197,7 @@ pub enum DiskEvent<'a> {
 enum PendingOp {
     Open { path: CString, flags: i32, mode: libc::mode_t },
     Read { offset: u64, len: usize, to_end: bool },
+    ReadToEnd { offset: u64 },
     Write { buf: Vec<u8>, offset: u64 },
     Sync { data_only: bool },
     Close,
@@ -204,6 +206,7 @@ enum PendingOp {
 enum InFlightOp {
     Open { path: CString, flags: i32, mode: libc::mode_t },
     Read { buf: Vec<u8>, offset: u64, wanted: usize, have: usize, to_end: bool },
+    Statx { offset: u64, statx: Box<MaybeUninit<libc::statx>> },
     Write { buf: Vec<u8>, offset: u64, written: usize },
     Sync { data_only: bool },
     Close,
@@ -331,7 +334,7 @@ impl DiskIo {
     /// Returns `false` for unknown or closing tokens.
     pub fn read_to_end(&mut self, file: FileToken, offset: u64) -> bool {
         let Some(state) = self.usable_file_mut(file) else { return false };
-        state.queue.push_back(PendingOp::Read { offset, len: READ_TO_END_CHUNK, to_end: true });
+        state.queue.push_back(PendingOp::ReadToEnd { offset });
         self.note_enqueued();
         true
     }
@@ -473,9 +476,9 @@ impl DiskIo {
         buf
     }
 
-    fn take_buffer_sized(&mut self, len: usize) -> Vec<u8> {
+    fn take_buffer_with_capacity(&mut self, len: usize) -> Vec<u8> {
         let mut buf = self.take_buffer();
-        buf.resize(len, 0);
+        buf.reserve(len);
         buf
     }
 
@@ -512,7 +515,9 @@ impl DiskIo {
                 let Some(head) = file.queue.front() else { break };
                 let ready = match head {
                     PendingOp::Open { .. } => true,
-                    PendingOp::Read { .. } | PendingOp::Write { .. } => file.fd.is_some(),
+                    PendingOp::Read { .. } |
+                    PendingOp::ReadToEnd { .. } |
+                    PendingOp::Write { .. } => file.fd.is_some(),
                     PendingOp::Sync { .. } | PendingOp::Close => {
                         file.fd.is_some() && file.in_flight == 0
                     }
@@ -533,12 +538,15 @@ impl DiskIo {
         let op = match op {
             PendingOp::Open { path, flags, mode } => InFlightOp::Open { path, flags, mode },
             PendingOp::Read { offset, len, to_end } => InFlightOp::Read {
-                buf: self.take_buffer_sized(len),
+                buf: self.take_buffer_with_capacity(len),
                 offset,
                 wanted: len,
                 have: 0,
                 to_end,
             },
+            PendingOp::ReadToEnd { offset } => {
+                InFlightOp::Statx { offset, statx: Box::new(MaybeUninit::uninit()) }
+            }
             PendingOp::Write { buf, offset } => InFlightOp::Write { buf, offset, written: 0 },
             PendingOp::Sync { data_only } => InFlightOp::Sync { data_only },
             PendingOp::Close => InFlightOp::Close,
@@ -564,10 +572,21 @@ impl DiskIo {
             InFlightOp::Read { buf, offset, wanted, have, .. } => {
                 let fd = fd.expect("read dispatched without an open fd");
                 let chunk = (*wanted - *have).min(MAX_OP_BYTES) as u32;
-                // SAFETY: `have < wanted == buf.len()`, so the pointer stays
-                // inside the buffer's allocation.
+                // SAFETY: `have < wanted <= buf.capacity()`, so the pointer
+                // stays inside the buffer's allocation.
                 let ptr = unsafe { buf.as_mut_ptr().add(*have) };
                 opcode::Read::new(types::Fd(fd), ptr, chunk).offset(*offset + *have as u64).build()
+            }
+            InFlightOp::Statx { statx, .. } => {
+                let fd = fd.expect("statx dispatched without an open fd");
+                opcode::Statx::new(
+                    types::Fd(fd),
+                    EMPTY_PATH.as_ptr().cast(),
+                    statx.as_mut_ptr().cast(),
+                )
+                .flags(libc::AT_STATX_SYNC_AS_STAT | libc::AT_EMPTY_PATH)
+                .mask(libc::STATX_SIZE)
+                .build()
             }
             InFlightOp::Write { buf, offset, written } => {
                 let fd = fd.expect("write dispatched without an open fd");
@@ -665,6 +684,9 @@ impl DiskIo {
             InFlightOp::Read { .. } | InFlightOp::Write { .. } => {
                 self.complete_transfer(user_data, file_index, entry.op, result, handler);
             }
+            InFlightOp::Statx { offset, statx } => {
+                self.complete_statx(user_data, file_index, offset, statx, result);
+            }
             InFlightOp::Sync { .. } => {
                 self.finish_op(slot, file_index);
                 if result < 0 {
@@ -710,6 +732,55 @@ impl DiskIo {
         }
     }
 
+    fn complete_statx(
+        &mut self,
+        user_data: u64,
+        file_index: usize,
+        offset: u64,
+        statx: Box<MaybeUninit<libc::statx>>,
+        result: i32,
+    ) {
+        let len = if result == 0 {
+            // SAFETY: a successful statx completion writes the output struct.
+            let statx = unsafe { statx.assume_init() };
+            (statx.stx_mask & libc::STATX_SIZE != 0).then_some(statx.stx_size)
+        } else {
+            None
+        };
+        self.start_read_to_end(user_data, file_index, offset, len);
+    }
+
+    fn start_read_to_end(
+        &mut self,
+        user_data: u64,
+        file_index: usize,
+        offset: u64,
+        file_len: Option<u64>,
+    ) {
+        let wanted = Self::read_to_end_len(file_len, offset);
+        let token = self.files[file_index].token;
+        let slot = user_data as usize;
+        self.slab[slot] = Some(InFlight {
+            file: token,
+            op: InFlightOp::Read {
+                buf: self.take_buffer_with_capacity(wanted),
+                offset,
+                wanted,
+                have: 0,
+                to_end: true,
+            },
+        });
+        self.push_slot(user_data);
+    }
+
+    fn read_to_end_len(file_len: Option<u64>, offset: u64) -> usize {
+        file_len
+            .map(|len| len.saturating_sub(offset).saturating_add(1))
+            .and_then(|len| usize::try_from(len).ok())
+            .unwrap_or(READ_TO_END_CHUNK)
+            .max(READ_TO_END_CHUNK)
+    }
+
     /// Handles a read or write completion, transparently continuing after
     /// short transfers.
     fn complete_transfer<F>(
@@ -735,6 +806,10 @@ impl DiskIo {
                     return;
                 }
                 let have = have + result as usize;
+                // SAFETY: a successful read initialized exactly `result`
+                // bytes starting at the prior `have`, within the reserved
+                // read range.
+                unsafe { buf.set_len(have) };
                 if result == 0 || (have >= wanted && !to_end) {
                     self.finish_op(slot, file_index);
                     let eof = result == 0;
@@ -745,7 +820,7 @@ impl DiskIo {
                         // The buffer filled before end-of-file: grow it and
                         // keep reading.
                         wanted = wanted.saturating_mul(2);
-                        buf.resize(wanted, 0);
+                        buf.reserve(wanted - buf.len());
                     }
                     self.slab[slot] = Some(InFlight {
                         file: token,
@@ -800,6 +875,9 @@ impl DiskIo {
             let failed = match op {
                 PendingOp::Open { .. } => FailedOp::Open,
                 PendingOp::Read { offset, len, .. } => FailedOp::Read { offset, len },
+                PendingOp::ReadToEnd { offset } => {
+                    FailedOp::Read { offset, len: READ_TO_END_CHUNK }
+                }
                 PendingOp::Write { buf, offset } => {
                     let len = buf.len();
                     self.recycle(buf);
@@ -874,10 +952,13 @@ impl Drop for DiskIo {
 mod tests {
     use std::{
         fs,
+        os::fd::IntoRawFd,
         time::{Duration as StdDuration, Instant as StdInstant},
     };
 
-    use super::{DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions};
+    use super::{
+        DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions, READ_TO_END_CHUNK,
+    };
 
     fn overwrite() -> OpenOptions {
         OpenOptions::new().write(true).create(true).truncate(true)
@@ -968,7 +1049,16 @@ mod tests {
     }
 
     #[test]
-    fn read_to_end_returns_full_contents_across_buffer_growth() {
+    fn read_to_end_size_hint_uses_metadata_or_falls_back() {
+        assert_eq!(DiskIo::read_to_end_len(Some(200_000), 0), 200_001);
+        assert_eq!(DiskIo::read_to_end_len(Some(200_000), 199_990), READ_TO_END_CHUNK);
+        assert_eq!(DiskIo::read_to_end_len(Some(0), 0), READ_TO_END_CHUNK);
+        assert_eq!(DiskIo::read_to_end_len(Some(10), 20), READ_TO_END_CHUNK);
+        assert_eq!(DiskIo::read_to_end_len(None, 0), READ_TO_END_CHUNK);
+    }
+
+    #[test]
+    fn read_to_end_returns_full_contents_from_a_static_large_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grown.bin");
         let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
@@ -988,6 +1078,37 @@ mod tests {
             payload: data[199_990..].to_vec(),
             eof: true,
         }));
+    }
+
+    #[test]
+    fn read_to_end_grows_after_a_stale_statx_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grown.bin");
+        let data: Vec<u8> = (0..READ_TO_END_CHUNK * 3).map(|i| i as u8).collect();
+        fs::write(&path, &data).unwrap();
+        let mut disk = DiskIo::default();
+        let file = FileToken(0);
+        disk.files.push(super::File {
+            token: file,
+            path: path.clone(),
+            fd: Some(fs::File::open(&path).unwrap().into_raw_fd()),
+            closing: false,
+            write_cursor: 0,
+            in_flight: 1,
+            queue: std::collections::VecDeque::new(),
+        });
+        disk.slab.push(None);
+        disk.in_flight_count = 1;
+
+        // Start from a deliberately stale size captured before the file grew.
+        disk.start_read_to_end(0, 0, 0, Some(READ_TO_END_CHUNK as u64));
+
+        let mut events = Vec::new();
+        drive(&mut disk, &mut events, |events| {
+            events.iter().any(|event| matches!(event, Ev::Read { .. }))
+        });
+        assert!(events.contains(&Ev::Read { file, offset: 0, payload: data, eof: true }));
+        assert!(disk.is_idle());
     }
 
     #[test]
