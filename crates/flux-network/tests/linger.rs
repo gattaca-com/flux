@@ -123,8 +123,8 @@ impl Server {
     fn build(endpoint: &Endpoint, group: ConnectionGroupConfig, config: HttpConfig) -> Self {
         let mut net = StreamNetwork::default();
         let group = net.add_group(group);
-        let mut service = HttpService::new(&mut net, group, config);
-        let endpoint = service.listen(&mut net, endpoint.clone()).unwrap();
+        let mut service = HttpService::new(group, config);
+        let endpoint = service.listen(endpoint.clone()).unwrap();
         Self {
             net,
             service,
@@ -148,8 +148,8 @@ impl Server {
     /// or events the service was already holding.
     fn pump(&mut self) -> bool {
         let Self { net, service, accepted, disconnected, requests, inline_answer, .. } = self;
-        let worked = net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
-        while let Some(event) = service.next_event(net) {
+        let worked = net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
+        while let Some(event) = service.next_event() {
             match event {
                 HttpEvent::Accepted { token, .. } => accepted.push(token),
                 HttpEvent::Disconnected { token } => disconnected.push(token),
@@ -184,7 +184,7 @@ impl Server {
     fn drive_blocking(&mut self) -> Duration {
         let Self { net, service, .. } = self;
         let started = Instant::now();
-        net.drive(None, &mut [service.as_service()], |_| {});
+        net.drive(None, &mut [&mut service]);
         started.elapsed()
     }
 
@@ -743,8 +743,8 @@ fn the_caps_start_when_the_answer_has_left() {
     let ended = loop {
         {
             let Server { net, service, disconnected, .. } = &mut server;
-            net.drive(None, &mut [service.as_service()], |_| {});
-            while let Some(event) = service.next_event(net) {
+            net.drive(None, &mut [&mut service]);
+            while let Some(event) = service.next_event() {
                 if let HttpEvent::Disconnected { token } = event {
                     disconnected.push(token);
                 }

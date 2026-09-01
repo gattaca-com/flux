@@ -145,8 +145,8 @@ impl Client {
     fn build(endpoint: &Endpoint, group: ConnectionGroupConfig, config: HttpConfig) -> Self {
         let mut net = StreamNetwork::default();
         let group = net.add_group(group);
-        let mut service = HttpService::new(&mut net, group, config);
-        let token = service.connect(&mut net, endpoint.clone());
+        let mut service = HttpService::new(group, config);
+        let token = service.connect(endpoint.clone());
         Self { net, service, token, pulled: Vec::new() }
     }
 
@@ -156,8 +156,8 @@ impl Client {
 
     fn pump(&mut self) {
         let Self { net, service, pulled, .. } = self;
-        net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
-        while let Some(event) = service.next_event(net) {
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
+        while let Some(event) = service.next_event() {
             match event {
                 HttpEvent::Connected { .. } => pulled.push(Pulled::Connected),
                 HttpEvent::Response { response, .. } => {
@@ -506,7 +506,7 @@ fn a_blocking_drive_wakes_for_a_request_deadline() {
     // That deadline is the only one the network has, so an uncapped drive
     // waits for it and no longer.
     let started = Instant::now();
-    client.net.drive(None, &mut [client.service.as_service()], |_| {});
+    client.net.drive(None, &mut [&mut client.service]);
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(100), "returned at once: {waited:?}");
     assert!(waited < Duration::from_secs(2), "the request deadline was not folded: {waited:?}");

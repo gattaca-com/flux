@@ -106,7 +106,7 @@ impl Http {
     fn build(mode: Mode, group: ConnectionGroupConfig, config: HttpConfig) -> Self {
         let (driver, mut net) = Driver::build(mode);
         let group = net.add_group(group);
-        let service = HttpService::new(&mut net, group, config);
+        let service = HttpService::new(group, config);
         Self { net, service, driver }
     }
 
@@ -126,7 +126,7 @@ impl Http {
     fn pump(&mut self, mut handler: impl for<'a> FnMut(HttpEvent<'a>)) {
         self.drive();
         let mut pulled = 0;
-        while let Some(event) = self.service.next_event(&mut self.net) {
+        while let Some(event) = self.service.next_event() {
             handler(event);
             pulled += 1;
             assert!(pulled < 10_000, "the pull loop delivered the same work forever");
@@ -136,7 +136,7 @@ impl Http {
     /// One iteration of the network alone, leaving the events to be pulled.
     fn drive(&mut self) -> bool {
         let Self { net, service, driver } = self;
-        driver.iterate(net, &mut [service.as_service()], |_| {})
+        driver.iterate(net, &mut [&mut service])
     }
 
     /// Listens, and reports the endpoint bound: for a TCP request on port
@@ -715,7 +715,7 @@ fn a_header_count_past_the_parse_scratch_is_refused_by_the_service() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
     let config = HttpConfig { max_headers: MAX_HEADERS + 1, ..HttpConfig::default() };
-    let _ = HttpService::new(&mut net, group, config);
+    let _ = HttpService::new(group, config);
 }
 
 #[test]
@@ -1571,7 +1571,7 @@ fn serve_two_pipelined_requests(inline_first: bool) -> (Vec<String>, Vec<u8>) {
     while Instant::now() < deadline && !received.ends_with(b"/two") {
         let mut deferred = None;
         server.drive();
-        while let Some(event) = server.service.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event() {
             if let HttpEvent::Request { token, request, responder } = event {
                 let path = request.path.to_owned();
                 if pulled.is_empty() && !inline_first {
@@ -1621,7 +1621,7 @@ fn serve_the_request_behind_an_answer(inline_first: bool) {
     while Instant::now() < deadline && !answered {
         let mut deferred = None;
         server.drive();
-        while let Some(event) = server.service.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event() {
             if let HttpEvent::Request { token, request, responder } = event {
                 assert_eq!(request.path, "/one", "{path}");
                 if inline_first {
@@ -1647,7 +1647,7 @@ fn serve_the_request_behind_an_answer(inline_first: bool) {
 
     let mut pulled = false;
     while Instant::now() < deadline && !pulled {
-        while let Some(event) = server.service.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event() {
             if let HttpEvent::Request { request, responder, .. } = event {
                 assert_eq!(request.method, "POST", "{path}");
                 assert_eq!(request.path, "/two", "{path}");
@@ -1716,7 +1716,7 @@ fn answered_bytes_cost_the_connection_nothing() {
     let mut token = None;
     while Instant::now() < deadline && token.is_none() {
         server.drive();
-        while let Some(event) = server.service.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event() {
             if let HttpEvent::Request { token: pulled, responder, .. } = event {
                 assert!(responder.respond(200, &[], b""));
                 token = Some(pulled);
@@ -1783,7 +1783,7 @@ fn a_pending_request_survives_a_compaction() {
     while Instant::now() < deadline && pulled.len() < 2 {
         server.drive();
         while pulled.len() < 2 {
-            let Some(event) = server.service.next_event(&mut server.net) else { break };
+            let Some(event) = server.service.next_event() else { break };
             if let HttpEvent::Request { token, request, responder } = event {
                 pulled.push(request.path.to_owned());
                 if pulled.len() == 1 {
@@ -1889,7 +1889,7 @@ fn a_caller_may_stop_pulling_and_resume_later() {
     let mut deferred = None;
     while Instant::now() < deadline && deferred.is_none() {
         server.drive();
-        if let Some(HttpEvent::Request { token, .. }) = server.service.next_event(&mut server.net) {
+        if let Some(HttpEvent::Request { token, .. }) = server.service.next_event() {
             deferred = Some(token);
         }
         thread::sleep(Duration::from_millis(1));
@@ -1978,7 +1978,7 @@ fn a_pending_request_reports_work_and_holds_off_the_sweep() {
     let mut token = None;
     while Instant::now() < deadline && token.is_none() {
         server.drive();
-        while let Some(event) = server.service.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event() {
             if let HttpEvent::Request { token: pulled, .. } = event {
                 token = Some(pulled);
                 break
@@ -2015,7 +2015,7 @@ fn work_is_reported_after_an_inline_answer_stops_the_pull() {
     let mut answered = false;
     while Instant::now() < deadline && !answered {
         server.drive();
-        while let Some(event) = server.service.next_event(&mut server.net) {
+        while let Some(event) = server.service.next_event() {
             if let HttpEvent::Request { request, responder, .. } = event {
                 assert_eq!(request.path, "/one");
                 assert!(responder.respond(200, &[], b"one"));
@@ -2028,7 +2028,7 @@ fn work_is_reported_after_an_inline_answer_stops_the_pull() {
     assert!(answered, "no request arrived");
 
     assert!(server.drive(), "the request behind the answered one is work");
-    match server.service.next_event(&mut server.net) {
+    match server.service.next_event() {
         Some(HttpEvent::Request { request, responder, .. }) => {
             assert_eq!(request.path, "/two");
             assert!(responder.respond(200, &[], b"two"));
@@ -2061,7 +2061,7 @@ fn a_blocking_drive_wakes_for_the_idle_sweep() {
         drop(std::net::TcpStream::connect(addr));
     });
     let started = Instant::now();
-    server.net.drive(None, &mut [server.service.as_service()], |_| {});
+    server.net.drive(None, &mut [&mut server.service]);
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(100), "returned at once: {waited:?}");
     assert!(waited < Duration::from_secs(2), "the sweep deadline was not folded: {waited:?}");
@@ -2083,14 +2083,14 @@ fn a_blocking_drive_wakes_for_a_connection() {
         drop((early, late));
     });
     let started = Instant::now();
-    let worked = server.net.drive(None, &mut [server.service.as_service()], |_| {});
+    let worked = server.net.drive(None, &mut [&mut server.service]);
     let waited = started.elapsed();
     assert!(worked, "an accepted connection is work");
     assert!(waited >= Duration::from_millis(150), "the drive did not block: {waited:?}");
     assert!(waited < Duration::from_secs(2), "the drive missed the connection: {waited:?}");
 
     let mut accepted = false;
-    while let Some(event) = server.service.next_event(&mut server.net) {
+    while let Some(event) = server.service.next_event() {
         accepted |= matches!(event, HttpEvent::Accepted { .. });
     }
     assert!(accepted, "the connection that woke the poll was not delivered");
@@ -2128,7 +2128,7 @@ fn a_request_from_a_client_that_left_is_dropped() {
 fn polling_a_network_that_has_services_is_refused() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
-    let _http = HttpService::new(&mut net, group, HttpConfig::default());
+    let _http = HttpService::new(group, HttpConfig::default());
     net.poll_with(|_| {});
 }
 
@@ -2168,10 +2168,10 @@ fn two_services_on_one_network_keep_their_own_events(mode: Mode) {
     let (mut driver, mut net) = Driver::build(mode);
     let first_group = net.add_group(ConnectionGroupConfig { name: "first", ..http_group() });
     let second_group = net.add_group(ConnectionGroupConfig { name: "second", ..http_group() });
-    let mut first = HttpService::new(&mut net, first_group, HttpConfig::default());
-    let mut second = HttpService::new(&mut net, second_group, HttpConfig::default());
-    let first_addr = bound_addr(first.listen(&mut net, ephemeral()).unwrap());
-    let second_addr = bound_addr(second.listen(&mut net, ephemeral()).unwrap());
+    let mut first = HttpService::new(first_group, HttpConfig::default());
+    let mut second = HttpService::new(second_group, HttpConfig::default());
+    let first_addr = bound_addr(first.listen(ephemeral()).unwrap());
+    let second_addr = bound_addr(second.listen(ephemeral()).unwrap());
 
     let mut to_first = std::net::TcpStream::connect(first_addr).unwrap();
     let mut to_second = std::net::TcpStream::connect(second_addr).unwrap();
@@ -2182,16 +2182,16 @@ fn two_services_on_one_network_keep_their_own_events(mode: Mode) {
     let mut second_paths = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && (first_paths.is_empty() || second_paths.is_empty()) {
-        driver.iterate(&mut net, &mut [first.as_service(), second.as_service()], |event| {
+        driver.iterate(&mut net, &mut [&mut first, &mut second], |event| {
             panic!("no unclaimed group exists: {:?}", event_group(&event))
         });
-        while let Some(event) = first.next_event(&mut net) {
+        while let Some(event) = first.next_event() {
             if let HttpEvent::Request { request, responder, .. } = event {
                 first_paths.push(request.path.to_owned());
                 assert!(responder.respond(200, &[], b"first"));
             }
         }
-        while let Some(event) = second.next_event(&mut net) {
+        while let Some(event) = second.next_event() {
             if let HttpEvent::Request { request, responder, .. } = event {
                 second_paths.push(request.path.to_owned());
                 assert!(responder.respond(200, &[], b"second"));
@@ -2223,13 +2223,13 @@ fn close_returns_the_group_to_raw_use() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
     let other_group = net.add_group(http_group());
-    let mut http = HttpService::new(&mut net, group, HttpConfig::default());
-    let mut other = HttpService::new(&mut net, other_group, HttpConfig::default());
-    http.listen(&mut net, ephemeral()).unwrap();
+    let mut http = HttpService::new(group, HttpConfig::default());
+    let mut other = HttpService::new(other_group, HttpConfig::default());
+    http.listen(ephemeral()).unwrap();
     http.close(&mut net);
 
     // The remaining service alone passes validation.
-    net.drive(Some(Duration::ZERO.into()), &mut [other.as_service()], |_| {});
+    net.drive(Some(Duration::ZERO.into()), &mut [&mut other]);
 
     let addr = bound_addr(net.listen(group, ephemeral()).unwrap());
     let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -2237,7 +2237,7 @@ fn close_returns_the_group_to_raw_use() {
     let mut raw = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && raw.is_empty() {
-        net.drive(Some(Duration::ZERO.into()), &mut [other.as_service()], |event| {
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut other], |event| {
             if let StreamEvent::Message { group: event_group, payload, .. } = event {
                 assert_eq!(event_group, group);
                 raw.push(payload.to_vec());
@@ -2255,8 +2255,8 @@ fn close_hangs_up_on_connections_and_listeners() {
     let path = dir.path().join("closed.sock");
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
-    let mut http = HttpService::new(&mut net, group, HttpConfig::default());
-    http.listen(&mut net, Endpoint::Unix(path.clone())).unwrap();
+    let mut http = HttpService::new(group, HttpConfig::default());
+    http.listen(Endpoint::Unix(path.clone())).unwrap();
     assert!(path.exists());
 
     let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
@@ -2264,8 +2264,8 @@ fn close_hangs_up_on_connections_and_listeners() {
     let deadline = Instant::now() + TIMEOUT;
     let mut accepted = false;
     while Instant::now() < deadline && !accepted {
-        net.drive(Some(Duration::ZERO.into()), &mut [http.as_service()], |_| {});
-        while let Some(event) = http.next_event(&mut net) {
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut http]);
+        while let Some(event) = http.next_event() {
             accepted |= matches!(event, HttpEvent::Accepted { .. });
         }
         thread::sleep(Duration::from_millis(1));
@@ -2291,18 +2291,18 @@ fn close_hangs_up_on_connections_and_listeners() {
 fn a_service_dropped_without_closing_is_reported() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
-    let http = HttpService::new(&mut net, group, HttpConfig::default());
+    let http = HttpService::new(group, HttpConfig::default());
     drop(http);
-    net.drive(Some(Duration::ZERO.into()), &mut [], |_| {});
+    net.drive(Some(Duration::ZERO.into()), &mut []);
 }
 
 #[test]
 fn dropping_a_service_and_its_network_together_is_harmless() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
-    let mut http = HttpService::new(&mut net, group, HttpConfig::default());
-    http.listen(&mut net, ephemeral()).unwrap();
-    net.drive(Some(Duration::ZERO.into()), &mut [http.as_service()], |_| {});
+    let mut http = HttpService::new(group, HttpConfig::default());
+    http.listen(ephemeral()).unwrap();
+    net.drive(Some(Duration::ZERO.into()), &mut [&mut http]);
     drop(http);
     drop(net);
 }
@@ -2312,5 +2312,5 @@ fn dropping_a_service_and_its_network_together_is_harmless() {
 fn a_service_refuses_a_length_prefixed_group() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(ConnectionGroupConfig::default());
-    let _http = HttpService::new(&mut net, group, HttpConfig::default());
+    let _http = HttpService::new(group, HttpConfig::default());
 }

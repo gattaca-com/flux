@@ -124,10 +124,10 @@ impl Harness {
             backlog_warn_bytes: None,
             ..ConnectionGroupConfig::default()
         });
-        let mut service = HttpService::new(&mut net, group, HttpConfig::default());
-        let serving = service.listen(&mut net, Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into()));
+        let mut service = HttpService::new(group, HttpConfig::default());
+        let serving = service.listen(Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into()));
         let Endpoint::Tcp(serve_addr) = serving.unwrap() else { unreachable!("a TCP listener") };
-        let upstream_token = service.connect(&mut net, Endpoint::Tcp(upstream_addr));
+        let upstream_token = service.connect(Endpoint::Tcp(upstream_addr));
 
         let client = TcpStream::connect(serve_addr).unwrap();
         client.set_nonblocking(true).unwrap();
@@ -162,7 +162,7 @@ impl Harness {
         // listener ever accepts, so it is the one every request rides.
         let upstream = loop {
             assert!(Instant::now() < deadline, "the service never reached its endpoint");
-            net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
+            net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
             if let Ok((stream, _)) = listener.accept() {
                 stream.set_nonblocking(true).unwrap();
                 break stream;
@@ -188,8 +188,8 @@ impl Harness {
     /// One iteration of the network, and every event it left to pull.
     fn pump(&mut self) {
         let Self { net, service, served, answered, .. } = self;
-        net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
-        while let Some(event) = service.next_event(net) {
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut *service]);
+        while let Some(event) = service.next_event() {
             match event {
                 HttpEvent::Request { responder, .. } => {
                     assert!(responder.respond_with(200, JSON, |out| {
@@ -223,8 +223,8 @@ impl Harness {
     /// One outbound round trip: the service asks, the upstream answers, and
     /// the service reports the response.
     fn ask_one(&mut self, deadline: Instant) {
-        let Self { net, service, upstream_token, .. } = self;
-        assert!(service.request(net, *upstream_token, "POST", "/rpc", JSON, REQUEST_BODY));
+        let Self { service, upstream_token, .. } = self;
+        assert!(service.request(*upstream_token, "POST", "/rpc", JSON, REQUEST_BODY));
         let mut read = 0;
         while read < self.upstream_request.len() {
             assert!(Instant::now() < deadline, "the outbound request stalled");

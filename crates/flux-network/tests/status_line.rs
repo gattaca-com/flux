@@ -46,8 +46,8 @@ impl Server {
             framing: Framing::Raw,
             ..ConnectionGroupConfig::default()
         });
-        let mut service = HttpService::new(&mut net, group, HttpConfig::default());
-        let addr = bound_addr(service.listen(&mut net, ephemeral()).unwrap());
+        let mut service = HttpService::new(group, HttpConfig::default());
+        let addr = bound_addr(service.listen(ephemeral()).unwrap());
         let client = TcpStream::connect(addr).unwrap();
         client.set_nonblocking(true).unwrap();
         (Self { net, service, requests: Vec::new() }, client)
@@ -55,8 +55,8 @@ impl Server {
 
     fn pump(&mut self) {
         let Self { net, service, requests } = self;
-        net.drive(Some(Duration::ZERO.into()), &mut [service.as_service()], |_| {});
-        while let Some(event) = service.next_event(net) {
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
+        while let Some(event) = service.next_event() {
             if let HttpEvent::Request { token, .. } = event {
                 requests.push(token);
             }

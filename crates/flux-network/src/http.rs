@@ -101,10 +101,11 @@ use std::{
 };
 
 use flux_timing::{Duration, Instant};
-use mio::Token;
+use mio::{Token, event::Event};
 
 use crate::stream::{
-    ConnectionGroup, Endpoint, Framing, Peer, ServiceRef, StreamEvent, StreamNetwork, private,
+    ConnectionGroup, ConnectionGroupId, Endpoint, Framing, Peer, ReadinessOutcome, Service,
+    StreamEvent, StreamNetwork,
 };
 
 /// The most headers one message may be parsed into, and the size of the fixed
@@ -332,7 +333,7 @@ impl<'a> HttpResponse<'a> {
 #[must_use = "respond now, or drop it to answer later with HttpService::respond; a request never \
               answered is closed by the idle sweep"]
 pub struct Responder<'a> {
-    net: &'a mut StreamNetwork,
+    group: &'a mut ConnectionGroup,
     state: &'a mut ConnState,
     scratch: &'a mut Vec<u8>,
     token: Token,
@@ -351,11 +352,11 @@ impl Responder<'_> {
     /// are reclaimed on the next pull or network tick, after the event's
     /// borrow ends. [`HttpService::respond`] reclaims before it returns.
     pub fn respond(self, status: u16, headers: &[(&str, &str)], body: &[u8]) -> bool {
-        let Self { net, state, token, linger, .. } = self;
+        let Self { group, state, token, linger, .. } = self;
         if !answerable(state, status, headers) {
             return false
         }
-        write_framed(net, state, token, linger, status, headers, body)
+        write_framed(group, state, token, linger, status, headers, body)
     }
 
     /// Queues the response with its body written by `body`, and returns
@@ -372,13 +373,13 @@ impl Responder<'_> {
         headers: &[(&str, &str)],
         body: impl FnOnce(&mut Vec<u8>),
     ) -> bool {
-        let Self { net, state, scratch, token, linger } = self;
+        let Self { group, state, scratch, token, linger } = self;
         if !answerable(state, status, headers) {
             return false
         }
         scratch.clear();
         body(scratch);
-        write_framed(net, state, token, linger, status, headers, scratch)
+        write_framed(group, state, token, linger, status, headers, scratch)
     }
 }
 
@@ -399,7 +400,7 @@ fn answerable(state: &ConnState, status: u16, headers: &[(&str, &str)]) -> bool 
 /// holds it. A `HEAD` request is framed with its `Content-Length` and sent
 /// none of it.
 fn write_framed(
-    net: &mut StreamNetwork,
+    group: &mut ConnectionGroup,
     state: &mut ConnState,
     token: Token,
     linger: Option<Linger>,
@@ -414,7 +415,7 @@ fn write_framed(
     let close = state.close || caller_close;
     let suppress_body = state.head_request || matches!(status, 100..=199 | 204 | 304);
     let include_length = !matches!(status, 100..=199 | 204);
-    let ok = net.send_with(token, |out| {
+    let ok = group.send_with(token, |out| {
         write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
         // Caller Connection headers only feed the close decision; exactly
         // one canonical Connection header is always written below.
@@ -450,15 +451,16 @@ fn write_framed(
             // The peer is still sending a request stream this response ends.
             // Shutting the write side alone puts the answer in front of it
             // before the connection goes.
-            net.shutdown_write_when_drained(token);
+            group.shutdown_write_when_drained(token);
             // The caps time what follows the answer, so they start where the
             // answer ends: here when nothing was queued behind it, and at the
             // tick that sees the write side shut otherwise.
-            let clock = net.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
+            let clock =
+                group.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
             state.phase = Phase::Lingering { clock };
         } else {
             state.phase = Phase::Draining;
-            net.disconnect_when_drained(token);
+            group.disconnect_when_drained(token);
         }
     }
     ok
@@ -658,14 +660,25 @@ enum Body {
 /// The name and value of one header, as byte ranges of a connection buffer.
 type HeaderRange = (Range<usize>, Range<usize>);
 
-/// An HTTP server, client, or both, owning one raw-framed group of a
-/// [`StreamNetwork`].
+/// An HTTP server, client, or both, owning one raw-framed
+/// [`ConnectionGroup`].
 ///
-/// The network schedules the service — hand it to
-/// [`StreamNetwork::drive`] with [`Self::as_service`] — and the caller pulls
-/// protocol events with [`Self::next_event`].
+/// The network schedules the service — pass it to
+/// [`StreamNetwork::drive`] — and the caller pulls protocol events with
+/// [`Self::next_event`]. Normal operations act on the group the service owns,
+/// so none of them takes a network.
 pub struct HttpService {
     group: ConnectionGroup,
+    http: HttpState,
+}
+
+/// The protocol state HTTP keeps beside the group it owns.
+///
+/// Splitting it from the group is what lets one call reach the transport and
+/// the protocol at once: they are disjoint fields, so a responder or an event
+/// borrows both without either standing in the other's way. It is private, and
+/// every operation on it takes the group it belongs to.
+struct HttpState {
     config: HttpConfig,
     conns: Vec<Conn>,
     /// Lifecycle events, oldest first from `record_cursor`.
@@ -683,88 +696,35 @@ pub struct HttpService {
     /// The connection awaiting bookkeeping from the last pulled event.
     last: Option<Token>,
 }
-
-impl HttpService {
-    /// Claims `group` for HTTP.
-    ///
-    /// # Panics
-    /// The group must be [`Framing::Raw`] and unclaimed, and `config` must
-    /// hold to the ranges its fields document.
-    pub fn new(net: &mut StreamNetwork, group: ConnectionGroup, config: HttpConfig) -> Self {
-        assert!(
-            net.framing(group) == Framing::Raw,
-            "HTTP frames its own messages and needs a raw-framed group"
-        );
-        config.validate();
-        net.claim_group(group);
-        Self {
-            group,
-            config,
-            conns: Vec::new(),
-            records: Vec::new(),
-            record_cursor: 0,
-            ready: Vec::new(),
-            ready_cursor: 0,
-            headers: Vec::new(),
-            decoded: Vec::new(),
-            scratch: Vec::new(),
-            last: None,
-        }
-    }
-
-    /// The group this service owns.
-    pub fn group(&self) -> ConnectionGroup {
-        self.group
-    }
-
-    /// Hands the service to [`StreamNetwork::drive`].
-    pub fn as_service(&mut self) -> ServiceRef<'_> {
-        ServiceRef::new(self)
-    }
-
+impl HttpState {
     /// Adds a listener, and reports the endpoint it bound.
     ///
     /// That endpoint is the one asked for, except for a TCP address whose
     /// port is `0`: the kernel picks the port, and what comes back is the
     /// address a client must dial.
-    ///
-    /// An [`Endpoint::Unix`] socket file is created with mode `0777` less the
-    /// umask bits and is unlinked when the service is closed; see
-    /// [`StreamNetwork::listen`].
-    pub fn listen(&mut self, net: &mut StreamNetwork, endpoint: Endpoint) -> io::Result<Endpoint> {
-        net.listen(self.group, endpoint)
-    }
-
     /// Adds a persistent outbound endpoint and immediately starts connecting.
     /// The returned token remains stable across reconnects.
     #[must_use = "the token identifies the outbound endpoint"]
-    pub fn connect(&mut self, net: &mut StreamNetwork, endpoint: Endpoint) -> Token {
-        let token = net.connect(self.group, endpoint.clone());
+    fn connect(&mut self, group: &mut ConnectionGroup, endpoint: Endpoint) -> Token {
+        let token = group.connect(endpoint.clone());
         self.conns.push(Conn::new(token, Role::Outbound { endpoint, in_flight: None }));
         token
     }
 
     /// Immediately disconnects an accepted client.
-    pub fn disconnect(&mut self, net: &mut StreamNetwork, token: Token) -> bool {
+    fn disconnect(&self, group: &mut ConnectionGroup, token: Token) -> bool {
         self.index_of(token).is_some_and(|index| matches!(self.conns[index].role, Role::Accepted)) &&
-            net.disconnect(token)
+            group.disconnect(token)
     }
 
     /// Permanently removes an outbound endpoint and stops it reconnecting.
-    pub fn remove(&mut self, net: &mut StreamNetwork, token: Token) -> bool {
+    fn remove(&mut self, group: &mut ConnectionGroup, token: Token) -> bool {
         let Some(index) = self.index_of(token) else { return false };
-        if !matches!(self.conns[index].role, Role::Outbound { .. }) || !net.remove(token) {
+        if !matches!(self.conns[index].role, Role::Outbound { .. }) || !group.remove(token) {
             return false
         }
         self.conns.swap_remove(index);
         true
-    }
-
-    /// Closes the service: every connection and listener of its group goes,
-    /// un-pulled events are discarded, and the group returns to unclaimed
-    /// status, empty and reusable.
-    pub fn close(self, net: &mut StreamNetwork) {
-        net.close_group(self.group);
     }
 
     /// Queues one request on an outbound endpoint.
@@ -772,9 +732,9 @@ impl HttpService {
     /// When the caller supplies no `Host` header, a TCP endpoint sends its
     /// socket address; a Unix-domain endpoint has no address to name and
     /// sends `localhost`.
-    pub fn request(
+    fn request(
         &mut self,
-        net: &mut StreamNetwork,
+        group: &mut ConnectionGroup,
         token: Token,
         method: &str,
         path: &str,
@@ -797,7 +757,7 @@ impl HttpService {
             return false
         };
         let Role::Outbound { endpoint, .. } = &conn.role else { return false };
-        let sent = net.send_with(token, |out| {
+        let sent = group.send_with(token, |out| {
             write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
             let mut has_host = false;
             for (name, value) in headers {
@@ -841,15 +801,15 @@ impl HttpService {
     ///
     /// Unlike [`Responder::respond`], this path holds no event borrow, so it
     /// reclaims answered bytes and requeues the connection before returning.
-    pub fn respond(
+    fn respond(
         &mut self,
-        net: &mut StreamNetwork,
+        group: &mut ConnectionGroup,
         token: Token,
         status: u16,
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        self.answer(net, token, |responder| responder.respond(status, headers, body))
+        self.answer(group, token, |responder| responder.respond(status, headers, body))
     }
 
     /// Answers a request whose [`Responder`] was dropped with a body `body`
@@ -861,22 +821,22 @@ impl HttpService {
     /// request was: a `HEAD` request is answered with the `Content-Length`
     /// of the body it is not sent. [`Responder::respond_with`] is the same
     /// answer, given inline.
-    pub fn respond_with(
+    fn respond_with(
         &mut self,
-        net: &mut StreamNetwork,
+        group: &mut ConnectionGroup,
         token: Token,
         status: u16,
         headers: &[(&str, &str)],
         body: impl FnOnce(&mut Vec<u8>),
     ) -> bool {
-        self.answer(net, token, |responder| responder.respond_with(status, headers, body))
+        self.answer(group, token, |responder| responder.respond_with(status, headers, body))
     }
 
     /// Hands `answer` the responder for the request pending on an accepted
     /// `token`, and reclaims what its response consumed.
     fn answer(
         &mut self,
-        net: &mut StreamNetwork,
+        group: &mut ConnectionGroup,
         token: Token,
         answer: impl FnOnce(Responder<'_>) -> bool,
     ) -> bool {
@@ -886,7 +846,7 @@ impl HttpService {
         }
         let linger = self.config.linger;
         let Self { conns, scratch, .. } = self;
-        let responder = Responder { net, state: &mut conns[index].state, scratch, token, linger };
+        let responder = Responder { group, state: &mut conns[index].state, scratch, token, linger };
         if !answer(responder) {
             return false
         }
@@ -899,9 +859,12 @@ impl HttpService {
     ///
     /// The event borrows the service and the network until it is dropped, so a
     /// handler reaches the network only through the event it was handed.
-    pub fn next_event<'a>(&'a mut self, net: &'a mut StreamNetwork) -> Option<HttpEvent<'a>> {
+    fn next_event<'a>(
+        &'a mut self,
+        group: &'a mut ConnectionGroup,
+    ) -> Option<HttpEvent<'a>> {
         self.apply_bookkeeping();
-        match self.plan(net)? {
+        match self.plan(group)? {
             Step::Accepted { token, peer } => Some(HttpEvent::Accepted { token, peer }),
             Step::Connected { token } => Some(HttpEvent::Connected { token }),
             Step::RequestFailed { token, reason } => {
@@ -927,7 +890,7 @@ impl HttpService {
                 Some(HttpEvent::Request {
                     token,
                     request,
-                    responder: Responder { net, state, scratch, token, linger },
+                    responder: Responder { group, state, scratch, token, linger },
                 })
             }
             Step::Response { index, version, status, reason, body } => {
@@ -971,7 +934,7 @@ impl HttpService {
 
     /// Resolves the next event, sending error responses and closing
     /// connections along the way; no borrow of a connection escapes.
-    fn plan(&mut self, net: &mut StreamNetwork) -> Option<Step> {
+    fn plan(&mut self, group: &mut ConnectionGroup) -> Option<Step> {
         loop {
             // Lifecycle first, so a connection's Accepted precedes its first
             // request, and its Disconnected follows everything it sent.
@@ -991,7 +954,7 @@ impl HttpService {
                     }
                     Record::Disconnected(token) => {
                         if let Some(index) = self.index_of(token) {
-                            if let Some(step) = self.plan_connection(net, index, true) {
+                            if let Some(step) = self.plan_connection(group, index, true) {
                                 return Some(step)
                             }
                             self.close_connection(index);
@@ -1002,7 +965,7 @@ impl HttpService {
                 }
             }
             let index = self.pop_ready()?;
-            if let Some(step) = self.plan_connection(net, index, false) {
+            if let Some(step) = self.plan_connection(group, index, false) {
                 return Some(step)
             }
         }
@@ -1010,21 +973,21 @@ impl HttpService {
 
     fn plan_connection(
         &mut self,
-        net: &mut StreamNetwork,
+        group: &mut ConnectionGroup,
         index: usize,
         at_eof: bool,
     ) -> Option<Step> {
         match self.conns[index].role {
             // A client that has gone can be told nothing, so its last request
             // is dropped rather than delivered with an answer that fails.
-            Role::Accepted => (!at_eof).then(|| self.plan_request(net, index)).flatten(),
-            Role::Outbound { .. } => self.plan_response(net, index, at_eof),
+            Role::Accepted => (!at_eof).then(|| self.plan_request(group, index)).flatten(),
+            Role::Outbound { .. } => self.plan_response(group, index, at_eof),
         }
     }
 
     /// Parses the next request of an accepted connection, answering it here
     /// when it is malformed or too large.
-    fn plan_request(&mut self, net: &mut StreamNetwork, index: usize) -> Option<Step> {
+    fn plan_request(&mut self, group: &mut ConnectionGroup, index: usize) -> Option<Step> {
         // The ready queue holds no connection that owes a response, but the
         // lifecycle path reaches a connection without going through it.
         if self.conns[index].state.phase != Phase::Idle {
@@ -1034,12 +997,12 @@ impl HttpService {
         match self.parse_request(index) {
             RequestPlan::Incomplete => None,
             RequestPlan::Error(status) => {
-                self.error(net, index, status);
+                self.error(group, index, status);
                 None
             }
             RequestPlan::Continue => {
                 let token = self.conns[index].token;
-                if net.send_with(token, |out| {
+                if group.send_with(token, |out| {
                     write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap();
                 }) {
                     self.conns[index].continued = true;
@@ -1128,7 +1091,7 @@ impl HttpService {
     /// informational ones.
     fn plan_response(
         &mut self,
-        net: &mut StreamNetwork,
+        group: &mut ConnectionGroup,
         index: usize,
         at_eof: bool,
     ) -> Option<Step> {
@@ -1154,7 +1117,7 @@ impl HttpService {
                 }
                 ResponsePlan::Fail { reason } => {
                     let token = self.conns[index].token;
-                    self.fail_outbound(net, index);
+                    self.fail_outbound(group, index);
                     return Some(Step::RequestFailed { token, reason })
                 }
                 ResponsePlan::Informational { end } => self.conns[index].state.consumed = end,
@@ -1165,7 +1128,7 @@ impl HttpService {
                     conn.deadline = None;
                     set_in_flight(&mut conn.role, None);
                     if close {
-                        net.disconnect(token);
+                        group.disconnect(token);
                     }
                     return Some(Step::Response { index, version, status, reason, body })
                 }
@@ -1324,7 +1287,7 @@ impl HttpService {
     }
 
     /// Answers a request the service itself rejected, and closes after it.
-    fn error(&mut self, net: &mut StreamNetwork, index: usize, status: u16) {
+    fn error(&mut self, group: &mut ConnectionGroup, index: usize, status: u16) {
         let token = self.conns[index].token;
         let linger = self.config.linger;
         let Self { conns, scratch, .. } = self;
@@ -1335,15 +1298,15 @@ impl HttpService {
         // The request this answers was never read to its end, whether it was
         // unparseable, too large, or framed in a way the service refuses.
         state.framing_lost = true;
-        Responder { net, state, scratch, token, linger }.respond(status, &[], &[]);
+        Responder { group, state, scratch, token, linger }.respond(status, &[], &[]);
     }
 
     /// Drops an outbound connection whose peer broke the protocol.
-    fn fail_outbound(&mut self, net: &mut StreamNetwork, index: usize) {
+    fn fail_outbound(&mut self, group: &mut ConnectionGroup, index: usize) {
         let token = self.conns[index].token;
         self.conns[index].clear();
         set_in_flight(&mut self.conns[index].role, None);
-        net.disconnect(token);
+        group.disconnect(token);
     }
 
     /// Forgets what a closed connection held: an accepted one goes, an
@@ -1434,14 +1397,191 @@ impl HttpService {
         self.record_cursor < self.records.len() || self.ready_cursor < self.ready.len()
     }
 }
-
-impl private::ServiceDriver for HttpService {
-    fn group(&self) -> ConnectionGroup {
-        self.group
+impl HttpService {
+    /// Takes over `group` for HTTP. Moving the group in is the claim: the
+    /// service owns its transport state from here, and no other service can
+    /// hold it.
+    ///
+    /// # Panics
+    /// The group must be [`Framing::Raw`], and `config` must hold to the
+    /// ranges its fields document.
+    pub fn new(group: ConnectionGroup, config: HttpConfig) -> Self {
+        assert!(
+            group.framing() == Framing::Raw,
+            "HTTP frames its own messages and needs a raw-framed group"
+        );
+        config.validate();
+        Self {
+            group,
+            http: HttpState {
+                config,
+                conns: Vec::new(),
+                records: Vec::new(),
+                record_cursor: 0,
+                ready: Vec::new(),
+                ready_cursor: 0,
+                headers: Vec::new(),
+                decoded: Vec::new(),
+                scratch: Vec::new(),
+                last: None,
+            },
+        }
     }
 
-    fn on_event(&mut self, event: &StreamEvent<'_>) {
-        debug_assert_eq!(event.group(), self.group, "the network routes by group");
+    /// Adds a listener, and reports the endpoint it bound.
+    ///
+    /// That endpoint is the one asked for, except for a TCP address whose
+    /// port is `0`: the kernel picks the port, and what comes back is the
+    /// address a client must dial.
+    ///
+    /// An [`Endpoint::Unix`] socket file is created with mode `0777` less the
+    /// umask bits and is unlinked when the service is closed; see
+    /// [`ConnectionGroup::listen`].
+    pub fn listen(&mut self, endpoint: Endpoint) -> io::Result<Endpoint> {
+        self.group.listen(endpoint)
+    }
+
+    /// Adds a persistent outbound endpoint and immediately starts connecting.
+    /// The returned token remains stable across reconnects.
+    #[must_use = "the token identifies the outbound endpoint"]
+    pub fn connect(&mut self, endpoint: Endpoint) -> Token {
+        let Self { group, http } = self;
+        http.connect(group, endpoint)
+    }
+
+    /// Immediately disconnects an accepted client.
+    pub fn disconnect(&mut self, token: Token) -> bool {
+        let Self { group, http } = self;
+        http.disconnect(group, token)
+    }
+
+    /// Permanently removes an outbound endpoint and stops it reconnecting.
+    pub fn remove(&mut self, token: Token) -> bool {
+        let Self { group, http } = self;
+        http.remove(group, token)
+    }
+
+    /// Connections this service refused because its group was at its
+    /// connection cap.
+    pub fn refused_connections(&self) -> u64 {
+        self.group.refused_connections()
+    }
+
+    /// Closes the service: every connection and listener of its group goes,
+    /// un-pulled events are discarded, and the group's slot closes.
+    ///
+    /// This is the one operation that still names the network, because ending
+    /// a group's life is the network's bookkeeping rather than the service's.
+    /// Dropping a service without closing it leaves an open slot with no
+    /// service, which the next scheduling call reports.
+    pub fn close(self, net: &mut StreamNetwork) {
+        net.remove_group(self.group);
+    }
+
+    /// Queues one request on an outbound endpoint.
+    ///
+    /// When the caller supplies no `Host` header, a TCP endpoint sends its
+    /// socket address; a Unix-domain endpoint has no address to name and
+    /// sends `localhost`.
+    pub fn request(
+        &mut self,
+        token: Token,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> bool {
+        let Self { group, http } = self;
+        http.request(group, token, method, path, headers, body)
+    }
+
+    /// Answers a request whose [`Responder`] was dropped, and returns whether
+    /// the response was written.
+    ///
+    /// Each call completes exactly one request for `token`. The status must
+    /// be in `100..=599`, and one this service has no phrase for is framed
+    /// with the empty reason phrase RFC 9112 permits — `HTTP/1.1 250 `.
+    ///
+    /// A `1xx` status is *final* here: it completes the request, framed with
+    /// no `Content-Length` and no body, and the connection moves on to the
+    /// next request or its close. HTTP makes an informational response the
+    /// prelude to a final one instead, so this is a non-conformance the
+    /// caller opts into by choosing such a status — what an endpoint echoing
+    /// a status chosen elsewhere needs to pass it through untouched.
+    ///
+    /// Unlike [`Responder::respond`], this path holds no event borrow, so it
+    /// reclaims answered bytes and requeues the connection before returning.
+    pub fn respond(
+        &mut self,
+        token: Token,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> bool {
+        let Self { group, http } = self;
+        http.respond(group, token, status, headers, body)
+    }
+
+    /// Answers a request whose [`Responder`] was dropped with a body `body`
+    /// writes, and returns whether the response was written.
+    ///
+    /// The closure renders into a buffer the service keeps for the next
+    /// response, so a body composed here costs no allocation. Every framing
+    /// rule of [`Self::respond`] holds, and the closure runs whatever the
+    /// request was: a `HEAD` request is answered with the `Content-Length`
+    /// of the body it is not sent. [`Responder::respond_with`] is the same
+    /// answer, given inline.
+    pub fn respond_with(
+        &mut self,
+        token: Token,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: impl FnOnce(&mut Vec<u8>),
+    ) -> bool {
+        let Self { group, http } = self;
+        http.respond_with(group, token, status, headers, body)
+    }
+
+    /// The next protocol event, parsed on demand from what the connection
+    /// buffered.
+    ///
+    /// The event borrows the service until it is dropped, so a handler reaches
+    /// the transport only through the responder it was handed.
+    pub fn next_event(&mut self) -> Option<HttpEvent<'_>> {
+        let Self { group, http } = self;
+        http.next_event(group)
+    }
+}
+
+impl Service for HttpService {
+    fn group_id(&self) -> &ConnectionGroupId {
+        self.group.group_id()
+    }
+
+    fn handle_event(&mut self, readiness: &Event) -> ReadinessOutcome {
+        let Self { group, http } = self;
+        let mut on_event = |event: StreamEvent<'_>| http.on_stream_event(&event);
+        group.handle_event(readiness, &mut on_event)
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        let Self { group, http } = self;
+        let maintained = {
+            let mut on_event = |event: StreamEvent<'_>| http.on_stream_event(&event);
+            group.maintain(now, &mut on_event)
+        };
+        maintained | http.protocol_tick(group, now)
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        fold(self.group.next_deadline(), self.http.protocol_deadline())
+    }
+}
+
+impl HttpState {
+    /// Turns one transport event into protocol state. Both scheduling phases
+    /// route through here, so the match lives in one place.
+    fn on_stream_event(&mut self, event: &StreamEvent<'_>) {
         match *event {
             StreamEvent::Accepted { token, peer, .. } => {
                 self.conns.push(Conn::new(token, Role::Accepted));
@@ -1462,7 +1602,9 @@ impl private::ServiceDriver for HttpService {
         }
     }
 
-    fn tick(&mut self, net: &mut StreamNetwork, now: Instant) -> bool {
+    /// Runs the protocol timers due now, after the transport work of the same
+    /// tick has reached protocol state.
+    fn protocol_tick(&mut self, group: &mut ConnectionGroup, now: Instant) -> bool {
         // Apply deferred bookkeeping before reporting pullable work.
         self.apply_bookkeeping();
         for index in 0..self.conns.len() {
@@ -1488,12 +1630,12 @@ impl private::ServiceDriver for HttpService {
                 // The head of whatever the client is sending was dropped at
                 // the limit, which is the framing loss every other head too
                 // large for the service answers with.
-                Phase::Idle if accepted => self.error(net, index, 431),
+                Phase::Idle if accepted => self.error(group, index, 431),
                 // An endpoint that overruns the limit is told nothing: what
                 // the service owes it is the request it already sent.
                 Phase::Idle => {
                     self.conns[index].over_limit = false;
-                    net.disconnect(self.conns[index].token);
+                    group.disconnect(self.conns[index].token);
                 }
                 Phase::Draining | Phase::Lingering { .. } => {}
             }
@@ -1509,7 +1651,7 @@ impl private::ServiceDriver for HttpService {
                     !matches!(conn.state.phase, Phase::Lingering { clock: Some(_) }) &&
                     now.saturating_sub(conn.last_activity) >= timeout
                 {
-                    net.disconnect(conn.token);
+                    group.disconnect(conn.token);
                 }
             }
         }
@@ -1522,7 +1664,7 @@ impl private::ServiceDriver for HttpService {
             // reconnects at its group's interval.
             let token = self.abandon_request(index);
             self.records.push(Record::RequestFailed(token, RequestFailure::Timeout));
-            net.disconnect(token);
+            group.disconnect(token);
         }
         if let Some(linger) = self.config.linger {
             for index in 0..self.conns.len() {
@@ -1539,20 +1681,22 @@ impl private::ServiceDriver for HttpService {
                     Some(clock) => clock,
                     // `now` is the instant the poll returned, so the caps run
                     // from the end of the wait rather than the start of it.
-                    None if net.write_side_shut(token) => *clock.insert(LingerClock::started(now)),
+                    None if group.write_side_shut(token) => *clock.insert(LingerClock::started(now)),
                     None => continue,
                 };
                 if now.saturating_sub(clock.last_inbound) >= linger.idle ||
                     now.saturating_sub(clock.since) >= linger.total
                 {
-                    net.disconnect(token);
+                    group.disconnect(token);
                 }
             }
         }
         self.pullable()
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    /// The earliest instant this service's own timers need a tick at. Its
+    /// group's transport deadline folds in beside it.
+    fn protocol_deadline(&self) -> Option<Instant> {
         let mut next: Option<Instant> = None;
         for conn in &self.conns {
             if !matches!(conn.role, Role::Accepted) {
@@ -1946,12 +2090,12 @@ mod tests {
     /// A service on a raw group of its own, with no listener and no
     /// connections.
     fn bare_service(net: &mut StreamNetwork) -> HttpService {
-        let group = net.add_group(ConnectionGroupConfig {
+        let group = group.add_group(ConnectionGroupConfig {
             name: "http",
             framing: Framing::Raw,
             ..ConnectionGroupConfig::default()
         });
-        HttpService::new(net, group, HttpConfig::default())
+        HttpService::new(group, group, HttpConfig::default())
     }
 
     /// A request of exactly `size` bytes, padded out with a header.
@@ -2004,7 +2148,7 @@ mod tests {
     #[test]
     fn a_ready_connection_is_queued_once() {
         let mut net = StreamNetwork::default();
-        let mut http = bare_service(&mut net);
+        let mut http = bare_service(&mut group);
         http.conns.push(Conn::new(Token(1), Role::Accepted));
 
         http.mark_ready(0);
@@ -2022,7 +2166,7 @@ mod tests {
     #[test]
     fn a_lingering_connection_drops_what_it_reads() {
         let mut net = StreamNetwork::default();
-        let mut http = bare_service(&mut net);
+        let mut http = bare_service(&mut group);
         // An instant the read is bound to fall after, so the idle cap can be
         // seen to move to it and the total cap to stay where it is.
         let answered = Instant(1);
@@ -2045,7 +2189,7 @@ mod tests {
     #[test]
     fn a_connection_owing_a_response_is_never_queued() {
         let mut net = StreamNetwork::default();
-        let mut http = bare_service(&mut net);
+        let mut http = bare_service(&mut group);
         let mut conn = Conn::new(Token(1), Role::Accepted);
         conn.state.phase = Phase::Pending;
         http.conns.push(conn);
@@ -2075,20 +2219,20 @@ mod tests {
         /// where reclaiming it moves the cursor without moving the bytes.
         fn with_two_requests() -> (Self, usize) {
             let mut net = StreamNetwork::default();
-            let mut http = bare_service(&mut net);
+            let mut http = bare_service(&mut group);
             // Port 0 leaves the port to the kernel, and the listener reports
             // the address a client must dial.
             let bound =
-                http.listen(&mut net, Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())).unwrap();
+                http.listen(&mut group, Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())).unwrap();
             let Endpoint::Tcp(addr) = bound else { unreachable!("the harness listens on TCP") };
             let mut client = TcpStream::connect(addr).unwrap();
             let first = padded_request("/one", 64);
             client.write_all(&[first.clone(), padded_request("/two", 192)].concat()).unwrap();
-            (Self { net, http, _client: client }, first.len())
+            (Self { group, http, _client: client }, first.len())
         }
 
         fn drive(&mut self) -> bool {
-            self.net.drive(Some(Duration::ZERO), &mut [self.http.as_service()], |_| {})
+            self.group.drive(Some(Duration::ZERO), &mut [self.http.as_service()], |_| {})
         }
 
         /// Drives until a request is delivered and reports its token,
@@ -2097,7 +2241,7 @@ mod tests {
             let deadline = std::time::Instant::now() + PATIENCE;
             while std::time::Instant::now() < deadline {
                 self.drive();
-                while let Some(event) = self.http.next_event(&mut self.net) {
+                while let Some(event) = self.http.next_event(&mut self.group) {
                     if let HttpEvent::Request { token, responder, .. } = event {
                         if inline {
                             assert!(responder.respond(200, &[], b""));
@@ -2112,11 +2256,11 @@ mod tests {
         /// Pulls one event with no driver call before it, which is what the
         /// reclaim-timing tests are about.
         fn pull_without_driving(&mut self) -> bool {
-            self.http.next_event(&mut self.net).is_some()
+            self.http.next_event(&mut self.group).is_some()
         }
 
         fn respond(&mut self, token: Token) -> bool {
-            self.http.respond(&mut self.net, token, 200, &[], b"")
+            self.http.respond(&mut self.group, token, 200, &[], b"")
         }
 
         /// Where a connection has parsed and answered up to: `start`,

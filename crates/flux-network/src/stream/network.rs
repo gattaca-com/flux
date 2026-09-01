@@ -1,7 +1,10 @@
 use std::{
     io::{self, IoSlice, Read, Write},
     net::Shutdown,
-    ops::{Deref, DerefMut},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use flux_communication::Timer;
@@ -10,7 +13,7 @@ use mio::{Events, Interest, Poll, Registry, Token, Waker, event::Event};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    Endpoint, Peer, ServiceRef, TcpTelemetry, set_socket_buf_size,
+    Endpoint, PayloadBuf, Peer, ReadinessOutcome, Service, TcpTelemetry, set_socket_buf_size,
     tcp_stream::{
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, frame_payload_len, write_frame_header,
         write_frame_len, write_frame_ts,
@@ -33,11 +36,6 @@ const EXTERNAL_POLLS: &str =
     "poll this external network yourself, then call next_deadline, handle_event and tick";
 const OWNED_POLLS: &str = "this network polls itself: use StreamNetwork::drive";
 
-/// Identifies a set of connections using the same application protocol and
-/// socket configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ConnectionGroup(usize);
-
 /// Selects how a group encodes messages on the wire.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Framing {
@@ -47,155 +45,6 @@ pub enum Framing {
     /// Bytes pass through untouched. Received chunks do not preserve message
     /// boundaries, and their event timestamp is the local receive time.
     Raw,
-}
-
-/// The payload of one outgoing frame while a serialiser fills it.
-///
-/// Frames are staged back to back in one send buffer, so a serialiser must
-/// not be able to reach the bytes of frames staged before its own. This
-/// wrapper exposes only the payload region: every length, index, and
-/// truncation is relative to the start of the payload, and the frame header
-/// and earlier frames stay out of reach.
-pub struct PayloadBuf<'a> {
-    bytes: &'a mut Vec<u8>,
-    start: usize,
-}
-
-impl<'a> PayloadBuf<'a> {
-    fn new(bytes: &'a mut Vec<u8>) -> Self {
-        let start = bytes.len();
-        Self { bytes, start }
-    }
-
-    /// Bytes serialised into this payload so far.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.bytes.len() - self.start
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Reserves room for at least `additional` more payload bytes.
-    #[inline]
-    pub fn reserve(&mut self, additional: usize) {
-        self.bytes.reserve(additional);
-    }
-
-    #[inline]
-    pub fn push(&mut self, byte: u8) {
-        self.bytes.push(byte);
-    }
-
-    #[inline]
-    pub fn extend_from_slice(&mut self, other: &[u8]) {
-        self.bytes.extend_from_slice(other);
-    }
-
-    /// Resizes the payload to `len` bytes, filling new bytes with `value`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the payload cannot fit in memory, as `Vec::resize` does.
-    #[inline]
-    pub fn resize(&mut self, len: usize, value: u8) {
-        let end = self.start.checked_add(len).expect("payload length overflows usize");
-        self.bytes.resize(end, value);
-    }
-
-    /// Shortens the payload to `len` bytes; no-op if already shorter.
-    #[inline]
-    pub fn truncate(&mut self, len: usize) {
-        // Clamping keeps `start + len` from wrapping into earlier frames.
-        let len = len.min(self.len());
-        self.bytes.truncate(self.start + len);
-    }
-
-    /// Removes every payload byte serialised so far.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.bytes.truncate(self.start);
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[self.start..]
-    }
-
-    #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.bytes[self.start..]
-    }
-}
-
-impl Deref for PayloadBuf<'_> {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl DerefMut for PayloadBuf<'_> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
-    }
-}
-
-impl Extend<u8> for PayloadBuf<'_> {
-    #[inline]
-    fn extend<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
-        self.bytes.extend(iter);
-    }
-}
-
-impl<'b> Extend<&'b u8> for PayloadBuf<'_> {
-    #[inline]
-    fn extend<I: IntoIterator<Item = &'b u8>>(&mut self, iter: I) {
-        self.bytes.extend(iter);
-    }
-}
-
-#[cfg(feature = "wincode")]
-impl wincode::io::Writer for PayloadBuf<'_> {
-    #[inline]
-    fn write(&mut self, src: &[u8]) -> Result<(), wincode::io::WriteError> {
-        self.bytes.extend_from_slice(src);
-        Ok(())
-    }
-
-    #[inline]
-    unsafe fn as_trusted_for(
-        &mut self,
-        n_bytes: usize,
-    ) -> Result<impl wincode::io::Writer, wincode::io::WriteError> {
-        // SAFETY: the caller upholds the `as_trusted_for` contract, and the
-        // `Vec<u8>` writer only ever appends, so the payload start stays valid.
-        unsafe { wincode::io::Writer::as_trusted_for(&mut *self.bytes, n_bytes) }
-    }
-}
-
-impl Write for PayloadBuf<'_> {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.bytes.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    #[inline]
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.bytes.extend_from_slice(buf);
-        Ok(())
-    }
-
-    #[inline]
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Socket options that exist only for TCP connections.
@@ -279,47 +128,153 @@ impl ConnectionGroupConfig {
     }
 }
 
-/// Event emitted by [`StreamNetwork::drive`].
+/// Transport event a [`ConnectionGroup`] lends its service for the duration of
+/// one callback.
 pub enum StreamEvent<'a> {
     /// A listener accepted a new connection.
-    Accepted { group: ConnectionGroup, token: Token, peer: Peer },
+    Accepted { token: Token, peer: Peer },
     /// A persistent outbound endpoint established a connection.
-    Connected { group: ConnectionGroup, token: Token, peer: Peer },
+    Connected { token: Token, peer: Peer },
     /// A complete length-prefixed message or a raw read chunk was received.
     /// For raw-framed groups, chunks do not preserve message boundaries and
     /// `send_ts` is the local receive time.
-    Message { group: ConnectionGroup, token: Token, payload: &'a [u8], send_ts: Nanos },
+    Message { token: Token, payload: &'a [u8], send_ts: Nanos },
     /// An established connection was closed.
-    Disconnected { group: ConnectionGroup, token: Token, peer: Peer },
+    Disconnected { token: Token, peer: Peer },
 }
 
-impl StreamEvent<'_> {
-    /// The group whose service, or whose unclaimed handler, this event is for.
-    pub(crate) fn group(&self) -> ConnectionGroup {
-        match *self {
-            Self::Accepted { group, .. } |
-            Self::Connected { group, .. } |
-            Self::Message { group, .. } |
-            Self::Disconnected { group, .. } => group,
+/// What every group of one network shares: the registration handle for the
+/// poll behind it, and the token space it allocates from.
+///
+/// Registry access, token uniqueness and network identity stay shared once
+/// group state moves into its service; nothing else does.
+struct NetworkCore {
+    registry: Registry,
+    /// The lowest token this network allocates. Every lower token belongs to
+    /// a source the caller registered on its own poll.
+    token_base: Token,
+    next_token: AtomicUsize,
+}
+
+impl NetworkCore {
+    /// Whether `token` is one this network allocated: at or above its base,
+    /// and below the high-water mark of its allocation. Tokens are never
+    /// reused, so anything outside that range is a source the caller
+    /// registered on its own poll — its waker included, wherever the caller
+    /// put it.
+    fn is_ours(&self, token: Token) -> bool {
+        (self.token_base.0..self.next_token.load(Ordering::Relaxed)).contains(&token.0)
+    }
+
+    /// One token, allocated when a listener or connection is created and
+    /// never on the byte path.
+    fn next_token(&self) -> Token {
+        let token = Token(self.next_token.fetch_add(1, Ordering::Relaxed));
+        assert!(token != WAKER_TOKEN, "stream token space exhausted");
+        token
+    }
+}
+
+/// The scheduler arms an obligation before the call that must honour it, and
+/// the group records having honoured it.
+const MAINTAIN_ARMED: usize = 1 << 0;
+const MAINTAIN_OBSERVED: usize = 1 << 1;
+const DEADLINE_OBSERVED: usize = 1 << 2;
+const DEADLINE_IS_SOME: usize = 1 << 3;
+
+/// What a service reports to its network in place of the group it owns.
+///
+/// The identity says which network created the group and which of its slots
+/// the group holds; it carries no transport state and lends none. It also
+/// holds the private state through which [`StreamNetwork`] verifies that a
+/// scheduled service reached the group operations its cadence depends on.
+pub struct ConnectionGroupId {
+    core: Arc<NetworkCore>,
+    slot: usize,
+    /// Which obligations are armed and which the group has honoured.
+    flags: AtomicUsize,
+    /// The deadline the group last reported, meaningful only alongside
+    /// [`DEADLINE_OBSERVED`]; absence is [`DEADLINE_IS_SOME`] being clear,
+    /// never a reserved instant.
+    deadline: AtomicU64,
+}
+
+impl ConnectionGroupId {
+    fn new(core: Arc<NetworkCore>, slot: usize) -> Self {
+        Self {
+            core,
+            slot,
+            flags: AtomicUsize::new(0),
+            deadline: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether this identity belongs to the network holding `core`.
+    fn belongs_to(&self, core: &Arc<NetworkCore>) -> bool {
+        Arc::ptr_eq(&self.core, core)
+    }
+
+    /// Arms the maintenance obligation, clearing what the check will read.
+    fn arm_maintain(&self) {
+        self.flags.store(MAINTAIN_ARMED, Ordering::Relaxed);
+    }
+
+    /// Records that the group ran its due transport work.
+    fn observe_maintain(&self) {
+        self.flags.fetch_or(MAINTAIN_OBSERVED, Ordering::Relaxed);
+    }
+
+    fn assert_maintained(&self) {
+        assert!(
+            self.flags.load(Ordering::Relaxed) & MAINTAIN_OBSERVED != 0,
+            "connection group {} ticked without reaching ConnectionGroup::maintain: a leaf \
+             service runs it at the start of its tick",
+            self.slot
+        );
+    }
+
+    /// Arms the deadline obligation, clearing what the check will read.
+    fn arm_deadline(&self) {
+        self.flags.fetch_and(!(DEADLINE_OBSERVED | DEADLINE_IS_SOME), Ordering::Relaxed);
+    }
+
+    /// Records the transport deadline the group reported.
+    fn observe_deadline(&self, deadline: Option<Instant>) {
+        if let Some(deadline) = deadline {
+            self.deadline.store(deadline.0, Ordering::Relaxed);
+            self.flags.fetch_or(DEADLINE_OBSERVED | DEADLINE_IS_SOME, Ordering::Relaxed);
+        } else {
+            self.flags.fetch_or(DEADLINE_OBSERVED, Ordering::Relaxed);
+        }
+    }
+
+    /// Panics unless the root folded in the deadline its group reported.
+    fn assert_deadline_included(&self, root: Option<Instant>) {
+        let flags = self.flags.load(Ordering::Relaxed);
+        assert!(
+            flags & DEADLINE_OBSERVED != 0,
+            "connection group {} reported a deadline without reaching \
+             ConnectionGroup::next_deadline: a leaf service folds it into its own",
+            self.slot
+        );
+        if flags & DEADLINE_IS_SOME == 0 {
+            return;
+        }
+        let group = Instant(self.deadline.load(Ordering::Relaxed));
+        match root {
+            Some(root) if root <= group => {}
+            _ => panic!(
+                "connection group {} needs a tick by {} but its service reported {:?}: a \
+                 service folds its group's deadline into its own",
+                self.slot, group.0, root
+            ),
         }
     }
 }
 
-struct GroupState {
-    config: ConnectionGroupConfig,
-    reconnector: Repeater,
-    /// Accepted connections this group currently holds, including those
-    /// draining or half-closed. Outbound connections do not count.
-    accepted: usize,
-    /// Connections refused since the group was added because it was at its
-    /// cap, and when the last of them was warned about.
-    refused: u64,
-    last_refusal_warning: Option<Instant>,
-}
 
 struct Listener {
     token: Token,
-    group: ConnectionGroup,
     socket: ListenSocket,
 }
 
@@ -332,7 +287,6 @@ enum ConnectionState {
 
 struct Connection {
     token: Token,
-    group: ConnectionGroup,
     peer: Peer,
     /// The endpoint a persistent outbound connection reconnects to; `None`
     /// for a connection the network accepted.
@@ -383,87 +337,106 @@ impl NetworkTimers {
         })
     }
 }
-
 #[derive(Clone, Copy)]
 struct PendingDisconnect {
-    group: ConnectionGroup,
     token: Token,
     peer: Peer,
 }
 
-/// Everything the network holds that never polls: it registers its sockets on
-/// the registry it was given, whoever owns the poll behind it.
-struct NetworkState {
-    registry: Registry,
-    groups: Vec<GroupState>,
+/// The listeners, outbound endpoints, connections and byte queues of one
+/// protocol group, owned by the service that owns the group.
+///
+/// [`StreamNetwork::add_group`] creates one and hands it over; moving it into a
+/// service is the claim, and the compiler is what keeps a group to one owner.
+/// A group cannot be scheduled on its own: only a [`Service`] reaches the
+/// driver.
+///
+/// # Ordering
+/// A leaf service calls [`Self::maintain`] at the start of every
+/// [`Service::tick`] and routes the events it emits before running its own
+/// timers, and folds [`Self::next_deadline`] into the deadline it reports.
+/// [`StreamNetwork`] verifies both and panics on either omission.
+pub struct ConnectionGroup {
+    identity: ConnectionGroupId,
+    config: ConnectionGroupConfig,
+    reconnector: Repeater,
+    /// Accepted connections this group currently holds, including those
+    /// draining or half-closed. Outbound connections do not count.
+    accepted: usize,
+    /// Connections refused since the group was added because it was at its
+    /// cap, and when the last of them was warned about.
+    refused: u64,
+    last_refusal_warning: Option<Instant>,
     listeners: Vec<Listener>,
     connections: Vec<Connection>,
     pending_disconnects: Vec<PendingDisconnect>,
-    /// The lowest token this network allocates. Every lower token belongs to
-    /// a source the caller registered on its own poll.
-    token_base: Token,
-    next_token: usize,
-    /// Frames staged for the next socket write, each as a contiguous
-    /// `[header][payload]` for length-prefixed groups or bare bytes for raw
-    /// groups.
+    /// The frames of the send in progress, staged back to back as
+    /// `[header][payload]` (raw-framed groups stage payloads only), written to
+    /// the socket in one call. Grown to the largest batch this group has sent
+    /// and never shrunk.
     send_buffer: Vec<u8>,
 }
 
-impl NetworkState {
-    fn new(registry: Registry, token_base: Token) -> Self {
+impl ConnectionGroup {
+    fn new(identity: ConnectionGroupId, config: ConnectionGroupConfig) -> Self {
+        let reconnector = Repeater::every(config.reconnect_interval);
         Self {
-            registry,
-            groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
+            identity,
+            config,
+            reconnector,
+            accepted: 0,
+            refused: 0,
+            last_refusal_warning: None,
             listeners: Vec::with_capacity(INITIAL_LISTENER_CAPACITY),
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             pending_disconnects: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
-            token_base,
-            next_token: token_base.0,
             send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
         }
     }
 
-    /// Whether `token` is one this network allocated: at or above its base,
-    /// and below the high-water mark of its allocation. Tokens are never
-    /// reused, so anything outside that range is a source the caller
-    /// registered on its own poll — its waker included, wherever the caller
-    /// put it.
-    fn is_ours(&self, token: Token) -> bool {
-        (self.token_base.0..self.next_token).contains(&token.0)
+    /// What this group's service reports to its network.
+    pub fn group_id(&self) -> &ConnectionGroupId {
+        &self.identity
     }
 
-    fn next_token(&mut self) -> Token {
-        let token = Token(self.next_token);
-        assert!(token != WAKER_TOKEN, "stream token space exhausted");
-        self.next_token += 1;
-        token
+    /// The wire encoding this group's messages use.
+    pub fn framing(&self) -> Framing {
+        self.config.framing
     }
 
-    fn config(&self, group: ConnectionGroup) -> &ConnectionGroupConfig {
-        &self.groups[group.0].config
+    fn registry(&self) -> &Registry {
+        &self.identity.core.registry
     }
 
-    fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<Endpoint> {
-        if group.0 >= self.groups.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown connection group"));
-        }
+    /// Adds a listener, and reports the endpoint it bound.
+    ///
+    /// That endpoint is the one asked for, except for a TCP address whose
+    /// port is `0`: the kernel picks the port, and what comes back is the
+    /// address a peer must dial.
+    ///
+    /// An [`Endpoint::Unix`] listener creates its socket file with mode `0777`
+    /// less the umask bits; flux sets no mode of its own. Connecting to a
+    /// Unix-domain socket requires *write* permission on that file, so the
+    /// usual `022` umask yields `0755` and admits the owner alone.
+    pub fn listen(&mut self, endpoint: Endpoint) -> io::Result<Endpoint> {
         let mut socket = ListenSocket::bind(endpoint)?;
         let bound = socket.endpoint()?;
-        let token = self.next_token();
-        self.registry.register(&mut socket, token, Interest::READABLE)?;
-        self.listeners.push(Listener { token, group, socket });
+        let token = self.identity.core.next_token();
+        self.registry().register(&mut socket, token, Interest::READABLE)?;
+        self.listeners.push(Listener { token, socket });
         Ok(bound)
     }
 
-    fn connect(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> Token {
-        assert!(group.0 < self.groups.len(), "unknown connection group");
-        let token = self.next_token();
+    /// Adds a persistent outbound endpoint and starts connecting to it. The
+    /// token it returns identifies the connection for its whole life,
+    /// reconnects included.
+    pub fn connect(&mut self, endpoint: Endpoint) -> Token {
+        let token = self.identity.core.next_token();
         let peer = endpoint.peer();
-        let config = self.config(group);
+        let config = &self.config;
         let timers = NetworkTimers::new(config.telemetry, config.name, token, peer, config.framing);
         self.connections.push(Connection {
             token,
-            group,
             peer,
             endpoint: Some(endpoint),
             state: ConnectionState::Disconnected,
@@ -483,9 +456,8 @@ impl NetworkState {
         let Some(endpoint) = &connection.endpoint else { return };
 
         let token = connection.token;
-        let group = connection.group;
         let peer = connection.peer;
-        let socket_buf_size = self.config(group).socket_buf_size;
+        let socket_buf_size = self.config.socket_buf_size;
 
         let Ok(mut socket) = TransportStream::connect(endpoint)
             .inspect_err(|err| debug!(?err, %endpoint, "couldn't start connection"))
@@ -495,7 +467,7 @@ impl NetworkState {
         if let Some(size) = socket_buf_size {
             set_socket_buf_size(&socket, size);
         }
-        if let Err(err) = self.registry.register(&mut socket, token, Interest::WRITABLE) {
+        if let Err(err) = self.registry().register(&mut socket, token, Interest::WRITABLE) {
             warn!(?err, %peer, "couldn't register connecting stream");
             let _ = socket.shutdown(Shutdown::Both);
             return;
@@ -503,62 +475,121 @@ impl NetworkState {
         self.connections[index].state = ConnectionState::Connecting(socket);
     }
 
-    /// Hard-closes every listener, accepted connection and outbound endpoint
-    /// of `group`, discarding the disconnect events that produces.
+    /// Hard-closes every listener, accepted connection and outbound endpoint,
+    /// discarding the disconnect events that produces.
     ///
     /// Closing an [`Endpoint::Unix`] listener unlinks its socket file.
-    fn close_group(&mut self, group: ConnectionGroup) {
+    fn close(&mut self) {
         for index in (0..self.listeners.len()).rev() {
-            if self.listeners[index].group == group {
-                let mut listener = self.listeners.swap_remove(index);
-                let _ = self.registry.deregister(&mut listener.socket);
-            }
+            let mut listener = self.listeners.swap_remove(index);
+            let _ = self.registry().deregister(&mut listener.socket);
         }
         for index in (0..self.connections.len()).rev() {
-            if self.connections[index].group == group {
-                self.close_connection_socket(index);
-                self.connections.swap_remove(index);
-            }
+            self.close_connection_socket(index);
+            self.connections.swap_remove(index);
         }
-        // Every accepted connection of the group was removed above.
-        self.groups[group.0].accepted = 0;
-        self.pending_disconnects.retain(|event| event.group != group);
+        self.accepted = 0;
+        self.pending_disconnects.clear();
     }
 
-    /// Retries every outbound endpoint whose group is due one, reporting
-    /// whether an attempt was made.
+    /// Retries every outbound endpoint that is down if the group is due one,
+    /// reporting whether an attempt was made.
     fn maybe_reconnect(&mut self, now: Instant) -> bool {
+        if !self.reconnector.fired_at(now) {
+            return false;
+        }
         let mut attempted = false;
-        for group_index in 0..self.groups.len() {
-            if !self.groups[group_index].reconnector.fired_at(now) {
-                continue;
-            }
-            let group = ConnectionGroup(group_index);
-            for index in 0..self.connections.len() {
-                if self.connections[index].group == group &&
-                    matches!(self.connections[index].state, ConnectionState::Disconnected)
-                {
-                    self.start_connect(index);
-                    attempted = true;
-                }
+        for index in 0..self.connections.len() {
+            if matches!(self.connections[index].state, ConnectionState::Disconnected) {
+                self.start_connect(index);
+                attempted = true;
             }
         }
         attempted
     }
 
-    /// The earliest instant the network's own timers need a call at: the next
-    /// retry of a group holding an outbound endpoint that is down.
-    fn next_deadline(&self) -> Option<Instant> {
+    /// The instant this group's transport needs a tick by: the next retry of
+    /// an outbound endpoint that is down, and immediately while a disconnect
+    /// is queued for delivery, so the poll cannot sleep across work the next
+    /// tick owes its service.
+    ///
+    /// Calling this is what satisfies the network's deadline audit, so a
+    /// service folds it into the deadline it reports rather than skipping it
+    /// when it has a nearer one of its own.
+    pub fn next_deadline(&self) -> Option<Instant> {
         let mut next: Option<Instant> = None;
         for connection in &self.connections {
             if connection.endpoint.is_some() &&
                 matches!(connection.state, ConnectionState::Disconnected)
             {
-                let fire = self.groups[connection.group.0].reconnector.next_fire();
+                let fire = self.reconnector.next_fire();
                 next = Some(next.map_or(fire, |next: Instant| next.min(fire)));
             }
         }
+        if !self.pending_disconnects.is_empty() {
+            let now = Instant::now();
+            next = Some(next.map_or(now, |next: Instant| next.min(now)));
+        }
+        self.identity.observe_deadline(next);
         next
+    }
+
+    /// Runs the transport work due now — queued disconnects and reconnect
+    /// attempts — routing every event it produces into `on_event`, and
+    /// reports whether anything happened.
+    ///
+    /// A leaf service calls this at the start of its [`Service::tick`] so
+    /// transport state never lags its protocol state by an iteration.
+    pub fn maintain<F>(&mut self, now: Instant, on_event: &mut F) -> bool
+    where
+        F: for<'a> FnMut(StreamEvent<'a>),
+    {
+        self.identity.observe_maintain();
+        let mut worked = false;
+        {
+            let mut sink = |event: StreamEvent<'_>| {
+                worked = true;
+                on_event(event);
+            };
+            self.drain_pending_disconnects(&mut sink);
+        }
+        let reconnected = self.maybe_reconnect(now);
+        worked || reconnected
+    }
+
+    /// Offers one readiness event to this group.
+    ///
+    /// A token this group does not hold produces
+    /// [`ReadinessOutcome::not_owned`], which lets the scheduler try the next
+    /// service. A token it holds is handled here, along with every disconnect
+    /// that handling it produced, and the outcome reports whether an event
+    /// reached `on_event`.
+    pub fn handle_event<F>(&mut self, event: &Event, on_event: &mut F) -> ReadinessOutcome
+    where
+        F: for<'a> FnMut(StreamEvent<'a>),
+    {
+        let token = event.token();
+        let listener = self.listeners.iter().position(|listener| listener.token == token);
+        let connection =
+            self.connections.iter().position(|connection| connection.token == token);
+        if listener.is_none() && connection.is_none() {
+            return ReadinessOutcome::not_owned();
+        }
+
+        let mut worked = false;
+        {
+            let mut sink = |event: StreamEvent<'_>| {
+                worked = true;
+                on_event(event);
+            };
+            if let Some(index) = listener {
+                self.accept_connections(index, &mut sink);
+            } else if let Some(index) = connection {
+                self.serve_connection(index, event, &mut sink);
+            }
+            self.drain_pending_disconnects(&mut sink);
+        }
+        ReadinessOutcome::owned(worked)
     }
 
     fn finish_connect<F>(&mut self, index: usize, handler: &mut F) -> bool
@@ -585,17 +616,16 @@ impl NetworkState {
             unreachable!();
         };
         let token = self.connections[index].token;
-        let group = self.connections[index].group;
         let peer = self.connections[index].peer;
         let mut timers = self.connections[index].timers;
-        let config = self.config(group);
+        let config = &self.config;
         let group_name = config.name;
 
         if config.tcp.nodelay &&
             let Err(err) = socket.set_nodelay()
         {
             warn!(?err, %peer, "couldn't set nodelay on tcp stream");
-            let _ = self.registry.deregister(&mut socket);
+            let _ = self.registry().deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
@@ -603,12 +633,12 @@ impl NetworkState {
             let Err(err) = socket.set_keepalive()
         {
             warn!(?err, %peer, "couldn't set keepalive on tcp stream");
-            let _ = self.registry.deregister(&mut socket);
+            let _ = self.registry().deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
         socket.set_user_timeout(config.tcp.user_timeout_ms);
-        if let Err(err) = self.registry.reregister(&mut socket, token, Interest::READABLE) {
+        if let Err(err) = self.registry().reregister(&mut socket, token, Interest::READABLE) {
             warn!(?err, %peer, "couldn't register connected stream");
             let _ = socket.shutdown(Shutdown::Both);
             return false;
@@ -621,10 +651,10 @@ impl NetworkState {
                 write_frame_header(&mut header, message.len(), Nanos::now());
                 header
             });
-            if stream.write_frame(&self.registry, header.as_ref(), message, config, &mut timers) ==
+            if stream.write_frame(self.registry(), header.as_ref(), message, config, &mut timers) ==
                 StreamState::Disconnected
             {
-                stream.close(&self.registry);
+                stream.close(self.registry());
                 self.connections[index].timers = timers;
                 return false;
             }
@@ -633,7 +663,7 @@ impl NetworkState {
         self.connections[index].timers = timers;
         self.connections[index].state = ConnectionState::Connected(stream);
         info!(group = group_name, %peer, "connection established");
-        handler(StreamEvent::Connected { group, token, peer });
+        handler(StreamEvent::Connected { token, peer });
         true
     }
 
@@ -641,19 +671,18 @@ impl NetworkState {
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
-        let group = self.listeners[listener_index].group;
         loop {
             let accepted = self.listeners[listener_index].socket.accept();
             let (mut socket, peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    warn!(?err, group = self.config(group).name, "accept failed");
+                    warn!(?err, group = self.config.name, "accept failed");
                     break;
                 }
             };
-            if let Some(max) = self.config(group).max_connections &&
-                self.groups[group.0].accepted >= max
+            if let Some(max) = self.config.max_connections &&
+                self.accepted >= max
             {
                 // The refusal is all that happens to this connection: it
                 // is never registered, never read from and never written
@@ -661,12 +690,12 @@ impl NetworkState {
                 // being sent a byte. The backlog still has to be drained to
                 // `WouldBlock`, so the loop goes on.
                 let _ = socket.shutdown(Shutdown::Both);
-                self.refuse(group, peer, max);
+                self.refuse(peer, max);
                 continue;
             }
-            let token = self.next_token();
+            let token = self.identity.core.next_token();
             let (stream, timers, group_name) = {
-                let config = self.config(group);
+                let config = &self.config;
                 if let Some(size) = config.socket_buf_size {
                     set_socket_buf_size(&socket, size);
                 }
@@ -685,7 +714,9 @@ impl NetworkState {
                     continue;
                 }
                 socket.set_user_timeout(config.tcp.user_timeout_ms);
-                if let Err(err) = self.registry.register(&mut socket, token, Interest::READABLE) {
+                if let Err(err) =
+                    self.identity.core.registry.register(&mut socket, token, Interest::READABLE)
+                {
                     warn!(?err, %peer, "couldn't register accepted stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     continue;
@@ -701,14 +732,14 @@ impl NetworkState {
                         header
                     });
                     if stream.write_frame(
-                        &self.registry,
+                        &self.identity.core.registry,
                         header.as_ref(),
                         message,
                         config,
                         &mut timers,
                     ) == StreamState::Disconnected
                     {
-                        stream.close(&self.registry);
+                        stream.close(&self.identity.core.registry);
                         continue;
                     }
                 }
@@ -717,7 +748,6 @@ impl NetworkState {
 
             self.connections.push(Connection {
                 token,
-                group,
                 peer,
                 endpoint: None,
                 state: ConnectionState::Connected(stream),
@@ -725,50 +755,44 @@ impl NetworkState {
                 write_side: WriteSide::Open,
                 timers,
             });
-            self.groups[group.0].accepted += 1;
+            self.accepted += 1;
             info!(group = group_name, %peer, "connection accepted");
-            handler(StreamEvent::Accepted { group, token, peer });
+            handler(StreamEvent::Accepted { token, peer });
         }
     }
 
-    /// Counts one refused connection, warning about the group at most once
-    /// every [`BACKLOG_WARNING_INTERVAL_SECS`] seconds: a group at its cap
-    /// refuses as often as clients arrive, and the count is what says how
-    /// often that is.
-    fn refuse(&mut self, group: ConnectionGroup, peer: Peer, max: usize) {
-        let state = &mut self.groups[group.0];
-        state.refused += 1;
-        if state
+    /// Counts one refused connection, warning at most once every
+    /// [`BACKLOG_WARNING_INTERVAL_SECS`] seconds: a group at its cap refuses
+    /// as often as clients arrive, and the count is what says how often that
+    /// is.
+    fn refuse(&mut self, peer: Peer, max: usize) {
+        self.refused += 1;
+        if self
             .last_refusal_warning
             .is_some_and(|last| last.elapsed() < Duration::from_secs(BACKLOG_WARNING_INTERVAL_SECS))
         {
             return;
         }
         warn!(
-            group = state.config.name,
+            group = self.config.name,
             %peer,
             max_connections = max,
-            refused = state.refused,
+            refused = self.refused,
             "refusing a connection: the group is at its connection cap"
         );
-        state.last_refusal_warning = Some(Instant::now());
+        self.last_refusal_warning = Some(Instant::now());
     }
 
-    fn handle_event<F>(&mut self, event: &Event, handler: &mut F)
+    /// Connections refused since the group was added because it was at its
+    /// connection cap.
+    pub fn refused_connections(&self) -> u64 {
+        self.refused
+    }
+
+    fn serve_connection<F>(&mut self, index: usize, event: &Event, handler: &mut F)
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
-        let token = event.token();
-        if let Some(index) = self.listeners.iter().position(|listener| listener.token == token) {
-            self.accept_connections(index, handler);
-            return;
-        }
-        let Some(index) = self.connections.iter().position(|connection| connection.token == token)
-        else {
-            debug!(?token, "ignoring stale readiness event");
-            return;
-        };
-
         if matches!(self.connections[index].state, ConnectionState::Connecting(_)) &&
             !self.finish_connect(index, handler)
         {
@@ -778,25 +802,25 @@ impl NetworkState {
             return;
         }
 
-        let group = self.connections[index].group;
+        let token = self.connections[index].token;
         let peer = self.connections[index].peer;
-        let config = &self.groups[group.0].config;
         let (state, queue_empty) = {
-            let connection = &mut self.connections[index];
+            let Self { config, connections, identity, .. } = self;
+            let connection = &mut connections[index];
             let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
             let state = stream.poll_with(
-                &self.registry,
+                &identity.core.registry,
                 event,
                 config,
                 &mut connection.timers,
                 &mut |payload, send_ts| {
-                    handler(StreamEvent::Message { group, token, payload, send_ts });
+                    handler(StreamEvent::Message { token, payload, send_ts });
                 },
             );
             (state, stream.send_queue.is_empty())
         };
         if state == StreamState::Disconnected {
-            handler(StreamEvent::Disconnected { group, token, peer });
+            handler(StreamEvent::Disconnected { token, peer });
             self.disconnect_index(index, false);
         } else if queue_empty {
             // A connection asked for both closes outright: a peer about to
@@ -816,12 +840,12 @@ impl NetworkState {
         match old_state {
             ConnectionState::Disconnected => false,
             ConnectionState::Connecting(mut socket) => {
-                let _ = self.registry.deregister(&mut socket);
+                let _ = self.registry().deregister(&mut socket);
                 let _ = socket.shutdown(Shutdown::Both);
                 false
             }
             ConnectionState::Connected(mut stream) => {
-                stream.close(&self.registry);
+                stream.close(self.registry());
                 true
             }
         }
@@ -829,7 +853,6 @@ impl NetworkState {
 
     fn disconnect_index(&mut self, index: usize, notify: bool) {
         let event = PendingDisconnect {
-            group: self.connections[index].group,
             token: self.connections[index].token,
             peer: self.connections[index].peer,
         };
@@ -839,7 +862,7 @@ impl NetworkState {
         let was_connected = self.close_connection_socket(index);
         if accepted {
             self.connections.swap_remove(index);
-            self.groups[event.group.0].accepted -= 1;
+            self.accepted -= 1;
         }
         if notify && was_connected {
             self.pending_disconnects.push(event);
@@ -851,19 +874,26 @@ impl NetworkState {
         F: for<'a> FnMut(StreamEvent<'a>),
     {
         for event in self.pending_disconnects.drain(..) {
-            handler(StreamEvent::Disconnected {
-                group: event.group,
-                token: event.token,
-                peer: event.peer,
-            });
+            handler(StreamEvent::Disconnected { token: event.token, peer: event.peer });
         }
     }
 
-    /// Finds the connection `token` can currently send on.
+    /// The index of `token`'s connection when it can take a send right now:
+    /// connected, its write side open, and not queued to close.
     fn sendable_index(&self, token: Token) -> Option<usize> {
         self.connections.iter().position(|connection| {
             connection.token == token &&
                 !connection.close_when_drained &&
+                connection.write_side == WriteSide::Open &&
+                matches!(connection.state, ConnectionState::Connected(_))
+        })
+    }
+
+    /// Whether at least one connection of this group can receive a broadcast
+    /// right now.
+    fn has_broadcast_recipient(&self) -> bool {
+        self.connections.iter().any(|connection| {
+            !connection.close_when_drained &&
                 connection.write_side == WriteSide::Open &&
                 matches!(connection.state, ConnectionState::Connected(_))
         })
@@ -874,22 +904,22 @@ impl NetworkState {
     /// in its length here; `stamp_frames` writes the timestamp just before the
     /// socket write. Empty or oversized payloads are removed again. Returns
     /// whether the frame was kept.
-    fn append_frame<F>(&mut self, group: ConnectionGroup, serialise: F) -> bool
+    fn append_frame<F>(&mut self, serialise: F) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
-        let config = &self.groups[group.0].config;
+        let Self { config, send_buffer, .. } = self;
         let framed = config.framing == Framing::LengthPrefixed;
-        let start = self.send_buffer.len();
+        let start = send_buffer.len();
         if framed {
-            self.send_buffer.resize(start + FRAME_HEADER_SIZE, 0);
+            send_buffer.resize(start + FRAME_HEADER_SIZE, 0);
         }
-        let payload_start = self.send_buffer.len();
-        let mut payload = PayloadBuf::new(&mut self.send_buffer);
+        let payload_start = send_buffer.len();
+        let mut payload = PayloadBuf::new(send_buffer);
         serialise(&mut payload);
         let payload_len = payload.len();
         if payload_len == 0 {
-            self.send_buffer.truncate(start);
+            send_buffer.truncate(start);
             return false;
         }
         if payload_len > config.max_frame_size || (framed && u32::try_from(payload_len).is_err()) {
@@ -899,19 +929,19 @@ impl NetworkState {
                 max_frame_size = config.max_frame_size,
                 "payload exceeds maximum frame size"
             );
-            self.send_buffer.truncate(start);
+            send_buffer.truncate(start);
             return false;
         }
         if framed {
-            write_frame_len(&mut self.send_buffer[start..payload_start], payload_len);
+            write_frame_len(&mut send_buffer[start..payload_start], payload_len);
         }
         true
     }
 
     /// Writes `ts` into the header of every frame staged in `send_buffer`.
-    /// Raw groups carry no headers and are left untouched.
-    fn stamp_frames(&mut self, group: ConnectionGroup, ts: Nanos) {
-        if self.groups[group.0].config.framing != Framing::LengthPrefixed {
+    /// Raw-framed groups carry no headers and are left untouched.
+    fn stamp_frames(&mut self, ts: Nanos) {
+        if self.config.framing != Framing::LengthPrefixed {
             return;
         }
         let mut offset = 0;
@@ -926,17 +956,18 @@ impl NetworkState {
     /// write, disconnecting it on failure. Returns whether the write was
     /// accepted or queued.
     fn write_staged(&mut self, index: usize) -> bool {
-        let group = self.connections[index].group;
-        let config = &self.groups[group.0].config;
-        let connection = &mut self.connections[index];
-        let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
-        let state = stream.write_frame(
-            &self.registry,
-            None,
-            &self.send_buffer,
-            config,
-            &mut connection.timers,
-        );
+        let state = {
+            let Self { config, connections, identity, send_buffer, .. } = self;
+            let connection = &mut connections[index];
+            let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
+            stream.write_frame(
+                &identity.core.registry,
+                None,
+                send_buffer,
+                config,
+                &mut connection.timers,
+            )
+        };
         if state == StreamState::Disconnected {
             self.disconnect_index(index, true);
             return false;
@@ -944,64 +975,15 @@ impl NetworkState {
         true
     }
 
-    fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
-    where
-        F: FnOnce(&mut PayloadBuf<'_>),
-    {
-        let Some(index) = self.sendable_index(token) else {
-            return false;
-        };
-        let group = self.connections[index].group;
-        self.send_buffer.clear();
-        if !self.append_frame(group, serialise) {
-            return false;
-        }
-        self.stamp_frames(group, Nanos::now());
-        self.write_staged(index)
-    }
-
-    fn send_many_with<I, F>(&mut self, token: Token, items: I, mut serialise: F) -> bool
-    where
-        I: IntoIterator,
-        F: FnMut(&mut PayloadBuf<'_>, I::Item),
-    {
-        let Some(index) = self.sendable_index(token) else {
-            return false;
-        };
-        let group = self.connections[index].group;
-        self.send_buffer.clear();
-        for item in items {
-            self.append_frame(group, |buf| serialise(buf, item));
-        }
-        if self.send_buffer.is_empty() {
-            return false;
-        }
-        self.stamp_frames(group, Nanos::now());
-        self.write_staged(index)
-    }
-
-    /// Whether `group` exists and has at least one member that can receive a
-    /// broadcast right now.
-    fn has_broadcast_recipient(&self, group: ConnectionGroup) -> bool {
-        group.0 < self.groups.len() &&
-            self.connections.iter().any(|connection| {
-                connection.group == group &&
-                    !connection.close_when_drained &&
-                    connection.write_side == WriteSide::Open &&
-                    matches!(connection.state, ConnectionState::Connected(_))
-            })
-    }
-
-    /// Writes the staged frames to every connected member of `group`,
-    /// disconnecting members whose write fails. Returns the number of
-    /// recipients attempted.
-    fn broadcast_staged(&mut self, group: ConnectionGroup) -> usize {
+    /// Writes the staged frames to every connection that can receive a
+    /// broadcast, disconnecting those whose write fails. Returns the number
+    /// of recipients attempted.
+    fn broadcast_staged(&mut self) -> usize {
         let mut attempted = 0;
         let mut index = self.connections.len();
         while index != 0 {
             index -= 1;
-            if self.connections[index].group != group ||
-                self.connections[index].close_when_drained ||
+            if self.connections[index].close_when_drained ||
                 self.connections[index].write_side != WriteSide::Open ||
                 !matches!(self.connections[index].state, ConnectionState::Connected(_))
             {
@@ -1013,46 +995,98 @@ impl NetworkState {
         attempted
     }
 
-    fn broadcast_with<F>(&mut self, group: ConnectionGroup, serialise: F) -> usize
+    /// Serializes and sends one payload to a connected token. Length-prefixed
+    /// groups add a frame header; raw-framed groups send the payload
+    /// unchanged. The closure is not called when the token is unknown or
+    /// currently disconnected.
+    pub fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
-        if !self.has_broadcast_recipient(group) {
-            return 0;
-        }
+        let Some(index) = self.sendable_index(token) else {
+            return false;
+        };
         self.send_buffer.clear();
-        if !self.append_frame(group, serialise) {
-            return 0;
+        if !self.append_frame(serialise) {
+            return false;
         }
-        self.stamp_frames(group, Nanos::now());
-        self.broadcast_staged(group)
+        self.stamp_frames(Nanos::now());
+        self.write_staged(index)
     }
 
-    fn broadcast_many_with<I, F>(
-        &mut self,
-        group: ConnectionGroup,
-        items: I,
-        mut serialise: F,
-    ) -> usize
+    /// Serializes and sends multiple payloads to a connected token.
+    /// Length-prefixed groups preserve each payload as a separate frame and
+    /// share one send timestamp; raw-framed groups concatenate the payloads.
+    /// The batch uses one socket write when no backlog exists. Each payload
+    /// is checked against `max_frame_size`, and invalid payloads are skipped;
+    /// the caller must bound the item count or the total batch size, because
+    /// `max_backlog_bytes` only limits bytes queued after a partial write. The
+    /// closure is not called when the token is unknown or currently
+    /// disconnected.
+    pub fn send_many_with<I, F>(&mut self, token: Token, items: I, mut serialise: F) -> bool
     where
         I: IntoIterator,
         F: FnMut(&mut PayloadBuf<'_>, I::Item),
     {
-        if !self.has_broadcast_recipient(group) {
+        let Some(index) = self.sendable_index(token) else {
+            return false;
+        };
+        self.send_buffer.clear();
+        for item in items {
+            self.append_frame(|buf| serialise(buf, item));
+        }
+        if self.send_buffer.is_empty() {
+            return false;
+        }
+        self.stamp_frames(Nanos::now());
+        self.write_staged(index)
+    }
+
+    /// Serializes one payload and sends it to every connected token of this
+    /// group, reporting how many were attempted. The closure is not called
+    /// when no connection can receive it.
+    pub fn broadcast_with<F>(&mut self, serialise: F) -> usize
+    where
+        F: FnOnce(&mut PayloadBuf<'_>),
+    {
+        if !self.has_broadcast_recipient() {
+            return 0;
+        }
+        self.send_buffer.clear();
+        if !self.append_frame(serialise) {
+            return 0;
+        }
+        self.stamp_frames(Nanos::now());
+        self.broadcast_staged()
+    }
+
+    /// Serializes multiple payloads once and sends the batch to every
+    /// connected token of this group, reporting how many were attempted.
+    /// Framing, size limits and the skipping of invalid payloads follow
+    /// [`ConnectionGroup::send_many_with`]; each recipient receives the batch
+    /// in one socket write when it has no backlog. The closure is not called
+    /// when no connection can receive it.
+    pub fn broadcast_many_with<I, F>(&mut self, items: I, mut serialise: F) -> usize
+    where
+        I: IntoIterator,
+        F: FnMut(&mut PayloadBuf<'_>, I::Item),
+    {
+        if !self.has_broadcast_recipient() {
             return 0;
         }
         self.send_buffer.clear();
         for item in items {
-            self.append_frame(group, |buf| serialise(buf, item));
+            self.append_frame(|buf| serialise(buf, item));
         }
         if self.send_buffer.is_empty() {
             return 0;
         }
-        self.stamp_frames(group, Nanos::now());
-        self.broadcast_staged(group)
+        self.stamp_frames(Nanos::now());
+        self.broadcast_staged()
     }
 
-    fn disconnect(&mut self, token: Token) -> bool {
+    /// Closes one connection now, queueing its disconnect for delivery.
+    pub fn disconnect(&mut self, token: Token) -> bool {
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             return false;
@@ -1064,7 +1098,8 @@ impl NetworkState {
         true
     }
 
-    fn disconnect_when_drained(&mut self, token: Token) -> bool {
+    /// Closes one connection once its queued bytes have reached the peer.
+    pub fn disconnect_when_drained(&mut self, token: Token) -> bool {
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             return false;
@@ -1079,7 +1114,9 @@ impl NetworkState {
         true
     }
 
-    fn shutdown_write_when_drained(&mut self, token: Token) -> bool {
+    /// Shuts the write side of one connection once its queued bytes have
+    /// reached the peer, leaving the read side open.
+    pub fn shutdown_write_when_drained(&mut self, token: Token) -> bool {
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             return false;
@@ -1096,7 +1133,8 @@ impl NetworkState {
         true
     }
 
-    fn write_side_shut(&self, token: Token) -> bool {
+    /// Whether the write side of one connection has been shut.
+    pub(crate) fn write_side_shut(&self, token: Token) -> bool {
         self.connections
             .iter()
             .any(|connection| connection.token == token && connection.write_side == WriteSide::Shut)
@@ -1117,7 +1155,9 @@ impl NetworkState {
         self.connections[index].write_side = WriteSide::Shut;
     }
 
-    fn remove(&mut self, token: Token) -> bool {
+    /// Drops one connection and any outbound endpoint behind it, without
+    /// queueing a disconnect.
+    pub fn remove(&mut self, token: Token) -> bool {
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             return false;
@@ -1125,43 +1165,33 @@ impl NetworkState {
         self.close_connection_socket(index);
         let removed = self.connections.swap_remove(index);
         if removed.endpoint.is_none() {
-            self.groups[removed.group.0].accepted -= 1;
+            self.accepted -= 1;
         }
         self.pending_disconnects.retain(|event| event.token != token);
         true
     }
 }
 
-/// A grouped collection of listeners and persistent outbound endpoints driven
-/// by one nonblocking poll.
+/// A poll, the token space behind it, and the group lifecycle of one network.
 ///
-/// One network mixes both transports of the [`Endpoint`] set: a TCP and a
-/// Unix-domain listener can share a group.
+/// [`Self::default`] makes an **Owned** network, which creates its own poll and
+/// drives it in [`Self::drive`]. [`Self::with_registry`] makes an **External**
+/// one, which registers on a registry cloned from the caller's poll and never
+/// polls: the caller polls and makes the three calls [`Self::next_deadline`],
+/// [`Self::handle_event`] and [`Self::tick`]. The [`crate::stream`] module
+/// documents the External loop in full.
 ///
-/// Unlike [`super::TcpConnector`], queued bytes are never retained across a
-/// disconnected socket. Use `TcpConnector` when reconnect backlog replay is
-/// required.
-///
-/// Dropping the network closes every listener, which unlinks the socket file
-/// of each [`Endpoint::Unix`] listener.
-///
-/// A group is either **service-owned** — a protocol layer claimed it and the
-/// network routes its events to that service — or an **unclaimed group**, whose
-/// events reach the handler passed to [`Self::drive`] as they arrive.
-///
-/// Who owns the poll is fixed at construction. [`StreamNetwork::default`]
-/// makes an **Owned** network, which creates its own poll, drives it in
-/// [`Self::drive`] and hands out a [`Self::waker`] for it.
-/// [`Self::with_registry`] makes an **External** one, which registers on a
-/// registry cloned from the caller's poll and never polls: the caller polls
-/// and makes the three calls [`Self::next_deadline`], [`Self::handle_event`]
-/// and [`Self::tick`]. The [`crate::stream`] module documents the External
-/// loop in full.
+/// The network owns no transport state. [`Self::add_group`] hands out a
+/// [`ConnectionGroup`] that owns its own, and a service owns that group; the
+/// network keeps only what every group shares and which of its group slots
+/// are open.
 pub struct StreamNetwork {
     poll: PollMode,
-    state: NetworkState,
-    /// Whether a service owns the group at each index.
-    claimed: Vec<bool>,
+    core: Arc<NetworkCore>,
+    /// Whether each group slot this network created is still open. Omission is
+    /// not a lifecycle state: an open slot with no service in a scheduling
+    /// call is a configuration error, not an idle group.
+    active_groups: Vec<bool>,
 }
 
 /// Who owns the poll the network's sockets are registered with.
@@ -1189,8 +1219,12 @@ impl Default for StreamNetwork {
                 events: Events::with_capacity(EVENTS_CAPACITY),
                 waker_taken: false,
             },
-            state: NetworkState::new(registry, Token(0)),
-            claimed: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
+            core: Arc::new(NetworkCore {
+                registry,
+                token_base: Token(0),
+                next_token: AtomicUsize::new(0),
+            }),
+            active_groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
         }
     }
 }
@@ -1219,13 +1253,21 @@ impl StreamNetwork {
     pub fn with_registry(registry: Registry, token_base: Token) -> Self {
         Self {
             poll: PollMode::External,
-            state: NetworkState::new(registry, token_base),
-            claimed: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
+            core: Arc::new(NetworkCore {
+                registry,
+                token_base,
+                next_token: AtomicUsize::new(token_base.0),
+            }),
+            active_groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
         }
     }
 
-    /// Adds a protocol group and returns its handle.
-    #[must_use = "the group handle identifies listeners and outbound endpoints"]
+    /// Creates a group and hands over the transport state it owns.
+    ///
+    /// Moving the group into a service is the claim. Until then it can be
+    /// configured and can register sockets, but it cannot be scheduled: only a
+    /// [`Service`] reaches the driver.
+    #[must_use = "the group is the transport state a service owns"]
     pub fn add_group(&mut self, config: ConnectionGroupConfig) -> ConnectionGroup {
         assert!(config.max_frame_size > 0, "max_frame_size must be nonzero");
         if config.framing == Framing::LengthPrefixed {
@@ -1248,138 +1290,82 @@ impl StreamNetwork {
                 assert!(warn < max, "backlog_warn_bytes must be below max_backlog_bytes");
             }
         }
-        let group = ConnectionGroup(self.state.groups.len());
-        let reconnector = Repeater::every(config.reconnect_interval);
-        self.state.groups.push(GroupState {
-            config,
-            reconnector,
-            accepted: 0,
-            refused: 0,
-            last_refusal_warning: None,
-        });
-        self.claimed.push(false);
-        group
+        let slot = self.active_groups.len();
+        self.active_groups.push(true);
+        ConnectionGroup::new(ConnectionGroupId::new(Arc::clone(&self.core), slot), config)
     }
 
-    /// Marks `group` as owned by the service making the call.
-    pub(crate) fn claim_group(&mut self, group: ConnectionGroup) {
-        assert!(group.0 < self.claimed.len(), "unknown connection group");
-        assert!(!self.claimed[group.0], "connection group {} already has a service", group.0);
-        self.claimed[group.0] = true;
-    }
-
-    /// Returns `group` to unclaimed status.
-    pub(crate) fn release_group(&mut self, group: ConnectionGroup) {
-        assert!(group.0 < self.claimed.len(), "unknown connection group");
-        self.claimed[group.0] = false;
-    }
-
-    /// The wire encoding of `group`, which a service checks before claiming it.
-    pub(crate) fn framing(&self, group: ConnectionGroup) -> Framing {
-        assert!(group.0 < self.state.groups.len(), "unknown connection group");
-        self.state.config(group).framing
-    }
-
-    /// Hard-closes every listener, accepted connection and outbound endpoint
-    /// of `group` and returns it to unclaimed status, empty and reusable.
-    pub(crate) fn close_group(&mut self, group: ConnectionGroup) {
-        self.state.close_group(group);
-        self.release_group(group);
-    }
-
-    /// Adds a listener to `group`, and reports the endpoint it bound.
+    /// Hard-closes a group's sockets, discards its queued events and closes
+    /// its slot, consuming the group.
     ///
-    /// That endpoint is the one asked for, except for a TCP address whose
-    /// port is `0`: the kernel picks the port, and what comes back is the
-    /// address a peer must dial.
-    ///
-    /// An [`Endpoint::Unix`] listener creates its socket file with mode `0777`
-    /// less the umask bits; flux sets no mode of its own. Connecting to a
-    /// Unix-domain socket requires *write* permission on that file, so the
-    /// usual `022` umask yields `0755` and admits the owner alone. An operator
-    /// who wants group or world access sets the umask before the bind or
-    /// changes the mode after it.
-    pub fn listen(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> io::Result<Endpoint> {
-        self.state.listen(group, endpoint)
-    }
-
-    /// Adds a persistent outbound endpoint and immediately starts connecting.
-    /// The returned token remains stable across reconnects.
-    #[must_use = "the token identifies the persistent outbound endpoint"]
-    pub fn connect(&mut self, group: ConnectionGroup, endpoint: Endpoint) -> Token {
-        self.state.connect(group, endpoint)
-    }
-
-    /// Runs one iteration of an Owned-mode network: maintenance, one poll,
-    /// event delivery and one tick per service. Returns whether anything
-    /// happened.
-    ///
-    /// The poll blocks for `max_timeout` at the longest, and for less when the
-    /// network's own timers or a service's [`ServiceRef`] deadline fall sooner;
-    /// `None` everywhere blocks until an event arrives. Events of a
-    /// service-owned group go to that service, the rest to `unclaimed_handler`,
-    /// which borrows each payload for the duration of the call. Protocol
-    /// events the services produced are pulled from the services
-    /// afterwards. A wake from [`Self::waker`] returns from the poll and is
-    /// not work of its own.
-    ///
-    /// The poll wait is where an iteration spends its time, so the ticks that
-    /// follow it are given the time after it: a timer a tick starts runs from
-    /// the moment the wait ended, and one that expired during the wait is due
-    /// in the same iteration rather than the next.
+    /// Closing an [`Endpoint::Unix`] listener unlinks its socket file. The
+    /// slot does not return to a reusable state: a closed group is gone, and
+    /// the remaining services carry on.
     ///
     /// # Panics
-    /// A network built with [`Self::with_registry`] is driven from the
-    /// caller's poll and refuses this call. Every service-owned group must
-    /// appear exactly once among `services`; a group whose service is missing
-    /// or doubled is a configuration error and panics before the call does
-    /// anything else.
-    pub fn drive<F>(
+    /// A group of another network, or one already closed.
+    pub fn remove_group(&mut self, mut group: ConnectionGroup) {
+        assert!(
+            group.identity.belongs_to(&self.core),
+            "this connection group belongs to another network"
+        );
+        let slot = group.identity.slot;
+        assert!(self.active_groups[slot], "connection group {slot} is already closed");
+        group.close();
+        self.active_groups[slot] = false;
+    }
+
+    /// Runs one iteration of an Owned-mode network: fold the deadlines, poll
+    /// once, route every readiness event to the service that owns it, then
+    /// tick each service once. Reports whether anything happened, a service
+    /// with events left to pull included.
+    ///
+    /// `max_timeout` caps the poll wait; `None` leaves it bounded only by the
+    /// services' own deadlines.
+    ///
+    /// # Panics
+    /// An External-mode network owns no poll and refuses this call. Every open
+    /// group must appear exactly once among `services`, and each service must
+    /// reach its group's `maintain` and fold its group's deadline.
+    pub fn drive<S: Service>(
         &mut self,
         max_timeout: Option<Duration>,
-        services: &mut [ServiceRef<'_>],
-        mut unclaimed_handler: F,
-    ) -> bool
-    where
-        F: for<'a> FnMut(StreamEvent<'a>),
-    {
+        services: &mut [S],
+    ) -> bool {
         assert!(matches!(self.poll, PollMode::Owned { .. }), "{EXTERNAL_POLLS}");
         let now = Instant::now();
         self.validate(services);
 
-        let mut worked = self.maintenance(now, services, &mut unclaimed_handler);
-        let timeout = self.poll_timeout(max_timeout, services, now);
-        let PollMode::Owned { poll, events, .. } = &mut self.poll else {
-            unreachable!("the mode is checked above");
-        };
-        match poll.poll(events, timeout) {
-            Ok(()) => {
-                for event in &*events {
-                    // A wake asks the poll to return and nothing more, so it
-                    // reaches neither a service nor the did-work result.
-                    if event.token() != WAKER_TOKEN {
-                        worked |= route_ready(
-                            &mut self.state,
-                            &self.claimed,
-                            event,
-                            services,
-                            &mut unclaimed_handler,
-                        );
+        let timeout = Self::poll_timeout(max_timeout, services, now);
+        let mut worked = false;
+        {
+            let PollMode::Owned { poll, events, .. } = &mut self.poll else {
+                unreachable!("the mode is checked above");
+            };
+            match poll.poll(events, timeout) {
+                Ok(()) => {
+                    for event in &*events {
+                        // A wake asks the poll to return and nothing more, so
+                        // it reaches neither a service nor the did-work
+                        // result.
+                        if event.token() != WAKER_TOKEN {
+                            worked |= route_ready(event, services);
+                        }
                     }
                 }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => flux_utils::safe_panic!("couldn't poll the stream network: {err}"),
             }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-            Err(err) => flux_utils::safe_panic!("couldn't poll the stream network: {err}"),
         }
 
         // The instant this iteration began is older than the poll wait it has
         // just come out of, which may have been the whole of a timeout.
-        let pullable = self.tick_services(services, Instant::now());
-        worked || pullable
+        let ticked = Self::tick_services(services, Instant::now());
+        worked || ticked
     }
 
-    /// The earliest instant this network or one of `services` needs a call at:
-    /// the fold of the network's own timers with every service deadline.
+    /// The earliest instant one of `services` needs a tick at: the fold of
+    /// every service's combined transport and protocol deadline.
     ///
     /// An External-mode caller folds only its own timers against this and
     /// converts the result into the timeout of its poll; `None` leaves that
@@ -1387,14 +1373,13 @@ impl StreamNetwork {
     ///
     /// # Panics
     /// An Owned-mode network folds its deadlines inside [`Self::drive`], and
-    /// refuses this call. Every service-owned group must appear exactly once
-    /// among `services`, as for [`Self::drive`] — an omitted service is a
-    /// configuration error the first call reports, not one that waits for a
-    /// deadline to be missed.
-    pub fn next_deadline(&self, services: &[ServiceRef<'_>]) -> Option<Instant> {
+    /// refuses this call. Every open group must appear exactly once among
+    /// `services` — an omitted service is a configuration error the first
+    /// call reports, not one that waits for a deadline to be missed.
+    pub fn next_deadline<S: Service>(&self, services: &[S]) -> Option<Instant> {
         assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
         self.validate(services);
-        self.fold_deadline(services)
+        Self::fold_deadline(services)
     }
 
     /// Takes one readiness event from the caller's poll, reporting whether it
@@ -1404,11 +1389,10 @@ impl StreamNetwork {
     /// high-water mark of its allocation. A token outside that range belongs
     /// to a source the caller registered — its waker included — and is handed
     /// straight back as `false`, untouched and unlogged. A token inside it is
-    /// this network's: the event is routed to the service owning its group, or
-    /// to `unclaimed_handler`, along with any disconnect that handling it
-    /// produced, and the call reports `true`. A token the network no longer
-    /// knows is one of its own that closed since the poll returned: ours,
-    /// and ignored.
+    /// this network's: the event is offered to each service in slice order
+    /// until one owns it, along with any disconnect that handling it
+    /// produced, and the call reports `true`. A token no group holds is one of
+    /// this network's that closed since the poll returned: ours, and ignored.
     ///
     /// `true` means this network owns the token, not that routing produced an
     /// event. Folding it into a did-work signal, as the [`crate::stream`] loop
@@ -1421,48 +1405,32 @@ impl StreamNetwork {
     /// [`Self::drive`] does; an event of the caller's is handed back without
     /// looking at them, since [`Self::next_deadline`] and [`Self::tick`]
     /// validate every iteration anyway.
-    pub fn handle_event<F>(
-        &mut self,
-        event: &Event,
-        services: &mut [ServiceRef<'_>],
-        mut unclaimed_handler: F,
-    ) -> bool
-    where
-        F: for<'a> FnMut(StreamEvent<'a>),
-    {
+    pub fn handle_event<S: Service>(&mut self, event: &Event, services: &mut [S]) -> bool {
         assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
-        if !self.state.is_ours(event.token()) {
+        if !self.core.is_ours(event.token()) {
             return false;
         }
         self.validate(services);
-        route_ready(&mut self.state, &self.claimed, event, services, &mut unclaimed_handler);
+        route_ready(event, services);
         true
     }
 
-    /// Runs the iteration work that owns no poll: the maintenance due now —
-    /// pending disconnects, routed to their services, and reconnect attempts —
-    /// then one tick per service in slice order. Returns whether anything
-    /// happened, a service with protocol events left to pull included.
+    /// Ticks each service once in slice order, after the caller has handed
+    /// over every event its poll returned. Reports whether anything happened,
+    /// a service with events left to pull included.
     ///
-    /// A transport event maintenance produces reaches its service before that
-    /// service's tick, so protocol state never lags transport state by an
-    /// iteration. An External-mode caller makes this call once per iteration,
-    /// after handing over every event its poll returned.
+    /// Each service runs its group's due transport work and routes the events
+    /// that produces into its protocol state before its own timers, so
+    /// protocol state never lags transport state by an iteration.
     ///
     /// # Panics
-    /// An Owned-mode network runs these phases inside [`Self::drive`], and
-    /// refuses this call. Every service-owned group must appear exactly once
-    /// among `services`, as for [`Self::drive`].
-    pub fn tick<F>(&mut self, services: &mut [ServiceRef<'_>], mut unclaimed_handler: F) -> bool
-    where
-        F: for<'a> FnMut(StreamEvent<'a>),
-    {
+    /// An Owned-mode network ticks inside [`Self::drive`], and refuses this
+    /// call. Every open group must appear exactly once among `services`, as
+    /// for [`Self::drive`].
+    pub fn tick<S: Service>(&mut self, services: &mut [S]) -> bool {
         assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
-        let now = Instant::now();
         self.validate(services);
-        let worked = self.maintenance(now, services, &mut unclaimed_handler);
-        let pullable = self.tick_services(services, now);
-        worked || pullable
+        Self::tick_services(services, Instant::now())
     }
 
     /// A waker for this network's own poll, on a token the event loop
@@ -1487,290 +1455,99 @@ impl StreamNetwork {
                  on a token below the base the network was built with"
             );
         };
-        assert!(
-            !*waker_taken,
-            "a stream network hands out one waker; keep the first (SpineAdapter::register_waker \
-             stores it for the process lifetime)"
-        );
+        assert!(!*waker_taken, "this network has already handed out its waker");
         let waker = Waker::new(poll.registry(), WAKER_TOKEN)?;
         *waker_taken = true;
         Ok(waker)
     }
 
-    /// Runs the maintenance due at `now`: the disconnects left pending by
-    /// work outside a driver call, routed to their services, and one reconnect
-    /// attempt per outbound endpoint whose group is due one.
-    fn maintenance<F>(
-        &mut self,
-        now: Instant,
-        services: &mut [ServiceRef<'_>],
-        unclaimed_handler: &mut F,
-    ) -> bool
-    where
-        F: for<'a> FnMut(StreamEvent<'a>),
-    {
-        let mut routed = false;
-        {
-            let claimed = &self.claimed;
-            let mut route = |event: StreamEvent<'_>| {
-                route_event(claimed, services, unclaimed_handler, &mut routed, event);
-            };
-            self.state.drain_pending_disconnects(&mut route);
-        }
-        let reconnected = self.state.maybe_reconnect(now);
-        routed || reconnected
-    }
-
-    /// Ticks every service once, in slice order, reporting whether any of them
-    /// has protocol events left to pull.
-    fn tick_services(&mut self, services: &mut [ServiceRef<'_>], now: Instant) -> bool {
-        let mut pullable = false;
+    /// Ticks every service once, in slice order, verifying that each reached
+    /// its group's maintenance.
+    fn tick_services<S: Service>(services: &mut [S], now: Instant) -> bool {
+        let mut worked = false;
         for service in services.iter_mut() {
-            pullable |= service.tick(self, now);
+            service.group_id().arm_maintain();
+            worked |= service.tick(now);
+            service.group_id().assert_maintained();
         }
-        pullable
+        worked
     }
 
-    /// Runs one nonblocking iteration of an Owned-mode network holding
-    /// unclaimed groups only.
-    ///
-    /// # Panics
-    /// A network with services is driven with [`Self::drive`], which is what
-    /// delivers their events; polling it without them panics. So does a
-    /// network built with [`Self::with_registry`], which owns no poll.
-    pub fn poll_with<F>(&mut self, handler: F)
-    where
-        F: for<'a> FnMut(StreamEvent<'a>),
-    {
-        assert!(matches!(self.poll, PollMode::Owned { .. }), "{EXTERNAL_POLLS}");
-        if let Some(index) = self.claimed.iter().position(|claimed| *claimed) {
-            panic!(
-                "connection group {index} has a service — drive the network with \
-                 StreamNetwork::drive, passing every service"
-            );
-        }
-        self.drive(Some(Duration::ZERO), &mut [], handler);
-    }
-
-    /// Panics unless `services` names every service-owned group exactly once.
-    fn validate(&self, services: &[ServiceRef<'_>]) {
+    /// Panics unless `services` names every open group exactly once, and each
+    /// of them belongs to this network.
+    fn validate<S: Service>(&self, services: &[S]) {
         for (position, service) in services.iter().enumerate() {
-            let group = service.group();
+            let id = service.group_id();
             assert!(
-                self.claimed.get(group.0).copied().unwrap_or(false),
-                "no service owns connection group {} — a service claims its group when it is built",
-                group.0
+                id.belongs_to(&self.core),
+                "a service of another network was passed to this one: its connection group was \
+                 created by a different StreamNetwork"
             );
             assert!(
-                services[..position].iter().all(|other| other.group() != group),
+                self.active_groups.get(id.slot).copied().unwrap_or(false),
+                "connection group {} is closed",
+                id.slot
+            );
+            assert!(
+                services[..position].iter().all(|other| other.group_id().slot != id.slot),
                 "duplicate service for group {}",
-                group.0
+                id.slot
             );
         }
-        for (index, claimed) in self.claimed.iter().enumerate() {
+        for (slot, active) in self.active_groups.iter().enumerate() {
             assert!(
-                !claimed || services.iter().any(|service| service.group().0 == index),
-                "service-owned group {index} has no service — call HttpService::close before \
-                 dropping it"
+                !active || services.iter().any(|service| service.group_id().slot == slot),
+                "connection group {slot} has no service — pass every service, or close the group \
+                 before dropping it"
             );
         }
     }
 
-    /// The earliest instant the network's own timers or one of `services`
-    /// needs a call at, taking the service set as given.
-    fn fold_deadline(&self, services: &[ServiceRef<'_>]) -> Option<Instant> {
-        self.state
-            .next_deadline()
-            .into_iter()
-            .chain(services.iter().filter_map(|service| service.next_deadline()))
-            .min()
+    /// The earliest instant one of `services` needs a tick at, verifying that
+    /// each folded in the deadline its group reported.
+    fn fold_deadline<S: Service>(services: &[S]) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        for service in services {
+            let id = service.group_id();
+            id.arm_deadline();
+            let deadline = service.next_deadline();
+            id.assert_deadline_included(deadline);
+            if let Some(deadline) = deadline {
+                next = Some(next.map_or(deadline, |next: Instant| next.min(deadline)));
+            }
+        }
+        next
     }
 
-    /// Folds the caller's cap, the network's own timers and every service's
-    /// deadline into the timeout of one poll.
-    fn poll_timeout(
-        &self,
+    /// Folds the caller's cap and every service's deadline into the timeout of
+    /// one poll.
+    fn poll_timeout<S: Service>(
         max_timeout: Option<Duration>,
-        services: &[ServiceRef<'_>],
+        services: &[S],
         now: Instant,
     ) -> Option<std::time::Duration> {
-        let deadline = self.fold_deadline(services);
+        let deadline = Self::fold_deadline(services);
         let timeout = match (max_timeout, deadline.map(|deadline| deadline.saturating_sub(now))) {
             (Some(max), Some(next)) => Some(max.min(next)),
             (max, next) => max.or(next),
         };
         timeout.map(std::time::Duration::from)
     }
-
-    /// Serializes and sends one payload to a connected token. Length-prefixed
-    /// groups add a frame header; raw-framed groups send the payload unchanged.
-    /// The closure is not called when the token is unknown or currently
-    /// disconnected.
-    pub fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
-    where
-        F: FnOnce(&mut PayloadBuf<'_>),
-    {
-        self.state.send_with(token, serialise)
-    }
-
-    /// Serializes and sends multiple payloads to a connected token.
-    /// Length-prefixed groups preserve each payload as a separate frame and
-    /// share one send timestamp. Raw groups concatenate the payloads. The
-    /// batch uses one socket write when no backlog exists. Each payload is
-    /// checked against `max_frame_size`. The caller must bound the item count
-    /// or total batch size. `max_backlog_bytes` only limits bytes queued after
-    /// a partial write. Invalid payloads are skipped. The closure is not called
-    /// when the token is unknown or disconnected.
-    pub fn send_many_with<I, F>(&mut self, token: Token, items: I, serialise: F) -> bool
-    where
-        I: IntoIterator,
-        F: FnMut(&mut PayloadBuf<'_>, I::Item),
-    {
-        self.state.send_many_with(token, items, serialise)
-    }
-
-    /// Serializes one payload and sends it to every connected member of
-    /// `group`. Length-prefixed groups add a frame header; raw-framed groups
-    /// send the payload unchanged. Returns the number of recipients
-    /// attempted.
-    pub fn broadcast_with<F>(&mut self, group: ConnectionGroup, serialise: F) -> usize
-    where
-        F: FnOnce(&mut PayloadBuf<'_>),
-    {
-        self.state.broadcast_with(group, serialise)
-    }
-
-    /// Serializes multiple payloads once and sends the batch to every
-    /// connected member of `group`. Framing, size limits, and skipping of
-    /// invalid payloads follow [`StreamNetwork::send_many_with`]; each member
-    /// receives the batch in one socket write when it has no backlog. The
-    /// closure is not called when the group has no connected member. Returns
-    /// the number of recipients attempted.
-    pub fn broadcast_many_with<I, F>(
-        &mut self,
-        group: ConnectionGroup,
-        items: I,
-        serialise: F,
-    ) -> usize
-    where
-        I: IntoIterator,
-        F: FnMut(&mut PayloadBuf<'_>, I::Item),
-    {
-        self.state.broadcast_many_with(group, items, serialise)
-    }
-
-    /// Closes a connection. Persistent outbound endpoints remain registered
-    /// and will reconnect; accepted connections are removed. Returns whether
-    /// the token identified an active socket.
-    pub fn disconnect(&mut self, token: Token) -> bool {
-        self.state.disconnect(token)
-    }
-
-    /// Closes a connected socket after its queued bytes have been written.
-    /// Returns `false` for unknown or disconnected tokens; sends to a draining
-    /// token are rejected. A TCP peer that never drains is bounded only by
-    /// `TCP_USER_TIMEOUT`; a Unix-domain peer has no such bound.
-    pub fn disconnect_when_drained(&mut self, token: Token) -> bool {
-        self.state.disconnect_when_drained(token)
-    }
-
-    /// Shuts the write side of a connection once its queued bytes have been
-    /// written, and keeps reading it: the peer reads the end of the stream,
-    /// while the bytes it sends afterwards still arrive as
-    /// [`StreamEvent::Message`] and its own close still arrives as
-    /// [`StreamEvent::Disconnected`]. Both transports of the [`Endpoint`] set
-    /// half-close. Returns `false` for unknown or disconnected tokens; a
-    /// connection whose write side is already shut, or already waiting to be,
-    /// is left as it is.
-    ///
-    /// Sends to such a token are rejected and queue nothing, so the queue
-    /// only shrinks from the call onward. [`Self::disconnect`] still closes
-    /// the connection outright at any point, and a token that is draining as
-    /// well ([`Self::disconnect_when_drained`]) closes when its queue empties
-    /// rather than half-closing. A TCP peer that never drains is bounded only
-    /// by `TCP_USER_TIMEOUT`; a Unix-domain peer has no such bound.
-    pub fn shutdown_write_when_drained(&mut self, token: Token) -> bool {
-        self.state.shutdown_write_when_drained(token)
-    }
-
-    /// Whether the write side of a connection has shut: the transport has
-    /// taken everything that was queued for it, and the end of the stream
-    /// after it. Up to a socket buffer of that may still be on its way, so
-    /// this says the network has nothing left to send, not that the peer has
-    /// read it.
-    ///
-    /// A connection still writing what [`Self::shutdown_write_when_drained`]
-    /// will end — and one that never asked for a half-close, or that closed
-    /// or was never known — reports `false`. The lingering close of
-    /// [`crate::http::HttpService`] starts its caps where this turns `true`.
-    #[must_use]
-    pub(crate) fn write_side_shut(&self, token: Token) -> bool {
-        self.state.write_side_shut(token)
-    }
-
-    /// How many connections `group` refused since it was added because it
-    /// was already holding its [`ConnectionGroupConfig::max_connections`] cap.
-    ///
-    /// # Panics
-    /// The group must be one this network added.
-    #[must_use]
-    pub fn refused_connections(&self, group: ConnectionGroup) -> u64 {
-        assert!(group.0 < self.state.groups.len(), "unknown connection group");
-        self.state.groups[group.0].refused
-    }
-
-    /// Permanently removes a connection or outbound endpoint. Returns whether
-    /// the token was found.
-    pub fn remove(&mut self, token: Token) -> bool {
-        self.state.remove(token)
-    }
 }
 
-/// Routes one readiness event of a socket this network owns, together with
-/// the disconnects handling it produced, and reports whether anything reached
-/// a service or the unclaimed handler.
-fn route_ready<F>(
-    state: &mut NetworkState,
-    claimed: &[bool],
-    event: &Event,
-    services: &mut [ServiceRef<'_>],
-    unclaimed_handler: &mut F,
-) -> bool
-where
-    F: for<'a> FnMut(StreamEvent<'a>),
-{
-    let mut routed = false;
-    let mut route = |event: StreamEvent<'_>| {
-        route_event(claimed, services, unclaimed_handler, &mut routed, event);
-    };
-    state.handle_event(event, &mut route);
-    state.drain_pending_disconnects(&mut route);
-    routed
-}
-
-/// Hands one event to the service owning its group, or to the unclaimed handler
-/// when no service owns it.
-fn route_event<F>(
-    claimed: &[bool],
-    services: &mut [ServiceRef<'_>],
-    unclaimed_handler: &mut F,
-    routed: &mut bool,
-    event: StreamEvent<'_>,
-) where
-    F: for<'a> FnMut(StreamEvent<'a>),
-{
-    *routed = true;
-    let group = event.group();
-    if let Some(service) = services.iter_mut().find(|service| service.group() == group) {
-        service.on_event(&event);
-    } else {
-        debug_assert!(
-            !claimed[group.0],
-            "service-owned group {} has no service to route to",
-            group.0
-        );
-        unclaimed_handler(event);
+/// Offers one readiness event to each service in slice order until one owns
+/// it, reporting whether handling it produced work.
+fn route_ready<S: Service>(event: &Event, services: &mut [S]) -> bool {
+    for service in services.iter_mut() {
+        let outcome = service.handle_event(event);
+        if outcome.is_owned() {
+            return outcome.worked();
+        }
     }
+    // A token inside this network's range that no group holds is one of ours
+    // that closed since the poll returned.
+    debug!(token = ?event.token(), "ignoring stale readiness event");
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2188,8 +1965,8 @@ mod tests {
 
     use super::{
         ByteQueue, ConnectionGroupConfig, DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE,
-        FramedStream, PayloadBuf, Peer, StreamState, TcpOptions, TransportStream,
-        set_socket_buf_size, write_frame_header,
+        FramedStream, Peer, StreamState, TcpOptions, TransportStream, set_socket_buf_size,
+        write_frame_header,
     };
 
     #[test]
@@ -2300,41 +2077,5 @@ mod tests {
             StreamState::Disconnected
         );
         assert_eq!(stream.send_queue.len(), 8);
-    }
-
-    #[test]
-    fn payload_buf_truncate_clamps_to_its_own_frame() {
-        let mut bytes = b"earlier".to_vec();
-        let mut payload = PayloadBuf::new(&mut bytes);
-        payload.extend_from_slice(b"payload");
-
-        payload.truncate(usize::MAX);
-        assert_eq!(payload.as_slice(), b"payload");
-        payload.truncate(3);
-        assert_eq!(payload.as_slice(), b"pay");
-        payload.truncate(0);
-        assert!(payload.is_empty());
-        assert_eq!(bytes, b"earlier");
-    }
-
-    #[test]
-    fn payload_buf_resize_and_clear_stay_relative() {
-        let mut bytes = b"earlier".to_vec();
-        let mut payload = PayloadBuf::new(&mut bytes);
-        payload.resize(3, 7);
-        assert_eq!(payload.as_slice(), &[7, 7, 7]);
-        payload.resize(1, 0);
-        assert_eq!(payload.as_slice(), &[7]);
-        payload.clear();
-        assert!(payload.is_empty());
-        assert_eq!(bytes, b"earlier");
-    }
-
-    #[test]
-    #[should_panic(expected = "payload length overflows usize")]
-    fn payload_buf_resize_rejects_overflow() {
-        let mut bytes = b"earlier".to_vec();
-        let mut payload = PayloadBuf::new(&mut bytes);
-        payload.resize(usize::MAX, 0);
     }
 }

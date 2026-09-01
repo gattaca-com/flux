@@ -427,15 +427,15 @@ fn a_cap_of_zero_is_rejected() {
 /// One iteration of an HTTP server: drive the network, then answer every
 /// request pulled from the service.
 fn serve(network: &mut StreamNetwork, service: &mut HttpService) {
-    network.drive(Some(flux_timing::Duration::ZERO), &mut [service.as_service()], |_| {});
+    network.drive(Some(flux_timing::Duration::ZERO), &mut [&mut service]);
     let mut requests = Vec::new();
-    while let Some(event) = service.next_event(network) {
+    while let Some(event) = service.next_event() {
         if let HttpEvent::Request { token, .. } = event {
             requests.push(token);
         }
     }
     for token in requests {
-        assert!(service.respond(network, token, 200, &[], BODY));
+        assert!(service.respond(token, 200, &[], BODY));
     }
 }
 
@@ -451,8 +451,8 @@ fn an_http_service_serves_its_clients_while_the_cap_refuses_another() {
         max_connections: Some(2),
         ..ConnectionGroupConfig::default()
     });
-    let mut service = HttpService::new(&mut network, group, HttpConfig::default());
-    let endpoint = service.listen(&mut network, ephemeral()).unwrap();
+    let mut service = HttpService::new(group, HttpConfig::default());
+    let endpoint = service.listen(ephemeral()).unwrap();
 
     let mut served = [connect_client(&endpoint), connect_client(&endpoint)];
     let mut answers = [Vec::new(), Vec::new()];
@@ -503,9 +503,9 @@ fn an_http_service_serves_its_clients_while_the_cap_refuses_another() {
 /// One iteration of an HTTP server with nothing to answer, reporting whether
 /// the service accepted a client.
 fn drive_service(network: &mut StreamNetwork, service: &mut HttpService) -> bool {
-    network.drive(Some(flux_timing::Duration::ZERO), &mut [service.as_service()], |_| {});
+    network.drive(Some(flux_timing::Duration::ZERO), &mut [&mut service]);
     let mut accepted = false;
-    while let Some(event) = service.next_event(network) {
+    while let Some(event) = service.next_event() {
         accepted |= matches!(event, HttpEvent::Accepted { .. });
     }
     accepted
