@@ -19,15 +19,15 @@
 //!     framing: Framing::Raw,
 //!     ..ConnectionGroupConfig::default()
 //! });
-//! let mut http = HttpService::new(&mut net, group, HttpConfig::default());
-//! http.listen(&mut net, Endpoint::Tcp("127.0.0.1:8080".parse::<SocketAddr>().unwrap()))?;
-//! let upstream = http.connect(&mut net, Endpoint::Unix("/run/flux/upstream.sock".into()));
+//! let mut http = HttpService::new(group, HttpConfig::default());
+//! http.listen(Endpoint::Tcp("127.0.0.1:8080".parse::<SocketAddr>().unwrap()))?;
+//! let upstream = http.connect(Endpoint::Unix("/run/flux/upstream.sock".into()));
 //!
 //! let mut slow = Vec::new();
 //! let mut ask_upstream = false;
 //! loop {
-//!     net.drive(Some(Duration::from_millis(10)), &mut [http.as_service()], |_| {});
-//!     while let Some(event) = http.next_event(&mut net) {
+//!     net.drive(Some(Duration::from_millis(10)), &mut [&mut http]);
+//!     while let Some(event) = http.next_event() {
 //!         match event {
 //!             HttpEvent::Request { token, request, responder } => {
 //!                 if request.path == "/health" {
@@ -43,20 +43,20 @@
 //!         }
 //!     }
 //!     for token in slow.drain(..) {
-//!         http.respond(&mut net, token, 200, &[], b"done");
+//!         http.respond(token, 200, &[], b"done");
 //!     }
 //!     if std::mem::take(&mut ask_upstream) {
-//!         http.request(&mut net, upstream, "GET", "/", &[], &[]);
+//!         http.request(upstream, "GET", "/", &[], &[]);
 //!     }
 //! }
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
 //! # The pull loop
-//! An event borrows the service and the network for as long as it lives, so
-//! nothing in the loop body may touch either: everything a handler needs
-//! arrives through the event, and the [`Responder`] on a request is the only
-//! way to answer from there. Events cannot be stored or cloned. A caller may
+//! An event borrows the service for as long as it lives, so nothing in the
+//! loop body may touch the service: everything a handler needs arrives
+//! through the event, and the [`Responder`] on a request is the only way to
+//! answer from there. Events cannot be stored or cloned. A caller may
 //! stop pulling after any number of events and resume in a later iteration
 //! with nothing lost.
 //!
@@ -455,8 +455,7 @@ fn write_framed(
             // The caps time what follows the answer, so they start where the
             // answer ends: here when nothing was queued behind it, and at the
             // tick that sees the write side shut otherwise.
-            let clock =
-                group.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
+            let clock = group.write_side_shut(token).then(|| LingerClock::started(Instant::now()));
             state.phase = Phase::Lingering { clock };
         } else {
             state.phase = Phase::Draining;
@@ -696,12 +695,8 @@ struct HttpState {
     /// The connection awaiting bookkeeping from the last pulled event.
     last: Option<Token>,
 }
+
 impl HttpState {
-    /// Adds a listener, and reports the endpoint it bound.
-    ///
-    /// That endpoint is the one asked for, except for a TCP address whose
-    /// port is `0`: the kernel picks the port, and what comes back is the
-    /// address a client must dial.
     /// Adds a persistent outbound endpoint and immediately starts connecting.
     /// The returned token remains stable across reconnects.
     #[must_use = "the token identifies the outbound endpoint"]
@@ -859,10 +854,7 @@ impl HttpState {
     ///
     /// The event borrows the service and the network until it is dropped, so a
     /// handler reaches the network only through the event it was handed.
-    fn next_event<'a>(
-        &'a mut self,
-        group: &'a mut ConnectionGroup,
-    ) -> Option<HttpEvent<'a>> {
+    fn next_event<'a>(&'a mut self, group: &'a mut ConnectionGroup) -> Option<HttpEvent<'a>> {
         self.apply_bookkeeping();
         match self.plan(group)? {
             Step::Accepted { token, peer } => Some(HttpEvent::Accepted { token, peer }),
@@ -1681,7 +1673,9 @@ impl HttpState {
                     Some(clock) => clock,
                     // `now` is the instant the poll returned, so the caps run
                     // from the end of the wait rather than the start of it.
-                    None if group.write_side_shut(token) => *clock.insert(LingerClock::started(now)),
+                    None if group.write_side_shut(token) => {
+                        *clock.insert(LingerClock::started(now))
+                    }
                     None => continue,
                 };
                 if now.saturating_sub(clock.last_inbound) >= linger.idle ||
@@ -2090,12 +2084,12 @@ mod tests {
     /// A service on a raw group of its own, with no listener and no
     /// connections.
     fn bare_service(net: &mut StreamNetwork) -> HttpService {
-        let group = group.add_group(ConnectionGroupConfig {
+        let group = net.add_group(ConnectionGroupConfig {
             name: "http",
             framing: Framing::Raw,
             ..ConnectionGroupConfig::default()
         });
-        HttpService::new(group, group, HttpConfig::default())
+        HttpService::new(group, HttpConfig::default())
     }
 
     /// A request of exactly `size` bytes, padded out with a header.
@@ -2148,7 +2142,8 @@ mod tests {
     #[test]
     fn a_ready_connection_is_queued_once() {
         let mut net = StreamNetwork::default();
-        let mut http = bare_service(&mut group);
+        let mut service = bare_service(&mut net);
+        let http = &mut service.http;
         http.conns.push(Conn::new(Token(1), Role::Accepted));
 
         http.mark_ready(0);
@@ -2166,7 +2161,8 @@ mod tests {
     #[test]
     fn a_lingering_connection_drops_what_it_reads() {
         let mut net = StreamNetwork::default();
-        let mut http = bare_service(&mut group);
+        let mut service = bare_service(&mut net);
+        let http = &mut service.http;
         // An instant the read is bound to fall after, so the idle cap can be
         // seen to move to it and the total cap to stay where it is.
         let answered = Instant(1);
@@ -2189,7 +2185,8 @@ mod tests {
     #[test]
     fn a_connection_owing_a_response_is_never_queued() {
         let mut net = StreamNetwork::default();
-        let mut http = bare_service(&mut group);
+        let mut service = bare_service(&mut net);
+        let http = &mut service.http;
         let mut conn = Conn::new(Token(1), Role::Accepted);
         conn.state.phase = Phase::Pending;
         http.conns.push(conn);
@@ -2208,7 +2205,7 @@ mod tests {
     /// the tests that need a connection to answer on.
     struct Harness {
         net: StreamNetwork,
-        http: HttpService,
+        service: HttpService,
         /// The client end, held open for as long as the harness lives.
         _client: TcpStream,
     }
@@ -2219,20 +2216,20 @@ mod tests {
         /// where reclaiming it moves the cursor without moving the bytes.
         fn with_two_requests() -> (Self, usize) {
             let mut net = StreamNetwork::default();
-            let mut http = bare_service(&mut group);
+            let mut service = bare_service(&mut net);
             // Port 0 leaves the port to the kernel, and the listener reports
             // the address a client must dial.
-            let bound =
-                http.listen(&mut group, Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())).unwrap();
+            let bound = service.listen(Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())).unwrap();
             let Endpoint::Tcp(addr) = bound else { unreachable!("the harness listens on TCP") };
             let mut client = TcpStream::connect(addr).unwrap();
             let first = padded_request("/one", 64);
             client.write_all(&[first.clone(), padded_request("/two", 192)].concat()).unwrap();
-            (Self { group, http, _client: client }, first.len())
+            (Self { net, service, _client: client }, first.len())
         }
 
         fn drive(&mut self) -> bool {
-            self.group.drive(Some(Duration::ZERO), &mut [self.http.as_service()], |_| {})
+            let Self { net, service, .. } = self;
+            net.drive(Some(Duration::ZERO), &mut [&mut *service])
         }
 
         /// Drives until a request is delivered and reports its token,
@@ -2241,7 +2238,7 @@ mod tests {
             let deadline = std::time::Instant::now() + PATIENCE;
             while std::time::Instant::now() < deadline {
                 self.drive();
-                while let Some(event) = self.http.next_event(&mut self.group) {
+                while let Some(event) = self.service.next_event() {
                     if let HttpEvent::Request { token, responder, .. } = event {
                         if inline {
                             assert!(responder.respond(200, &[], b""));
@@ -2256,24 +2253,26 @@ mod tests {
         /// Pulls one event with no driver call before it, which is what the
         /// reclaim-timing tests are about.
         fn pull_without_driving(&mut self) -> bool {
-            self.http.next_event(&mut self.group).is_some()
+            self.service.next_event().is_some()
         }
 
         fn respond(&mut self, token: Token) -> bool {
-            self.http.respond(&mut self.group, token, 200, &[], b"")
+            self.service.respond(token, 200, &[], b"")
         }
 
         /// Where a connection has parsed and answered up to: `start`,
         /// `consumed` and `req_end`.
         fn cursors(&self, token: Token) -> (usize, usize, Option<usize>) {
-            let index = self.http.index_of(token).expect("the connection went");
-            let conn = &self.http.conns[index];
+            let http = &self.service.http;
+            let index = http.index_of(token).expect("the connection went");
+            let conn = &http.conns[index];
             (conn.start, conn.state.consumed, conn.state.req_end)
         }
 
         /// Connections queued as ready to parse.
         fn queued(&self) -> usize {
-            self.http.ready.len() - self.http.ready_cursor
+            let http = &self.service.http;
+            http.ready.len() - http.ready_cursor
         }
     }
 

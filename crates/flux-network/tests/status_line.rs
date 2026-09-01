@@ -55,7 +55,7 @@ impl Server {
 
     fn pump(&mut self) {
         let Self { net, service, requests } = self;
-        net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut *service]);
         while let Some(event) = service.next_event() {
             if let HttpEvent::Request { token, .. } = event {
                 requests.push(token);
@@ -76,7 +76,7 @@ impl Server {
     }
 
     fn respond(&mut self, token: Token, status: u16, body: &[u8]) -> bool {
-        self.service.respond(&mut self.net, token, status, &[], body)
+        self.service.respond(token, status, &[], body)
     }
 
     /// Reads until the client has as many bytes as `expected`, and asserts

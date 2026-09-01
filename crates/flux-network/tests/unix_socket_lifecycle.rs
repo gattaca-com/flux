@@ -1,6 +1,8 @@
 //! ADR 0003: what binding a Unix-domain listener does to an occupied path,
 //! and what closing one leaves behind.
 
+mod common;
+
 use std::{
     io::{self, Read, Write},
     os::{
@@ -11,28 +13,31 @@ use std::{
         },
     },
     path::Path,
-    thread,
     time::{Duration, Instant},
 };
 
-use flux_network::stream::{ConnectionGroupConfig, Endpoint, StreamEvent, StreamNetwork};
+use common::RawService;
+use flux_network::stream::{ConnectionGroupConfig, Endpoint, StreamNetwork};
 
-/// A network with one group, ready to listen.
-fn network() -> (StreamNetwork, flux_network::stream::ConnectionGroup) {
-    let mut network = StreamNetwork::default();
-    let group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
-    (network, group)
+/// How long one iteration of a test loop is allowed to wait in the poll.
+fn poll_slice() -> flux_timing::Duration {
+    flux_timing::Duration::from_millis(1)
 }
 
-fn accepts_a_connection(network: &mut StreamNetwork, path: &Path) -> bool {
+/// A network with one group, and the service that owns it, ready to listen.
+fn network() -> (StreamNetwork, RawService) {
+    let mut network = StreamNetwork::default();
+    let group = network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() });
+    (network, RawService::new(group))
+}
+
+fn accepts_a_connection(network: &mut StreamNetwork, server: &mut RawService, path: &Path) -> bool {
     let _client = UnixStream::connect(path).unwrap();
-    let mut accepted = false;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !accepted {
-        network.poll_with(|event| accepted |= matches!(event, StreamEvent::Accepted { .. }));
-        thread::sleep(Duration::from_millis(1));
+    while Instant::now() < deadline && server.accepted().is_none() {
+        network.drive(Some(poll_slice()), &mut [&mut *server]);
     }
-    accepted
+    server.accepted().is_some()
 }
 
 #[test]
@@ -45,9 +50,9 @@ fn stale_socket_file_is_replaced() {
     drop(UnixListener::bind(&path).unwrap());
     assert!(path.exists());
 
-    let (mut network, group) = network();
-    network.listen(group, Endpoint::Unix(path.clone())).unwrap();
-    assert!(accepts_a_connection(&mut network, &path));
+    let (mut network, mut server) = network();
+    server.listen(Endpoint::Unix(path.clone())).unwrap();
+    assert!(accepts_a_connection(&mut network, &mut server, &path));
 }
 
 #[test]
@@ -56,8 +61,8 @@ fn live_socket_file_is_left_to_its_owner() {
     let path = dir.path().join("s");
     let live = UnixListener::bind(&path).unwrap();
 
-    let (mut network, group) = network();
-    let err = network.listen(group, Endpoint::Unix(path.clone())).unwrap_err();
+    let (_network, mut server) = network();
+    let err = server.listen(Endpoint::Unix(path.clone())).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
     assert!(path.exists());
@@ -82,8 +87,8 @@ fn regular_file_at_the_path_is_untouched() {
     let path = dir.path().join("s");
     std::fs::write(&path, b"not a socket").unwrap();
 
-    let (mut network, group) = network();
-    let err = network.listen(group, Endpoint::Unix(path.clone())).unwrap_err();
+    let (_network, mut server) = network();
+    let err = server.listen(Endpoint::Unix(path.clone())).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
     assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
@@ -97,9 +102,9 @@ fn symlink_to_a_socket_is_untouched() {
     let _live = UnixListener::bind(&target).unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let (mut network, group) = network();
+    let (_network, mut server) = network();
     // The link resolves to a live socket, but the bind must not follow it.
-    let err = network.listen(group, Endpoint::Unix(link.clone())).unwrap_err();
+    let err = server.listen(Endpoint::Unix(link.clone())).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert!(err.to_string().contains(link.to_str().unwrap()), "{err}");
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
@@ -112,11 +117,13 @@ fn closing_the_listener_unlinks_its_socket_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s");
 
-    let (mut network, group) = network();
-    network.listen(group, Endpoint::Unix(path.clone())).unwrap();
+    let (mut network, mut server) = network();
+    server.listen(Endpoint::Unix(path.clone())).unwrap();
     assert!(path.exists());
 
-    drop(network);
+    // The listener belongs to the group the service owns, so closing that
+    // group is what closes the listener.
+    network.remove_group(server.into_group());
     assert!(!path.exists());
 }
 
@@ -138,9 +145,9 @@ fn saturated_live_socket_is_still_left_to_its_owner() {
         assert!(queued.len() < 64, "the accept queue never filled");
     }
 
-    let (mut network, group) = network();
+    let (_network, mut server) = network();
     let started = Instant::now();
-    let err = network.listen(group, Endpoint::Unix(path.clone())).unwrap_err();
+    let err = server.listen(Endpoint::Unix(path.clone())).unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(1), "the probe waited for the owner");
     assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
@@ -168,8 +175,8 @@ fn non_refused_probe_error_leaves_the_file() {
     // the file is stale.
     let _datagram = UnixDatagram::bind(&path).unwrap();
 
-    let (mut network, group) = network();
-    let err = network.listen(group, Endpoint::Unix(path.clone())).unwrap_err();
+    let (_network, mut server) = network();
+    let err = server.listen(Endpoint::Unix(path.clone())).unwrap_err();
     assert_ne!(err.kind(), io::ErrorKind::AddrInUse);
     assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
     assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_socket());
@@ -182,8 +189,8 @@ fn directory_at_the_path_is_untouched() {
     std::fs::create_dir(&path).unwrap();
     std::fs::write(path.join("keep"), b"contents").unwrap();
 
-    let (mut network, group) = network();
-    let err = network.listen(group, Endpoint::Unix(path.clone())).unwrap_err();
+    let (_network, mut server) = network();
+    let err = server.listen(Endpoint::Unix(path.clone())).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
     assert!(path.is_dir());

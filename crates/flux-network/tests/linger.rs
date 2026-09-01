@@ -11,7 +11,7 @@ use std::{
 use flux_network::{
     Token,
     http::{HttpConfig, HttpEvent, HttpService, Linger},
-    stream::{ConnectionGroup, ConnectionGroupConfig, Endpoint, Framing, StreamNetwork},
+    stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -108,7 +108,6 @@ fn small_heads() -> HttpConfig {
 struct Server {
     net: StreamNetwork,
     service: HttpService,
-    group: ConnectionGroup,
     accepted: Vec<Token>,
     disconnected: Vec<Token>,
     requests: Vec<Token>,
@@ -128,7 +127,6 @@ impl Server {
         Self {
             net,
             service,
-            group,
             accepted: Vec::new(),
             disconnected: Vec::new(),
             requests: Vec::new(),
@@ -148,7 +146,7 @@ impl Server {
     /// or events the service was already holding.
     fn pump(&mut self) -> bool {
         let Self { net, service, accepted, disconnected, requests, inline_answer, .. } = self;
-        let worked = net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
+        let worked = net.drive(Some(Duration::ZERO.into()), &mut [&mut *service]);
         while let Some(event) = service.next_event() {
             match event {
                 HttpEvent::Accepted { token, .. } => accepted.push(token),
@@ -184,7 +182,7 @@ impl Server {
     fn drive_blocking(&mut self) -> Duration {
         let Self { net, service, .. } = self;
         let started = Instant::now();
-        net.drive(None, &mut [&mut service]);
+        net.drive(None, &mut [&mut *service]);
         started.elapsed()
     }
 
@@ -214,7 +212,7 @@ impl Server {
     }
 
     fn respond(&mut self, token: Token, status: u16, body: &[u8]) -> bool {
-        self.service.respond(&mut self.net, token, status, &[], body)
+        self.service.respond(token, status, &[], body)
     }
 
     /// Reads the client to the end of the stream, driving the server
@@ -398,7 +396,7 @@ fn a_lingering_connection_holds_its_place(endpoint: &Endpoint) {
     // A connection reading its peer out is a connection the group holds.
     let mut refused = connect_client(endpoint);
     assert!(server.read_to_end_of_stream(&mut *refused).is_empty());
-    assert_eq!(server.net.refused_connections(server.group), 1);
+    assert_eq!(server.service.refused_connections(), 1);
 
     drop(client);
     server.wait_until(|server| server.disconnected == [token], "the linger did not end");
@@ -406,7 +404,7 @@ fn a_lingering_connection_holds_its_place(endpoint: &Endpoint) {
     server.wait_until(|server| server.accepted.len() == 2, "the freed place was not taken");
     next.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
     server.wait_until(|server| !server.requests.is_empty(), "the new client was not served");
-    assert_eq!(server.net.refused_connections(server.group), 1);
+    assert_eq!(server.service.refused_connections(), 1);
 }
 
 over_both_transports!(
@@ -743,7 +741,7 @@ fn the_caps_start_when_the_answer_has_left() {
     let ended = loop {
         {
             let Server { net, service, disconnected, .. } = &mut server;
-            net.drive(None, &mut [&mut service]);
+            net.drive(None, &mut [&mut *service]);
             while let Some(event) = service.next_event() {
                 if let HttpEvent::Disconnected { token } = event {
                     disconnected.push(token);

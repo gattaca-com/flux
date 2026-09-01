@@ -37,21 +37,16 @@ _Avoid_: socket (the OS handle, not the channel), pipe
 **ConnectionGroup**:
 The connections — inbound and outbound, TCP or Unix-domain — that share one configuration
 (framing, socket options, backlog and connection caps) and one owner, together with the listeners
-and outbound endpoints that produce them. Owned by one Service, or by the caller as an unclaimed
-group. A Service requires one; you never use one bare.
-_Avoid_: pool, channel, transport, stream group
+and outbound endpoints that produce them. Created by a network and owned by exactly one Service
+chain: moving the group into its Service is the claim, and a group cannot be scheduled bare.
+_Avoid_: pool, channel, transport, stream group, unclaimed group
 
 **Service**:
-A stateful server, client, or both, for an application-layer protocol. It owns one ConnectionGroup
-inside a shared network and is scheduled by that network. An HTTP server or client is a Service
-(`HttpService`).
+A stateful server, client, or both, for an application-layer protocol. It implements the static
+scheduling contract (`Service`), owns one ConnectionGroup — directly, or through a lower Service
+it contains — and is scheduled by the network that created the group; of a composed chain, only
+the outermost Service is scheduled. An HTTP server or client is a Service (`HttpService`).
 _Avoid_: tenant, handler, protocol
-
-**Unclaimed ConnectionGroup**:
-A ConnectionGroup no Service has claimed; the caller is its protocol layer and receives its events
-inline through the closure passed to `drive`. Claiming is a group-level decision made when a
-Service is constructed and undone by `close`, never a per-connection state.
-_Avoid_: raw group, unmanaged group, bare group
 
 **Owned poll**:
 A network that holds its own poll and drives it, with whatever timeout the caller passes.
@@ -74,7 +69,9 @@ _Avoid_: client, remote
 
 **Deadline**:
 The per-request timer on an outbound connection; expiry fails the request and closes the
-connection.
+connection. In scheduling (`next_deadline`), the earliest instant a tick of a Service could
+progress work, with work already due reported at the instant it became due; work a Service
+exposes upward for its caller to pull rides the did-work report, never the deadline.
 _Avoid_: timeout (which names the idle sweep), TTL
 
 **Draining**:

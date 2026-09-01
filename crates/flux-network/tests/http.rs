@@ -8,9 +8,7 @@ use std::{
 use flux_network::{
     Token,
     http::{HttpConfig, HttpEvent, HttpService, MAX_HEADERS},
-    stream::{
-        ConnectionGroupConfig, Endpoint, Framing, Peer, ServiceRef, StreamEvent, StreamNetwork,
-    },
+    stream::{ConnectionGroupConfig, Endpoint, Framing, Peer, Service, StreamNetwork},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,17 +68,9 @@ impl Driver {
 
     /// One nonblocking iteration: one `drive`, or the three calls a
     /// caller-held poll requires.
-    fn iterate<F>(
-        &mut self,
-        net: &mut StreamNetwork,
-        services: &mut [ServiceRef<'_>],
-        mut unclaimed_handler: F,
-    ) -> bool
-    where
-        F: for<'a> FnMut(StreamEvent<'a>),
-    {
+    fn iterate<S: Service>(&mut self, net: &mut StreamNetwork, services: &mut [S]) -> bool {
         let Some((poll, events)) = &mut self.poll else {
-            return net.drive(Some(Duration::ZERO.into()), services, unclaimed_handler);
+            return net.drive(Some(Duration::ZERO.into()), services);
         };
         // The fold is what an External caller turns into its poll timeout;
         // this one polls without waiting, and calls it for the same
@@ -89,9 +79,9 @@ impl Driver {
         poll.poll(events, Some(Duration::ZERO)).unwrap();
         let mut worked = false;
         for event in &*events {
-            worked |= net.handle_event(event, services, &mut unclaimed_handler);
+            worked |= net.handle_event(event, services);
         }
-        worked | net.tick(services, &mut unclaimed_handler)
+        worked | net.tick(services)
     }
 }
 
@@ -136,17 +126,17 @@ impl Http {
     /// One iteration of the network alone, leaving the events to be pulled.
     fn drive(&mut self) -> bool {
         let Self { net, service, driver } = self;
-        driver.iterate(net, &mut [&mut service])
+        driver.iterate(net, &mut [&mut *service])
     }
 
     /// Listens, and reports the endpoint bound: for a TCP request on port
     /// `0` that is the address a client must dial.
     fn listen(&mut self, endpoint: &Endpoint) -> Endpoint {
-        self.service.listen(&mut self.net, endpoint.clone()).unwrap()
+        self.service.listen(endpoint.clone()).unwrap()
     }
 
     fn connect(&mut self, endpoint: Endpoint) -> Token {
-        self.service.connect(&mut self.net, endpoint)
+        self.service.connect(endpoint)
     }
 
     fn respond(
@@ -156,7 +146,7 @@ impl Http {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        self.service.respond(&mut self.net, token, status, headers, body)
+        self.service.respond(token, status, headers, body)
     }
 
     fn respond_with(
@@ -166,7 +156,7 @@ impl Http {
         headers: &[(&str, &str)],
         body: impl FnOnce(&mut Vec<u8>),
     ) -> bool {
-        self.service.respond_with(&mut self.net, token, status, headers, body)
+        self.service.respond_with(token, status, headers, body)
     }
 
     fn request(
@@ -177,15 +167,15 @@ impl Http {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        self.service.request(&mut self.net, token, method, path, headers, body)
+        self.service.request(token, method, path, headers, body)
     }
 
     fn disconnect(&mut self, token: Token) -> bool {
-        self.service.disconnect(&mut self.net, token)
+        self.service.disconnect(token)
     }
 
     fn remove(&mut self, token: Token) -> bool {
-        self.service.remove(&mut self.net, token)
+        self.service.remove(token)
     }
 }
 
@@ -2124,15 +2114,6 @@ fn a_request_from_a_client_that_left_is_dropped() {
 }
 
 #[test]
-#[should_panic(expected = "drive the network with StreamNetwork::drive")]
-fn polling_a_network_that_has_services_is_refused() {
-    let mut net = StreamNetwork::default();
-    let group = net.add_group(http_group());
-    let _http = HttpService::new(group, HttpConfig::default());
-    net.poll_with(|_| {});
-}
-
-#[test]
 fn an_accepted_connection_is_announced_before_its_first_request() {
     let (mut server, addr) = server();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -2182,9 +2163,7 @@ fn two_services_on_one_network_keep_their_own_events(mode: Mode) {
     let mut second_paths = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && (first_paths.is_empty() || second_paths.is_empty()) {
-        driver.iterate(&mut net, &mut [&mut first, &mut second], |event| {
-            panic!("no unclaimed group exists: {:?}", event_group(&event))
-        });
+        driver.iterate(&mut net, &mut [&mut first, &mut second]);
         while let Some(event) = first.next_event() {
             if let HttpEvent::Request { request, responder, .. } = event {
                 first_paths.push(request.path.to_owned());
@@ -2206,46 +2185,37 @@ fn two_services_on_one_network_keep_their_own_events(mode: Mode) {
     second.close(&mut net);
 }
 
-fn event_group(event: &StreamEvent<'_>) -> &'static str {
-    match event {
-        StreamEvent::Accepted { .. } => "accepted",
-        StreamEvent::Connected { .. } => "connected",
-        StreamEvent::Message { .. } => "message",
-        StreamEvent::Disconnected { .. } => "disconnected",
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Service lifecycle
 
 #[test]
-fn close_returns_the_group_to_raw_use() {
+fn close_leaves_the_other_services_of_the_network_serving() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
     let other_group = net.add_group(http_group());
     let mut http = HttpService::new(group, HttpConfig::default());
     let mut other = HttpService::new(other_group, HttpConfig::default());
     http.listen(ephemeral()).unwrap();
+    let addr = bound_addr(other.listen(ephemeral()).unwrap());
     http.close(&mut net);
 
-    // The remaining service alone passes validation.
-    net.drive(Some(Duration::ZERO.into()), &mut [&mut other]);
-
-    let addr = bound_addr(net.listen(group, ephemeral()).unwrap());
+    // The closed slot asks for no service of its own, so the remaining one
+    // alone passes validation — and goes on serving on its own listener.
     let mut client = std::net::TcpStream::connect(addr).unwrap();
-    client.write_all(b"raw bytes").unwrap();
-    let mut raw = Vec::new();
+    client.write_all(b"GET /still-here HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut paths = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && raw.is_empty() {
-        net.drive(Some(Duration::ZERO.into()), &mut [&mut other], |event| {
-            if let StreamEvent::Message { group: event_group, payload, .. } = event {
-                assert_eq!(event_group, group);
-                raw.push(payload.to_vec());
+    while Instant::now() < deadline && paths.is_empty() {
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut other]);
+        while let Some(event) = other.next_event() {
+            if let HttpEvent::Request { request, responder, .. } = event {
+                paths.push(request.path.to_owned());
+                assert!(responder.respond(200, &[], b"ok"));
             }
-        });
+        }
         thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(raw, [b"raw bytes".to_vec()]);
+    assert_eq!(paths, ["/still-here"]);
     other.close(&mut net);
 }
 
@@ -2287,13 +2257,13 @@ fn close_hangs_up_on_connections_and_listeners() {
 }
 
 #[test]
-#[should_panic(expected = "call HttpService::close before dropping it")]
+#[should_panic(expected = "connection group 0 has no service")]
 fn a_service_dropped_without_closing_is_reported() {
     let mut net = StreamNetwork::default();
     let group = net.add_group(http_group());
     let http = HttpService::new(group, HttpConfig::default());
     drop(http);
-    net.drive(Some(Duration::ZERO.into()), &mut []);
+    net.drive(Some(Duration::ZERO.into()), &mut [] as &mut [HttpService]);
 }
 
 #[test]

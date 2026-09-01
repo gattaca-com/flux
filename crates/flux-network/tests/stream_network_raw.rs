@@ -1,13 +1,23 @@
+mod common;
+
 use std::{
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
-    thread,
     time::{Duration, Instant},
 };
 
-use flux_network::stream::{ConnectionGroupConfig, Endpoint, Framing, StreamEvent, StreamNetwork};
+use common::{RawEvent, RawService, Record};
+use flux_network::{
+    Token,
+    stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork},
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one iteration of a test loop is allowed to wait in the poll.
+fn poll_slice() -> flux_timing::Duration {
+    flux_timing::Duration::from_millis(1)
+}
 
 /// A loopback endpoint whose port the kernel picks when the listener binds,
 /// so no address is handed out before something holds it.
@@ -27,12 +37,42 @@ fn raw_group(name: &'static str) -> ConnectionGroupConfig {
     ConnectionGroupConfig { name, framing: Framing::Raw, ..ConnectionGroupConfig::default() }
 }
 
+/// Sends every payload a service read back down the connection it arrived on,
+/// reporting how many that was.
+fn echo(service: &mut RawService) -> usize {
+    let mut echoed = 0;
+    let leftovers = service.spin(usize::MAX, |event| match event {
+        RawEvent::Message { payload, reply, .. } => {
+            assert!(reply.send(payload), "the echo reached its connection");
+            echoed += 1;
+        }
+    });
+    assert!(!leftovers, "an unbounded drain leaves nothing behind");
+    echoed
+}
+
+/// Moves every payload a service read into `out`, in arrival order.
+fn drain(service: &mut RawService, out: &mut Vec<u8>) {
+    let leftovers = service.spin(usize::MAX, |event| match event {
+        RawEvent::Message { payload, .. } => out.extend_from_slice(payload),
+    });
+    assert!(!leftovers, "an unbounded drain leaves nothing behind");
+}
+
+/// Whether a service has reported `token` connected.
+fn connected(service: &RawService, token: Token) -> bool {
+    service
+        .records()
+        .iter()
+        .any(|record| matches!(record, Record::Connected { token: at, .. } if *at == token))
+}
+
 #[test]
 fn raw_roundtrip() {
     let request = b"raw request bytes";
     let mut network = StreamNetwork::default();
-    let group = network.add_group(raw_group("raw-server"));
-    let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
+    let mut server = RawService::new(network.add_group(raw_group("raw-server")));
+    let addr = bound_addr(server.listen(ephemeral()).unwrap());
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -42,24 +82,14 @@ fn raw_roundtrip() {
     client.write_all(request).unwrap();
 
     while Instant::now() < deadline && received.len() < request.len() {
-        let mut echo = None;
-        network.poll_with(|event| {
-            if let StreamEvent::Message { group: event_group, token, payload, .. } = event {
-                assert_eq!(event_group, group);
-                echo = Some((token, payload.to_vec()));
-            }
-        });
-        if let Some((token, payload)) = echo {
-            assert!(network.send_with(token, |buf| buf.extend_from_slice(&payload)));
-            echoed = true;
-        }
+        network.drive(Some(poll_slice()), &mut [&mut server]);
+        echoed |= echo(&mut server) > 0;
         let mut buffer = [0; 128];
         match client.read(&mut buffer) {
             Ok(read) => received.extend_from_slice(&buffer[..read]),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => panic!("client read failed: {err}"),
         }
-        thread::sleep(Duration::from_millis(1));
     }
 
     assert!(echoed);
@@ -68,42 +98,35 @@ fn raw_roundtrip() {
 
 #[test]
 fn raw_batch_concatenates_payloads() {
-    let addr = unused_addr();
     let mut network = StreamNetwork::default();
-    let group = network.add_group(raw_group("raw-server"));
-    network.listen(group, Endpoint::Tcp(addr)).unwrap();
+    let mut server = RawService::new(network.add_group(raw_group("raw-server")));
+    let addr = bound_addr(server.listen(ephemeral()).unwrap());
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
-
-    let mut accepted = None;
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && accepted.is_none() {
-        network.poll_with(|event| {
-            if let StreamEvent::Accepted { group: event_group, token, .. } = event {
-                assert_eq!(event_group, group);
-                accepted = Some(token);
-            }
-        });
-        thread::sleep(Duration::from_millis(1));
+    while Instant::now() < deadline && server.accepted().is_none() {
+        network.drive(Some(poll_slice()), &mut [&mut server]);
     }
-    let token = accepted.expect("connection was not accepted");
+    let token = server.accepted().expect("connection was not accepted");
 
+    // Raw framing has no boundaries to keep: a batch is one run of bytes.
     let parts: [&[u8]; 3] = [b"raw-", b"batch-", b"bytes"];
-    assert!(network.send_many_with(token, parts, |buf, part| buf.extend_from_slice(part)));
+    let mut group = server.into_group();
+    assert!(group.send_many_with(token, parts, |buf, part| buf.extend_from_slice(part)));
+    let mut server = RawService::new(group);
 
     let expected = b"raw-batch-bytes";
     let mut received = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && received.len() < expected.len() {
-        network.poll_with(|_| {});
+        network.drive(Some(poll_slice()), &mut [&mut server]);
         let mut buffer = [0; 128];
         match client.read(&mut buffer) {
             Ok(read) => received.extend_from_slice(&buffer[..read]),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => panic!("client read failed: {err}"),
         }
-        thread::sleep(Duration::from_millis(1));
     }
 
     assert_eq!(received, expected);
@@ -114,8 +137,8 @@ fn http_get_smoke() {
     let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
     let mut network = StreamNetwork::default();
-    let group = network.add_group(raw_group("http"));
-    let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
+    let mut server = RawService::new(network.add_group(raw_group("http")));
+    let addr = bound_addr(server.listen(ephemeral()).unwrap());
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -126,24 +149,24 @@ fn http_get_smoke() {
     let deadline = Instant::now() + TIMEOUT;
 
     while Instant::now() < deadline && response_token.is_none() {
+        network.drive(Some(poll_slice()), &mut [&mut server]);
         let mut reply_to = None;
-        network.poll_with(|event| {
-            if let StreamEvent::Message { group: event_group, token, payload, .. } = event {
-                assert_eq!(event_group, group);
+        let leftovers = server.spin(usize::MAX, |event| match event {
+            RawEvent::Message { token, payload, .. } => {
                 request_bytes.extend_from_slice(payload);
                 if request_bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                     reply_to = Some(token);
                 }
             }
         });
+        assert!(!leftovers, "an unbounded drain leaves nothing behind");
         if let Some(token) = reply_to {
-            assert!(network.send_with(token, |buf| buf.extend_from_slice(response)));
+            assert!(server.send(token, response));
             response_token = Some(token);
         }
-        thread::sleep(Duration::from_millis(1));
     }
     let token = response_token.expect("HTTP request was not received");
-    assert!(network.disconnect(token));
+    assert!(server.disconnect(token));
 
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -153,8 +176,7 @@ fn http_get_smoke() {
             Ok(read) => received.extend_from_slice(&buffer[..read]),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 assert!(Instant::now() < deadline, "HTTP response did not reach EOF");
-                network.poll_with(|_| {});
-                thread::sleep(Duration::from_millis(1));
+                network.drive(Some(poll_slice()), &mut [&mut server]);
             }
             Err(err) => panic!("client read failed: {err}"),
         }
@@ -172,18 +194,18 @@ fn raw_outbound_connect() {
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     let mut network = StreamNetwork::default();
-    let group = network.add_group(ConnectionGroupConfig {
+    let mut client = RawService::new(network.add_group(ConnectionGroupConfig {
         name: "raw-client",
         framing: Framing::Raw,
         on_connect_msg: Some(hello.to_vec()),
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..ConnectionGroupConfig::default()
-    });
-    let token = network.connect(group, Endpoint::Tcp(addr));
+    }));
+    let token = client.connect(Endpoint::Tcp(addr));
     let mut peer = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && peer.is_none() {
-        network.poll_with(|_| {});
+        network.drive(Some(poll_slice()), &mut [&mut client]);
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(true).unwrap();
@@ -192,100 +214,80 @@ fn raw_outbound_connect() {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => panic!("accept failed: {err}"),
         }
-        thread::sleep(Duration::from_millis(1));
     }
     let mut peer = peer.expect("outbound connection was not accepted");
 
     let mut received = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && received.len() < hello.len() {
-        network.poll_with(|_| {});
+        network.drive(Some(poll_slice()), &mut [&mut client]);
         let mut buffer = [0; 128];
         match peer.read(&mut buffer) {
             Ok(read) => received.extend_from_slice(&buffer[..read]),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => panic!("peer read failed: {err}"),
         }
-        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(received, hello);
 
-    assert!(network.send_with(token, |buf| buf.extend_from_slice(message)));
+    assert!(client.send(token, message));
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && received.len() < hello.len() + message.len() {
-        network.poll_with(|_| {});
+        network.drive(Some(poll_slice()), &mut [&mut client]);
         let mut buffer = [0; 128];
         match peer.read(&mut buffer) {
             Ok(read) => received.extend_from_slice(&buffer[..read]),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => panic!("peer read failed: {err}"),
         }
-        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(received, [hello.as_slice(), message.as_slice()].concat());
 }
 
 #[test]
 fn framed_and_raw_coexist() {
-    let mut server = StreamNetwork::default();
-    let framed_server =
-        server.add_group(ConnectionGroupConfig { name: "framed-server", ..Default::default() });
-    let raw_server = server.add_group(raw_group("raw-server"));
-    let framed_addr = bound_addr(server.listen(framed_server, ephemeral()).unwrap());
-    let raw_addr = bound_addr(server.listen(raw_server, ephemeral()).unwrap());
+    let mut server_net = StreamNetwork::default();
+    let mut framed_server = RawService::new(
+        server_net.add_group(ConnectionGroupConfig { name: "framed-server", ..Default::default() }),
+    );
+    let mut raw_server = RawService::new(server_net.add_group(raw_group("raw-server")));
+    let framed_addr = bound_addr(framed_server.listen(ephemeral()).unwrap());
+    let raw_addr = bound_addr(raw_server.listen(ephemeral()).unwrap());
 
-    let mut framed_client = StreamNetwork::default();
-    let framed_client_group = framed_client.add_group(ConnectionGroupConfig {
+    let mut client_net = StreamNetwork::default();
+    let mut framed_client = RawService::new(client_net.add_group(ConnectionGroupConfig {
         name: "framed-client",
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..Default::default()
-    });
-    let framed_client_token =
-        framed_client.connect(framed_client_group, Endpoint::Tcp(framed_addr));
+    }));
+    let framed_client_token = framed_client.connect(Endpoint::Tcp(framed_addr));
     let mut raw_client = std::net::TcpStream::connect(raw_addr).unwrap();
     raw_client.set_nonblocking(true).unwrap();
     raw_client.write_all(b"raw").unwrap();
 
-    let mut framed_server_token = None;
-    let mut framed_connected = false;
     let mut framed_sent = false;
     let mut framed_reply = Vec::new();
     let mut raw_reply = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline &&
-        (framed_server_token.is_none() ||
-            !framed_connected ||
+        (framed_server.accepted().is_none() ||
+            !connected(&framed_client, framed_client_token) ||
             framed_reply != b"framed" ||
             raw_reply != b"raw")
     {
-        let mut echoes = Vec::new();
-        server.poll_with(|event| match event {
-            StreamEvent::Accepted { group, token, .. } if group == framed_server => {
-                framed_server_token = Some(token);
-            }
-            StreamEvent::Message { group, token, payload, .. }
-                if group == framed_server || group == raw_server =>
-            {
-                echoes.push((token, payload.to_vec()));
-            }
-            _ => {}
-        });
-        for (token, payload) in echoes {
-            assert!(server.send_with(token, |buf| buf.extend_from_slice(&payload)));
-        }
-        framed_client.poll_with(|event| match event {
-            StreamEvent::Connected { token, .. } => {
-                assert_eq!(token, framed_client_token);
-                framed_connected = true;
-            }
-            StreamEvent::Message { payload, .. } => framed_reply.extend_from_slice(payload),
-            _ => {}
-        });
-        if framed_connected && framed_server_token.is_some() && !framed_sent {
-            assert!(
-                framed_client
-                    .send_with(framed_client_token, |buf| buf.extend_from_slice(b"framed"))
-            );
+        // Each group echoes what its own connections sent, whichever framing
+        // that group speaks.
+        server_net.drive(Some(poll_slice()), &mut [&mut framed_server, &mut raw_server]);
+        echo(&mut framed_server);
+        echo(&mut raw_server);
+
+        client_net.drive(Some(poll_slice()), &mut [&mut framed_client]);
+        drain(&mut framed_client, &mut framed_reply);
+        if connected(&framed_client, framed_client_token) &&
+            framed_server.accepted().is_some() &&
+            !framed_sent
+        {
+            assert!(framed_client.send(framed_client_token, b"framed"));
             framed_sent = true;
         }
         let mut buffer = [0; 32];
@@ -294,7 +296,6 @@ fn framed_and_raw_coexist() {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => panic!("raw client read failed: {err}"),
         }
-        thread::sleep(Duration::from_millis(1));
     }
 
     assert_eq!(framed_reply, b"framed");
@@ -305,33 +306,26 @@ fn framed_and_raw_coexist() {
 fn raw_disconnect_when_drained_flushes_queue() {
     let payload = vec![0xA5; 8 * 1024 * 1024];
     let mut network = StreamNetwork::default();
-    let group = network.add_group(ConnectionGroupConfig {
+    let mut server = RawService::new(network.add_group(ConnectionGroupConfig {
         name: "raw-drain",
         framing: Framing::Raw,
         socket_buf_size: Some(1024),
         max_frame_size: payload.len(),
         ..ConnectionGroupConfig::default()
-    });
-    let addr = bound_addr(network.listen(group, ephemeral()).unwrap());
+    }));
+    let addr = bound_addr(server.listen(ephemeral()).unwrap());
 
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client.set_nonblocking(true).unwrap();
-    let mut token = None;
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && token.is_none() {
-        network.poll_with(|event| {
-            if let StreamEvent::Accepted { group: event_group, token: accepted, .. } = event {
-                assert_eq!(event_group, group);
-                token = Some(accepted);
-            }
-        });
-        thread::sleep(Duration::from_millis(1));
+    while Instant::now() < deadline && server.accepted().is_none() {
+        network.drive(Some(poll_slice()), &mut [&mut server]);
     }
-    let token = token.expect("raw connection was not accepted");
+    let token = server.accepted().expect("raw connection was not accepted");
 
-    assert!(network.send_with(token, |buf| buf.extend_from_slice(&payload)));
-    assert!(network.disconnect_when_drained(token));
-    assert!(!network.send_with(token, |buf| buf.extend_from_slice(b"late response")));
+    assert!(server.send(token, &payload));
+    assert!(server.disconnect_when_drained(token));
+    assert!(!server.send(token, b"late response"));
 
     let mut received = Vec::with_capacity(payload.len());
     let deadline = Instant::now() + TIMEOUT;
@@ -342,8 +336,7 @@ fn raw_disconnect_when_drained_flushes_queue() {
             Ok(read) => received.extend_from_slice(&buffer[..read]),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 assert!(Instant::now() < deadline, "raw response did not reach EOF");
-                network.poll_with(|_| {});
-                thread::sleep(Duration::from_millis(1));
+                network.drive(Some(poll_slice()), &mut [&mut server]);
             }
             Err(err) => panic!("client read failed: {err}"),
         }

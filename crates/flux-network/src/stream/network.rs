@@ -175,12 +175,11 @@ impl NetworkCore {
     }
 }
 
-/// The scheduler arms an obligation before the call that must honour it, and
-/// the group records having honoured it.
-const MAINTAIN_ARMED: usize = 1 << 0;
-const MAINTAIN_OBSERVED: usize = 1 << 1;
-const DEADLINE_OBSERVED: usize = 1 << 2;
-const DEADLINE_IS_SOME: usize = 1 << 3;
+/// The scheduler arms an obligation by clearing its bits before the call that
+/// must honour it, and the group sets them as it does.
+const MAINTAIN_OBSERVED: usize = 1 << 0;
+const DEADLINE_OBSERVED: usize = 1 << 1;
+const DEADLINE_IS_SOME: usize = 1 << 2;
 
 /// What a service reports to its network in place of the group it owns.
 ///
@@ -201,12 +200,7 @@ pub struct ConnectionGroupId {
 
 impl ConnectionGroupId {
     fn new(core: Arc<NetworkCore>, slot: usize) -> Self {
-        Self {
-            core,
-            slot,
-            flags: AtomicUsize::new(0),
-            deadline: AtomicU64::new(0),
-        }
+        Self { core, slot, flags: AtomicUsize::new(0), deadline: AtomicU64::new(0) }
     }
 
     /// Whether this identity belongs to the network holding `core`.
@@ -215,8 +209,14 @@ impl ConnectionGroupId {
     }
 
     /// Arms the maintenance obligation, clearing what the check will read.
+    ///
+    /// The plain store wipes the deadline bits too. That is safe by call
+    /// sequence: an arm's bits are consumed by the assert paired with it
+    /// inside the same scheduler entry point, so nothing a deadline fold set
+    /// is still live here. [`Self::arm_deadline`] masks instead, assuming
+    /// no ordering at all.
     fn arm_maintain(&self) {
-        self.flags.store(MAINTAIN_ARMED, Ordering::Relaxed);
+        self.flags.store(0, Ordering::Relaxed);
     }
 
     /// Records that the group ran its due transport work.
@@ -234,6 +234,10 @@ impl ConnectionGroupId {
     }
 
     /// Arms the deadline obligation, clearing what the check will read.
+    ///
+    /// Masked, unlike [`Self::arm_maintain`]: an External caller orders its
+    /// deadline fold and its tick as it likes, so this call leaves the
+    /// maintenance obligation's state alone.
     fn arm_deadline(&self) {
         self.flags.fetch_and(!(DEADLINE_OBSERVED | DEADLINE_IS_SOME), Ordering::Relaxed);
     }
@@ -271,7 +275,6 @@ impl ConnectionGroupId {
         }
     }
 }
-
 
 struct Listener {
     token: Token,
@@ -370,6 +373,10 @@ pub struct ConnectionGroup {
     listeners: Vec<Listener>,
     connections: Vec<Connection>,
     pending_disconnects: Vec<PendingDisconnect>,
+    /// The instant the pending-disconnect queue became non-empty: when its
+    /// delivery became due, stable until the queue drains. `Some` exactly
+    /// while the queue is non-empty.
+    disconnects_due: Option<Instant>,
     /// The frames of the send in progress, staged back to back as
     /// `[header][payload]` (raw-framed groups stage payloads only), written to
     /// the socket in one call. Grown to the largest batch this group has sent
@@ -390,6 +397,7 @@ impl ConnectionGroup {
             listeners: Vec::with_capacity(INITIAL_LISTENER_CAPACITY),
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             pending_disconnects: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
+            disconnects_due: None,
             send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
         }
     }
@@ -490,6 +498,7 @@ impl ConnectionGroup {
         }
         self.accepted = 0;
         self.pending_disconnects.clear();
+        self.disconnects_due = None;
     }
 
     /// Retries every outbound endpoint that is down if the group is due one,
@@ -509,26 +518,32 @@ impl ConnectionGroup {
     }
 
     /// The instant this group's transport needs a tick by: the next retry of
-    /// an outbound endpoint that is down, and immediately while a disconnect
-    /// is queued for delivery, so the poll cannot sleep across work the next
-    /// tick owes its service.
+    /// an outbound endpoint that is down, and the instant the queue of
+    /// undelivered disconnects became non-empty, so the poll cannot sleep
+    /// across work the next tick owes its service.
+    ///
+    /// Queued disconnects report the instant their delivery *became* due —
+    /// stable until the queue drains — never a fresh clock read: a fresh read
+    /// lands after the instant the caller folds this deadline against, and
+    /// mio rounds the resulting sub-millisecond timeout up to a whole
+    /// millisecond. The recorded instant keeps the timeout at exactly zero.
     ///
     /// Calling this is what satisfies the network's deadline audit, so a
     /// service folds it into the deadline it reports rather than skipping it
     /// when it has a nearer one of its own.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let mut next: Option<Instant> = None;
-        for connection in &self.connections {
-            if connection.endpoint.is_some() &&
-                matches!(connection.state, ConnectionState::Disconnected)
-            {
-                let fire = self.reconnector.next_fire();
-                next = Some(next.map_or(fire, |next: Instant| next.min(fire)));
-            }
-        }
-        if !self.pending_disconnects.is_empty() {
-            let now = Instant::now();
-            next = Some(next.map_or(now, |next: Instant| next.min(now)));
+        // Every down endpoint retries at the same group-wide fire, so the
+        // first one settles the reconnect half of the fold.
+        let mut next: Option<Instant> = self
+            .connections
+            .iter()
+            .any(|connection| {
+                connection.endpoint.is_some() &&
+                    matches!(connection.state, ConnectionState::Disconnected)
+            })
+            .then(|| self.reconnector.next_fire());
+        if let Some(due) = self.disconnects_due {
+            next = Some(next.map_or(due, |next: Instant| next.min(due)));
         }
         self.identity.observe_deadline(next);
         next
@@ -570,8 +585,7 @@ impl ConnectionGroup {
     {
         let token = event.token();
         let listener = self.listeners.iter().position(|listener| listener.token == token);
-        let connection =
-            self.connections.iter().position(|connection| connection.token == token);
+        let connection = self.connections.iter().position(|connection| connection.token == token);
         if listener.is_none() && connection.is_none() {
             return ReadinessOutcome::not_owned();
         }
@@ -865,8 +879,18 @@ impl ConnectionGroup {
             self.accepted -= 1;
         }
         if notify && was_connected {
-            self.pending_disconnects.push(event);
+            self.queue_disconnect(event);
         }
+    }
+
+    /// Queues one disconnect for delivery, recording — when the queue was
+    /// empty — the instant it became non-empty: when this work became due,
+    /// held stable until the queue drains.
+    fn queue_disconnect(&mut self, event: PendingDisconnect) {
+        if self.pending_disconnects.is_empty() {
+            self.disconnects_due = Some(Instant::now());
+        }
+        self.pending_disconnects.push(event);
     }
 
     fn drain_pending_disconnects<F>(&mut self, handler: &mut F)
@@ -876,6 +900,7 @@ impl ConnectionGroup {
         for event in self.pending_disconnects.drain(..) {
             handler(StreamEvent::Disconnected { token: event.token, peer: event.peer });
         }
+        self.disconnects_due = None;
     }
 
     /// The index of `token`'s connection when it can take a send right now:
@@ -1168,6 +1193,9 @@ impl ConnectionGroup {
             self.accepted -= 1;
         }
         self.pending_disconnects.retain(|event| event.token != token);
+        if self.pending_disconnects.is_empty() {
+            self.disconnects_due = None;
+        }
         true
     }
 }
@@ -1327,11 +1355,7 @@ impl StreamNetwork {
     /// An External-mode network owns no poll and refuses this call. Every open
     /// group must appear exactly once among `services`, and each service must
     /// reach its group's `maintain` and fold its group's deadline.
-    pub fn drive<S: Service>(
-        &mut self,
-        max_timeout: Option<Duration>,
-        services: &mut [S],
-    ) -> bool {
+    pub fn drive<S: Service>(&mut self, max_timeout: Option<Duration>, services: &mut [S]) -> bool {
         assert!(matches!(self.poll, PollMode::Owned { .. }), "{EXTERNAL_POLLS}");
         let now = Instant::now();
         self.validate(services);
@@ -1960,13 +1984,14 @@ mod tests {
         net::{Ipv4Addr, TcpListener, TcpStream as StdTcpStream},
     };
 
-    use flux_timing::Nanos;
-    use mio::{Poll, Token};
+    use flux_timing::{Instant, Nanos};
+    use mio::{Poll, Token, event::Event};
 
     use super::{
-        ByteQueue, ConnectionGroupConfig, DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE,
-        FramedStream, Peer, StreamState, TcpOptions, TransportStream, set_socket_buf_size,
-        write_frame_header,
+        ByteQueue, ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, FramedStream, Peer, PendingDisconnect,
+        ReadinessOutcome, Service, StreamNetwork, StreamState, TcpOptions, TransportStream,
+        set_socket_buf_size, write_frame_header,
     };
 
     #[test]
@@ -2077,5 +2102,49 @@ mod tests {
             StreamState::Disconnected
         );
         assert_eq!(stream.send_queue.len(), 8);
+    }
+
+    /// A service that is nothing but its group, for driving the scheduler's
+    /// private arithmetic against real transport state.
+    struct Leaf(ConnectionGroup);
+
+    impl Service for Leaf {
+        fn group_id(&self) -> &ConnectionGroupId {
+            self.0.group_id()
+        }
+
+        fn handle_event(&mut self, event: &Event) -> ReadinessOutcome {
+            self.0.handle_event(event, &mut |_| {})
+        }
+
+        fn tick(&mut self, now: Instant) -> bool {
+            self.0.maintain(now, &mut |_| {})
+        }
+
+        fn next_deadline(&self) -> Option<Instant> {
+            self.0.next_deadline()
+        }
+    }
+
+    /// A queued disconnect is due at the instant the queue became non-empty,
+    /// which is at or before any instant the caller later folds against, so
+    /// the poll timeout comes out exactly zero. A fresh clock read in its
+    /// place would land after the fold's instant, and mio would round the
+    /// sub-millisecond remainder up to a whole millisecond of sleep across
+    /// work the next tick already owes.
+    #[test]
+    fn queued_disconnect_yields_a_zero_poll_timeout() {
+        let mut net = StreamNetwork::default();
+        let mut leaf = Leaf(net.add_group(ConnectionGroupConfig::default()));
+        leaf.0.queue_disconnect(PendingDisconnect {
+            token: Token(0),
+            peer: Peer::Tcp((Ipv4Addr::LOCALHOST, 1).into()),
+        });
+
+        let episode = leaf.0.next_deadline();
+        assert_eq!(leaf.0.next_deadline(), episode, "the episode instant is stable across folds");
+
+        let t1 = Instant::now();
+        assert_eq!(StreamNetwork::poll_timeout(None, &[leaf], t1), Some(std::time::Duration::ZERO));
     }
 }

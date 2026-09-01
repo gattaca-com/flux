@@ -59,8 +59,8 @@ impl ReadinessOutcome {
 }
 
 /// What [`StreamNetwork`](super::StreamNetwork) calls on each service it
-/// schedules, in the order [`StreamNetwork::drive`](super::StreamNetwork::drive)
-/// fixes.
+/// schedules, in the order
+/// [`StreamNetwork::drive`](super::StreamNetwork::drive) fixes.
 ///
 /// A service owns exactly one [`ConnectionGroup`](super::ConnectionGroup),
 /// either directly or through a service it contains. Only the outermost one is

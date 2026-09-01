@@ -156,7 +156,7 @@ impl Client {
 
     fn pump(&mut self) {
         let Self { net, service, pulled, .. } = self;
-        net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
+        net.drive(Some(Duration::ZERO.into()), &mut [&mut *service]);
         while let Some(event) = service.next_event() {
             match event {
                 HttpEvent::Connected { .. } => pulled.push(Pulled::Connected),
@@ -171,7 +171,7 @@ impl Client {
     }
 
     fn request(&mut self, body: &[u8]) -> bool {
-        self.service.request(&mut self.net, self.token, "GET", "/", &[], body)
+        self.service.request(self.token, "GET", "/", &[], body)
     }
 }
 

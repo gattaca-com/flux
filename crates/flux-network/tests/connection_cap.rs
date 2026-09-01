@@ -1,6 +1,8 @@
 //! The per-group connection cap: which connections hold a place in it, and
 //! what a client that arrives at a full group sees.
 
+mod common;
+
 use std::{
     io::{self, Read, Write},
     net::Ipv4Addr,
@@ -8,12 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use common::{RawService, Record};
 use flux_network::{
     Token,
     http::{HttpConfig, HttpEvent, HttpService},
-    stream::{
-        ConnectionGroup, ConnectionGroupConfig, Endpoint, Framing, StreamEvent, StreamNetwork,
-    },
+    stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,61 +92,69 @@ fn read_available(client: &mut dyn Read, out: &mut Vec<u8>) -> bool {
     }
 }
 
-/// A network under test, and the lifecycle events it delivered.
+/// Whether a service has reported `token` connected.
+fn connected(service: &RawService, token: Token) -> bool {
+    service
+        .records()
+        .iter()
+        .any(|record| matches!(record, Record::Connected { token: at, .. } if *at == token))
+}
+
+/// A network under test, and the services owning the groups it created.
+///
+/// A group is named by the place its service holds here, which is what a test
+/// carries in place of the group it handed over.
 struct Server {
     network: StreamNetwork,
-    accepted: Vec<(ConnectionGroup, Token)>,
-    connected: Vec<Token>,
-    disconnected: Vec<Token>,
+    services: Vec<RawService>,
 }
 
 impl Server {
     fn new() -> Self {
-        Self {
-            network: StreamNetwork::default(),
-            accepted: Vec::new(),
-            connected: Vec::new(),
-            disconnected: Vec::new(),
-        }
+        Self { network: StreamNetwork::default(), services: Vec::new() }
     }
 
-    /// Adds a group and a listener for it, reporting the group and the
-    /// endpoint the listener bound.
-    fn listen(
-        &mut self,
-        config: ConnectionGroupConfig,
-        endpoint: &Endpoint,
-    ) -> (ConnectionGroup, Endpoint) {
-        let group = self.network.add_group(config);
-        let bound = self.network.listen(group, endpoint.clone()).unwrap();
-        (group, bound)
+    /// Adds a group with a listener and the service that owns it, reporting
+    /// which service holds it and the endpoint the listener bound.
+    fn listen(&mut self, config: ConnectionGroupConfig, endpoint: &Endpoint) -> (usize, Endpoint) {
+        let mut service = RawService::new(self.network.add_group(config));
+        let bound = service.listen(endpoint.clone()).unwrap();
+        self.services.push(service);
+        (self.services.len() - 1, bound)
     }
 
-    /// Runs one iteration of the network, recording what it delivers.
+    /// Runs one iteration of the network, which is what delivers to the
+    /// services the lifecycle events every assertion here reads.
     fn pump(&mut self) {
-        let Self { network, accepted, connected, disconnected } = self;
-        network.poll_with(|event| match event {
-            StreamEvent::Accepted { group, token, .. } => accepted.push((group, token)),
-            StreamEvent::Connected { token, .. } => connected.push(token),
-            StreamEvent::Disconnected { token, .. } => disconnected.push(token),
-            StreamEvent::Message { .. } => {}
-        });
+        self.network.drive(Some(flux_timing::Duration::ZERO), &mut self.services);
     }
 
-    fn accepted_in(&self, group: ConnectionGroup) -> Vec<Token> {
-        self.accepted
+    fn accepted_in(&self, group: usize) -> Vec<Token> {
+        self.services[group]
+            .records()
             .iter()
-            .filter(|(event_group, _)| *event_group == group)
-            .map(|(_, token)| *token)
+            .filter_map(|record| match record {
+                Record::Accepted { token, .. } => Some(*token),
+                _ => None,
+            })
             .collect()
     }
 
-    fn refused(&self, group: ConnectionGroup) -> u64 {
-        self.network.refused_connections(group)
+    fn refused(&self, group: usize) -> u64 {
+        self.services[group].refused_connections()
+    }
+
+    /// How many connections every group of this network has reported closed.
+    fn disconnects(&self) -> usize {
+        self.services
+            .iter()
+            .flat_map(|service| service.records())
+            .filter(|record| matches!(record, Record::Disconnected { .. }))
+            .count()
     }
 
     /// Pumps until `group` has accepted `count` connections.
-    fn wait_for_accepts(&mut self, group: ConnectionGroup, count: usize) -> Vec<Token> {
+    fn wait_for_accepts(&mut self, group: usize, count: usize) -> Vec<Token> {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline && self.accepted_in(group).len() < count {
             self.pump();
@@ -159,11 +168,11 @@ impl Server {
     /// Pumps until `count` connections have been reported closed.
     fn wait_for_disconnects(&mut self, count: usize) {
         let deadline = Instant::now() + TIMEOUT;
-        while Instant::now() < deadline && self.disconnected.len() < count {
+        while Instant::now() < deadline && self.disconnects() < count {
             self.pump();
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(self.disconnected.len(), count);
+        assert_eq!(self.disconnects(), count);
     }
 
     /// Asserts that the network closes `client` without sending it a byte.
@@ -234,8 +243,8 @@ fn a_draining_connection_holds_its_place(endpoint: &Endpoint) {
 
     let mut first = connect_client(endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
-    assert!(server.network.send_with(token, |out| out.extend_from_slice(&payload)));
-    assert!(server.network.disconnect_when_drained(token));
+    assert!(server.services[group].send(token, &payload));
+    assert!(server.services[group].disconnect_when_drained(token));
 
     // The peer reads none of the backlog, so the connection is still
     // draining when the next client arrives.
@@ -265,7 +274,7 @@ fn a_half_closed_connection_holds_its_place(endpoint: &Endpoint) {
 
     let mut first = connect_client(endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
-    assert!(server.network.shutdown_write_when_drained(token));
+    assert!(server.services[group].shutdown_write_when_drained(token));
     assert!(server.read_to_end_of_stream(&mut *first).is_empty());
 
     // The peer has read the end of the stream, and the connection is still
@@ -324,7 +333,7 @@ fn a_disconnected_connection_frees_its_place() {
 
     let _first = connect_client(&endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
-    assert!(server.network.disconnect(token));
+    assert!(server.services[group].disconnect(token));
     server.wait_for_disconnects(1);
 
     let _second = connect_client(&endpoint);
@@ -332,8 +341,9 @@ fn a_disconnected_connection_frees_its_place() {
     assert_eq!(server.refused(group), 0, "the group refused a client it had room for");
 }
 
-/// A removed connection leaves no [`StreamEvent::Disconnected`] behind, so the
-/// place it held is freed by the removal itself.
+/// A removed connection leaves no
+/// [`flux_network::stream::StreamEvent::Disconnected`] behind, so the place it
+/// held is freed by the removal itself.
 #[test]
 fn a_removed_connection_frees_its_place() {
     let mut server = Server::new();
@@ -341,12 +351,12 @@ fn a_removed_connection_frees_its_place() {
 
     let _first = connect_client(&endpoint);
     let token = server.wait_for_accepts(group, 1)[0];
-    assert!(server.network.remove(token));
+    assert!(server.services[group].remove(token));
 
     let _second = connect_client(&endpoint);
     server.wait_for_accepts(group, 2);
     assert_eq!(server.refused(group), 0, "the group refused a client it had room for");
-    assert!(server.disconnected.is_empty(), "a removed connection was reported closed");
+    assert_eq!(server.disconnects(), 0, "a removed connection was reported closed");
 }
 
 #[test]
@@ -373,7 +383,7 @@ fn two_listeners_of_one_group_share_its_cap() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = Server::new();
     let (group, tcp) = server.listen(capped_group("shared", 1), &ephemeral());
-    let unix = server.network.listen(group, Endpoint::Unix(dir.path().join("s"))).unwrap();
+    let unix = server.services[group].listen(Endpoint::Unix(dir.path().join("s"))).unwrap();
 
     let first = connect_client(&tcp);
     server.wait_for_accepts(group, 1);
@@ -404,14 +414,14 @@ fn an_outbound_endpoint_holds_no_place() {
 
     // The capped group holds an outbound endpoint of its own: a connection
     // it made rather than accepted, which the cap counts for nothing.
-    let outbound = server.network.connect(capped, remote_endpoint);
+    let outbound = server.services[capped].connect(remote_endpoint);
     server.wait_for_accepts(remote, 1);
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && !server.connected.contains(&outbound) {
+    while Instant::now() < deadline && !connected(&server.services[capped], outbound) {
         server.pump();
         thread::sleep(Duration::from_millis(1));
     }
-    assert!(server.connected.contains(&outbound), "the outbound endpoint never connected");
+    assert!(connected(&server.services[capped], outbound), "the outbound endpoint never connected");
 
     let _client = connect_client(&capped_endpoint);
     server.wait_for_accepts(capped, 1);
@@ -427,7 +437,7 @@ fn a_cap_of_zero_is_rejected() {
 /// One iteration of an HTTP server: drive the network, then answer every
 /// request pulled from the service.
 fn serve(network: &mut StreamNetwork, service: &mut HttpService) {
-    network.drive(Some(flux_timing::Duration::ZERO), &mut [&mut service]);
+    network.drive(Some(flux_timing::Duration::ZERO), &mut [&mut *service]);
     let mut requests = Vec::new();
     while let Some(event) = service.next_event() {
         if let HttpEvent::Request { token, .. } = event {
@@ -480,7 +490,7 @@ fn an_http_service_serves_its_clients_while_the_cap_refuses_another() {
         serve(&mut network, &mut service);
     }
     assert!(answer.is_empty(), "the refused client was answered: {answer:?}");
-    assert_eq!(network.refused_connections(group), 1);
+    assert_eq!(service.refused_connections(), 1);
 
     // The clients holding the cap are unaffected: they are still served.
     for (client, answer) in served.iter_mut().zip(&mut answers) {
@@ -503,7 +513,7 @@ fn an_http_service_serves_its_clients_while_the_cap_refuses_another() {
 /// One iteration of an HTTP server with nothing to answer, reporting whether
 /// the service accepted a client.
 fn drive_service(network: &mut StreamNetwork, service: &mut HttpService) -> bool {
-    network.drive(Some(flux_timing::Duration::ZERO), &mut [&mut service]);
+    network.drive(Some(flux_timing::Duration::ZERO), &mut [&mut *service]);
     let mut accepted = false;
     while let Some(event) = service.next_event() {
         accepted |= matches!(event, HttpEvent::Accepted { .. });
@@ -511,21 +521,21 @@ fn drive_service(network: &mut StreamNetwork, service: &mut HttpService) -> bool
     accepted
 }
 
-/// Closing a group empties it and hands it back reusable, so it listens again
-/// and admits a client: the places its connections held went with them.
-/// `HttpService::close` is the public way to close a group.
+/// The places a cap holds go with the group that held them: closing a group at
+/// its cap closes the connection filling it, and the peer reads the end of its
+/// stream. `HttpService::close` is the public way to close a group.
 #[test]
-fn a_closed_group_frees_the_places_it_held() {
-    let mut server = Server::new();
-    let group = server.network.add_group(capped_group("closed", 1));
-    let mut service = HttpService::new(&mut server.network, group, HttpConfig::default());
-    let endpoint = service.listen(&mut server.network, ephemeral()).unwrap();
+fn a_closed_group_lets_go_of_the_places_it_held() {
+    let mut network = StreamNetwork::default();
+    let group = network.add_group(capped_group("closed", 1));
+    let mut service = HttpService::new(group, HttpConfig::default());
+    let endpoint = service.listen(ephemeral()).unwrap();
 
-    let _first = connect_client(&endpoint);
+    let mut first = connect_client(&endpoint);
     let deadline = Instant::now() + TIMEOUT;
     let mut accepted = false;
     while Instant::now() < deadline && !accepted {
-        accepted = drive_service(&mut server.network, &mut service);
+        accepted = drive_service(&mut network, &mut service);
         thread::sleep(Duration::from_millis(1));
     }
     assert!(accepted, "the service never accepted a client");
@@ -536,15 +546,20 @@ fn a_closed_group_frees_the_places_it_held() {
     let deadline = Instant::now() + TIMEOUT;
     while !read_available(&mut *refused, &mut received) {
         assert!(Instant::now() < deadline, "the connection was not refused");
-        drive_service(&mut server.network, &mut service);
+        drive_service(&mut network, &mut service);
     }
     assert!(received.is_empty(), "a refused connection was sent bytes: {received:?}");
-    assert_eq!(server.refused(group), 1);
+    assert_eq!(service.refused_connections(), 1);
 
-    service.close(&mut server.network);
+    service.close(&mut network);
 
-    let reopened_endpoint = server.network.listen(group, ephemeral()).unwrap();
-    let _client = connect_client(&reopened_endpoint);
-    server.wait_for_accepts(group, 1);
-    assert_eq!(server.refused(group), 1, "the group refused a client it had room for");
+    // Nothing is left to drive: the connection that held the one place was
+    // closed with the group, and its peer sees that for itself.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut received = Vec::new();
+    while !read_available(&mut *first, &mut received) {
+        assert!(Instant::now() < deadline, "the closed group left its connection open");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(received.is_empty(), "the closed group answered its client: {received:?}");
 }

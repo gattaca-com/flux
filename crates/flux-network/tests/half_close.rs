@@ -1,6 +1,8 @@
 //! The write-side half-close: what the peer of a half-closed connection
 //! reads, and what still reaches the network afterwards.
 
+mod common;
+
 use std::{
     cell::Cell,
     io::{self, Read, Write},
@@ -9,9 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::stream::{
-    ConnectionGroup, ConnectionGroupConfig, Endpoint, Framing, StreamEvent, StreamNetwork,
-};
+use common::{RawEvent, RawService, Record};
+use flux_network::stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork};
 use mio::Token;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,34 +67,20 @@ fn raw_group(name: &'static str) -> ConnectionGroupConfig {
     ConnectionGroupConfig { name, framing: Framing::Raw, ..ConnectionGroupConfig::default() }
 }
 
-/// A listening network, the group its connections belong to, and the endpoint
-/// it bound: for a TCP request on port `0` that is where a client must dial.
+/// A listening network, the service owning the group its connections belong
+/// to, and the endpoint it bound: for a TCP request on port `0` that is where
+/// a client must dial.
 fn server(
     endpoint: &Endpoint,
     config: ConnectionGroupConfig,
-) -> (StreamNetwork, ConnectionGroup, Endpoint) {
+) -> (StreamNetwork, RawService, Endpoint) {
     let mut network = StreamNetwork::default();
-    let group = network.add_group(config);
-    let bound = network.listen(group, endpoint.clone()).unwrap();
-    (network, group, bound)
+    let mut service = RawService::new(network.add_group(config));
+    let bound = service.listen(endpoint.clone()).unwrap();
+    (network, service, bound)
 }
 
-fn wait_for_accept(network: &mut StreamNetwork, group: ConnectionGroup) -> Token {
-    let mut accepted = None;
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && accepted.is_none() {
-        network.poll_with(|event| {
-            if let StreamEvent::Accepted { group: event_group, token, .. } = event {
-                assert_eq!(event_group, group);
-                accepted = Some(token);
-            }
-        });
-        thread::sleep(Duration::from_millis(1));
-    }
-    accepted.expect("connection was not accepted")
-}
-
-/// What the network delivered while a test drove it.
+/// What the service delivered while a test drove it.
 #[derive(Default)]
 struct Events {
     messages: Vec<(Token, Vec<u8>)>,
@@ -103,32 +90,56 @@ struct Events {
 }
 
 impl Events {
-    /// Runs one iteration of the network, recording what it delivers.
-    fn pump(&mut self, network: &mut StreamNetwork) {
-        let Self { messages, accepted, connected, disconnected } = self;
-        network.poll_with(|event| match event {
-            StreamEvent::Message { token, payload, .. } => {
-                messages.push((token, payload.to_vec()));
+    /// Runs one iteration of the network, recording what its service
+    /// delivers.
+    fn pump(&mut self, network: &mut StreamNetwork, service: &mut RawService) {
+        network.drive(Some(Duration::ZERO.into()), &mut [&mut *service]);
+        self.collect(service);
+    }
+
+    /// Takes everything one service is holding: the lifecycle records it
+    /// pulled out of the transport, and the payloads awaiting a drain.
+    fn collect(&mut self, service: &mut RawService) {
+        for record in service.take_records() {
+            match record {
+                Record::Accepted { token, .. } => self.accepted.push(token),
+                Record::Connected { token, .. } => self.connected.push(token),
+                Record::Disconnected { token, .. } => self.disconnected.push(token),
             }
-            StreamEvent::Accepted { token, .. } => accepted.push(token),
-            StreamEvent::Connected { token, .. } => connected.push(token),
-            StreamEvent::Disconnected { token, .. } => disconnected.push(token),
+        }
+        let messages = &mut self.messages;
+        let left = service.spin(usize::MAX, |event| match event {
+            RawEvent::Message { token, payload, .. } => messages.push((token, payload.to_vec())),
         });
+        assert!(!left, "an unbounded drain left payloads behind");
     }
 
     /// Pumps until `done` holds, failing with `what` at the deadline.
     fn wait_until(
         &mut self,
         network: &mut StreamNetwork,
+        service: &mut RawService,
         done: impl Fn(&Self) -> bool,
         what: &str,
     ) {
         let deadline = Instant::now() + TIMEOUT;
         while !done(self) {
             assert!(Instant::now() < deadline, "{what}");
-            self.pump(network);
+            self.pump(network, service);
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Waits for one more connection to be accepted, and reports its token.
+    fn wait_for_accept(&mut self, network: &mut StreamNetwork, service: &mut RawService) -> Token {
+        let before = self.accepted.len();
+        self.wait_until(
+            network,
+            service,
+            |events| events.accepted.len() > before,
+            "connection was not accepted",
+        );
+        self.accepted[before]
     }
 
     /// The bytes one connection delivered, as its peer wrote them: a raw-framed
@@ -164,9 +175,10 @@ fn read_available(client: &mut dyn Read, out: &mut Vec<u8>) -> bool {
 }
 
 /// Reads the client to the end of the stream, driving the network and
-/// recording what it delivers meanwhile.
+/// recording what its service delivers meanwhile.
 fn read_to_end_of_stream(
     network: &mut StreamNetwork,
+    service: &mut RawService,
     client: &mut dyn Read,
     events: &mut Events,
 ) -> Vec<u8> {
@@ -177,7 +189,7 @@ fn read_to_end_of_stream(
             return received;
         }
         assert!(Instant::now() < deadline, "the peer did not see the end of the stream");
-        events.pump(network);
+        events.pump(network, service);
     }
 }
 
@@ -187,16 +199,16 @@ over_both_transports!(
     half_close_ends_the_stream_and_keeps_reading_unix
 );
 fn half_close_ends_the_stream_and_keeps_reading(endpoint: &Endpoint) {
-    let (mut network, group, bound) = server(endpoint, raw_group("half-close"));
+    let (mut network, mut service, bound) = server(endpoint, raw_group("half-close"));
     let endpoint = &bound;
     let mut client = connect_client(endpoint);
-    let token = wait_for_accept(&mut network, group);
+    let mut events = Events::default();
+    let token = events.wait_for_accept(&mut network, &mut service);
 
-    assert!(network.shutdown_write_when_drained(token));
+    assert!(service.shutdown_write_when_drained(token));
 
     // An empty queue shuts the write side there and then.
-    let mut events = Events::default();
-    let received = read_to_end_of_stream(&mut network, &mut client, &mut events);
+    let received = read_to_end_of_stream(&mut network, &mut service, &mut client, &mut events);
     assert!(received.is_empty(), "{received:?}");
 
     // The connection is still registered and readable, so what the peer
@@ -204,6 +216,7 @@ fn half_close_ends_the_stream_and_keeps_reading(endpoint: &Endpoint) {
     client.write_all(INBOUND).unwrap();
     events.wait_until(
         &mut network,
+        &mut service,
         |events| events.inbound_from(token) == INBOUND,
         "the inbound bytes did not arrive",
     );
@@ -213,6 +226,7 @@ fn half_close_ends_the_stream_and_keeps_reading(endpoint: &Endpoint) {
     drop(client);
     events.wait_until(
         &mut network,
+        &mut service,
         |events| !events.disconnected.is_empty(),
         "the peer's close was not reported",
     );
@@ -226,7 +240,7 @@ over_both_transports!(
 );
 fn queued_bytes_reach_the_peer_before_the_end_of_the_stream(endpoint: &Endpoint) {
     let payload = vec![0xA5; 4 * 1024 * 1024];
-    let (mut network, group, bound) = server(endpoint, ConnectionGroupConfig {
+    let (mut network, mut service, bound) = server(endpoint, ConnectionGroupConfig {
         socket_buf_size: Some(4096),
         max_frame_size: payload.len(),
         backlog_warn_bytes: None,
@@ -234,21 +248,21 @@ fn queued_bytes_reach_the_peer_before_the_end_of_the_stream(endpoint: &Endpoint)
     });
     let endpoint = &bound;
     let mut client = connect_client(endpoint);
-    let token = wait_for_accept(&mut network, group);
+    let mut events = Events::default();
+    let token = events.wait_for_accept(&mut network, &mut service);
 
-    assert!(network.send_with(token, |out| out.extend_from_slice(&payload)));
-    assert!(network.shutdown_write_when_drained(token));
+    assert!(service.send(token, &payload));
+    assert!(service.shutdown_write_when_drained(token));
 
     // The peer starts reading late, so the write side is asked to shut while
     // the bulk of the payload is still queued, and again while the queue
     // drains.
-    let mut events = Events::default();
     for _ in 0..10 {
-        events.pump(&mut network);
+        events.pump(&mut network, &mut service);
         thread::sleep(Duration::from_millis(1));
     }
 
-    let received = read_to_end_of_stream(&mut network, &mut client, &mut events);
+    let received = read_to_end_of_stream(&mut network, &mut service, &mut client, &mut events);
     assert_eq!(received.len(), payload.len(), "the end of the stream arrived early");
     assert!(received == payload, "the peer received bytes the network never sent");
     assert!(events.disconnected.is_empty(), "the drain ended the connection");
@@ -260,29 +274,33 @@ over_both_transports!(
     sends_after_the_half_close_are_refused_unix
 );
 fn sends_after_the_half_close_are_refused(endpoint: &Endpoint) {
-    let (mut network, group, bound) = server(endpoint, raw_group("half-close-send"));
+    let (mut network, mut service, bound) = server(endpoint, raw_group("half-close-send"));
     let endpoint = &bound;
     let mut client = connect_client(endpoint);
-    let token = wait_for_accept(&mut network, group);
+    let mut events = Events::default();
+    let token = events.wait_for_accept(&mut network, &mut service);
 
-    assert!(network.shutdown_write_when_drained(token));
+    assert!(service.shutdown_write_when_drained(token));
 
+    // The closure is the payload's only path onto the wire, so both calls go
+    // to the group the service owns: a refused send never serialises.
     let serialised = Cell::new(false);
-    assert!(!network.send_with(token, |out| {
+    let mut group = service.into_group();
+    assert!(!group.send_with(token, |out| {
         serialised.set(true);
         out.extend_from_slice(b"after the end of the stream");
     }));
     assert_eq!(
-        network.broadcast_with(group, |out| {
+        group.broadcast_with(|out| {
             serialised.set(true);
             out.extend_from_slice(b"after the end of the stream");
         }),
         0
     );
     assert!(!serialised.get(), "a refused send serialised its payload");
+    let mut service = RawService::new(group);
 
-    let mut events = Events::default();
-    let received = read_to_end_of_stream(&mut network, &mut client, &mut events);
+    let received = read_to_end_of_stream(&mut network, &mut service, &mut client, &mut events);
     assert!(received.is_empty(), "{received:?}");
     assert!(events.disconnected.is_empty(), "the refused send ended the connection");
 }
@@ -293,18 +311,19 @@ over_both_transports!(
     a_hard_close_after_the_half_close_ends_the_connection_unix
 );
 fn a_hard_close_after_the_half_close_ends_the_connection(endpoint: &Endpoint) {
-    let (mut network, group, bound) = server(endpoint, raw_group("half-close-hard"));
+    let (mut network, mut service, bound) = server(endpoint, raw_group("half-close-hard"));
     let endpoint = &bound;
     let mut client = connect_client(endpoint);
-    let token = wait_for_accept(&mut network, group);
-
-    assert!(network.shutdown_write_when_drained(token));
     let mut events = Events::default();
-    assert!(read_to_end_of_stream(&mut network, &mut client, &mut events).is_empty());
+    let token = events.wait_for_accept(&mut network, &mut service);
 
-    assert!(network.disconnect(token), "the half-closed connection was gone already");
+    assert!(service.shutdown_write_when_drained(token));
+    assert!(read_to_end_of_stream(&mut network, &mut service, &mut client, &mut events).is_empty());
+
+    assert!(service.disconnect(token), "the half-closed connection was gone already");
     events.wait_until(
         &mut network,
+        &mut service,
         |events| !events.disconnected.is_empty(),
         "the hard close was not reported",
     );
@@ -312,11 +331,11 @@ fn a_hard_close_after_the_half_close_ends_the_connection(endpoint: &Endpoint) {
 
     // The connection is gone: the token is unknown, and what the peer sends
     // reaches nobody.
-    assert!(!network.disconnect(token));
-    assert!(!network.shutdown_write_when_drained(token));
+    assert!(!service.disconnect(token));
+    assert!(!service.shutdown_write_when_drained(token));
     let _ = client.write_all(INBOUND);
     for _ in 0..50 {
-        events.pump(&mut network);
+        events.pump(&mut network, &mut service);
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(events.disconnected, [token]);
@@ -356,7 +375,7 @@ fn a_hard_close_asked_for_second_wins(endpoint: &Endpoint) {
 /// then the end of the stream, and the connection is gone.
 fn a_hard_close_wins(endpoint: &Endpoint, order: Order) {
     let payload = vec![0xC3; 4 * 1024 * 1024];
-    let (mut network, group, bound) = server(endpoint, ConnectionGroupConfig {
+    let (mut network, mut service, bound) = server(endpoint, ConnectionGroupConfig {
         socket_buf_size: Some(4096),
         max_frame_size: payload.len(),
         backlog_warn_bytes: None,
@@ -364,39 +383,40 @@ fn a_hard_close_wins(endpoint: &Endpoint, order: Order) {
     });
     let endpoint = &bound;
     let mut client = connect_client(endpoint);
-    let token = wait_for_accept(&mut network, group);
+    let mut events = Events::default();
+    let token = events.wait_for_accept(&mut network, &mut service);
 
     // Both closes are asked for while the queue holds the bulk of the
     // payload, so the drain is what decides between them.
-    assert!(network.send_with(token, |out| out.extend_from_slice(&payload)));
+    assert!(service.send(token, &payload));
     match order {
         Order::HardCloseFirst => {
-            assert!(network.disconnect_when_drained(token));
-            assert!(network.shutdown_write_when_drained(token));
+            assert!(service.disconnect_when_drained(token));
+            assert!(service.shutdown_write_when_drained(token));
         }
         Order::HalfCloseFirst => {
-            assert!(network.shutdown_write_when_drained(token));
-            assert!(network.disconnect_when_drained(token));
+            assert!(service.shutdown_write_when_drained(token));
+            assert!(service.disconnect_when_drained(token));
         }
     }
 
-    let mut events = Events::default();
-    let received = read_to_end_of_stream(&mut network, &mut client, &mut events);
+    let received = read_to_end_of_stream(&mut network, &mut service, &mut client, &mut events);
     assert_eq!(received.len(), payload.len(), "the end of the stream arrived early");
 
     events.wait_until(
         &mut network,
+        &mut service,
         |events| !events.disconnected.is_empty(),
         "the connection was half-closed instead of closed",
     );
     assert_eq!(events.disconnected, [token]);
-    assert!(!network.disconnect(token), "the connection outlived its hard close");
+    assert!(!service.disconnect(token), "the connection outlived its hard close");
 
     // The peer holds its own end of the connection open, and nothing more
     // reaches the network through it.
     let _ = client.write_all(INBOUND);
     for _ in 0..50 {
-        events.pump(&mut network);
+        events.pump(&mut network, &mut service);
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(events.disconnected, [token]);
@@ -409,25 +429,25 @@ over_both_transports!(
     a_broadcast_passes_over_a_half_closed_member_unix
 );
 fn a_broadcast_passes_over_a_half_closed_member(endpoint: &Endpoint) {
-    let (mut network, group, bound) = server(endpoint, raw_group("broadcast"));
+    let (mut network, mut service, bound) = server(endpoint, raw_group("broadcast"));
     let endpoint = &bound;
+    let mut events = Events::default();
     let mut open = connect_client(endpoint);
-    let open_token = wait_for_accept(&mut network, group);
+    let open_token = events.wait_for_accept(&mut network, &mut service);
     let mut shut = connect_client(endpoint);
-    let shut_token = wait_for_accept(&mut network, group);
+    let shut_token = events.wait_for_accept(&mut network, &mut service);
     assert_ne!(open_token, shut_token);
 
-    assert!(network.shutdown_write_when_drained(shut_token));
-    let mut events = Events::default();
-    assert!(read_to_end_of_stream(&mut network, &mut shut, &mut events).is_empty());
+    assert!(service.shutdown_write_when_drained(shut_token));
+    assert!(read_to_end_of_stream(&mut network, &mut service, &mut shut, &mut events).is_empty());
 
     // The half-closed member is not a recipient, and the group's other
     // connection is untouched by its being there.
-    assert_eq!(network.broadcast_with(group, |out| out.extend_from_slice(BROADCAST)), 1);
+    assert_eq!(service.broadcast(BROADCAST), 1);
     let mut received = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && received != BROADCAST {
-        events.pump(&mut network);
+        events.pump(&mut network, &mut service);
         read_available(&mut open, &mut received);
         thread::sleep(Duration::from_millis(1));
     }
@@ -441,6 +461,37 @@ fn a_broadcast_passes_over_a_half_closed_member(endpoint: &Endpoint) {
     assert!(late.is_empty(), "{late:?}");
 }
 
+/// One iteration of a network whose two groups have a service each, and
+/// everything the pair delivered.
+fn pump_pair(
+    network: &mut StreamNetwork,
+    listening: &mut RawService,
+    calling: &mut RawService,
+    events: &mut Events,
+) {
+    network.drive(Some(Duration::ZERO.into()), &mut [&mut *listening, &mut *calling]);
+    events.collect(listening);
+    events.collect(calling);
+}
+
+/// Pumps both services until `done` holds, failing with `what` at the
+/// deadline.
+fn wait_until_pair(
+    network: &mut StreamNetwork,
+    listening: &mut RawService,
+    calling: &mut RawService,
+    events: &mut Events,
+    done: impl Fn(&Events) -> bool,
+    what: &str,
+) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !done(events) {
+        assert!(Instant::now() < deadline, "{what}");
+        pump_pair(network, listening, calling, events);
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 over_both_transports!(
     a_reconnect_opens_the_write_side_again,
     a_reconnect_opens_the_write_side_again_tcp,
@@ -448,17 +499,21 @@ over_both_transports!(
 );
 fn a_reconnect_opens_the_write_side_again(endpoint: &Endpoint) {
     let mut network = StreamNetwork::default();
-    let server_group = network.add_group(raw_group("server"));
-    let client_group = network.add_group(ConnectionGroupConfig {
+    let mut listening = RawService::new(network.add_group(raw_group("server")));
+    let mut calling = RawService::new(network.add_group(ConnectionGroupConfig {
         reconnect_interval: flux_timing::Duration::from_millis(1),
         ..raw_group("client")
-    });
-    let bound = network.listen(server_group, endpoint.clone()).unwrap();
-    let outbound = network.connect(client_group, bound);
+    }));
+    let bound = listening.listen(endpoint.clone()).unwrap();
+    let outbound = calling.connect(bound);
 
+    // Both groups are open, so both services go to every iteration.
     let mut events = Events::default();
-    events.wait_until(
+    wait_until_pair(
         &mut network,
+        &mut listening,
+        &mut calling,
+        &mut events,
         |events| events.connected.contains(&outbound) && !events.accepted.is_empty(),
         "the outbound endpoint did not connect",
     );
@@ -466,9 +521,12 @@ fn a_reconnect_opens_the_write_side_again(endpoint: &Endpoint) {
     // The half-close ends this connection: the accepting side reads the end
     // of the stream and closes what is left of it, which the endpoint
     // answers by reconnecting.
-    assert!(network.shutdown_write_when_drained(outbound));
-    events.wait_until(
+    assert!(calling.shutdown_write_when_drained(outbound));
+    wait_until_pair(
         &mut network,
+        &mut listening,
+        &mut calling,
+        &mut events,
         |events| {
             events.disconnected.len() == 2 &&
                 events.connected.iter().filter(|token| **token == outbound).count() == 2 &&
@@ -480,9 +538,12 @@ fn a_reconnect_opens_the_write_side_again(endpoint: &Endpoint) {
     // The half-close belonged to the socket that is gone, so the endpoint
     // sends over its new one.
     let accepted = events.accepted[1];
-    assert!(network.send_with(outbound, |out| out.extend_from_slice(RECONNECTED)));
-    events.wait_until(
+    assert!(calling.send(outbound, RECONNECTED));
+    wait_until_pair(
         &mut network,
+        &mut listening,
+        &mut calling,
+        &mut events,
         |events| events.inbound_from(accepted) == RECONNECTED,
         "the payload did not reach the reconnected peer",
     );

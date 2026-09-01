@@ -6,11 +6,11 @@
 //! construction-time mode of the network.
 //!
 //! **Owned** — [`StreamNetwork::default`] — creates a poll of its own and
-//! drives it: one call per iteration, [`StreamNetwork::drive`], runs
-//! maintenance, folds every deadline, polls once, routes each event to the
-//! service owning its group and ticks each service. [`StreamNetwork::waker`]
-//! hands out a [`mio::Waker`] for that poll, on a reserved token whose wakes
-//! the loop swallows.
+//! drives it: one call per iteration, [`StreamNetwork::drive`], folds every
+//! deadline, polls once, routes each event to the service owning its group
+//! and ticks each service once. [`StreamNetwork::waker`] hands out a
+//! [`mio::Waker`] for that poll, on a reserved token whose wakes the loop
+//! swallows.
 //!
 //! **External** — [`StreamNetwork::with_registry`] — is built over a registry
 //! cloned from the caller's poll and a token base, and never polls. The
@@ -27,11 +27,11 @@
 //! [`StreamNetwork::drive`], an External one by the three calls — and asking a
 //! network for the other's panics.
 //!
-//! Both modes deliver readiness and maintenance events before ticking
-//! services. Owned runs maintenance before its poll; External handles the
-//! poll's events first and runs maintenance in [`StreamNetwork::tick`]. Their
-//! order across different connections may therefore differ and is not a
-//! correctness guarantee.
+//! Both modes run one tick per iteration, after readiness: a service runs its
+//! group's due transport work at the start of its tick and routes what that
+//! produces before its own timers, so protocol state never lags transport
+//! state by an iteration. Delivery order across different connections may
+//! differ between the modes and is not a correctness guarantee.
 //!
 //! ```no_run
 //! use flux_network::{
@@ -53,12 +53,12 @@
 //!     framing: Framing::Raw,
 //!     ..ConnectionGroupConfig::default()
 //! });
-//! let mut api = HttpService::new(&mut net, group, HttpConfig::default());
-//! api.listen(&mut net, Endpoint::Unix("/run/flux/api.sock".into()))?;
+//! let mut api = HttpService::new(group, HttpConfig::default());
+//! api.listen(Endpoint::Unix("/run/flux/api.sock".into()))?;
 //!
 //! let mut events = mio::Events::with_capacity(128);
 //! loop {
-//!     let mut services = [api.as_service()];
+//!     let mut services = [&mut api];
 //!     let timeout = net
 //!         .next_deadline(&services)
 //!         .map(|deadline| deadline.saturating_sub(Instant::now()).into());
@@ -66,17 +66,17 @@
 //!
 //!     let mut worked = false;
 //!     for event in &events {
-//!         let ours = net.handle_event(event, &mut services, |_| {});
+//!         let ours = net.handle_event(event, &mut services);
 //!         worked |= ours;
 //!         if !ours {
 //!             // A source of the caller's own: the waker, or a socket it
 //!             // registered on this poll itself.
 //!         }
 //!     }
-//!     worked |= net.tick(&mut services, |_| {});
+//!     worked |= net.tick(&mut services);
 //!     drop(services);
 //!
-//!     while let Some(event) = api.next_event(&mut net) {
+//!     while let Some(event) = api.next_event() {
 //!         if let HttpEvent::Request { request, responder, .. } = event {
 //!             responder.respond(200, &[], request.path.as_bytes());
 //!         }
@@ -99,8 +99,8 @@ mod transport;
 pub use connector::{PollEvent, SendBehavior, TcpConnector};
 pub use endpoint::{Endpoint, Peer};
 pub use network::{
-    ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Framing, StreamEvent,
-    StreamNetwork, TcpOptions,
+    ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Framing, StreamEvent, StreamNetwork,
+    TcpOptions,
 };
 pub use payload_buf::PayloadBuf;
 pub use service::{ReadinessOutcome, Service};
