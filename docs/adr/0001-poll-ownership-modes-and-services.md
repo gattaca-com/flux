@@ -87,8 +87,14 @@ audited through the group's identity at runtime, panicking on the first omission
   flight would otherwise never have that deadline folded). Dropping a service without closing
   it while the network is still driven is a programming error, and the next driver call reports
   it through that same validation, naming the group; at teardown, dropping services and network
-  together is harmless because nothing is driven afterwards. Omission is therefore never a
-  lifecycle state. Routing is a linear offer by group.
+  together is harmless because nothing is driven afterwards. Full validation makes one pass
+  over the supplied services for identity and liveness, plus a pairwise uniqueness check.
+  External `handle_event` repeats only the linear identity-and-liveness pass, so pairwise work
+  is not multiplied by readiness events. Successful validation does not scale with live
+  connections or historical group slots; only omission diagnostics walk the group table. A
+  foreign service is rejected before routing. A duplicate is rejected by that iteration's full
+  validation, which in External mode may follow the routed events of that iteration. Omission is
+  therefore never a lifecycle state. Routing is a linear offer by group.
 - A deadline is the earliest instant a tick of the scheduled service could progress work, and
   work already due reports the instant it *became* due — a queued disconnect its queue instant,
   a composer's undrained leftovers the tick instant the composer already held — never a fresh

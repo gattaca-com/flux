@@ -211,21 +211,25 @@ fn a_foreign_event_is_handed_back_before_the_services_are_checked() {
 
 #[test]
 #[should_panic(expected = "connection group 0 has no service")]
-fn an_own_event_is_checked_against_the_services_before_it_is_routed() {
+fn an_omitted_service_is_reported_within_its_iteration() {
     let mut ext = External::new();
     let (_http, addr) = served(&mut ext, HttpConfig::default());
     let _client = client_at(addr);
 
-    // The listener becomes readable on a token of the network's own, and the
-    // same empty slice is a configuration error that event reports.
+    // The listener becomes readable on a token of the network's own. Per
+    // event, only identity and liveness are checked, so the empty slice gets
+    // the event handed back as this network's with nothing to route it to;
+    // the iteration's tick is where the omission is a configuration error.
     let deadline = Instant::now() + TIMEOUT;
-    loop {
+    let mut handled = false;
+    while !handled {
         assert!(Instant::now() < deadline, "the listener never became readable");
         ext.poll.poll(&mut ext.events, Some(POLL_SLICE)).unwrap();
-        if let Some(event) = ext.events.iter().next() {
-            ext.net.handle_event(event, &mut [] as &mut [RawService]);
+        for event in &ext.events {
+            handled |= ext.net.handle_event(event, &mut [] as &mut [RawService]);
         }
     }
+    ext.net.tick(&mut [] as &mut [RawService]);
 }
 
 #[test]

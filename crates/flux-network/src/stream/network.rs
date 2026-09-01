@@ -655,11 +655,11 @@ impl ConnectionGroup {
 
     /// Offers one readiness event to this group.
     ///
-    /// A token this group does not hold produces
-    /// [`ReadinessOutcome::not_owned`], which lets the scheduler try the next
-    /// service. A token it holds is handled here, along with every disconnect
-    /// that handling it produced, and the outcome reports whether an event
-    /// reached `on_event`.
+    /// A token this group does not hold produces a not-owned
+    /// [`ReadinessOutcome`], which lets the scheduler try the next service. A
+    /// token it holds is handled here, along with every disconnect that
+    /// handling it produced, and the outcome reports whether an event reached
+    /// `on_event`.
     pub fn handle_event<F>(&mut self, event: &Event, on_event: &mut F) -> ReadinessOutcome
     where
         F: for<'a> FnMut(StreamEvent<'a>),
@@ -1516,16 +1516,20 @@ impl StreamNetwork {
     ///
     /// # Panics
     /// An Owned-mode network polls itself, and refuses this call. An event of
-    /// this network's validates `services` before it is routed, exactly as
-    /// [`Self::drive`] does; an event of the caller's is handed back without
-    /// looking at them, since [`Self::next_deadline`] and [`Self::tick`]
-    /// validate every iteration anyway.
+    /// this network's checks each supplied service's identity and liveness
+    /// before it is routed — a foreign or closed service is rejected per
+    /// event — while uniqueness and completeness cost a pairwise scan and run
+    /// only at iteration-level entry points, in [`Self::next_deadline`] and
+    /// [`Self::tick`]. A duplicate or an omitted service is rejected by that
+    /// iteration's full validation, which may follow the routed events of that
+    /// iteration. An event of the caller's is handed back without looking at
+    /// `services` at all.
     pub fn handle_event<S: Service>(&mut self, event: &Event, services: &mut [S]) -> bool {
         assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
         if !self.core.is_ours(event.token()) {
             return false;
         }
-        self.validate(services);
+        self.validate_each(services);
         route_ready(event, services);
         true
     }
@@ -1588,16 +1592,10 @@ impl StreamNetwork {
         worked
     }
 
-    /// Panics unless `services` names every open group exactly once, and each
-    /// of them belongs to this network.
-    ///
-    /// Costs one pass over `services`: each is checked local, open and
-    /// unique, after which the slice length against the open-slot count is
-    /// the completeness check. Slots close for good, so the table of every
-    /// slot ever created is walked only on the panic path, to name the
-    /// omitted group.
-    fn validate<S: Service>(&self, services: &[S]) {
-        for (position, service) in services.iter().enumerate() {
+    /// Panics unless each of `services` belongs to this network and its group
+    /// is open: the linear half of validation, cheap enough to run per event.
+    fn validate_each<S: Service>(&self, services: &[S]) {
+        for service in services {
             let id = service.group_id();
             assert!(
                 id.belongs_to(&self.core),
@@ -1609,6 +1607,22 @@ impl StreamNetwork {
                 "connection group {} is closed",
                 id.slot
             );
+        }
+    }
+
+    /// Panics unless `services` names every open group exactly once, and each
+    /// of them belongs to this network.
+    ///
+    /// The full form, run by [`Self::drive`], [`Self::next_deadline`] and
+    /// [`Self::tick`] but never per event: the linear checks, the pairwise
+    /// uniqueness scan, and then the slice length against the open-slot count
+    /// as the completeness check. Slots close for good, so the table of every
+    /// slot ever created is walked only on the panic path, to name the omitted
+    /// group.
+    fn validate<S: Service>(&self, services: &[S]) {
+        self.validate_each(services);
+        for (position, service) in services.iter().enumerate() {
+            let id = service.group_id();
             assert!(
                 services[..position].iter().all(|other| other.group_id().slot != id.slot),
                 "duplicate service for group {}",

@@ -5,6 +5,7 @@ mod common;
 
 use std::{
     cell::RefCell,
+    io::Write,
     net::{Ipv4Addr, SocketAddr, TcpStream},
     rc::Rc,
     time::{Duration as StdDuration, Instant as StdInstant},
@@ -159,6 +160,197 @@ fn an_external_tick_delivers_a_maintenance_disconnect_before_its_timers() {
         ["transport", "timers"],
         "one tick, transport routing first, timers second"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Readiness precedes the tick, and there is exactly one tick per iteration
+
+/// A leaf that logs every scheduling call made on it.
+struct CallLog {
+    group: ConnectionGroup,
+    log: Vec<&'static str>,
+}
+
+impl Service for CallLog {
+    fn group_id(&self) -> &ConnectionGroupId {
+        self.group.group_id()
+    }
+
+    fn handle_event(&mut self, event: &Event) -> ReadinessOutcome {
+        self.log.push("event");
+        self.group.handle_event(event, &mut |_| {})
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        let worked = self.group.maintain(now, &mut |_| {});
+        self.log.push("tick");
+        worked
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.group.next_deadline()
+    }
+}
+
+#[test]
+fn readiness_is_delivered_before_the_iterations_one_tick() {
+    let mut net = StreamNetwork::default();
+    let mut leaf = CallLog { group: net.add_group(raw_config("readiness-first")), log: Vec::new() };
+    let addr = bound_addr(leaf.group.listen(ephemeral()).unwrap());
+    let _client = client_at(addr);
+
+    // The connect is in flight, so some drive's poll returns its readiness;
+    // within that drive, every event precedes the single tick.
+    let deadline = StdInstant::now() + TIMEOUT;
+    loop {
+        assert!(StdInstant::now() < deadline, "the listener never became readable");
+        leaf.log.clear();
+        let _ = net.drive(Some(Duration::from_millis(1)), &mut [&mut leaf]);
+        if leaf.log.contains(&"event") {
+            break;
+        }
+    }
+    assert_eq!(leaf.log.last(), Some(&"tick"), "the tick follows readiness");
+    assert_eq!(
+        leaf.log.iter().filter(|call| **call == "tick").count(),
+        1,
+        "one iteration runs one tick"
+    );
+    assert!(
+        leaf.log[..leaf.log.len() - 1].iter().all(|call| *call == "event"),
+        "every event precedes the tick: {:?}",
+        leaf.log
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A composer's tick consumes lower events before its own timers
+
+/// A composer with an observable timer phase: its tick delegates, drains the
+/// leaf, and only then runs timers of its own, logging both phases.
+struct TimeredComposer {
+    lower: RawService,
+    log: Vec<&'static str>,
+}
+
+impl Service for TimeredComposer {
+    fn group_id(&self) -> &ConnectionGroupId {
+        self.lower.group_id()
+    }
+
+    fn handle_event(&mut self, event: &Event) -> ReadinessOutcome {
+        self.lower.handle_event(event)
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        let Self { lower, log } = self;
+        let worked = lower.tick(now);
+        let leftovers = lower.spin(usize::MAX, |event| match event {
+            common::RawEvent::Message { .. } => log.push("lower-event"),
+        });
+        assert!(!leftovers, "an unbounded drain leaves nothing");
+        log.push("timers");
+        worked
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.lower.next_deadline()
+    }
+}
+
+#[test]
+fn a_composers_tick_consumes_lower_events_before_its_timers() {
+    let mut net = StreamNetwork::default();
+    let mut raw = RawService::new(net.add_group(raw_config("timered")));
+    let addr = bound_addr(raw.listen(ephemeral()).unwrap());
+    let mut composer = TimeredComposer { lower: raw, log: Vec::new() };
+
+    let mut client = client_at(addr);
+    let deadline = StdInstant::now() + TIMEOUT;
+    while composer.lower.accepted().is_none() {
+        assert!(StdInstant::now() < deadline, "the client was never accepted");
+        let _ = net.drive(Some(Duration::from_millis(1)), &mut [&mut composer]);
+    }
+
+    client.write_all(b"payload").unwrap();
+    loop {
+        assert!(StdInstant::now() < deadline, "the payload never arrived");
+        composer.log.clear();
+        let _ = net.drive(Some(Duration::from_millis(1)), &mut [&mut composer]);
+        if composer.log.contains(&"lower-event") {
+            break;
+        }
+    }
+    assert_eq!(composer.log.last(), Some(&"timers"), "the timers close the tick");
+    assert!(
+        composer.log[..composer.log.len() - 1].iter().all(|call| *call == "lower-event"),
+        "every lower event is consumed before the timers run: {:?}",
+        composer.log
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Validation: a duplicate identity is presentable in safe code, and rejected
+
+/// A degenerate service that borrows an identity it does not own: the
+/// cheapest safe way to present one group twice. Its hooks are unreachable
+/// wherever full validation runs first.
+struct Alias<'a>(&'a ConnectionGroupId);
+
+impl Service for Alias<'_> {
+    fn group_id(&self) -> &ConnectionGroupId {
+        self.0
+    }
+
+    fn handle_event(&mut self, _: &Event) -> ReadinessOutcome {
+        unreachable!("a routable duplicate diverges: it cannot construct an outcome")
+    }
+
+    fn tick(&mut self, _: Instant) -> bool {
+        unreachable!("validation rejects the duplicate before any tick")
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        unreachable!("validation rejects the duplicate before any fold")
+    }
+}
+
+#[test]
+#[should_panic(expected = "duplicate service for group 0")]
+fn a_duplicate_identity_is_rejected_before_any_work() {
+    let poll = Poll::new().unwrap();
+    let mut net = StreamNetwork::with_registry(poll.registry().try_clone().unwrap(), TOKEN_BASE);
+    let group = net.add_group(raw_config("aliased"));
+
+    let _ = net.tick(&mut [Alias(group.group_id()), Alias(group.group_id())]);
+}
+
+/// The window the per-event linear check leaves open, pinned so a change is
+/// visible: `handle_event` checks identity and liveness per event and leaves
+/// the pairwise uniqueness scan to the once-per-iteration calls, so a
+/// duplicate can be offered an event first — where it diverges, because safe
+/// code cannot construct the outcome. This pins the documented rejection
+/// window, not a right to route duplicates; restoring full validation per
+/// event changes the panic back to "duplicate service" and fails this test.
+#[test]
+#[should_panic(expected = "a routable duplicate diverges")]
+fn an_events_linear_check_leaves_the_duplicate_for_the_iterations_validation() {
+    let mut poll = Poll::new().unwrap();
+    let mut net = StreamNetwork::with_registry(poll.registry().try_clone().unwrap(), TOKEN_BASE);
+    let mut group = net.add_group(raw_config("aliased"));
+    let addr = bound_addr(group.listen(ephemeral()).unwrap());
+    let _client = client_at(addr);
+
+    let mut events = Events::with_capacity(4);
+    let deadline = StdInstant::now() + TIMEOUT;
+    loop {
+        assert!(StdInstant::now() < deadline, "the listener never became readable");
+        poll.poll(&mut events, Some(StdDuration::from_millis(1))).unwrap();
+        for event in &events {
+            let _ =
+                net.handle_event(event, &mut [Alias(group.group_id()), Alias(group.group_id())]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
