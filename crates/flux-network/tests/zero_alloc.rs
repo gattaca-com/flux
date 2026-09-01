@@ -13,6 +13,8 @@
 //! open, and nothing the peers themselves do grows a buffer. The count is
 //! per-thread besides, which keeps the test harness's own thread out of it.
 
+mod common;
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
@@ -21,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use common::{RawService, RelayService};
 use flux_network::{
     Token,
     http::{HttpConfig, HttpEvent, HttpService},
@@ -286,5 +289,76 @@ fn a_warm_http_connection_allocates_nothing() {
     assert_eq!(
         outbound, 0,
         "making {ROUND_TRIPS} requests allocated {outbound} times, and must allocate none"
+    );
+}
+
+/// One echo through the composed chain: the client sends, the relay's drain
+/// answers through the scoped reply, and the client reads it all back.
+fn echo_one(
+    net: &mut StreamNetwork,
+    relay: &mut RelayService,
+    client: &mut TcpStream,
+    payload: &[u8],
+    buf: &mut [u8; 8192],
+    deadline: Instant,
+) {
+    let sent = client.write(payload).unwrap();
+    assert_eq!(sent, payload.len(), "the payload outgrew the socket buffer");
+    let mut read = 0;
+    while read < payload.len() {
+        assert!(Instant::now() < deadline, "the echo stalled");
+        let _ = net.drive(Some(Duration::ZERO.into()), &mut [&mut *relay]);
+        match client.read(buf) {
+            Ok(0) => panic!("the service closed the connection"),
+            Ok(count) => {
+                assert!(buf[..count].iter().all(|byte| *byte == 7), "the echoed bytes changed");
+                read += count;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => panic!("the client could not read: {err}"),
+        }
+    }
+    assert_eq!(read, payload.len(), "more came back than went out");
+}
+
+#[test]
+fn a_warm_composed_chain_allocates_nothing() {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut net = StreamNetwork::default();
+    let mut raw = RawService::new(net.add_group(ConnectionGroupConfig {
+        name: "composed-zero-alloc",
+        framing: Framing::Raw,
+        max_frame_size: usize::MAX,
+        backlog_warn_bytes: None,
+        ..ConnectionGroupConfig::default()
+    }));
+    let listening = raw.listen(Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into()));
+    let Endpoint::Tcp(addr) = listening.unwrap() else { unreachable!("a TCP listener") };
+    let mut relay = RelayService::new(raw, usize::MAX);
+
+    let mut client = TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    while relay.lower().accepted().is_none() {
+        assert!(Instant::now() < deadline, "the client was never accepted");
+        let _ = net.drive(Some(Duration::ZERO.into()), &mut [&mut relay]);
+    }
+
+    let payload = [7; 512];
+    let mut buf = [0; 8192];
+    for _ in 0..WARM_UP {
+        echo_one(&mut net, &mut relay, &mut client, &payload, &mut buf, deadline);
+    }
+
+    let before = allocations();
+    for _ in 0..ROUND_TRIPS {
+        echo_one(&mut net, &mut relay, &mut client, &payload, &mut buf, deadline);
+    }
+    let echoed = allocations() - before;
+
+    assert!(relay.echoed() as u64 >= WARM_UP + ROUND_TRIPS, "every payload was echoed");
+    assert_eq!(
+        echoed, 0,
+        "echoing {ROUND_TRIPS} payloads through the composed chain allocated {echoed} times, \
+         and must allocate none"
     );
 }

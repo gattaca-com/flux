@@ -99,10 +99,10 @@ mod transport;
 pub use connector::{PollEvent, SendBehavior, TcpConnector};
 pub use endpoint::{Endpoint, Peer};
 pub use network::{
-    ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Framing, StreamEvent, StreamNetwork,
-    TcpOptions,
+    ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Framing, ReadinessOutcome,
+    StreamEvent, StreamNetwork, TcpOptions,
 };
 pub use payload_buf::PayloadBuf;
-pub use service::{ReadinessOutcome, Service};
+pub use service::Service;
 pub(crate) use tcp_stream::set_socket_buf_size;
 pub use tcp_stream::{ConnState, TcpStream, TcpTelemetry};

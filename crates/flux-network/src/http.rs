@@ -852,8 +852,8 @@ impl HttpState {
     /// The next protocol event, parsed on demand from what the connection
     /// buffered.
     ///
-    /// The event borrows the service and the network until it is dropped, so a
-    /// handler reaches the network only through the event it was handed.
+    /// The event borrows the service until it is dropped, so a handler
+    /// reaches the connection only through the event it was handed.
     fn next_event<'a>(&'a mut self, group: &'a mut ConnectionGroup) -> Option<HttpEvent<'a>> {
         self.apply_bookkeeping();
         match self.plan(group)? {
@@ -1667,7 +1667,7 @@ impl HttpState {
                 // Until the transport has the whole answer there is nothing
                 // to cap: what bounds a connection still writing is its
                 // transport, as it is for one that is draining. Asking costs
-                // a walk of the network's connections, so only a linger that
+                // a walk of the group's connections, so only a linger that
                 // is still waiting on its answer asks.
                 let clock = match *clock {
                     Some(clock) => clock,

@@ -1,62 +1,11 @@
-//! The scheduling contract a service implements, and the readiness result only
-//! its connection group can produce.
+//! The scheduling contract a service implements. The readiness result only a
+//! service's connection group can produce lives with the group, in
+//! [`ReadinessOutcome`].
 
 use flux_timing::Instant;
 use mio::event::Event;
 
-use super::ConnectionGroupId;
-
-/// What offering one readiness event to a service produced.
-///
-/// Only [`ConnectionGroup::handle_event`](super::ConnectionGroup::handle_event)
-/// builds one, and the value is neither `Copy` nor `Clone`, so a service
-/// reaches a truthful outcome only by offering the event to the group it owns.
-/// A service containing another can pass the inner outcome through or widen
-/// its work with [`Self::or_worked`], and can do nothing else with it: the
-/// obligation to delegate readiness is the type, not a runtime check.
-#[must_use]
-pub struct ReadinessOutcome {
-    owned: bool,
-    worked: bool,
-}
-
-impl ReadinessOutcome {
-    /// The token is not one this group holds, so the scheduler tries the next
-    /// service.
-    pub(in crate::stream) fn not_owned() -> Self {
-        Self { owned: false, worked: false }
-    }
-
-    /// The token is this group's, and `worked` records whether handling it
-    /// emitted an event.
-    pub(in crate::stream) fn owned(worked: bool) -> Self {
-        Self { owned: true, worked }
-    }
-
-    /// Whether the event belonged to this service's group. The scheduler stops
-    /// routing an owned event.
-    pub fn is_owned(&self) -> bool {
-        self.owned
-    }
-
-    /// Whether handling the event produced observable work. Always false for
-    /// an event this service does not own.
-    pub fn worked(&self) -> bool {
-        self.owned && self.worked
-    }
-
-    /// Adds work a containing service found while consuming what the inner one
-    /// emitted.
-    ///
-    /// An outcome that is not owned stays not owned and gains no work, and
-    /// work already reported is never withdrawn.
-    pub fn or_worked(mut self, worked: bool) -> Self {
-        if self.owned {
-            self.worked |= worked;
-        }
-        self
-    }
-}
+use super::{ConnectionGroupId, ReadinessOutcome};
 
 /// What [`StreamNetwork`](super::StreamNetwork) calls on each service it
 /// schedules, in the order
@@ -78,9 +27,20 @@ impl ReadinessOutcome {
 /// into every [`Self::next_deadline`]. The network verifies both and panics on
 /// either omission. Readiness needs no check: a
 /// [`ReadinessOutcome`] comes from the group or not at all.
+///
+/// # Lifetime
+/// A service must not be used after the
+/// [`StreamNetwork`](super::StreamNetwork) that created its group is dropped:
+/// the group's registrations then reach no poll, so nothing readiness-driven
+/// happens again. Close a service first where its sockets matter; at process
+/// teardown, dropping services and network together is harmless.
 pub trait Service {
     /// The group this service owns, directly or through the service it
     /// contains.
+    ///
+    /// Side-effect-free and O(1), and stable for the service's whole life:
+    /// every call reports the same identity until a consuming close ends the
+    /// service. The scheduler calls this on every phase of every iteration.
     fn group_id(&self) -> &ConnectionGroupId;
 
     /// Offers one readiness event to this service.
@@ -92,7 +52,12 @@ pub trait Service {
     fn tick(&mut self, now: Instant) -> bool;
 
     /// The earliest transport or protocol deadline in this service, folded
-    /// from its group outward. Immediately due while a tick already owes work.
+    /// from its group outward.
+    ///
+    /// Only work a tick of this service can progress becomes immediately due,
+    /// and it reports the instant it *became* due, never a fresh clock read.
+    /// Work exposed upward for the caller to pull is the caller's to
+    /// schedule: it rides the did-work report and never alters the deadline.
     fn next_deadline(&self) -> Option<Instant>;
 }
 

@@ -13,7 +13,7 @@ use mio::{Events, Interest, Poll, Registry, Token, Waker, event::Event};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    Endpoint, PayloadBuf, Peer, ReadinessOutcome, Service, TcpTelemetry, set_socket_buf_size,
+    Endpoint, PayloadBuf, Peer, Service, TcpTelemetry, set_socket_buf_size,
     tcp_stream::{
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, frame_payload_len, write_frame_header,
         write_frame_len, write_frame_ts,
@@ -91,7 +91,7 @@ pub struct ConnectionGroupConfig {
     /// while the outbound endpoints and listeners of the group count for
     /// nothing. `None` sets no limit. At the cap, a pending connection is
     /// accepted and dropped where it stands, without registration, bytes or
-    /// an event, and counted by [`StreamNetwork::refused_connections`].
+    /// an event, and counted by [`ConnectionGroup::refused_connections`].
     pub max_connections: Option<usize>,
     /// Wire encoding used by this group.
     pub framing: Framing,
@@ -257,8 +257,9 @@ impl ConnectionGroupId {
         let flags = self.flags.load(Ordering::Relaxed);
         assert!(
             flags & DEADLINE_OBSERVED != 0,
-            "connection group {} reported a deadline without reaching \
-             ConnectionGroup::next_deadline: a leaf service folds it into its own",
+            "connection group {}'s service reported its deadline without reaching \
+             ConnectionGroup::next_deadline: a leaf service folds the group's deadline into its \
+             own",
             self.slot
         );
         if flags & DEADLINE_IS_SOME == 0 {
@@ -273,6 +274,69 @@ impl ConnectionGroupId {
                 self.slot, group.0, root
             ),
         }
+    }
+}
+
+/// What offering one readiness event to a service produced.
+///
+/// Only [`ConnectionGroup::handle_event`] builds one: the constructors are
+/// private to the group's own module, and the value is neither `Copy` nor
+/// `Clone`, so a service reaches a truthful outcome only by offering the
+/// event to the group it owns. A service containing another can pass the
+/// inner outcome through or widen its work with [`Self::or_worked`], and can
+/// do nothing else with it: the obligation to delegate readiness is the type,
+/// not a runtime check.
+///
+/// ```compile_fail
+/// // The constructors are private: a service cannot fabricate an outcome.
+/// let outcome = flux_network::stream::ReadinessOutcome::owned(true);
+/// ```
+///
+/// ```compile_fail
+/// // The fields are private too.
+/// let outcome = flux_network::stream::ReadinessOutcome { owned: true, worked: true };
+/// ```
+#[must_use]
+pub struct ReadinessOutcome {
+    owned: bool,
+    worked: bool,
+}
+
+impl ReadinessOutcome {
+    /// The token is not one this group holds, so the scheduler tries the next
+    /// service.
+    fn not_owned() -> Self {
+        Self { owned: false, worked: false }
+    }
+
+    /// The token is this group's, and `worked` records whether handling it
+    /// emitted an event.
+    fn owned(worked: bool) -> Self {
+        Self { owned: true, worked }
+    }
+
+    /// Whether the event belonged to this service's group. The scheduler stops
+    /// routing an owned event.
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
+
+    /// Whether handling the event produced observable work. Always false for
+    /// an event this service does not own.
+    pub fn worked(&self) -> bool {
+        self.owned && self.worked
+    }
+
+    /// Adds work a containing service found while consuming what the inner one
+    /// emitted.
+    ///
+    /// An outcome that is not owned stays not owned and gains no work, and
+    /// work already reported is never withdrawn.
+    pub fn or_worked(mut self, worked: bool) -> Self {
+        if self.owned {
+            self.worked |= worked;
+        }
+        self
     }
 }
 
@@ -303,8 +367,8 @@ struct Connection {
 }
 
 /// The write side of a connected socket: what the half-close requested
-/// through [`StreamNetwork::shutdown_write_when_drained`] is waiting for, and
-/// whether it has happened.
+/// through [`ConnectionGroup::shutdown_write_when_drained`] is waiting for,
+/// and whether it has happened.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WriteSide {
     /// Open, and carrying whatever the caller sends.
@@ -359,6 +423,21 @@ struct PendingDisconnect {
 /// [`Service::tick`] and routes the events it emits before running its own
 /// timers, and folds [`Self::next_deadline`] into the deadline it reports.
 /// [`StreamNetwork`] verifies both and panics on either omission.
+///
+/// ```compile_fail
+/// // A group has one owner: it is not Copy, so a move ends the old binding.
+/// let mut net = flux_network::stream::StreamNetwork::default();
+/// let group = net.add_group(flux_network::stream::ConnectionGroupConfig::default());
+/// let claimed = group;
+/// let duplicate = group;
+/// ```
+///
+/// ```compile_fail
+/// // Nor is it Clone.
+/// let mut net = flux_network::stream::StreamNetwork::default();
+/// let group = net.add_group(flux_network::stream::ConnectionGroupConfig::default());
+/// let duplicate = group.clone();
+/// ```
 pub struct ConnectionGroup {
     identity: ConnectionGroupId,
     config: ConnectionGroupConfig,
@@ -379,8 +458,10 @@ pub struct ConnectionGroup {
     disconnects_due: Option<Instant>,
     /// The frames of the send in progress, staged back to back as
     /// `[header][payload]` (raw-framed groups stage payloads only), written to
-    /// the socket in one call. Grown to the largest batch this group has sent
-    /// and never shrunk.
+    /// the socket in one call. 32 KiB up front, grown to the largest batch
+    /// this group has sent and never shrunk; the cost is per group, priced
+    /// against a group being one protocol's whole transport rather than one
+    /// connection.
     send_buffer: Vec<u8>,
 }
 
@@ -897,10 +978,12 @@ impl ConnectionGroup {
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
+        // Cleared before the loop: if the lending callback unwinds, `Drain`'s
+        // guard still empties the queue, and the flag must not outlive it.
+        self.disconnects_due = None;
         for event in self.pending_disconnects.drain(..) {
             handler(StreamEvent::Disconnected { token: event.token, peer: event.peer });
         }
-        self.disconnects_due = None;
     }
 
     /// The index of `token`'s connection when it can take a send right now:
@@ -1218,8 +1301,12 @@ pub struct StreamNetwork {
     core: Arc<NetworkCore>,
     /// Whether each group slot this network created is still open. Omission is
     /// not a lifecycle state: an open slot with no service in a scheduling
-    /// call is a configuration error, not an idle group.
+    /// call is a configuration error, not an idle group. Walked only on the
+    /// panic path, to name an omitted group.
     active_groups: Vec<bool>,
+    /// How many slots are open, so the completeness check costs one
+    /// comparison instead of a walk of every slot ever created.
+    active_count: usize,
 }
 
 /// Who owns the poll the network's sockets are registered with.
@@ -1253,6 +1340,7 @@ impl Default for StreamNetwork {
                 next_token: AtomicUsize::new(0),
             }),
             active_groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
+            active_count: 0,
         }
     }
 }
@@ -1287,6 +1375,7 @@ impl StreamNetwork {
                 next_token: AtomicUsize::new(token_base.0),
             }),
             active_groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
+            active_count: 0,
         }
     }
 
@@ -1320,6 +1409,7 @@ impl StreamNetwork {
         }
         let slot = self.active_groups.len();
         self.active_groups.push(true);
+        self.active_count += 1;
         ConnectionGroup::new(ConnectionGroupId::new(Arc::clone(&self.core), slot), config)
     }
 
@@ -1341,6 +1431,7 @@ impl StreamNetwork {
         assert!(self.active_groups[slot], "connection group {slot} is already closed");
         group.close();
         self.active_groups[slot] = false;
+        self.active_count -= 1;
     }
 
     /// Runs one iteration of an Owned-mode network: fold the deadlines, poll
@@ -1357,8 +1448,8 @@ impl StreamNetwork {
     /// reach its group's `maintain` and fold its group's deadline.
     pub fn drive<S: Service>(&mut self, max_timeout: Option<Duration>, services: &mut [S]) -> bool {
         assert!(matches!(self.poll, PollMode::Owned { .. }), "{EXTERNAL_POLLS}");
-        let now = Instant::now();
         self.validate(services);
+        let now = Instant::now();
 
         let timeout = Self::poll_timeout(max_timeout, services, now);
         let mut worked = false;
@@ -1499,6 +1590,12 @@ impl StreamNetwork {
 
     /// Panics unless `services` names every open group exactly once, and each
     /// of them belongs to this network.
+    ///
+    /// Costs one pass over `services`: each is checked local, open and
+    /// unique, after which the slice length against the open-slot count is
+    /// the completeness check. Slots close for good, so the table of every
+    /// slot ever created is walked only on the panic path, to name the
+    /// omitted group.
     fn validate<S: Service>(&self, services: &[S]) {
         for (position, service) in services.iter().enumerate() {
             let id = service.group_id();
@@ -1518,11 +1615,20 @@ impl StreamNetwork {
                 id.slot
             );
         }
-        for (slot, active) in self.active_groups.iter().enumerate() {
-            assert!(
-                !active || services.iter().any(|service| service.group_id().slot == slot),
-                "connection group {slot} has no service — pass every service, or close the group \
-                 before dropping it"
+        if services.len() != self.active_count {
+            // Unique open slots can only undercount, so some open group has
+            // no service; the walk exists to name it.
+            for (slot, active) in self.active_groups.iter().enumerate() {
+                assert!(
+                    !active || services.iter().any(|service| service.group_id().slot == slot),
+                    "connection group {slot} has no service — pass every service, or close the \
+                     group before dropping it"
+                );
+            }
+            unreachable!(
+                "{} services validated against {} open groups",
+                services.len(),
+                self.active_count
             );
         }
     }
@@ -1990,8 +2096,8 @@ mod tests {
     use super::{
         ByteQueue, ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId,
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, FramedStream, Peer, PendingDisconnect,
-        ReadinessOutcome, Service, StreamNetwork, StreamState, TcpOptions, TransportStream,
-        set_socket_buf_size, write_frame_header,
+        ReadinessOutcome, Service, StreamEvent, StreamNetwork, StreamState, TcpOptions,
+        TransportStream, set_socket_buf_size, write_frame_header,
     };
 
     #[test]
@@ -2146,5 +2252,28 @@ mod tests {
 
         let t1 = Instant::now();
         assert_eq!(StreamNetwork::poll_timeout(None, &[leaf], t1), Some(std::time::Duration::ZERO));
+    }
+
+    /// A lending callback that unwinds destroys the queued disconnects —
+    /// `Drain`'s guard empties the queue — and the due flag must not outlive
+    /// them: `Some` over an empty queue would report an immediately-due
+    /// deadline for work that no longer exists.
+    #[test]
+    fn an_unwinding_callback_does_not_leave_the_due_flag_armed() {
+        let mut net = StreamNetwork::default();
+        let mut group = net.add_group(ConnectionGroupConfig::default());
+        group.queue_disconnect(PendingDisconnect {
+            token: Token(0),
+            peer: Peer::Tcp((Ipv4Addr::LOCALHOST, 1).into()),
+        });
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut handler = |_: StreamEvent<'_>| panic!("the callback unwound");
+            let _ = group.maintain(Instant::now(), &mut handler);
+        }));
+        assert!(unwound.is_err(), "the callback's panic reached the caller");
+
+        assert!(group.pending_disconnects.is_empty(), "the drain guard empties the queue");
+        assert_eq!(group.next_deadline(), None, "no work is due over an empty queue");
     }
 }

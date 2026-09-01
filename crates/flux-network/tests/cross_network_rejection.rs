@@ -10,12 +10,14 @@
 //! go through the `ConnectionGroup` a service owns and take no network, so no
 //! call pairs a service with the wrong network's operations.
 
+use std::net::{Ipv4Addr, TcpStream};
+
 use flux_network::{
     http::{HttpConfig, HttpService},
-    stream::{ConnectionGroup, ConnectionGroupConfig, Framing, StreamNetwork},
+    stream::{ConnectionGroup, ConnectionGroupConfig, Endpoint, Framing, StreamNetwork},
 };
 use flux_timing::Duration;
-use mio::{Poll, Token};
+use mio::{Events, Poll, Token};
 
 /// The first group of `net`: slot 0, whichever network allocated it.
 fn first_group(net: &mut StreamNetwork, name: &'static str) -> ConnectionGroup {
@@ -50,6 +52,53 @@ fn an_external_fold_rejects_a_service_of_another_network() {
     let wrong_http = HttpService::new(first_group(&mut other_net, "other"), HttpConfig::default());
 
     let _ = external.next_deadline(&[wrong_http]);
+}
+
+#[test]
+#[should_panic(expected = "a service of another network was passed to this one")]
+fn an_external_tick_rejects_a_service_of_another_network() {
+    let poll = Poll::new().unwrap();
+    let mut external =
+        StreamNetwork::with_registry(poll.registry().try_clone().unwrap(), Token(1024));
+
+    let mut other_net = StreamNetwork::default();
+    let mut wrong_http =
+        HttpService::new(first_group(&mut other_net, "other"), HttpConfig::default());
+
+    let _ = external.tick(&mut [&mut wrong_http]);
+}
+
+#[test]
+#[should_panic(expected = "a service of another network was passed to this one")]
+fn an_external_event_rejects_a_service_of_another_network() {
+    let mut poll = Poll::new().unwrap();
+    let mut external =
+        StreamNetwork::with_registry(poll.registry().try_clone().unwrap(), Token(1024));
+    // A listener of the external network's own, so a readiness event arrives
+    // on a token the network recognises and validation is reached at all —
+    // a foreign token is handed back before the services are looked at.
+    let mut local = first_group(&mut external, "local");
+    let Endpoint::Tcp(addr) = local.listen(Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())).unwrap()
+    else {
+        unreachable!("a TCP listener")
+    };
+    let _client = TcpStream::connect(addr).unwrap();
+
+    let mut other_net = StreamNetwork::default();
+    let mut wrong_http =
+        HttpService::new(first_group(&mut other_net, "other"), HttpConfig::default());
+
+    let mut events = Events::with_capacity(4);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "the listener never became readable");
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(1))).unwrap();
+        for event in &events {
+            // The foreign service is checked before the event is routed, and
+            // before the omission of the listener's own service could be.
+            let _ = external.handle_event(event, &mut [&mut wrong_http]);
+        }
+    }
 }
 
 #[test]

@@ -101,11 +101,11 @@ audited through the group's identity at runtime, panicking on the first omission
   the audits hold the root to the leaf's obligations. A composer consumes the lower service's
   lending events through a bounded drain whose result — events remain undrained, `#[must_use]`
   — is what it folds into its deadline, at the tick instant that left them.
-- Response capability is offered only where a response is possible: `Request` and `Writable`
-  carry a `Responder` scoped to that connection, writing the body straight into the send
-  buffer; a request borrowed from the connection buffer is never copied to make a response
-  possible. Answering later by token remains available; a request is answered exactly once
-  and that is connection state, not caller choreography.
+- Response capability is offered only where a response is possible: `Request` carries a
+  `Responder` scoped to that connection, writing the body straight into the send buffer; a
+  request borrowed from the connection buffer is never copied to make a response possible.
+  Answering later by token remains available; a request is answered exactly once and that is
+  connection state, not caller choreography.
 - A pulled event borrows the service for as long as it lives, so a handler reaches the
   connection only through the `Responder` it was handed, and events cannot be stored or
   cloned. Parsed request metadata is kept as byte ranges owned by the service so that an
@@ -120,15 +120,18 @@ audited through the group's identity at runtime, panicking on the first omission
   tile a per-iteration work cap. A service's `tick` returns `true` while it has pullable protocol
   events — created by this tick or left un-pulled by a caller that stopped early — and
   `drive`, `handle_event` and the network's `tick` fold that with their own actions into one
-  did-work result, so a tile can honour the park contract without inspecting service internals
-  and never parks on outstanding work.
+  did-work result, so a tile that follows the default loop honours the park contract without
+  inspecting service internals and never parks on outstanding work; a tile that deliberately
+  defers pullable work parks only with a wake-up of its own arranged.
 - Configuration ownership follows the layers: stream transport and queue policy (socket
   options, reconnect interval, framing, backlog caps, connection cap) live on the ConnectionGroup;
   HTTP parsing and HTTP connection-state policy (head, body and header limits, idle timeout,
   linger caps, request deadline) live on the service; nothing varies per operation until a
   consumer demonstrates the need. A service takes ownership of a caller-created group and adds
   no transport settings of its own, so two services with different caps coexist because they
-  own different groups.
+  own different groups. Send-serialisation scratch follows the group: 32 KiB per group up
+  front, grown to the largest payload that group has sent and never shrunk — priced against a
+  group being one protocol's whole transport rather than one connection.
 - The park contract this serves: a tile registers the network's (Owned) or its own
   (External) `Waker` via `SpineAdapter::register_waker`, after which the tile runner stops
   parking on the Signal and the tile blocks in its poll; the Signal wakes the poll on spine

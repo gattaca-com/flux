@@ -2273,8 +2273,10 @@ fn dropping_a_service_and_its_network_together_is_harmless() {
     let mut http = HttpService::new(group, HttpConfig::default());
     http.listen(ephemeral()).unwrap();
     net.drive(Some(Duration::ZERO.into()), &mut [&mut http]);
-    drop(http);
+    // The network goes first: nothing is driven afterwards, so the service
+    // it leaves behind is inert, not an error.
     drop(net);
+    drop(http);
 }
 
 #[test]

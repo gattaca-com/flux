@@ -430,6 +430,23 @@ fn a_composer_folds_its_leftovers_at_the_tick_instant_it_holds() {
     assert_eq!(relay.echoed(), 3);
 }
 
+#[test]
+fn a_composed_service_closes_by_delegating_the_consuming_close() {
+    let mut ext = External::new();
+    let mut kept = RawService::new(ext.net.add_group(raw_group("kept")));
+    let _addr = bound_addr(kept.listen(ephemeral()).unwrap());
+    let relay = RelayService::new(RawService::new(ext.net.add_group(raw_group("closed"))), 1);
+
+    // The composed close is delegation the whole way down: the relay hands
+    // back its leaf, the leaf hands back its group, and removing the group
+    // is what ends the chain's life.
+    ext.net.remove_group(relay.into_lower().into_group());
+
+    // The closed slot asks for no service; the surviving one alone passes
+    // validation and carries on being scheduled.
+    assert!(!ext.iterate(&mut [&mut kept]), "an idle survivor reports no work");
+}
+
 // ---------------------------------------------------------------------------
 // Wakers
 
