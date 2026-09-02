@@ -409,10 +409,10 @@ fn a_composer_folds_its_leftovers_at_the_tick_instant_it_holds() {
     relay.lower_mut().push_inbound(accepted, b"two");
     relay.lower_mut().push_inbound(accepted, b"three");
     let first_tick = flux_timing::Instant::now();
-    assert!(relay.tick(first_tick), "three payloads awaited the drain");
+    assert!(relay.tick(first_tick).worked(), "three payloads awaited the drain");
     assert_eq!(relay.echoed(), 1, "the bound of one drained exactly one payload");
     assert_eq!(
-        relay.next_deadline(),
+        relay.next_deadline().instant(),
         Some(first_tick),
         "the folded instant is the tick instant the composer held"
     );
@@ -420,17 +420,17 @@ fn a_composer_folds_its_leftovers_at_the_tick_instant_it_holds() {
     // A later tick whose drain still leaves events records its own instant:
     // the deadline is that tick's `now`, not the first tick's.
     let second_tick = flux_timing::Instant::now();
-    assert!(relay.tick(second_tick), "the relay had work to report");
+    assert!(relay.tick(second_tick).worked(), "the relay had work to report");
     assert_eq!(relay.echoed(), 2, "the second tick drained the next payload");
     assert_eq!(
-        relay.next_deadline(),
+        relay.next_deadline().instant(),
         Some(second_tick),
         "each tick with leftovers re-records the instant it held"
     );
 
     // The tick that drains the last leftover clears the deadline with it.
-    assert!(relay.tick(flux_timing::Instant::now()), "the relay had work to report");
-    assert_eq!(relay.next_deadline(), None);
+    assert!(relay.tick(flux_timing::Instant::now()).worked(), "the relay had work to report");
+    assert_eq!(relay.next_deadline().instant(), None);
     assert_eq!(relay.echoed(), 3);
 }
 

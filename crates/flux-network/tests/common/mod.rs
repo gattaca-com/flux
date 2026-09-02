@@ -19,7 +19,8 @@ use std::io;
 use flux_network::{
     Token,
     stream::{
-        ConnectionGroup, ConnectionGroupId, Endpoint, Peer, ReadinessOutcome, Service, StreamEvent,
+        ConnectionGroup, ConnectionGroupId, Deadline, Endpoint, Peer, ReadinessOutcome, Service,
+        StreamEvent, TickOutcome,
     },
 };
 use flux_timing::Instant;
@@ -252,7 +253,7 @@ impl Service for RawService {
         group.handle_event(readiness, &mut on_event)
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         let Self { group, records, inbox, spare, .. } = self;
         let maintained = {
             let mut on_event =
@@ -262,11 +263,11 @@ impl Service for RawService {
         self.ticks += 1;
         // Payloads awaiting a drain are work this Service exposes upward:
         // they ride the did-work report, never the deadline.
-        maintained || self.pending() > 0
+        maintained.or_worked(self.pending() > 0)
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
-        earliest(self.group.next_deadline(), self.deadline)
+    fn next_deadline(&self) -> Deadline {
+        self.group.next_deadline().earliest(self.deadline)
     }
 }
 
@@ -360,27 +361,19 @@ impl Service for RelayService {
         outcome.or_worked(leftovers || self.unpulled > 0)
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         let lower = self.lower.tick(now);
         let leftovers = self.relay();
         self.lower_work_due = leftovers.then_some(now);
         // Payloads this relay exposes upward ride the did-work report.
-        lower || leftovers || self.unpulled > 0
+        lower.or_worked(leftovers || self.unpulled > 0)
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         // The deadline carries only work a tick of this Service can progress:
         // what the last tick's bounded drain left in the leaf, due at that
         // tick's own instant. Payloads exposed upward are the caller's to
         // pull, and ride the did-work report instead.
-        earliest(self.lower.next_deadline(), self.lower_work_due)
-    }
-}
-
-/// The earlier of two deadlines, either of which may be absent.
-fn earliest(one: Option<Instant>, two: Option<Instant>) -> Option<Instant> {
-    match (one, two) {
-        (Some(one), Some(two)) => Some(one.min(two)),
-        (one, two) => one.or(two),
+        self.lower.next_deadline().earliest(self.lower_work_due)
     }
 }

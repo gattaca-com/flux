@@ -16,8 +16,8 @@ use flux_network::{
     Token,
     http::{HttpConfig, HttpEvent, HttpService},
     stream::{
-        ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Endpoint, Framing,
-        ReadinessOutcome, Service, StreamEvent, StreamNetwork,
+        ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Deadline, Endpoint, Framing,
+        ReadinessOutcome, Service, StreamEvent, StreamNetwork, TickOutcome,
     },
 };
 use flux_timing::{Duration, Instant};
@@ -84,7 +84,7 @@ impl Service for PhaseLog {
         })
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         let Self { group, log, .. } = self;
         let worked = group.maintain(now, &mut |event| {
             if let StreamEvent::Disconnected { .. } = event {
@@ -95,7 +95,7 @@ impl Service for PhaseLog {
         worked
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         self.group.next_deadline()
     }
 }
@@ -181,13 +181,13 @@ impl Service for CallLog {
         self.group.handle_event(event, &mut |_| {})
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         let worked = self.group.maintain(now, &mut |_| {});
         self.log.push("tick");
         worked
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         self.group.next_deadline()
     }
 }
@@ -242,7 +242,7 @@ impl Service for TimeredComposer {
         self.lower.handle_event(event)
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         let Self { lower, log } = self;
         let worked = lower.tick(now);
         let leftovers = lower.spin(usize::MAX, |event| match event {
@@ -253,7 +253,7 @@ impl Service for TimeredComposer {
         worked
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         self.lower.next_deadline()
     }
 }
@@ -306,11 +306,11 @@ impl Service for Alias<'_> {
         unreachable!("a routable duplicate diverges: it cannot construct an outcome")
     }
 
-    fn tick(&mut self, _: Instant) -> bool {
+    fn tick(&mut self, _: Instant) -> TickOutcome {
         unreachable!("validation rejects the duplicate before any tick")
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         unreachable!("validation rejects the duplicate before any fold")
     }
 }
@@ -378,13 +378,13 @@ impl Service for Ordered {
         })
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         let worked = self.group.maintain(now, &mut |_| {});
         self.log.borrow_mut().push(self.name);
         worked
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         self.group.next_deadline()
     }
 }
@@ -442,12 +442,12 @@ impl Service for ClockLeaf {
         self.group.handle_event(event, &mut |_| {})
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         self.last_tick = Some(now);
         self.group.maintain(now, &mut |_| {})
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         self.group.next_deadline()
     }
 }
@@ -501,7 +501,7 @@ fn lower_work_stays_true_through_a_composer_that_adds_none() {
 
     // The disconnect is the lower tick's work; the relay again adds none.
     assert!(relay.lower_mut().disconnect(accepted));
-    assert!(relay.tick(Instant::now()), "the lower service's tick work was withdrawn");
+    assert!(relay.tick(Instant::now()).worked(), "the lower service's tick work was withdrawn");
 }
 
 // ---------------------------------------------------------------------------
@@ -568,14 +568,14 @@ impl Service for TileService {
         }
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         match self {
             Self::Http(http) => http.tick(now),
             Self::Raw(raw) => raw.tick(now),
         }
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         match self {
             Self::Http(http) => http.next_deadline(),
             Self::Raw(raw) => raw.next_deadline(),

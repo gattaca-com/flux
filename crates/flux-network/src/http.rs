@@ -104,8 +104,8 @@ use flux_timing::{Duration, Instant};
 use mio::{Token, event::Event};
 
 use crate::stream::{
-    ConnectionGroup, ConnectionGroupId, Endpoint, Framing, Peer, ReadinessOutcome, Service,
-    StreamEvent, StreamNetwork,
+    ConnectionGroup, ConnectionGroupId, Deadline, Endpoint, Framing, Peer, ReadinessOutcome,
+    Service, StreamEvent, StreamNetwork, TickOutcome,
 };
 
 /// The most headers one message may be parsed into, and the size of the fixed
@@ -1556,17 +1556,17 @@ impl Service for HttpService {
         group.handle_event(readiness, &mut on_event)
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         let Self { group, http } = self;
         let maintained = {
             let mut on_event = |event: StreamEvent<'_>| http.on_stream_event(&event);
             group.maintain(now, &mut on_event)
         };
-        maintained | http.protocol_tick(group, now)
+        maintained.or_worked(http.protocol_tick(group, now))
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
-        fold(self.group.next_deadline(), self.http.protocol_deadline())
+    fn next_deadline(&self) -> Deadline {
+        self.group.next_deadline().earliest(self.http.protocol_deadline())
     }
 }
 

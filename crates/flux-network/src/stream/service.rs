@@ -1,11 +1,11 @@
-//! The scheduling contract a service implements. The readiness result only a
-//! service's connection group can produce lives with the group, in
-//! [`ReadinessOutcome`].
+//! The scheduling contract a service implements. The three results only a
+//! service's connection group can produce live with the group:
+//! [`ReadinessOutcome`], [`TickOutcome`] and [`Deadline`].
 
 use flux_timing::Instant;
 use mio::event::Event;
 
-use super::{ConnectionGroupId, ReadinessOutcome};
+use super::{ConnectionGroupId, Deadline, ReadinessOutcome, TickOutcome};
 
 /// What [`StreamNetwork`](super::StreamNetwork) calls on each service it
 /// schedules, in the order
@@ -24,9 +24,10 @@ use super::{ConnectionGroupId, ReadinessOutcome};
 /// [`ConnectionGroup::maintain`](super::ConnectionGroup::maintain) at the start
 /// of every [`Self::tick`] and folds
 /// [`ConnectionGroup::next_deadline`](super::ConnectionGroup::next_deadline)
-/// into every [`Self::next_deadline`]. The network verifies both and panics on
-/// either omission. Readiness needs no check: a
-/// [`ReadinessOutcome`] comes from the group or not at all.
+/// into every [`Self::next_deadline`]. The return types carry both: a
+/// [`TickOutcome`], a [`Deadline`] and a [`ReadinessOutcome`] each come from
+/// the group or not at all, and a containing service can only pass them
+/// through, widen the work or bring the deadline forward.
 ///
 /// # Lifetime
 /// A service must not be used after the
@@ -47,18 +48,18 @@ pub trait Service {
     fn handle_event(&mut self, event: &Event) -> ReadinessOutcome;
 
     /// Runs the transport work and timers due now, once after readiness, from
-    /// the owned group outward. Reports whether anything happened, events left
-    /// unpulled from an earlier iteration included.
-    fn tick(&mut self, now: Instant) -> bool;
+    /// the owned group outward. The outcome reports whether anything happened,
+    /// events left unpulled from an earlier iteration included.
+    fn tick(&mut self, now: Instant) -> TickOutcome;
 
     /// The earliest transport or protocol deadline in this service, folded
-    /// from its group outward.
+    /// from its group outward with [`Deadline::earliest`].
     ///
     /// Only work a tick of this service can progress becomes immediately due,
     /// and it reports the instant it *became* due, never a fresh clock read.
     /// Work exposed upward for the caller to pull is the caller's to
     /// schedule: it rides the did-work report and never alters the deadline.
-    fn next_deadline(&self) -> Option<Instant>;
+    fn next_deadline(&self) -> Deadline;
 }
 
 /// Lets a slice of borrowed services go through the driver unchanged, without
@@ -72,11 +73,11 @@ impl<S: Service> Service for &mut S {
         (**self).handle_event(event)
     }
 
-    fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> TickOutcome {
         (**self).tick(now)
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Deadline {
         (**self).next_deadline()
     }
 }

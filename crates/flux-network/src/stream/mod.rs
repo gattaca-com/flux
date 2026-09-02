@@ -99,8 +99,8 @@ mod transport;
 pub use connector::{PollEvent, SendBehavior, TcpConnector};
 pub use endpoint::{Endpoint, Peer};
 pub use network::{
-    ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Framing, ReadinessOutcome,
-    StreamEvent, StreamNetwork, TcpOptions,
+    ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId, Deadline, Framing, ReadinessOutcome,
+    StreamEvent, StreamNetwork, TcpOptions, TickOutcome,
 };
 pub use payload_buf::PayloadBuf;
 pub use service::Service;

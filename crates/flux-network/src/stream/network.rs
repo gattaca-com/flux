@@ -3,7 +3,7 @@ use std::{
     net::Shutdown,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -175,105 +175,23 @@ impl NetworkCore {
     }
 }
 
-/// The scheduler arms an obligation by clearing its bits before the call that
-/// must honour it, and the group sets them as it does.
-const MAINTAIN_OBSERVED: usize = 1 << 0;
-const DEADLINE_OBSERVED: usize = 1 << 1;
-const DEADLINE_IS_SOME: usize = 1 << 2;
-
 /// What a service reports to its network in place of the group it owns.
 ///
 /// The identity says which network created the group and which of its slots
-/// the group holds; it carries no transport state and lends none. It also
-/// holds the private state through which [`StreamNetwork`] verifies that a
-/// scheduled service reached the group operations its cadence depends on.
+/// the group holds; it carries no transport state and lends none.
 pub struct ConnectionGroupId {
     core: Arc<NetworkCore>,
     slot: usize,
-    /// Which obligations are armed and which the group has honoured.
-    flags: AtomicUsize,
-    /// The deadline the group last reported, meaningful only alongside
-    /// [`DEADLINE_OBSERVED`]; absence is [`DEADLINE_IS_SOME`] being clear,
-    /// never a reserved instant.
-    deadline: AtomicU64,
 }
 
 impl ConnectionGroupId {
     fn new(core: Arc<NetworkCore>, slot: usize) -> Self {
-        Self { core, slot, flags: AtomicUsize::new(0), deadline: AtomicU64::new(0) }
+        Self { core, slot }
     }
 
     /// Whether this identity belongs to the network holding `core`.
     fn belongs_to(&self, core: &Arc<NetworkCore>) -> bool {
         Arc::ptr_eq(&self.core, core)
-    }
-
-    /// Arms the maintenance obligation, clearing what the check will read.
-    ///
-    /// The plain store wipes the deadline bits too. That is safe by call
-    /// sequence: an arm's bits are consumed by the assert paired with it
-    /// inside the same scheduler entry point, so nothing a deadline fold set
-    /// is still live here. [`Self::arm_deadline`] masks instead, assuming
-    /// no ordering at all.
-    fn arm_maintain(&self) {
-        self.flags.store(0, Ordering::Relaxed);
-    }
-
-    /// Records that the group ran its due transport work.
-    fn observe_maintain(&self) {
-        self.flags.fetch_or(MAINTAIN_OBSERVED, Ordering::Relaxed);
-    }
-
-    fn assert_maintained(&self) {
-        assert!(
-            self.flags.load(Ordering::Relaxed) & MAINTAIN_OBSERVED != 0,
-            "connection group {} ticked without reaching ConnectionGroup::maintain: a leaf \
-             service runs it at the start of its tick",
-            self.slot
-        );
-    }
-
-    /// Arms the deadline obligation, clearing what the check will read.
-    ///
-    /// Masked, unlike [`Self::arm_maintain`]: an External caller orders its
-    /// deadline fold and its tick as it likes, so this call leaves the
-    /// maintenance obligation's state alone.
-    fn arm_deadline(&self) {
-        self.flags.fetch_and(!(DEADLINE_OBSERVED | DEADLINE_IS_SOME), Ordering::Relaxed);
-    }
-
-    /// Records the transport deadline the group reported.
-    fn observe_deadline(&self, deadline: Option<Instant>) {
-        if let Some(deadline) = deadline {
-            self.deadline.store(deadline.0, Ordering::Relaxed);
-            self.flags.fetch_or(DEADLINE_OBSERVED | DEADLINE_IS_SOME, Ordering::Relaxed);
-        } else {
-            self.flags.fetch_or(DEADLINE_OBSERVED, Ordering::Relaxed);
-        }
-    }
-
-    /// Panics unless the root folded in the deadline its group reported.
-    fn assert_deadline_included(&self, root: Option<Instant>) {
-        let flags = self.flags.load(Ordering::Relaxed);
-        assert!(
-            flags & DEADLINE_OBSERVED != 0,
-            "connection group {}'s service reported its deadline without reaching \
-             ConnectionGroup::next_deadline: a leaf service folds the group's deadline into its \
-             own",
-            self.slot
-        );
-        if flags & DEADLINE_IS_SOME == 0 {
-            return;
-        }
-        let group = Instant(self.deadline.load(Ordering::Relaxed));
-        match root {
-            Some(root) if root <= group => {}
-            _ => panic!(
-                "connection group {} needs a tick by {} but its service reported {:?}: a \
-                 service folds its group's deadline into its own",
-                self.slot, group.0, root
-            ),
-        }
     }
 }
 
@@ -337,6 +255,102 @@ impl ReadinessOutcome {
             self.worked |= worked;
         }
         self
+    }
+}
+
+/// What one tick of a service produced.
+///
+/// Only [`ConnectionGroup::maintain`] builds one, and the value is neither
+/// `Copy` nor `Clone`, so a service's [`Service::tick`] can return an outcome
+/// only by running its group's due transport work inside that tick. A service
+/// containing another passes the inner outcome through or widens its work
+/// with [`Self::or_worked`], and can do nothing else with it.
+///
+/// ```compile_fail
+/// // A tick that never reaches ConnectionGroup::maintain has no outcome to
+/// // return: `false` is not a TickOutcome, and nothing but the group makes one.
+/// use flux_network::stream::{ConnectionGroup, ConnectionGroupId, ReadinessOutcome, Service};
+/// use flux_network::stream::{Deadline, TickOutcome};
+/// struct Leaf(ConnectionGroup);
+/// impl Service for Leaf {
+///     fn group_id(&self) -> &ConnectionGroupId { self.0.group_id() }
+///     fn handle_event(&mut self, e: &mio::event::Event) -> ReadinessOutcome {
+///         self.0.handle_event(e, &mut |_| {})
+///     }
+///     fn tick(&mut self, _now: flux_timing::Instant) -> TickOutcome { false }
+///     fn next_deadline(&self) -> Deadline { self.0.next_deadline() }
+/// }
+/// ```
+#[must_use]
+pub struct TickOutcome {
+    worked: bool,
+}
+
+impl TickOutcome {
+    fn new(worked: bool) -> Self {
+        Self { worked }
+    }
+
+    /// Whether the tick did anything: transport work ran, or the service has
+    /// events left to pull.
+    pub fn worked(&self) -> bool {
+        self.worked
+    }
+
+    /// Adds work a service found beyond its group's: protocol timers that
+    /// fired, or events it holds for its caller to pull. Work already reported
+    /// is never withdrawn.
+    pub fn or_worked(mut self, worked: bool) -> Self {
+        self.worked |= worked;
+        self
+    }
+}
+
+/// The instant a service needs a tick by, folded from its group outward.
+///
+/// Only [`ConnectionGroup::next_deadline`] builds one, and the value is
+/// neither `Copy` nor `Clone`, so a service's [`Service::next_deadline`] can
+/// report a deadline only by consulting its group's, and [`Self::earliest`]
+/// can only bring it forward: a root never reports later than the transport
+/// beneath it, and never `None` while the transport is due.
+///
+/// ```compile_fail
+/// // A deadline that skips the group does not exist: `None` is not a Deadline.
+/// use flux_network::stream::{ConnectionGroup, ConnectionGroupId, ReadinessOutcome, Service};
+/// use flux_network::stream::{Deadline, TickOutcome};
+/// struct Leaf(ConnectionGroup);
+/// impl Service for Leaf {
+///     fn group_id(&self) -> &ConnectionGroupId { self.0.group_id() }
+///     fn handle_event(&mut self, e: &mio::event::Event) -> ReadinessOutcome {
+///         self.0.handle_event(e, &mut |_| {})
+///     }
+///     fn tick(&mut self, now: flux_timing::Instant) -> TickOutcome { self.0.maintain(now, &mut |_| {}) }
+///     fn next_deadline(&self) -> Deadline { None }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // Nor can one be pushed later than the group's: there is no constructor
+/// // from an instant, and `earliest` is the only fold.
+/// let group_deadline: flux_network::stream::Deadline = unimplemented!();
+/// let later = flux_network::stream::Deadline(Some(flux_timing::Instant(u64::MAX)));
+/// ```
+#[must_use]
+pub struct Deadline(Option<Instant>);
+
+impl Deadline {
+    /// The earlier of this deadline and `at`: a service folds its own timers
+    /// in with this, and can only bring the result forward.
+    pub fn earliest(self, at: Option<Instant>) -> Self {
+        Self(match (self.0, at) {
+            (Some(this), Some(at)) => Some(this.min(at)),
+            (this, at) => this.or(at),
+        })
+    }
+
+    /// The instant itself, `None` when nothing is due.
+    pub fn instant(&self) -> Option<Instant> {
+        self.0
     }
 }
 
@@ -422,7 +436,8 @@ struct PendingDisconnect {
 /// A leaf service calls [`Self::maintain`] at the start of every
 /// [`Service::tick`] and routes the events it emits before running its own
 /// timers, and folds [`Self::next_deadline`] into the deadline it reports.
-/// [`StreamNetwork`] verifies both and panics on either omission.
+/// Both are the types: a [`TickOutcome`] and a [`Deadline`] come from the
+/// group or not at all.
 ///
 /// ```compile_fail
 /// // A group has one owner: it is not Copy, so a move ends the old binding.
@@ -609,10 +624,10 @@ impl ConnectionGroup {
     /// mio rounds the resulting sub-millisecond timeout up to a whole
     /// millisecond. The recorded instant keeps the timeout at exactly zero.
     ///
-    /// Calling this is what satisfies the network's deadline audit, so a
-    /// service folds it into the deadline it reports rather than skipping it
-    /// when it has a nearer one of its own.
-    pub fn next_deadline(&self) -> Option<Instant> {
+    /// The [`Deadline`] this returns is the only one a service can report, so
+    /// a nearer deadline of the service's own is folded in with
+    /// [`Deadline::earliest`] rather than reported in its place.
+    pub fn next_deadline(&self) -> Deadline {
         // Every down endpoint retries at the same group-wide fire, so the
         // first one settles the reconnect half of the fold.
         let mut next: Option<Instant> = self
@@ -626,8 +641,7 @@ impl ConnectionGroup {
         if let Some(due) = self.disconnects_due {
             next = Some(next.map_or(due, |next: Instant| next.min(due)));
         }
-        self.identity.observe_deadline(next);
-        next
+        Deadline(next)
     }
 
     /// Runs the transport work due now — queued disconnects and reconnect
@@ -636,11 +650,10 @@ impl ConnectionGroup {
     ///
     /// A leaf service calls this at the start of its [`Service::tick`] so
     /// transport state never lags its protocol state by an iteration.
-    pub fn maintain<F>(&mut self, now: Instant, on_event: &mut F) -> bool
+    pub fn maintain<F>(&mut self, now: Instant, on_event: &mut F) -> TickOutcome
     where
         F: for<'a> FnMut(StreamEvent<'a>),
     {
-        self.identity.observe_maintain();
         let mut worked = false;
         {
             let mut sink = |event: StreamEvent<'_>| {
@@ -650,7 +663,7 @@ impl ConnectionGroup {
             self.drain_pending_disconnects(&mut sink);
         }
         let reconnected = self.maybe_reconnect(now);
-        worked || reconnected
+        TickOutcome::new(worked || reconnected)
     }
 
     /// Offers one readiness event to this group.
@@ -1444,8 +1457,7 @@ impl StreamNetwork {
     ///
     /// # Panics
     /// An External-mode network owns no poll and refuses this call. Every open
-    /// group must appear exactly once among `services`, and each service must
-    /// reach its group's `maintain` and fold its group's deadline.
+    /// group must appear exactly once among `services`.
     pub fn drive<S: Service>(&mut self, max_timeout: Option<Duration>, services: &mut [S]) -> bool {
         assert!(matches!(self.poll, PollMode::Owned { .. }), "{EXTERNAL_POLLS}");
         self.validate(services);
@@ -1580,14 +1592,11 @@ impl StreamNetwork {
         Ok(waker)
     }
 
-    /// Ticks every service once, in slice order, verifying that each reached
-    /// its group's maintenance.
+    /// Ticks every service once, in slice order.
     fn tick_services<S: Service>(services: &mut [S], now: Instant) -> bool {
         let mut worked = false;
         for service in services.iter_mut() {
-            service.group_id().arm_maintain();
-            worked |= service.tick(now);
-            service.group_id().assert_maintained();
+            worked |= service.tick(now).worked();
         }
         worked
     }
@@ -1647,16 +1656,11 @@ impl StreamNetwork {
         }
     }
 
-    /// The earliest instant one of `services` needs a tick at, verifying that
-    /// each folded in the deadline its group reported.
+    /// The earliest instant one of `services` needs a tick at.
     fn fold_deadline<S: Service>(services: &[S]) -> Option<Instant> {
         let mut next: Option<Instant> = None;
         for service in services {
-            let id = service.group_id();
-            id.arm_deadline();
-            let deadline = service.next_deadline();
-            id.assert_deadline_included(deadline);
-            if let Some(deadline) = deadline {
+            if let Some(deadline) = service.next_deadline().instant() {
                 next = Some(next.map_or(deadline, |next: Instant| next.min(deadline)));
             }
         }
@@ -2109,9 +2113,9 @@ mod tests {
 
     use super::{
         ByteQueue, ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId,
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, FramedStream, Peer, PendingDisconnect,
-        ReadinessOutcome, Service, StreamEvent, StreamNetwork, StreamState, TcpOptions,
-        TransportStream, set_socket_buf_size, write_frame_header,
+        DEFAULT_TCP_USER_TIMEOUT_MS, Deadline, FRAME_HEADER_SIZE, FramedStream, Peer,
+        PendingDisconnect, ReadinessOutcome, Service, StreamEvent, StreamNetwork, StreamState,
+        TcpOptions, TickOutcome, TransportStream, set_socket_buf_size, write_frame_header,
     };
 
     #[test]
@@ -2237,11 +2241,11 @@ mod tests {
             self.0.handle_event(event, &mut |_| {})
         }
 
-        fn tick(&mut self, now: Instant) -> bool {
+        fn tick(&mut self, now: Instant) -> TickOutcome {
             self.0.maintain(now, &mut |_| {})
         }
 
-        fn next_deadline(&self) -> Option<Instant> {
+        fn next_deadline(&self) -> Deadline {
             self.0.next_deadline()
         }
     }
@@ -2261,8 +2265,13 @@ mod tests {
             peer: Peer::Tcp((Ipv4Addr::LOCALHOST, 1).into()),
         });
 
-        let episode = leaf.0.next_deadline();
-        assert_eq!(leaf.0.next_deadline(), episode, "the episode instant is stable across folds");
+        let episode = leaf.0.next_deadline().instant();
+        assert!(episode.is_some(), "a queued disconnect is due");
+        assert_eq!(
+            leaf.0.next_deadline().instant(),
+            episode,
+            "the episode instant is stable across folds"
+        );
 
         let t1 = Instant::now();
         assert_eq!(StreamNetwork::poll_timeout(None, &[leaf], t1), Some(std::time::Duration::ZERO));
@@ -2288,6 +2297,6 @@ mod tests {
         assert!(unwound.is_err(), "the callback's panic reached the caller");
 
         assert!(group.pending_disconnects.is_empty(), "the drain guard empties the queue");
-        assert_eq!(group.next_deadline(), None, "no work is due over an empty queue");
+        assert_eq!(group.next_deadline().instant(), None, "no work is due over an empty queue");
     }
 }
