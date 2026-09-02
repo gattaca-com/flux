@@ -572,6 +572,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "exp_QA3_staleness"
+version = "0.2.0"
+dependencies = [
+ "flux-network",
+ "flux-timing",
+ "mio",
+ "tempfile",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,24 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "exp_QA3_staleness"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# The package carries the exploration's exp_QA3_ prefix; the lib target is
+# snake_case so the crate name passes the workspace's warning gates.
+[lib]
+name = "exp_qa3_staleness"
+
+[dependencies]
+flux-network.workspace = true
+flux-timing.workspace = true
+mio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
