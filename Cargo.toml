@@ -16,6 +16,7 @@ members = [
   "crates/flux-versioned-types-macros",
   "crates/flux-versioned-types",
   "crates/exp_QA3_staleness",
+  "crates/exp_consumers",
 ]
 resolver = "3"
 

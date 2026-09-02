@@ -1,0 +1,16 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "exp_consumers"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flux-network.workspace = true
+flux-timing.workspace = true
+mio.workspace = true
+
+[lints]
+workspace = true
