@@ -10,7 +10,6 @@ version.workspace = true
 [dependencies]
 flux-network.workspace = true
 flux-timing.workspace = true
-mio.workspace = true
 
 [lints]
 workspace = true

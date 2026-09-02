@@ -1,24 +1,22 @@
 //! The overseer's headless `PostgreSQL` server: a raw byte stream, hard
 //! backpressure, fairness by round robin, and both close flavours.
 //!
-//! Raw framing hands the service read chunks without message boundaries; the
+//! Raw framing hands the tile read chunks without message boundaries; the
 //! protocol layer reassembles newline-terminated queries per connection. The
 //! backpressure is exactly the original's: a per-connection input cap the
-//! service enforces (fatal `54000`), and the group's hard `max_backlog_bytes`
-//! the *stack* enforces by disconnecting a peer that stops reading. At most
-//! one query is processed per iteration, round robin from the last served,
-//! and a reply chooses its close: `Immediate` cuts the connection where it
-//! stands, `Drained` lets the reply flush first.
+//! tile enforces (fatal `54000`), an output cap that cuts the connection
+//! immediately, and the group's hard `max_backlog_bytes` the *stack* enforces
+//! by disconnecting a peer that stops reading. At most one query is processed
+//! per iteration, round robin from the last served, and a reply chooses its
+//! close: `Immediate` cuts the connection where it stands, `Drained` lets the
+//! reply flush first. The leaf is `StreamService`; the connection table, the
+//! cursor and the caps are all tile state.
 
 use flux_network::{
     Token,
-    stream::{
-        ConnectionGroup, ConnectionGroupId, Deadline, ReadinessOutcome, Service, StreamEvent,
-        StreamNetwork, TickOutcome,
-    },
+    stream::{StreamEvent, StreamNetwork, StreamService},
 };
-use flux_timing::{Duration, Instant};
-use mio::event::Event;
+use flux_timing::Duration;
 
 /// How a reply wants its connection closed, if at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,73 +44,71 @@ struct Conn {
     failed: bool,
 }
 
-/// The server's leaf: raw chunks in, per-connection reassembly, replies and
-/// closes flushed after processing.
-pub struct PgService {
-    group: ConnectionGroup,
+/// The server tile: per-connection reassembly, replies and closes flushed
+/// after processing, one query per iteration.
+pub struct PgTile {
+    pub service: StreamService,
     conns: Vec<Conn>,
     cursor: usize,
     pub served: Vec<Token>,
 }
 
-impl PgService {
-    pub fn new(group: ConnectionGroup) -> Self {
-        Self { group, conns: Vec::new(), cursor: 0, served: Vec::new() }
+impl PgTile {
+    pub fn new(service: StreamService) -> Self {
+        Self { service, conns: Vec::new(), cursor: 0, served: Vec::new() }
     }
 
     pub fn connections(&self) -> usize {
         self.conns.len()
     }
 
-    /// The application's handle on the transport, for `listen`.
-    pub fn group_mut(&mut self) -> &mut ConnectionGroup {
-        &mut self.group
-    }
-
-    fn record(event: &StreamEvent<'_>, conns: &mut Vec<Conn>) {
-        match event {
-            StreamEvent::Accepted { token, .. } => {
-                let over_capacity = conns.len() >= MAX_CONNECTIONS;
-                let mut conn = Conn {
-                    token: *token,
-                    input: Vec::new(),
-                    output: Vec::new(),
-                    close: None,
-                    failed: false,
-                };
-                if over_capacity {
-                    conn.output.extend_from_slice(b"53300 too many connections\n");
-                    conn.close = Some(CloseMode::Drained);
-                    conn.failed = true;
+    /// Pulls the iteration's transport events into the connection table.
+    fn pull(&mut self) {
+        while let Some(event) = self.service.next_event() {
+            match event {
+                StreamEvent::Accepted { token, .. } => {
+                    let over_capacity = self.conns.len() >= MAX_CONNECTIONS;
+                    let mut conn = Conn {
+                        token,
+                        input: Vec::new(),
+                        output: Vec::new(),
+                        close: None,
+                        failed: false,
+                    };
+                    if over_capacity {
+                        conn.output.extend_from_slice(b"53300 too many connections\n");
+                        conn.close = Some(CloseMode::Drained);
+                        conn.failed = true;
+                    }
+                    self.conns.push(conn);
                 }
-                conns.push(conn);
-            }
-            StreamEvent::Message { token, payload, .. } => {
-                let Some(conn) = conns.iter_mut().find(|conn| conn.token == *token) else {
-                    return;
-                };
-                if conn.failed {
-                    return;
+                StreamEvent::Message { token, payload, .. } => {
+                    let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) else {
+                        continue;
+                    };
+                    if conn.failed {
+                        continue;
+                    }
+                    if conn.input.len() + payload.len() > MAX_INPUT {
+                        conn.output.extend_from_slice(b"54000 program limit exceeded\n");
+                        conn.close = Some(CloseMode::Drained);
+                        conn.failed = true;
+                        conn.input.clear();
+                    } else {
+                        conn.input.extend_from_slice(payload);
+                    }
                 }
-                if conn.input.len() + payload.len() > MAX_INPUT {
-                    conn.output.extend_from_slice(b"54000 program limit exceeded\n");
-                    conn.close = Some(CloseMode::Drained);
-                    conn.failed = true;
-                    conn.input.clear();
-                } else {
-                    conn.input.extend_from_slice(payload);
+                StreamEvent::Disconnected { token, .. } => {
+                    self.conns.retain(|conn| conn.token != token);
                 }
+                StreamEvent::Connected { .. } => unreachable!("this group only listens"),
             }
-            StreamEvent::Disconnected { token, .. } => {
-                conns.retain(|conn| conn.token != *token);
-            }
-            StreamEvent::Connected { .. } => unreachable!("this group only listens"),
         }
     }
 
     /// Processes at most one complete query, round robin from the connection
     /// after the last one served.
-    pub fn process_one(&mut self, execute: impl FnOnce(&[u8]) -> (Vec<u8>, Option<CloseMode>)) {
+    fn process_one(&mut self, execute: impl FnOnce(&[u8]) -> (Vec<u8>, Option<CloseMode>)) {
         let count = self.conns.len();
         if count == 0 {
             return;
@@ -140,25 +136,24 @@ impl PgService {
     /// [`MAX_OUTPUT`] makes the close `Immediate` first, a refused send
     /// becomes `Immediate`, then `Immediate` disconnects where the connection
     /// stands and `Drained` lets the reply out first.
-    pub fn flush(&mut self) {
-        let Self { group, conns, .. } = self;
-        for conn in conns.iter_mut() {
+    fn flush(&mut self) {
+        for conn in &mut self.conns {
             if conn.output.len() > MAX_OUTPUT {
                 conn.close = Some(CloseMode::Immediate);
             }
             if !conn.output.is_empty() {
                 let output = std::mem::take(&mut conn.output);
-                if !group.send_with(conn.token, |buf| buf.extend_from_slice(&output)) {
+                if !self.service.send_with(conn.token, |buf| buf.extend_from_slice(&output)) {
                     conn.close = Some(CloseMode::Immediate);
                 }
             }
             match conn.close.take() {
                 Some(CloseMode::Immediate) => {
-                    let _ = group.disconnect(conn.token);
+                    let _ = self.service.disconnect(conn.token);
                     conn.failed = true;
                 }
                 Some(CloseMode::Drained) => {
-                    let _ = group.disconnect_when_drained(conn.token);
+                    let _ = self.service.disconnect_when_drained(conn.token);
                     conn.failed = true;
                 }
                 None => {}
@@ -166,35 +161,17 @@ impl PgService {
         }
     }
 
-    /// One server iteration: the network pass, one query, the flush.
+    /// One server iteration: the network pass, the pull, one query, the
+    /// flush.
     pub fn step(
         &mut self,
         net: &mut StreamNetwork,
         execute: impl FnOnce(&[u8]) -> (Vec<u8>, Option<CloseMode>),
     ) {
-        let _ = net.drive(Some(Duration::ZERO), std::slice::from_mut(self));
+        let _ = net.drive(Some(Duration::ZERO), std::slice::from_mut(&mut self.service));
+        self.pull();
         self.process_one(execute);
         self.flush();
-    }
-}
-
-impl Service for PgService {
-    fn group_id(&self) -> &ConnectionGroupId {
-        self.group.group_id()
-    }
-
-    fn handle_event(&mut self, event: &Event) -> ReadinessOutcome {
-        let Self { group, conns, .. } = self;
-        group.handle_event(event, &mut |event| Self::record(&event, conns))
-    }
-
-    fn tick(&mut self, now: Instant) -> TickOutcome {
-        let Self { group, conns, .. } = self;
-        group.maintain(now, &mut |event| Self::record(&event, conns))
-    }
-
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline()
     }
 }
 
@@ -205,9 +182,9 @@ mod tests {
         net::TcpStream,
     };
 
-    use flux_network::stream::{ConnectionGroupConfig, Framing, StreamNetwork};
+    use flux_network::stream::{ConnectionGroupConfig, Framing, StreamNetwork, StreamService};
 
-    use super::{CloseMode, PgService};
+    use super::{CloseMode, PgTile};
     use crate::harness::{bound_addr, ephemeral, expired};
 
     /// The test's `execute`: ping/quit/die/flood, as the close and
@@ -223,9 +200,9 @@ mod tests {
         }
     }
 
-    fn raw_server(max_backlog: Option<usize>) -> (StreamNetwork, PgService, std::net::SocketAddr) {
+    fn raw_server(max_backlog: Option<usize>) -> (StreamNetwork, PgTile, std::net::SocketAddr) {
         let mut net = StreamNetwork::default();
-        let mut service = PgService::new(net.add_group(ConnectionGroupConfig {
+        let mut service = StreamService::new(net.add_group(ConnectionGroupConfig {
             name: "postgres",
             framing: Framing::Raw,
             max_frame_size: 128 * 1024,
@@ -234,8 +211,8 @@ mod tests {
             socket_buf_size: Some(4096),
             ..ConnectionGroupConfig::default()
         }));
-        let addr = bound_addr(&service.group_mut().listen(ephemeral()).unwrap());
-        (net, service, addr)
+        let addr = bound_addr(&service.listen(ephemeral()).unwrap());
+        (net, PgTile::new(service), addr)
     }
 
     fn read_available(stream: &mut TcpStream, into: &mut Vec<u8>) -> bool {
@@ -347,7 +324,7 @@ mod tests {
 
         // The megaflood reply exceeds MAX_OUTPUT, so the flush marks the
         // close Immediate before anything else: the connection is cut and the
-        // service forgets it.
+        // tile forgets it.
         alice.write_all(b"megaflood\n").unwrap();
         while server.connections() > 0 || server.served.is_empty() {
             assert!(!expired(started), "the output cap never fired");
@@ -370,7 +347,7 @@ mod tests {
 
         // The flood reply is 64 KiB against an 8 KiB backlog cap and a client
         // that never reads: the stack disconnects the peer rather than queue
-        // past the cap, and the service sees the Disconnected like any other.
+        // past the cap, and the tile sees the Disconnected like any other.
         alice.write_all(b"flood\n").unwrap();
         while server.connections() > 0 || server.served.is_empty() {
             assert!(!expired(started), "the backlog cap never fired");

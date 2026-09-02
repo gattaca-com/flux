@@ -587,7 +587,6 @@ version = "0.2.0"
 dependencies = [
  "flux-network",
  "flux-timing",
- "mio",
 ]
 
 [[package]]
