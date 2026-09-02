@@ -1,7 +1,7 @@
-//! The HTTP hot path allocates nothing once its connections are warm.
+//! The hot paths allocate nothing once their connections are warm.
 //!
-//! Every allocation this thread makes is counted, and both directions are
-//! measured over a keep-alive connection of their own: a peer's request
+//! Every allocation this thread makes is counted. For HTTP both directions
+//! are measured over a keep-alive connection of their own: a peer's request
 //! answered through [`flux_network::http::Responder::respond_with`], and the
 //! service's own request answered by a peer. Everything the measured window
 //! touches was sized by the warm-up — the connection buffers, the header
@@ -27,7 +27,7 @@ use common::{RawService, RelayService};
 use flux_network::{
     Token,
     http::{HttpConfig, HttpEvent, HttpService},
-    stream::{ConnectionGroupConfig, Endpoint, Framing, StreamNetwork},
+    stream::{ConnectionGroupConfig, Endpoint, Framing, StreamEvent, StreamNetwork, StreamService},
 };
 
 thread_local! {
@@ -360,5 +360,70 @@ fn a_warm_composed_chain_allocates_nothing() {
         echoed, 0,
         "echoing {ROUND_TRIPS} payloads through the composed chain allocated {echoed} times, \
          and must allocate none"
+    );
+}
+
+/// One message into a retained stream service: the client sends, the service
+/// records during the iteration, and the pull reads every byte back.
+fn stream_one(
+    net: &mut StreamNetwork,
+    service: &mut StreamService,
+    client: &mut TcpStream,
+    payload: &[u8],
+    deadline: Instant,
+) {
+    let sent = client.write(payload).unwrap();
+    assert_eq!(sent, payload.len(), "the payload outgrew the socket buffer");
+    let mut read = 0;
+    while read < payload.len() {
+        assert!(Instant::now() < deadline, "the message stalled");
+        let _ = net.drive(Some(Duration::ZERO.into()), &mut [&mut *service]);
+        while let Some(event) = service.next_event() {
+            if let StreamEvent::Message { payload: bytes, .. } = event {
+                assert!(bytes.iter().all(|byte| *byte == 9), "the recorded bytes changed");
+                read += bytes.len();
+            }
+        }
+    }
+    assert_eq!(read, payload.len(), "more was recorded than was sent");
+}
+
+#[test]
+fn a_warm_retained_stream_service_allocates_nothing() {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut net = StreamNetwork::default();
+    let mut service = StreamService::new(net.add_group(ConnectionGroupConfig {
+        name: "retained-zero-alloc",
+        framing: Framing::Raw,
+        max_frame_size: usize::MAX,
+        backlog_warn_bytes: None,
+        ..ConnectionGroupConfig::default()
+    }));
+    let listening = service.listen(Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into()));
+    let Endpoint::Tcp(addr) = listening.unwrap() else { unreachable!("a TCP listener") };
+
+    let mut client = TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    while service.pending() == 0 {
+        assert!(Instant::now() < deadline, "the client was never accepted");
+        let _ = net.drive(Some(Duration::ZERO.into()), &mut [&mut service]);
+    }
+    assert!(matches!(service.next_event(), Some(StreamEvent::Accepted { .. })));
+
+    let payload = [9; 512];
+    for _ in 0..WARM_UP {
+        stream_one(&mut net, &mut service, &mut client, &payload, deadline);
+    }
+
+    let before = allocations();
+    for _ in 0..ROUND_TRIPS {
+        stream_one(&mut net, &mut service, &mut client, &payload, deadline);
+    }
+    let recorded = allocations() - before;
+
+    assert_eq!(
+        recorded, 0,
+        "recording and pulling {ROUND_TRIPS} messages allocated {recorded} times, and must \
+         allocate none"
     );
 }

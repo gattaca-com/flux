@@ -1,6 +1,9 @@
 //! Poll-driven byte-stream networking: TCP and Unix-domain sockets in one
 //! [`StreamNetwork`], with protocol layers as services inside it.
 //!
+//! [`StreamService`] is the service for a group whose messages the tile
+//! handles itself; [`crate::http::HttpService`] speaks HTTP over one.
+//!
 //! # Poll ownership
 //! A tile hosting sockets owns exactly one poll, so which side holds it is a
 //! construction-time mode of the network.
@@ -93,6 +96,7 @@ mod endpoint;
 mod network;
 mod payload_buf;
 mod service;
+mod stream_service;
 mod tcp_stream;
 mod transport;
 
@@ -104,5 +108,6 @@ pub use network::{
 };
 pub use payload_buf::PayloadBuf;
 pub use service::Service;
+pub use stream_service::{Retained, StreamService, StreamSink};
 pub(crate) use tcp_stream::set_socket_buf_size;
 pub use tcp_stream::{ConnState, TcpStream, TcpTelemetry};

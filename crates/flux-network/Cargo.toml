@@ -31,6 +31,10 @@ wincode-derive = { workspace = true }
 harness = false
 name = "reclaim"
 
+[[bench]]
+harness = false
+name = "stream_service"
+
 [lints]
 workspace = true
 
