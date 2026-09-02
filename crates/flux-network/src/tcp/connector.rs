@@ -65,6 +65,7 @@ struct ConnectionManager {
     socket_buf_size: Option<usize>,
     user_timeout_ms: u32,
     dcache: Option<DCachePtr>,
+    max_receive_frame_size: usize,
     /// When set, connections whose send backlog exceeds `max` messages for
     /// longer than `timeout` are disconnected (outbound scheduled for
     /// reconnection).
@@ -98,6 +99,7 @@ impl Default for ConnectionManager {
             socket_buf_size: None,
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             dcache: None,
+            max_receive_frame_size: u32::MAX as usize,
             max_backlog: None,
             drop_outbound_backlog_on_disconnect: false,
             nodelay: true,
@@ -342,6 +344,7 @@ impl ConnectionManager {
                 addr,
                 self.telemetry,
                 self.dcache.is_some(),
+                self.max_receive_frame_size,
             );
             if let Some(msg) = &self.on_connect_msg &&
                 tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
@@ -547,6 +550,7 @@ impl ConnectionManager {
                             addr,
                             self.telemetry,
                             self.dcache.is_some(),
+                            self.max_receive_frame_size,
                         );
 
                         if let Some(msg) = &self.on_connect_msg &&
@@ -641,6 +645,7 @@ impl ConnectionManager {
                             addr,
                             self.telemetry,
                             self.dcache.is_some(),
+                            self.max_receive_frame_size,
                         );
                         if let Some(msg) = &self.on_connect_msg &&
                             conn.write_or_enqueue_with(
@@ -741,6 +746,15 @@ impl TcpConnector {
     /// Sets telemetry config for all streams created by this connector.
     pub fn with_telemetry(mut self, telemetry: TcpTelemetry) -> Self {
         self.conn_mgr.telemetry = telemetry;
+        self
+    }
+
+    /// Sets the largest receive-frame payload accepted by subsequently created
+    /// streams.
+    pub fn with_max_receive_frame_size(mut self, max: usize) -> Self {
+        assert!(max > 0, "max receive frame size must be nonzero");
+        assert!(u32::try_from(max).is_ok(), "max receive frame size exceeds wire length field");
+        self.conn_mgr.max_receive_frame_size = max;
         self
     }
 

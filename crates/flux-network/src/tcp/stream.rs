@@ -70,7 +70,9 @@ pub(crate) fn write_frame_header(
     payload_len: usize,
     ts: Nanos,
 ) {
-    header[..LEN_HEADER_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    let payload_len =
+        u32::try_from(payload_len).expect("TCP frame payload exceeds u32 length field");
+    header[..LEN_HEADER_SIZE].copy_from_slice(&payload_len.to_le_bytes());
     header[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].copy_from_slice(&ts.0.to_le_bytes());
 }
 
@@ -145,6 +147,7 @@ pub struct TcpStream {
 
     rx_state: RxState,
     rx_buf: RxBuf,
+    max_receive_frame_size: usize,
     header_buf: [u8; FRAME_HEADER_SIZE],
     send_buf: Vec<u8>,
     /// Filled when send would block.
@@ -178,6 +181,7 @@ impl TcpStream {
         peer_addr: SocketAddr,
         telemetry: TcpTelemetry,
         use_dcache: bool,
+        max_receive_frame_size: usize,
     ) -> Self {
         let timers = match telemetry {
             TcpTelemetry::Disabled => None,
@@ -196,6 +200,7 @@ impl TcpStream {
             token,
             rx_state: RxState::default(),
             rx_buf,
+            max_receive_frame_size,
             header_buf: [0; FRAME_HEADER_SIZE],
             send_buf: vec![0; Self::SEND_BUF_SIZE],
             send_backlog: VecDeque::with_capacity(64),
@@ -529,6 +534,15 @@ impl TcpStream {
                                     let msg_len = u32::from_le_bytes(
                                         buf[..LEN_HEADER_SIZE].try_into().unwrap(),
                                     ) as usize;
+                                    if msg_len > self.max_receive_frame_size {
+                                        warn!(
+                                            ?self.peer_addr,
+                                            msg_len,
+                                            max_receive_frame_size = self.max_receive_frame_size,
+                                            "tcp frame exceeds configured receive maximum"
+                                        );
+                                        return ReadOutcome::Disconnected;
+                                    }
                                     let send_ts = Nanos(u64::from_le_bytes(
                                         buf[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
                                     ));

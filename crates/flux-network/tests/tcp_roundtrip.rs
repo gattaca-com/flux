@@ -1,4 +1,5 @@
 use std::{
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     thread,
     time::Duration,
@@ -90,6 +91,50 @@ fn tcp_roundtrip() {
 
     server.join().unwrap();
     client.join().unwrap();
+}
+
+#[test]
+fn oversized_receive_frame_disconnects() {
+    let probe =
+        std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("probe");
+    let bind_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let mut listener = TcpConnector::default().with_max_receive_frame_size(1024);
+    listener.listen_at(bind_addr).unwrap();
+
+    let mut client = TcpStream::connect(bind_addr).expect("failed to connect client");
+    let mut stream_token = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stream_token.is_none() && std::time::Instant::now() < deadline {
+        listener.poll_with(|event| {
+            if let PollEvent::Accept { stream, .. } = event {
+                stream_token = Some(stream);
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    let stream_token = stream_token.expect("listener did not accept client");
+
+    let mut header = [0_u8; 12];
+    header[..4].copy_from_slice(&1025_u32.to_le_bytes());
+    client.write_all(&header).unwrap();
+
+    let mut disconnected = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !disconnected && std::time::Instant::now() < deadline {
+        listener.poll_with(|event| match event {
+            PollEvent::Disconnect { token } => {
+                assert_eq!(token, stream_token);
+                disconnected = true;
+            }
+            PollEvent::Message { .. } => panic!("oversized frame was delivered"),
+            _ => {}
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(disconnected, "oversized frame did not disconnect");
 }
 
 #[test]
