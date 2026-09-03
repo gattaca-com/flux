@@ -5,31 +5,32 @@ status: accepted
 # Poll ownership is a network mode; services are protocol layers the network schedules
 
 A tile that hosts sockets must own exactly one `mio::Poll`, so that under `flux/park` it can
-register one `Waker` with the Signal and block in `poll` with a non-zero timeout — two polls
-in one tile means neither may ever block. `StreamNetwork` therefore chooses at construction who
+register one `Waker` with the Signal and block in `poll` with a non-zero timeout — two polls in
+one tile means neither may ever block. `StreamNetwork` therefore chooses at construction who
 holds the poll: **Owned poll** (the network creates and drives its own poll, and hands out a
-`Waker` on a reserved token) or **External poll** (the network is built over a `Registry`
-cloned from the caller's poll and a token base, and never polls). Protocol layers do not own a
-network: each is a **Service** owning one `ConnectionGroup`, and the network — not the caller —
-schedules them. The group is the transport state itself — listeners, outbound endpoints,
-connections and byte queues — created by `add_group` and moved into its service: ownership is
-the claim, the compiler keeps a group to one owner, and the network keeps only what every group
-shares (the registry, one contiguous token space, and each group's identity). `Service` is a
-public, statically dispatched trait of four methods — `group_id`, `handle_event`, `tick`,
-`next_deadline` — that downstream crates implement; the driver is generic over the service
-slice (with a blanket `impl Service for &mut S`), and a tile hosting several service types
-wraps them in one enum of its own. `HttpService` is the first service. Under Owned poll, one
-call per iteration, `drive(max_timeout, services)`, folds every deadline, polls once, routes
-each event to the service owning its group and ticks each service once. Under External poll the
-caller makes only the three calls a caller-held poll inherently requires —
-`next_deadline(services)` to fold into its own timeout, `handle_event(&event, services) ->
-bool` per readiness event (false: not ours, route to your own sources), and `tick(services)`
-once per iteration — and reconstructs nothing else. Services expose their protocol events by
-pull (`next_event()`). The scheduling contract is enforced without hiding it: readiness is
-truthful by construction, because `handle_event` returns a `ReadinessOutcome` that only
-`ConnectionGroup::handle_event` can produce, and the two obligations the type cannot carry —
-run the group's maintenance inside every tick, fold the group's deadline into every fold — are
-audited through the group's identity at runtime, panicking on the first omission.
+`Waker` on a reserved token) or **External poll** (the network is built over a `Registry` cloned
+from the caller's poll and a token base, and never polls). Protocol layers do not own a network:
+each is a **Service** owning one `ConnectionGroup`, and the network — not the caller — schedules
+them. The group is the transport state itself — listeners, outbound endpoints, connections and
+byte queues — created by `add_group` and moved into its service: ownership is the claim, the
+compiler keeps a group to one owner, and the network keeps only what every group shares (the
+registry, one contiguous token space, and each group's identity). `Service` is a public,
+statically dispatched trait of four methods — `group_id`, `handle_event`, `tick`,
+`next_deadline` — that downstream crates implement; the driver is generic over the service slice
+(with a blanket `impl Service for &mut S`), and a tile hosting several service types wraps them
+in one enum of its own. `HttpService` and `StreamService` are the services flux ships. Under
+Owned poll, one call per iteration, `drive(max_timeout, services)`, folds every deadline, polls
+once, routes each event to the service owning its group and ticks each service once. Under
+External poll the caller makes only the three calls a caller-held poll inherently requires —
+`next_deadline(services)` to fold into its own timeout, `handle_event(&event, services) -> bool`
+per readiness event (false: not ours, route to your own sources), and `tick(services)` once per
+iteration — and reconstructs nothing else. Services expose their protocol events by pull
+(`next_event()`). The scheduling contract is enforced without hiding it: readiness is truthful
+by construction, because `handle_event` returns a `ReadinessOutcome` that only
+`ConnectionGroup::handle_event` can produce, and the two obligations the readiness type cannot
+carry — run the group's maintenance inside every tick, fold the group's deadline into every fold
+— are carried by two more witnesses only the group constructs, `TickOutcome` and `Deadline`,
+stamped with the instant they answer for (ADR 0004).
 
 ## Considered options
 
@@ -104,7 +105,8 @@ audited through the group's identity at runtime, panicking on the first omission
   Under External poll the caller folds only its own timers against the result.
 - A service may own a lower service instead of the group directly; only the outermost one is
   scheduled, and each level delegates readiness, the tick and the deadline along the chain —
-  the audits hold the root to the leaf's obligations. A composer consumes the lower service's
+  the witness types hold the root to the leaf's obligations, and their stamps hold each answer
+  to the invocation that asked for it (ADR 0004). A composer consumes the lower service's
   lending events through a bounded drain whose result — events remain undrained, `#[must_use]`
   — is what it folds into its deadline, at the tick instant that left them.
 - Response capability is offered only where a response is possible: `Request` carries a
@@ -123,8 +125,8 @@ audited through the group's identity at runtime, panicking on the first omission
   connection ready.
 - Readiness is service state, not per-iteration scratch: a caller may stop pulling after any
   number of events and resume in a later iteration with nothing lost, which is what gives a
-  tile a per-iteration work cap. A service's `tick` returns `true` while it has pullable protocol
-  events — created by this tick or left un-pulled by a caller that stopped early — and
+  tile a per-iteration work cap. A service's tick outcome reports work while it has pullable
+  protocol events — created by this tick or left un-pulled by a caller that stopped early — and
   `drive`, `handle_event` and the network's `tick` fold that with their own actions into one
   did-work result, so a tile that follows the default loop honours the park contract without
   inspecting service internals and never parks on outstanding work; a tile that deliberately

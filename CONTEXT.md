@@ -71,8 +71,17 @@ _Avoid_: client, remote
 The per-request timer on an outbound connection; expiry fails the request and closes the
 connection. In scheduling (`next_deadline`), the earliest instant a tick of a Service could
 progress work, with work already due reported at the instant it became due; work a Service
-exposes upward for its caller to pull rides the did-work report, never the deadline.
+exposes upward for its caller to pull rides the did-work report, never the deadline. The fold
+is asked and answered for one instant, which the deadline carries (see Witness).
 _Avoid_: timeout (which names the idle sweep), TTL
+
+**Witness**:
+A value only a ConnectionGroup constructs — `ReadinessOutcome`, `TickOutcome`, `Deadline` —
+that carries proof of a scheduling obligation up a Service chain: a composer can pass it
+through, widen its work or bring its deadline forward, and nothing else. The tick and deadline
+witnesses also carry the instant they answer for, and reading one for another instant fails
+under debug assertions (ADR 0004).
+_Avoid_: outcome type, token, receipt, proof object
 
 **Draining**:
 The closing state of a connection whose request stream was fully consumed: the
