@@ -11,9 +11,10 @@
 //!
 //! The starved obligation is `maintain`: while the bank is replayed, queued
 //! disconnects are not delivered and due reconnects are not attempted, for
-//! every connection of the group. The audit on the refactor branch panics on
-//! the first replayed tick; here the transport silently freezes for exactly
-//! the iterations the bank covers.
+//! every connection of the group. The freshness stamp fails the replayed
+//! outcome's first read under debug assertions, because it carries the
+//! instant of the tick that banked it; in a release build the transport
+//! silently freezes for exactly the iterations the bank covers.
 
 use flux_network::stream::{ConnectionGroupId, Deadline, ReadinessOutcome, Service, TickOutcome};
 use flux_timing::Instant;
@@ -59,8 +60,8 @@ impl Service for BankingLeaf {
         outcome
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.lower.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.lower.next_deadline(now)
     }
 }
 
@@ -77,9 +78,12 @@ mod tests {
         Instant(at.0 + 60_000_000_000)
     }
 
-    /// Pins the hazard, not desired behaviour: the replayed tick leaves the
-    /// group's schedule exactly where it was, proving `maintain` never ran.
+    /// Under debug assertions the replayed outcome's read panics, which is the
+    /// defence working; in release the final assertion pins the hazard: the
+    /// replayed tick leaves the group's schedule exactly where it was, proving
+    /// `maintain` never ran.
     #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "replayed an earlier answer"))]
     fn a_banked_tick_outcome_freezes_the_transport() {
         let mut net = StreamNetwork::default();
         let dir = tempfile::tempdir().unwrap();
@@ -88,9 +92,13 @@ mod tests {
         // overdue retry and reschedules it, so its deadline moves.
         let mut honest = Leaf::new(raw_group(&mut net, "honest"));
         let _token = honest.group_mut().connect(Endpoint::Unix(dir.path().join("nobody")));
-        let scheduled = honest.next_deadline().instant().expect("the retry is scheduled");
-        let _ = honest.tick(a_minute_past(scheduled));
-        let rescheduled = honest.next_deadline().instant().expect("the retry stays scheduled");
+        let fold = Instant::now();
+        let scheduled = honest.next_deadline(fold).instant(fold).expect("the retry is scheduled");
+        let overdue = a_minute_past(scheduled);
+        assert!(honest.tick(overdue).worked(overdue), "an honest tick attempts the retry");
+        let fold = Instant::now();
+        let rescheduled =
+            honest.next_deadline(fold).instant(fold).expect("the retry stays scheduled");
         assert!(rescheduled > scheduled, "an honest tick attempts the retry and reschedules it");
 
         // The banker: same endpoint shape, but its second tick replays the
@@ -99,12 +107,18 @@ mod tests {
         let mut banker = BankingLeaf::new(Leaf::new(raw_group(&mut net, "banker")));
         let _token =
             banker.lower_mut().group_mut().connect(Endpoint::Unix(dir.path().join("nobody")));
-        let _ = banker.tick(Instant::now());
-        let frozen = banker.next_deadline().instant().expect("the retry is scheduled");
+        let first = Instant::now();
+        let _ = banker.tick(first).worked(first);
+        let fold = Instant::now();
+        let frozen = banker.next_deadline(fold).instant(fold).expect("the retry is scheduled");
 
-        let _ = banker.tick(a_minute_past(frozen));
+        // Under debug assertions this read is where the replay dies: the
+        // banked outcome carries `first`, and this tick asks for `overdue`.
+        let overdue = a_minute_past(frozen);
+        let _ = banker.tick(overdue).worked(overdue);
+        let fold = Instant::now();
         assert_eq!(
-            banker.next_deadline().instant(),
+            banker.next_deadline(fold).instant(fold),
             Some(frozen),
             "the replayed tick never reached maintain: the overdue retry was not attempted"
         );

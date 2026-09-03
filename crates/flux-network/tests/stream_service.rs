@@ -244,7 +244,8 @@ fn unpulled_events_ride_did_work_and_never_the_deadline() {
 
     // The sockets are idle now; only the unpulled events can report work.
     assert!(net.drive(ZERO, &mut [&mut service]), "unpulled events are work");
-    assert!(service.next_deadline().instant().is_none(), "and they never arm a deadline");
+    let fold = flux_timing::Instant::now();
+    assert!(service.next_deadline(fold).instant(fold).is_none(), "and they never arm a deadline");
 
     let mut seen = Vec::new();
     pull_all(&mut service, &mut seen);
@@ -290,7 +291,8 @@ fn a_sinks_pending_report_is_the_services_did_work() {
     let mut service = StreamService::with_sink(group, Tally { nag: true, ..Tally::default() });
     bound_addr(service.listen(ephemeral()));
     assert!(net.drive(ZERO, &mut [&mut service]), "the sink's word is the did-work report");
-    assert!(service.next_deadline().instant().is_none(), "and never a deadline");
+    let fold = flux_timing::Instant::now();
+    assert!(service.next_deadline(fold).instant(fold).is_none(), "and never a deadline");
     service.sink_mut().nag = false;
     assert!(!net.drive(ZERO, &mut [&mut service]));
 }

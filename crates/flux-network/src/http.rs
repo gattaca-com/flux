@@ -1565,8 +1565,8 @@ impl Service for HttpService {
         maintained.or_worked(http.protocol_tick(group, now))
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline().earliest(self.http.protocol_deadline())
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now).earliest(self.http.protocol_deadline())
     }
 }
 

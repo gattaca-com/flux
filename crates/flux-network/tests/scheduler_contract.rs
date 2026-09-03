@@ -95,8 +95,8 @@ impl Service for PhaseLog {
         worked
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now)
     }
 }
 
@@ -187,8 +187,8 @@ impl Service for CallLog {
         worked
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now)
     }
 }
 
@@ -253,8 +253,8 @@ impl Service for TimeredComposer {
         worked
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.lower.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.lower.next_deadline(now)
     }
 }
 
@@ -310,7 +310,7 @@ impl Service for Alias<'_> {
         unreachable!("validation rejects the duplicate before any tick")
     }
 
-    fn next_deadline(&self) -> Deadline {
+    fn next_deadline(&self, _: Instant) -> Deadline {
         unreachable!("validation rejects the duplicate before any fold")
     }
 }
@@ -384,8 +384,8 @@ impl Service for Ordered {
         worked
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now)
     }
 }
 
@@ -447,8 +447,8 @@ impl Service for ClockLeaf {
         self.group.maintain(now, &mut |_| {})
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now)
     }
 }
 
@@ -501,7 +501,8 @@ fn lower_work_stays_true_through_a_composer_that_adds_none() {
 
     // The disconnect is the lower tick's work; the relay again adds none.
     assert!(relay.lower_mut().disconnect(accepted));
-    assert!(relay.tick(Instant::now()).worked(), "the lower service's tick work was withdrawn");
+    let now = Instant::now();
+    assert!(relay.tick(now).worked(now), "the lower service's tick work was withdrawn");
 }
 
 // ---------------------------------------------------------------------------
@@ -575,10 +576,10 @@ impl Service for TileService {
         }
     }
 
-    fn next_deadline(&self) -> Deadline {
+    fn next_deadline(&self, now: Instant) -> Deadline {
         match self {
-            Self::Http(http) => http.next_deadline(),
-            Self::Raw(raw) => raw.next_deadline(),
+            Self::Http(http) => http.next_deadline(now),
+            Self::Raw(raw) => raw.next_deadline(now),
         }
     }
 }

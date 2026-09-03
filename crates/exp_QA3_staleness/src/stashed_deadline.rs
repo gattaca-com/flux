@@ -9,9 +9,9 @@
 //! and moved no timer the composer knows about, so the stash hides it and an
 //! Owned `drive(None)` sleeps on a deadline that no longer exists.
 //!
-//! The audit on the refactor branch panics on this composer's first stale
-//! answer, because the reported instant diverges from what the group records
-//! having said. Here it compiles, runs and oversleeps.
+//! The freshness stamp fails this composer's first stale read under debug
+//! assertions: the stash carries the tick's instant and the fold asks for
+//! another. In a release build it compiles, runs and oversleeps.
 
 use std::cell::Cell;
 
@@ -40,8 +40,8 @@ impl StashingComposer {
     }
 
     /// The fresh answer the stash stands in for: the test's source of truth.
-    pub fn fresh(&self) -> Deadline {
-        self.lower.next_deadline()
+    pub fn fresh(&self, now: Instant) -> Deadline {
+        self.lower.next_deadline(now)
     }
 }
 
@@ -59,14 +59,14 @@ impl Service for StashingComposer {
         // "The deadline only changes when the transport does something, and
         // the transport just did it" — false: the application mutates the
         // group between iterations too.
-        self.stash.set(Some(self.lower.next_deadline()));
+        self.stash.set(Some(self.lower.next_deadline(now)));
         outcome
     }
 
-    fn next_deadline(&self) -> Deadline {
+    fn next_deadline(&self, now: Instant) -> Deadline {
         // Fresh on the first fold, replayed ever after: the fallback makes
         // the shape look robust while the stash makes it wrong.
-        self.stash.take().unwrap_or_else(|| self.lower.next_deadline())
+        self.stash.take().unwrap_or_else(|| self.lower.next_deadline(now))
     }
 }
 
@@ -78,10 +78,10 @@ mod tests {
     use super::StashingComposer;
     use crate::{Leaf, raw_group};
 
-    /// Pins the hazard, not desired behaviour: a defence that closes the
-    /// staleness hole should flip the final assertion or reject the composer
-    /// at compile time.
+    /// Under debug assertions the stale read panics, which is the defence
+    /// working; in release the final assertion pins the hazard's shape.
     #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "replayed an earlier answer"))]
     fn a_stashed_deadline_sleeps_through_a_new_endpoint() {
         let mut net = StreamNetwork::default();
         let mut composer = StashingComposer::new(Leaf::new(raw_group(&mut net, "stashed")));
@@ -95,10 +95,13 @@ mod tests {
         let _token =
             composer.lower_mut().group_mut().connect(Endpoint::Unix(dir.path().join("nobody")));
 
-        let truth = composer.fresh().instant();
+        let fold = Instant::now();
+        let truth = composer.fresh(fold).instant(fold);
         assert!(truth.is_some(), "the group schedules the retry the moment it exists");
 
-        let folded = composer.next_deadline().instant();
+        // Under debug assertions this read is where the replay dies: the stash
+        // carries the tick's instant, and this fold asks for another.
+        let folded = composer.next_deadline(fold).instant(fold);
         assert!(
             folded.is_none(),
             "the stale stash hides the retry: an Owned drive(None) sleeps forever on this answer"

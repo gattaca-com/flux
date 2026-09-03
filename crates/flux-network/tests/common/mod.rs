@@ -266,8 +266,8 @@ impl Service for RawService {
         maintained.or_worked(self.pending() > 0)
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline().earliest(self.deadline)
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now).earliest(self.deadline)
     }
 }
 
@@ -369,11 +369,11 @@ impl Service for RelayService {
         lower.or_worked(leftovers || self.unpulled > 0)
     }
 
-    fn next_deadline(&self) -> Deadline {
+    fn next_deadline(&self, now: Instant) -> Deadline {
         // The deadline carries only work a tick of this Service can progress:
         // what the last tick's bounded drain left in the leaf, due at that
         // tick's own instant. Payloads exposed upward are the caller's to
         // pull, and ride the did-work report instead.
-        self.lower.next_deadline().earliest(self.lower_work_due)
+        self.lower.next_deadline(now).earliest(self.lower_work_due)
     }
 }

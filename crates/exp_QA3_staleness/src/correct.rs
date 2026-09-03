@@ -47,8 +47,8 @@ impl Service for Composer {
         outcome.or_worked(fired)
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.lower.next_deadline().earliest(self.timer)
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.lower.next_deadline(now).earliest(self.timer)
     }
 }
 
@@ -64,7 +64,8 @@ mod tests {
     fn an_endpoint_added_between_iterations_is_scheduled() {
         let mut net = StreamNetwork::default();
         let mut leaf = Leaf::new(raw_group(&mut net, "correct-leaf"));
-        assert!(leaf.next_deadline().instant().is_none(), "an idle group has nothing due");
+        let fold = Instant::now();
+        assert!(leaf.next_deadline(fold).instant(fold).is_none(), "an idle group has nothing due");
 
         // Between iterations the application adds an outbound endpoint nobody
         // listens on: the inline connect fails and the retry is the group's
@@ -72,7 +73,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _token = leaf.group_mut().connect(Endpoint::Unix(dir.path().join("nobody")));
 
-        assert!(leaf.next_deadline().instant().is_some(), "the very next fold schedules the retry");
+        let fold = Instant::now();
+        assert!(
+            leaf.next_deadline(fold).instant(fold).is_some(),
+            "the very next fold schedules the retry"
+        );
     }
 
     #[test]
@@ -83,8 +88,9 @@ mod tests {
         // exists, is the earlier of the two.
         let far_timer = Instant(Instant::now().0 + 3_600_000_000_000);
         let mut composer = Composer::new(leaf, Some(far_timer));
+        let fold = Instant::now();
         assert_eq!(
-            composer.next_deadline().instant(),
+            composer.next_deadline(fold).instant(fold),
             Some(far_timer),
             "with an idle group the composer's own timer is the deadline"
         );
@@ -93,7 +99,8 @@ mod tests {
         let _token =
             composer.lower_mut().group_mut().connect(Endpoint::Unix(dir.path().join("nobody")));
 
-        let folded = composer.next_deadline().instant().expect("something is due");
+        let fold = Instant::now();
+        let folded = composer.next_deadline(fold).instant(fold).expect("something is due");
         assert!(folded < far_timer, "the fresh fold brings the retry forward past the timer");
     }
 }

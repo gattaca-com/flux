@@ -487,8 +487,8 @@ impl<S: StreamSink> Service for StreamService<S> {
         maintained.or_worked(sink.has_pending())
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now)
     }
 }
 

@@ -6,10 +6,13 @@
 //! compile. Both are ordinary values, though: code that stashes one and
 //! replays it on a later iteration compiles cleanly, and reports yesterday's
 //! truth for today's transport. Each buggy module here is such a replay,
-//! ordered from innocent-looking to deliberate, with a test pinning the exact
-//! misbehaviour. Those tests pin the hazard, not desired behaviour: a defence
-//! that closes the hole should turn them into compile errors or flip their
-//! assertions.
+//! ordered from innocent-looking to deliberate. The freshness stamps close
+//! the hole at test time: each witness carries the instant it was produced
+//! for, and reading it for another instant panics under debug assertions, so
+//! every replay here fails at its first stale read. The tests are
+//! `should_panic` under debug assertions; in a release build, where the
+//! stamps are not checked, they still pin the hazard's shape: the replay
+//! compiles, runs and oversleeps.
 //!
 //! - [`correct`]: the contract as intended — a leaf and a composer that consult
 //!   the group on every call. Their tests show what the buggy variants lose.
@@ -74,8 +77,8 @@ impl Service for Leaf {
         self.group.maintain(now, &mut |_| {})
     }
 
-    fn next_deadline(&self) -> Deadline {
-        self.group.next_deadline()
+    fn next_deadline(&self, now: Instant) -> Deadline {
+        self.group.next_deadline(now)
     }
 }
 

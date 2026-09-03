@@ -258,13 +258,19 @@ impl ReadinessOutcome {
     }
 }
 
-/// What one tick of a service produced.
+/// What one tick of a service produced, for the instant it was asked about.
 ///
 /// Only [`ConnectionGroup::maintain`] builds one, and the value is neither
 /// `Copy` nor `Clone`, so a service's [`Service::tick`] can return an outcome
 /// only by running its group's due transport work inside that tick. A service
 /// containing another passes the inner outcome through or widens its work
 /// with [`Self::or_worked`], and can do nothing else with it.
+///
+/// The outcome carries the `now` the group was ticked with, and reading it
+/// names the `now` of the tick being reported: an outcome kept from an
+/// earlier tick and returned for a later one fails that read under debug
+/// assertions. That is the freshness half of the tick contract; the
+/// monotone half is that [`Self::or_worked`] only widens.
 ///
 /// ```compile_fail
 /// // A tick that never reaches ConnectionGroup::maintain has no outcome to
@@ -278,22 +284,36 @@ impl ReadinessOutcome {
 ///         self.0.handle_event(e, &mut |_| {})
 ///     }
 ///     fn tick(&mut self, _now: flux_timing::Instant) -> TickOutcome { false }
-///     fn next_deadline(&self) -> Deadline { self.0.next_deadline() }
+///     fn next_deadline(&self, now: flux_timing::Instant) -> Deadline { self.0.next_deadline(now) }
 /// }
 /// ```
 #[must_use]
 pub struct TickOutcome {
     worked: bool,
+    /// The instant the group was ticked with.
+    at: Instant,
 }
 
 impl TickOutcome {
-    fn new(worked: bool) -> Self {
-        Self { worked }
+    fn new(worked: bool, at: Instant) -> Self {
+        Self { worked, at }
     }
 
     /// Whether the tick did anything: transport work ran, or the service has
     /// events left to pull.
-    pub fn worked(&self) -> bool {
+    ///
+    /// `now` is the instant of the tick this outcome is reported for. Under
+    /// debug assertions an outcome produced for a different instant panics
+    /// here: the tick replayed an earlier answer instead of reaching its
+    /// group. Reading does not consume, so a composer may branch on a lower
+    /// outcome and still pass it up.
+    pub fn worked(&self, now: Instant) -> bool {
+        debug_assert!(
+            self.at == now,
+            "a tick outcome produced for {:?} was reported for {now:?}: the tick replayed an \
+             earlier answer instead of reaching its group",
+            self.at
+        );
         self.worked
     }
 
@@ -306,13 +326,21 @@ impl TickOutcome {
     }
 }
 
-/// The instant a service needs a tick by, folded from its group outward.
+/// The instant a service needs a tick by, folded from its group outward, for
+/// the fold it was asked in.
 ///
 /// Only [`ConnectionGroup::next_deadline`] builds one, and the value is
 /// neither `Copy` nor `Clone`, so a service's [`Service::next_deadline`] can
 /// report a deadline only by consulting its group's, and [`Self::earliest`]
 /// can only bring it forward: a root never reports later than the transport
 /// beneath it, and never `None` while the transport is due.
+///
+/// The deadline carries the `now` of the fold that asked the group, and
+/// reading it names the `now` of the fold being answered: a deadline kept
+/// from an earlier fold (or computed during a tick) and served for a later
+/// fold fails that read under debug assertions. That is the freshness half
+/// of the deadline contract; the monotone half is that [`Self::earliest`]
+/// only brings the instant forward and treats `None` as infinity.
 ///
 /// ```compile_fail
 /// // A deadline that skips the group does not exist: `None` is not a Deadline.
@@ -325,32 +353,50 @@ impl TickOutcome {
 ///         self.0.handle_event(e, &mut |_| {})
 ///     }
 ///     fn tick(&mut self, now: flux_timing::Instant) -> TickOutcome { self.0.maintain(now, &mut |_| {}) }
-///     fn next_deadline(&self) -> Deadline { None }
+///     fn next_deadline(&self, _now: flux_timing::Instant) -> Deadline { None }
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// // Nor can one be pushed later than the group's: there is no constructor
-/// // from an instant, and `earliest` is the only fold.
-/// let group_deadline: flux_network::stream::Deadline = unimplemented!();
-/// let later = flux_network::stream::Deadline(Some(flux_timing::Instant(u64::MAX)));
+/// // Nor can one be pushed later than the group's, or stamped by hand: the
+/// // fields are private, and `earliest` is the only fold.
+/// let now = flux_timing::Instant::now();
+/// let later = flux_network::stream::Deadline { at: now, next: Some(flux_timing::Instant(u64::MAX)) };
 /// ```
 #[must_use]
-pub struct Deadline(Option<Instant>);
+pub struct Deadline {
+    /// The instant of the fold that asked the group.
+    at: Instant,
+    next: Option<Instant>,
+}
 
 impl Deadline {
     /// The earlier of this deadline and `at`: a service folds its own timers
-    /// in with this, and can only bring the result forward.
+    /// in with this, and can only bring the result forward. `None` is
+    /// infinity on both sides.
     pub fn earliest(self, at: Option<Instant>) -> Self {
-        Self(match (self.0, at) {
+        let next = match (self.next, at) {
             (Some(this), Some(at)) => Some(this.min(at)),
             (this, at) => this.or(at),
-        })
+        };
+        Self { at: self.at, next }
     }
 
     /// The instant itself, `None` when nothing is due.
-    pub fn instant(&self) -> Option<Instant> {
-        self.0
+    ///
+    /// `now` is the instant of the fold this deadline answers. Under debug
+    /// assertions a deadline produced for a different instant panics here:
+    /// the fold served an earlier answer instead of consulting its group. The
+    /// instant returned may already be in the past; `now` is a consistency
+    /// token, not a filter.
+    pub fn instant(&self, now: Instant) -> Option<Instant> {
+        debug_assert!(
+            self.at == now,
+            "a deadline folded for {:?} was reported for {now:?}: the fold replayed an earlier \
+             answer instead of consulting its group",
+            self.at
+        );
+        self.next
     }
 }
 
@@ -626,8 +672,10 @@ impl ConnectionGroup {
     ///
     /// The [`Deadline`] this returns is the only one a service can report, so
     /// a nearer deadline of the service's own is folded in with
-    /// [`Deadline::earliest`] rather than reported in its place.
-    pub fn next_deadline(&self) -> Deadline {
+    /// [`Deadline::earliest`] rather than reported in its place. `now` is the
+    /// instant of the fold asking, handed down unchanged from the driver; the
+    /// deadline carries it, and a read for any other instant is a replay.
+    pub fn next_deadline(&self, now: Instant) -> Deadline {
         // Every down endpoint retries at the same group-wide fire, so the
         // first one settles the reconnect half of the fold.
         let mut next: Option<Instant> = self
@@ -641,7 +689,7 @@ impl ConnectionGroup {
         if let Some(due) = self.disconnects_due {
             next = Some(next.map_or(due, |next: Instant| next.min(due)));
         }
-        Deadline(next)
+        Deadline { at: now, next }
     }
 
     /// Runs the transport work due now — queued disconnects and reconnect
@@ -649,7 +697,8 @@ impl ConnectionGroup {
     /// reports whether anything happened.
     ///
     /// A leaf service calls this at the start of its [`Service::tick`] so
-    /// transport state never lags its protocol state by an iteration.
+    /// transport state never lags its protocol state by an iteration, with
+    /// the `now` the tick was given; the outcome carries it.
     pub fn maintain<F>(&mut self, now: Instant, on_event: &mut F) -> TickOutcome
     where
         F: for<'a> FnMut(StreamEvent<'a>),
@@ -663,7 +712,7 @@ impl ConnectionGroup {
             self.drain_pending_disconnects(&mut sink);
         }
         let reconnected = self.maybe_reconnect(now);
-        TickOutcome::new(worked || reconnected)
+        TickOutcome::new(worked || reconnected, now)
     }
 
     /// Offers one readiness event to this group.
@@ -1486,7 +1535,9 @@ impl StreamNetwork {
         }
 
         // The instant this iteration began is older than the poll wait it has
-        // just come out of, which may have been the whole of a timeout.
+        // just come out of, which may have been the whole of a timeout. Each
+        // delegation chain gets one instant of its own: the fold above ran
+        // with `now`, the tick runs with this one.
         let ticked = Self::tick_services(services, Instant::now());
         worked || ticked
     }
@@ -1506,7 +1557,10 @@ impl StreamNetwork {
     pub fn next_deadline<S: Service>(&self, services: &[S]) -> Option<Instant> {
         assert!(matches!(self.poll, PollMode::External), "{OWNED_POLLS}");
         self.validate(services);
-        Self::fold_deadline(services)
+        // The fold's instant is minted here, as `drive` mints its own: the
+        // network is the start of every delegation chain in both modes, so
+        // the caller never handles a scheduler instant.
+        Self::fold_deadline(services, Instant::now())
     }
 
     /// Takes one readiness event from the caller's poll, reporting whether it
@@ -1592,11 +1646,12 @@ impl StreamNetwork {
         Ok(waker)
     }
 
-    /// Ticks every service once, in slice order.
+    /// Ticks every service once, in slice order, and reads each outcome for
+    /// the instant it was ticked with.
     fn tick_services<S: Service>(services: &mut [S], now: Instant) -> bool {
         let mut worked = false;
         for service in services.iter_mut() {
-            worked |= service.tick(now).worked();
+            worked |= service.tick(now).worked(now);
         }
         worked
     }
@@ -1656,11 +1711,12 @@ impl StreamNetwork {
         }
     }
 
-    /// The earliest instant one of `services` needs a tick at.
-    fn fold_deadline<S: Service>(services: &[S]) -> Option<Instant> {
+    /// The earliest instant one of `services` needs a tick at, asked and read
+    /// for one instant `now`.
+    fn fold_deadline<S: Service>(services: &[S], now: Instant) -> Option<Instant> {
         let mut next: Option<Instant> = None;
         for service in services {
-            if let Some(deadline) = service.next_deadline().instant() {
+            if let Some(deadline) = service.next_deadline(now).instant(now) {
                 next = Some(next.map_or(deadline, |next: Instant| next.min(deadline)));
             }
         }
@@ -1674,7 +1730,7 @@ impl StreamNetwork {
         services: &[S],
         now: Instant,
     ) -> Option<std::time::Duration> {
-        let deadline = Self::fold_deadline(services);
+        let deadline = Self::fold_deadline(services, now);
         let timeout = match (max_timeout, deadline.map(|deadline| deadline.saturating_sub(now))) {
             (Some(max), Some(next)) => Some(max.min(next)),
             (max, next) => max.or(next),
@@ -2245,8 +2301,8 @@ mod tests {
             self.0.maintain(now, &mut |_| {})
         }
 
-        fn next_deadline(&self) -> Deadline {
-            self.0.next_deadline()
+        fn next_deadline(&self, now: Instant) -> Deadline {
+            self.0.next_deadline(now)
         }
     }
 
@@ -2265,10 +2321,12 @@ mod tests {
             peer: Peer::Tcp((Ipv4Addr::LOCALHOST, 1).into()),
         });
 
-        let episode = leaf.0.next_deadline().instant();
+        let fold = Instant::now();
+        let episode = leaf.0.next_deadline(fold).instant(fold);
         assert!(episode.is_some(), "a queued disconnect is due");
+        let later = Instant::now();
         assert_eq!(
-            leaf.0.next_deadline().instant(),
+            leaf.0.next_deadline(later).instant(later),
             episode,
             "the episode instant is stable across folds"
         );
@@ -2297,6 +2355,11 @@ mod tests {
         assert!(unwound.is_err(), "the callback's panic reached the caller");
 
         assert!(group.pending_disconnects.is_empty(), "the drain guard empties the queue");
-        assert_eq!(group.next_deadline().instant(), None, "no work is due over an empty queue");
+        let fold = Instant::now();
+        assert_eq!(
+            group.next_deadline(fold).instant(fold),
+            None,
+            "no work is due over an empty queue"
+        );
     }
 }
