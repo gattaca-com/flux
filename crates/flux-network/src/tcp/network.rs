@@ -1,6 +1,7 @@
 use std::{
     io::{self, IoSlice, Read, Write},
     net::{Shutdown, SocketAddr},
+    ops::{Deref, DerefMut},
 };
 
 use flux_communication::Timer;
@@ -11,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use super::{
     TcpTelemetry, set_socket_buf_size,
     stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_keepalive, set_user_timeout,
-        write_frame_header,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, frame_payload_len, set_keepalive,
+        set_user_timeout, write_frame_header, write_frame_len, write_frame_ts,
     },
 };
 
@@ -40,6 +41,155 @@ pub enum Framing {
     /// Bytes pass through untouched. Received chunks do not preserve message
     /// boundaries, and their event timestamp is the local receive time.
     Raw,
+}
+
+/// The payload of one outgoing frame while a serialiser fills it.
+///
+/// Frames are staged back to back in one send buffer, so a serialiser must
+/// not be able to reach the bytes of frames staged before its own. This
+/// wrapper exposes only the payload region: every length, index, and
+/// truncation is relative to the start of the payload, and the frame header
+/// and earlier frames stay out of reach.
+pub struct PayloadBuf<'a> {
+    bytes: &'a mut Vec<u8>,
+    start: usize,
+}
+
+impl<'a> PayloadBuf<'a> {
+    fn new(bytes: &'a mut Vec<u8>) -> Self {
+        let start = bytes.len();
+        Self { bytes, start }
+    }
+
+    /// Bytes serialised into this payload so far.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len() - self.start
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reserves room for at least `additional` more payload bytes.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.bytes.reserve(additional);
+    }
+
+    #[inline]
+    pub fn push(&mut self, byte: u8) {
+        self.bytes.push(byte);
+    }
+
+    #[inline]
+    pub fn extend_from_slice(&mut self, other: &[u8]) {
+        self.bytes.extend_from_slice(other);
+    }
+
+    /// Resizes the payload to `len` bytes, filling new bytes with `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload cannot fit in memory, as `Vec::resize` does.
+    #[inline]
+    pub fn resize(&mut self, len: usize, value: u8) {
+        let end = self.start.checked_add(len).expect("payload length overflows usize");
+        self.bytes.resize(end, value);
+    }
+
+    /// Shortens the payload to `len` bytes; no-op if already shorter.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        // Clamping keeps `start + len` from wrapping into earlier frames.
+        let len = len.min(self.len());
+        self.bytes.truncate(self.start + len);
+    }
+
+    /// Removes every payload byte serialised so far.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.bytes.truncate(self.start);
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[self.start..]
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.start..]
+    }
+}
+
+impl Deref for PayloadBuf<'_> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl DerefMut for PayloadBuf<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+impl Extend<u8> for PayloadBuf<'_> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
+        self.bytes.extend(iter);
+    }
+}
+
+impl<'b> Extend<&'b u8> for PayloadBuf<'_> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = &'b u8>>(&mut self, iter: I) {
+        self.bytes.extend(iter);
+    }
+}
+
+#[cfg(feature = "wincode")]
+impl wincode::io::Writer for PayloadBuf<'_> {
+    #[inline]
+    fn write(&mut self, src: &[u8]) -> Result<(), wincode::io::WriteError> {
+        self.bytes.extend_from_slice(src);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn as_trusted_for(
+        &mut self,
+        n_bytes: usize,
+    ) -> Result<impl wincode::io::Writer, wincode::io::WriteError> {
+        // SAFETY: the caller upholds the `as_trusted_for` contract, and the
+        // `Vec<u8>` writer only ever appends, so the payload start stays valid.
+        unsafe { wincode::io::Writer::as_trusted_for(&mut *self.bytes, n_bytes) }
+    }
+}
+
+impl Write for PayloadBuf<'_> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.bytes.extend_from_slice(buf);
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Configuration shared by every listener and connection in a [`TcpGroup`].
@@ -188,8 +338,10 @@ struct NetworkState {
     connections: Vec<Connection>,
     pending_disconnects: Vec<PendingDisconnect>,
     next_token: usize,
-    send_header: [u8; FRAME_HEADER_SIZE],
-    send_payload: Vec<u8>,
+    /// Frames staged for the next socket write, each as a contiguous
+    /// `[header][payload]` for length-prefixed groups or bare bytes for raw
+    /// groups.
+    send_buffer: Vec<u8>,
 }
 
 impl Default for NetworkState {
@@ -201,8 +353,7 @@ impl Default for NetworkState {
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             pending_disconnects: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             next_token: 0,
-            send_header: [0; FRAME_HEADER_SIZE],
-            send_payload: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
+            send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
         }
     }
 }
@@ -577,58 +728,80 @@ impl NetworkState {
         }
     }
 
-    fn prepare_frame<F>(&mut self, group: TcpGroup, serialise: F) -> bool
+    /// Finds the connection `token` can currently send on.
+    fn sendable_index(&self, token: Token) -> Option<usize> {
+        self.connections.iter().position(|connection| {
+            connection.token == token &&
+                !connection.close_when_drained &&
+                matches!(connection.state, ConnectionState::Connected(_))
+        })
+    }
+
+    /// Serialises one payload as a frame at the end of `send_buffer`.
+    /// Length-prefixed groups reserve a header ahead of the payload and fill
+    /// in its length here; `stamp_frames` writes the timestamp just before the
+    /// socket write. Empty or oversized payloads are removed again. Returns
+    /// whether the frame was kept.
+    fn append_frame<F>(&mut self, group: TcpGroup, serialise: F) -> bool
     where
-        F: FnOnce(&mut Vec<u8>),
+        F: FnOnce(&mut PayloadBuf<'_>),
     {
-        self.send_payload.clear();
-        serialise(&mut self.send_payload);
-        let config = self.config(group);
-        if self.send_payload.is_empty() {
+        let config = &self.groups[group.0].config;
+        let framed = config.framing == Framing::LengthPrefixed;
+        let start = self.send_buffer.len();
+        if framed {
+            self.send_buffer.resize(start + FRAME_HEADER_SIZE, 0);
+        }
+        let payload_start = self.send_buffer.len();
+        let mut payload = PayloadBuf::new(&mut self.send_buffer);
+        serialise(&mut payload);
+        let payload_len = payload.len();
+        if payload_len == 0 {
+            self.send_buffer.truncate(start);
             return false;
         }
-        if self.send_payload.len() > config.max_frame_size ||
-            (config.framing == Framing::LengthPrefixed &&
-                u32::try_from(self.send_payload.len()).is_err())
-        {
+        if payload_len > config.max_frame_size || (framed && u32::try_from(payload_len).is_err()) {
             error!(
                 group = config.name,
-                payload_len = self.send_payload.len(),
+                payload_len,
                 max_frame_size = config.max_frame_size,
                 "tcp payload exceeds maximum frame size"
             );
-            self.send_payload.clear();
+            self.send_buffer.truncate(start);
             return false;
         }
-        if config.framing == Framing::LengthPrefixed {
-            write_frame_header(&mut self.send_header, self.send_payload.len(), Nanos::now());
+        if framed {
+            write_frame_len(&mut self.send_buffer[start..payload_start], payload_len);
         }
         true
     }
 
-    fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
-    where
-        F: FnOnce(&mut Vec<u8>),
-    {
-        let Some(index) = self.connections.iter().position(|connection| {
-            connection.token == token &&
-                !connection.close_when_drained &&
-                matches!(connection.state, ConnectionState::Connected(_))
-        }) else {
-            return false;
-        };
-        let group = self.connections[index].group;
-        if !self.prepare_frame(group, serialise) {
-            return false;
+    /// Writes `ts` into the header of every frame staged in `send_buffer`.
+    /// Raw groups carry no headers and are left untouched.
+    fn stamp_frames(&mut self, group: TcpGroup, ts: Nanos) {
+        if self.groups[group.0].config.framing != Framing::LengthPrefixed {
+            return;
         }
+        let mut offset = 0;
+        while offset < self.send_buffer.len() {
+            let header = &mut self.send_buffer[offset..offset + FRAME_HEADER_SIZE];
+            write_frame_ts(header, ts);
+            offset += FRAME_HEADER_SIZE + frame_payload_len(header);
+        }
+    }
+
+    /// Writes the staged frames to the connection at `index` in one socket
+    /// write, disconnecting it on failure. Returns whether the write was
+    /// accepted or queued.
+    fn write_staged(&mut self, index: usize) -> bool {
+        let group = self.connections[index].group;
         let config = &self.groups[group.0].config;
         let connection = &mut self.connections[index];
         let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
-        let header = (config.framing == Framing::LengthPrefixed).then_some(&self.send_header);
         let state = stream.write_frame(
             self.poll.registry(),
-            header,
-            &self.send_payload,
+            None,
+            &self.send_buffer,
             config,
             &mut connection.timers,
         );
@@ -639,24 +812,57 @@ impl NetworkState {
         true
     }
 
-    fn broadcast_with<F>(&mut self, group: TcpGroup, serialise: F) -> usize
+    fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
     where
-        F: FnOnce(&mut Vec<u8>),
+        F: FnOnce(&mut PayloadBuf<'_>),
     {
-        if group.0 >= self.groups.len() {
-            return 0;
+        let Some(index) = self.sendable_index(token) else {
+            return false;
+        };
+        let group = self.connections[index].group;
+        self.send_buffer.clear();
+        if !self.append_frame(group, serialise) {
+            return false;
         }
-        if !self.connections.iter().any(|connection| {
-            connection.group == group &&
-                !connection.close_when_drained &&
-                matches!(connection.state, ConnectionState::Connected(_))
-        }) {
-            return 0;
-        }
-        if !self.prepare_frame(group, serialise) {
-            return 0;
-        }
+        self.stamp_frames(group, Nanos::now());
+        self.write_staged(index)
+    }
 
+    fn send_many_with<I, F>(&mut self, token: Token, items: I, mut serialise: F) -> bool
+    where
+        I: IntoIterator,
+        F: FnMut(&mut PayloadBuf<'_>, I::Item),
+    {
+        let Some(index) = self.sendable_index(token) else {
+            return false;
+        };
+        let group = self.connections[index].group;
+        self.send_buffer.clear();
+        for item in items {
+            self.append_frame(group, |buf| serialise(buf, item));
+        }
+        if self.send_buffer.is_empty() {
+            return false;
+        }
+        self.stamp_frames(group, Nanos::now());
+        self.write_staged(index)
+    }
+
+    /// Whether `group` exists and has at least one member that can receive a
+    /// broadcast right now.
+    fn has_broadcast_recipient(&self, group: TcpGroup) -> bool {
+        group.0 < self.groups.len() &&
+            self.connections.iter().any(|connection| {
+                connection.group == group &&
+                    !connection.close_when_drained &&
+                    matches!(connection.state, ConnectionState::Connected(_))
+            })
+    }
+
+    /// Writes the staged frames to every connected member of `group`,
+    /// disconnecting members whose write fails. Returns the number of
+    /// recipients attempted.
+    fn broadcast_staged(&mut self, group: TcpGroup) -> usize {
         let mut attempted = 0;
         let mut index = self.connections.len();
         while index != 0 {
@@ -668,27 +874,43 @@ impl NetworkState {
                 continue;
             }
             attempted += 1;
-            let state = {
-                let config = &self.groups[group.0].config;
-                let connection = &mut self.connections[index];
-                let ConnectionState::Connected(stream) = &mut connection.state else {
-                    unreachable!()
-                };
-                let header =
-                    (config.framing == Framing::LengthPrefixed).then_some(&self.send_header);
-                stream.write_frame(
-                    self.poll.registry(),
-                    header,
-                    &self.send_payload,
-                    config,
-                    &mut connection.timers,
-                )
-            };
-            if state == StreamState::Disconnected {
-                self.disconnect_index(index, true);
-            }
+            self.write_staged(index);
         }
         attempted
+    }
+
+    fn broadcast_with<F>(&mut self, group: TcpGroup, serialise: F) -> usize
+    where
+        F: FnOnce(&mut PayloadBuf<'_>),
+    {
+        if !self.has_broadcast_recipient(group) {
+            return 0;
+        }
+        self.send_buffer.clear();
+        if !self.append_frame(group, serialise) {
+            return 0;
+        }
+        self.stamp_frames(group, Nanos::now());
+        self.broadcast_staged(group)
+    }
+
+    fn broadcast_many_with<I, F>(&mut self, group: TcpGroup, items: I, mut serialise: F) -> usize
+    where
+        I: IntoIterator,
+        F: FnMut(&mut PayloadBuf<'_>, I::Item),
+    {
+        if !self.has_broadcast_recipient(group) {
+            return 0;
+        }
+        self.send_buffer.clear();
+        for item in items {
+            self.append_frame(group, |buf| serialise(buf, item));
+        }
+        if self.send_buffer.is_empty() {
+            return 0;
+        }
+        self.stamp_frames(group, Nanos::now());
+        self.broadcast_staged(group)
     }
 
     fn disconnect(&mut self, token: Token) -> bool {
@@ -813,9 +1035,25 @@ impl TcpNetwork {
     /// disconnected.
     pub fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
     where
-        F: FnOnce(&mut Vec<u8>),
+        F: FnOnce(&mut PayloadBuf<'_>),
     {
         self.state.send_with(token, serialise)
+    }
+
+    /// Serializes and sends multiple payloads to a connected token.
+    /// Length-prefixed groups preserve each payload as a separate frame and
+    /// share one send timestamp. Raw groups concatenate the payloads. The
+    /// batch uses one socket write when no backlog exists. Each payload is
+    /// checked against `max_frame_size`. The caller must bound the item count
+    /// or total batch size. `max_backlog_bytes` only limits bytes queued after
+    /// a partial write. Invalid payloads are skipped. The closure is not called
+    /// when the token is unknown or disconnected.
+    pub fn send_many_with<I, F>(&mut self, token: Token, items: I, serialise: F) -> bool
+    where
+        I: IntoIterator,
+        F: FnMut(&mut PayloadBuf<'_>, I::Item),
+    {
+        self.state.send_many_with(token, items, serialise)
     }
 
     /// Serializes one payload and sends it to every connected member of
@@ -823,9 +1061,23 @@ impl TcpNetwork {
     /// the payload unchanged. Returns the number of recipients attempted.
     pub fn broadcast_with<F>(&mut self, group: TcpGroup, serialise: F) -> usize
     where
-        F: FnOnce(&mut Vec<u8>),
+        F: FnOnce(&mut PayloadBuf<'_>),
     {
         self.state.broadcast_with(group, serialise)
+    }
+
+    /// Serializes multiple payloads once and sends the batch to every
+    /// connected member of `group`. Framing, size limits, and skipping of
+    /// invalid payloads follow [`TcpNetwork::send_many_with`]; each member
+    /// receives the batch in one socket write when it has no backlog. The
+    /// closure is not called when the group has no connected member. Returns
+    /// the number of recipients attempted.
+    pub fn broadcast_many_with<I, F>(&mut self, group: TcpGroup, items: I, serialise: F) -> usize
+    where
+        I: IntoIterator,
+        F: FnMut(&mut PayloadBuf<'_>, I::Item),
+    {
+        self.state.broadcast_many_with(group, items, serialise)
     }
 
     /// Closes a connection. Persistent outbound endpoints remain registered
@@ -1269,7 +1521,7 @@ mod tests {
     use mio::{Poll, Token};
 
     use super::{
-        ByteQueue, FRAME_HEADER_SIZE, FramedStream, StreamState, TcpGroupConfig,
+        ByteQueue, FRAME_HEADER_SIZE, FramedStream, PayloadBuf, StreamState, TcpGroupConfig,
         set_socket_buf_size, write_frame_header,
     };
 
@@ -1371,5 +1623,41 @@ mod tests {
             StreamState::Disconnected
         );
         assert_eq!(stream.send_queue.len(), 8);
+    }
+
+    #[test]
+    fn payload_buf_truncate_clamps_to_its_own_frame() {
+        let mut bytes = b"earlier".to_vec();
+        let mut payload = PayloadBuf::new(&mut bytes);
+        payload.extend_from_slice(b"payload");
+
+        payload.truncate(usize::MAX);
+        assert_eq!(payload.as_slice(), b"payload");
+        payload.truncate(3);
+        assert_eq!(payload.as_slice(), b"pay");
+        payload.truncate(0);
+        assert!(payload.is_empty());
+        assert_eq!(bytes, b"earlier");
+    }
+
+    #[test]
+    fn payload_buf_resize_and_clear_stay_relative() {
+        let mut bytes = b"earlier".to_vec();
+        let mut payload = PayloadBuf::new(&mut bytes);
+        payload.resize(3, 7);
+        assert_eq!(payload.as_slice(), &[7, 7, 7]);
+        payload.resize(1, 0);
+        assert_eq!(payload.as_slice(), &[7]);
+        payload.clear();
+        assert!(payload.is_empty());
+        assert_eq!(bytes, b"earlier");
+    }
+
+    #[test]
+    #[should_panic(expected = "payload length overflows usize")]
+    fn payload_buf_resize_rejects_overflow() {
+        let mut bytes = b"earlier".to_vec();
+        let mut payload = PayloadBuf::new(&mut bytes);
+        payload.resize(usize::MAX, 0);
     }
 }

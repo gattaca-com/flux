@@ -61,6 +61,49 @@ fn raw_roundtrip() {
 }
 
 #[test]
+fn raw_batch_concatenates_payloads() {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let group = network.add_group(raw_group("raw-server"));
+    network.listen(group, addr).unwrap();
+
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+
+    let mut accepted = None;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && accepted.is_none() {
+        network.poll_with(|event| {
+            if let TcpEvent::Accepted { group: event_group, token, .. } = event {
+                assert_eq!(event_group, group);
+                accepted = Some(token);
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    let token = accepted.expect("connection was not accepted");
+
+    let parts: [&[u8]; 3] = [b"raw-", b"batch-", b"bytes"];
+    assert!(network.send_many_with(token, parts, |buf, part| buf.extend_from_slice(part)));
+
+    let expected = b"raw-batch-bytes";
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && received.len() < expected.len() {
+        network.poll_with(|_| {});
+        let mut buffer = [0; 128];
+        match client.read(&mut buffer) {
+            Ok(read) => received.extend_from_slice(&buffer[..read]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => panic!("client read failed: {err}"),
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(received, expected);
+}
+
+#[test]
 fn http_get_smoke() {
     let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
