@@ -70,8 +70,27 @@ pub(crate) fn write_frame_header(
     payload_len: usize,
     ts: Nanos,
 ) {
+    write_frame_len(header, payload_len);
+    write_frame_ts(header, ts);
+}
+
+/// Write only the `[len]` half of a frame header. Used when frames are staged
+/// ahead of the write and stamped with `write_frame_ts` once they go out.
+#[inline]
+pub(crate) fn write_frame_len(header: &mut [u8], payload_len: usize) {
     header[..LEN_HEADER_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
+}
+
+/// Write only the `[ts]` half of a frame header.
+#[inline]
+pub(crate) fn write_frame_ts(header: &mut [u8], ts: Nanos) {
     header[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].copy_from_slice(&ts.0.to_le_bytes());
+}
+
+/// Read the payload length from a frame header.
+#[inline]
+pub(crate) fn frame_payload_len(header: &[u8]) -> usize {
+    u32::from_le_bytes(header[..LEN_HEADER_SIZE].try_into().unwrap()) as usize
 }
 
 /// Allocate a contiguous `header + payload` frame for the send backlog.

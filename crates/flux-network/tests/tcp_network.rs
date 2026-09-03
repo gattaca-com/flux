@@ -14,6 +14,7 @@ const CLIENT_HELLO: &[u8] = b"client-hello";
 const SERVER_HELLO: &[u8] = b"server-hello";
 const REQUEST: &[u8] = b"request-payload";
 const RESPONSE: &[u8] = b"response-payload";
+const BATCH_MESSAGES: [&[u8]; 3] = [b"batch-one", b"batch-two", b"batch-three"];
 
 fn unused_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -131,6 +132,208 @@ fn groups_route_events_and_messages() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(contains(&client_messages, RESPONSE));
+}
+
+#[test]
+fn batch_send_preserves_framed_messages() {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(TcpGroupConfig { name: "client", ..Default::default() });
+    network.listen(server_group, addr).unwrap();
+    let _ = network.connect(client_group, addr);
+    let server_token = wait_for_accept(&mut network, server_group);
+
+    assert!(network.send_many_with(server_token, BATCH_MESSAGES, |buf, message| {
+        buf.extend_from_slice(message);
+    }));
+    assert!(network.send_many_with(server_token, [RESPONSE], |buf, message| {
+        buf.extend_from_slice(message);
+    }));
+
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && messages.len() < BATCH_MESSAGES.len() + 1 {
+        network.poll_with(|event| {
+            if let TcpEvent::Message { group, payload, .. } = event &&
+                group == client_group
+            {
+                messages.push(payload.to_vec());
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let expected = BATCH_MESSAGES.into_iter().chain([RESPONSE]);
+    assert!(messages.iter().map(Vec::as_slice).eq(expected));
+}
+
+#[test]
+fn payload_buffer_is_relative_to_its_own_frame() {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(TcpGroupConfig { name: "client", ..Default::default() });
+    network.listen(server_group, addr).unwrap();
+    let _ = network.connect(client_group, addr);
+    let server_token = wait_for_accept(&mut network, server_group);
+
+    // The middle serialiser rewrites its payload from scratch. Every
+    // operation must stay inside its own frame and leave the first intact.
+    assert!(network.send_many_with(server_token, BATCH_MESSAGES, |buf, message| {
+        buf.extend_from_slice(b"scratch");
+        assert_eq!(buf.len(), b"scratch".len());
+        buf.clear();
+        assert!(buf.is_empty());
+        buf.resize(message.len(), 0);
+        buf.copy_from_slice(message);
+    }));
+
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && messages.len() < BATCH_MESSAGES.len() {
+        network.poll_with(|event| {
+            if let TcpEvent::Message { group, payload, .. } = event &&
+                group == client_group
+            {
+                messages.push(payload.to_vec());
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(messages.iter().map(Vec::as_slice).eq(BATCH_MESSAGES));
+}
+
+#[cfg(feature = "wincode")]
+#[test]
+fn payload_buffer_is_a_wincode_writer() {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(TcpGroupConfig { name: "client", ..Default::default() });
+    network.listen(server_group, addr).unwrap();
+    let _ = network.connect(client_group, addr);
+    let server_token = wait_for_accept(&mut network, server_group);
+
+    let values = [7u64, 11, 13];
+    assert!(network.send_many_with(server_token, values, |buf, value| {
+        wincode::serialize_into(buf, &value).unwrap();
+    }));
+
+    let mut decoded = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && decoded.len() < values.len() {
+        network.poll_with(|event| {
+            if let TcpEvent::Message { group, payload, .. } = event &&
+                group == client_group
+            {
+                decoded.push(wincode::deserialize::<u64>(payload).unwrap());
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn batch_skips_oversized_payloads_and_keeps_the_rest() {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let server_group = network.add_group(TcpGroupConfig {
+        name: "server",
+        max_frame_size: 32,
+        ..Default::default()
+    });
+    let client_group = network.add_group(TcpGroupConfig { name: "client", ..Default::default() });
+    network.listen(server_group, addr).unwrap();
+    let _ = network.connect(client_group, addr);
+    let server_token = wait_for_accept(&mut network, server_group);
+
+    let oversized = [7u8; 64];
+    let items: [&[u8]; 3] = [b"fits-one", &oversized, b"fits-two"];
+    assert!(network.send_many_with(server_token, items, |buf, item| buf.extend_from_slice(item)));
+
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && messages.len() < 2 {
+        network.poll_with(|event| match event {
+            TcpEvent::Message { group, payload, .. } if group == client_group => {
+                messages.push(payload.to_vec());
+            }
+            TcpEvent::Disconnected { .. } => panic!("oversized payload disconnected the peer"),
+            _ => {}
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let expected: [&[u8]; 2] = [b"fits-one", b"fits-two"];
+    assert!(messages.iter().map(Vec::as_slice).eq(expected));
+}
+
+#[test]
+fn broadcast_many_serializes_each_payload_once() {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let server_group = network.add_group(TcpGroupConfig { name: "server", ..Default::default() });
+    let client_group = network.add_group(TcpGroupConfig {
+        name: "clients",
+        reconnect_interval: flux_timing::Duration::from_millis(1),
+        ..Default::default()
+    });
+    network.listen(server_group, addr).unwrap();
+    let _first_client = network.connect(client_group, addr);
+    let _second_client = network.connect(client_group, addr);
+
+    let mut accepted = 0;
+    let mut connected = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && (accepted != 2 || connected != 2) {
+        network.poll_with(|event| match event {
+            TcpEvent::Accepted { group, .. } => {
+                assert_eq!(group, server_group);
+                accepted += 1;
+            }
+            TcpEvent::Connected { group, .. } => {
+                assert_eq!(group, client_group);
+                connected += 1;
+            }
+            TcpEvent::Disconnected { .. } => panic!("unexpected disconnect"),
+            TcpEvent::Message { .. } => {}
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(accepted, 2);
+    assert_eq!(connected, 2);
+
+    let serializations = Cell::new(0);
+    let recipients = network.broadcast_many_with(server_group, BATCH_MESSAGES, |buf, message| {
+        serializations.set(serializations.get() + 1);
+        buf.extend_from_slice(message);
+    });
+    assert_eq!(recipients, 2);
+    assert_eq!(serializations.get(), BATCH_MESSAGES.len());
+
+    let mut per_client = std::collections::HashMap::<mio::Token, Vec<Vec<u8>>>::new();
+    let mut received = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && received != 2 * BATCH_MESSAGES.len() {
+        network.poll_with(|event| {
+            if let TcpEvent::Message { group, token, payload, .. } = event &&
+                group == client_group
+            {
+                per_client.entry(token).or_default().push(payload.to_vec());
+                received += 1;
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(per_client.len(), 2);
+    for messages in per_client.values() {
+        assert!(messages.iter().map(Vec::as_slice).eq(BATCH_MESSAGES));
+    }
 }
 
 #[test]
