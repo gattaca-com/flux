@@ -441,6 +441,131 @@ fn broadcast_many_serializes_each_payload_once(endpoint: &Endpoint) {
 }
 
 over_both_transports!(
+    batch_skips_empty_payloads_and_sends_nothing_for_an_empty_batch,
+    batch_skips_empty_payloads_and_sends_nothing_for_an_empty_batch_tcp,
+    batch_skips_empty_payloads_and_sends_nothing_for_an_empty_batch_unix
+);
+fn batch_skips_empty_payloads_and_sends_nothing_for_an_empty_batch(endpoint: &Endpoint) {
+    let mut network = StreamNetwork::default();
+    let mut server = RawService::new(
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() }),
+    );
+    let mut client = RawService::new(
+        network.add_group(ConnectionGroupConfig { name: "client", ..Default::default() }),
+    );
+    let bound = server.listen(endpoint.clone()).unwrap();
+    let _ = client.connect(bound);
+    let server_token = wait_for_accept_between(&mut network, &mut server, &mut client);
+
+    // Every item reaches the serialiser; one that leaves its payload empty
+    // is dropped from the batch, and a batch with nothing left is no send.
+    let mut group = server.into_group();
+    let mut serialised = 0;
+    let items: [&[u8]; 3] = [b"first", b"", b"second"];
+    assert!(group.send_many_with(server_token, items, |buf, item| {
+        serialised += 1;
+        buf.extend_from_slice(item);
+    }));
+    assert_eq!(serialised, items.len());
+    let empties: [&[u8]; 2] = [b"", b""];
+    assert!(!group.send_many_with(server_token, empties, |buf, item| buf.extend_from_slice(item)));
+    assert!(group.send_with(server_token, |buf| buf.extend_from_slice(RESPONSE)));
+    let mut server = RawService::new(group);
+
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && messages.len() < 3 {
+        network.drive(Some(poll_slice()), &mut [&mut server, &mut client]);
+        drain(&mut client, &mut messages);
+    }
+
+    let expected: [&[u8]; 3] = [b"first", b"second", RESPONSE];
+    assert!(messages.iter().map(Vec::as_slice).eq(expected), "{messages:?}");
+}
+
+over_both_transports!(
+    a_batch_is_not_capped_as_a_whole_by_the_backlog_limit,
+    a_batch_is_not_capped_as_a_whole_by_the_backlog_limit_tcp,
+    a_batch_is_not_capped_as_a_whole_by_the_backlog_limit_unix
+);
+fn a_batch_is_not_capped_as_a_whole_by_the_backlog_limit(endpoint: &Endpoint) {
+    let mut network = StreamNetwork::default();
+    let mut server = RawService::new(
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() }),
+    );
+    let mut client = RawService::new(network.add_group(ConnectionGroupConfig {
+        name: "client",
+        backlog_warn_bytes: None,
+        max_backlog_bytes: Some(1),
+        ..Default::default()
+    }));
+    let bound = server.listen(endpoint.clone()).unwrap();
+    let client_token = client.connect(bound);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !connected(&client, client_token) {
+        network.drive(Some(poll_slice()), &mut [&mut server, &mut client]);
+    }
+    assert!(connected(&client, client_token));
+
+    // The cap measures what a partial write leaves behind, never the batch
+    // itself: a batch far above the cap goes out whole when the socket takes
+    // it in one write.
+    let mut group = client.into_group();
+    assert!(group.send_many_with(client_token, BATCH_MESSAGES, |buf, message| {
+        buf.extend_from_slice(message);
+    }));
+    let mut client = RawService::new(group);
+
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && messages.len() < BATCH_MESSAGES.len() {
+        network.drive(Some(poll_slice()), &mut [&mut server, &mut client]);
+        drain(&mut server, &mut messages);
+    }
+
+    assert!(messages.iter().map(Vec::as_slice).eq(BATCH_MESSAGES), "{messages:?}");
+    assert!(!has_disconnect(&server) && !has_disconnect(&client), "unexpected disconnect");
+}
+
+/// The batch twin of `hard_backlog_limit_disconnects_the_peer`: what the socket
+/// does not take of a batch is queued as one remainder, and the cap judges
+/// that remainder.
+#[test]
+fn a_batch_remainder_beyond_the_backlog_limit_disconnects_the_peer() {
+    let mut network = StreamNetwork::default();
+    let mut server = RawService::new(
+        network.add_group(ConnectionGroupConfig { name: "server", ..Default::default() }),
+    );
+    let mut client = RawService::new(network.add_group(ConnectionGroupConfig {
+        name: "client",
+        socket_buf_size: Some(1024),
+        backlog_warn_bytes: None,
+        max_backlog_bytes: Some(1),
+        max_frame_size: 2 * 1024 * 1024,
+        ..Default::default()
+    }));
+    let addr = bound_addr(server.listen(ephemeral()).unwrap());
+    let client_token = client.connect(Endpoint::Tcp(addr));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !connected(&client, client_token) {
+        network.drive(Some(poll_slice()), &mut [&mut server, &mut client]);
+    }
+    assert!(connected(&client, client_token));
+
+    let mut group = client.into_group();
+    let halves = [vec![7u8; 512 * 1024], vec![8u8; 512 * 1024]];
+    assert!(!group.send_many_with(client_token, &halves, |buf, half| buf.extend_from_slice(half)));
+    let mut client = RawService::new(group);
+
+    // The refused send closed the connection there and then, and the
+    // disconnect it queued is delivered by the very next iteration.
+    network.drive(Some(poll_slice()), &mut [&mut server, &mut client]);
+    assert!(disconnected(&client, client_token));
+}
+
+over_both_transports!(
     partial_header_and_payload_are_not_delivered_early,
     partial_header_and_payload_are_not_delivered_early_tcp,
     partial_header_and_payload_are_not_delivered_early_unix

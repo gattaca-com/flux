@@ -2160,12 +2160,12 @@ impl FramedStream {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{self, Write},
+        io::{self, Read, Write},
         net::{Ipv4Addr, TcpListener, TcpStream as StdTcpStream},
     };
 
     use flux_timing::{Instant, Nanos};
-    use mio::{Poll, Token, event::Event};
+    use mio::{Interest, Poll, Token, event::Event};
 
     use super::{
         ByteQueue, ConnectionGroup, ConnectionGroupConfig, ConnectionGroupId,
@@ -2282,6 +2282,62 @@ mod tests {
             StreamState::Disconnected
         );
         assert_eq!(stream.send_queue.len(), 8);
+    }
+
+    /// A batch that overflows the socket's send buffer is queued as the one
+    /// unwritten suffix of the staged bytes: the socket takes a prefix in one
+    /// write and the queue holds exactly the rest, so the peer reads the batch
+    /// byte for byte once the queue drains.
+    #[test]
+    fn a_staged_batch_beyond_the_socket_buffer_queues_one_remainder() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, peer_addr) = listener.accept().unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        let poll = Poll::new().unwrap();
+        let mut socket = TransportStream::Tcp(mio::net::TcpStream::from_std(client));
+        set_socket_buf_size(&socket, 1024);
+        poll.registry().register(&mut socket, Token(0), Interest::READABLE).unwrap();
+        let mut stream = FramedStream::new(socket, Token(0), Peer::Tcp(peer_addr), 1024);
+
+        // Three frames staged back to back: more than the socket buffer and
+        // the peer's receive window hold between them.
+        let mut staged = Vec::new();
+        for fill in [1u8, 2, 3] {
+            let payload = vec![fill; 512 * 1024];
+            let mut header = [0; FRAME_HEADER_SIZE];
+            write_frame_header(&mut header, payload.len(), Nanos::now());
+            staged.extend_from_slice(&header);
+            staged.extend_from_slice(&payload);
+        }
+        let config = ConnectionGroupConfig {
+            backlog_warn_bytes: None,
+            max_backlog_bytes: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            stream.write_frame(poll.registry(), None, &staged, &config, &mut None),
+            StreamState::Alive
+        );
+
+        let queued = stream.send_queue.len();
+        assert!(
+            0 < queued && queued < staged.len(),
+            "the socket took a prefix: {queued} of {} bytes queued",
+            staged.len()
+        );
+        let written = staged.len() - queued;
+        assert_eq!(
+            stream.send_queue.remaining(),
+            &staged[written..],
+            "the queue is the unwritten suffix, appended once"
+        );
+
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut received = vec![0; written];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, staged[..written]);
     }
 
     /// A service that is nothing but its group, for driving the scheduler's
