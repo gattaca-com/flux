@@ -6,7 +6,9 @@
 //! are measured per frame at the frame sizes the consumers send, twice: the
 //! sink layer alone, which isolates the copy and the record, and a loopback
 //! round trip through the network, which places it against everything else
-//! an iteration costs.
+//! an iteration costs. A third group sends a full FEC set of shred-sized
+//! payloads to one peer as eight sends and as one batch, so what coalescing
+//! saves is read against the same sink.
 
 use std::{
     hint::black_box,
@@ -178,5 +180,58 @@ fn loopback(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, sink_only, loopback);
+/// A full FEC set of shred-sized payloads: how many, and how large each.
+const BATCH: (usize, usize) = (8, 1280);
+
+fn batch(c: &mut Criterion) {
+    let (count, size) = BATCH;
+    let mut group = c.benchmark_group("batch");
+    group.measurement_time(Duration::from_secs(8));
+    group.throughput(Throughput::Bytes((count * size) as u64));
+    let payload = vec![7; size];
+    let items: Vec<&[u8]> = vec![payload.as_slice(); count];
+
+    let mut net = StreamNetwork::default();
+    let mut server = StreamService::with_sink(net.add_group(config("server")), Counting::default());
+    let addr = bound_addr(server.listen(Endpoint::Tcp((Ipv4Addr::LOCALHOST, 0).into())));
+    let mut dialler =
+        StreamService::with_sink(net.add_group(config("dialler")), Counting::default());
+    let token = dialler.connect(Endpoint::Tcp(addr));
+    let mut services = [server, dialler];
+    // Until the dialler's first send succeeds, the connection is not up.
+    while !services[1].send_with(token, |out| out.extend_from_slice(b"up")) {
+        let _ = net.drive(ZERO, &mut services);
+    }
+    while services[0].sink().bytes < 2 {
+        let _ = net.drive(ZERO, &mut services);
+    }
+
+    group.bench_function(BenchmarkId::new("eight_sends", "8x1280B"), |b| {
+        b.iter(|| {
+            let before = services[0].sink().bytes;
+            for _ in 0..count {
+                assert!(services[1].send_with(token, |out| out.extend_from_slice(&payload)));
+            }
+            while services[0].sink().bytes < before + count * size {
+                let _ = net.drive(ZERO, &mut services);
+            }
+            black_box(services[0].sink().bytes)
+        });
+    });
+    group.bench_function(BenchmarkId::new("one_batch", "8x1280B"), |b| {
+        b.iter(|| {
+            let before = services[0].sink().bytes;
+            assert!(services[1].send_many_with(token, items.iter().copied(), |out, item| {
+                out.extend_from_slice(item);
+            }));
+            while services[0].sink().bytes < before + count * size {
+                let _ = net.drive(ZERO, &mut services);
+            }
+            black_box(services[0].sink().bytes)
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, sink_only, loopback, batch);
 criterion_main!(benches);
