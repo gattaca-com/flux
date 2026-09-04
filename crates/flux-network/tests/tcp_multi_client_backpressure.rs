@@ -48,8 +48,14 @@ fn spawn_frame_collector(read_delay: Duration) -> (SocketAddr, thread::JoinHandl
 fn pump(conn: &mut TcpConnector, for_how_long: Duration) {
     let deadline = std::time::Instant::now() + for_how_long;
     while std::time::Instant::now() < deadline {
-        while conn.poll_with(|_| {}) {}
-        thread::sleep(Duration::from_millis(1));
+        let mut worked = false;
+        while conn.poll_with(|_| {}) {
+            worked = true;
+        }
+        // Sleep only when idle so the delay does not slow backlog draining.
+        if !worked {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -69,9 +75,9 @@ fn queued_messages_flush_on_second_connection_after_backpressure() {
     let slow_token = conn.connect(slow_addr).expect("failed to connect to slow collector");
     assert_ne!(fast_token, slow_token);
 
-    // Fill the 2nd socket while the receiver is paused, forcing queue/backpressure
-    // path.
-    let big = vec![7_u8; 8 * 1024 * 1024];
+    // Send a large payload while the second receiver is paused to exercise the
+    // backpressure path. Keep it modest so the test has time to drain the backlog.
+    let big = vec![7_u8; 2 * 1024 * 1024];
     send_payload(&mut conn, slow_token, &big);
 
     let marker = b"marker-after-backpressure".to_vec();

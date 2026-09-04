@@ -803,6 +803,11 @@ impl TcpConnector {
     /// 2) polls `mio` with a zero timeout
     /// 3) for each event calls `handler` with the appropriate [`PollEvent`]
     /// 4) returns whether any IO events were processed
+    ///
+    /// Writable events trigger retries of queued writes. Because this method
+    /// performs a single non-blocking poll, calling it infrequently can slow
+    /// backlog draining under backpressure, particularly when using small
+    /// socket buffers configured via [`Self::with_socket_buf_size`].
     #[inline]
     pub fn poll_with<F>(&mut self, mut handler: F) -> bool
     where
