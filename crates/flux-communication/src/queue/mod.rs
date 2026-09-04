@@ -1101,6 +1101,12 @@ impl<T: 'static + Copy> Consumer<T> {
         self.should_log = arg;
     }
 
+    /// Returns whether queue overrun logging is enabled for this consumer.
+    #[inline]
+    pub fn logging_enabled(&self) -> bool {
+        self.should_log
+    }
+
     pub fn set_collaborative_group(&mut self, group_label: &'static str) {
         self.bare.set_collaborative_group(group_label);
     }

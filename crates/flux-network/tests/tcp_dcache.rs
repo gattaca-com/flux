@@ -10,7 +10,7 @@ use std::{
 
 use flux::{
     communication::{ShmemData, cleanup_shmem},
-    spine::{DCacheRead, ScopedSpine, SpineAdapter, SpineProducerWithDCache},
+    spine::{ScopedSpine, SpineAdapter, SpineProducerWithDCache},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
 use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
@@ -74,11 +74,10 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
         let count = &mut self.count;
         adapter.consume_with_dcache::<Payload, (), _, _>(
             |msg, bytes| assert_eq!(&msg.0[..], bytes),
-            |result, _| {
-                if let DCacheRead::Ok((msg, ())) = result {
-                    received.lock().unwrap().push(msg);
-                    *count += 1;
-                }
+            |msg, payload, _| {
+                assert_eq!(payload, Some(()));
+                received.lock().unwrap().push(msg);
+                *count += 1;
             },
         );
         if self.count >= self.expected || Instant::now() >= self.deadline {
