@@ -953,6 +953,19 @@ impl NetworkState {
     }
 }
 
+impl Drop for NetworkState {
+    fn drop(&mut self) {
+        // Deregister before closing. On Linux, a duplicated descriptor can
+        // keep an epoll registration alive after the original descriptor closes.
+        for index in 0..self.connections.len() {
+            self.close_connection_socket(index);
+        }
+        for listener in &mut self.listeners {
+            let _ = self.registry.deregister(&mut listener.socket);
+        }
+    }
+}
+
 /// A grouped collection of TCP listeners and persistent outbound endpoints
 /// with an internal nonblocking poll.
 ///
@@ -961,8 +974,8 @@ impl NetworkState {
 /// caller-owned poll instead.
 pub struct TcpNetwork {
     events: Events,
-    poll: Poll,
     core: TcpNetworkCore,
+    poll: Poll,
 }
 
 impl Default for TcpNetwork {
@@ -972,8 +985,8 @@ impl Default for TcpNetwork {
         // This network owns the poll, so its token range starts at zero.
         Self {
             events: Events::with_capacity(EVENTS_CAPACITY),
-            poll,
             core: TcpNetworkCore::new(registry, 0..usize::MAX),
+            poll,
         }
     }
 }
@@ -1149,8 +1162,7 @@ impl TcpNetworkCore {
 /// A polling pass consists of [`Self::pre_poll`], polling, calling
 /// [`Self::handle_event`] for each event in this network's token range, and
 /// [`Self::post_poll`]. The caller owns the poll, event buffer, and timeout.
-/// Dropping this value drops its sockets but does not explicitly deregister
-/// them.
+/// Dropping this value attempts to deregister its sockets before closing them.
 ///
 /// # Example
 ///
@@ -1814,5 +1826,48 @@ mod tests {
         let mut bytes = b"earlier".to_vec();
         let mut payload = PayloadBuf::new(&mut bytes);
         payload.resize(usize::MAX, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_removes_listener_and_endpoint_registrations() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        use flux_timing::{Duration, Repeater};
+
+        use super::{GroupState, NetworkState, TcpGroup};
+
+        fn registered_fds(epoll_fd: i32) -> usize {
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{epoll_fd}"))
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("tfd:"))
+                .count()
+        }
+
+        let poll = Poll::new().unwrap();
+        let epoll_fd = poll.as_raw_fd();
+        let registry = poll.registry().try_clone().unwrap();
+        let mut state = NetworkState::new(registry, 100..200);
+        state.groups.push(GroupState {
+            config: TcpGroupConfig::default(),
+            reconnector: Repeater::every(Duration::from_secs(2)),
+        });
+        let group = TcpGroup(0);
+        state.listen(group, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let addr = state.listeners[0].socket.local_addr().unwrap();
+        let _endpoint = state.connect(group, addr);
+        assert_eq!(registered_fds(epoll_fd), 2);
+
+        // Keep the listener's file description alive after its mio socket drops.
+        // SAFETY: the listener owns this descriptor for the duration of the call.
+        let dup_fd = unsafe { libc::dup(state.listeners[0].socket.as_raw_fd()) };
+        assert!(dup_fd >= 0);
+        // SAFETY: dup_fd is valid after the check above, and ownership is
+        // transferred exactly once.
+        let _dup = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+
+        drop(state);
+        assert_eq!(registered_fds(epoll_fd), 0);
     }
 }
