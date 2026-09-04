@@ -728,3 +728,14 @@ fn tcp_network_client_is_wire_compatible_with_tcp_connector_server() {
     }
     assert!(contains(&network_messages, RESPONSE));
 }
+
+#[test]
+fn owned_poll_assigns_tokens_from_zero() {
+    let mut network = TcpNetwork::default();
+    let group = network.add_group(TcpGroupConfig::default());
+    let first = network.connect(group, unused_addr());
+    assert_eq!(first, mio::Token(0));
+    network.listen(group, unused_addr()).unwrap();
+    let second = network.connect(group, unused_addr());
+    assert_eq!(second, mio::Token(2), "the listener consumed token 1 from the same counter");
+}
