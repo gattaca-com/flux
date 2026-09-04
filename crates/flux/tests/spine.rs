@@ -40,6 +40,25 @@ struct TestSpine {
     pub qb: SpineQueue<MsgB>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+struct DCacheMsg(u8);
+
+#[from_spine("dcache-consume-api-test")]
+#[derive(Debug)]
+struct DCacheTestSpine {
+    pub tile_info: ShmemData<TileInfo>,
+    #[queue(size(16), mtu(64))]
+    pub messages: SpineQueue<DCacheMsg>,
+}
+
+#[derive(Clone, Copy)]
+struct DCacheTestTile;
+
+impl Tile<DCacheTestSpine> for DCacheTestTile {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<DCacheTestSpine>) {}
+}
+
 #[derive(Clone, Copy, Default)]
 struct Writer;
 
@@ -166,6 +185,55 @@ fn all_shmem_files_reside_in_base_dir() {
             base.display()
         );
     }
+
+    cleanup_shmem(base);
+}
+
+#[test]
+fn dcache_consume_handles_optional_payload_and_ignores_empty() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let base = tmp.path();
+    let mut spine = DCacheTestSpine::new_with_base_dir(base, None);
+    let mut adapter = SpineAdapter::connect_tile(&DCacheTestTile, &mut spine);
+
+    let mut empty_reads = 0;
+    let mut empty_handles = 0;
+    adapter.consume_with_dcache::<DCacheMsg, Vec<u8>, _, _>(
+        |_, _| {
+            empty_reads += 1;
+            Vec::new()
+        },
+        |_, _, _| empty_handles += 1,
+    );
+    assert_eq!(empty_reads, 0);
+    assert_eq!(empty_handles, 0);
+
+    adapter
+        .produce_with_dcache(
+            DCacheMsg(1),
+            Some((3, |payload: &mut [u8]| payload.copy_from_slice(b"one"))),
+        )
+        .unwrap();
+    adapter.produce_with_dcache(DCacheMsg(2), None::<(usize, fn(&mut [u8]))>).unwrap();
+
+    let mut read_calls = 0;
+    let mut handled = Vec::new();
+    adapter.consume_with_dcache(
+        |_, payload| {
+            read_calls += 1;
+            payload.to_vec()
+        },
+        |msg, payload, _| handled.push((msg, payload)),
+    );
+
+    assert_eq!(read_calls, 1);
+    assert_eq!(handled, vec![(DCacheMsg(1), Some(b"one".to_vec())), (DCacheMsg(2), None)]);
+
+    adapter.consume_with_dcache(
+        |_, payload| payload.to_vec(),
+        |msg, payload, _| handled.push((msg, payload)),
+    );
+    assert_eq!(handled.len(), 2, "empty queue must not call either closure");
 
     cleanup_shmem(base);
 }
