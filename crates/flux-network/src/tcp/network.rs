@@ -1110,7 +1110,7 @@ impl TcpNetworkCore {
 
     /// Serializes multiple payloads once and sends the batch to every
     /// connected member of `group`. Framing, size limits, and skipping of
-    /// invalid payloads follow [`TcpNetwork::send_many_with`]; each member
+    /// invalid payloads follow [`Self::send_many_with`]; each member
     /// receives the batch in one socket write when it has no backlog. The
     /// closure is not called when the group has no connected member. Returns
     /// the number of recipients attempted.
@@ -1151,6 +1151,45 @@ impl TcpNetworkCore {
 /// [`Self::post_poll`]. The caller owns the poll, event buffer, and timeout.
 /// Dropping this value drops its sockets but does not explicitly deregister
 /// them.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use flux_network::tcp::{TcpEvent, TcpGroupConfig, TcpNetworkWithExternalPoll};
+/// use mio::{Events, Poll};
+///
+/// // Every source sharing the poll must use non-overlapping token range.
+/// const NETWORK_TOKENS: std::ops::Range<usize> = (1 << 48)..(2 << 48);
+///
+/// let mut poll = Poll::new().unwrap();
+/// let mut events = Events::with_capacity(128);
+/// let mut network = TcpNetworkWithExternalPoll::new(
+///     poll.registry().try_clone().unwrap(),
+///     NETWORK_TOKENS,
+/// );
+/// let group = network.add_group(TcpGroupConfig::default());
+/// network.listen(group, "127.0.0.1:9099".parse().unwrap()).unwrap();
+///
+/// let mut handle_tcp_event = |_event: TcpEvent<'_>| {
+///     // Process the event here. Copy payload bytes if they must outlive the
+///     // callback.
+/// };
+///
+/// loop {
+///     network.pre_poll(&mut handle_tcp_event);
+///     poll.poll(&mut events, Some(Duration::from_millis(1))).unwrap();
+///     for event in &events {
+///         if NETWORK_TOKENS.contains(&event.token().0) {
+///             network.handle_event(event, &mut handle_tcp_event);
+///         } else {
+///             // Route the event to another source registered with this poll.
+///         }
+///     }
+///     network.post_poll(&mut handle_tcp_event);
+/// }
+/// ```
 pub struct TcpNetworkWithExternalPoll {
     core: TcpNetworkCore,
 }

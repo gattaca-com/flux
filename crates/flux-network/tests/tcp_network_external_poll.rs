@@ -249,3 +249,27 @@ fn exhausted_token_range_panics_naming_the_range() {
 
     let _ = network.connect(group, unused_addr());
 }
+
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "lies outside this network's token range"))]
+fn foreign_token_trips_the_containment_assert() {
+    let mut poll = Poll::new().unwrap();
+    let mut network =
+        TcpNetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 100..200);
+
+    // Register a readiness source outside the network's token range.
+    let mut listener = mio::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    poll.registry().register(&mut listener, Token(7), mio::Interest::READABLE).unwrap();
+    let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+    let mut events = Events::with_capacity(4);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while events.is_empty() && Instant::now() < deadline {
+        poll.poll(&mut events, Some(Duration::from_millis(10))).unwrap();
+    }
+    let event = events.iter().next().expect("listener readiness did not arrive");
+    assert_eq!(event.token(), Token(7));
+
+    // Debug builds reject the token; release builds emit no TcpEvent for it.
+    network.handle_event(event, &mut |_| panic!("no TcpEvent expected for a foreign token"));
+}
