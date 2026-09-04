@@ -1,6 +1,6 @@
 use std::{
     io::{self, IoSlice, Read, Write},
-    net::{Shutdown, SocketAddr},
+    net::{Shutdown, SocketAddr}, ops::{Deref, DerefMut},
 };
 
 use flux_communication::Timer;
@@ -182,7 +182,7 @@ struct PendingDisconnect {
 }
 
 struct NetworkState {
-    poll: Poll,
+    registry: Registry,
     groups: Vec<GroupState>,
     listeners: Vec<Listener>,
     connections: Vec<Connection>,
@@ -192,22 +192,20 @@ struct NetworkState {
     send_payload: Vec<u8>,
 }
 
-impl Default for NetworkState {
-    fn default() -> Self {
+impl NetworkState {
+    fn new(registry: Registry, next_token: usize) -> Self {
         Self {
-            poll: Poll::new().expect("couldn't set up a poll for tcp network"),
+            registry,
             groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
             listeners: Vec::with_capacity(INITIAL_LISTENER_CAPACITY),
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             pending_disconnects: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
-            next_token: 0,
+            next_token,
             send_header: [0; FRAME_HEADER_SIZE],
             send_payload: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
         }
     }
-}
 
-impl NetworkState {
     fn next_token(&mut self) -> Token {
         let token = Token(self.next_token);
         self.next_token = self.next_token.checked_add(1).expect("tcp token space exhausted");
@@ -224,7 +222,7 @@ impl NetworkState {
         }
         let mut socket = TcpListener::bind(addr)?;
         let token = self.next_token();
-        self.poll.registry().register(&mut socket, token, Interest::READABLE)?;
+        self.registry.register(&mut socket, token, Interest::READABLE)?;
         self.listeners.push(Listener { token, group, socket });
         Ok(())
     }
@@ -269,7 +267,7 @@ impl NetworkState {
         if let Some(size) = socket_buf_size {
             set_socket_buf_size(&socket, size);
         }
-        if let Err(err) = self.poll.registry().register(&mut socket, token, Interest::WRITABLE) {
+        if let Err(err) = self.registry.register(&mut socket, token, Interest::WRITABLE) {
             warn!(?err, %peer_addr, "couldn't register connecting tcp stream");
             let _ = socket.shutdown(Shutdown::Both);
             return;
@@ -347,7 +345,7 @@ impl NetworkState {
             let Err(err) = socket.set_nodelay(true)
         {
             warn!(?err, %peer_addr, "couldn't set nodelay on tcp stream");
-            let _ = self.poll.registry().deregister(&mut socket);
+            let _ = self.registry.deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
@@ -355,12 +353,12 @@ impl NetworkState {
             let Err(err) = set_keepalive(&socket)
         {
             warn!(?err, %peer_addr, "couldn't set keepalive on tcp stream");
-            let _ = self.poll.registry().deregister(&mut socket);
+            let _ = self.registry.deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
         set_user_timeout(&socket, config.user_timeout_ms);
-        if let Err(err) = self.poll.registry().reregister(&mut socket, token, Interest::READABLE) {
+        if let Err(err) = self.registry.reregister(&mut socket, token, Interest::READABLE) {
             warn!(?err, %peer_addr, "couldn't register connected tcp stream");
             let _ = socket.shutdown(Shutdown::Both);
             return false;
@@ -374,14 +372,14 @@ impl NetworkState {
                 header
             });
             if stream.write_frame(
-                self.poll.registry(),
+                &self.registry,
                 header.as_ref(),
                 message,
                 config,
                 &mut timers,
             ) == StreamState::Disconnected
             {
-                stream.close(self.poll.registry());
+                stream.close(&self.registry);
                 self.connections[index].timers = timers;
                 return false;
             }
@@ -431,7 +429,7 @@ impl NetworkState {
                 }
                 set_user_timeout(&socket, config.user_timeout_ms);
                 if let Err(err) =
-                    self.poll.registry().register(&mut socket, token, Interest::READABLE)
+                    self.registry.register(&mut socket, token, Interest::READABLE)
                 {
                     warn!(?err, %peer_addr, "couldn't register accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
@@ -453,14 +451,14 @@ impl NetworkState {
                         header
                     });
                     if stream.write_frame(
-                        self.poll.registry(),
+                        &self.registry,
                         header.as_ref(),
                         message,
                         config,
                         &mut timers,
                     ) == StreamState::Disconnected
                     {
-                        stream.close(self.poll.registry());
+                        stream.close(&self.registry);
                         continue;
                     }
                 }
@@ -512,7 +510,7 @@ impl NetworkState {
             let connection = &mut self.connections[index];
             let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
             let state = stream.poll_with(
-                self.poll.registry(),
+                &self.registry,
                 event,
                 config,
                 &mut connection.timers,
@@ -536,12 +534,12 @@ impl NetworkState {
         match old_state {
             ConnectionState::Disconnected => false,
             ConnectionState::Connecting(mut socket) => {
-                let _ = self.poll.registry().deregister(&mut socket);
+                let _ = self.registry.deregister(&mut socket);
                 let _ = socket.shutdown(Shutdown::Both);
                 false
             }
             ConnectionState::Connected(mut stream) => {
-                stream.close(self.poll.registry());
+                stream.close(&self.registry);
                 true
             }
         }
@@ -626,7 +624,7 @@ impl NetworkState {
         let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
         let header = (config.framing == Framing::LengthPrefixed).then_some(&self.send_header);
         let state = stream.write_frame(
-            self.poll.registry(),
+            &self.registry,
             header,
             &self.send_payload,
             config,
@@ -677,7 +675,7 @@ impl NetworkState {
                 let header =
                     (config.framing == Framing::LengthPrefixed).then_some(&self.send_header);
                 stream.write_frame(
-                    self.poll.registry(),
+                    &self.registry,
                     header,
                     &self.send_payload,
                     config,
@@ -730,24 +728,69 @@ impl NetworkState {
     }
 }
 
+pub struct TcpNetwork {
+    events: Events,
+    poll: Poll,
+    raw: TcpNetworkRaw,
+}
+
+impl Default for TcpNetwork {
+    fn default() -> Self {
+        let poll = Poll::new().expect("failed to create poll");
+        let registry = poll.registry().try_clone().expect("failed to clone poll registry");
+        Self { events: Events::with_capacity(EVENTS_CAPACITY), poll, raw: TcpNetworkRaw::new(registry, 0) }
+    }
+}
+
+impl Deref for TcpNetwork {
+    type Target = TcpNetworkRaw;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl DerefMut for TcpNetwork {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.raw
+    }
+}
+
+impl TcpNetwork {
+    pub fn poll_with<F>(&mut self, mut handler: F)
+    where
+        F: for<'a> FnMut(TcpEvent<'a>),
+    {
+        self.raw.state.drain_pending_disconnects(&mut handler);
+        self.raw.state.maybe_reconnect();
+        if let Err(err) = self.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
+            if err.kind() != io::ErrorKind::Interrupted {
+                flux_utils::safe_panic!("couldn't poll tcp network: {err}");
+            }
+            return;
+        }
+        for event in &self.events {
+            self.raw.state.handle_event(event, &mut handler);
+        }
+        self.raw.state.drain_pending_disconnects(&mut handler);
+    }
+}
+
 /// A grouped collection of TCP listeners and persistent outbound endpoints
 /// driven by one nonblocking poll.
 ///
 /// Unlike [`super::TcpConnector`], queued bytes are never retained across a
 /// disconnected socket. Use `TcpConnector` when reconnect backlog replay is
 /// required.
-pub struct TcpNetwork {
-    events: Events,
+pub struct TcpNetworkRaw {
     state: NetworkState,
 }
 
-impl Default for TcpNetwork {
-    fn default() -> Self {
-        Self { events: Events::with_capacity(EVENTS_CAPACITY), state: NetworkState::default() }
+impl TcpNetworkRaw {
+    fn new(registry: Registry, next_token: usize) -> Self {
+        Self { state: NetworkState::new(registry, next_token) }
     }
-}
 
-impl TcpNetwork {
     /// Adds a protocol group and returns its handle.
     #[must_use = "the group handle identifies listeners and outbound endpoints"]
     pub fn add_group(&mut self, config: TcpGroupConfig) -> TcpGroup {
@@ -787,24 +830,6 @@ impl TcpNetwork {
     #[must_use = "the token identifies the persistent outbound endpoint"]
     pub fn connect(&mut self, group: TcpGroup, peer_addr: SocketAddr) -> Token {
         self.state.connect(group, peer_addr)
-    }
-
-    pub fn poll_with<F>(&mut self, mut handler: F)
-    where
-        F: for<'a> FnMut(TcpEvent<'a>),
-    {
-        self.state.drain_pending_disconnects(&mut handler);
-        self.state.maybe_reconnect();
-        if let Err(err) = self.state.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
-            if err.kind() != io::ErrorKind::Interrupted {
-                flux_utils::safe_panic!("couldn't poll tcp network: {err}");
-            }
-            return;
-        }
-        for event in &self.events {
-            self.state.handle_event(event, &mut handler);
-        }
-        self.state.drain_pending_disconnects(&mut handler);
     }
 
     /// Serializes and sends one payload to a connected token. Length-prefixed
@@ -847,6 +872,43 @@ impl TcpNetwork {
     /// the token was found.
     pub fn remove(&mut self, token: Token) -> bool {
         self.state.remove(token)
+    }
+}
+
+pub struct TcpNetworkWithExternalPoll {
+    raw: TcpNetworkRaw,
+}
+
+impl Deref for TcpNetworkWithExternalPoll {
+    type Target = TcpNetworkRaw;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl DerefMut for TcpNetworkWithExternalPoll {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.raw
+    }
+}
+
+impl TcpNetworkWithExternalPoll {
+    pub fn new(registry: Registry, first_token: usize) -> Self {
+        Self { raw: TcpNetworkRaw::new(registry, first_token) }
+    }
+
+    pub fn pre_poll<F>(&mut self, handler: &mut F) where F: for<'a> FnMut(TcpEvent<'a>) {
+        self.raw.state.drain_pending_disconnects(handler);
+        self.raw.state.maybe_reconnect();
+    }
+
+    pub fn post_poll<F>(&mut self, handler: &mut F) where F: for<'a> FnMut(TcpEvent<'a>) {
+        self.raw.state.drain_pending_disconnects(handler);
+    }
+
+    pub fn epoll_event<F>(&mut self, event: &Event, handler: &mut F) where F: for<'a> FnMut(TcpEvent<'a>) {
+        self.raw.state.handle_event(event, handler);
     }
 }
 
