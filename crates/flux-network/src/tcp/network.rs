@@ -953,10 +953,16 @@ impl NetworkState {
     }
 }
 
+/// A grouped collection of TCP listeners and persistent outbound endpoints
+/// with an internal nonblocking poll.
+///
+/// Shared network operations are provided by [`TcpNetworkCore`] through
+/// `Deref`. Use [`TcpNetworkWithExternalPoll`] to register the sockets with a
+/// caller-owned poll instead.
 pub struct TcpNetwork {
     events: Events,
     poll: Poll,
-    raw: TcpNetworkRaw,
+    core: TcpNetworkCore,
 }
 
 impl Default for TcpNetwork {
@@ -967,22 +973,22 @@ impl Default for TcpNetwork {
         Self {
             events: Events::with_capacity(EVENTS_CAPACITY),
             poll,
-            raw: TcpNetworkRaw::new(registry, 0..usize::MAX),
+            core: TcpNetworkCore::new(registry, 0..usize::MAX),
         }
     }
 }
 
 impl Deref for TcpNetwork {
-    type Target = TcpNetworkRaw;
+    type Target = TcpNetworkCore;
 
     fn deref(&self) -> &Self::Target {
-        &self.raw
+        &self.core
     }
 }
 
 impl DerefMut for TcpNetwork {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.raw
+        &mut self.core
     }
 }
 
@@ -991,8 +997,8 @@ impl TcpNetwork {
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
-        self.raw.state.drain_pending_disconnects(&mut handler);
-        self.raw.state.maybe_reconnect();
+        self.core.state.drain_pending_disconnects(&mut handler);
+        self.core.state.maybe_reconnect();
         if let Err(err) = self.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             if err.kind() != io::ErrorKind::Interrupted {
                 flux_utils::safe_panic!("couldn't poll tcp network: {err}");
@@ -1000,23 +1006,26 @@ impl TcpNetwork {
             return;
         }
         for event in &self.events {
-            self.raw.state.handle_event(event, &mut handler);
+            self.core.state.handle_event(event, &mut handler);
         }
-        self.raw.state.drain_pending_disconnects(&mut handler);
+        self.core.state.drain_pending_disconnects(&mut handler);
     }
 }
 
-/// A grouped collection of TCP listeners and persistent outbound endpoints
-/// driven by one nonblocking poll.
+/// Shared state and network operations used by [`TcpNetwork`] and
+/// [`TcpNetworkWithExternalPoll`].
+///
+/// This type stores protocol groups, listeners, and connections, but does not
+/// own or poll a [`Poll`].
 ///
 /// Unlike [`super::TcpConnector`], queued bytes are never retained across a
 /// disconnected socket. Use `TcpConnector` when reconnect backlog replay is
 /// required.
-pub struct TcpNetworkRaw {
+pub struct TcpNetworkCore {
     state: NetworkState,
 }
 
-impl TcpNetworkRaw {
+impl TcpNetworkCore {
     fn new(registry: Registry, tokens: Range<usize>) -> Self {
         Self { state: NetworkState::new(registry, tokens) }
     }
@@ -1135,21 +1144,28 @@ impl TcpNetworkRaw {
     }
 }
 
+/// A TCP network whose sockets are registered with a poll owned by the caller.
+///
+/// A polling pass consists of [`Self::pre_poll`], polling, calling
+/// [`Self::handle_event`] for each event in this network's token range, and
+/// [`Self::post_poll`]. The caller owns the poll, event buffer, and timeout.
+/// Dropping this value drops its sockets but does not explicitly deregister
+/// them.
 pub struct TcpNetworkWithExternalPoll {
-    raw: TcpNetworkRaw,
+    core: TcpNetworkCore,
 }
 
 impl Deref for TcpNetworkWithExternalPoll {
-    type Target = TcpNetworkRaw;
+    type Target = TcpNetworkCore;
 
     fn deref(&self) -> &Self::Target {
-        &self.raw
+        &self.core
     }
 }
 
 impl DerefMut for TcpNetworkWithExternalPoll {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.raw
+        &mut self.core
     }
 }
 
@@ -1161,29 +1177,44 @@ impl TcpNetworkWithExternalPoll {
     /// The caller is responsible for avoiding collisions with other tokens
     /// registered with the same poll.
     pub fn new(registry: Registry, tokens: Range<usize>) -> Self {
-        Self { raw: TcpNetworkRaw::new(registry, tokens) }
+        Self { core: TcpNetworkCore::new(registry, tokens) }
     }
 
+    /// Delivers pending disconnect notifications and attempts due reconnects.
     pub fn pre_poll<F>(&mut self, handler: &mut F)
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
-        self.raw.state.drain_pending_disconnects(handler);
-        self.raw.state.maybe_reconnect();
+        self.core.state.drain_pending_disconnects(handler);
+        self.core.state.maybe_reconnect();
     }
 
+    /// Delivers pending disconnect notifications.
+    ///
+    /// If this step is skipped, notifications remain queued for a later call
+    /// to this method or [`Self::pre_poll`].
     pub fn post_poll<F>(&mut self, handler: &mut F)
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
-        self.raw.state.drain_pending_disconnects(handler);
+        self.core.state.drain_pending_disconnects(handler);
     }
 
-    pub fn epoll_event<F>(&mut self, event: &Event, handler: &mut F)
+    /// Processes one readiness event routed to this network.
+    ///
+    /// The event token must be in the range supplied to [`Self::new`]. This is
+    /// checked by an assertion in debug builds.
+    pub fn handle_event<F>(&mut self, event: &Event, handler: &mut F)
     where
         F: for<'a> FnMut(TcpEvent<'a>),
     {
-        self.raw.state.handle_event(event, handler);
+        debug_assert!(
+            self.core.state.token_range.contains(&event.token().0),
+            "event token {:?} lies outside this network's token range {:?}",
+            event.token(),
+            self.core.state.token_range
+        );
+        self.core.state.handle_event(event, handler);
     }
 }
 
