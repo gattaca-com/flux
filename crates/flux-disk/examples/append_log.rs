@@ -20,7 +20,7 @@ fn main() {
     for line in 0..10 {
         disk.write_with(file, |buf| writeln!(buf, "line {line}").unwrap());
     }
-    disk.sync_all(file);
+    let sync_id = disk.sync_all(file).expect("file is available");
     disk.close(file);
 
     let mut done = false;
@@ -30,13 +30,18 @@ fn main() {
             DiskEvent::Written { offset, len, .. } => {
                 println!("wrote {len} bytes at offset {offset}");
             }
-            DiskEvent::Synced { .. } => println!("synced"),
+            DiskEvent::Synced { operation_id, .. } => {
+                assert_eq!(operation_id, sync_id);
+                println!("synced operation {}", operation_id.get());
+            }
             DiskEvent::Closed { .. } => {
                 println!("closed after writing");
                 done = true;
             }
             DiskEvent::Failed { op, error, .. } => panic!("write phase failed: {op:?}: {error}"),
-            DiskEvent::Read { .. } => unreachable!("no reads issued in the write phase"),
+            DiskEvent::Read { .. } | DiskEvent::Truncated { .. } | DiskEvent::Renamed { .. } => {
+                unreachable!("no reads or structural changes issued in the write phase")
+            }
         });
     }
 
@@ -55,7 +60,10 @@ fn main() {
             }
             DiskEvent::Closed { .. } => done = true,
             DiskEvent::Failed { op, error, .. } => panic!("read phase failed: {op:?}: {error}"),
-            DiskEvent::Written { .. } | DiskEvent::Synced { .. } => {
+            DiskEvent::Written { .. } |
+            DiskEvent::Synced { .. } |
+            DiskEvent::Truncated { .. } |
+            DiskEvent::Renamed { .. } => {
                 unreachable!("no writes or syncs issued in the read phase")
             }
         });

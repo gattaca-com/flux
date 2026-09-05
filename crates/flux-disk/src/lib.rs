@@ -9,11 +9,13 @@
 //! submission ring and reaped from its completion ring without waiting.
 //!
 //! Operations on one file run concurrently, except [`DiskIo::sync_all`],
-//! [`DiskIo::sync_data`] and [`DiskIo::close`], which act as barriers: they
+//! [`DiskIo::sync_data`], [`DiskIo::truncate`], [`DiskIo::rename`] and
+//! [`DiskIo::close`], which act as barriers: they
 //! start only after every earlier operation on that file has completed, so a
-//! sync covers all earlier writes and a close cannot race them. Operations
-//! submitted before the file finished opening are queued and dispatched once
-//! the descriptor is available.
+//! sync covers all earlier writes and structural changes cannot race them.
+//! Truncates and renames additionally prevent later operations from starting
+//! until they complete. Operations submitted before the file finished opening
+//! are queued and dispatched once the descriptor is available.
 
 use std::{
     collections::VecDeque,
@@ -43,6 +45,20 @@ const EMPTY_PATH: &[u8] = b"\0";
 /// Identifies one open (or opening) file. Tokens are never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileToken(usize);
+
+/// Identifies an accepted sync, truncate or rename operation.
+///
+/// Assigned by `DiskIo` and echoed by completion and failure events. IDs are
+/// unique within one `DiskIo` instance and never reused. An ID identifies
+/// queued work; it does not imply that the operation has completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OperationId(u64);
+
+impl OperationId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// How [`DiskIo::open`] opens a file.
 ///
@@ -169,6 +185,8 @@ pub enum FailedOp {
     Read { offset: u64, len: usize },
     Write { offset: u64, len: usize },
     Sync,
+    Truncate { len: u64 },
+    Rename,
     Close,
 }
 
@@ -185,13 +203,18 @@ pub enum DiskEvent<'a> {
     /// A [`DiskIo::sync_all`] or [`DiskIo::sync_data`] barrier finished;
     /// every
     /// write submitted before it is durable.
-    Synced { file: FileToken },
+    Synced { file: FileToken, operation_id: OperationId },
+    /// The file was truncated to `len` bytes.
+    Truncated { file: FileToken, len: u64, operation_id: OperationId },
+    /// The open file was atomically renamed.
+    Renamed { file: FileToken, operation_id: OperationId },
     /// The file was closed and its token retired.
     Closed { file: FileToken },
     /// An operation failed. `Failed { op: FailedOp::Open, .. }` retires the
     /// token and fails every queued operation on it; other failures leave the
-    /// file usable.
-    Failed { file: FileToken, op: FailedOp, error: io::Error },
+    /// file usable. Sync, truncate and rename failures include the ID returned
+    /// when the operation was queued; other operations have no ID.
+    Failed { file: FileToken, op: FailedOp, operation_id: Option<OperationId>, error: io::Error },
 }
 
 enum PendingOp {
@@ -199,16 +222,48 @@ enum PendingOp {
     Read { offset: u64, len: usize, to_end: bool },
     ReadToEnd { offset: u64 },
     Write { buf: Vec<u8>, offset: u64 },
-    Sync { data_only: bool },
+    Sync { data_only: bool, operation_id: OperationId },
+    Truncate { len: u64, operation_id: OperationId },
+    Rename { destination: CString, destination_path: PathBuf, operation_id: OperationId },
     Close,
 }
 
 enum InFlightOp {
-    Open { path: CString, flags: i32, mode: libc::mode_t },
-    Read { buf: Vec<u8>, offset: u64, wanted: usize, have: usize, to_end: bool },
-    Statx { offset: u64, statx: Box<MaybeUninit<libc::statx>> },
-    Write { buf: Vec<u8>, offset: u64, written: usize },
-    Sync { data_only: bool },
+    Open {
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
+    },
+    Read {
+        buf: Vec<u8>,
+        offset: u64,
+        wanted: usize,
+        have: usize,
+        to_end: bool,
+    },
+    Statx {
+        offset: u64,
+        statx: Box<MaybeUninit<libc::statx>>,
+    },
+    Write {
+        buf: Vec<u8>,
+        offset: u64,
+        written: usize,
+    },
+    Sync {
+        data_only: bool,
+        operation_id: OperationId,
+    },
+    Truncate {
+        len: u64,
+        operation_id: OperationId,
+    },
+    Rename {
+        source: CString,
+        destination: CString,
+        destination_path: PathBuf,
+        operation_id: OperationId,
+    },
     Close,
 }
 
@@ -224,6 +279,10 @@ struct File {
     closing: bool,
     write_cursor: u64,
     in_flight: usize,
+    // Set by `submit_op` while a truncate or rename is in flight.
+    // `dispatch_pending` pauses this file's queue until `finish_op` clears
+    // it on completion, whether the operation succeeded or failed.
+    exclusive_in_flight: bool,
     queue: VecDeque<PendingOp>,
 }
 
@@ -250,6 +309,7 @@ pub struct DiskIo {
     completions: Vec<(u64, i32)>,
     buffer_pool: Vec<Vec<u8>>,
     next_token: usize,
+    next_operation_id: u64,
     need_submit: bool,
     last_pending_warning: Option<Instant>,
 }
@@ -279,6 +339,7 @@ impl DiskIo {
             completions: Vec::with_capacity(INITIAL_IN_FLIGHT_CAPACITY),
             buffer_pool: Vec::new(),
             next_token: 0,
+            next_operation_id: 0,
             need_submit: false,
             last_pending_warning: None,
         })
@@ -288,17 +349,32 @@ impl DiskIo {
     /// queue behind the open and dispatch once [`DiskEvent::Opened`] fires.
     /// If the open fails, every queued operation fails with `EBADF`.
     pub fn open<P: AsRef<Path>>(&mut self, path: P, options: OpenOptions) -> io::Result<FileToken> {
-        let path = path.as_ref();
+        self.open_with_flags(path.as_ref(), options.flags()?, options.mode as libc::mode_t)
+    }
+
+    /// Starts opening a directory for use with [`Self::sync_all`].
+    ///
+    /// A directory sync makes a completed rename durable. When a rename moves
+    /// a file between directories, both directories must be synced. Directory
+    /// operations are not ordered with operations on other file tokens, so
+    /// queue the sync after receiving [`DiskEvent::Renamed`].
+    pub fn open_directory<P: AsRef<Path>>(&mut self, path: P) -> io::Result<FileToken> {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        self.open_with_flags(path.as_ref(), flags, 0)
+    }
+
+    fn open_with_flags(
+        &mut self,
+        path: &Path,
+        flags: i32,
+        mode: libc::mode_t,
+    ) -> io::Result<FileToken> {
         let cpath = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))?;
         let token = FileToken(self.next_token);
         self.next_token = self.next_token.checked_add(1).expect("file token space exhausted");
         let mut queue = VecDeque::new();
-        queue.push_back(PendingOp::Open {
-            path: cpath,
-            flags: options.flags()?,
-            mode: options.mode as libc::mode_t,
-        });
+        queue.push_back(PendingOp::Open { path: cpath, flags, mode });
         self.files.push(File {
             token,
             path: path.to_path_buf(),
@@ -306,6 +382,7 @@ impl DiskIo {
             closing: false,
             write_cursor: 0,
             in_flight: 0,
+            exclusive_in_flight: false,
             queue,
         });
         self.note_enqueued();
@@ -397,20 +474,66 @@ impl DiskIo {
         true
     }
 
+    /// Queues an `ftruncate` barrier after all earlier operations on `file`.
+    /// Later operations do not start until the truncate completes. The append
+    /// cursor is unchanged; use [`Self::set_write_cursor`] when repairing an
+    /// append-only file. Requires Linux 6.9 or newer.
+    ///
+    /// Returns an ID echoed by its completion or failure event, or `None` for
+    /// unknown or closing tokens.
+    pub fn truncate(&mut self, file: FileToken, len: u64) -> Option<OperationId> {
+        self.enqueue_operation(file, |operation_id| PendingOp::Truncate { len, operation_id })
+    }
+
+    /// Queues an atomic rename of the open file after all earlier operations
+    /// on it. Later operations do not start until the rename completes.
+    ///
+    /// A successful rename updates the path associated with `file`, but is not
+    /// durable until the affected parent directories have been synced.
+    ///
+    /// Returns an ID echoed by its completion or failure event, or `None` for
+    /// unknown or closing tokens. A destination containing a nul byte returns
+    /// an error without queueing an operation.
+    pub fn rename<P: AsRef<Path>>(
+        &mut self,
+        file: FileToken,
+        destination: P,
+    ) -> io::Result<Option<OperationId>> {
+        let destination_path = destination.as_ref();
+        let destination = CString::new(destination_path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))?;
+        Ok(self.enqueue_operation(file, |operation_id| PendingOp::Rename {
+            destination,
+            destination_path: destination_path.to_path_buf(),
+            operation_id,
+        }))
+    }
+
     /// Queues a full-integrity `fsync` barrier, the durability of
     /// [`std::fs::File::sync_all`]: it starts only after every earlier
     /// operation on this file completed, and later operations start only
-    /// after the barrier was handed to the kernel. Returns `false` for
+    /// after the barrier was handed to the kernel.
+    ///
+    /// Returns an ID echoed by its completion or failure event, or `None` for
     /// unknown or closing tokens.
-    pub fn sync_all(&mut self, file: FileToken) -> bool {
-        self.push_sync(file, false)
+    pub fn sync_all(&mut self, file: FileToken) -> Option<OperationId> {
+        self.enqueue_operation(file, |operation_id| PendingOp::Sync {
+            data_only: false,
+            operation_id,
+        })
     }
 
     /// Queues an `fdatasync` barrier, the durability of
     /// [`std::fs::File::sync_data`]; like [`DiskIo::sync_all`] without
     /// flushing file metadata timestamps.
-    pub fn sync_data(&mut self, file: FileToken) -> bool {
-        self.push_sync(file, true)
+    ///
+    /// Returns an ID echoed by its completion or failure event, or `None` for
+    /// unknown or closing tokens.
+    pub fn sync_data(&mut self, file: FileToken) -> Option<OperationId> {
+        self.enqueue_operation(file, |operation_id| PendingOp::Sync {
+            data_only: true,
+            operation_id,
+        })
     }
 
     /// Queues a close barrier after every earlier operation on this file and
@@ -442,11 +565,18 @@ impl DiskIo {
         self.drain_completions(&mut handler);
     }
 
-    fn push_sync(&mut self, file: FileToken, data_only: bool) -> bool {
-        let Some(state) = self.usable_file_mut(file) else { return false };
-        state.queue.push_back(PendingOp::Sync { data_only });
+    fn enqueue_operation(
+        &mut self,
+        file: FileToken,
+        make_op: impl FnOnce(OperationId) -> PendingOp,
+    ) -> Option<OperationId> {
+        let operation_id = OperationId(self.next_operation_id);
+        let state = self.usable_file_mut(file)?;
+        let next_id = operation_id.0.checked_add(1).expect("disk operation id space exhausted");
+        state.queue.push_back(make_op(operation_id));
+        self.next_operation_id = next_id;
         self.note_enqueued();
-        true
+        Some(operation_id)
     }
 
     fn usable_file_mut(&mut self, token: FileToken) -> Option<&mut File> {
@@ -512,15 +642,19 @@ impl DiskIo {
                     return;
                 }
                 let file = &self.files[file_index];
+                if file.exclusive_in_flight {
+                    break;
+                }
                 let Some(head) = file.queue.front() else { break };
                 let ready = match head {
                     PendingOp::Open { .. } => true,
                     PendingOp::Read { .. } |
                     PendingOp::ReadToEnd { .. } |
                     PendingOp::Write { .. } => file.fd.is_some(),
-                    PendingOp::Sync { .. } | PendingOp::Close => {
-                        file.fd.is_some() && file.in_flight == 0
-                    }
+                    PendingOp::Sync { .. } |
+                    PendingOp::Truncate { .. } |
+                    PendingOp::Rename { .. } |
+                    PendingOp::Close => file.fd.is_some() && file.in_flight == 0,
                 };
                 if !ready {
                     break;
@@ -535,6 +669,7 @@ impl DiskIo {
 
     fn submit_op(&mut self, file_index: usize, op: PendingOp) {
         let token = self.files[file_index].token;
+        let exclusive = matches!(&op, PendingOp::Truncate { .. } | PendingOp::Rename { .. });
         let op = match op {
             PendingOp::Open { path, flags, mode } => InFlightOp::Open { path, flags, mode },
             PendingOp::Read { offset, len, to_end } => InFlightOp::Read {
@@ -548,11 +683,20 @@ impl DiskIo {
                 InFlightOp::Statx { offset, statx: Box::new(MaybeUninit::uninit()) }
             }
             PendingOp::Write { buf, offset } => InFlightOp::Write { buf, offset, written: 0 },
-            PendingOp::Sync { data_only } => InFlightOp::Sync { data_only },
+            PendingOp::Sync { data_only, operation_id } => {
+                InFlightOp::Sync { data_only, operation_id }
+            }
+            PendingOp::Truncate { len, operation_id } => InFlightOp::Truncate { len, operation_id },
+            PendingOp::Rename { destination, destination_path, operation_id } => {
+                let source = CString::new(self.files[file_index].path.as_os_str().as_bytes())
+                    .expect("an opened path cannot contain a nul byte");
+                InFlightOp::Rename { source, destination, destination_path, operation_id }
+            }
             PendingOp::Close => InFlightOp::Close,
         };
         let slot = self.alloc_slot(InFlight { file: token, op });
         self.files[file_index].in_flight += 1;
+        self.files[file_index].exclusive_in_flight = exclusive;
         self.in_flight_count += 1;
         self.push_slot(slot as u64);
     }
@@ -598,7 +742,7 @@ impl DiskIo {
                     .offset(*offset + *written as u64)
                     .build()
             }
-            InFlightOp::Sync { data_only } => {
+            InFlightOp::Sync { data_only, .. } => {
                 let fd = fd.expect("sync dispatched without an open fd");
                 let mut sync = opcode::Fsync::new(types::Fd(fd));
                 if *data_only {
@@ -606,6 +750,17 @@ impl DiskIo {
                 }
                 sync.build()
             }
+            InFlightOp::Truncate { len, .. } => {
+                let fd = fd.expect("truncate dispatched without an open fd");
+                opcode::Ftruncate::new(types::Fd(fd), *len).build()
+            }
+            InFlightOp::Rename { source, destination, .. } => opcode::RenameAt::new(
+                types::Fd(libc::AT_FDCWD),
+                source.as_ptr(),
+                types::Fd(libc::AT_FDCWD),
+                destination.as_ptr(),
+            )
+            .build(),
             InFlightOp::Close => {
                 let fd = fd.expect("close dispatched without an open fd");
                 opcode::Close::new(types::Fd(fd)).build()
@@ -687,13 +842,47 @@ impl DiskIo {
             InFlightOp::Statx { offset, statx } => {
                 self.complete_statx(user_data, file_index, offset, statx, result);
             }
-            InFlightOp::Sync { .. } => {
+            InFlightOp::Sync { operation_id, .. } => {
                 self.finish_op(slot, file_index);
                 if result < 0 {
                     let error = io::Error::from_raw_os_error(-result);
-                    handler(DiskEvent::Failed { file: token, op: FailedOp::Sync, error });
+                    handler(DiskEvent::Failed {
+                        file: token,
+                        op: FailedOp::Sync,
+                        operation_id: Some(operation_id),
+                        error,
+                    });
                 } else {
-                    handler(DiskEvent::Synced { file: token });
+                    handler(DiskEvent::Synced { file: token, operation_id });
+                }
+            }
+            InFlightOp::Truncate { len, operation_id } => {
+                self.finish_op(slot, file_index);
+                if result < 0 {
+                    let error = io::Error::from_raw_os_error(-result);
+                    handler(DiskEvent::Failed {
+                        file: token,
+                        op: FailedOp::Truncate { len },
+                        operation_id: Some(operation_id),
+                        error,
+                    });
+                } else {
+                    handler(DiskEvent::Truncated { file: token, len, operation_id });
+                }
+            }
+            InFlightOp::Rename { destination_path, operation_id, .. } => {
+                self.finish_op(slot, file_index);
+                if result < 0 {
+                    let error = io::Error::from_raw_os_error(-result);
+                    handler(DiskEvent::Failed {
+                        file: token,
+                        op: FailedOp::Rename,
+                        operation_id: Some(operation_id),
+                        error,
+                    });
+                } else {
+                    self.files[file_index].path = destination_path;
+                    handler(DiskEvent::Renamed { file: token, operation_id });
                 }
             }
             InFlightOp::Close => {
@@ -703,7 +892,12 @@ impl DiskIo {
                     handler(DiskEvent::Closed { file: token });
                 } else {
                     let error = io::Error::from_raw_os_error(-result);
-                    handler(DiskEvent::Failed { file: token, op: FailedOp::Close, error });
+                    handler(DiskEvent::Failed {
+                        file: token,
+                        op: FailedOp::Close,
+                        operation_id: None,
+                        error,
+                    });
                 }
                 self.remove_file(file_index);
             }
@@ -726,7 +920,12 @@ impl DiskIo {
                 %error,
                 "couldn't open file"
             );
-            handler(DiskEvent::Failed { file: token, op: FailedOp::Open, error });
+            handler(DiskEvent::Failed {
+                file: token,
+                op: FailedOp::Open,
+                operation_id: None,
+                error,
+            });
             self.fail_queued(file_index, handler);
             self.remove_file(file_index);
         }
@@ -801,7 +1000,7 @@ impl DiskIo {
                     self.finish_op(slot, file_index);
                     let error = io::Error::from_raw_os_error(-result);
                     let op = FailedOp::Read { offset, len: wanted };
-                    handler(DiskEvent::Failed { file: token, op, error });
+                    handler(DiskEvent::Failed { file: token, op, operation_id: None, error });
                     self.recycle(buf);
                     return;
                 }
@@ -838,7 +1037,7 @@ impl DiskIo {
                         io::Error::from_raw_os_error(-result)
                     };
                     let op = FailedOp::Write { offset, len: buf.len() };
-                    handler(DiskEvent::Failed { file: token, op, error });
+                    handler(DiskEvent::Failed { file: token, op, operation_id: None, error });
                     self.recycle(buf);
                     return;
                 }
@@ -862,6 +1061,9 @@ impl DiskIo {
     fn finish_op(&mut self, slot: usize, file_index: usize) {
         self.free_slots.push(slot);
         self.files[file_index].in_flight -= 1;
+        if self.files[file_index].in_flight == 0 {
+            self.files[file_index].exclusive_in_flight = false;
+        }
         self.in_flight_count -= 1;
     }
 
@@ -872,28 +1074,33 @@ impl DiskIo {
         let token = self.files[file_index].token;
         while let Some(op) = self.files[file_index].queue.pop_front() {
             self.pending_count -= 1;
-            let failed = match op {
-                PendingOp::Open { .. } => FailedOp::Open,
-                PendingOp::Read { offset, len, .. } => FailedOp::Read { offset, len },
+            let (failed, operation_id) = match op {
+                PendingOp::Open { .. } => (FailedOp::Open, None),
+                PendingOp::Read { offset, len, .. } => (FailedOp::Read { offset, len }, None),
                 PendingOp::ReadToEnd { offset } => {
-                    FailedOp::Read { offset, len: READ_TO_END_CHUNK }
+                    (FailedOp::Read { offset, len: READ_TO_END_CHUNK }, None)
                 }
                 PendingOp::Write { buf, offset } => {
                     let len = buf.len();
                     self.recycle(buf);
-                    FailedOp::Write { offset, len }
+                    (FailedOp::Write { offset, len }, None)
                 }
-                PendingOp::Sync { .. } => FailedOp::Sync,
-                PendingOp::Close => FailedOp::Close,
+                PendingOp::Sync { operation_id, .. } => (FailedOp::Sync, Some(operation_id)),
+                PendingOp::Truncate { len, operation_id } => {
+                    (FailedOp::Truncate { len }, Some(operation_id))
+                }
+                PendingOp::Rename { operation_id, .. } => (FailedOp::Rename, Some(operation_id)),
+                PendingOp::Close => (FailedOp::Close, None),
             };
             let error = io::Error::from_raw_os_error(libc::EBADF);
-            handler(DiskEvent::Failed { file: token, op: failed, error });
+            handler(DiskEvent::Failed { file: token, op: failed, operation_id, error });
         }
     }
 
     fn remove_file(&mut self, file_index: usize) {
         let file = &self.files[file_index];
         flux_utils::safe_assert!(file.in_flight == 0);
+        flux_utils::safe_assert!(!file.exclusive_in_flight);
         flux_utils::safe_assert!(file.queue.is_empty());
         self.files.swap_remove(file_index);
     }
@@ -957,7 +1164,8 @@ mod tests {
     };
 
     use super::{
-        DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions, READ_TO_END_CHUNK,
+        DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions, OperationId,
+        READ_TO_END_CHUNK,
     };
 
     fn overwrite() -> OpenOptions {
@@ -969,9 +1177,11 @@ mod tests {
         Opened(FileToken),
         Read { file: FileToken, offset: u64, payload: Vec<u8>, eof: bool },
         Written { file: FileToken, offset: u64, len: usize },
-        Synced(FileToken),
+        Synced(FileToken, OperationId),
+        Truncated { file: FileToken, len: u64, operation_id: OperationId },
+        Renamed { file: FileToken, operation_id: OperationId },
         Closed(FileToken),
-        Failed { file: FileToken, op: FailedOp },
+        Failed { file: FileToken, op: FailedOp, operation_id: Option<OperationId> },
     }
 
     impl From<DiskEvent<'_>> for Ev {
@@ -982,9 +1192,15 @@ mod tests {
                     Self::Read { file, offset, payload: payload.to_vec(), eof }
                 }
                 DiskEvent::Written { file, offset, len } => Self::Written { file, offset, len },
-                DiskEvent::Synced { file } => Self::Synced(file),
+                DiskEvent::Synced { file, operation_id } => Self::Synced(file, operation_id),
+                DiskEvent::Truncated { file, len, operation_id } => {
+                    Self::Truncated { file, len, operation_id }
+                }
+                DiskEvent::Renamed { file, operation_id } => Self::Renamed { file, operation_id },
                 DiskEvent::Closed { file } => Self::Closed(file),
-                DiskEvent::Failed { file, op, .. } => Self::Failed { file, op },
+                DiskEvent::Failed { file, op, operation_id, .. } => {
+                    Self::Failed { file, op, operation_id }
+                }
             }
         }
     }
@@ -1006,14 +1222,15 @@ mod tests {
         assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"alpha")));
         assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"beta")));
         assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"gamma")));
-        assert!(disk.sync_all(file));
+        let sync_id = disk.sync_all(file).unwrap();
         assert!(disk.close(file));
 
         let mut events = Vec::new();
         drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
 
         assert_eq!(events[0], Ev::Opened(file));
-        let synced_at = events.iter().position(|event| *event == Ev::Synced(file)).unwrap();
+        let synced_at =
+            events.iter().position(|event| *event == Ev::Synced(file, sync_id)).unwrap();
         for (offset, len) in [(0, 5), (5, 4), (9, 5)] {
             let written = Ev::Written { file, offset, len };
             let written_at = events.iter().position(|event| *event == written).unwrap();
@@ -1095,6 +1312,7 @@ mod tests {
             closing: false,
             write_cursor: 0,
             in_flight: 1,
+            exclusive_in_flight: false,
             queue: std::collections::VecDeque::new(),
         });
         disk.slab.push(None);
@@ -1133,15 +1351,21 @@ mod tests {
         let mut disk = DiskIo::default();
         let file = disk.open(&path, overwrite()).unwrap();
         assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"data")));
+        let sync_id = disk.sync_data(file).unwrap();
+        let truncate_id = disk.truncate(file, 2).unwrap();
+        let rename_id = disk.rename(file, dir.path().join("renamed.bin")).unwrap().unwrap();
         assert!(disk.close(file));
 
         let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.len() >= 3);
+        drive(&mut disk, &mut events, |events| events.len() >= 6);
 
         assert_eq!(events, vec![
-            Ev::Failed { file, op: FailedOp::Open },
-            Ev::Failed { file, op: FailedOp::Write { offset: 0, len: 4 } },
-            Ev::Failed { file, op: FailedOp::Close },
+            Ev::Failed { file, op: FailedOp::Open, operation_id: None },
+            Ev::Failed { file, op: FailedOp::Write { offset: 0, len: 4 }, operation_id: None },
+            Ev::Failed { file, op: FailedOp::Sync, operation_id: Some(sync_id) },
+            Ev::Failed { file, op: FailedOp::Truncate { len: 2 }, operation_id: Some(truncate_id) },
+            Ev::Failed { file, op: FailedOp::Rename, operation_id: Some(rename_id) },
+            Ev::Failed { file, op: FailedOp::Close, operation_id: None },
         ]);
         assert!(!disk.write_with(file, |buf| buf.push(1)));
         assert!(disk.is_idle());
@@ -1154,15 +1378,112 @@ mod tests {
         let mut disk = DiskIo::default();
         let file = disk.open(&path, overwrite()).unwrap();
         assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"aaaa")));
-        assert!(disk.sync_all(file));
+        disk.sync_all(file).unwrap();
         assert!(disk.write_at_with(file, 1, |buf| buf.extend_from_slice(b"bb")));
-        assert!(disk.sync_data(file));
+        disk.sync_data(file).unwrap();
         assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"cccc")));
         assert!(disk.close(file));
 
         let mut events = Vec::new();
         drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
         assert_eq!(fs::read(&path).unwrap(), b"abbacccc");
+    }
+
+    #[test]
+    fn sync_echoes_returned_operation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskIo::default();
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let first = disk.open(dir.path().join("first.bin"), overwrite()).unwrap();
+            let second = disk.open(dir.path().join("second.bin"), overwrite()).unwrap();
+            assert!(disk.write_with(first, |buf| buf.extend_from_slice(b"durable")));
+            let first_id = disk.sync_data(first).unwrap();
+            let second_id = disk.sync_all(second).unwrap();
+            for id in [first_id, second_id] {
+                assert!(seen_ids.insert(id), "operation IDs must not be reused");
+            }
+            assert!(disk.close(first));
+            assert!(disk.close(second));
+            drive(&mut disk, &mut events, |events| {
+                events.contains(&Ev::Closed(first)) && events.contains(&Ev::Closed(second))
+            });
+            assert!(events.contains(&Ev::Synced(first, first_id)));
+            assert!(events.contains(&Ev::Synced(second, second_id)));
+        }
+    }
+
+    #[test]
+    fn failed_operations_echo_returned_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.bin");
+        fs::write(&path, b"unchanged").unwrap();
+        let mut disk = DiskIo::default();
+        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+        let truncate_id = disk.truncate(file, 0).unwrap();
+        let rename_id = disk.rename(file, dir.path().join("missing/file.bin")).unwrap().unwrap();
+        assert_ne!(truncate_id, rename_id);
+        assert!(disk.close(file));
+
+        let mut events = Vec::new();
+        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+        assert_eq!(events, vec![
+            Ev::Opened(file),
+            Ev::Failed { file, op: FailedOp::Truncate { len: 0 }, operation_id: Some(truncate_id) },
+            Ev::Failed { file, op: FailedOp::Rename, operation_id: Some(rename_id) },
+            Ev::Closed(file),
+        ]);
+        assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn truncate_blocks_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repaired.bin");
+        fs::write(&path, b"valid-torn-tail").unwrap();
+        let mut disk = DiskIo::default();
+        let file = disk.open(&path, OpenOptions::new().read(true).write(true)).unwrap();
+        assert!(disk.set_write_cursor(file, 5));
+        let operation_id = disk.truncate(file, 5).unwrap();
+        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"-next")));
+        assert!(disk.close(file));
+
+        let mut events = Vec::new();
+        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+
+        let truncated = Ev::Truncated { file, len: 5, operation_id };
+        let truncated_at = events.iter().position(|event| *event == truncated).unwrap();
+        let written = Ev::Written { file, offset: 5, len: 5 };
+        let written_at = events.iter().position(|event| *event == written).unwrap();
+        assert!(truncated_at < written_at, "write completed before truncate: {events:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"valid-next");
+    }
+
+    #[test]
+    fn rename_then_directory_sync_reports_operation_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("wal.tmp");
+        let destination = dir.path().join("wal");
+        let mut disk = DiskIo::default();
+        let file = disk.open(&source, overwrite()).unwrap();
+        let directory = disk.open_directory(dir.path()).unwrap();
+        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"complete")));
+        disk.sync_data(file).unwrap();
+        let rename_id = disk.rename(file, &destination).unwrap().unwrap();
+        assert!(disk.close(file));
+
+        let mut events = Vec::new();
+        let renamed = Ev::Renamed { file, operation_id: rename_id };
+        drive(&mut disk, &mut events, |events| events.contains(&renamed));
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"complete");
+
+        let directory_sync_id = disk.sync_all(directory).unwrap();
+        assert!(disk.close(directory));
+        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(directory)));
+        assert!(events.contains(&Ev::Synced(directory, directory_sync_id)));
+        assert!(disk.is_idle());
     }
 
     #[test]
@@ -1215,13 +1536,37 @@ mod tests {
         assert!(!disk.write_at_with(file, 0, |buf| buf.push(1)));
         assert!(!disk.read_at(file, 0, 1));
         assert!(!disk.read_to_end(file, 0));
-        assert!(!disk.sync_all(file));
+        for token in [file, FileToken(usize::MAX)] {
+            assert!(disk.sync_all(token).is_none());
+            assert!(disk.sync_data(token).is_none());
+            assert!(disk.truncate(token, 0).is_none());
+            assert!(disk.rename(token, dir.path().join("unused.bin")).unwrap().is_none());
+        }
         assert!(!disk.set_write_cursor(file, 0));
         assert!(!disk.close(file));
 
         let mut events = Vec::new();
         drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
         assert!(!disk.write_with(file, |buf| buf.push(1)), "retired tokens are rejected");
+        assert!(disk.sync_all(file).is_none());
+        assert!(disk.sync_data(file).is_none());
+        assert!(disk.truncate(file, 0).is_none());
+        assert!(disk.rename(file, dir.path().join("unused.bin")).unwrap().is_none());
+        assert!(disk.is_idle());
+    }
+
+    #[test]
+    fn rename_rejects_invalid_paths_without_queueing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskIo::default();
+        let file = disk.open(dir.path().join("original.bin"), overwrite()).unwrap();
+        let error = disk.rename(file, "invalid\0path").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(disk.close(file));
+        let mut events = Vec::new();
+        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+        assert_eq!(events, vec![Ev::Opened(file), Ev::Closed(file)]);
+        assert!(disk.is_idle());
     }
 
     #[test]
