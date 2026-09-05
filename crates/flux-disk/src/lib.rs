@@ -281,6 +281,9 @@ struct File {
     closing: bool,
     write_cursor: u64,
     in_flight: usize,
+    // Set by `submit_op` while a truncate or rename is in flight.
+    // `dispatch_pending` pauses this file's queue until `finish_op` clears
+    // it on completion, whether the operation succeeded or failed.
     exclusive_in_flight: bool,
     queue: VecDeque<PendingOp>,
 }
