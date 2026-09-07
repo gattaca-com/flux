@@ -664,6 +664,7 @@ dependencies = [
  "httparse",
  "libc",
  "mio",
+ "rustc-hash",
  "serde",
  "spine-derive",
  "tempfile",

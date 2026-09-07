@@ -16,6 +16,7 @@ flux-utils.workspace = true
 httparse.workspace = true
 libc.workspace = true
 mio.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 tracing.workspace = true
 wincode = { workspace = true, optional = true }
