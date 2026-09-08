@@ -64,7 +64,7 @@ fn connector(transport: Transport) -> NetworkDriver {
 /// Message count and bound on outstanding messages for a burst of `size`.
 fn burst_plan(size: usize) -> (usize, usize) {
     let count = (64 * 1024 * 1024 / size).clamp(16, 4096);
-    let window = (UdpConfig::default().send_window / 2 / size.div_ceil(1173)).clamp(1, 256);
+    let window = (UdpConfig::default().send_window / 2 / size.div_ceil(1171)).clamp(1, 256);
     (count, window)
 }
 
@@ -245,13 +245,13 @@ impl Relay {
                     client = Some(from);
                     server
                 };
-                // Wire layout: kind in the low nibble of byte 0, session at
-                // [1..5], sequence at [5..13]. Only data carries a payload.
-                if n >= 27 && buf[0] & 0x0f == 1 {
+                // Wire layout: magic, kind in the low nibble of byte 2, session
+                // at [3..7], sequence at [7..15]. Only data carries a payload.
+                if n >= 29 && buf[2] & 0x0f == 1 {
                     n_data += 1;
                     data_c.fetch_add(1, Ordering::Relaxed);
-                    let session = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-                    let seq = u64::from_le_bytes(buf[5..13].try_into().unwrap());
+                    let session = u32::from_le_bytes(buf[3..7].try_into().unwrap());
+                    let seq = u64::from_le_bytes(buf[7..15].try_into().unwrap());
                     if !seen.insert((session, seq)) {
                         retx_c.fetch_add(1, Ordering::Relaxed);
                     }

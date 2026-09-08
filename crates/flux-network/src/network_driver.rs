@@ -3,14 +3,12 @@ use std::net::SocketAddr;
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_timing::{Duration, Nanos};
 use flux_utils::DCachePtr;
-use mio::{Events, Poll, Token};
+use mio::Token;
 
 use crate::{
     tcp::{DEFAULT_TCP_USER_TIMEOUT_MS, TcpConfig, TcpManager, TcpStream, TcpTelemetry},
     udp::{UdpConfig, UdpManager},
 };
-
-const EVENTS_CAPACITY: usize = 128;
 
 /// Wire transport used by a [`NetworkDriver`], with its transport-specific
 /// settings. Settings both share are the `with_*` builders.
@@ -54,14 +52,15 @@ pub enum PollEvent<Payload> {
     Message { token: Token, payload: Payload, send_ts: Nanos },
 }
 
-/// Settings shared by both transports, set through the `with_*` builders.
+/// Settings shared by both transports, set through the `with_*` builders and
+/// owned by whichever manager is active.
+#[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) on_connect_msg: Option<Vec<u8>>,
     pub(crate) telemetry: TcpTelemetry,
     pub(crate) socket_buf_size: Option<usize>,
     /// `TCP_USER_TIMEOUT`, or the UDP peer silence timeout.
-    pub(crate) user_timeout_ms: u32,
-    pub(crate) dcache: Option<DCachePtr>,
+    pub(crate) user_timeout: Duration,
     /// Connections whose send backlog exceeds `max` for longer than
     /// `timeout` are disconnected (outbound scheduled for reconnection).
     /// Counted in framed messages for TCP, unacked datagrams for UDP.
@@ -69,10 +68,32 @@ pub(crate) struct Config {
     pub(crate) drop_outbound_backlog_on_disconnect: bool,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            on_connect_msg: None,
+            telemetry: TcpTelemetry::Disabled,
+            socket_buf_size: None,
+            user_timeout: Duration::from_millis(u64::from(DEFAULT_TCP_USER_TIMEOUT_MS)),
+            max_backlog: None,
+            drop_outbound_backlog_on_disconnect: false,
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 enum Inner {
     Tcp(TcpManager),
-    /// Boxed: carries the recv and send batch buffers.
-    Udp(Box<UdpManager>),
+    Udp(UdpManager),
+}
+
+impl Inner {
+    fn config_mut(&mut self) -> &mut Config {
+        match self {
+            Self::Tcp(m) => &mut m.config,
+            Self::Udp(m) => &mut m.config,
+        }
+    }
 }
 
 /// Poll-driven message transport built on `mio`, over TCP or reliable UDP
@@ -112,9 +133,6 @@ enum Inner {
 /// reconnect everything still queued is resent under the new session unless
 /// [`with_drop_outbound_backlog_on_disconnect`] is set.
 pub struct NetworkDriver {
-    poll: Poll,
-    events: Events,
-    config: Config,
     /// Scratch the caller serialises into; managers get it as a slice.
     payload: Vec<u8>,
     inner: Inner,
@@ -122,22 +140,9 @@ pub struct NetworkDriver {
 
 impl Default for NetworkDriver {
     fn default() -> Self {
-        let poll = Poll::new().expect("couldn't set up a poll for connector");
-        let registry = poll.registry().try_clone().expect("couldn't clone poll registry");
         Self {
-            poll,
-            events: Events::with_capacity(EVENTS_CAPACITY),
-            config: Config {
-                on_connect_msg: None,
-                telemetry: TcpTelemetry::Disabled,
-                socket_buf_size: None,
-                user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
-                dcache: None,
-                max_backlog: None,
-                drop_outbound_backlog_on_disconnect: false,
-            },
             payload: Vec::with_capacity(TcpStream::SEND_BUF_SIZE),
-            inner: Inner::Tcp(TcpManager::new(registry, TcpConfig::default())),
+            inner: Inner::Tcp(TcpManager::new(Config::default(), TcpConfig::default())),
         }
     }
 }
@@ -148,17 +153,21 @@ impl NetworkDriver {
     /// # Panics
     /// Panics on an invalid [`UdpConfig`] or if sockets already exist.
     pub fn with_transport(mut self, transport: Transport) -> Self {
-        let empty = match &self.inner {
-            Inner::Tcp(m) => m.is_empty(),
-            Inner::Udp(m) => m.is_empty(),
+        let (config, dcache) = match &self.inner {
+            Inner::Tcp(m) => {
+                assert!(m.is_empty(), "with_transport must precede connect/listen_at");
+                (m.config.clone(), m.dcache)
+            }
+            Inner::Udp(m) => {
+                assert!(m.is_empty(), "with_transport must precede connect/listen_at");
+                (m.config.clone(), m.dcache)
+            }
         };
-        assert!(empty, "with_transport must precede connect/listen_at");
-        let registry = self.poll.registry().try_clone().expect("couldn't clone poll registry");
         self.inner = match transport {
-            Transport::Tcp(config) => Inner::Tcp(TcpManager::new(registry, config)),
-            Transport::Udp(config) => Inner::Udp(Box::new(UdpManager::new(registry, config))),
+            Transport::Tcp(tcp) => Inner::Tcp(TcpManager::new(config, tcp)),
+            Transport::Udp(udp) => Inner::Udp(UdpManager::new(config, udp)),
         };
-        self
+        self.with_dcache_opt(dcache)
     }
 
     /// Sends this message once immediately after a connection becomes usable.
@@ -171,26 +180,33 @@ impl NetworkDriver {
     /// Panics if `msg.len() > TcpStream::SEND_BUF_SIZE`.
     pub fn with_on_connect_msg(mut self, msg: Vec<u8>) -> Self {
         assert!(msg.len() <= TcpStream::SEND_BUF_SIZE, "on_connect_msg exceeds send buffer size");
-        self.config.on_connect_msg = Some(msg);
+        self.inner.config_mut().on_connect_msg = Some(msg);
         self
     }
 
     /// Attaches a dcache as the shared receive buffer for all streams.
-    pub fn with_dcache(mut self, dcache: DCachePtr) -> Self {
-        self.config.dcache = Some(dcache);
+    pub fn with_dcache(self, dcache: DCachePtr) -> Self {
+        self.with_dcache_opt(Some(dcache))
+    }
+
+    fn with_dcache_opt(mut self, dcache: Option<DCachePtr>) -> Self {
+        match &mut self.inner {
+            Inner::Tcp(m) => m.dcache = dcache,
+            Inner::Udp(m) => m.dcache = dcache,
+        }
         self
     }
 
     /// Sets telemetry config for all streams created by this connector.
     pub fn with_telemetry(mut self, telemetry: TcpTelemetry) -> Self {
-        self.config.telemetry = telemetry;
+        self.inner.config_mut().telemetry = telemetry;
         self
     }
 
     /// Sets kernel `SO_SNDBUF` and `SO_RCVBUF` on all sockets (outbound and
     /// accepted).
     pub fn with_socket_buf_size(mut self, size: usize) -> Self {
-        self.config.socket_buf_size = Some(size);
+        self.inner.config_mut().socket_buf_size = Some(size);
         self
     }
 
@@ -198,7 +214,7 @@ impl NetworkDriver {
     /// outbound connections. For UDP this is the silence after which a peer
     /// is considered gone.
     pub fn with_user_timeout(mut self, timeout_ms: u32) -> Self {
-        self.config.user_timeout_ms = timeout_ms;
+        self.inner.config_mut().user_timeout = Duration::from_millis(u64::from(timeout_ms));
         self
     }
 
@@ -211,7 +227,7 @@ impl NetworkDriver {
     /// that same limit, additional messages are dropped until reconnect
     /// succeeds. The exceeded-since timer resets on reconnect.
     pub fn with_max_backlog(mut self, max: usize, timeout: Duration) -> Self {
-        self.config.max_backlog = Some((max, timeout));
+        self.inner.config_mut().max_backlog = Some((max, timeout));
         self
     }
 
@@ -220,7 +236,7 @@ impl NetworkDriver {
     /// While that outbound connection is disconnected, sends to it are also
     /// dropped instead of being queued for replay after reconnect.
     pub fn with_drop_outbound_backlog_on_disconnect(mut self, enabled: bool) -> Self {
-        self.config.drop_outbound_backlog_on_disconnect = enabled;
+        self.inner.config_mut().drop_outbound_backlog_on_disconnect = enabled;
         self
     }
 
@@ -242,10 +258,9 @@ impl NetworkDriver {
     where
         F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
-        let Self { poll, events, config, inner, .. } = self;
-        match inner {
-            Inner::Tcp(m) => m.poll_with(config, poll, events, handler),
-            Inner::Udp(m) => m.poll_with(config, poll, events, handler),
+        match &mut self.inner {
+            Inner::Tcp(m) => m.poll_with(handler),
+            Inner::Udp(m) => m.poll_with(handler),
         }
     }
 
@@ -262,10 +277,9 @@ impl NetworkDriver {
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
     {
-        let Self { poll, events, config, inner, .. } = self;
-        match inner {
-            Inner::Tcp(m) => m.poll_with_produce(config, poll, events, produce, on_msg),
-            Inner::Udp(m) => m.poll_with_produce(config, poll, events, produce, on_msg),
+        match &mut self.inner {
+            Inner::Tcp(m) => m.poll_with_produce(produce, on_msg),
+            Inner::Udp(m) => m.poll_with_produce(produce, on_msg),
         }
     }
 
@@ -286,8 +300,8 @@ impl NetworkDriver {
             return;
         }
         match &mut self.inner {
-            Inner::Tcp(m) => m.write(&self.config, where_to, &self.payload),
-            Inner::Udp(m) => m.write(&self.config, where_to, &mut self.payload),
+            Inner::Tcp(m) => m.write(where_to, &self.payload),
+            Inner::Udp(m) => m.write(where_to, &mut self.payload),
         }
     }
 
@@ -297,8 +311,8 @@ impl NetworkDriver {
     /// Inbound connections and listeners are left untouched.
     pub fn disconnect_outbound(&mut self) {
         match &mut self.inner {
-            Inner::Tcp(m) => m.disconnect_outbound(&self.config),
-            Inner::Udp(m) => m.disconnect_outbound(&self.config),
+            Inner::Tcp(m) => m.disconnect_outbound(),
+            Inner::Udp(m) => m.disconnect_outbound(),
         }
     }
 
@@ -308,8 +322,8 @@ impl NetworkDriver {
     /// reconnection. If inbound, it's simply closed. No-op if token not found.
     pub fn disconnect(&mut self, token: Token) {
         match &mut self.inner {
-            Inner::Tcp(m) => m.disconnect(&self.config, token),
-            Inner::Udp(m) => m.disconnect(&self.config, token),
+            Inner::Tcp(m) => m.disconnect(token),
+            Inner::Udp(m) => m.disconnect(token),
         }
     }
 
@@ -324,8 +338,8 @@ impl NetworkDriver {
     #[inline]
     pub fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         match &mut self.inner {
-            Inner::Tcp(m) => m.connect(&self.config, addr),
-            Inner::Udp(m) => m.connect(&self.config, addr),
+            Inner::Tcp(m) => m.connect(addr),
+            Inner::Udp(m) => m.connect(addr),
         }
     }
 
@@ -338,7 +352,7 @@ impl NetworkDriver {
     pub fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
         match &mut self.inner {
             Inner::Tcp(m) => m.listen_at(addr),
-            Inner::Udp(m) => m.listen_at(&self.config, addr),
+            Inner::Udp(m) => m.listen_at(addr),
         }
     }
 
@@ -358,7 +372,7 @@ impl NetworkDriver {
     #[inline]
     pub fn force_reconnect(&mut self) {
         match &mut self.inner {
-            Inner::Tcp(m) => m.force_reconnect(&self.config),
+            Inner::Tcp(m) => m.force_reconnect(),
             Inner::Udp(m) => m.force_reconnect(),
         }
     }

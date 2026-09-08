@@ -141,7 +141,7 @@ fn udp_broadcast_mixed_sizes_to_two_subscribers() {
     }
 
     // 1 byte, one datagram, one stride exactly, and a 2 MiB message.
-    let sizes = [1usize, 100, 1168, 1169, 5000, 2 * 1024 * 1024];
+    let sizes = [1usize, 100, 1171, 1172, 5000, 2 * 1024 * 1024];
     let msgs: Vec<Vec<u8>> =
         sizes.iter().enumerate().map(|(i, s)| make_msg(i as u32, *s)).collect();
     for m in &msgs {
@@ -586,7 +586,7 @@ fn udp_server_disconnect_reconnects_client() {
 #[test]
 fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let addr = free_addr();
-    let config = UdpConfig { send_window: 64, max_message_size: 64 * 1173, ..UdpConfig::lan() };
+    let config = UdpConfig { send_window: 64, max_message_size: 64 * 1171, ..UdpConfig::lan() };
     let mut server = udp(config);
     let mut client = udp(config);
     let (accepted, _) = connect_pair(&mut server, &mut client, addr);

@@ -280,14 +280,14 @@ impl TxWindow {
     #[inline]
     fn is_acked(&self, seq: u64) -> bool {
         let i = seq & self.mask;
-        self.acked[(i / 64) as usize] & (1 << (i % 64)) != 0
+        self.acked[(i >> 6) as usize] & (1 << (i & 63)) != 0
     }
 
     #[inline]
     fn set_acked(&mut self, seq: u64, v: bool) {
         let i = seq & self.mask;
-        let bit = 1 << (i % 64);
-        let word = &mut self.acked[(i / 64) as usize];
+        let bit = 1 << (i & 63);
+        let word = &mut self.acked[(i >> 6) as usize];
         if v {
             *word |= bit;
         } else {
@@ -638,14 +638,14 @@ impl RxWindow {
     #[inline]
     fn bit(&self, seq: u64) -> bool {
         let i = seq & self.mask;
-        self.bits[(i / 64) as usize] & (1 << (i % 64)) != 0
+        self.bits[(i >> 6) as usize] & (1 << (i & 63)) != 0
     }
 
     #[inline]
     fn set_bit(&mut self, seq: u64, v: bool) {
         let i = seq & self.mask;
-        let bit = 1 << (i % 64);
-        let word = &mut self.bits[(i / 64) as usize];
+        let bit = 1 << (i & 63);
+        let word = &mut self.bits[(i >> 6) as usize];
         if v {
             *word |= bit;
         } else {
@@ -681,7 +681,7 @@ impl RxWindow {
         let ring_words = self.bits.len();
         for w in 0..words {
             let idx = (self.ack_next + 1 + 64 * w as u64) & self.mask;
-            let (word, shift) = ((idx / 64) as usize, idx % 64);
+            let (word, shift) = ((idx >> 6) as usize, idx & 63);
             let mut v = self.bits[word] >> shift;
             if shift != 0 {
                 v |= self.bits[(word + 1) % ring_words] << (64 - shift);
@@ -703,20 +703,18 @@ pub(crate) struct UdpPeer {
     /// peers, the listener's for accepted ones.
     pub(crate) socket_token: Token,
     native_addr: SockAddr,
+    config: UdpConfig,
     connected: bool,
     ever_connected: bool,
     local_session: u32,
     remote_session: Option<u32>,
-    stride: usize,
-    max_message_size: usize,
-    heartbeat: Duration,
-    max_rto: Duration,
     tx: TxWindow,
     rx: RxWindow,
     rto: Rto,
     last_recv: Instant,
     last_send: Instant,
-    hello_sent_at: Instant,
+    /// When the next hello goes out while disconnected.
+    hello_due: Instant,
     hello_backoff: u8,
     ack_due: bool,
     latency: Option<Timer>,
@@ -732,7 +730,7 @@ impl UdpPeer {
         token: Token,
         socket_token: Token,
         local_session: u32,
-        config: &UdpConfig,
+        config: UdpConfig,
         latency: Option<Timer>,
     ) -> Self {
         let now = Instant::now();
@@ -744,21 +742,18 @@ impl UdpPeer {
             token,
             socket_token,
             native_addr: SockAddr::new(addr),
+            config,
             connected: false,
             ever_connected: false,
             local_session,
             remote_session: None,
-            stride: config.stride(),
-            max_message_size: config.max_message_size,
-            heartbeat: config.heartbeat_interval,
-            max_rto: config.max_rto,
             tx: TxWindow::new(config.send_window),
             ctrl: vec![0; HEADER_SIZE + rx.max_bits.div_ceil(64) as usize * 8],
             rx,
-            rto: Rto::new(config),
+            rto: Rto::new(&config),
             last_recv: now,
             last_send: now,
-            hello_sent_at: Instant::ZERO,
+            hello_due: Instant::ZERO,
             hello_backoff: 0,
             ack_due: false,
             latency,
@@ -822,7 +817,7 @@ impl UdpPeer {
         } else {
             self.tx.rewind(new_session);
         }
-        self.hello_sent_at = Instant::ZERO;
+        self.hello_due = Instant::ZERO;
         self.hello_backoff = 0;
     }
 
@@ -857,8 +852,12 @@ impl UdpPeer {
         send_datagram(socket, self.addr, &self.ctrl[..HEADER_SIZE])
     }
 
+    /// Also schedules the retry, backing off per attempt up to `max_rto`.
     pub(crate) fn send_hello(&mut self, socket: &UdpSocket, now: Instant) -> SendOutcome {
-        self.hello_sent_at = now;
+        let interval = (self.rto.current().0 << self.hello_backoff.min(MAX_BACKOFF_SHIFT))
+            .min(self.config.max_rto.0);
+        self.hello_due = now + Duration(interval);
+        self.hello_backoff = self.hello_backoff.saturating_add(1);
         self.send_control(socket, Kind::Hello, self.tx.base, 0, now)
     }
 
@@ -890,11 +889,11 @@ impl UdpPeer {
         now: Instant,
     ) -> PushOutcome {
         let len = store.bytes(slot).len();
-        if len > self.max_message_size {
-            warn!(%self.addr, len, max = self.max_message_size, "udp message too large");
+        if len > self.config.max_message_size {
+            warn!(%self.addr, len, max = self.config.max_message_size, "udp message too large");
             return PushOutcome::TooLarge;
         }
-        if self.tx.push(self.local_session, self.stride, store, slot, ts) {
+        if self.tx.push(self.local_session, self.config.stride(), store, slot, ts) {
             return PushOutcome::Queued;
         }
         self.dropped_full += 1;
@@ -981,15 +980,15 @@ impl UdpPeer {
         self.last_recv = now;
         let len = header.len as usize;
         let index = usize::from(header.index);
-        let offset = index * self.stride;
-        let total = fragment_count(len, self.stride);
+        let offset = index * self.config.stride();
+        let total = fragment_count(len, self.config.stride());
         // Validate before the sequence is committed: a bad datagram must not
         // consume the sequence a good retry will carry.
         if len == 0 ||
-            len > self.max_message_size ||
+            len > self.config.max_message_size ||
             index >= total ||
             header.seq < index as u64 ||
-            payload.len() != self.stride.min(len - offset)
+            payload.len() != self.config.stride().min(len - offset)
         {
             debug!(%self.addr, len, index, got = payload.len(), "udp fragment header invalid");
             return;
@@ -1121,12 +1120,7 @@ impl UdpPeer {
         peer_timeout: Duration,
     ) -> Result<SendOutcome, ()> {
         if !self.connected {
-            let interval = Duration(
-                (self.rto.current().0 << self.hello_backoff.min(MAX_BACKOFF_SHIFT))
-                    .min(self.max_rto.0),
-            );
-            if now.saturating_sub(self.hello_sent_at) >= interval {
-                self.hello_backoff = self.hello_backoff.saturating_add(1);
+            if now >= self.hello_due {
                 return Ok(self.send_hello(socket, now));
             }
             return Ok(SendOutcome::Done);
@@ -1136,7 +1130,7 @@ impl UdpPeer {
         }
         let (resent, blocked) = self.tx.retransmit_due(
             self.rto.current(),
-            self.max_rto,
+            self.config.max_rto,
             self.rto.reorder_window(),
             store,
             socket.as_raw_fd(),
@@ -1150,7 +1144,7 @@ impl UdpPeer {
         if blocked {
             return Ok(SendOutcome::WouldBlock);
         }
-        if self.ack_due || now.saturating_sub(self.last_send) >= self.heartbeat {
+        if self.ack_due || now.saturating_sub(self.last_send) >= self.config.heartbeat_interval {
             return Ok(self.send_ack(socket, now));
         }
         Ok(SendOutcome::Done)
@@ -1165,7 +1159,7 @@ mod tests {
         UdpConfig {
             send_window: 64,
             recv_window: 64,
-            max_message_size: 64 * 1173,
+            max_message_size: 64 * 1171,
             ..UdpConfig::lan()
         }
     }

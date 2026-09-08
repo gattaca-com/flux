@@ -26,7 +26,7 @@ pub(crate) use connector::UdpManager;
 /// `max_datagram_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
-    /// Datagram size including the 27-byte header. 1200 stays under the
+    /// Datagram size including the 29-byte header. 1200 stays under the
     /// 1280-byte IPv6 minimum MTU.
     pub max_datagram_size: usize,
     /// Datagrams a sender may have in flight per peer, counted from the oldest

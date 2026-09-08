@@ -1,12 +1,13 @@
 //! Datagram layout.
 //!
 //! ```text
-//! [0]      version << 4 | kind
-//! [1..5]   session      random per connection attempt
-//! [5..13]  seq          per-datagram sequence (Data) or ack point (Ack)
-//! [13..17] len          message length (Data) or bitmap bit count (Ack)
-//! [17..19] index        fragment index within the message (Data)
-//! [19..27] send_ts      sender wall clock, for receive-side latency telemetry
+//! [0..2]   magic        "FX"; anything else is not ours and is dropped unread
+//! [2]      version << 4 | kind
+//! [3..7]   session      random per connection attempt
+//! [7..15]  seq          per-datagram sequence (Data) or ack point (Ack)
+//! [15..19] len          message length (Data) or bitmap bit count (Ack)
+//! [19..21] index        fragment index within the message (Data)
+//! [21..29] send_ts      sender wall clock, for receive-side latency telemetry
 //! ```
 //!
 //! An Ack's payload is its bitmap: bit `i` set means `seq + 1 + i` arrived.
@@ -16,8 +17,9 @@
 //! of its first fragment: `seq - index`. Datagrams from any other session are
 //! dropped.
 
+pub(crate) const MAGIC: [u8; 2] = *b"FX";
 pub(crate) const VERSION: u8 = 1;
-pub(crate) const HEADER_SIZE: usize = 27;
+pub(crate) const HEADER_SIZE: usize = 29;
 /// Largest UDP payload over IPv4.
 pub(crate) const MAX_DATAGRAM_SIZE: usize = 65_507;
 /// Fragment index is a `u16`.
@@ -60,27 +62,28 @@ pub(crate) struct Header {
 impl Header {
     #[inline]
     pub(crate) fn encode(&self, buf: &mut [u8]) {
-        buf[0] = (VERSION << 4) | self.kind as u8;
-        buf[1..5].copy_from_slice(&self.session.to_le_bytes());
-        buf[5..13].copy_from_slice(&self.seq.to_le_bytes());
-        buf[13..17].copy_from_slice(&self.len.to_le_bytes());
-        buf[17..19].copy_from_slice(&self.index.to_le_bytes());
-        buf[19..27].copy_from_slice(&self.send_ts.to_le_bytes());
+        buf[0..2].copy_from_slice(&MAGIC);
+        buf[2] = (VERSION << 4) | self.kind as u8;
+        buf[3..7].copy_from_slice(&self.session.to_le_bytes());
+        buf[7..15].copy_from_slice(&self.seq.to_le_bytes());
+        buf[15..19].copy_from_slice(&self.len.to_le_bytes());
+        buf[19..21].copy_from_slice(&self.index.to_le_bytes());
+        buf[21..29].copy_from_slice(&self.send_ts.to_le_bytes());
     }
 
-    /// `None` for short, unknown-kind, or other-version datagrams.
+    /// `None` for short, foreign, unknown-kind, or other-version datagrams.
     #[inline]
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < HEADER_SIZE || bytes[0] >> 4 != VERSION {
+        if bytes.len() < HEADER_SIZE || bytes[0..2] != MAGIC || bytes[2] >> 4 != VERSION {
             return None;
         }
         Some(Self {
-            kind: Kind::from_u8(bytes[0] & 0x0f)?,
-            session: u32::from_le_bytes(bytes[1..5].try_into().unwrap()),
-            seq: u64::from_le_bytes(bytes[5..13].try_into().unwrap()),
-            len: u32::from_le_bytes(bytes[13..17].try_into().unwrap()),
-            index: u16::from_le_bytes(bytes[17..19].try_into().unwrap()),
-            send_ts: u64::from_le_bytes(bytes[19..27].try_into().unwrap()),
+            kind: Kind::from_u8(bytes[2] & 0x0f)?,
+            session: u32::from_le_bytes(bytes[3..7].try_into().unwrap()),
+            seq: u64::from_le_bytes(bytes[7..15].try_into().unwrap()),
+            len: u32::from_le_bytes(bytes[15..19].try_into().unwrap()),
+            index: u16::from_le_bytes(bytes[19..21].try_into().unwrap()),
+            send_ts: u64::from_le_bytes(bytes[21..29].try_into().unwrap()),
         })
     }
 }
@@ -88,7 +91,7 @@ impl Header {
 /// Rewrite only the session of an encoded header (replay after reconnect).
 #[inline]
 pub(crate) fn write_session(buf: &mut [u8], session: u32) {
-    buf[1..5].copy_from_slice(&session.to_le_bytes());
+    buf[3..7].copy_from_slice(&session.to_le_bytes());
 }
 
 /// Fragments per message; an empty message is never sent.

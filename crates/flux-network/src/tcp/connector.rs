@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_timing::{Duration, Instant, Nanos, Repeater};
-use flux_utils::safe_panic;
+use flux_utils::{DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
@@ -16,6 +16,8 @@ use crate::{
         set_user_timeout, write_frame_header,
     },
 };
+
+const EVENTS_CAPACITY: usize = 128;
 
 // Outbound will try to reconnect, inbound not
 enum Variant {
@@ -50,8 +52,12 @@ impl Default for TcpConfig {
 }
 
 pub(crate) struct TcpManager {
+    pub(crate) config: Config,
+    pub(crate) dcache: Option<DCachePtr>,
+    tcp: TcpConfig,
+    poll: Poll,
+    events: Events,
     registry: Registry,
-    config: TcpConfig,
     conns: Vec<(Token, Variant)>,
     reconnector: Repeater,
     // Always only outbound/client side connection streams
@@ -67,12 +73,18 @@ pub(crate) struct TcpManager {
 }
 
 impl TcpManager {
-    pub(crate) fn new(registry: Registry, config: TcpConfig) -> Self {
+    pub(crate) fn new(config: Config, tcp: TcpConfig) -> Self {
+        let poll = Poll::new().expect("couldn't set up a poll for connector");
+        let registry = poll.registry().try_clone().expect("couldn't clone poll registry");
         Self {
-            registry,
             config,
+            dcache: None,
+            tcp,
+            poll,
+            events: Events::with_capacity(EVENTS_CAPACITY),
+            registry,
             conns: Vec::with_capacity(5),
-            reconnector: Repeater::every(config.reconnect_interval),
+            reconnector: Repeater::every(tcp.reconnect_interval),
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             pending_disconnects: Vec::with_capacity(10),
@@ -85,22 +97,22 @@ impl TcpManager {
         self.conns.is_empty() && self.to_be_reconnected.is_empty()
     }
 
-    pub(crate) fn disconnect_outbound(&mut self, cfg: &Config) {
+    pub(crate) fn disconnect_outbound(&mut self) {
         let mut i = self.conns.len();
         while i != 0 {
             i -= 1;
             if matches!(self.conns[i].1, Variant::Outbound(_)) {
-                self.disconnect_at_index(cfg, i);
+                self.disconnect_at_index(i);
             }
         }
     }
 
-    fn disconnect_at_index(&mut self, cfg: &Config, index: usize) {
+    fn disconnect_at_index(&mut self, index: usize) {
         let (token, stream) = self.conns.swap_remove(index);
         match stream {
             Variant::Outbound(mut tcp_connection) => {
                 tcp_connection.close(&self.registry);
-                if cfg.drop_outbound_backlog_on_disconnect {
+                if self.config.drop_outbound_backlog_on_disconnect {
                     tcp_connection.clear_send_backlog();
                 }
                 self.to_be_reconnected.push((token, Variant::Outbound(tcp_connection)));
@@ -114,22 +126,22 @@ impl TcpManager {
         }
     }
 
-    fn disconnect_at_index_pending(&mut self, cfg: &Config, index: usize) {
+    fn disconnect_at_index_pending(&mut self, index: usize) {
         let token = self.conns[index].0;
-        self.disconnect_at_index(cfg, index);
+        self.disconnect_at_index(index);
         self.pending_disconnects.push(token);
     }
 
-    pub(crate) fn disconnect(&mut self, cfg: &Config, token: Token) {
+    pub(crate) fn disconnect(&mut self, token: Token) {
         if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
-            self.disconnect_at_index(cfg, i);
+            self.disconnect_at_index(i);
         }
     }
 
     #[inline]
-    fn broadcast(&mut self, cfg: &Config, payload: &[u8]) {
-        let max_backlog = cfg.max_backlog;
-        if !cfg.drop_outbound_backlog_on_disconnect {
+    fn broadcast(&mut self, payload: &[u8]) {
+        let max_backlog = self.config.max_backlog;
+        if !self.config.drop_outbound_backlog_on_disconnect {
             for (_, c) in &mut self.to_be_reconnected {
                 let Variant::Outbound(tcp) = c else {
                     unreachable!("only outbound should be auto reconnected");
@@ -150,8 +162,8 @@ impl TcpManager {
                     );
                     if state == ConnState::Disconnected {
                         let token = self.conns[i].0;
-                        self.disconnect_at_index_pending(cfg, i);
-                        if !cfg.drop_outbound_backlog_on_disconnect &&
+                        self.disconnect_at_index_pending(i);
+                        if !self.config.drop_outbound_backlog_on_disconnect &&
                             let Some((_, Variant::Outbound(tcp))) =
                                 self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                         {
@@ -163,7 +175,7 @@ impl TcpManager {
                             );
                         }
                     } else if Self::active_backlog_exceeded(max_backlog, tcp_connection) {
-                        self.disconnect_at_index_pending(cfg, i);
+                        self.disconnect_at_index_pending(i);
                     }
                 }
                 Variant::Listener(_tcp_listener) => {}
@@ -218,10 +230,10 @@ impl TcpManager {
 
     /// Frames `payload` and writes it to one connection or all of them.
     #[inline]
-    pub(crate) fn write(&mut self, cfg: &Config, where_to: SendBehavior, payload: &[u8]) {
+    pub(crate) fn write(&mut self, where_to: SendBehavior, payload: &[u8]) {
         write_frame_header(&mut self.header, payload.len(), Nanos::now());
         match where_to {
-            SendBehavior::Broadcast => self.broadcast(cfg, payload),
+            SendBehavior::Broadcast => self.broadcast(payload),
             SendBehavior::Single(token) => {
                 if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
                     match &mut self.conns[i].1 {
@@ -233,23 +245,25 @@ impl TcpManager {
                             );
                             if state == ConnState::Disconnected {
                                 tracing::warn!("issue when writing to {token:?} disconnecting");
-                                self.disconnect_at_index_pending(cfg, i);
-                                if !cfg.drop_outbound_backlog_on_disconnect &&
+                                self.disconnect_at_index_pending(i);
+                                if !self.config.drop_outbound_backlog_on_disconnect &&
                                     let Some((_, Variant::Outbound(tcp))) = self
                                         .to_be_reconnected
                                         .iter_mut()
                                         .find(|(t, _)| *t == token)
                                 {
                                     Self::push_reconnect_backlog_shared(
-                                        cfg.max_backlog,
+                                        self.config.max_backlog,
                                         tcp,
                                         &self.header,
                                         payload,
                                     );
                                 }
-                            } else if Self::active_backlog_exceeded(cfg.max_backlog, tcp_connection)
-                            {
-                                self.disconnect_at_index_pending(cfg, i);
+                            } else if Self::active_backlog_exceeded(
+                                self.config.max_backlog,
+                                tcp_connection,
+                            ) {
+                                self.disconnect_at_index_pending(i);
                             }
                         }
                         Variant::Listener(_tcp_listener) => error!(
@@ -259,9 +273,9 @@ impl TcpManager {
                 } else if let Some((_, Variant::Outbound(tcp))) =
                     self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                 {
-                    if !cfg.drop_outbound_backlog_on_disconnect {
+                    if !self.config.drop_outbound_backlog_on_disconnect {
                         Self::push_reconnect_backlog_shared(
-                            cfg.max_backlog,
+                            self.config.max_backlog,
                             tcp,
                             &self.header,
                             payload,
@@ -274,17 +288,17 @@ impl TcpManager {
         }
     }
 
-    pub(crate) fn connect(&mut self, cfg: &Config, addr: SocketAddr) -> Option<Token> {
+    pub(crate) fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
-        if let Some(stream) = self.try_connect(cfg, o, addr) {
+        if let Some(stream) = self.try_connect(o, addr) {
             let mut tcp_stream = TcpStream::from_stream_with_telemetry(
                 stream,
                 o,
                 addr,
-                cfg.telemetry,
-                cfg.dcache.is_some(),
+                self.config.telemetry,
+                self.dcache.is_some(),
             );
-            if let Some(msg) = &cfg.on_connect_msg &&
+            if let Some(msg) = &self.config.on_connect_msg &&
                 tcp_stream.write_or_enqueue_with(&self.registry, |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
@@ -318,7 +332,7 @@ impl TcpManager {
         Some(token)
     }
 
-    fn maybe_reconnect(&mut self, cfg: &Config) {
+    fn maybe_reconnect(&mut self) {
         if !self.reconnector.fired() {
             return;
         }
@@ -327,7 +341,7 @@ impl TcpManager {
         while i != 0 {
             i -= 1;
             let (token, mut stream) = self.to_be_reconnected.swap_remove(i);
-            if self.try_reconnect(cfg, token, &mut stream) {
+            if self.try_reconnect(token, &mut stream) {
                 self.conns.push((token, stream));
                 self.reconnected_to.push(token);
             } else {
@@ -336,19 +350,14 @@ impl TcpManager {
         }
     }
 
-    fn try_connect(
-        &self,
-        cfg: &Config,
-        token: Token,
-        addr: SocketAddr,
-    ) -> Option<mio::net::TcpStream> {
+    fn try_connect(&self, token: Token, addr: SocketAddr) -> Option<mio::net::TcpStream> {
         let Ok(mut new_stream) = mio::net::TcpStream::connect(addr)
             .inspect_err(|e| warn!("couldn't connect to {addr}: {e}"))
         else {
             return None;
         };
 
-        if let Some(size) = cfg.socket_buf_size {
+        if let Some(size) = self.config.socket_buf_size {
             set_socket_buf_size(&new_stream, size);
         }
         let Ok(err) =
@@ -365,7 +374,7 @@ impl TcpManager {
             error!("couldn't register tcp stream for {addr} with registry: {e}");
             return None;
         }
-        if self.config.nodelay {
+        if self.tcp.nodelay {
             new_stream
                 .set_nodelay(true)
                 .inspect_err(|e| {
@@ -373,27 +382,30 @@ impl TcpManager {
                 })
                 .ok()?;
         }
-        if self.config.keepalive {
+        if self.tcp.keepalive {
             set_keepalive(&new_stream)
                 .inspect_err(|e| error!("couldn't setup keepalive for tcp stream for {addr}: {e}"))
                 .ok()?;
         }
-        set_user_timeout(&new_stream, cfg.user_timeout_ms);
+        set_user_timeout(&new_stream, self.config.user_timeout.as_millis_u64() as u32);
         Some(new_stream)
     }
 
-    fn try_reconnect(&self, cfg: &Config, token: Token, stream: &mut Variant) -> bool {
+    fn try_reconnect(&self, token: Token, stream: &mut Variant) -> bool {
         let Variant::Outbound(stream) = stream else {
             panic!("Can only try to connect a Outbound connection");
         };
         let addr = stream.peer();
 
-        let Some(new_stream) = self.try_connect(cfg, token, addr) else {
+        let Some(new_stream) = self.try_connect(token, addr) else {
             return false;
         };
 
-        if stream.reset_with_new_stream(&self.registry, new_stream, cfg.on_connect_msg.as_ref()) ==
-            ConnState::Disconnected
+        if stream.reset_with_new_stream(
+            &self.registry,
+            new_stream,
+            self.config.on_connect_msg.as_ref(),
+        ) == ConnState::Disconnected
         {
             warn!(addr = ?addr, "on_connect_msg send failed");
             return false;
@@ -410,9 +422,9 @@ impl TcpManager {
     }
 
     #[inline]
-    pub(crate) fn force_reconnect(&mut self, cfg: &Config) {
+    pub(crate) fn force_reconnect(&mut self) {
         self.reconnector.reset();
-        self.maybe_reconnect(cfg);
+        self.maybe_reconnect();
     }
 
     #[inline]
@@ -429,20 +441,15 @@ impl TcpManager {
 
     /// Accepts every pending connection on the listener at `index`, emitting
     /// [`PollEvent::Accept`] for each.
-    fn accept_all<F>(
-        &mut self,
-        cfg: &Config,
-        index: usize,
-        listener_token: Token,
-        on_accept: &mut F,
-    ) where
+    fn accept_all<F>(&mut self, index: usize, listener_token: Token, on_accept: &mut F)
+    where
         F: FnMut(PollEvent<&[u8]>),
     {
         loop {
             let Variant::Listener(tcp_listener) = &mut self.conns[index].1 else { unreachable!() };
             let Ok((mut stream, addr)) = tcp_listener.accept() else { return };
             tracing::info!(?addr, "client connected");
-            if let Some(size) = cfg.socket_buf_size {
+            if let Some(size) = self.config.socket_buf_size {
                 set_socket_buf_size(&stream, size);
             }
             let token = Token(self.next_token);
@@ -451,27 +458,27 @@ impl TcpManager {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 continue;
             }
-            if self.config.nodelay {
+            if self.tcp.nodelay {
                 if let Err(e) = stream.set_nodelay(true) {
                     error!("couldn't set nodelay on stream to {addr}: {e}");
                     continue;
                 }
             }
-            if self.config.keepalive &&
+            if self.tcp.keepalive &&
                 let Err(e) = set_keepalive(&stream)
             {
                 error!("couldn't set keepalive on stream to {addr}: {e}");
                 continue;
             }
-            set_user_timeout(&stream, cfg.user_timeout_ms);
+            set_user_timeout(&stream, self.config.user_timeout.as_millis_u64() as u32);
             let mut conn = TcpStream::from_stream_with_telemetry(
                 stream,
                 token,
                 addr,
-                cfg.telemetry,
-                cfg.dcache.is_some(),
+                self.config.telemetry,
+                self.dcache.is_some(),
             );
-            if let Some(msg) = &cfg.on_connect_msg &&
+            if let Some(msg) = &self.config.on_connect_msg &&
                 conn.write_or_enqueue_with(&self.registry, |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
@@ -489,7 +496,7 @@ impl TcpManager {
     }
 
     #[inline]
-    fn handle_event<F>(&mut self, cfg: &Config, e: &Event, handler: &mut F)
+    fn handle_event<F>(&mut self, e: &Event, handler: &mut F)
     where
         F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
@@ -504,28 +511,23 @@ impl TcpManager {
                 if tcp_connection.poll_with(
                     &self.registry,
                     e,
-                    cfg.dcache.as_deref(),
+                    self.dcache.as_deref(),
                     &mut |token, bytes, send_ts| {
                         handler(PollEvent::Message { token, payload: bytes, send_ts });
                     },
                 ) == ConnState::Disconnected
                 {
                     handler(PollEvent::Disconnect { token: event_token });
-                    self.disconnect_at_index(cfg, stream_id);
+                    self.disconnect_at_index(stream_id);
                 }
             }
-            Variant::Listener(_) => self.accept_all(cfg, stream_id, event_token, handler),
+            Variant::Listener(_) => self.accept_all(stream_id, event_token, handler),
         }
     }
 
     #[inline]
-    fn handle_event_produce<T, P, F>(
-        &mut self,
-        cfg: &Config,
-        e: &Event,
-        produce: &mut P,
-        on_msg: &mut F,
-    ) where
+    fn handle_event_produce<T, P, F>(&mut self, e: &Event, produce: &mut P, on_msg: &mut F)
+    where
         T: 'static + Copy,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
@@ -538,7 +540,7 @@ impl TcpManager {
 
         match &mut self.conns[stream_id].1 {
             Variant::Outbound(tcp_connection) | Variant::Inbound(tcp_connection) => {
-                let dcache = cfg.dcache.as_deref().expect("dcache required for poll_with_produce");
+                let dcache = self.dcache.as_deref().expect("dcache required for poll_with_produce");
                 if tcp_connection.poll_with_produce(
                     &self.registry,
                     e,
@@ -550,10 +552,10 @@ impl TcpManager {
                 ) == ConnState::Disconnected
                 {
                     let _ = on_msg(PollEvent::Disconnect { token: event_token });
-                    self.disconnect_at_index(cfg, stream_id);
+                    self.disconnect_at_index(stream_id);
                 }
             }
-            Variant::Listener(_) => self.accept_all(cfg, stream_id, event_token, &mut |event| {
+            Variant::Listener(_) => self.accept_all(stream_id, event_token, &mut |event| {
                 let _ = on_msg(event);
             }),
         }
@@ -561,43 +563,34 @@ impl TcpManager {
 
     /// Delivers pending disconnects and reconnects, then polls once.
     #[inline]
-    pub(crate) fn poll_with<F>(
-        &mut self,
-        cfg: &Config,
-        poll: &mut Poll,
-        events: &mut Events,
-        mut handler: F,
-    ) -> bool
+    pub(crate) fn poll_with<F>(&mut self, mut handler: F) -> bool
     where
         F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
         let mut o = self.drain_pending_disconnects(&mut handler);
-        self.maybe_reconnect(cfg);
+        self.maybe_reconnect();
         for token in self.reconnected_to.drain(..) {
             handler(PollEvent::Reconnect { token });
             o = true;
         }
-        if let Err(e) = poll.poll(events, Some(std::time::Duration::ZERO)) {
+        // Taken out so `handle_event` can borrow `self`; put back below.
+        let mut events = std::mem::replace(&mut self.events, Events::with_capacity(0));
+        if let Err(e) = self.poll.poll(&mut events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
+            self.events = events;
             return false;
         }
-        for e in &*events {
+        for e in &events {
             o = true;
-            self.handle_event(cfg, e, &mut handler);
+            self.handle_event(e, &mut handler);
         }
+        self.events = events;
         o |= self.drain_pending_disconnects(&mut handler);
         o
     }
 
     #[inline]
-    pub(crate) fn poll_with_produce<T, P, F>(
-        &mut self,
-        cfg: &Config,
-        poll: &mut Poll,
-        events: &mut Events,
-        produce: &mut P,
-        mut on_msg: F,
-    ) -> bool
+    pub(crate) fn poll_with_produce<T, P, F>(&mut self, produce: &mut P, mut on_msg: F) -> bool
     where
         T: 'static + Copy,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
@@ -606,19 +599,22 @@ impl TcpManager {
         let mut o = self.drain_pending_disconnects(&mut |event| {
             let _ = on_msg(event);
         });
-        self.maybe_reconnect(cfg);
+        self.maybe_reconnect();
         for token in self.reconnected_to.drain(..) {
             let _ = on_msg(PollEvent::Reconnect { token });
             o = true;
         }
-        if let Err(e) = poll.poll(events, Some(std::time::Duration::ZERO)) {
+        let mut events = std::mem::replace(&mut self.events, Events::with_capacity(0));
+        if let Err(e) = self.poll.poll(&mut events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
+            self.events = events;
             return false;
         }
-        for e in &*events {
+        for e in &events {
             o = true;
-            self.handle_event_produce(cfg, e, produce, &mut on_msg);
+            self.handle_event_produce(e, produce, &mut on_msg);
         }
+        self.events = events;
         o |= self.drain_pending_disconnects(&mut |event| {
             let _ = on_msg(event);
         });

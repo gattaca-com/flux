@@ -16,7 +16,7 @@ use std::{
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos};
-use flux_utils::{DCache, safe_panic};
+use flux_utils::{DCache, DCachePtr, safe_panic};
 use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::UdpSocket};
 use tracing::{debug, info, warn};
 
@@ -30,6 +30,8 @@ use crate::{
     network_driver::{Config, PollEvent, SendBehavior},
     tcp::{TcpTelemetry, set_socket_buf_size},
 };
+
+const EVENTS_CAPACITY: usize = 128;
 
 struct Endpoint {
     token: Token,
@@ -94,8 +96,12 @@ fn socket_index(sockets: &[Endpoint], token: Token) -> usize {
 }
 
 pub(crate) struct UdpManager {
+    pub(crate) config: Config,
+    pub(crate) dcache: Option<DCachePtr>,
+    udp: UdpConfig,
+    poll: Poll,
+    events: Events,
     registry: Registry,
-    config: UdpConfig,
     sockets: Vec<Endpoint>,
     peers: Vec<UdpPeer>,
     store: MsgStore,
@@ -112,20 +118,26 @@ pub(crate) struct UdpManager {
 }
 
 impl UdpManager {
-    pub(crate) fn new(registry: Registry, config: UdpConfig) -> Self {
-        config.validate();
+    pub(crate) fn new(config: Config, udp: UdpConfig) -> Self {
+        udp.validate();
+        let poll = Poll::new().expect("couldn't set up a poll for connector");
+        let registry = poll.registry().try_clone().expect("couldn't clone poll registry");
         Self {
-            registry,
             config,
+            dcache: None,
+            udp,
+            poll,
+            events: Events::with_capacity(EVENTS_CAPACITY),
+            registry,
             sockets: Vec::new(),
             peers: Vec::new(),
             store: MsgStore::new(),
             batch: SendBatch::new(),
             staged: [Staged { peer: 0, seq: 0 }; BATCH],
-            recv: Some(RecvBatch::new(config.max_datagram_size)),
+            recv: Some(RecvBatch::new(udp.max_datagram_size)),
             pending_disconnects: Vec::new(),
             next_token: 0,
-            tick_interval: config.min_rto / 2_u32,
+            tick_interval: udp.min_rto / 2_u32,
             next_tick: Instant::ZERO,
         }
     }
@@ -140,9 +152,9 @@ impl UdpManager {
         token
     }
 
-    fn bind(&mut self, cfg: &Config, bind: SocketAddr, listener: bool) -> io::Result<Token> {
+    fn bind(&mut self, bind: SocketAddr, listener: bool) -> io::Result<Token> {
         let mut socket = UdpSocket::bind(bind)?;
-        if let Some(size) = cfg.socket_buf_size {
+        if let Some(size) = self.config.socket_buf_size {
             set_socket_buf_size(&socket, size);
         }
         let token = self.next_token();
@@ -151,13 +163,13 @@ impl UdpManager {
         Ok(token)
     }
 
-    pub(crate) fn connect(&mut self, cfg: &Config, addr: SocketAddr) -> Option<Token> {
+    pub(crate) fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
         let bind = match addr {
             SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
         let token = self
-            .bind(cfg, bind, false)
+            .bind(bind, false)
             .inspect_err(|e| warn!("couldn't open udp socket for {addr}: {e}"))
             .ok()?;
         let entry = self.sockets.last().unwrap();
@@ -166,19 +178,19 @@ impl UdpManager {
             token,
             token,
             new_session(token.0),
-            &self.config,
-            latency_timer(cfg.telemetry, addr),
+            self.udp,
+            latency_timer(self.config.telemetry, addr),
         );
         let now = Instant::now();
         peer.send_hello(&entry.socket, now);
         // First in the queue; nothing goes out before the handshake anyway.
-        push_on_connect(&mut self.store, cfg, &mut peer, now);
+        push_on_connect(&mut self.store, &self.config, &mut peer, now);
         self.peers.push(peer);
         Some(token)
     }
 
-    pub(crate) fn listen_at(&mut self, cfg: &Config, addr: SocketAddr) -> Option<Token> {
-        self.bind(cfg, addr, true)
+    pub(crate) fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
+        self.bind(addr, true)
             .inspect_err(|e| warn!("couldn't start listening at {addr:?}: {e}"))
             .ok()
     }
@@ -186,11 +198,15 @@ impl UdpManager {
     /// Resets an outbound peer to a fresh session and starts dialling again.
     /// The on-connect message is queued behind any retained backlog; UDP
     /// delivery is unordered regardless.
-    fn reset_outbound(&mut self, cfg: &Config, index: usize, now: Instant) {
+    fn reset_outbound(&mut self, index: usize, now: Instant) {
         let peer = &mut self.peers[index];
         let session = new_session(peer.token.0);
-        peer.mark_disconnected(cfg.drop_outbound_backlog_on_disconnect, session, &mut self.store);
-        push_on_connect(&mut self.store, cfg, peer, now);
+        peer.mark_disconnected(
+            self.config.drop_outbound_backlog_on_disconnect,
+            session,
+            &mut self.store,
+        );
+        push_on_connect(&mut self.store, &self.config, peer, now);
         let entry = &self.sockets[socket_index(&self.sockets, peer.token)];
         peer.send_hello(&entry.socket, now);
     }
@@ -203,23 +219,23 @@ impl UdpManager {
     }
 
     /// Outbound peers renegotiate; accepted peers are dropped.
-    fn drop_peer(&mut self, cfg: &Config, index: usize, now: Instant) {
+    fn drop_peer(&mut self, index: usize, now: Instant) {
         if self.peers[index].is_outbound() {
-            self.reset_outbound(cfg, index, now);
+            self.reset_outbound(index, now);
         } else {
             self.remove_peer(index);
         }
     }
 
-    fn drop_peer_pending(&mut self, cfg: &Config, index: usize, now: Instant) {
+    fn drop_peer_pending(&mut self, index: usize, now: Instant) {
         self.pending_disconnects.push(self.peers[index].token);
-        self.drop_peer(cfg, index, now);
+        self.drop_peer(index, now);
     }
 
-    pub(crate) fn disconnect(&mut self, cfg: &Config, token: Token) {
+    pub(crate) fn disconnect(&mut self, token: Token) {
         let now = Instant::now();
         if let Some(i) = self.peers.iter().position(|p| p.token == token) {
-            self.drop_peer(cfg, i, now);
+            self.drop_peer(i, now);
             return;
         }
         let Some(k) = self.sockets.iter().position(|s| s.token == token && s.listener) else {
@@ -237,11 +253,11 @@ impl UdpManager {
         let _ = self.registry.deregister(&mut entry.socket);
     }
 
-    pub(crate) fn disconnect_outbound(&mut self, cfg: &Config) {
+    pub(crate) fn disconnect_outbound(&mut self) {
         let now = Instant::now();
         for i in 0..self.peers.len() {
             if self.peers[i].is_outbound() {
-                self.reset_outbound(cfg, i, now);
+                self.reset_outbound(i, now);
             }
         }
     }
@@ -249,7 +265,7 @@ impl UdpManager {
     /// Takes `payload` into the store and stages it for one peer or every
     /// peer, then flushes the sockets touched. `payload` comes back as a
     /// recycled buffer for the caller's next message.
-    pub(crate) fn write(&mut self, cfg: &Config, where_to: SendBehavior, payload: &mut Vec<u8>) {
+    pub(crate) fn write(&mut self, where_to: SendBehavior, payload: &mut Vec<u8>) {
         let now = Instant::now();
         let ts = Nanos::now();
         let slot = self.store.insert(payload);
@@ -258,8 +274,8 @@ impl UdpManager {
                 let mut i = self.peers.len();
                 while i != 0 {
                     i -= 1;
-                    if !self.stage_message(cfg, i, slot, ts, now) {
-                        self.drop_peer_pending(cfg, i, now);
+                    if !self.stage_message(i, slot, ts, now) {
+                        self.drop_peer_pending(i, now);
                     }
                 }
                 self.store.release(slot);
@@ -270,8 +286,8 @@ impl UdpManager {
             SendBehavior::Single(token) => {
                 if let Some(i) = self.peers.iter().position(|p| p.token == token) {
                     let k = socket_index(&self.sockets, self.peers[i].socket_token);
-                    if !self.stage_message(cfg, i, slot, ts, now) {
-                        self.drop_peer_pending(cfg, i, now);
+                    if !self.stage_message(i, slot, ts, now) {
+                        self.drop_peer_pending(i, now);
                     }
                     self.store.release(slot);
                     self.flush_socket(k, now);
@@ -290,20 +306,16 @@ impl UdpManager {
     /// Queues the stored message for one peer. `false` when the peer must be
     /// dropped: it violated the backlog limit or cannot hold the message.
     #[inline]
-    fn stage_message(
-        &mut self,
-        cfg: &Config,
-        index: usize,
-        slot: u32,
-        ts: Nanos,
-        now: Instant,
-    ) -> bool {
+    fn stage_message(&mut self, index: usize, slot: u32, ts: Nanos, now: Instant) -> bool {
         let peer = &mut self.peers[index];
-        if peer.is_outbound() && !peer.is_connected() && cfg.drop_outbound_backlog_on_disconnect {
+        if peer.is_outbound() &&
+            !peer.is_connected() &&
+            self.config.drop_outbound_backlog_on_disconnect
+        {
             return true;
         }
         match peer.push_message(&mut self.store, slot, ts, now) {
-            PushOutcome::Queued => !peer.backlog_exceeded(cfg.max_backlog),
+            PushOutcome::Queued => !peer.backlog_exceeded(self.config.max_backlog),
             PushOutcome::WindowFull => false,
             PushOutcome::TooLarge => true,
         }
@@ -367,8 +379,8 @@ impl UdpManager {
     }
 
     /// Hello retries, retransmits, heartbeats and peer timeouts.
-    fn tick(&mut self, cfg: &Config, now: Instant) {
-        let peer_timeout = Duration::from_millis(u64::from(cfg.user_timeout_ms));
+    fn tick(&mut self, now: Instant) {
+        let peer_timeout = self.config.user_timeout;
         let mut i = self.peers.len();
         while i != 0 {
             i -= 1;
@@ -380,14 +392,14 @@ impl UdpManager {
                 Ok(SendOutcome::WouldBlock) => arm_writable(&self.registry, entry),
                 Err(()) => {
                     warn!(addr = %peer.addr, "udp peer timed out");
-                    self.drop_peer_pending(cfg, i, now);
+                    self.drop_peer_pending(i, now);
                 }
             }
         }
     }
 
     /// Creates the accepted peer for a hello from `from`.
-    fn accept<F>(&mut self, cfg: &Config, k: usize, dgram: &Datagram<'_>, deliver: &mut F)
+    fn accept<F>(&mut self, k: usize, dgram: &Datagram<'_>, deliver: &mut F)
     where
         F: for<'a> FnMut(PollEvent<RxPayload<'a>>),
     {
@@ -398,12 +410,12 @@ impl UdpManager {
             token,
             entry.token,
             new_session(token.0),
-            &self.config,
-            latency_timer(cfg.telemetry, dgram.from),
+            self.udp,
+            latency_timer(self.config.telemetry, dgram.from),
         );
         let listener = entry.token;
         peer.on_hello(&dgram.header, &entry.socket, dgram.now);
-        push_on_connect(&mut self.store, cfg, &mut peer, dgram.now);
+        push_on_connect(&mut self.store, &self.config, &mut peer, dgram.now);
         info!(addr = %dgram.from, "udp client connected");
         deliver(PollEvent::Accept { listener, stream: token, peer_addr: dgram.from });
         self.peers.push(peer);
@@ -413,7 +425,6 @@ impl UdpManager {
     /// One received datagram.
     fn on_datagram<F>(
         &mut self,
-        cfg: &Config,
         k: usize,
         dgram: &Datagram<'_>,
         dcache: Option<&DCache>,
@@ -439,7 +450,7 @@ impl UdpManager {
                     let old = self.remove_peer(i);
                     deliver(PollEvent::Disconnect { token: old });
                 }
-                self.accept(cfg, k, dgram, deliver);
+                self.accept(k, dgram, deliver);
             }
             Kind::HelloAck => {
                 let Some(i) = peer_index else { return };
@@ -462,7 +473,7 @@ impl UdpManager {
                     warn!(addr = %from, "udp peer reset us, reconnecting");
                     let token = peer.token;
                     deliver(PollEvent::Disconnect { token });
-                    self.drop_peer(cfg, i, now);
+                    self.drop_peer(i, now);
                 }
             }
             Kind::Data | Kind::Ack => {
@@ -497,14 +508,8 @@ impl UdpManager {
     }
 
     /// Readable/writable event on the socket at `k`.
-    fn handle_event<F>(
-        &mut self,
-        cfg: &Config,
-        k: usize,
-        event: &Event,
-        dcache: Option<&DCache>,
-        deliver: &mut F,
-    ) where
+    fn handle_event<F>(&mut self, k: usize, event: &Event, dcache: Option<&DCache>, deliver: &mut F)
+    where
         F: for<'a> FnMut(PollEvent<RxPayload<'a>>),
     {
         let now = Instant::now();
@@ -525,7 +530,7 @@ impl UdpManager {
                     let Some((bytes, from)) = recv.datagram(i) else { continue };
                     let Some(header) = Header::decode(bytes) else { continue };
                     let dgram = Datagram { header, payload: &bytes[HEADER_SIZE..], from, now };
-                    self.on_datagram(cfg, k, &dgram, dcache, deliver);
+                    self.on_datagram(k, &dgram, dcache, deliver);
                 }
             }
             self.recv = Some(recv);
@@ -564,14 +569,7 @@ impl UdpManager {
     }
 
     /// One non-blocking poll pass with all housekeeping around it.
-    fn drive<F>(
-        &mut self,
-        cfg: &Config,
-        poll: &mut Poll,
-        events: &mut Events,
-        dcache: Option<&DCache>,
-        deliver: &mut F,
-    ) -> bool
+    fn drive<F>(&mut self, dcache: Option<&DCache>, deliver: &mut F) -> bool
     where
         F: for<'a> FnMut(PollEvent<RxPayload<'a>>),
     {
@@ -579,36 +577,34 @@ impl UdpManager {
         let now = Instant::now();
         if now >= self.next_tick {
             self.next_tick = now + self.tick_interval;
-            self.tick(cfg, now);
+            self.tick(now);
         }
-        if let Err(e) = poll.poll(events, Some(std::time::Duration::ZERO)) {
+        // Taken out so `handle_event` can borrow `self`; put back below.
+        let mut events = std::mem::replace(&mut self.events, Events::with_capacity(0));
+        if let Err(e) = self.poll.poll(&mut events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
+            self.events = events;
             return false;
         }
-        for event in &*events {
+        for event in &events {
             o = true;
             let Some(k) = self.sockets.iter().position(|s| s.token == event.token()) else {
                 debug!(token = ?event.token(), "ignoring stale udp readiness event");
                 continue;
             };
-            self.handle_event(cfg, k, event, dcache, deliver);
+            self.handle_event(k, event, dcache, deliver);
         }
+        self.events = events;
         o |= self.drain_pending_disconnects(deliver);
         o
     }
 
-    pub(crate) fn poll_with<F>(
-        &mut self,
-        cfg: &Config,
-        poll: &mut Poll,
-        events: &mut Events,
-        mut handler: F,
-    ) -> bool
+    pub(crate) fn poll_with<F>(&mut self, mut handler: F) -> bool
     where
         F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
-        let dcache = cfg.dcache;
-        self.drive(cfg, poll, events, dcache.as_deref(), &mut |event| match event {
+        let dcache = self.dcache;
+        self.drive(dcache.as_deref(), &mut |event| match event {
             PollEvent::Message { token, payload: RxPayload::Raw(bytes), send_ts } => {
                 handler(PollEvent::Message { token, payload: bytes, send_ts });
             }
@@ -623,21 +619,14 @@ impl UdpManager {
         })
     }
 
-    pub(crate) fn poll_with_produce<T, P, F>(
-        &mut self,
-        cfg: &Config,
-        poll: &mut Poll,
-        events: &mut Events,
-        produce: &P,
-        mut on_msg: F,
-    ) -> bool
+    pub(crate) fn poll_with_produce<T, P, F>(&mut self, produce: &P, mut on_msg: F) -> bool
     where
         T: 'static + Copy,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
     {
-        let dcache = cfg.dcache.expect("dcache required for poll_with_produce");
-        self.drive(cfg, poll, events, Some(&dcache), &mut |event| match event {
+        let dcache = self.dcache.expect("dcache required for poll_with_produce");
+        self.drive(Some(&dcache), &mut |event| match event {
             PollEvent::Message { token, payload: RxPayload::DCache(dref), send_ts } => match dcache
                 .map(dref, |bytes| on_msg(PollEvent::Message { token, payload: bytes, send_ts }))
             {
