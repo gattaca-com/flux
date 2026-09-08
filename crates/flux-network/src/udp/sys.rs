@@ -149,13 +149,11 @@ impl SendBatch {
     pub(crate) fn send(&mut self, fd: RawFd) -> io::Result<usize> {
         let n = mem::take(&mut self.len);
         #[cfg(target_os = "linux")]
-        // A single GSO send is atomic: its result still counts wire datagrams.
-        // Mixed destinations and sizes retain sendmmsg's accepted-prefix path.
         if self.gso && n >= 4 {
             let size = self.iovs[0][0].iov_len + self.iovs[0][1].iov_len;
             let addr = SockAddr::decode(&self.addrs[0].storage, self.addrs[0].len);
             let can_segment = size != 0 &&
-                size * n <= 65_507 &&
+                size * n <= super::wire::MAX_DATAGRAM_SIZE &&
                 (1..n).all(|i| {
                     let len = self.iovs[i][0].iov_len + self.iovs[i][1].iov_len;
                     (len == size || (i == n - 1 && len != 0 && len < size)) &&
@@ -180,6 +178,7 @@ impl SendBatch {
                 hdr.msg_controllen = SEGMENT_CONTROL_SPACE;
                 let sent = unsafe { libc::sendmsg(fd, ptr::from_ref(&hdr), libc::MSG_DONTWAIT) };
                 if sent >= 0 {
+                    // UDP sends are atomic; report wire datagrams, not GSO packets.
                     return Ok(n);
                 }
                 let err = io::Error::last_os_error();
@@ -195,7 +194,6 @@ impl SendBatch {
                 ) {
                     return Err(err);
                 }
-                // Retry this untouched batch normally, and stop probing GSO.
                 self.gso = false;
             }
         }
@@ -315,13 +313,14 @@ impl RecvBatch {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
+
     use super::*;
 
     #[cfg(target_os = "linux")]
     #[test]
     fn segmented_batch_preserves_datagrams() {
-        use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
-
         for bind in ["127.0.0.1:0", "[::1]:0"] {
             let sender = UdpSocket::bind(bind).unwrap();
             let receiver = UdpSocket::bind(bind).unwrap();
@@ -349,8 +348,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn segmentation_falls_back_without_checksums() {
-        use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
-
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -384,8 +381,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn mixed_batch_preserves_destinations_and_lengths() {
-        use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
-
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         let receivers =
             [UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap()];
@@ -393,17 +388,24 @@ mod tests {
             receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         }
         let to = receivers.each_ref().map(|r| SockAddr::new(r.local_addr().unwrap()));
-        let mut batch = SendBatch::new();
-        let payloads: [&[u8]; 4] = [b"a", b"bbbb", b"cc", b"ddd"];
-        for (i, payload) in payloads.iter().enumerate() {
-            batch.push(b"h", payload, &to[i % 2]);
-        }
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
-        let mut buf = [0; 32];
-        for (i, payload) in payloads.iter().enumerate() {
-            let n = receivers[i % 2].recv(&mut buf).unwrap();
-            assert_eq!(buf[0], b'h');
-            assert_eq!(&buf[1..n], *payload);
+        for mixed_destinations in [false, true] {
+            let mut batch = SendBatch::new();
+            let payloads: [&[u8]; 4] = if mixed_destinations {
+                [b"aaa", b"bbb", b"ccc", b"ddd"]
+            } else {
+                [b"a", b"bbbb", b"cc", b"ddd"]
+            };
+            let destination = |i: usize| if mixed_destinations { i % 2 } else { 0 };
+            for (i, payload) in payloads.iter().enumerate() {
+                batch.push(b"h", payload, &to[destination(i)]);
+            }
+            assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
+            let mut buf = [0; 32];
+            for (i, payload) in payloads.iter().enumerate() {
+                let n = receivers[destination(i)].recv(&mut buf).unwrap();
+                assert_eq!(buf[0], b'h');
+                assert_eq!(&buf[1..n], *payload);
+            }
         }
     }
 
