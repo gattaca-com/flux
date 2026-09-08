@@ -8,22 +8,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::{Connector, PollEvent, SendBehavior, Transport, UdpConfig};
+use flux_network::{NetworkDriver, PollEvent, SendBehavior, Transport, UdpConfig};
 use mio::Token;
 
 fn free_addr() -> SocketAddr {
     UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap()
 }
 
-fn udp(config: UdpConfig) -> Connector {
-    Connector::default().with_transport(Transport::Udp(config))
+fn udp(config: UdpConfig) -> NetworkDriver {
+    NetworkDriver::default().with_transport(Transport::Udp(config))
 }
 
 /// Handshake between a fresh listener and client, returning the accepted and
 /// the outbound token. `dial` differs from `addr` when a relay sits between.
 fn connect_via(
-    server: &mut Connector,
-    client: &mut Connector,
+    server: &mut NetworkDriver,
+    client: &mut NetworkDriver,
     addr: SocketAddr,
     dial: SocketAddr,
 ) -> (Token, Token) {
@@ -51,8 +51,8 @@ fn connect_via(
 }
 
 fn connect_pair(
-    server: &mut Connector,
-    client: &mut Connector,
+    server: &mut NetworkDriver,
+    client: &mut NetworkDriver,
     addr: SocketAddr,
 ) -> (Token, Token) {
     connect_via(server, client, addr, addr)

@@ -12,7 +12,7 @@ use crate::{
 
 const EVENTS_CAPACITY: usize = 128;
 
-/// Wire transport used by a [`Connector`], with its transport-specific
+/// Wire transport used by a [`NetworkDriver`], with its transport-specific
 /// settings. Settings both share are the `with_*` builders.
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
@@ -33,8 +33,8 @@ pub enum SendBehavior {
     Single(Token),
 }
 
-/// Event emitted by [`Connector::poll_with`] and
-/// [`Connector::poll_with_produce`] for each notable IO occurrence.
+/// Event emitted by [`NetworkDriver::poll_with`] and
+/// [`NetworkDriver::poll_with_produce`] for each notable IO occurrence.
 ///
 /// `Payload = &'a [u8]` for both variants.
 pub enum PollEvent<Payload> {
@@ -75,7 +75,7 @@ enum Inner {
     Udp(Box<UdpManager>),
 }
 
-/// Non-blocking connector/acceptor built on `mio`, over TCP or reliable UDP
+/// Poll-driven message transport built on `mio`, over TCP or reliable UDP
 /// (see [`Transport`]). The API and events are identical for both.
 ///
 /// Manages:
@@ -111,7 +111,7 @@ enum Inner {
 /// Messages are delivered as soon as they are complete, in any order. On
 /// reconnect everything still queued is resent under the new session unless
 /// [`with_drop_outbound_backlog_on_disconnect`] is set.
-pub struct Connector {
+pub struct NetworkDriver {
     poll: Poll,
     events: Events,
     config: Config,
@@ -120,7 +120,7 @@ pub struct Connector {
     inner: Inner,
 }
 
-impl Default for Connector {
+impl Default for NetworkDriver {
     fn default() -> Self {
         let poll = Poll::new().expect("couldn't set up a poll for connector");
         let registry = poll.registry().try_clone().expect("couldn't clone poll registry");
@@ -142,7 +142,7 @@ impl Default for Connector {
     }
 }
 
-impl Connector {
+impl NetworkDriver {
     /// Selects the wire transport. Must precede [`connect`] and [`listen_at`].
     ///
     /// # Panics

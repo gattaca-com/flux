@@ -7,7 +7,7 @@ use std::{
 };
 
 use flux_network::{
-    Connector, PollEvent, SendBehavior,
+    NetworkDriver, PollEvent, SendBehavior,
     tcp::{TcpEvent, TcpGroupConfig, TcpNetwork},
 };
 
@@ -612,7 +612,7 @@ fn tcp_network_is_wire_compatible_with_tcp_connector() {
     });
     network.listen(server_group, addr).unwrap();
 
-    let mut connector = Connector::default();
+    let mut connector = NetworkDriver::default();
     let connector_token = connector.connect(addr).expect("connector failed to connect");
     connector.write_or_enqueue_with(SendBehavior::Single(connector_token), |buf| {
         buf.extend_from_slice(REQUEST);
@@ -658,7 +658,7 @@ fn tcp_network_is_wire_compatible_with_tcp_connector() {
 #[test]
 fn tcp_network_client_is_wire_compatible_with_tcp_connector_server() {
     let addr = unused_addr();
-    let mut connector = Connector::default().with_on_connect_msg(SERVER_HELLO.to_vec());
+    let mut connector = NetworkDriver::default().with_on_connect_msg(SERVER_HELLO.to_vec());
     connector.listen_at(addr).expect("connector failed to listen");
 
     let mut network = TcpNetwork::default();

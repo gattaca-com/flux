@@ -1,4 +1,5 @@
-//! UDP side of [`crate::Connector`]: sockets, peers, and the per-poll drive.
+//! UDP side of [`crate::NetworkDriver`]: sockets, peers, and the per-poll
+//! drive.
 //!
 //! One socket per `listen_at` (shared by every peer that dials it) and one per
 //! `connect` (owned by that single peer). Peers hold all reliability state,
@@ -26,7 +27,7 @@ use super::{
     wire::{HEADER_SIZE, Header, Kind},
 };
 use crate::{
-    connector::{Config, PollEvent, SendBehavior},
+    network_driver::{Config, PollEvent, SendBehavior},
     tcp::{TcpTelemetry, set_socket_buf_size},
 };
 

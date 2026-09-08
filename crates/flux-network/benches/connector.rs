@@ -1,4 +1,4 @@
-//! TCP vs reliable UDP through `Connector`, on loopback.
+//! TCP vs reliable UDP through `NetworkDriver`, on loopback.
 //!
 //! `rtt`: one message to the server and its echo back, both connectors polled
 //! from this thread. `throughput`: a burst of messages one way, timed until
@@ -17,7 +17,7 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use flux_network::{Connector, PollEvent, SendBehavior, Transport, UdpConfig};
+use flux_network::{NetworkDriver, PollEvent, SendBehavior, Transport, UdpConfig};
 use mio::Token;
 
 const SIZES: [(&str, usize); 3] = [("2k", 2 * 1024), ("64k", 64 * 1024), ("2m", 2 * 1024 * 1024)];
@@ -30,8 +30,8 @@ fn free_addr() -> SocketAddr {
 
 /// A connected pair. The server echoes everything back on `Single(accepted)`.
 struct Pair {
-    server: Connector,
-    client: Connector,
+    server: NetworkDriver,
+    client: NetworkDriver,
     accepted: Token,
     client_token: Token,
 }
@@ -42,8 +42,8 @@ fn udp_config() -> UdpConfig {
     UdpConfig { max_message_size: 4 * 1024 * 1024, ..UdpConfig::lan() }
 }
 
-fn connector(transport: Transport) -> Connector {
-    Connector::default().with_transport(transport).with_socket_buf_size(16 * 1024 * 1024)
+fn connector(transport: Transport) -> NetworkDriver {
+    NetworkDriver::default().with_transport(transport).with_socket_buf_size(16 * 1024 * 1024)
 }
 
 fn pair(transport: Transport, listen: SocketAddr, dial: SocketAddr) -> Pair {

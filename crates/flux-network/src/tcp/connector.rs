@@ -1,4 +1,4 @@
-//! TCP side of [`crate::Connector`]: mio streams and listeners with framed
+//! TCP side of [`crate::NetworkDriver`]: mio streams and listeners with framed
 //! messages, reconnect of outbound streams, and per-stream send backlogs.
 
 use std::net::SocketAddr;
@@ -10,7 +10,7 @@ use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::TcpListene
 use tracing::{debug, error, warn};
 
 use crate::{
-    connector::{Config, PollEvent, SendBehavior},
+    network_driver::{Config, PollEvent, SendBehavior},
     tcp::{
         ConnState, FRAME_HEADER_SIZE, TcpStream, set_keepalive, set_socket_buf_size,
         set_user_timeout, write_frame_header,

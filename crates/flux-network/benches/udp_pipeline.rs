@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::{Connector, PollEvent, SendBehavior, Transport, UdpConfig};
+use flux_network::{NetworkDriver, PollEvent, SendBehavior, Transport, UdpConfig};
 use flux_timing::Nanos;
 
 const SIZES: [(&str, usize); 3] = [("2k", 2 * 1024), ("64k", 64 * 1024), ("2m", 2 * 1024 * 1024)];
@@ -57,8 +57,8 @@ fn transports() -> [(&'static str, Transport); 2] {
     [("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))]
 }
 
-fn connector(transport: Transport) -> Connector {
-    Connector::default().with_transport(transport).with_socket_buf_size(BIG_SOCKET_BUF)
+fn connector(transport: Transport) -> NetworkDriver {
+    NetworkDriver::default().with_transport(transport).with_socket_buf_size(BIG_SOCKET_BUF)
 }
 
 /// Message count and bound on outstanding messages for a burst of `size`.
@@ -97,10 +97,10 @@ fn connect(
     listen: SocketAddr,
     dial: SocketAddr,
     clients: usize,
-) -> (Connector, Vec<Connector>, Vec<mio::Token>) {
+) -> (NetworkDriver, Vec<NetworkDriver>, Vec<mio::Token>) {
     let mut server = connector(transport);
     server.listen_at(listen).unwrap();
-    let mut receivers: Vec<Connector> = (0..clients).map(|_| connector(transport)).collect();
+    let mut receivers: Vec<NetworkDriver> = (0..clients).map(|_| connector(transport)).collect();
     for r in &mut receivers {
         r.connect(dial).unwrap();
     }

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::{Connector, SendBehavior};
+use flux_network::{NetworkDriver, SendBehavior};
 use mio::Token;
 
 const FRAME_HEADER_SIZE: usize = core::mem::size_of::<u32>() + core::mem::size_of::<u64>();
@@ -45,7 +45,7 @@ fn spawn_frame_collector(read_delay: Duration) -> (SocketAddr, thread::JoinHandl
     (addr, handle)
 }
 
-fn pump(conn: &mut Connector, for_how_long: Duration) {
+fn pump(conn: &mut NetworkDriver, for_how_long: Duration) {
     let deadline = std::time::Instant::now() + for_how_long;
     while std::time::Instant::now() < deadline {
         let mut worked = false;
@@ -59,7 +59,7 @@ fn pump(conn: &mut Connector, for_how_long: Duration) {
     }
 }
 
-fn send_payload(conn: &mut Connector, token: Token, payload: &[u8]) {
+fn send_payload(conn: &mut NetworkDriver, token: Token, payload: &[u8]) {
     conn.write_or_enqueue_with(SendBehavior::Single(token), |buf| {
         buf.extend_from_slice(payload);
     });
@@ -70,7 +70,7 @@ fn queued_messages_flush_on_second_connection_after_backpressure() {
     let (fast_addr, fast_handle) = spawn_frame_collector(Duration::from_millis(0));
     let (slow_addr, slow_handle) = spawn_frame_collector(Duration::from_millis(700));
 
-    let mut conn = Connector::default().with_socket_buf_size(1024);
+    let mut conn = NetworkDriver::default().with_socket_buf_size(1024);
     let fast_token = conn.connect(fast_addr).expect("failed to connect to fast collector");
     let slow_token = conn.connect(slow_addr).expect("failed to connect to slow collector");
     assert_ne!(fast_token, slow_token);

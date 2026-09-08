@@ -1,4 +1,4 @@
-//! Reliable, unordered UDP transport for [`crate::Connector`].
+//! Reliable, unordered UDP transport for [`crate::NetworkDriver`].
 //!
 //! Each message is fragmented into datagrams that carry consecutive sequence
 //! numbers. The receiver acks with a cumulative point plus a selective bitmap

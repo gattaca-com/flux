@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::{Connector, PollEvent, SendBehavior, TcpConfig, Transport};
+use flux_network::{NetworkDriver, PollEvent, SendBehavior, TcpConfig, Transport};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
@@ -21,7 +21,7 @@ where
 fn tcp_roundtrip() {
     let bind_addr = SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), 24712));
 
-    let mut listener = Connector::default();
+    let mut listener = NetworkDriver::default();
     let _listening_token = listener.listen_at(bind_addr).unwrap();
 
     let server = thread::spawn(move || {
@@ -64,7 +64,7 @@ fn tcp_roundtrip() {
 
     let client = thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let mut conn = Connector::default();
+        let mut conn = NetworkDriver::default();
         let tok = conn.connect(bind_addr).unwrap();
         // Then responds
         conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
@@ -99,7 +99,7 @@ fn backlog_disconnect_is_reported() {
     let bind_addr = probe.local_addr().unwrap();
     drop(probe);
 
-    let mut listener = Connector::default()
+    let mut listener = NetworkDriver::default()
         .with_socket_buf_size(1024)
         .with_max_backlog(0, flux_timing::Duration::ZERO);
     listener.listen_at(bind_addr).unwrap();
@@ -146,10 +146,10 @@ fn receive_after_reconnect(drop_backlog: bool) -> Option<TestMsg> {
     let bind_addr = probe.local_addr().unwrap();
     drop(probe);
 
-    let mut listener = Connector::default();
+    let mut listener = NetworkDriver::default();
     listener.listen_at(bind_addr).unwrap();
 
-    let mut client = Connector::default()
+    let mut client = NetworkDriver::default()
         .with_transport(Transport::Tcp(TcpConfig {
             reconnect_interval: flux_timing::Duration::from_millis(1),
             ..TcpConfig::default()

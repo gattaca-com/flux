@@ -13,7 +13,7 @@ use flux::{
     spine::{ScopedSpine, SpineAdapter, SpineProducerWithDCache},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
-use flux_network::{Connector, PollEvent, SendBehavior, Transport, UdpConfig};
+use flux_network::{NetworkDriver, PollEvent, SendBehavior, Transport, UdpConfig};
 use spine_derive::from_spine;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -29,7 +29,7 @@ struct TcpDcacheSpine {
 }
 
 struct NetworkTile {
-    conn: Option<Connector>,
+    conn: Option<NetworkDriver>,
     transport: Transport,
     ready: Arc<AtomicBool>,
     bind_addr: SocketAddr,
@@ -40,7 +40,7 @@ impl Tile<TcpDcacheSpine> for NetworkTile {
     fn try_init(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) -> bool {
         let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
         let mut conn =
-            Connector::default().with_transport(self.transport).with_dcache(sp.dcache_ptr());
+            NetworkDriver::default().with_transport(self.transport).with_dcache(sp.dcache_ptr());
         conn.listen_at(self.bind_addr).unwrap();
         self.conn = Some(conn);
         self.ready.store(true, Ordering::Release);
@@ -57,7 +57,7 @@ impl Tile<TcpDcacheSpine> for NetworkTile {
             let PollEvent::Message { payload: bytes, .. } = ev else { return None };
             bytes.try_into().ok().map(Payload)
         });
-        // Connector is polled rather than registered with Flux's park waker,
+        // NetworkDriver is polled rather than registered with Flux's park waker,
         // so keep this background tile ticking when the workspace enables `park`.
         adapter.mark_work();
     }
@@ -123,7 +123,7 @@ fn dcache_multi_stream(transport: Transport) {
             thread::sleep(Duration::from_millis(1));
         }
         for msg in [MSG_A, MSG_B] {
-            let mut conn = Connector::default().with_transport(transport);
+            let mut conn = NetworkDriver::default().with_transport(transport);
             let tok = conn.connect(bind_addr).unwrap();
             conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
                 buf.extend_from_slice(msg);
