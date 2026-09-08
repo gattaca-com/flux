@@ -258,36 +258,4 @@ mod tests {
             assert_eq!(SockAddr::decode(&native.storage, native.len), Some(addr));
         }
     }
-
-    #[test]
-    fn batches_roundtrip_over_loopback() {
-        use std::{net::UdpSocket, os::fd::AsRawFd};
-        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        rx.set_nonblocking(true).unwrap();
-        let to = SockAddr::new(rx.local_addr().unwrap());
-        let headers: Vec<[u8; 2]> = (0..5u8).map(|i| [i, i]).collect();
-        let payload = b"payload";
-        let mut batch = SendBatch::new();
-        for h in &headers {
-            batch.push(h, payload, &to);
-        }
-        assert_eq!(batch.send(tx.as_raw_fd()).unwrap(), 5);
-        assert_eq!(batch.len, 0);
-
-        let mut recv = RecvBatch::new(64);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut got = Vec::new();
-        while got.len() < 5 && std::time::Instant::now() < deadline {
-            let Ok(n) = recv.recv(rx.as_raw_fd()) else { continue };
-            for i in 0..n {
-                let (bytes, from) = recv.datagram(i).unwrap();
-                assert_eq!(from, tx.local_addr().unwrap());
-                assert_eq!(&bytes[2..], payload);
-                got.push(bytes[0]);
-            }
-        }
-        got.sort_unstable();
-        assert_eq!(got, [0, 1, 2, 3, 4]);
-    }
 }

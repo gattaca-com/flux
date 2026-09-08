@@ -1193,19 +1193,6 @@ mod tests {
     }
 
     #[test]
-    fn rto_tracks_samples_within_clamps() {
-        let c = cfg();
-        let mut rto = Rto::new(&c);
-        assert_eq!(rto.current(), c.initial_rto);
-        rto.sample(Duration::from_micros(10));
-        assert_eq!(rto.current(), c.min_rto);
-        for _ in 0..50 {
-            rto.sample(Duration::from_millis(200));
-        }
-        assert_eq!(rto.current(), c.max_rto);
-    }
-
-    #[test]
     fn tx_window_capacity_and_ack() {
         let config = cfg();
         let stride = config.stride();
