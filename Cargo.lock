@@ -657,6 +657,8 @@ dependencies = [
 name = "flux-network"
 version = "0.3.0"
 dependencies = [
+ "core_affinity",
+ "criterion",
  "flux",
  "flux-communication",
  "flux-timing",

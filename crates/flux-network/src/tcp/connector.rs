@@ -1,29 +1,24 @@
+//! TCP side of [`crate::Connector`]: mio streams and listeners with framed
+//! messages, reconnect of outbound streams, and per-stream send backlogs.
+
 use std::net::SocketAddr;
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_timing::{Duration, Instant, Nanos, Repeater};
-use flux_utils::{DCachePtr, safe_panic};
-use mio::{Events, Interest, Poll, Token, event::Event, net::TcpListener};
+use flux_utils::safe_panic;
+use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, warn};
 
-use crate::tcp::{
-    ConnState, TcpStream, TcpTelemetry, set_socket_buf_size,
-    stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, set_keepalive, set_user_timeout,
-        write_frame_header,
+use crate::{
+    connector::{Config, PollEvent, SendBehavior},
+    tcp::{
+        ConnState, FRAME_HEADER_SIZE, TcpStream, set_keepalive, set_socket_buf_size,
+        set_user_timeout, write_frame_header,
     },
 };
 
-#[derive(Clone, Copy, Debug)]
-#[repr(u8)]
-pub enum SendBehavior {
-    Broadcast,
-    Single(Token),
-}
-
 // Outbound will try to reconnect, inbound not
-#[repr(u8)]
-pub enum ConnectionVariant {
+enum Variant {
     /// Connections that we initiated, will be reconnected
     Outbound(TcpStream),
     /// Connections that were initated from outside through one of
@@ -35,153 +30,94 @@ pub enum ConnectionVariant {
     Listener(TcpListener),
 }
 
-/// Event emitted by [`TcpConnector::poll_with`] and
-/// [`TcpConnector::poll_with_produce`] for each notable IO occurrence.
-///
-/// `Payload = &'a [u8]` for both variants.
-pub enum PollEvent<Payload> {
-    /// A new connection was accepted from a listener.
-    ///
-    /// - `listener`: token of the listening socket that accepted
-    /// - `stream`: token assigned to the new inbound stream
-    /// - `peer_addr`: remote address
-    ///
-    /// Use the `stream` token with [`SendBehavior::Single`] to write back.
-    Accept { listener: Token, stream: Token, peer_addr: SocketAddr },
-    /// Succuessfully reconnected to an outbound stream.
-    Reconnect { token: Token },
-    /// A connection was closed (by the remote or due to an IO error).
-    Disconnect { token: Token },
-    /// A complete framed message was received.
-    Message { token: Token, payload: Payload, send_ts: Nanos },
-}
-
-struct ConnectionManager {
-    poll: Poll,
-    conns: Vec<(Token, ConnectionVariant)>,
+pub(crate) struct TcpManager {
+    registry: Registry,
+    conns: Vec<(Token, Variant)>,
     reconnector: Repeater,
-    on_connect_msg: Option<Vec<u8>>,
-    telemetry: TcpTelemetry,
-    socket_buf_size: Option<usize>,
-    user_timeout_ms: u32,
-    dcache: Option<DCachePtr>,
-    /// When set, connections whose send backlog exceeds `max` messages for
-    /// longer than `timeout` are disconnected (outbound scheduled for
-    /// reconnection).
-    max_backlog: Option<(usize, Duration)>,
-    drop_outbound_backlog_on_disconnect: bool,
-    /// Whether to set `TCP_NODELAY` on sockets (disables Nagle's algorithm).
-    nodelay: bool,
-    keepalive: bool,
-
     // Always only outbound/client side connection streams
-    to_be_reconnected: Vec<(Token, ConnectionVariant)>,
+    to_be_reconnected: Vec<(Token, Variant)>,
     // Outbound connections that completed during maybe_reconnect, drained in poll_with.
     reconnected_to: Vec<Token>,
     // Connections dropped outside event handling, drained in poll_with before reconnects.
     pending_disconnects: Vec<Token>,
     next_token: usize,
-
-    /// Scratch buffers for [`SendBehavior::Broadcast`]: the frame is serialised
-    /// once per broadcast and the identical bytes are written to every
-    /// connection.
-    bcast_header: [u8; FRAME_HEADER_SIZE],
-    bcast_payload: Vec<u8>,
+    /// Header of the frame currently being written; the payload is the
+    /// caller's and identical for every recipient of a broadcast.
+    header: [u8; FRAME_HEADER_SIZE],
 }
-impl Default for ConnectionManager {
-    fn default() -> Self {
+
+impl TcpManager {
+    pub(crate) fn new(registry: Registry) -> Self {
         Self {
+            registry,
             conns: Vec::with_capacity(5),
             reconnector: Repeater::every(Duration::from_secs(2)),
-            on_connect_msg: None,
-            telemetry: TcpTelemetry::Disabled,
-            socket_buf_size: None,
-            user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
-            dcache: None,
-            max_backlog: None,
-            drop_outbound_backlog_on_disconnect: false,
-            nodelay: true,
-            keepalive: false,
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             pending_disconnects: Vec::with_capacity(10),
-            poll: Poll::new().expect("couldn't set up a poll for tcp connector"),
             next_token: 0,
-            bcast_header: [0; FRAME_HEADER_SIZE],
-            bcast_payload: Vec::with_capacity(TcpStream::SEND_BUF_SIZE),
+            header: [0; FRAME_HEADER_SIZE],
         }
     }
-}
-impl ConnectionManager {
-    #[inline]
-    fn disconnect_all_outbound(&mut self) {
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.conns.is_empty() && self.to_be_reconnected.is_empty()
+    }
+
+    pub(crate) fn set_reconnect_interval(&mut self, interval: Duration) {
+        self.reconnector = Repeater::every(interval);
+    }
+
+    pub(crate) fn disconnect_outbound(&mut self, cfg: &Config) {
         let mut i = self.conns.len();
         while i != 0 {
             i -= 1;
-            if matches!(self.conns[i].1, ConnectionVariant::Outbound(_)) {
-                self.disconnect_at_index(i);
+            if matches!(self.conns[i].1, Variant::Outbound(_)) {
+                self.disconnect_at_index(cfg, i);
             }
         }
     }
 
-    fn disconnect_at_index(&mut self, index: usize) {
+    fn disconnect_at_index(&mut self, cfg: &Config, index: usize) {
         let (token, stream) = self.conns.swap_remove(index);
         match stream {
-            ConnectionVariant::Outbound(mut tcp_connection) => {
-                tcp_connection.close(self.poll.registry());
-                if self.drop_outbound_backlog_on_disconnect {
+            Variant::Outbound(mut tcp_connection) => {
+                tcp_connection.close(&self.registry);
+                if cfg.drop_outbound_backlog_on_disconnect {
                     tcp_connection.clear_send_backlog();
                 }
-                self.to_be_reconnected.push((token, ConnectionVariant::Outbound(tcp_connection)));
+                self.to_be_reconnected.push((token, Variant::Outbound(tcp_connection)));
             }
-            ConnectionVariant::Inbound(mut tcp_connection) => {
-                tcp_connection.close(self.poll.registry());
+            Variant::Inbound(mut tcp_connection) => {
+                tcp_connection.close(&self.registry);
             }
-            ConnectionVariant::Listener(mut tcp_listener) => {
-                let _ = self.poll.registry().deregister(&mut tcp_listener);
+            Variant::Listener(mut tcp_listener) => {
+                let _ = self.registry.deregister(&mut tcp_listener);
             }
         }
     }
 
-    fn disconnect_at_index_pending(&mut self, index: usize) {
+    fn disconnect_at_index_pending(&mut self, cfg: &Config, index: usize) {
         let token = self.conns[index].0;
-        self.disconnect_at_index(index);
+        self.disconnect_at_index(cfg, index);
         self.pending_disconnects.push(token);
     }
 
-    fn disconnect_token(&mut self, token: Token) {
+    pub(crate) fn disconnect(&mut self, cfg: &Config, token: Token) {
         if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
-            self.disconnect_at_index(i);
+            self.disconnect_at_index(cfg, i);
         }
     }
 
     #[inline]
-    fn broadcast<F>(&mut self, serialise: &F)
-    where
-        F: Fn(&mut Vec<u8>),
-    {
-        // Serialise the frame ONCE for the whole fan-out, then hand the
-        // identical bytes to every connection. A single send-ts is shared
-        // across all connections for the broadcast.
-        self.bcast_payload.clear();
-        serialise(&mut self.bcast_payload);
-        if self.bcast_payload.is_empty() {
-            return;
-        }
-        write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
-
-        let max_backlog = self.max_backlog;
-        if !self.drop_outbound_backlog_on_disconnect {
+    fn broadcast(&mut self, cfg: &Config, payload: &[u8]) {
+        let max_backlog = cfg.max_backlog;
+        if !cfg.drop_outbound_backlog_on_disconnect {
             for (_, c) in &mut self.to_be_reconnected {
-                let ConnectionVariant::Outbound(tcp) = c else {
+                let Variant::Outbound(tcp) = c else {
                     unreachable!("only outbound should be auto reconnected");
                 };
-                Self::push_reconnect_backlog_shared(
-                    max_backlog,
-                    tcp,
-                    &self.bcast_header,
-                    &self.bcast_payload,
-                );
+                Self::push_reconnect_backlog_shared(max_backlog, tcp, &self.header, payload);
             }
         }
 
@@ -189,32 +125,31 @@ impl ConnectionManager {
         while i != 0 {
             i -= 1;
             match &mut self.conns[i].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
+                Variant::Outbound(tcp_connection) | Variant::Inbound(tcp_connection) => {
                     let state = tcp_connection.write_or_enqueue_shared(
-                        self.poll.registry(),
-                        &self.bcast_header,
-                        &self.bcast_payload,
+                        &self.registry,
+                        &self.header,
+                        payload,
                     );
                     if state == ConnState::Disconnected {
                         let token = self.conns[i].0;
-                        self.disconnect_at_index_pending(i);
-                        if !self.drop_outbound_backlog_on_disconnect &&
-                            let Some((_, ConnectionVariant::Outbound(tcp))) =
+                        self.disconnect_at_index_pending(cfg, i);
+                        if !cfg.drop_outbound_backlog_on_disconnect &&
+                            let Some((_, Variant::Outbound(tcp))) =
                                 self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                         {
                             Self::push_reconnect_backlog_shared(
                                 max_backlog,
                                 tcp,
-                                &self.bcast_header,
-                                &self.bcast_payload,
+                                &self.header,
+                                payload,
                             );
                         }
                     } else if Self::active_backlog_exceeded(max_backlog, tcp_connection) {
-                        self.disconnect_at_index_pending(i);
+                        self.disconnect_at_index_pending(cfg, i);
                     }
                 }
-                ConnectionVariant::Listener(_tcp_listener) => {}
+                Variant::Listener(_tcp_listener) => {}
             }
         }
     }
@@ -264,66 +199,55 @@ impl ConnectionManager {
         }
     }
 
+    /// Frames `payload` and writes it to one connection or all of them.
     #[inline]
-    fn write_or_enqueue_with<F>(&mut self, serialise: F, where_to: SendBehavior)
-    where
-        F: Fn(&mut Vec<u8>),
-    {
+    pub(crate) fn write(&mut self, cfg: &Config, where_to: SendBehavior, payload: &[u8]) {
+        write_frame_header(&mut self.header, payload.len(), Nanos::now());
         match where_to {
-            SendBehavior::Broadcast => self.broadcast(&serialise),
+            SendBehavior::Broadcast => self.broadcast(cfg, payload),
             SendBehavior::Single(token) => {
-                self.bcast_payload.clear();
-                serialise(&mut self.bcast_payload);
-                if self.bcast_payload.is_empty() {
-                    return;
-                }
-                write_frame_header(&mut self.bcast_header, self.bcast_payload.len(), Nanos::now());
-
                 if let Some(i) = self.conns.iter().position(|(t, _)| *t == token) {
                     match &mut self.conns[i].1 {
-                        ConnectionVariant::Outbound(tcp_connection) |
-                        ConnectionVariant::Inbound(tcp_connection) => {
+                        Variant::Outbound(tcp_connection) | Variant::Inbound(tcp_connection) => {
                             let state = tcp_connection.write_or_enqueue_shared(
-                                self.poll.registry(),
-                                &self.bcast_header,
-                                &self.bcast_payload,
+                                &self.registry,
+                                &self.header,
+                                payload,
                             );
                             if state == ConnState::Disconnected {
                                 tracing::warn!("issue when writing to {token:?} disconnecting");
-                                self.disconnect_at_index_pending(i);
-                                if !self.drop_outbound_backlog_on_disconnect &&
-                                    let Some((_, ConnectionVariant::Outbound(tcp))) = self
+                                self.disconnect_at_index_pending(cfg, i);
+                                if !cfg.drop_outbound_backlog_on_disconnect &&
+                                    let Some((_, Variant::Outbound(tcp))) = self
                                         .to_be_reconnected
                                         .iter_mut()
                                         .find(|(t, _)| *t == token)
                                 {
                                     Self::push_reconnect_backlog_shared(
-                                        self.max_backlog,
+                                        cfg.max_backlog,
                                         tcp,
-                                        &self.bcast_header,
-                                        &self.bcast_payload,
+                                        &self.header,
+                                        payload,
                                     );
                                 }
-                            } else if Self::active_backlog_exceeded(
-                                self.max_backlog,
-                                tcp_connection,
-                            ) {
-                                self.disconnect_at_index_pending(i);
+                            } else if Self::active_backlog_exceeded(cfg.max_backlog, tcp_connection)
+                            {
+                                self.disconnect_at_index_pending(cfg, i);
                             }
                         }
-                        ConnectionVariant::Listener(_tcp_listener) => error!(
+                        Variant::Listener(_tcp_listener) => error!(
                             "cannot write to listener bound to token {token:?}, what are you doing"
                         ),
                     }
-                } else if let Some((_, ConnectionVariant::Outbound(tcp))) =
+                } else if let Some((_, Variant::Outbound(tcp))) =
                     self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
                 {
-                    if !self.drop_outbound_backlog_on_disconnect {
+                    if !cfg.drop_outbound_backlog_on_disconnect {
                         Self::push_reconnect_backlog_shared(
-                            self.max_backlog,
+                            cfg.max_backlog,
                             tcp,
-                            &self.bcast_header,
-                            &self.bcast_payload,
+                            &self.header,
+                            payload,
                         );
                     }
                 } else {
@@ -333,25 +257,25 @@ impl ConnectionManager {
         }
     }
 
-    fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
+    pub(crate) fn connect(&mut self, cfg: &Config, addr: SocketAddr) -> Option<Token> {
         let o = Token(self.next_token);
-        if let Some(stream) = self.try_connect(o, addr) {
+        if let Some(stream) = self.try_connect(cfg, o, addr) {
             let mut tcp_stream = TcpStream::from_stream_with_telemetry(
                 stream,
                 o,
                 addr,
-                self.telemetry,
-                self.dcache.is_some(),
+                cfg.telemetry,
+                cfg.dcache.is_some(),
             );
-            if let Some(msg) = &self.on_connect_msg &&
-                tcp_stream.write_or_enqueue_with(self.poll.registry(), |buf: &mut Vec<u8>| {
+            if let Some(msg) = &cfg.on_connect_msg &&
+                tcp_stream.write_or_enqueue_with(&self.registry, |buf: &mut Vec<u8>| {
                     buf.extend_from_slice(msg);
                 }) == ConnState::Disconnected
             {
                 warn!(?addr, "on_connect_msg send failed");
                 return None;
             }
-            self.conns.push((o, ConnectionVariant::Outbound(tcp_stream)));
+            self.conns.push((o, Variant::Outbound(tcp_stream)));
             self.next_token += 1;
             Some(o)
         } else {
@@ -363,22 +287,21 @@ impl ConnectionManager {
     // port. When a connection comes in through that port, this token will be
     // communicated to the handling function so the handler can know what
     // endpoint it is receiving a connection for.
-    fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
+    pub(crate) fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
         let mut listener = mio::net::TcpListener::bind(addr)
             .inspect_err(|e| warn!("couldn't start listening at {addr:?}: {e}"))
             .ok()?;
         let token = Token(self.next_token);
-        self.poll
-            .registry()
+        self.registry
             .register(&mut listener, token, Interest::READABLE)
             .inspect_err(|err| warn!("Couldn't register listening addr {addr:?}: {err}"))
             .ok()?;
-        self.conns.push((token, ConnectionVariant::Listener(listener)));
+        self.conns.push((token, Variant::Listener(listener)));
         self.next_token += 1;
         Some(token)
     }
 
-    fn maybe_reconnect(&mut self) {
+    fn maybe_reconnect(&mut self, cfg: &Config) {
         if !self.reconnector.fired() {
             return;
         }
@@ -387,7 +310,7 @@ impl ConnectionManager {
         while i != 0 {
             i -= 1;
             let (token, mut stream) = self.to_be_reconnected.swap_remove(i);
-            if self.try_reconnect(token, &mut stream) {
+            if self.try_reconnect(cfg, token, &mut stream) {
                 self.conns.push((token, stream));
                 self.reconnected_to.push(token);
             } else {
@@ -396,14 +319,19 @@ impl ConnectionManager {
         }
     }
 
-    fn try_connect(&self, token: Token, addr: SocketAddr) -> Option<mio::net::TcpStream> {
+    fn try_connect(
+        &self,
+        cfg: &Config,
+        token: Token,
+        addr: SocketAddr,
+    ) -> Option<mio::net::TcpStream> {
         let Ok(mut new_stream) = mio::net::TcpStream::connect(addr)
             .inspect_err(|e| warn!("couldn't connect to {addr}: {e}"))
         else {
             return None;
         };
 
-        if let Some(size) = self.socket_buf_size {
+        if let Some(size) = cfg.socket_buf_size {
             set_socket_buf_size(&new_stream, size);
         }
         let Ok(err) =
@@ -416,11 +344,11 @@ impl ConnectionManager {
             return None;
         }
 
-        if let Err(e) = self.poll.registry().register(&mut new_stream, token, Interest::READABLE) {
+        if let Err(e) = self.registry.register(&mut new_stream, token, Interest::READABLE) {
             error!("couldn't register tcp stream for {addr} with registry: {e}");
             return None;
         }
-        if self.nodelay {
+        if cfg.nodelay {
             new_stream
                 .set_nodelay(true)
                 .inspect_err(|e| {
@@ -428,30 +356,27 @@ impl ConnectionManager {
                 })
                 .ok()?;
         }
-        if self.keepalive {
+        if cfg.keepalive {
             set_keepalive(&new_stream)
                 .inspect_err(|e| error!("couldn't setup keepalive for tcp stream for {addr}: {e}"))
                 .ok()?;
         }
-        set_user_timeout(&new_stream, self.user_timeout_ms);
+        set_user_timeout(&new_stream, cfg.user_timeout_ms);
         Some(new_stream)
     }
 
-    fn try_reconnect(&self, token: Token, stream: &mut ConnectionVariant) -> bool {
-        let ConnectionVariant::Outbound(stream) = stream else {
+    fn try_reconnect(&self, cfg: &Config, token: Token, stream: &mut Variant) -> bool {
+        let Variant::Outbound(stream) = stream else {
             panic!("Can only try to connect a Outbound connection");
         };
         let addr = stream.peer();
 
-        let Some(new_stream) = self.try_connect(token, addr) else {
+        let Some(new_stream) = self.try_connect(cfg, token, addr) else {
             return false;
         };
 
-        if stream.reset_with_new_stream(
-            self.poll.registry(),
-            new_stream,
-            self.on_connect_msg.as_ref(),
-        ) == ConnState::Disconnected
+        if stream.reset_with_new_stream(&self.registry, new_stream, cfg.on_connect_msg.as_ref()) ==
+            ConnState::Disconnected
         {
             warn!(addr = ?addr, "on_connect_msg send failed");
             return false;
@@ -463,14 +388,14 @@ impl ConnectionManager {
     }
 
     #[inline]
-    fn currently_disconnected(&self) -> impl Iterator<Item = Token> {
+    pub(crate) fn currently_disconnected(&self) -> impl Iterator<Item = Token> {
         self.to_be_reconnected.iter().map(|(t, _)| *t)
     }
 
     #[inline]
-    fn force_reconnect(&mut self) {
+    pub(crate) fn force_reconnect(&mut self, cfg: &Config) {
         self.reconnector.reset();
-        self.maybe_reconnect();
+        self.maybe_reconnect(cfg);
     }
 
     #[inline]
@@ -485,8 +410,69 @@ impl ConnectionManager {
         had_pending
     }
 
+    /// Accepts every pending connection on the listener at `index`, emitting
+    /// [`PollEvent::Accept`] for each.
+    fn accept_all<F>(
+        &mut self,
+        cfg: &Config,
+        index: usize,
+        listener_token: Token,
+        on_accept: &mut F,
+    ) where
+        F: FnMut(PollEvent<&[u8]>),
+    {
+        loop {
+            let Variant::Listener(tcp_listener) = &mut self.conns[index].1 else { unreachable!() };
+            let Ok((mut stream, addr)) = tcp_listener.accept() else { return };
+            tracing::info!(?addr, "client connected");
+            if let Some(size) = cfg.socket_buf_size {
+                set_socket_buf_size(&stream, size);
+            }
+            let token = Token(self.next_token);
+            if let Err(e) = self.registry.register(&mut stream, token, Interest::READABLE) {
+                error!("couldn't register client {e}");
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+            if cfg.nodelay {
+                if let Err(e) = stream.set_nodelay(true) {
+                    error!("couldn't set nodelay on stream to {addr}: {e}");
+                    continue;
+                }
+            }
+            if cfg.keepalive &&
+                let Err(e) = set_keepalive(&stream)
+            {
+                error!("couldn't set keepalive on stream to {addr}: {e}");
+                continue;
+            }
+            set_user_timeout(&stream, cfg.user_timeout_ms);
+            let mut conn = TcpStream::from_stream_with_telemetry(
+                stream,
+                token,
+                addr,
+                cfg.telemetry,
+                cfg.dcache.is_some(),
+            );
+            if let Some(msg) = &cfg.on_connect_msg &&
+                conn.write_or_enqueue_with(&self.registry, |buf: &mut Vec<u8>| {
+                    buf.extend_from_slice(msg);
+                }) == ConnState::Disconnected
+            {
+                continue;
+            }
+            on_accept(PollEvent::Accept {
+                listener: listener_token,
+                stream: token,
+                peer_addr: addr,
+            });
+            self.conns.push((token, Variant::Inbound(conn)));
+            self.next_token += 1;
+        }
+    }
+
     #[inline]
-    fn handle_event<F>(&mut self, e: &Event, handler: &mut F)
+    fn handle_event<F>(&mut self, cfg: &Config, e: &Event, handler: &mut F)
     where
         F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
@@ -496,87 +482,33 @@ impl ConnectionManager {
             return;
         };
 
-        loop {
-            match &mut self.conns[stream_id].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
-                    if tcp_connection.poll_with(
-                        self.poll.registry(),
-                        e,
-                        self.dcache.as_deref(),
-                        &mut |token, bytes, send_ts| {
-                            handler(PollEvent::Message { token, payload: bytes, send_ts });
-                        },
-                    ) == ConnState::Disconnected
-                    {
-                        handler(PollEvent::Disconnect { token: event_token });
-                        self.disconnect_at_index(stream_id);
-                    }
-                    return;
-                }
-                ConnectionVariant::Listener(tcp_listener) => {
-                    if let Ok((mut stream, addr)) = tcp_listener.accept() {
-                        tracing::info!(?addr, "client connected");
-                        if let Some(size) = self.socket_buf_size {
-                            set_socket_buf_size(&stream, size);
-                        }
-                        let token = Token(self.next_token);
-                        if let Err(e) =
-                            self.poll.registry().register(&mut stream, token, Interest::READABLE)
-                        {
-                            error!("couldn't register client {e}");
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                            continue;
-                        }
-                        if self.nodelay {
-                            if let Err(e) = stream.set_nodelay(true) {
-                                error!("couldn't set nodelay on stream to {addr}: {e}");
-                                continue;
-                            }
-                        }
-                        if self.keepalive &&
-                            let Err(e) = set_keepalive(&stream)
-                        {
-                            error!("couldn't set keepalive on stream to {addr}: {e}");
-                            continue;
-                        }
-                        set_user_timeout(&stream, self.user_timeout_ms);
-                        let mut conn = TcpStream::from_stream_with_telemetry(
-                            stream,
-                            token,
-                            addr,
-                            self.telemetry,
-                            self.dcache.is_some(),
-                        );
-
-                        if let Some(msg) = &self.on_connect_msg &&
-                            conn.write_or_enqueue_with(
-                                self.poll.registry(),
-                                |buf: &mut Vec<u8>| {
-                                    buf.extend_from_slice(msg);
-                                },
-                            ) == ConnState::Disconnected
-                        {
-                            continue;
-                        }
-                        handler(PollEvent::Accept {
-                            listener: event_token,
-                            stream: token,
-                            peer_addr: addr,
-                        });
-                        self.conns.push((token, ConnectionVariant::Inbound(conn)));
-                        self.next_token += 1;
-                    } else {
-                        return;
-                    }
+        match &mut self.conns[stream_id].1 {
+            Variant::Outbound(tcp_connection) | Variant::Inbound(tcp_connection) => {
+                if tcp_connection.poll_with(
+                    &self.registry,
+                    e,
+                    cfg.dcache.as_deref(),
+                    &mut |token, bytes, send_ts| {
+                        handler(PollEvent::Message { token, payload: bytes, send_ts });
+                    },
+                ) == ConnState::Disconnected
+                {
+                    handler(PollEvent::Disconnect { token: event_token });
+                    self.disconnect_at_index(cfg, stream_id);
                 }
             }
+            Variant::Listener(_) => self.accept_all(cfg, stream_id, event_token, handler),
         }
     }
 
     #[inline]
-    fn handle_event_produce<T, P, F>(&mut self, e: &Event, produce: &mut P, on_msg: &mut F)
-    where
+    fn handle_event_produce<T, P, F>(
+        &mut self,
+        cfg: &Config,
+        e: &Event,
+        produce: &mut P,
+        on_msg: &mut F,
+    ) where
         T: 'static + Copy,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
@@ -587,349 +519,92 @@ impl ConnectionManager {
             return;
         };
 
-        loop {
-            match &mut self.conns[stream_id].1 {
-                ConnectionVariant::Outbound(tcp_connection) |
-                ConnectionVariant::Inbound(tcp_connection) => {
-                    let dcache =
-                        self.dcache.as_deref().expect("dcache required for poll_with_produce");
-                    if tcp_connection.poll_with_produce(
-                        self.poll.registry(),
-                        e,
-                        dcache,
-                        produce,
-                        &mut |token, bytes, send_ts| {
-                            on_msg(PollEvent::Message { token, payload: bytes, send_ts })
-                        },
-                    ) == ConnState::Disconnected
-                    {
-                        let _ = on_msg(PollEvent::Disconnect { token: event_token });
-                        self.disconnect_at_index(stream_id);
-                    }
-                    return;
-                }
-                ConnectionVariant::Listener(tcp_listener) => {
-                    if let Ok((mut stream, addr)) = tcp_listener.accept() {
-                        tracing::info!(?addr, "client connected");
-                        if let Some(size) = self.socket_buf_size {
-                            set_socket_buf_size(&stream, size);
-                        }
-                        let token = Token(self.next_token);
-                        if let Err(e) =
-                            self.poll.registry().register(&mut stream, token, Interest::READABLE)
-                        {
-                            error!("couldn't register client {e}");
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                            continue;
-                        }
-                        if self.nodelay {
-                            if let Err(e) = stream.set_nodelay(true) {
-                                error!("couldn't set nodelay on stream to {addr}: {e}");
-                                continue;
-                            }
-                        }
-                        if self.keepalive &&
-                            let Err(e) = set_keepalive(&stream)
-                        {
-                            error!("couldn't set keepalive on stream to {addr}: {e}");
-                            continue;
-                        }
-                        set_user_timeout(&stream, self.user_timeout_ms);
-                        let mut conn = TcpStream::from_stream_with_telemetry(
-                            stream,
-                            token,
-                            addr,
-                            self.telemetry,
-                            self.dcache.is_some(),
-                        );
-                        if let Some(msg) = &self.on_connect_msg &&
-                            conn.write_or_enqueue_with(
-                                self.poll.registry(),
-                                |buf: &mut Vec<u8>| {
-                                    buf.extend_from_slice(msg);
-                                },
-                            ) == ConnState::Disconnected
-                        {
-                            continue;
-                        }
-                        let _ = on_msg(PollEvent::Accept {
-                            listener: event_token,
-                            stream: token,
-                            peer_addr: addr,
-                        });
-                        self.conns.push((token, ConnectionVariant::Inbound(conn)));
-                        self.next_token += 1;
-                    } else {
-                        return;
-                    }
+        match &mut self.conns[stream_id].1 {
+            Variant::Outbound(tcp_connection) | Variant::Inbound(tcp_connection) => {
+                let dcache = cfg.dcache.as_deref().expect("dcache required for poll_with_produce");
+                if tcp_connection.poll_with_produce(
+                    &self.registry,
+                    e,
+                    dcache,
+                    produce,
+                    &mut |token, bytes, send_ts| {
+                        on_msg(PollEvent::Message { token, payload: bytes, send_ts })
+                    },
+                ) == ConnState::Disconnected
+                {
+                    let _ = on_msg(PollEvent::Disconnect { token: event_token });
+                    self.disconnect_at_index(cfg, stream_id);
                 }
             }
+            Variant::Listener(_) => self.accept_all(cfg, stream_id, event_token, &mut |event| {
+                let _ = on_msg(event);
+            }),
         }
     }
-}
 
-/// Non-blocking TCP connector/acceptor built on `mio`.
-///
-/// Manages:
-/// - **Outbound (client) connections** created via [`connect`]. These are
-///   **auto-retried** on failure/disconnect based on the configured reconnect
-///   interval.
-/// - **Listeners** created via [`listen_at`] and **inbound (server)
-///   connections** accepted from them. Inbound connections are **not**
-///   reconnected.
-///
-/// Drive all IO by calling [`poll_with`] regularly (typically in your event
-/// loop). Use [`write_or_enqueue_with`] to send to one connection or broadcast
-/// to all.
-///
-/// ## Tokens
-/// Every listener and stream is identified by a `mio::Token`.
-/// - [`listen_at`] returns the listener token.
-/// - Each accepted inbound stream receives a new token (reported via
-///   [`ConnectionEvent`]).
-/// - [`connect`] returns the token for the outbound stream if the connection is
-///   established.
-///
-/// ## on-connect message
-/// If configured via [`with_on_connect_msg`], the provided bytes are sent once
-/// after a connection is established (both outbound and newly accepted
-/// inbound).
-///
-/// ## `DCache`
-/// If built via [`with_dcache`], each received message payload is written
-/// into the dcache and [`PollEvent::Message`] carries
-/// [`MessagePayload::Cached`]. Otherwise it carries [`MessagePayload::Raw`].
-pub struct TcpConnector {
-    events: Events,
-    conn_mgr: ConnectionManager,
-}
-impl Default for TcpConnector {
-    fn default() -> Self {
-        Self { events: Events::with_capacity(128), conn_mgr: ConnectionManager::default() }
-    }
-}
-impl TcpConnector {
-    /// Sets the interval used to retry disconnected/failed outbound
-    /// connections.
-    ///
-    /// Reconnect attempts are performed from within [`poll_with`].
-    pub fn with_reconnect_interval(mut self, interval: Duration) -> Self {
-        self.conn_mgr.reconnector = Repeater::every(interval);
-        self
-    }
-
-    /// Sends this message once immediately after a connection becomes usable.
-    ///
-    /// Applied to:
-    /// - outbound connections after a successful (re)connect
-    /// - inbound connections right after accept
-    ///
-    /// # Panics
-    /// Panics if `msg.len() > TcpConnection::SEND_BUF_SIZE`.
-    pub fn with_on_connect_msg(mut self, msg: Vec<u8>) -> Self {
-        assert!(msg.len() <= TcpStream::SEND_BUF_SIZE, "on_connect_msg exceeds send buffer size");
-        self.conn_mgr.on_connect_msg = Some(msg);
-        self
-    }
-
-    /// Attaches a dcache as the shared receive buffer for all streams.
-    pub fn with_dcache(mut self, dcache: DCachePtr) -> Self {
-        self.conn_mgr.dcache = Some(dcache);
-        self
-    }
-
-    /// Sets telemetry config for all streams created by this connector.
-    pub fn with_telemetry(mut self, telemetry: TcpTelemetry) -> Self {
-        self.conn_mgr.telemetry = telemetry;
-        self
-    }
-
-    /// Sets kernel `SO_SNDBUF` and `SO_RCVBUF` on all sockets (outbound and
-    /// accepted).
-    pub fn with_socket_buf_size(mut self, size: usize) -> Self {
-        self.conn_mgr.socket_buf_size = Some(size);
-        self
-    }
-
-    /// Overrides the `TCP_USER_TIMEOUT` socket option applied to
-    /// outbound connections.
-    pub fn with_user_timeout(mut self, timeout_ms: u32) -> Self {
-        self.conn_mgr.user_timeout_ms = timeout_ms;
-        self
-    }
-
-    /// Controls whether `TCP_NODELAY` is set on sockets (default: **true**).
-    ///
-    /// When enabled, Nagle's algorithm is disabled and small writes are sent
-    /// immediately.  Set to `false` to allow the kernel to coalesce small
-    /// writes (higher throughput at the cost of up to ~40 ms latency).
-    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
-        self.conn_mgr.nodelay = nodelay;
-        self
-    }
-
-    /// Enables TCP keepalive on outbound and accepted connections.
-    pub fn with_keepalive(mut self) -> Self {
-        self.conn_mgr.keepalive = true;
-        self
-    }
-
-    /// Sets the maximum send backlog (in framed messages) and how long it must
-    /// stay exceeded before a connection is automatically disconnected.
-    ///
-    /// Active connections are closed once their backlog exceeds `max` for
-    /// `timeout`. If a disconnected outbound connection's backlog would exceed
-    /// that same limit, additional messages are dropped until reconnect
-    /// succeeds. The exceeded-since timer resets on reconnect.
-    pub fn with_max_backlog(mut self, max: usize, timeout: Duration) -> Self {
-        self.conn_mgr.max_backlog = Some((max, timeout));
-        self
-    }
-
-    /// Drops queued outbound messages when a connection is moved to reconnect.
-    ///
-    /// While that outbound connection is disconnected, sends to it are also
-    /// dropped instead of being queued for replay after reconnect.
-    pub fn with_drop_outbound_backlog_on_disconnect(mut self, enabled: bool) -> Self {
-        self.conn_mgr.drop_outbound_backlog_on_disconnect = enabled;
-        self
-    }
-
-    /// Polls sockets once (non-blocking) and dispatches events via
-    /// [`PollEvent`].
-    ///
-    /// This call:
-    /// 1) attempts outbound reconnects if the interval fired
-    /// 2) polls `mio` with a zero timeout
-    /// 3) for each event calls `handler` with the appropriate [`PollEvent`]
-    /// 4) returns whether any IO events were processed
-    ///
-    /// Writable events trigger retries of queued writes. Because this method
-    /// performs a single non-blocking poll, calling it infrequently can slow
-    /// backlog draining under backpressure, particularly when using small
-    /// socket buffers configured via [`Self::with_socket_buf_size`].
+    /// Delivers pending disconnects and reconnects, then polls once.
     #[inline]
-    pub fn poll_with<F>(&mut self, mut handler: F) -> bool
+    pub(crate) fn poll_with<F>(
+        &mut self,
+        cfg: &Config,
+        poll: &mut Poll,
+        events: &mut Events,
+        mut handler: F,
+    ) -> bool
     where
         F: for<'a> FnMut(PollEvent<&'a [u8]>),
     {
-        let mut o = self.conn_mgr.drain_pending_disconnects(&mut handler);
-        self.conn_mgr.maybe_reconnect();
-        for token in self.conn_mgr.reconnected_to.drain(..) {
+        let mut o = self.drain_pending_disconnects(&mut handler);
+        self.maybe_reconnect(cfg);
+        for token in self.reconnected_to.drain(..) {
             handler(PollEvent::Reconnect { token });
             o = true;
         }
-        if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
+        if let Err(e) = poll.poll(events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
             return false;
         }
-
-        for e in &self.events {
+        for e in &*events {
             o = true;
-            self.conn_mgr.handle_event(e, &mut handler);
+            self.handle_event(cfg, e, &mut handler);
         }
-        o |= self.conn_mgr.drain_pending_disconnects(&mut handler);
+        o |= self.drain_pending_disconnects(&mut handler);
         o
     }
 
-    /// Like [`poll_with`] but for dcache-backed streams. The handler receives
-    /// `PollEvent<&[u8]>` for all events; for `Message` events, returning
-    /// `Some(T)` produces into the spine.
-    ///
-    /// # Panics
-    /// Panics if no dcache was configured via [`with_dcache`].
     #[inline]
-    pub fn poll_with_produce<T, P, F>(&mut self, produce: &mut P, mut on_msg: F) -> bool
+    pub(crate) fn poll_with_produce<T, P, F>(
+        &mut self,
+        cfg: &Config,
+        poll: &mut Poll,
+        events: &mut Events,
+        produce: &mut P,
+        mut on_msg: F,
+    ) -> bool
     where
         T: 'static + Copy,
         P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
         F: for<'a> FnMut(PollEvent<&'a [u8]>) -> Option<T>,
     {
-        let mut o = self.conn_mgr.drain_pending_disconnects(&mut |event| {
+        let mut o = self.drain_pending_disconnects(&mut |event| {
             let _ = on_msg(event);
         });
-        self.conn_mgr.maybe_reconnect();
-        for token in self.conn_mgr.reconnected_to.drain(..) {
+        self.maybe_reconnect(cfg);
+        for token in self.reconnected_to.drain(..) {
             let _ = on_msg(PollEvent::Reconnect { token });
             o = true;
         }
-        if let Err(e) = self.conn_mgr.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
+        if let Err(e) = poll.poll(events, Some(std::time::Duration::ZERO)) {
             safe_panic!("got error polling {e}");
             return false;
         }
-        for e in &self.events {
+        for e in &*events {
             o = true;
-            self.conn_mgr.handle_event_produce(e, produce, &mut on_msg);
+            self.handle_event_produce(cfg, e, produce, &mut on_msg);
         }
-        o |= self.conn_mgr.drain_pending_disconnects(&mut |event| {
+        o |= self.drain_pending_disconnects(&mut |event| {
             let _ = on_msg(event);
         });
         o
-    }
-
-    /// Writes immediately or enqueues bytes for later sending.
-    ///
-    /// `serialise` is called with a mutable send buffer and must return the
-    /// number of bytes written. Use [`SendBehavior::BroadCast`] to send to
-    /// all active connections or [`SendBehavior::Single`] to target one
-    /// token.
-    #[inline]
-    pub fn write_or_enqueue_with<F>(&mut self, where_to: SendBehavior, serialise: F)
-    where
-        F: Fn(&mut Vec<u8>),
-    {
-        self.conn_mgr.write_or_enqueue_with(serialise, where_to);
-    }
-
-    /// Disconnects all outbound connections and schedules them for
-    /// reconnection.
-    ///
-    /// Inbound connections and listeners are left untouched.
-    pub fn disconnect_outbound(&mut self) {
-        self.conn_mgr.disconnect_all_outbound();
-    }
-
-    /// Disconnects a specific connection by token.
-    ///
-    /// If the token is an outbound connection, it will be scheduled for
-    /// reconnection. If inbound, it's simply closed. No-op if token not found.
-    pub fn disconnect(&mut self, token: Token) {
-        self.conn_mgr.disconnect_token(token);
-    }
-
-    /// Initiates (or schedules) an outbound connection to `addr`.
-    ///
-    /// Returns the token for this connection if the connection becomes
-    /// established; otherwise returns `None` (the connector may still retry
-    /// later).
-    ///
-    /// Note: reconnect attempts are driven by [`poll_with`].
-    #[inline]
-    pub fn connect(&mut self, addr: SocketAddr) -> Option<Token> {
-        self.conn_mgr.connect(addr)
-    }
-
-    /// Starts listening on `addr` and registers the listener for readable
-    /// events.
-    ///
-    /// Returns the token associated with the listener socket. When a client
-    /// connects, `poll_with` will accept it, allocate a new token for the
-    /// inbound stream, and emit a [`ConnectionEvent`] through `on_accept`.
-    pub fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
-        self.conn_mgr.listen_at(addr)
-    }
-
-    /// Returns an iterator over tokens that are currently pending reconnection
-    /// (outbound only).
-    #[inline]
-    pub fn currently_disconnected(&self) -> impl Iterator<Item = Token> {
-        self.conn_mgr.currently_disconnected()
-    }
-
-    /// Forces the reconnect timer to fire and immediately attempts
-    /// reconnections.
-    #[inline]
-    pub fn force_reconnect(&mut self) {
-        self.conn_mgr.force_reconnect();
     }
 }

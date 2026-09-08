@@ -13,7 +13,7 @@ use flux::{
     spine::{ScopedSpine, SpineAdapter, SpineProducerWithDCache},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
-use flux_network::tcp::{PollEvent, SendBehavior, TcpConnector};
+use flux_network::{Connector, PollEvent, SendBehavior, Transport, UdpConfig};
 use spine_derive::from_spine;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -29,7 +29,8 @@ struct TcpDcacheSpine {
 }
 
 struct NetworkTile {
-    conn: Option<TcpConnector>,
+    conn: Option<Connector>,
+    transport: Transport,
     ready: Arc<AtomicBool>,
     bind_addr: SocketAddr,
     deadline: Instant,
@@ -38,7 +39,8 @@ struct NetworkTile {
 impl Tile<TcpDcacheSpine> for NetworkTile {
     fn try_init(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) -> bool {
         let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
-        let mut conn = TcpConnector::default().with_dcache(sp.dcache_ptr());
+        let mut conn =
+            Connector::default().with_transport(self.transport).with_dcache(sp.dcache_ptr());
         conn.listen_at(self.bind_addr).unwrap();
         self.conn = Some(conn);
         self.ready.store(true, Ordering::Release);
@@ -86,17 +88,26 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
     }
 }
 
-/// Two TCP streams into the same dcache-backed spine queue.
+#[test]
+fn dcache_multi_stream_tcp() {
+    dcache_multi_stream(Transport::Tcp);
+}
+
+#[test]
+fn dcache_multi_stream_udp() {
+    dcache_multi_stream(Transport::Udp(UdpConfig::lan()));
+}
+
+/// Two streams into the same dcache-backed spine queue.
 /// Verifies dcache bytes match the queue message (same shmem region).
 #[allow(clippy::significant_drop_tightening)]
-#[test]
-fn dcache_multi_stream() {
+fn dcache_multi_stream(transport: Transport) {
     const MSG_A: &[u8; 8] = b"stream-a";
     const MSG_B: &[u8; 8] = b"stream-b";
 
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let bind_addr = probe.local_addr().unwrap();
     drop(probe);
 
@@ -112,7 +123,7 @@ fn dcache_multi_stream() {
             thread::sleep(Duration::from_millis(1));
         }
         for msg in [MSG_A, MSG_B] {
-            let mut conn = TcpConnector::default();
+            let mut conn = Connector::default().with_transport(transport);
             let tok = conn.connect(bind_addr).unwrap();
             conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
                 buf.extend_from_slice(msg);
@@ -130,6 +141,7 @@ fn dcache_multi_stream() {
         attach_tile(
             NetworkTile {
                 conn: None,
+                transport,
                 ready: ready.clone(),
                 bind_addr,
                 deadline: Instant::now() + Duration::from_secs(10),
