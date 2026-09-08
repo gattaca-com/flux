@@ -876,9 +876,12 @@ impl UdpPeer {
         }
         .encode(&mut self.ctrl);
         let n = self.rx.write_bitmap(n_bits, &mut self.ctrl[HEADER_SIZE..]);
-        self.ack_due = false;
-        self.last_send = now;
-        send_datagram(socket, self.addr, &self.ctrl[..HEADER_SIZE + n])
+        let outcome = send_datagram(socket, self.addr, &self.ctrl[..HEADER_SIZE + n]);
+        self.ack_due = outcome == SendOutcome::WouldBlock;
+        if outcome == SendOutcome::Done {
+            self.last_send = now;
+        }
+        outcome
     }
 
     /// Stages the message in store `slot`.
@@ -1155,6 +1158,43 @@ impl UdpPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blocked_ack_is_retried_after_send_capacity_returns() {
+        use std::os::fd::AsRawFd;
+
+        use crate::udp::{UringConfig, sys::uring::Ring};
+
+        let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        remote.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let addr = remote.local_addr().unwrap();
+        let (mut socket, _) = sock();
+        socket.ring = Some(std::cell::RefCell::new(
+            Ring::new(socket.as_raw_fd(), UringConfig { send_entries: 1, recv_entries: 1 })
+                .unwrap(),
+        ));
+        let mut peer = UdpPeer::new(addr, Token(1), Token(0), 7, cfg(), None);
+        socket.send_to(b"occupy", addr).unwrap();
+        assert_eq!(peer.send_ack(&socket, Instant::now()), SendOutcome::WouldBlock);
+        assert!(peer.take_ack_due(), "backpressure must retain the pending ACK");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            socket.ring.as_ref().unwrap().borrow_mut().poll();
+            if peer.send_ack(&socket, Instant::now()) == SendOutcome::Done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        assert!(!peer.take_ack_due());
+        socket.ring.as_ref().unwrap().borrow_mut().submit();
+        let mut bytes = [0; 1200];
+        assert_eq!(remote.recv(&mut bytes).unwrap(), 6);
+        let n = remote.recv(&mut bytes).unwrap();
+        let header = Header::decode(&bytes[..n]).unwrap();
+        assert_eq!(header.kind, Kind::Ack);
+        assert_eq!(header.session, 7);
+    }
 
     fn cfg() -> UdpConfig {
         UdpConfig {

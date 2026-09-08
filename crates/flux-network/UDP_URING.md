@@ -34,9 +34,12 @@ security policy may still disable them.
   queue counts as acceptance by the local socket backend. Completion errors
   become packet loss, handled by the existing reliability protocol. Neither
   ACK processing nor reconnect can invalidate kernel-owned bytes.
-- Completion passes are bounded. ACKs are emitted between receive passes so
+- Each poll processes at most 32 receive passes per socket, each capped at
+  `recv_entries` buffers (a GRO buffer can contain several datagrams).
+  ACKs are emitted between receive passes so
   callback processing cannot defer them behind a whole send window. Buffer
   exhaustion ends/rearms the multishot request after buffers are recycled.
+  An ACK blocked by send-queue capacity remains pending for retry.
 - Normal polling uses no waiting for completions and skips idle kernel entries
   using the task-work flag. There is no async executor, SQPOLL thread, or
   zero-copy send machinery.
@@ -70,6 +73,7 @@ AMD Ryzen 9 9950X, Linux `7.1.5-arch1-2`, Rust `1.91.0`, release optimization,
 thread. Socket buffers request 16 MiB; this host's send/receive sysctl maxima
 are 4 MiB (Linux reports doubled effective socket accounting limits).
 
+Samples were refreshed after the ACK-backpressure and bounded-drain audit fixes.
 Five measured rounds followed one discarded run of each binary. Main and
 branch alternate order; UDP and io_uring also alternate order within the
 branch binary. No builds or tests ran concurrently with the measured rounds.
@@ -92,29 +96,31 @@ including their busy polling; it is not an idle-efficiency measurement.
 
 | Workload | Main MiB/s | io_uring MiB/s | Change | Main p50 / p99 µs | io_uring p50 / p99 µs | Main / io_uring CPU ns/B |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| paced/2k | 20 | 20 | +0.0% | 4.7 / 5.7 | 2.4 / 3.4 | 95.436 / 96.388 |
-| paced/64k | 625 | 625 | +0.0% | 8.9 / 356.5 | 9.5 / 36.8 | 2.959 / 2.955 |
-| paced/2m | 7,446 | 7,397 | -0.7% | 229.2 / 283.5 | 231.8 / 240.6 | 0.193 / 0.201 |
-| burst/2k | 442 | 772 | +74.7% | 4.8 / 5.8 | 2.4 / 3.3 | 2.420 / 1.393 |
-| burst/64k | 6,891 | 7,108 | +3.1% | 9.0 / 12.2 | 9.5 / 12.6 | 0.201 / 0.191 |
-| burst/2m | 7,589 | 7,329 | -3.4% | 219.2 / 259.1 | 230.7 / 242.1 | 0.187 / 0.201 |
-| bcast/2k | 562 | 950 | +69.0% | 17.0 / 34.4 | 18.7 / 35.2 | 1.778 / 1.075 |
-| bcast/64k | 1,402 | 7,499 | +434.9% | 207.7 / 345.3 | 44.1 / 69.4 | 0.765 / 0.181 |
-| bcast/2m | 6,820 | 6,700 | -1.8% | 1,344.5 / 4,861.2 | 3,431.1 / 6,699.6 | 0.211 / 0.246 |
+| paced/2k | 20 | 20 | +0.0% | 4.7 / 5.6 | 2.4 / 3.4 | 95.432 / 96.388 |
+| paced/64k | 625 | 625 | +0.0% | 9.0 / 452.2 | 9.5 / 172.7 | 2.958 / 2.955 |
+| paced/2m | 7,430 | 7,408 | -0.3% | 232.5 / 249.5 | 231.6 / 239.1 | 0.193 / 0.200 |
+| burst/2k | 442 | 773 | +74.9% | 4.8 / 5.8 | 2.4 / 3.3 | 2.420 / 1.396 |
+| burst/64k | 6,849 | 7,178 | +4.8% | 9.1 / 11.7 | 9.5 / 12.7 | 0.203 / 0.188 |
+| burst/2m | 7,285 | 7,315 | +0.4% | 234.5 / 254.6 | 229.9 / 236.9 | 0.197 / 0.202 |
+| bcast/2k | 561 | 946 | +68.6% | 16.6 / 40.5 | 18.8 / 35.1 | 1.784 / 1.084 |
+| bcast/64k | 1,398 | 7,461 | +433.7% | 187.4 / 345.8 | 44.5 / 69.6 | 0.767 / 0.181 |
+| bcast/2m | 6,855 | 7,043 | +2.7% | 1,333.8 / 4,693.6 | 3,232.8 / 6,186.5 | 0.207 / 0.233 |
 
 The strongest gains are 2 KiB bursts (+75% throughput, roughly half median
-latency) and 64 KiB broadcasts (5.35x throughput, p99 345 → 69 µs). The latter
+latency) and 64 KiB broadcasts (5.34x throughput, p99 346 → 70 µs). The latter
 also benefits from retaining GSO across mixed-peer batches: these results
 measure the complete backend implementation, not an isolated io_uring syscall
 substitution. The syscall backend could independently adopt that grouping.
 
-Large messages are a tradeoff: 2 MiB burst throughput is 3.4% lower, and 2 MiB
-broadcast median latency increases from 1.34 ms to 3.43 ms while throughput
-falls 1.8%. The extra send copy and different batching/scheduling costs remain.
-This is why io_uring stays opt-in. Paced p99 varies substantially between runs;
-consult the raw samples rather than treating a median as a guarantee.
+Large messages remain a tradeoff: 2 MiB burst throughput is within 1% of
+main, but 3.0% below the branch's syscall control (7,315 vs 7,541 MiB/s).
+Broadcast throughput is 2.7% above main, while median latency increases from
+1.33 ms to 3.23 ms and CPU cost rises from 0.207 to 0.233 ns/B. The extra send
+copy and different batching/scheduling costs remain. This is why io_uring
+stays opt-in. Paced p99 varies substantially between runs; consult the raw
+samples rather than treating a median as a guarantee.
 
-The single-loss relay case completed in a median 6.21 ms on main and 5.26 ms
+The single-loss relay case completed in a median 6.09 ms on main and 5.39 ms
 with io_uring. Every run observed 1,793 data datagrams, including 2 repeated
 sequences. Each run sends only one message, so this is a recovery check, not a
 useful p99 measurement. Relay CPU is excluded from the CPU column.
@@ -122,7 +128,7 @@ useful p99 measurement. Relay CPU is excluded from the CPU column.
 All raw runs are in [benches/results/udp-uring](benches/results/udp-uring).
 `main-N.txt` is the isolated main build; `branch-N.txt` includes both backends
 on this branch. The branch's syscall control preserves similar throughput
-(e.g. 441 vs 442 MiB/s for 2 KiB bursts, 1,406 vs 1,402 for 64 KiB broadcasts).
+(e.g. 441 vs 442 MiB/s for 2 KiB bursts, 1,408 vs 1,398 for 64 KiB broadcasts).
 These are local loopback measurements, not physical-NIC, WAN, or AWS results.
 Non-Linux builds were not cross-compiled.
 
@@ -145,13 +151,14 @@ Validation passed:
 
 - `just fmt`
 - `just clippy`
-- `cargo test --workspace --all-features --locked`: 362 passed, 4 existing
+- `cargo test --workspace --all-features --locked`: 364 passed, 4 existing
   ignored documentation tests, no failures.
 
 Both backends run the same UDP integration suite. Additional coverage checks
 mixed-backend peers, DCache delivery, sustained large messages with slow debug
 callbacks, owned send buffers, queue saturation, IPv4/IPv6, mixed GSO groups,
-fallback, GRO validation, receive-pool exhaustion, 16-bit descriptor-tail
+fallback, GRO validation, receive-pool exhaustion, ACK retry under send
+backpressure, duplex delivery with one send/receive slot, 16-bit descriptor-tail
 wraparound, and driver movement across threads. Tests require local socket
 and io_uring permissions. Local runs used `RUSTC_WRAPPER=` and a temporary
 `CARGO_TARGET_DIR` because the shared build cache was sandbox-restricted.

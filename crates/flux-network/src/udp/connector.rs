@@ -615,7 +615,7 @@ impl UdpManager {
             self.tick(now);
         }
         #[cfg(target_os = "linux")]
-        if matches!(self.udp.io, super::UdpIo::Uring(_)) {
+        if let super::UdpIo::Uring(config) = self.udp.io {
             for k in 0..self.sockets.len() {
                 // Drain in bounded passes, emitting ACKs between passes so
                 // slow callbacks cannot hold back the sender's whole window.
@@ -623,7 +623,8 @@ impl UdpManager {
                     let work = self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().poll();
                     o |= work;
                     let mut received_any = false;
-                    loop {
+                    // ACK processing can reap more receives while sending.
+                    for _ in 0..config.recv_entries {
                         let received =
                             self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().receive();
                         let Some(received) = received else { break };

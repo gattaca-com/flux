@@ -1,4 +1,5 @@
-//! Batched datagram syscalls. Linux uses `sendmmsg`/`recvmmsg`; elsewhere the
+//! Datagram I/O with an optional Linux completion backend.
+//! Batched syscalls use `sendmmsg`/`recvmmsg` on Linux; elsewhere the
 //! same API loops over `sendmsg`/`recvmsg`. Both are non-blocking and send or
 //! receive whatever is available right now: there is no accumulation delay.
 
