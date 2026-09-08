@@ -6,7 +6,7 @@ use std::{
     io, mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     os::fd::RawFd,
-    ptr,
+    ptr, slice,
 };
 
 /// Datagrams per syscall.
@@ -80,6 +80,21 @@ impl SockAddr {
             _ => None,
         }
     }
+
+    /// Encoded bytes; `new` zero-fills `storage`, so equal addresses are
+    /// byte-equal over `len`.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(ptr::from_ref(&self.storage).cast(), self.len as usize) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for SockAddr {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.bytes() == other.bytes()
+    }
 }
 
 /// Read-only buffer for sending.
@@ -115,6 +130,7 @@ pub(crate) struct SendBatch {
     iovs: [[libc::iovec; 2]; BATCH],
     addrs: [SockAddr; BATCH],
     len: usize,
+    /// Kernel accepts `UDP_SEGMENT`; see [`Self::enable_gso`].
     #[cfg(target_os = "linux")]
     gso: bool,
 }
@@ -131,8 +147,28 @@ impl SendBatch {
             addrs: [SockAddr { storage: unsafe { mem::zeroed() }, len: 0 }; BATCH],
             len: 0,
             #[cfg(target_os = "linux")]
-            gso: true,
+            gso: false,
         }
+    }
+
+    /// Turns on segmentation offload for `send` if the kernel supports it.
+    /// Kernels before 4.18 ignore an unknown `SOL_UDP` cmsg and coalesce the
+    /// batch into one datagram, so support has to be probed rather than
+    /// detected from a send error. `fd` is left unchanged (segment size 0).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn enable_gso(&mut self, fd: RawFd) -> io::Result<()> {
+        let size: libc::c_int = 0;
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_UDP,
+                libc::UDP_SEGMENT,
+                ptr::from_ref(&size).cast(),
+                mem::size_of_val(&size) as _,
+            )
+        };
+        self.gso = result == 0;
+        if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
     #[inline]
@@ -151,13 +187,12 @@ impl SendBatch {
         #[cfg(target_os = "linux")]
         if self.gso && n >= 4 {
             let size = self.iovs[0][0].iov_len + self.iovs[0][1].iov_len;
-            let addr = SockAddr::decode(&self.addrs[0].storage, self.addrs[0].len);
             let can_segment = size != 0 &&
                 size * n <= super::wire::MAX_DATAGRAM_SIZE &&
                 (1..n).all(|i| {
                     let len = self.iovs[i][0].iov_len + self.iovs[i][1].iov_len;
                     (len == size || (i == n - 1 && len != 0 && len < size)) &&
-                        SockAddr::decode(&self.addrs[i].storage, self.addrs[i].len) == addr
+                        self.addrs[i] == self.addrs[0]
                 });
             if can_segment {
                 let mut control = SegmentControl {
@@ -181,20 +216,9 @@ impl SendBatch {
                     // UDP sends are atomic; report wire datagrams, not GSO packets.
                     return Ok(n);
                 }
-                let err = io::Error::last_os_error();
-                if !matches!(
-                    err.raw_os_error(),
-                    Some(
-                        libc::EINVAL |
-                            libc::EIO |
-                            libc::ENOPROTOOPT |
-                            libc::EOPNOTSUPP |
-                            libc::EMSGSIZE
-                    )
-                ) {
-                    return Err(err);
-                }
-                self.gso = false;
+                // Route MTU, SG support, checksum offload and memory pressure
+                // all fail the whole GSO send; sendmmsg keeps per-datagram
+                // accounting and reports the same errno if it persists.
             }
         }
         for i in 0..n {
@@ -322,11 +346,13 @@ mod tests {
     #[test]
     fn segmented_batch_preserves_datagrams() {
         for bind in ["127.0.0.1:0", "[::1]:0"] {
-            let sender = UdpSocket::bind(bind).unwrap();
+            // Hosts without IPv6 loopback only run the v4 case.
+            let Ok(sender) = UdpSocket::bind(bind) else { continue };
             let receiver = UdpSocket::bind(bind).unwrap();
             receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             let to = SockAddr::new(receiver.local_addr().unwrap());
             let mut batch = SendBatch::new();
+            batch.enable_gso(sender.as_raw_fd()).unwrap();
             let headers: [[u8; 29]; BATCH] = std::array::from_fn(|i| [i as u8; 29]);
             let payload = [0x5a; 1171];
             for (i, header) in headers.iter().enumerate() {
@@ -366,11 +392,13 @@ mod tests {
         );
         let to = SockAddr::new(receiver.local_addr().unwrap());
         let mut batch = SendBatch::new();
+        batch.enable_gso(sender.as_raw_fd()).unwrap();
         for _ in 0..4 {
             batch.push(b"header", b"payload", &to);
         }
         assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
-        assert!(!batch.gso);
+        // Per-socket EIO is not a kernel capability; offload stays enabled.
+        assert!(batch.gso);
         let mut buf = [0; 32];
         for _ in 0..4 {
             let n = receiver.recv(&mut buf).unwrap();
@@ -390,6 +418,7 @@ mod tests {
         let to = receivers.each_ref().map(|r| SockAddr::new(r.local_addr().unwrap()));
         for mixed_destinations in [false, true] {
             let mut batch = SendBatch::new();
+            batch.enable_gso(sender.as_raw_fd()).unwrap();
             let payloads: [&[u8]; 4] = if mixed_destinations {
                 [b"aaa", b"bbb", b"ccc", b"ddd"]
             } else {

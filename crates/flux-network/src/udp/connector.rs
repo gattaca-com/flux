@@ -154,6 +154,10 @@ impl UdpManager {
 
     fn bind(&mut self, bind: SocketAddr, listener: bool) -> io::Result<Token> {
         let mut socket = UdpSocket::bind(bind)?;
+        #[cfg(target_os = "linux")]
+        if let Err(err) = self.batch.enable_gso(socket.as_raw_fd()) {
+            debug!(?err, "UDP GSO unavailable");
+        }
         if let Some(size) = self.config.socket_buf_size {
             set_socket_buf_size(&socket, size);
         }
