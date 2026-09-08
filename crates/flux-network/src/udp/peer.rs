@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 use super::{
     UdpConfig,
     sys::{BATCH, SendBatch, SockAddr},
-    wire::{HEADER_SIZE, Header, Kind, fragment_count, write_send_ts, write_session},
+    wire::{HEADER_SIZE, Header, Kind, fragment_count, write_session},
 };
 
 /// Retransmit backoff saturates at `rto << MAX_BACKOFF_SHIFT` (and `max_rto`).
@@ -115,11 +115,11 @@ impl Rto {
 }
 
 /// Serialised messages shared by every peer that still has fragments of
-/// them in flight. A broadcast is copied once and referenced per peer.
+/// them in flight. A broadcast is stored once and referenced per peer.
 pub(crate) struct MsgStore {
     entries: Vec<Entry>,
+    /// Entries with no references; their buffers are reused by `insert`.
     free: Vec<u32>,
-    spare: Vec<Vec<u8>>,
 }
 
 struct Entry {
@@ -129,20 +129,21 @@ struct Entry {
 
 impl MsgStore {
     pub(crate) fn new() -> Self {
-        Self { entries: Vec::new(), free: Vec::new(), spare: Vec::new() }
+        Self { entries: Vec::new(), free: Vec::new() }
     }
 
-    /// Stores a copy of `payload` holding one reference for the caller, who
-    /// must [`Self::release`] it once every peer has taken its own.
-    pub(crate) fn insert(&mut self, payload: &[u8]) -> u32 {
-        let mut bytes = self.spare.pop().unwrap_or_default();
-        bytes.clear();
-        bytes.extend_from_slice(payload);
+    /// Takes `payload`'s buffer into the store, leaving a recycled buffer in
+    /// its place. The caller holds one reference and must [`Self::release`]
+    /// it once every peer has taken its own.
+    pub(crate) fn insert(&mut self, payload: &mut Vec<u8>) -> u32 {
         if let Some(slot) = self.free.pop() {
-            self.entries[slot as usize] = Entry { bytes, refs: 1 };
+            let e = &mut self.entries[slot as usize];
+            std::mem::swap(&mut e.bytes, payload);
+            payload.clear();
+            e.refs = 1;
             slot
         } else {
-            self.entries.push(Entry { bytes, refs: 1 });
+            self.entries.push(Entry { bytes: std::mem::take(payload), refs: 1 });
             (self.entries.len() - 1) as u32
         }
     }
@@ -152,12 +153,11 @@ impl MsgStore {
         self.entries[slot as usize].refs += 1;
     }
 
-    /// Drops one reference; recycles the buffer on the last.
+    /// Drops one reference; the last frees the entry for reuse.
     pub(crate) fn release(&mut self, slot: u32) {
         let e = &mut self.entries[slot as usize];
         e.refs -= 1;
         if e.refs == 0 {
-            self.spare.push(std::mem::take(&mut e.bytes));
             self.free.push(slot);
         }
     }
@@ -328,21 +328,11 @@ impl TxWindow {
         true
     }
 
-    /// Puts fragment `seq` into `batch`. A retransmit gets a fresh wire
-    /// timestamp.
+    /// Puts fragment `seq` into `batch`. The wire timestamp stays as first
+    /// sent, so receive-side latency includes recovery time.
     #[inline]
-    fn stage(
-        &mut self,
-        seq: u64,
-        retransmit: bool,
-        store: &MsgStore,
-        to: &SockAddr,
-        batch: &mut SendBatch,
-    ) {
-        let f = &mut self.slots[(seq & self.mask) as usize];
-        if retransmit {
-            write_send_ts(&mut f.header, Nanos::now().0);
-        }
+    fn stage(&self, seq: u64, store: &MsgStore, to: &SockAddr, batch: &mut SendBatch) {
+        let f = &self.slots[(seq & self.mask) as usize];
         batch.push(&f.header, payload_of(store, f), to);
     }
 
@@ -358,13 +348,14 @@ impl TxWindow {
         }
     }
 
-    /// Sends `seqs` of this peer alone in batches. Returns how many went out
-    /// and whether the socket blocked before the end.
+    /// Resends every `seq` in `range` for which `pred` holds, in batches.
+    /// Returns how many went out and whether the socket blocked before the
+    /// end.
     #[allow(clippy::too_many_arguments)]
-    fn send_seqs(
+    fn send_where(
         &mut self,
-        seqs: impl Iterator<Item = u64>,
-        retransmit: bool,
+        range: std::ops::Range<u64>,
+        mut pred: impl FnMut(&Self, u64) -> bool,
         store: &MsgStore,
         fd: i32,
         to: &SockAddr,
@@ -372,21 +363,31 @@ impl TxWindow {
         now: Instant,
     ) -> (u64, bool) {
         let mut pushed = [0u64; BATCH];
+        let mut n = 0;
         let mut sent = 0;
-        let mut seqs = seqs.peekable();
-        while seqs.peek().is_some() {
-            let mut n = 0;
-            for seq in seqs.by_ref() {
-                self.stage(seq, retransmit, store, to, batch);
-                pushed[n] = seq;
-                n += 1;
-                if batch.is_full() {
-                    break;
-                }
+        for seq in range {
+            if !pred(self, seq) {
+                continue;
             }
+            self.stage(seq, store, to, batch);
+            pushed[n] = seq;
+            n += 1;
+            if n == BATCH {
+                let accepted = send_batch(batch, fd, n);
+                for &seq in &pushed[..accepted] {
+                    self.mark_sent(seq, true, now);
+                }
+                sent += accepted as u64;
+                if accepted < n {
+                    return (sent, true);
+                }
+                n = 0;
+            }
+        }
+        if n != 0 {
             let accepted = send_batch(batch, fd, n);
             for &seq in &pushed[..accepted] {
-                self.mark_sent(seq, retransmit, now);
+                self.mark_sent(seq, true, now);
             }
             sent += accepted as u64;
             if accepted < n {
@@ -484,34 +485,36 @@ impl TxWindow {
         }
         self.release_messages(store);
 
-        let holes = self.holes(rto, reorder, now);
-        if !holes.is_empty() {
-            let (_, blocked) = self.send_seqs(holes.into_iter(), true, store, fd, to, batch, now);
+        if let Some(end) = self.hole_scan_end() {
+            let pred = |tx: &Self, seq: u64| tx.is_hole(seq, rto, reorder, now);
+            let (_, blocked) = self.send_where(self.base..end, pred, store, fd, to, batch, now);
             acked.blocked = blocked;
         }
         acked
     }
 
-    /// Unacked sequences below the highest acked one: the receiver has moved
-    /// past them. A first send counts as lost after a reordering window, a
-    /// retransmit only after its backed-off RTO so its own ack has time to
-    /// arrive through whatever queue delayed the original.
-    fn holes(&self, rto: Duration, reorder: Duration, now: Instant) -> Vec<u64> {
-        let Some(highest) = self.highest_acked else { return Vec::new() };
-        (self.base..highest.min(self.next_send))
-            .filter(|&seq| {
-                if self.is_acked(seq) {
-                    return false;
-                }
-                let slot = &self.slots[(seq & self.mask) as usize];
-                let age = now.saturating_sub(slot.sent_at).0;
-                if slot.retries == 0 {
-                    age >= reorder.0
-                } else {
-                    age >= rto.0 << slot.retries.min(MAX_BACKOFF_SHIFT)
-                }
-            })
-            .collect()
+    /// Sequences below the highest acked one are candidates for holes.
+    #[inline]
+    fn hole_scan_end(&self) -> Option<u64> {
+        self.highest_acked.map(|h| h.min(self.next_send)).filter(|&end| end > self.base)
+    }
+
+    /// An unacked sequence the receiver has moved past. A first send counts
+    /// as lost after a reordering window, a retransmit only after its
+    /// backed-off RTO so its own ack has time to arrive through whatever
+    /// queue delayed the original.
+    #[inline]
+    fn is_hole(&self, seq: u64, rto: Duration, reorder: Duration, now: Instant) -> bool {
+        if self.is_acked(seq) {
+            return false;
+        }
+        let slot = &self.slots[(seq & self.mask) as usize];
+        let age = now.saturating_sub(slot.sent_at).0;
+        if slot.retries == 0 {
+            age >= reorder.0
+        } else {
+            age >= rto.0 << slot.retries.min(MAX_BACKOFF_SHIFT)
+        }
     }
 
     /// Timer-driven recovery, scanned at most every `rto / 2`. Resends holes
@@ -535,23 +538,25 @@ impl TxWindow {
             return (0, false);
         }
         self.last_scan = now;
-        let mut due = self.holes(rto, reorder, now);
         let oldest = &self.slots[(self.base & self.mask) as usize];
         let backoff = (rto.0 << oldest.retries.min(MAX_BACKOFF_SHIFT)).min(max_rto.0).max(rto.0);
-        let quiet_since = self.last_ack_at.max(oldest.sent_at);
-        if now.saturating_sub(quiet_since).0 >= backoff {
-            let probes = (self.base..self.next_send)
-                .filter(|&s| !self.is_acked(s))
-                .take(self.recover as usize);
-            due.extend(probes);
-            due.sort_unstable();
-            due.dedup();
+        let probing = now.saturating_sub(self.last_ack_at.max(oldest.sent_at)).0 >= backoff;
+        let hole_end = self.hole_scan_end().unwrap_or(self.base);
+        let mut probes = if probing { self.recover } else { 0 };
+        if probing {
             self.recover = (self.recover * 2).min(MAX_RECOVER);
         }
-        if due.is_empty() {
-            return (0, false);
-        }
-        self.send_seqs(due.into_iter(), true, store, fd, to, batch, now)
+        let pred = |tx: &Self, seq: u64| {
+            if seq < hole_end && tx.is_hole(seq, rto, reorder, now) {
+                return true;
+            }
+            if probes != 0 && !tx.is_acked(seq) {
+                probes -= 1;
+                return true;
+            }
+            false
+        };
+        self.send_where(self.base..self.next_send, pred, store, fd, to, batch, now)
     }
 
     /// Restarts every retained message from its first fragment under
@@ -586,8 +591,8 @@ impl TxWindow {
 struct Partial {
     first_seq: u64,
     len: usize,
+    /// Kept at its largest past length; the message is `buf[..len]`.
     buf: Vec<u8>,
-    have: Vec<u64>,
     remaining: usize,
     send_ts: u64,
 }
@@ -785,8 +790,8 @@ impl UdpPeer {
     }
 
     #[inline]
-    pub(crate) fn stage(&mut self, seq: u64, store: &MsgStore, batch: &mut SendBatch) {
-        self.tx.stage(seq, false, store, &self.native_addr, batch);
+    pub(crate) fn stage(&self, seq: u64, store: &MsgStore, batch: &mut SendBatch) {
+        self.tx.stage(seq, store, &self.native_addr, batch);
     }
 
     #[inline]
@@ -881,6 +886,7 @@ impl UdpPeer {
         &mut self,
         store: &mut MsgStore,
         slot: u32,
+        ts: Nanos,
         now: Instant,
     ) -> PushOutcome {
         let len = store.bytes(slot).len();
@@ -888,7 +894,7 @@ impl UdpPeer {
             warn!(%self.addr, len, max = self.max_message_size, "udp message too large");
             return PushOutcome::TooLarge;
         }
-        if self.tx.push(self.local_session, self.stride, store, slot, Nanos::now()) {
+        if self.tx.push(self.local_session, self.stride, store, slot, ts) {
             return PushOutcome::Queued;
         }
         self.dropped_full += 1;
@@ -1017,12 +1023,8 @@ impl UdpPeer {
             debug!(%self.addr, "udp fragment disagrees on message length");
             return;
         }
-        let word = index / 64;
-        let bit = 1_u64 << (index % 64);
-        if partial.have[word] & bit != 0 {
-            return;
-        }
-        partial.have[word] |= bit;
+        // The window already rejected this sequence if it was a duplicate, and
+        // a fragment index maps to exactly one sequence of its message.
         partial.remaining -= 1;
         partial.buf[offset..offset + payload.len()].copy_from_slice(payload);
         if partial.remaining != 0 {
@@ -1031,9 +1033,10 @@ impl UdpPeer {
 
         let done = self.rx.partials.swap_remove(pos);
         let send_ts = Nanos(done.send_ts);
+        let bytes = &done.buf[..len];
         match dcache {
-            None => self.deliver(RxPayload::Raw(&done.buf), send_ts, deliver),
-            Some(dc) => match dc.write(len, |buf| buf.copy_from_slice(&done.buf)) {
+            None => self.deliver(RxPayload::Raw(bytes), send_ts, deliver),
+            Some(dc) => match dc.write(len, |buf| buf.copy_from_slice(bytes)) {
                 Ok(dref) => self.deliver(RxPayload::DCache(dref), send_ts, deliver),
                 Err(e) => warn!("dcache write failed: {e}"),
             },
@@ -1050,15 +1053,14 @@ impl UdpPeer {
             first_seq: 0,
             len: 0,
             buf: Vec::new(),
-            have: Vec::new(),
             remaining: 0,
             send_ts: 0,
         });
-        partial.buf.resize(len, 0);
+        if partial.buf.len() < len {
+            partial.buf.resize(len, 0);
+        }
         partial.first_seq = first_seq;
         partial.len = len;
-        partial.have.clear();
-        partial.have.resize(total.div_ceil(u64::BITS as usize), 0);
         partial.remaining = total;
         partial.send_ts = send_ts;
         self.rx.partials.push(partial);
@@ -1176,10 +1178,18 @@ mod tests {
 
     /// Stores a payload and pushes it, dropping the owner reference.
     fn push(tx: &mut TxWindow, store: &mut MsgStore, stride: usize, payload: &[u8]) -> bool {
-        let slot = store.insert(payload);
+        let slot = store.insert(&mut payload.to_vec());
         let ok = tx.push(1, stride, store, slot, Nanos(1));
         store.release(slot);
         ok
+    }
+
+    /// Marks `range` as sent for the first time, as the manager's flush does.
+    fn send_all(tx: &mut TxWindow, range: std::ops::Range<u64>) {
+        let now = Instant::now();
+        for seq in range {
+            tx.mark_sent(seq, false, now);
+        }
     }
 
     #[test]
@@ -1213,8 +1223,7 @@ mod tests {
         let mut batch = SendBatch::new();
         let now = Instant::now();
         let fd = s.as_raw_fd();
-        let (sent, blocked) = tx.send_seqs(0..8, false, &store, fd, &to, &mut batch, now);
-        assert_eq!((sent, blocked), (8, false));
+        send_all(&mut tx, 0..8);
         assert_eq!(tx.next_send, 8);
         // Ack 0..3 cumulatively, 5 and 7 selectively: 3, 4, 6 are holes.
         let bits = 0b0000_1010_u64.to_le_bytes();
@@ -1248,13 +1257,13 @@ mod tests {
         for _ in 0..64 {
             assert!(push(&mut tx, &mut store, stride, &[1]));
         }
-        tx.send_seqs(0..64, false, &store, fd, &to, &mut batch, now);
+        send_all(&mut tx, 0..64);
         tx.on_ack(64, 0, &[], zero, zero, &mut store, fd, &to, &mut batch, now);
         assert_eq!(tx.base, 64);
         for _ in 0..8 {
             assert!(push(&mut tx, &mut store, stride, &[2]));
         }
-        tx.send_seqs(64..72, false, &store, fd, &to, &mut batch, now);
+        send_all(&mut tx, 64..72);
         // Old ack: cumulative 1, selective bit for seq 2, which aliases seq 66.
         let bits = 0b1_u64.to_le_bytes();
         tx.on_ack(1, 8, &bits, zero, zero, &mut store, fd, &to, &mut batch, now);
@@ -1274,7 +1283,7 @@ mod tests {
         let now = Instant::now();
         let zero = Duration::ZERO;
         assert!(push(&mut tx, &mut store, stride, &vec![0; stride * 4]));
-        tx.send_seqs(0..4, false, &store, fd, &to, &mut batch, now);
+        send_all(&mut tx, 0..4);
         tx.on_ack(2, 0, &[], zero, zero, &mut store, fd, &to, &mut batch, now);
         assert_eq!(tx.base, 2);
         tx.rewind(0xabcd);

@@ -86,12 +86,6 @@ impl Header {
     }
 }
 
-/// Rewrite only the send timestamp of an encoded header (retransmits).
-#[inline]
-pub(crate) fn write_send_ts(buf: &mut [u8], ts: u64) {
-    buf[19..27].copy_from_slice(&ts.to_le_bytes());
-}
-
 /// Rewrite only the session of an encoded header (replay after reconnect).
 #[inline]
 pub(crate) fn write_session(buf: &mut [u8], session: u32) {
@@ -121,8 +115,8 @@ mod tests {
         let mut buf = [0u8; HEADER_SIZE];
         h.encode(&mut buf);
         assert_eq!(Header::decode(&buf), Some(h));
-        write_send_ts(&mut buf, 5);
-        assert_eq!(Header::decode(&buf).unwrap().send_ts, 5);
+        write_session(&mut buf, 5);
+        assert_eq!(Header::decode(&buf).unwrap().session, 5);
     }
 
     #[test]

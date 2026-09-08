@@ -314,7 +314,7 @@ impl Connector {
         }
         match &mut self.inner {
             Inner::Tcp(m) => m.write(&self.config, where_to, &self.payload),
-            Inner::Udp(m) => m.write(&self.config, where_to, &self.payload),
+            Inner::Udp(m) => m.write(&self.config, where_to, &mut self.payload),
         }
     }
 

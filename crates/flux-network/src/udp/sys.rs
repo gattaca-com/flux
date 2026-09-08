@@ -123,11 +123,6 @@ impl SendBatch {
     }
 
     #[inline]
-    pub(crate) fn is_full(&self) -> bool {
-        self.len == BATCH
-    }
-
-    #[inline]
     pub(crate) fn push(&mut self, header: &[u8], payload: &[u8], to: &SockAddr) {
         let i = self.len;
         self.iovs[i] = [iovec(header), iovec(payload)];
@@ -281,7 +276,7 @@ mod tests {
             batch.push(h, payload, &to);
         }
         assert_eq!(batch.send(tx.as_raw_fd()).unwrap(), 5);
-        assert!(!batch.is_full());
+        assert_eq!(batch.len, 0);
 
         let mut recv = RecvBatch::new(64);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
