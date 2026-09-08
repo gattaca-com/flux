@@ -94,8 +94,8 @@ struct Tx {
 }
 
 impl Tx {
-    fn new() -> Box<Self> {
-        Box::new(Self {
+    fn new() -> Self {
+        Self {
             header: unsafe { mem::zeroed() },
             addr: SockAddr::new("0.0.0.0:0".parse().unwrap()),
             control: unsafe { mem::zeroed() },
@@ -105,7 +105,7 @@ impl Tx {
             segment: 0,
             offset: 0,
             fallback: false,
-        })
+        }
     }
 
     fn prepare(&mut self, fd: RawFd, index: usize) -> io_uring::squeue::Entry {
@@ -187,14 +187,14 @@ pub(crate) struct Ring {
     io: IoUring,
     fd: RawFd,
     owner: std::thread::ThreadId,
-    // Boxes keep msghdr, iovec and ancillary pointers stable across moves.
     rx: Vec<Option<Rx>>,
     provided: Option<Provided>,
+    // Boxed: the multishot SQE points at it and `Ring` itself moves.
     receive_header: Box<libc::msghdr>,
     rx_active: bool,
     available: usize,
-    #[allow(clippy::vec_box)]
-    tx: Vec<Box<Tx>>,
+    // Never resized, so SQE pointers into entries stay stable.
+    tx: Vec<Tx>,
     free_tx: Vec<usize>,
     ready: VecDeque<usize>,
     completions: Vec<(u64, i32, u32)>,

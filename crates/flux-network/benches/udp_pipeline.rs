@@ -78,6 +78,11 @@ fn transports() -> Vec<(&'static str, Transport)> {
     transports
 }
 
+fn sizes() -> impl Iterator<Item = (&'static str, usize)> {
+    let filter = std::env::var("FLUX_BENCH_SIZE").ok();
+    SIZES.into_iter().filter(move |(name, _)| filter.as_deref().is_none_or(|s| s == *name))
+}
+
 fn connector(transport: Transport) -> NetworkDriver {
     NetworkDriver::default().with_transport(transport).with_socket_buf_size(BIG_SOCKET_BUF)
 }
@@ -316,10 +321,7 @@ impl Drop for Relay {
 fn main() {
     pin(usize::MAX);
     println!("== paced: one message per 100µs, one receiver ==");
-    for (size_name, size) in SIZES
-        .into_iter()
-        .filter(|(name, _)| std::env::var("FLUX_BENCH_SIZE").ok().is_none_or(|s| s == *name))
-    {
+    for (size_name, size) in sizes() {
         for (name, transport) in transports() {
             let addr = free_addr();
             let s = run(Scenario {
@@ -337,10 +339,7 @@ fn main() {
     }
 
     println!("\n== burst: bounded outstanding, one receiver ==");
-    for (size_name, size) in SIZES
-        .into_iter()
-        .filter(|(name, _)| std::env::var("FLUX_BENCH_SIZE").ok().is_none_or(|s| s == *name))
-    {
+    for (size_name, size) in sizes() {
         let (count, window) = burst_plan(size);
         for (name, transport) in transports() {
             let addr = free_addr();
@@ -382,10 +381,7 @@ fn main() {
     }
 
     println!("\n== bcast: one sender, {BCAST_PEERS} receivers on one listener ==");
-    for (size_name, size) in SIZES
-        .into_iter()
-        .filter(|(name, _)| std::env::var("FLUX_BENCH_SIZE").ok().is_none_or(|s| s == *name))
-    {
+    for (size_name, size) in sizes() {
         let (count, window) = burst_plan(size);
         let count = count / BCAST_PEERS;
         for (name, transport) in transports() {

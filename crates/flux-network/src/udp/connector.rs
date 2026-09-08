@@ -620,14 +620,12 @@ impl UdpManager {
                 // Drain in bounded passes, emitting ACKs between passes so
                 // slow callbacks cannot hold back the sender's whole window.
                 for _ in 0..BATCH {
-                    let work = self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().poll();
+                    let work = self.sockets[k].socket.ring().poll();
                     o |= work;
                     let mut received_any = false;
                     // ACK processing can reap more receives while sending.
                     for _ in 0..config.recv_entries {
-                        let received =
-                            self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().receive();
-                        let Some(received) = received else { break };
+                        let Some(received) = self.sockets[k].socket.ring().receive() else { break };
                         received_any = true;
                         if let Some((datagrams, from)) =
                             received.datagrams(self.udp.max_datagram_size)
@@ -639,22 +637,16 @@ impl UdpManager {
                                 self.on_datagram(k, &dgram, dcache, deliver);
                             }
                         }
-                        self.sockets[k]
-                            .socket
-                            .ring
-                            .as_ref()
-                            .unwrap()
-                            .borrow_mut()
-                            .recycle(received);
+                        self.sockets[k].socket.ring().recycle(received);
                     }
-                    self.handle_event(k, false, false, dcache, deliver);
                     if !work && !received_any {
                         break;
                     }
+                    self.handle_event(k, false, false, dcache, deliver);
                 }
                 let writable = self.sockets[k].writable_armed;
                 self.handle_event(k, false, writable, dcache, deliver);
-                self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().submit();
+                self.sockets[k].socket.ring().submit();
             }
             return o | self.drain_pending_disconnects(deliver);
         }

@@ -35,6 +35,12 @@ impl UdpSocket {
         self.socket.local_addr()
     }
 
+    /// Panics unless the socket was opened with [`crate::udp::UdpIo::Uring`].
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ring(&self) -> std::cell::RefMut<'_, uring::Ring> {
+        self.ring.as_ref().expect("io_uring socket").borrow_mut()
+    }
+
     pub(crate) fn send_to(&self, bytes: &[u8], addr: SocketAddr) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
         if let Some(ring) = &self.ring {
