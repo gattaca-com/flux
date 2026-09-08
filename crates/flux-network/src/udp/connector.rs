@@ -154,6 +154,14 @@ impl UdpManager {
 
     fn bind(&mut self, bind: SocketAddr, listener: bool) -> io::Result<Token> {
         let mut socket = UdpSocket::bind(bind)?;
+        #[cfg(target_os = "linux")]
+        if let Err(err) = RecvBatch::enable_gro(socket.as_raw_fd()) {
+            debug!(?err, "UDP GRO unavailable");
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(err) = self.batch.enable_gso(socket.as_raw_fd()) {
+            debug!(?err, "UDP GSO unavailable");
+        }
         if let Some(size) = self.config.socket_buf_size {
             set_socket_buf_size(&socket, size);
         }
@@ -527,10 +535,12 @@ impl UdpManager {
                     }
                 };
                 for i in 0..n {
-                    let Some((bytes, from)) = recv.datagram(i) else { continue };
-                    let Some(header) = Header::decode(bytes) else { continue };
-                    let dgram = Datagram { header, payload: &bytes[HEADER_SIZE..], from, now };
-                    self.on_datagram(k, &dgram, dcache, deliver);
+                    let Some((datagrams, from)) = recv.datagrams(i) else { continue };
+                    for bytes in datagrams {
+                        let Some(header) = Header::decode(bytes) else { continue };
+                        let dgram = Datagram { header, payload: &bytes[HEADER_SIZE..], from, now };
+                        self.on_datagram(k, &dgram, dcache, deliver);
+                    }
                 }
             }
             self.recv = Some(recv);

@@ -5,7 +5,7 @@
 //! for the loss scenario how many datagrams were retransmitted.
 //!
 //! Scenarios:
-//! - `paced`: one message every 100 µs, so nothing queues. Minimum latency.
+//! - `paced`: at most one message every 100 µs, with bounded outstanding sends.
 //! - `burst`: as fast as the send window allows. Throughput and queueing.
 //! - `loss1`: UDP through a relay that drops exactly one data datagram of a 2
 //!   MiB message. Recovery should resend one datagram, not the message.
@@ -287,7 +287,7 @@ fn main() {
                 size,
                 count: PACED_MSGS,
                 pace: Some(PACE),
-                window: usize::MAX,
+                window: burst_plan(size).1,
             });
             s.row(&format!("paced/{name}/{size_name}"), "");
         }
