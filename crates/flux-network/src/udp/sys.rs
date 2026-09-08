@@ -248,10 +248,27 @@ impl SendBatch {
     }
 }
 
-/// Up to [`BATCH`] incoming datagrams with their source addresses.
+#[cfg(target_os = "linux")]
+const GRO_CONTROL_SPACE: usize =
+    unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as _) as usize };
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GroControl {
+    header: libc::cmsghdr,
+    size: libc::c_int,
+    padding:
+        [u8; GRO_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - mem::size_of::<libc::c_int>()],
+}
+
+/// Up to [`BATCH`] receive entries, each possibly holding GRO segments.
 pub(crate) struct RecvBatch {
     bufs: Vec<u8>,
     stride: usize,
+    datagram_size: usize,
+    #[cfg(target_os = "linux")]
+    controls: [GroControl; BATCH],
     addrs: [libc::sockaddr_storage; BATCH],
     iovs: [libc::iovec; BATCH],
     hdrs: [MMsgHdr; BATCH],
@@ -262,12 +279,18 @@ pub(crate) struct RecvBatch {
 unsafe impl Send for RecvBatch {}
 
 impl RecvBatch {
-    /// `datagram_size` bounds each datagram; longer ones are flagged truncated
-    /// and dropped by [`Self::datagram`].
+    /// `datagram_size` bounds each wire datagram, including GRO segments.
     pub(crate) fn new(datagram_size: usize) -> Self {
+        #[cfg(target_os = "linux")]
+        let stride = datagram_size.saturating_mul(64).min(65_535);
+        #[cfg(not(target_os = "linux"))]
+        let stride = datagram_size;
         Self {
-            bufs: vec![0; BATCH * datagram_size],
-            stride: datagram_size,
+            bufs: vec![0; BATCH * stride],
+            stride,
+            datagram_size,
+            #[cfg(target_os = "linux")]
+            controls: unsafe { mem::zeroed() },
             addrs: unsafe { mem::zeroed() },
             iovs: unsafe { mem::zeroed() },
             hdrs: unsafe { mem::zeroed() },
@@ -275,7 +298,22 @@ impl RecvBatch {
         }
     }
 
-    /// Receives whatever is queued, up to [`BATCH`] datagrams.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn enable_gro(fd: RawFd) -> io::Result<()> {
+        let enabled: libc::c_int = 1;
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                ptr::from_ref(&enabled).cast(),
+                mem::size_of_val(&enabled) as _,
+            )
+        };
+        if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    /// Receives whatever is queued, up to [`BATCH`] entries.
     pub(crate) fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
         self.len = 0;
         for i in 0..BATCH {
@@ -286,6 +324,11 @@ impl RecvBatch {
             hdr.msg_iov = ptr::from_mut(&mut self.iovs[i]);
             hdr.msg_iovlen = 1;
             hdr.msg_flags = 0;
+            #[cfg(target_os = "linux")]
+            {
+                hdr.msg_control = ptr::from_mut(&mut self.controls[i]).cast();
+                hdr.msg_controllen = GRO_CONTROL_SPACE;
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -321,17 +364,39 @@ impl RecvBatch {
         Ok(self.len)
     }
 
-    /// Datagram `i` of the last receive. `None` if it was truncated or its
-    /// source address is not IP.
-    pub(crate) fn datagram(&self, i: usize) -> Option<(&[u8], SocketAddr)> {
+    /// Wire datagrams in receive entry `i`; rejects truncated or oversized
+    /// entries.
+    pub(crate) fn datagrams(&self, i: usize) -> Option<(std::slice::Chunks<'_, u8>, SocketAddr)> {
         debug_assert!(i < self.len);
         let hdr = &self.hdrs[i];
-        if hdr.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
+        if hdr.msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+            return None;
+        }
+        let len = hdr.msg_len as usize;
+        #[cfg(not(target_os = "linux"))]
+        let segment_size = len;
+        #[cfg(target_os = "linux")]
+        let segment_size = if hdr.msg_hdr.msg_controllen != 0 {
+            let control = &self.controls[i];
+            let control_len =
+                unsafe { libc::CMSG_LEN(mem::size_of::<libc::c_int>() as _) as usize };
+            if hdr.msg_hdr.msg_controllen < control_len ||
+                control.header.cmsg_len != control_len ||
+                control.header.cmsg_level != libc::SOL_UDP ||
+                control.header.cmsg_type != libc::UDP_GRO
+            {
+                return None;
+            }
+            usize::try_from(control.size).ok()?
+        } else {
+            len
+        };
+        if segment_size == 0 || segment_size > self.datagram_size {
             return None;
         }
         let from = SockAddr::decode(&self.addrs[i], hdr.msg_hdr.msg_namelen)?;
         let start = i * self.stride;
-        Some((&self.bufs[start..start + hdr.msg_len as usize], from))
+        Some((self.bufs[start..start + len].chunks(segment_size), from))
     }
 }
 
@@ -343,16 +408,33 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    fn offload_available(result: io::Result<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(err)
+                if matches!(err.raw_os_error(), Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP)) =>
+            {
+                false
+            }
+            Err(err) => panic!("offload setup failed: {err}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn segmented_batch_preserves_datagrams() {
         for bind in ["127.0.0.1:0", "[::1]:0"] {
             // Hosts without IPv6 loopback only run the v4 case.
-            let Ok(sender) = UdpSocket::bind(bind) else { continue };
+            let sender = match UdpSocket::bind(bind) {
+                Ok(socket) => socket,
+                Err(_) if bind.starts_with('[') => continue,
+                Err(err) => panic!("IPv4 bind failed: {err}"),
+            };
             let receiver = UdpSocket::bind(bind).unwrap();
             receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             let to = SockAddr::new(receiver.local_addr().unwrap());
             let mut batch = SendBatch::new();
-            batch.enable_gso(sender.as_raw_fd()).unwrap();
+            offload_available(batch.enable_gso(sender.as_raw_fd()));
             let headers: [[u8; 29]; BATCH] = std::array::from_fn(|i| [i as u8; 29]);
             let payload = [0x5a; 1171];
             for (i, header) in headers.iter().enumerate() {
@@ -392,7 +474,9 @@ mod tests {
         );
         let to = SockAddr::new(receiver.local_addr().unwrap());
         let mut batch = SendBatch::new();
-        batch.enable_gso(sender.as_raw_fd()).unwrap();
+        if !offload_available(batch.enable_gso(sender.as_raw_fd())) {
+            return;
+        }
         for _ in 0..4 {
             batch.push(b"header", b"payload", &to);
         }
@@ -418,7 +502,7 @@ mod tests {
         let to = receivers.each_ref().map(|r| SockAddr::new(r.local_addr().unwrap()));
         for mixed_destinations in [false, true] {
             let mut batch = SendBatch::new();
-            batch.enable_gso(sender.as_raw_fd()).unwrap();
+            offload_available(batch.enable_gso(sender.as_raw_fd()));
             let payloads: [&[u8]; 4] = if mixed_destinations {
                 [b"aaa", b"bbb", b"ccc", b"ddd"]
             } else {
@@ -435,6 +519,79 @@ mod tests {
                 assert_eq!(buf[0], b'h');
                 assert_eq!(&buf[1..n], *payload);
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gro_splits_segments_and_then_receives_plain_datagrams() {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let sender = match UdpSocket::bind(bind) {
+                Ok(socket) => socket,
+                Err(_) if bind.starts_with('[') => continue,
+                Err(err) => panic!("IPv4 bind failed: {err}"),
+            };
+            let receiver = UdpSocket::bind(bind).unwrap();
+            if !offload_available(RecvBatch::enable_gro(receiver.as_raw_fd())) {
+                return;
+            }
+            let to = SockAddr::new(receiver.local_addr().unwrap());
+            let mut tx = SendBatch::new();
+            if !offload_available(tx.enable_gso(sender.as_raw_fd())) {
+                return;
+            }
+            let headers = [[1; 29], [2; 29], [3; 29], [4; 29]];
+            let payload = [0x5a; 1171];
+            for (i, header) in headers.iter().enumerate() {
+                tx.push(header, &payload[..if i == 3 { 17 } else { 1171 }], &to);
+            }
+            assert_eq!(tx.send(sender.as_raw_fd()).unwrap(), 4);
+            let mut rx = RecvBatch::new(1200);
+            let n = rx.recv(receiver.as_raw_fd()).unwrap();
+            assert_eq!(n, 1, "expected a combined GRO entry");
+            assert_eq!(rx.controls[0].header.cmsg_type, libc::UDP_GRO);
+            let mut seen = 0;
+            for i in 0..n {
+                let (datagrams, from) = rx.datagrams(i).unwrap();
+                assert_eq!(from, sender.local_addr().unwrap());
+                for bytes in datagrams {
+                    assert_eq!(&bytes[..29], &headers[seen]);
+                    assert_eq!(&bytes[29..], &payload[..if seen == 3 { 17 } else { 1171 }]);
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, 4);
+            sender.send_to(b"plain", receiver.local_addr().unwrap()).unwrap();
+            assert_eq!(rx.recv(receiver.as_raw_fd()).unwrap(), 1);
+            let (mut datagrams, _) = rx.datagrams(0).unwrap();
+            assert_eq!(datagrams.next(), Some(b"plain".as_slice()));
+            assert!(datagrams.next().is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gro_rejects_bad_metadata_and_oversized_datagrams() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut rx = RecvBatch::new(1200);
+        sender.send_to(&[0; 1201], receiver.local_addr().unwrap()).unwrap();
+        assert_eq!(rx.recv(receiver.as_raw_fd()).unwrap(), 1);
+        assert!(rx.datagrams(0).is_none());
+        rx.hdrs[0].msg_hdr.msg_controllen = GRO_CONTROL_SPACE;
+        rx.controls[0].header = libc::cmsghdr {
+            cmsg_len: unsafe { libc::CMSG_LEN(mem::size_of::<libc::c_int>() as _) as usize },
+            cmsg_level: libc::SOL_UDP,
+            cmsg_type: libc::UDP_GRO,
+        };
+        for size in [0, -1, 1201] {
+            rx.controls[0].size = size;
+            assert!(rx.datagrams(0).is_none());
+        }
+        rx.controls[0].size = 1200;
+        for flag in [libc::MSG_TRUNC, libc::MSG_CTRUNC] {
+            rx.hdrs[0].msg_hdr.msg_flags = flag;
+            assert!(rx.datagrams(0).is_none());
         }
     }
 
