@@ -7,12 +7,6 @@
 //! oldest unacked datagram, doubling the probe size per round. Messages are
 //! delivered as soon as all their fragments are in, so a lost datagram delays
 //! only its own message.
-//!
-//! There is no flow control: a sender may have `send_window` datagrams in
-//! flight, and a receiver whose kernel socket buffer cannot hold that many
-//! drops them and recovers through retransmits. Size `SO_RCVBUF` (via
-//! `Connector::with_socket_buf_size`, subject to `net.core.rmem_max`) to at
-//! least `send_window * max_datagram_size` for burst-heavy links.
 
 use flux_timing::Duration;
 
@@ -32,12 +26,14 @@ pub(crate) use connector::UdpManager;
 /// `max_datagram_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
-    /// Datagram size including the 27-byte header. 1200 fits every path
-    /// including the IPv6 / tailscale 1280 MTU.
+    /// Datagram size including the 27-byte header. 1200 stays under the
+    /// 1280-byte IPv6 minimum MTU.
     pub max_datagram_size: usize,
     /// Datagrams a sender may have in flight per peer, counted from the oldest
     /// message not yet fully acked. Power of two, at least 64. A message that
-    /// does not fit disconnects the peer, like an exceeded backlog.
+    /// does not fit disconnects the peer, like an exceeded backlog. There is
+    /// no flow control, so the receiver's socket buffer should hold a full
+    /// window.
     pub send_window: usize,
     /// Datagrams a receiver tracks above its ack point. Power of two, at least
     /// 64. Should be at least the peer's `send_window`.
@@ -73,7 +69,7 @@ impl UdpConfig {
     pub fn lan() -> Self {
         Self {
             initial_rto: Duration::from_millis(1),
-            min_rto: Duration::from_micros(100),
+            min_rto: Duration::from_micros(250),
             max_rto: Duration::from_millis(50),
             heartbeat_interval: Duration::from_millis(100),
             ..Self::default()

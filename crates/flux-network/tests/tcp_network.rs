@@ -6,8 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::tcp::{
-    PollEvent, SendBehavior, TcpConnector, TcpEvent, TcpGroupConfig, TcpNetwork,
+use flux_network::{
+    Connector, PollEvent, SendBehavior,
+    tcp::{TcpEvent, TcpGroupConfig, TcpNetwork},
 };
 
 const CLIENT_HELLO: &[u8] = b"client-hello";
@@ -611,7 +612,7 @@ fn tcp_network_is_wire_compatible_with_tcp_connector() {
     });
     network.listen(server_group, addr).unwrap();
 
-    let mut connector = TcpConnector::default();
+    let mut connector = Connector::default();
     let connector_token = connector.connect(addr).expect("connector failed to connect");
     connector.write_or_enqueue_with(SendBehavior::Single(connector_token), |buf| {
         buf.extend_from_slice(REQUEST);
@@ -657,7 +658,7 @@ fn tcp_network_is_wire_compatible_with_tcp_connector() {
 #[test]
 fn tcp_network_client_is_wire_compatible_with_tcp_connector_server() {
     let addr = unused_addr();
-    let mut connector = TcpConnector::default().with_on_connect_msg(SERVER_HELLO.to_vec());
+    let mut connector = Connector::default().with_on_connect_msg(SERVER_HELLO.to_vec());
     connector.listen_at(addr).expect("connector failed to listen");
 
     let mut network = TcpNetwork::default();

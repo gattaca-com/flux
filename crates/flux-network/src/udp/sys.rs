@@ -1,9 +1,6 @@
 //! Batched datagram syscalls. Linux uses `sendmmsg`/`recvmmsg`; elsewhere the
 //! same API loops over `sendmsg`/`recvmsg`. Both are non-blocking and send or
 //! receive whatever is available right now: there is no accumulation delay.
-//!
-//! The `msghdr` pointers are (re)established immediately before each syscall,
-//! so neither batch is self-referential and both may be moved freely.
 
 use std::{
     io, mem,

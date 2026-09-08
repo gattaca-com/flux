@@ -57,7 +57,7 @@ impl Tile<TcpDcacheSpine> for NetworkTile {
             let PollEvent::Message { payload: bytes, .. } = ev else { return None };
             bytes.try_into().ok().map(Payload)
         });
-        // TcpConnector is polled rather than registered with Flux's park waker,
+        // Connector is polled rather than registered with Flux's park waker,
         // so keep this background tile ticking when the workspace enables `park`.
         adapter.mark_work();
     }

@@ -328,8 +328,8 @@ impl TxWindow {
         true
     }
 
-    /// Puts fragment `seq` into `batch`. The wire timestamp stays as first
-    /// sent, so receive-side latency includes recovery time.
+    /// Puts fragment `seq` into `batch`. The header keeps its original send
+    /// timestamp: receive-side latency includes recovery time.
     #[inline]
     fn stage(&self, seq: u64, store: &MsgStore, to: &SockAddr, batch: &mut SendBatch) {
         let f = &self.slots[(seq & self.mask) as usize];
@@ -1023,8 +1023,8 @@ impl UdpPeer {
             debug!(%self.addr, "udp fragment disagrees on message length");
             return;
         }
-        // The window already rejected this sequence if it was a duplicate, and
-        // a fragment index maps to exactly one sequence of its message.
+        // No per-fragment dedup needed: the window rejects duplicate sequences
+        // and a fragment index maps to exactly one sequence of its message.
         partial.remaining -= 1;
         partial.buf[offset..offset + payload.len()].copy_from_slice(payload);
         if partial.remaining != 0 {

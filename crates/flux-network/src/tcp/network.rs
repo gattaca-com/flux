@@ -1031,8 +1031,8 @@ impl TcpNetwork {
 /// This type stores protocol groups, listeners, and connections, but does not
 /// own or poll a [`Poll`].
 ///
-/// Unlike [`super::TcpConnector`], queued bytes are never retained across a
-/// disconnected socket. Use `TcpConnector` when reconnect backlog replay is
+/// Unlike [`crate::Connector`], queued bytes are never retained across a
+/// disconnected socket. Use `Connector` when reconnect backlog replay is
 /// required.
 pub struct TcpNetworkCore {
     state: NetworkState,
