@@ -54,7 +54,7 @@ fn udp_config() -> UdpConfig {
 }
 
 fn transports() -> [(&'static str, Transport); 2] {
-    [("tcp", Transport::Tcp), ("udp", Transport::Udp(udp_config()))]
+    [("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))]
 }
 
 fn connector(transport: Transport) -> Connector {

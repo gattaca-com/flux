@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::{Connector, PollEvent, SendBehavior};
+use flux_network::{Connector, PollEvent, SendBehavior, TcpConfig, Transport};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
@@ -150,8 +150,11 @@ fn receive_after_reconnect(drop_backlog: bool) -> Option<TestMsg> {
     listener.listen_at(bind_addr).unwrap();
 
     let mut client = Connector::default()
-        .with_drop_outbound_backlog_on_disconnect(drop_backlog)
-        .with_reconnect_interval(flux_timing::Duration::from_millis(1));
+        .with_transport(Transport::Tcp(TcpConfig {
+            reconnect_interval: flux_timing::Duration::from_millis(1),
+            ..TcpConfig::default()
+        }))
+        .with_drop_outbound_backlog_on_disconnect(drop_backlog);
     let token = client.connect(bind_addr).unwrap();
 
     let mut accepted = 0;

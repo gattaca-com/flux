@@ -6,17 +6,24 @@ use flux_utils::DCachePtr;
 use mio::{Events, Poll, Token};
 
 use crate::{
-    tcp::{DEFAULT_TCP_USER_TIMEOUT_MS, TcpManager, TcpStream, TcpTelemetry},
+    tcp::{DEFAULT_TCP_USER_TIMEOUT_MS, TcpConfig, TcpManager, TcpStream, TcpTelemetry},
     udp::{UdpConfig, UdpManager},
 };
 
 const EVENTS_CAPACITY: usize = 128;
 
-/// Wire transport used by a [`Connector`].
+/// Wire transport used by a [`Connector`], with its transport-specific
+/// settings. Settings both share are the `with_*` builders.
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
-    Tcp,
+    Tcp(TcpConfig),
     Udp(UdpConfig),
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Self::Tcp(TcpConfig::default())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,8 +67,6 @@ pub(crate) struct Config {
     /// Counted in framed messages for TCP, unacked datagrams for UDP.
     pub(crate) max_backlog: Option<(usize, Duration)>,
     pub(crate) drop_outbound_backlog_on_disconnect: bool,
-    pub(crate) nodelay: bool,
-    pub(crate) keepalive: bool,
 }
 
 enum Inner {
@@ -75,8 +80,8 @@ enum Inner {
 ///
 /// Manages:
 /// - **Outbound (client) connections** created via [`connect`]. These are
-///   **auto-retried** on failure/disconnect based on the configured reconnect
-///   interval (TCP) or the adaptive RTO (UDP).
+///   **auto-retried** on failure/disconnect: TCP on its configured reconnect
+///   interval, UDP on its adaptive RTO.
 /// - **Listeners** created via [`listen_at`] and **inbound (server)
 ///   connections** accepted from them. Inbound connections are **not**
 ///   reconnected.
@@ -130,11 +135,9 @@ impl Default for Connector {
                 dcache: None,
                 max_backlog: None,
                 drop_outbound_backlog_on_disconnect: false,
-                nodelay: true,
-                keepalive: false,
             },
             payload: Vec::with_capacity(TcpStream::SEND_BUF_SIZE),
-            inner: Inner::Tcp(TcpManager::new(registry)),
+            inner: Inner::Tcp(TcpManager::new(registry, TcpConfig::default())),
         }
     }
 }
@@ -152,21 +155,9 @@ impl Connector {
         assert!(empty, "with_transport must precede connect/listen_at");
         let registry = self.poll.registry().try_clone().expect("couldn't clone poll registry");
         self.inner = match transport {
-            Transport::Tcp => Inner::Tcp(TcpManager::new(registry)),
+            Transport::Tcp(config) => Inner::Tcp(TcpManager::new(registry, config)),
             Transport::Udp(config) => Inner::Udp(Box::new(UdpManager::new(registry, config))),
         };
-        self
-    }
-
-    /// Sets the interval used to retry disconnected/failed outbound
-    /// connections.
-    ///
-    /// Reconnect attempts are performed from within [`poll_with`]. UDP
-    /// outbound peers retry their hello on the adaptive RTO instead.
-    pub fn with_reconnect_interval(mut self, interval: Duration) -> Self {
-        if let Inner::Tcp(m) = &mut self.inner {
-            m.set_reconnect_interval(interval);
-        }
         self
     }
 
@@ -208,24 +199,6 @@ impl Connector {
     /// is considered gone.
     pub fn with_user_timeout(mut self, timeout_ms: u32) -> Self {
         self.config.user_timeout_ms = timeout_ms;
-        self
-    }
-
-    /// Controls whether `TCP_NODELAY` is set on sockets (default: **true**).
-    ///
-    /// When enabled, Nagle's algorithm is disabled and small writes are sent
-    /// immediately.  Set to `false` to allow the kernel to coalesce small
-    /// writes (higher throughput at the cost of up to ~40 ms latency).
-    /// Ignored for UDP.
-    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
-        self.config.nodelay = nodelay;
-        self
-    }
-
-    /// Enables TCP keepalive on outbound and accepted connections. UDP peers
-    /// always heartbeat.
-    pub fn with_keepalive(mut self) -> Self {
-        self.config.keepalive = true;
         self
     }
 

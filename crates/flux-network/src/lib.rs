@@ -5,4 +5,5 @@ pub mod udp;
 
 pub use connector::{Connector, PollEvent, SendBehavior, Transport};
 pub use mio::Token;
+pub use tcp::TcpConfig;
 pub use udp::UdpConfig;

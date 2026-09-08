@@ -30,8 +30,28 @@ enum Variant {
     Listener(TcpListener),
 }
 
+/// Socket options for [`crate::Transport::Tcp`].
+#[derive(Clone, Copy, Debug)]
+pub struct TcpConfig {
+    /// `TCP_NODELAY`: send small writes immediately instead of letting Nagle
+    /// coalesce them.
+    pub nodelay: bool,
+    /// `SO_KEEPALIVE` with short probe timings, so a silently vanished peer is
+    /// noticed within seconds.
+    pub keepalive: bool,
+    /// Retry interval for disconnected outbound connections.
+    pub reconnect_interval: Duration,
+}
+
+impl Default for TcpConfig {
+    fn default() -> Self {
+        Self { nodelay: true, keepalive: false, reconnect_interval: Duration::from_secs(2) }
+    }
+}
+
 pub(crate) struct TcpManager {
     registry: Registry,
+    config: TcpConfig,
     conns: Vec<(Token, Variant)>,
     reconnector: Repeater,
     // Always only outbound/client side connection streams
@@ -47,11 +67,12 @@ pub(crate) struct TcpManager {
 }
 
 impl TcpManager {
-    pub(crate) fn new(registry: Registry) -> Self {
+    pub(crate) fn new(registry: Registry, config: TcpConfig) -> Self {
         Self {
             registry,
+            config,
             conns: Vec::with_capacity(5),
-            reconnector: Repeater::every(Duration::from_secs(2)),
+            reconnector: Repeater::every(config.reconnect_interval),
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             pending_disconnects: Vec::with_capacity(10),
@@ -62,10 +83,6 @@ impl TcpManager {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.conns.is_empty() && self.to_be_reconnected.is_empty()
-    }
-
-    pub(crate) fn set_reconnect_interval(&mut self, interval: Duration) {
-        self.reconnector = Repeater::every(interval);
     }
 
     pub(crate) fn disconnect_outbound(&mut self, cfg: &Config) {
@@ -348,7 +365,7 @@ impl TcpManager {
             error!("couldn't register tcp stream for {addr} with registry: {e}");
             return None;
         }
-        if cfg.nodelay {
+        if self.config.nodelay {
             new_stream
                 .set_nodelay(true)
                 .inspect_err(|e| {
@@ -356,7 +373,7 @@ impl TcpManager {
                 })
                 .ok()?;
         }
-        if cfg.keepalive {
+        if self.config.keepalive {
             set_keepalive(&new_stream)
                 .inspect_err(|e| error!("couldn't setup keepalive for tcp stream for {addr}: {e}"))
                 .ok()?;
@@ -434,13 +451,13 @@ impl TcpManager {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 continue;
             }
-            if cfg.nodelay {
+            if self.config.nodelay {
                 if let Err(e) = stream.set_nodelay(true) {
                     error!("couldn't set nodelay on stream to {addr}: {e}");
                     continue;
                 }
             }
-            if cfg.keepalive &&
+            if self.config.keepalive &&
                 let Err(e) = set_keepalive(&stream)
             {
                 error!("couldn't set keepalive on stream to {addr}: {e}");

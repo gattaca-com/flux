@@ -2,6 +2,7 @@ mod connector;
 mod network;
 mod stream;
 
+pub use connector::TcpConfig;
 pub(crate) use connector::TcpManager;
 pub use network::{
     Framing, PayloadBuf, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork, TcpNetworkCore,

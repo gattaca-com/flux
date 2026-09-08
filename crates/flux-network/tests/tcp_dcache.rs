@@ -90,7 +90,7 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
 
 #[test]
 fn dcache_multi_stream_tcp() {
-    dcache_multi_stream(Transport::Tcp);
+    dcache_multi_stream(Transport::default());
 }
 
 #[test]
