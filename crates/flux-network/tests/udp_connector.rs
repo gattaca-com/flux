@@ -47,6 +47,12 @@ fn connect_via(
         client.poll_with(|_| {});
         thread::sleep(Duration::from_micros(50));
     }
+    // A hello retry may still be in flight if the ack took longer than one
+    // RTO. Let it land now, while the peer it belongs to still exists.
+    for _ in 0..5 {
+        server.poll_with(|_| {});
+        client.poll_with(|_| {});
+    }
     (accepted.unwrap(), client_token)
 }
 
