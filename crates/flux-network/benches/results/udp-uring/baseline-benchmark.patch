@@ -1,0 +1,88 @@
+--- a/crates/flux-network/benches/udp_pipeline.rs
++++ b/crates/flux-network/benches/udp_pipeline.rs
+@@ -13,0 +14,5 @@
++//! `FLUX_BENCH_TRANSPORT=udp,uring` selects backends; `FLUX_BENCH_REVERSE=1`
++//! reverses their order. `FLUX_BENCH_SCALE=16` increases burst/broadcast sample
++//! counts. `FLUX_BENCH_SIZE=2m` filters paced/burst/broadcast sizes. CPU ns/B
++//! sums sender and receiver thread CPU time; it excludes the loss relay.
++//!
+@@ -56,2 +61,10 @@
+-fn transports() -> [(&'static str, Transport); 2] {
+-    [("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))]
++fn transports() -> Vec<(&'static str, Transport)> {
++    let mut transports = vec![("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))];
++    if let Ok(filter) = std::env::var("FLUX_BENCH_TRANSPORT") {
++        transports.retain(|(name, _)| filter.split(',').any(|selected| selected == *name));
++        assert!(!transports.is_empty(), "unknown FLUX_BENCH_TRANSPORT");
++    }
++    if std::env::var_os("FLUX_BENCH_REVERSE").is_some() {
++        transports.reverse();
++    }
++    transports
+@@ -68 +81,4 @@
+-    (count, window)
++    let scale: usize = std::env::var("FLUX_BENCH_SCALE")
++        .map_or(1, |s| s.parse().expect("invalid FLUX_BENCH_SCALE"));
++    assert!((1..=64).contains(&scale));
++    (count * scale, window)
+@@ -74,0 +91 @@
++    cpu: Duration,
+@@ -84 +101 @@
+-            "{name:<28} n={:<6} p50={:>9.1}µs p99={:>9.1}µs max={:>9.1}µs {mibps:>9.0} MiB/s {extra}",
++            "{name:<28} n={:<6} p50={:>9.1}µs p99={:>9.1}µs max={:>9.1}µs {mibps:>9.0} MiB/s cpu={:.3}ns/B {extra}",
+@@ -88,0 +106 @@
++            self.cpu.as_nanos() as f64 / self.bytes as f64,
+@@ -136,0 +155,11 @@
++}
++
++fn thread_cpu_time() -> Duration {
++    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
++    assert_eq!(
++        unsafe {
++            libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, std::ptr::from_mut(&mut time))
++        },
++        0
++    );
++    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+@@ -155,0 +185 @@
++            let cpu_start = thread_cpu_time();
+@@ -167 +197 @@
+-            lat
++            (lat, thread_cpu_time() - cpu_start)
+@@ -172,0 +203 @@
++    let cpu_start = thread_cpu_time();
+@@ -191,3 +222,4 @@
+-    let latencies_ns = rx_thread.join().unwrap();
+-    assert_eq!(latencies_ns.len(), expected, "receiver timed out");
+-    Stats { latencies_ns, elapsed, bytes: expected * size }
++    let sender_cpu = thread_cpu_time() - cpu_start;
++    let (latencies_ns, receiver_cpu) = rx_thread.join().unwrap();
++    assert_eq!(latencies_ns.len(), expected, "receiver timed out after {sent} sends");
++    Stats { latencies_ns, elapsed, bytes: expected * size, cpu: sender_cpu + receiver_cpu }
+@@ -279 +311,4 @@
+-    for (size_name, size) in SIZES {
++    for (size_name, size) in SIZES
++        .into_iter()
++        .filter(|(name, _)| std::env::var("FLUX_BENCH_SIZE").ok().is_none_or(|s| s == *name))
++    {
+@@ -297 +332,4 @@
+-    for (size_name, size) in SIZES {
++    for (size_name, size) in SIZES
++        .into_iter()
++        .filter(|(name, _)| std::env::var("FLUX_BENCH_SIZE").ok().is_none_or(|s| s == *name))
++    {
+@@ -315,0 +354,2 @@
++    for (name, transport) in
++        transports().into_iter().filter(|(_, t)| matches!(t, Transport::Udp(_)))
+@@ -321 +361 @@
+-            transport: Transport::Udp(udp_config()),
++            transport,
+@@ -333 +373 @@
+-        s.row("loss1/udp/2m", &format!("datagrams={data} retransmitted={retx}"));
++        s.row(&format!("loss1/{name}/2m"), &format!("datagrams={data} retransmitted={retx}"));
+@@ -337 +377,4 @@
+-    for (size_name, size) in SIZES {
++    for (size_name, size) in SIZES
++        .into_iter()
++        .filter(|(name, _)| std::env::var("FLUX_BENCH_SIZE").ok().is_none_or(|s| s == *name))
++    {

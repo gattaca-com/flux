@@ -9,6 +9,88 @@ use std::{
     ptr, slice,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) mod uring;
+
+/// Datagram socket and its optional completion backend.
+pub(crate) struct UdpSocket {
+    #[cfg(target_os = "linux")]
+    // Retire kernel requests before closing the socket below.
+    pub(crate) ring: Option<std::cell::RefCell<uring::Ring>>,
+    socket: mio::net::UdpSocket,
+}
+
+impl UdpSocket {
+    pub(crate) fn bind(addr: SocketAddr) -> io::Result<Self> {
+        Ok(Self {
+            socket: mio::net::UdpSocket::bind(addr)?,
+            #[cfg(target_os = "linux")]
+            ring: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub(crate) fn send_to(&self, bytes: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(ring) = &self.ring {
+            return ring.borrow_mut().send(bytes, SockAddr::new(addr));
+        }
+        self.socket.send_to(bytes, addr)
+    }
+
+    pub(crate) fn send_batch(&self, batch: &mut SendBatch) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(ring) = &self.ring {
+            return ring.borrow_mut().send_batch(batch);
+        }
+        batch.send(std::os::fd::AsRawFd::as_raw_fd(self))
+    }
+}
+
+impl std::os::fd::AsRawFd for UdpSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+}
+
+impl mio::event::Source for UdpSocket {
+    fn register(
+        &mut self,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.ring.is_some() {
+            return Ok(());
+        }
+        self.socket.register(registry, token, interests)
+    }
+    fn reregister(
+        &mut self,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.ring.is_some() {
+            return Ok(());
+        }
+        self.socket.reregister(registry, token, interests)
+    }
+    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.ring.is_some() {
+            return Ok(());
+        }
+        self.socket.deregister(registry)
+    }
+}
+
 /// Datagrams per syscall.
 pub(crate) const BATCH: usize = 32;
 
@@ -368,36 +450,50 @@ impl RecvBatch {
     /// entries.
     pub(crate) fn datagrams(&self, i: usize) -> Option<(std::slice::Chunks<'_, u8>, SocketAddr)> {
         debug_assert!(i < self.len);
-        let hdr = &self.hdrs[i];
-        if hdr.msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-            return None;
-        }
-        let len = hdr.msg_len as usize;
-        #[cfg(not(target_os = "linux"))]
-        let segment_size = len;
-        #[cfg(target_os = "linux")]
-        let segment_size = if hdr.msg_hdr.msg_controllen != 0 {
-            let control = &self.controls[i];
-            let control_len =
-                unsafe { libc::CMSG_LEN(mem::size_of::<libc::c_int>() as _) as usize };
-            if hdr.msg_hdr.msg_controllen < control_len ||
-                control.header.cmsg_len != control_len ||
-                control.header.cmsg_level != libc::SOL_UDP ||
-                control.header.cmsg_type != libc::UDP_GRO
-            {
-                return None;
-            }
-            usize::try_from(control.size).ok()?
-        } else {
-            len
-        };
-        if segment_size == 0 || segment_size > self.datagram_size {
-            return None;
-        }
-        let from = SockAddr::decode(&self.addrs[i], hdr.msg_hdr.msg_namelen)?;
         let start = i * self.stride;
-        Some((self.bufs[start..start + len].chunks(segment_size), from))
+        decode_datagrams(
+            &self.hdrs[i],
+            &self.addrs[i],
+            #[cfg(target_os = "linux")]
+            &self.controls[i],
+            &self.bufs[start..start + self.stride],
+            self.datagram_size,
+        )
     }
+}
+
+fn decode_datagrams<'a>(
+    hdr: &MMsgHdr,
+    addr: &libc::sockaddr_storage,
+    #[cfg(target_os = "linux")] control: &GroControl,
+    bytes: &'a [u8],
+    datagram_size: usize,
+) -> Option<(std::slice::Chunks<'a, u8>, SocketAddr)> {
+    if hdr.msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return None;
+    }
+    let len = hdr.msg_len as usize;
+    #[cfg(not(target_os = "linux"))]
+    let segment_size = len;
+    #[cfg(target_os = "linux")]
+    let segment_size = if hdr.msg_hdr.msg_controllen != 0 {
+        let control_len = unsafe { libc::CMSG_LEN(mem::size_of::<libc::c_int>() as _) as usize };
+        if hdr.msg_hdr.msg_controllen < control_len ||
+            control.header.cmsg_len != control_len ||
+            control.header.cmsg_level != libc::SOL_UDP ||
+            control.header.cmsg_type != libc::UDP_GRO
+        {
+            return None;
+        }
+        usize::try_from(control.size).ok()?
+    } else {
+        len
+    };
+    if segment_size == 0 || segment_size > datagram_size {
+        return None;
+    }
+    let from = SockAddr::decode(addr, hdr.msg_hdr.msg_namelen)?;
+    Some((bytes[..len].chunks(segment_size), from))
 }
 
 #[cfg(test)]

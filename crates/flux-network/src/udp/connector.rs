@@ -17,13 +17,13 @@ use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos};
 use flux_utils::{DCache, DCachePtr, safe_panic};
-use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::UdpSocket};
+use mio::{Events, Interest, Poll, Registry, Token};
 use tracing::{debug, info, warn};
 
 use super::{
     UdpConfig,
     peer::{MsgStore, PushOutcome, RxPayload, SendOutcome, Staged, UdpPeer, send_batch},
-    sys::{BATCH, RecvBatch, SendBatch},
+    sys::{BATCH, RecvBatch, SendBatch, UdpSocket},
     wire::{HEADER_SIZE, Header, Kind},
 };
 use crate::{
@@ -134,7 +134,11 @@ impl UdpManager {
             store: MsgStore::new(),
             batch: SendBatch::new(),
             staged: [Staged { peer: 0, seq: 0 }; BATCH],
-            recv: Some(RecvBatch::new(udp.max_datagram_size)),
+            recv: match udp.io {
+                super::UdpIo::Syscall => Some(RecvBatch::new(udp.max_datagram_size)),
+                #[cfg(target_os = "linux")]
+                super::UdpIo::Uring(_) => None,
+            },
             pending_disconnects: Vec::new(),
             next_token: 0,
             tick_interval: udp.min_rto / 2_u32,
@@ -164,6 +168,13 @@ impl UdpManager {
         }
         if let Some(size) = self.config.socket_buf_size {
             set_socket_buf_size(&socket, size);
+        }
+        #[cfg(target_os = "linux")]
+        if let super::UdpIo::Uring(config) = self.udp.io {
+            socket.ring = Some(std::cell::RefCell::new(super::sys::uring::Ring::new(
+                socket.as_raw_fd(),
+                config,
+            )?));
         }
         let token = self.next_token();
         self.registry.register(&mut socket, token, Interest::READABLE)?;
@@ -333,7 +344,7 @@ impl UdpManager {
     /// peers. Arms WRITABLE if the kernel stopped accepting.
     fn flush_socket(&mut self, k: usize, now: Instant) {
         let entry = &mut self.sockets[k];
-        let fd = entry.socket.as_raw_fd();
+        let socket = &entry.socket;
         let mut n = 0;
         for i in 0..self.peers.len() {
             if self.peers[i].socket_token != entry.token {
@@ -344,7 +355,14 @@ impl UdpManager {
                 self.staged[n] = Staged { peer: i, seq };
                 n += 1;
                 if n == BATCH {
-                    if !Self::dispatch(&mut self.batch, &self.staged, &mut self.peers, fd, n, now) {
+                    if !Self::dispatch(
+                        &mut self.batch,
+                        &self.staged,
+                        &mut self.peers,
+                        socket,
+                        n,
+                        now,
+                    ) {
                         arm_writable(&self.registry, entry);
                         return;
                     }
@@ -352,7 +370,8 @@ impl UdpManager {
                 }
             }
         }
-        if n != 0 && !Self::dispatch(&mut self.batch, &self.staged, &mut self.peers, fd, n, now) {
+        if n != 0 && !Self::dispatch(&mut self.batch, &self.staged, &mut self.peers, socket, n, now)
+        {
             arm_writable(&self.registry, entry);
         }
     }
@@ -363,11 +382,11 @@ impl UdpManager {
         batch: &mut SendBatch,
         staged: &[Staged; BATCH],
         peers: &mut [UdpPeer],
-        fd: i32,
+        socket: &UdpSocket,
         n: usize,
         now: Instant,
     ) -> bool {
-        let accepted = send_batch(batch, fd, n);
+        let accepted = send_batch(batch, socket, n);
         for s in &staged[..accepted] {
             peers[s.peer].mark_sent(s.seq, now);
         }
@@ -516,12 +535,18 @@ impl UdpManager {
     }
 
     /// Readable/writable event on the socket at `k`.
-    fn handle_event<F>(&mut self, k: usize, event: &Event, dcache: Option<&DCache>, deliver: &mut F)
-    where
+    fn handle_event<F>(
+        &mut self,
+        k: usize,
+        readable: bool,
+        writable: bool,
+        dcache: Option<&DCache>,
+        deliver: &mut F,
+    ) where
         F: for<'a> FnMut(PollEvent<RxPayload<'a>>),
     {
         let now = Instant::now();
-        if event.is_readable() {
+        if readable {
             let fd = self.sockets[k].socket.as_raw_fd();
             let mut recv = self.recv.take().expect("recv batch in use");
             loop {
@@ -546,7 +571,7 @@ impl UdpManager {
             self.recv = Some(recv);
         }
 
-        if event.is_writable() {
+        if writable {
             self.sockets[k].writable_armed = false;
             self.flush_socket(k, now);
         }
@@ -557,7 +582,7 @@ impl UdpManager {
                 arm_writable(&self.registry, entry);
             }
         }
-        if event.is_writable() && !entry.writable_armed {
+        if writable && !entry.writable_armed {
             if let Err(err) =
                 self.registry.reregister(&mut entry.socket, entry.token, Interest::READABLE)
             {
@@ -589,6 +614,49 @@ impl UdpManager {
             self.next_tick = now + self.tick_interval;
             self.tick(now);
         }
+        #[cfg(target_os = "linux")]
+        if matches!(self.udp.io, super::UdpIo::Uring(_)) {
+            for k in 0..self.sockets.len() {
+                // Drain in bounded passes, emitting ACKs between passes so
+                // slow callbacks cannot hold back the sender's whole window.
+                for _ in 0..BATCH {
+                    let work = self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().poll();
+                    o |= work;
+                    let mut received_any = false;
+                    loop {
+                        let received =
+                            self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().receive();
+                        let Some(received) = received else { break };
+                        received_any = true;
+                        if let Some((datagrams, from)) =
+                            received.datagrams(self.udp.max_datagram_size)
+                        {
+                            for bytes in datagrams {
+                                let Some(header) = Header::decode(bytes) else { continue };
+                                let dgram =
+                                    Datagram { header, payload: &bytes[HEADER_SIZE..], from, now };
+                                self.on_datagram(k, &dgram, dcache, deliver);
+                            }
+                        }
+                        self.sockets[k]
+                            .socket
+                            .ring
+                            .as_ref()
+                            .unwrap()
+                            .borrow_mut()
+                            .recycle(received);
+                    }
+                    self.handle_event(k, false, false, dcache, deliver);
+                    if !work && !received_any {
+                        break;
+                    }
+                }
+                let writable = self.sockets[k].writable_armed;
+                self.handle_event(k, false, writable, dcache, deliver);
+                self.sockets[k].socket.ring.as_ref().unwrap().borrow_mut().submit();
+            }
+            return o | self.drain_pending_disconnects(deliver);
+        }
         // Taken out so `handle_event` can borrow `self`; put back below.
         let mut events = std::mem::replace(&mut self.events, Events::with_capacity(0));
         if let Err(e) = self.poll.poll(&mut events, Some(std::time::Duration::ZERO)) {
@@ -602,7 +670,7 @@ impl UdpManager {
                 debug!(token = ?event.token(), "ignoring stale udp readiness event");
                 continue;
             };
-            self.handle_event(k, event, dcache, deliver);
+            self.handle_event(k, event.is_readable(), event.is_writable(), dcache, deliver);
         }
         self.events = events;
         o |= self.drain_pending_disconnects(deliver);

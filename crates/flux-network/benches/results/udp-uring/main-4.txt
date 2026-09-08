@@ -1,0 +1,17 @@
+== paced: one message per 100µs, one receiver ==
+paced/udp/2k                 n=2000   p50=      4.7µs p99=      6.2µs max=     56.6µs        20 MiB/s cpu=95.439ns/B
+paced/udp/64k                n=2000   p50=      8.9µs p99=    340.1µs max=   2285.9µs       625 MiB/s cpu=2.960ns/B
+paced/udp/2m                 n=2000   p50=    233.8µs p99=    288.9µs max=   3134.6µs      7361 MiB/s cpu=0.196ns/B
+
+== burst: bounded outstanding, one receiver ==
+burst/udp/2k                 n=65536  p50=      4.8µs p99=      5.8µs max=   2663.3µs       445 MiB/s cpu=2.403ns/B window=256
+burst/udp/64k                n=16384  p50=      9.1µs p99=     12.2µs max=   3505.6µs      6857 MiB/s cpu=0.203ns/B window=146
+burst/udp/2m                 n=512    p50=    231.1µs p99=    259.1µs max=   3046.1µs      7335 MiB/s cpu=0.195ns/B window=4
+
+== loss1: one 2 MiB message, exactly one datagram dropped by a relay ==
+loss1/udp/2m                 n=1      p50=   6141.2µs p99=   6141.2µs max=   6141.2µs       293 MiB/s cpu=3.060ns/B datagrams=1793 retransmitted=2
+
+== bcast: one sender, 8 receivers on one listener ==
+bcast/udp/2k                 n=65536  p50=     16.6µs p99=     34.4µs max=   2306.9µs       561 MiB/s cpu=1.784ns/B window=256
+bcast/udp/64k                n=16384  p50=    182.9µs p99=    345.6µs max=    361.7µs      1398 MiB/s cpu=0.768ns/B window=146
+bcast/udp/2m                 n=512    p50=   1344.5µs p99=   4861.2µs max=   7029.2µs      6895 MiB/s cpu=0.206ns/B window=4

@@ -1,0 +1,27 @@
+== paced: one message per 100µs, one receiver ==
+paced/uring/2k               n=2000   p50=      2.4µs p99=      3.4µs max=     67.9µs        20 MiB/s cpu=96.393ns/B
+paced/udp/2k                 n=2000   p50=      4.8µs p99=    328.1µs max=   2324.2µs        20 MiB/s cpu=94.873ns/B
+paced/uring/64k              n=2000   p50=      9.5µs p99=     13.4µs max=   1762.7µs       625 MiB/s cpu=2.959ns/B
+paced/udp/64k                n=2000   p50=      9.1µs p99=    706.3µs max=   2653.7µs       625 MiB/s cpu=2.956ns/B
+paced/uring/2m               n=2000   p50=    233.3µs p99=    249.3µs max=   2046.2µs      7362 MiB/s cpu=0.201ns/B
+paced/udp/2m                 n=2000   p50=    208.0µs p99=    238.8µs max=   2905.7µs      8001 MiB/s cpu=0.178ns/B
+
+== burst: bounded outstanding, one receiver ==
+burst/uring/2k               n=65536  p50=      2.4µs p99=      3.3µs max=   2563.5µs       767 MiB/s cpu=1.409ns/B window=256
+burst/udp/2k                 n=65536  p50=      4.8µs p99=      5.9µs max=   3029.5µs       441 MiB/s cpu=2.422ns/B window=256
+burst/uring/64k              n=16384  p50=      9.4µs p99=     12.4µs max=   2874.5µs      7291 MiB/s cpu=0.184ns/B window=146
+burst/udp/64k                n=16384  p50=      8.9µs p99=     12.0µs max=   2799.0µs      7044 MiB/s cpu=0.195ns/B window=146
+burst/uring/2m               n=512    p50=    230.7µs p99=    569.2µs max=   2604.1µs      7329 MiB/s cpu=0.201ns/B window=4
+burst/udp/2m                 n=512    p50=    225.3µs p99=    284.2µs max=   3285.2µs      7344 MiB/s cpu=0.195ns/B window=4
+
+== loss1: one 2 MiB message, exactly one datagram dropped by a relay ==
+loss1/uring/2m               n=1      p50=   5365.6µs p99=   5365.6µs max=   5365.6µs       357 MiB/s cpu=3.212ns/B datagrams=1793 retransmitted=2
+loss1/udp/2m                 n=1      p50=   6156.9µs p99=   6156.9µs max=   6156.9µs       303 MiB/s cpu=2.845ns/B datagrams=1793 retransmitted=2
+
+== bcast: one sender, 8 receivers on one listener ==
+bcast/uring/2k               n=65536  p50=     18.7µs p99=     35.4µs max=    356.2µs       942 MiB/s cpu=1.083ns/B window=256
+bcast/udp/2k                 n=65536  p50=     16.9µs p99=     31.6µs max=   1995.7µs       562 MiB/s cpu=1.777ns/B window=256
+bcast/uring/64k              n=16384  p50=     46.1µs p99=     71.8µs max=    138.3µs      7123 MiB/s cpu=0.190ns/B window=146
+bcast/udp/64k                n=16384  p50=    212.4µs p99=    343.5µs max=   2958.4µs      1406 MiB/s cpu=0.758ns/B window=146
+bcast/uring/2m               n=512    p50=   3584.3µs p99=   7297.2µs max=   8506.7µs      6522 MiB/s cpu=0.254ns/B window=4
+bcast/udp/2m                 n=512    p50=   1435.3µs p99=   4666.5µs max=   6445.6µs      6485 MiB/s cpu=0.219ns/B window=4

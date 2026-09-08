@@ -20,6 +20,9 @@ serde.workspace = true
 tracing.workspace = true
 wincode = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring.workspace = true
+
 [dev-dependencies]
 core_affinity.workspace = true
 criterion.workspace = true
