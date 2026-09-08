@@ -1,9 +1,8 @@
-//! Datagram layout shared by every UDP peer. Internal links only, so the
-//! header carries exactly what the protocol needs:
+//! Datagram layout.
 //!
 //! ```text
 //! [0]      version << 4 | kind
-//! [1..5]   session      random per socket, changes on restart
+//! [1..5]   session      random per connection attempt
 //! [5..13]  seq          per-datagram sequence (Data) or ack point (Ack)
 //! [13..17] len          message length (Data) or bitmap bit count (Ack)
 //! [17..19] index        fragment index within the message (Data)
@@ -14,8 +13,8 @@
 //!
 //! A message is split into `ceil(len / stride)` fragments carrying
 //! consecutive sequence numbers, so the message is identified by the sequence
-//! of its first fragment: `seq - index`. Anything with a foreign session is
-//! dropped, which is what keeps stray datagrams out.
+//! of its first fragment: `seq - index`. Datagrams from any other session are
+//! dropped.
 
 pub(crate) const VERSION: u8 = 1;
 pub(crate) const HEADER_SIZE: usize = 27;
