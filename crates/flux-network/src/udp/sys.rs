@@ -94,6 +94,18 @@ fn iovec_mut(bytes: &mut [u8]) -> libc::iovec {
     libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() }
 }
 
+#[cfg(target_os = "linux")]
+const SEGMENT_CONTROL_SPACE: usize =
+    unsafe { libc::CMSG_SPACE(mem::size_of::<u16>() as _) as usize };
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SegmentControl {
+    header: libc::cmsghdr,
+    size: u16,
+    padding: [u8; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
+}
+
 /// Up to [`BATCH`] outgoing datagrams, each a header plus a payload slice.
 ///
 /// Destinations are copied in; the slices passed to [`Self::push`] must stay
@@ -103,6 +115,8 @@ pub(crate) struct SendBatch {
     iovs: [[libc::iovec; 2]; BATCH],
     addrs: [SockAddr; BATCH],
     len: usize,
+    #[cfg(target_os = "linux")]
+    gso: bool,
 }
 
 // SAFETY: the raw pointers inside are written right before each syscall and
@@ -116,6 +130,8 @@ impl SendBatch {
             iovs: unsafe { mem::zeroed() },
             addrs: [SockAddr { storage: unsafe { mem::zeroed() }, len: 0 }; BATCH],
             len: 0,
+            #[cfg(target_os = "linux")]
+            gso: true,
         }
     }
 
@@ -132,6 +148,57 @@ impl SendBatch {
     /// the kernel accepted; `WouldBlock` only when it accepted none.
     pub(crate) fn send(&mut self, fd: RawFd) -> io::Result<usize> {
         let n = mem::take(&mut self.len);
+        #[cfg(target_os = "linux")]
+        // A single GSO send is atomic: its result still counts wire datagrams.
+        // Mixed destinations and sizes retain sendmmsg's accepted-prefix path.
+        if self.gso && n >= 4 {
+            let size = self.iovs[0][0].iov_len + self.iovs[0][1].iov_len;
+            let addr = SockAddr::decode(&self.addrs[0].storage, self.addrs[0].len);
+            let can_segment = size != 0 &&
+                size * n <= 65_507 &&
+                (1..n).all(|i| {
+                    let len = self.iovs[i][0].iov_len + self.iovs[i][1].iov_len;
+                    (len == size || (i == n - 1 && len != 0 && len < size)) &&
+                        SockAddr::decode(&self.addrs[i].storage, self.addrs[i].len) == addr
+                });
+            if can_segment {
+                let mut control = SegmentControl {
+                    header: libc::cmsghdr {
+                        cmsg_len: unsafe { libc::CMSG_LEN(mem::size_of::<u16>() as _) as usize },
+                        cmsg_level: libc::SOL_UDP,
+                        cmsg_type: libc::UDP_SEGMENT,
+                    },
+                    size: size as u16,
+                    padding: [0; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
+                };
+                let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
+                hdr.msg_iov = self.iovs.as_mut_ptr().cast();
+                hdr.msg_iovlen = 2 * n;
+                hdr.msg_name = ptr::from_mut(&mut self.addrs[0].storage).cast();
+                hdr.msg_namelen = self.addrs[0].len;
+                hdr.msg_control = ptr::from_mut(&mut control).cast();
+                hdr.msg_controllen = SEGMENT_CONTROL_SPACE;
+                let sent = unsafe { libc::sendmsg(fd, ptr::from_ref(&hdr), libc::MSG_DONTWAIT) };
+                if sent >= 0 {
+                    return Ok(n);
+                }
+                let err = io::Error::last_os_error();
+                if !matches!(
+                    err.raw_os_error(),
+                    Some(
+                        libc::EINVAL |
+                            libc::EIO |
+                            libc::ENOPROTOOPT |
+                            libc::EOPNOTSUPP |
+                            libc::EMSGSIZE
+                    )
+                ) {
+                    return Err(err);
+                }
+                // Retry this untouched batch normally, and stop probing GSO.
+                self.gso = false;
+            }
+        }
         for i in 0..n {
             let hdr = &mut self.hdrs[i].msg_hdr;
             hdr.msg_iov = self.iovs[i].as_mut_ptr();
@@ -249,6 +316,96 @@ impl RecvBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn segmented_batch_preserves_datagrams() {
+        use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
+
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let sender = UdpSocket::bind(bind).unwrap();
+            let receiver = UdpSocket::bind(bind).unwrap();
+            receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let to = SockAddr::new(receiver.local_addr().unwrap());
+            let mut batch = SendBatch::new();
+            let headers: [[u8; 29]; BATCH] = std::array::from_fn(|i| [i as u8; 29]);
+            let payload = [0x5a; 1171];
+            for (i, header) in headers.iter().enumerate() {
+                let len = if i == BATCH - 1 { 17 } else { payload.len() };
+                batch.push(header, &payload[..len], &to);
+            }
+            assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), BATCH);
+            let mut buf = [0; 2048];
+            for (i, header) in headers.iter().enumerate() {
+                let len = if i == BATCH - 1 { 17 } else { payload.len() };
+                let n = receiver.recv(&mut buf).unwrap();
+                assert_eq!(n, header.len() + len);
+                assert_eq!(&buf[..header.len()], header);
+                assert_eq!(&buf[header.len()..n], &payload[..len]);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn segmentation_falls_back_without_checksums() {
+        use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let no_check: libc::c_int = 1;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NO_CHECK,
+                    ptr::from_ref(&no_check).cast(),
+                    mem::size_of_val(&no_check) as _,
+                )
+            },
+            0
+        );
+        let to = SockAddr::new(receiver.local_addr().unwrap());
+        let mut batch = SendBatch::new();
+        for _ in 0..4 {
+            batch.push(b"header", b"payload", &to);
+        }
+        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
+        assert!(!batch.gso);
+        let mut buf = [0; 32];
+        for _ in 0..4 {
+            let n = receiver.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"headerpayload");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mixed_batch_preserves_destinations_and_lengths() {
+        use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receivers =
+            [UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap()];
+        for receiver in &receivers {
+            receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        }
+        let to = receivers.each_ref().map(|r| SockAddr::new(r.local_addr().unwrap()));
+        let mut batch = SendBatch::new();
+        let payloads: [&[u8]; 4] = [b"a", b"bbbb", b"cc", b"ddd"];
+        for (i, payload) in payloads.iter().enumerate() {
+            batch.push(b"h", payload, &to[i % 2]);
+        }
+        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
+        let mut buf = [0; 32];
+        for (i, payload) in payloads.iter().enumerate() {
+            let n = receivers[i % 2].recv(&mut buf).unwrap();
+            assert_eq!(buf[0], b'h');
+            assert_eq!(&buf[1..n], *payload);
+        }
+    }
 
     #[test]
     fn sockaddr_roundtrip() {
