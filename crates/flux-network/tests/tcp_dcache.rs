@@ -98,6 +98,15 @@ fn dcache_multi_stream_udp() {
     dcache_multi_stream(Transport::Udp(UdpConfig::lan()));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn dcache_multi_stream_udp_uring() {
+    dcache_multi_stream(Transport::Udp(UdpConfig {
+        io: flux_network::udp::UdpIo::Uring(flux_network::udp::UringConfig::default()),
+        ..UdpConfig::lan()
+    }));
+}
+
 /// Two streams into the same dcache-backed spine queue.
 /// Verifies dcache bytes match the queue message (same shmem region).
 #[allow(clippy::significant_drop_tightening)]

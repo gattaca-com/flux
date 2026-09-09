@@ -664,6 +664,7 @@ dependencies = [
  "flux-timing",
  "flux-utils",
  "httparse",
+ "io-uring",
  "libc",
  "mio",
  "serde",
