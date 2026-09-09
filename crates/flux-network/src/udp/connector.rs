@@ -567,6 +567,7 @@ impl UdpManager {
                         self.on_datagram(k, &dgram, dcache, deliver);
                     }
                 }
+                self.flush_acks(k, Instant::now());
             }
             self.recv = Some(recv);
         }
@@ -575,18 +576,23 @@ impl UdpManager {
             self.sockets[k].writable_armed = false;
             self.flush_socket(k, now);
         }
+        self.flush_acks(k, now);
         let entry = &mut self.sockets[k];
-        let token = entry.token;
-        for peer in self.peers.iter_mut().filter(|p| p.socket_token == token) {
-            if peer.take_ack_due() && peer.send_ack(&entry.socket, now) == SendOutcome::WouldBlock {
-                arm_writable(&self.registry, entry);
-            }
-        }
         if writable && !entry.writable_armed {
             if let Err(err) =
                 self.registry.reregister(&mut entry.socket, entry.token, Interest::READABLE)
             {
                 debug!(?err, "udp: reregister drop writable");
+            }
+        }
+    }
+
+    fn flush_acks(&mut self, k: usize, now: Instant) {
+        let entry = &mut self.sockets[k];
+        let token = entry.token;
+        for peer in self.peers.iter_mut().filter(|p| p.socket_token == token) {
+            if peer.take_ack_due() && peer.send_ack(&entry.socket, now) == SendOutcome::WouldBlock {
+                arm_writable(&self.registry, entry);
             }
         }
     }

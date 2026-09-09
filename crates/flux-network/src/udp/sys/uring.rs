@@ -94,8 +94,8 @@ struct Tx {
 }
 
 impl Tx {
-    fn new() -> Self {
-        Self {
+    fn new() -> Box<Self> {
+        Box::new(Self {
             header: unsafe { mem::zeroed() },
             addr: SockAddr::new("0.0.0.0:0".parse().unwrap()),
             control: unsafe { mem::zeroed() },
@@ -105,7 +105,7 @@ impl Tx {
             segment: 0,
             offset: 0,
             fallback: false,
-        }
+        })
     }
 
     fn prepare(&mut self, fd: RawFd, index: usize) -> io_uring::squeue::Entry {
@@ -193,15 +193,16 @@ pub(crate) struct Ring {
     receive_header: Box<libc::msghdr>,
     rx_active: bool,
     available: usize,
-    // Never resized, so SQE pointers into entries stay stable.
-    tx: Vec<Tx>,
+    // Vec indexing must not reborrow headers retained by other in-flight SQEs.
+    #[allow(clippy::vec_box)]
+    tx: Vec<Box<Tx>>,
     free_tx: Vec<usize>,
     ready: VecDeque<usize>,
     completions: Vec<(u64, i32, u32)>,
 }
 
-// SAFETY: requests only access their boxed buffers. Moving the owner does not
-// move the buffers; RefCell on the socket excludes concurrent access.
+// SAFETY: requests point into stable heap allocations. Moving the owner does
+// not move those allocations; RefCell on the socket excludes concurrent access.
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Ring {}
 

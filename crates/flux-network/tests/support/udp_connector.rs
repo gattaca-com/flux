@@ -610,3 +610,59 @@ fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     assert_eq!(disconnected, Some(accepted));
     let _ = &client;
 }
+
+#[test]
+fn sustained_large_messages_keep_acknowledgements_current() {
+    const COUNT: usize = 64;
+    let addr = free_addr();
+    let mut server = udp(UdpConfig::lan()).with_socket_buf_size(16 * 1024 * 1024);
+    let mut client = udp(UdpConfig::lan()).with_socket_buf_size(16 * 1024 * 1024);
+    let (accepted, _) = connect_pair(&mut server, &mut client, addr);
+    let got = Arc::new(AtomicUsize::new(0));
+    let progress = got.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let receiver = thread::spawn(move || {
+        let mut seen = [false; COUNT];
+        while progress.load(Ordering::Relaxed) < COUNT {
+            client.poll_with(|event| {
+                if let PollEvent::Message { payload, .. } = event {
+                    assert_eq!(payload.len(), 2 * 1024 * 1024);
+                    let id = msg_id(payload) as usize;
+                    assert!(!seen[id]);
+                    assert!(payload[4..].iter().all(|b| *b == 0x5a));
+                    seen[id] = true;
+                    progress.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            assert!(
+                Instant::now() < deadline,
+                "large-message receiver stalled at {}",
+                progress.load(Ordering::Relaxed)
+            );
+        }
+    });
+    let mut sent = 0;
+    let mut payload = vec![0x5a; 2 * 1024 * 1024];
+    while got.load(Ordering::Relaxed) < COUNT {
+        if sent < COUNT && sent - got.load(Ordering::Relaxed) < 4 {
+            payload[..4].copy_from_slice(&(sent as u32).to_le_bytes());
+            server.write_or_enqueue_with(SendBehavior::Single(accepted), |buf| {
+                buf.extend_from_slice(&payload);
+            });
+            sent += 1;
+        }
+        server.poll_with(|event| {
+            assert!(
+                !matches!(event, PollEvent::Disconnect { .. }),
+                "sender disconnected at {sent} sent, {} received",
+                got.load(Ordering::Relaxed)
+            );
+        });
+        assert!(
+            Instant::now() < deadline,
+            "large-message sender stalled at {sent} sent, {} received",
+            got.load(Ordering::Relaxed)
+        );
+    }
+    receiver.join().unwrap();
+}
