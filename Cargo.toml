@@ -83,6 +83,7 @@ thiserror = "1.0.58"
 tinyvec = "1.10.0"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+uuid = "1"
 wincode = "0.5"
 wincode-derive = "0.4"
 zstd = "0.13.2"

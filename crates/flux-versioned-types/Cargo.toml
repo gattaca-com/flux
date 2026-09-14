@@ -12,7 +12,14 @@ categories = ["data-structures", "encoding"]
 
 [dependencies]
 bincode.workspace = true
+flux-timing.workspace = true
+flux-utils.workspace = true
 flux-versioned-types-macros.workspace = true
+serde.workspace = true
+tracing.workspace = true
+type-hash.workspace = true
+uuid.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 flux.workspace = true
