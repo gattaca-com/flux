@@ -27,8 +27,8 @@ const MAX_DISK_BLOB_LEN: u64 = 16_000_000_000;
 /// A versioned type with a stable on-disk home.
 ///
 /// `<base_dir>/<PERSIST_DIR>/` holds its `<filename>.bin` blobs.
-/// `versioned_telemetry!` implements this with the type name as the
-/// directory; other types can opt in by hand.
+/// `versioned_telemetry!` with `persist = "dir"` implements this;
+/// other types can opt in by hand.
 pub trait VersionedPersistable: VersionedDeserialize + TypeHash + Serialize {
     const PERSIST_DIR: &'static str;
 
@@ -46,7 +46,7 @@ pub trait VersionedPersistable: VersionedDeserialize + TypeHash + Serialize {
 /// use flux::type_hash_derive::type_hash_lock;
 /// use flux_versioned_types::{VersionedBlob, VersionedPersistable, versioned_telemetry};
 ///
-/// versioned_telemetry!(Bid =>
+/// versioned_telemetry!(Bid, persist = "bids" =>
 ///     #[type_hash_lock(hash = 3778581902668456365)]
 ///     BidV1 { pub price: u64 }
 ///
@@ -66,8 +66,8 @@ pub trait VersionedPersistable: VersionedDeserialize + TypeHash + Serialize {
 /// let latest: Vec<Bid> = blob.data_as()?;
 /// assert_eq!(latest, vec![BidV2 { price: 10, size: 0 }]);
 ///
-/// // Persisting is the same blob under the type's own directory:
-/// // `<base>/Bid/bids.bin`, framed and compressed.
+/// // Persisting is the same blob under the type's persist directory:
+/// // `<base>/bids/bids.bin`, framed and compressed.
 /// let base = std::env::temp_dir().join("flux-doctest");
 /// blob.write_as::<Bid>(&base, "bids", 1);
 /// let loaded = VersionedBlob::read_as::<Bid>(&base, "bids").unwrap();
