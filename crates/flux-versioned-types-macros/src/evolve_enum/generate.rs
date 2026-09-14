@@ -18,7 +18,6 @@ fn generate_enum_def(
     let emit_attrs = |attrs: &[Attribute]| {
         if is_final { attrs.to_vec() } else { without_schema_attrs(attrs) }
     };
-    let enum_attrs = emit_attrs(enum_attrs);
     let variant_tokens: Vec<_> = variants
         .iter()
         .map(|v| {

@@ -87,12 +87,8 @@ pub(crate) fn generate_base_struct(input: &EvolveInput) -> (TokenStream2, Vec<Fi
         })
         .collect();
 
-    let output = generate_struct_def(
-        &input.base.name,
-        &input.default_attrs,
-        &emitted_attrs(&input.base.attrs, is_final),
-        &fields,
-    );
+    let output =
+        generate_struct_def(&input.base.name, &input.default_attrs, &input.base.attrs, &fields);
 
     let field_infos = input.base.items.iter().map(FieldInfo::from_struct_field).collect();
 
@@ -101,7 +97,7 @@ pub(crate) fn generate_base_struct(input: &EvolveInput) -> (TokenStream2, Vec<Fi
 
 /// Field attributes for an emitted version: schema-only attributes survive
 /// only on the final, queryable version, while the accumulated `FieldInfo`
-/// keeps them for later steps.
+/// keeps them for later steps. Version-level attributes are never stripped.
 fn emitted_attrs(attrs: &[Attribute], is_final: bool) -> Vec<Attribute> {
     if is_final { attrs.to_vec() } else { without_schema_attrs(attrs) }
 }
@@ -243,12 +239,8 @@ pub(crate) fn generate_evolution(
         current_fields.iter().filter(|f| !ctx.remove_names.contains(&f.name.to_string())).collect();
 
     let struct_fields = generate_evolved_struct_fields(&kept_fields, &ctx, is_final);
-    let struct_def = generate_struct_def(
-        &evolution.name,
-        default_attrs,
-        &emitted_attrs(&evolution.attrs, is_final),
-        &struct_fields,
-    );
+    let struct_def =
+        generate_struct_def(&evolution.name, default_attrs, &evolution.attrs, &struct_fields);
     let into_impl = generate_into_impl(prev_name, &evolution.name, &kept_fields, &ctx);
 
     let mut output = struct_def;
