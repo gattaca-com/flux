@@ -45,9 +45,11 @@ impl<Op> Named for EvolveBlock<Op> {
     }
 }
 
-/// Schema-only attributes describe the final, queryable shape, so they are
-/// stripped from every older version's expansion: only the version carrying
-/// the schema derive may name them.
+/// Schema-only attributes on fields and variants describe the final,
+/// queryable shape, so they are stripped from every older version's
+/// expansion: only the version carrying the schema derive may name them.
+/// Version-level attributes are left alone, so an explicit whole-type proxy
+/// keeps working on any version.
 pub(crate) fn without_schema_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
     attrs.iter().filter(|attr| !attr.path().is_ident("telemetry_schema")).cloned().collect()
 }
