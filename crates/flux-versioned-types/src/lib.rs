@@ -52,8 +52,25 @@ macro_rules! versioned_struct {
 
 /// Define an evolving enum, its hash-directed decoder, and its
 /// `TelemetrySchema`.
+///
+/// With `persist = "dir"` the type also gets a [`VersionedPersistable`]
+/// home under that directory.
 #[macro_export]
 macro_rules! versioned_enum {
+    ($name:ident, persist = $dir:expr => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!($name => $($tokens)*);
+        impl $crate::VersionedPersistable for $name {
+            const PERSIST_DIR: &'static str = $dir;
+        }
+    };
+    ($name:ident => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!($name => $($tokens)*);
+    };
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __versioned_enum_inner {
     ($name:ident => $($tokens:tt)*) => {
         $crate::evolve_enum! {
             roll_into $name

@@ -44,7 +44,7 @@ pub trait VersionedPersistable: VersionedDeserialize + TypeHash + Serialize {
 ///
 /// ```
 /// use flux::type_hash_derive::type_hash_lock;
-/// use flux_versioned_types::{VersionedBlob, VersionedPersistable, versioned_telemetry};
+/// use flux_versioned_types::{VersionedBlob, VersionedPersistable, versioned_enum, versioned_telemetry};
 ///
 /// versioned_telemetry!(Bid, persist = "bids" =>
 ///     #[type_hash_lock(hash = 3778581902668456365)]
@@ -79,6 +79,13 @@ pub trait VersionedPersistable: VersionedDeserialize + TypeHash + Serialize {
 ///     LegacyV1 { pub price: u64 }
 /// );
 /// assert_eq!(<Legacy as VersionedPersistable>::PERSIST_DIR, "legacy_bids");
+///
+/// // Enums get the same machinery.
+/// versioned_enum!(Mode, persist = "modes" =>
+///     #[type_hash_lock(hash = 2116725509198536217)]
+///     ModeV1 { Fast, Slow }
+/// );
+/// assert_eq!(<Mode as VersionedPersistable>::PERSIST_DIR, "modes");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
