@@ -45,10 +45,17 @@ impl<Op> Named for EvolveBlock<Op> {
     }
 }
 
+/// Schema-only attributes describe the final, queryable shape, so they are
+/// stripped from every older version's expansion: only the version carrying
+/// the schema derive may name them.
+pub(crate) fn without_schema_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
+    attrs.iter().filter(|attr| !attr.path().is_ident("telemetry_schema")).cloned().collect()
+}
+
 pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     input: &mut EvolveInputGeneric<B, E>,
     generate_base: impl FnOnce(&EvolveInputGeneric<B, E>) -> (TokenStream2, Vec<Item>),
-    generate_step: impl Fn(&E, &[Attribute], &[Item], &Ident) -> (TokenStream2, Vec<Item>),
+    generate_step: impl Fn(&E, &[Attribute], &[Item], &Ident, bool) -> (TokenStream2, Vec<Item>),
 ) -> TokenStream2 {
     if input.evolutions.is_empty() {
         input.base.attrs_mut().extend(input.final_attrs.clone());
@@ -84,9 +91,10 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     let mut output = base_output;
     let mut prev_name = input.base.name().clone();
 
-    for evolution in &input.evolutions {
+    for (index, evolution) in input.evolutions.iter().enumerate() {
+        let is_final = index + 1 == input.evolutions.len();
         let (ev_output, new_items) =
-            generate_step(evolution, &input.default_attrs, &current, &prev_name);
+            generate_step(evolution, &input.default_attrs, &current, &prev_name, is_final);
         output.extend(ev_output);
         current = new_items;
         prev_name = evolution.name().clone();
