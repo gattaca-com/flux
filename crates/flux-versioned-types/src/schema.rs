@@ -75,6 +75,30 @@ impl TelemetrySchema for uuid::Uuid {
     type FlattenedProxy = String;
 }
 
+impl<const N: usize> TelemetrySchema for alloy_primitives::FixedBytes<N> {
+    type Proxy = String;
+    type FlattenedProxy = String;
+}
+
+impl<const BITS: usize, const LIMBS: usize> TelemetrySchema
+    for alloy_primitives::Uint<BITS, LIMBS>
+{
+    type Proxy = String;
+    type FlattenedProxy = String;
+}
+
+impl<const BITS: usize, const LIMBS: usize> TelemetrySchema
+    for alloy_primitives::Signed<BITS, LIMBS>
+{
+    type Proxy = String;
+    type FlattenedProxy = String;
+}
+
+impl TelemetrySchema for alloy_primitives::Address {
+    type Proxy = String;
+    type FlattenedProxy = String;
+}
+
 impl<T: TelemetrySchema + Copy, const N: usize> TelemetrySchema for flux_utils::ArrayVec<T, N> {
     type Proxy = Vec<T::Proxy>;
     type FlattenedProxy = Vec<T::FlattenedProxy>;

@@ -11,6 +11,7 @@ keywords = ["schema", "versioning", "migration", "serde"]
 categories = ["data-structures", "encoding"]
 
 [dependencies]
+alloy-primitives.workspace = true
 bincode.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
