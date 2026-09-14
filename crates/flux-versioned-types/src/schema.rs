@@ -75,6 +75,17 @@ impl TelemetrySchema for uuid::Uuid {
     type FlattenedProxy = String;
 }
 
+// Exact decimal strings: the full range does not fit in Arrow numerics.
+impl TelemetrySchema for u128 {
+    type Proxy = String;
+    type FlattenedProxy = String;
+}
+
+impl TelemetrySchema for i128 {
+    type Proxy = String;
+    type FlattenedProxy = String;
+}
+
 impl<const N: usize> TelemetrySchema for alloy_primitives::FixedBytes<N> {
     type Proxy = String;
     type FlattenedProxy = String;
