@@ -6,18 +6,23 @@ use syn::{Attribute, Expr, Ident, Index};
 use super::parse::{
     EnumVariant, EvolveEnum, EvolveEnumInput, EvolveEnumOp, ModifyVariant, RemoveVariant,
 };
-use crate::shared::is_closure;
+use crate::shared::{is_closure, without_schema_attrs};
 
 fn generate_enum_def(
     name: &Ident,
     default_attrs: &[Attribute],
     enum_attrs: &[Attribute],
     variants: &[EnumVariant],
+    is_final: bool,
 ) -> TokenStream2 {
+    let emit_attrs = |attrs: &[Attribute]| {
+        if is_final { attrs.to_vec() } else { without_schema_attrs(attrs) }
+    };
+    let enum_attrs = emit_attrs(enum_attrs);
     let variant_tokens: Vec<_> = variants
         .iter()
         .map(|v| {
-            let vattrs = &v.attrs;
+            let vattrs = emit_attrs(&v.attrs);
             let vname = &v.name;
             let disc = v.discriminant.as_ref().map(|d| quote! { = #d });
             if v.is_unit() {
@@ -27,7 +32,7 @@ fn generate_enum_def(
                     .fields
                     .iter()
                     .map(|f| {
-                        let fattrs = &f.attrs;
+                        let fattrs = emit_attrs(&f.attrs);
                         let ty = &f.ty;
                         quote! { #(#fattrs)* #ty }
                     })
@@ -214,6 +219,7 @@ pub(crate) fn generate_base_enum(input: &EvolveEnumInput) -> (TokenStream2, Vec<
         &input.default_attrs,
         &input.base.attrs,
         &input.base.items,
+        input.evolutions.is_empty(),
     );
 
     (output, input.base.items.clone())
@@ -224,6 +230,7 @@ pub(crate) fn generate_evolution(
     default_attrs: &[Attribute],
     current_variants: &[EnumVariant],
     prev_name: &Ident,
+    is_final: bool,
 ) -> (TokenStream2, Vec<EnumVariant>) {
     let mut add_variants = Vec::new();
     let mut remove_map = FxHashMap::default();
@@ -274,8 +281,13 @@ pub(crate) fn generate_evolution(
         new_variants.push(av.clone());
     }
 
-    let enum_def =
-        generate_enum_def(&evolution.name, default_attrs, &evolution.attrs, &new_variants);
+    let enum_def = generate_enum_def(
+        &evolution.name,
+        default_attrs,
+        &evolution.attrs,
+        &new_variants,
+        is_final,
+    );
     let into_impl = generate_into_impl(
         prev_name,
         &evolution.name,

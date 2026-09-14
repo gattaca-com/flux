@@ -92,6 +92,10 @@ macro_rules! __versioned_enum_inner {
 /// Like [`versioned_struct`], but the latest version also derives
 /// [`TelemetrySchema`] so it is queryable. With `persist = "dir"` the type
 /// also gets a [`VersionedPersistable`] home under that directory.
+///
+/// Schema-only field attributes (`#[telemetry_schema(..)]`) may be written
+/// on any version; they describe the final shape and are stripped from older
+/// versions' expansions.
 #[macro_export]
 macro_rules! versioned_telemetry {
     ($name:ident, persist = $dir:expr => $($tokens:tt)*) => {
