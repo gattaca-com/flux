@@ -8,18 +8,17 @@
 //! those stay downstream.
 
 pub mod blob;
-pub mod bridge;
 mod schema;
+pub mod wire;
 
 pub use blob::{InternalMetadata, InternalMetadataV1, VersionedBlob, VersionedPersistable};
-pub use bridge::{
-    DEFAULT_TELEMETRY_BRIDGE_ZSTD_LEVEL, TelemetryBridgeMessage, TelemetryBridgeMessageV2,
-    TelemetryBridgePayloadEncoding,
-};
 pub use flux_versioned_types_macros::{
     TelemetrySchema, evolve_enum, evolve_struct, roll_chain_into,
 };
 pub use schema::TelemetrySchema;
+pub use wire::{
+    DEFAULT_TELEMETRY_WIRE_ZSTD_LEVEL, TelemetryWire, TelemetryWirePayloadEncoding, TelemetryWireV2,
+};
 
 /// A type whose historical bincode payloads can be migrated to its latest form.
 pub trait VersionedDeserialize: Sized {

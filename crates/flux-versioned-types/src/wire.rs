@@ -1,14 +1,14 @@
 //! Batched telemetry envelopes for spine-to-receiver transport.
 //!
-//! A [`TelemetryBridgeMessage`] carries one type's accumulated batch for a
+//! A [`TelemetryWire`] carries one type's accumulated batch for a
 //! slot window: the writer's `type_hash` so the reader can migrate it, a
 //! `type_name` routing label, and the flattened `(data, metadata)` byte
 //! pair. It deliberately carries no slot: slot boundaries travel as an
 //! ordinary sentinel message and per-item timing lives in the metadata
 //! payload, so the envelope stays generic transport.
 //!
-//! Senders compressing on the wire use [`TelemetryBridgeMessageV2`], which
-//! records the [`TelemetryBridgePayloadEncoding`] alongside the payloads.
+//! Senders compressing on the wire use [`TelemetryWireV2`], which
+//! records the [`TelemetryWirePayloadEncoding`] alongside the payloads.
 
 use std::{
     borrow::Cow,
@@ -17,11 +17,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_TELEMETRY_BRIDGE_ZSTD_LEVEL: i32 = 0;
+pub const DEFAULT_TELEMETRY_WIRE_ZSTD_LEVEL: i32 = 0;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[repr(C)]
-pub struct TelemetryBridgeMessage {
+pub struct TelemetryWire {
     pub type_hash: u64,
     // Not 100% required, but useful to direct handling of the hashes to
     // different parts of the code + knowing which hashes belong to which
@@ -32,20 +32,20 @@ pub struct TelemetryBridgeMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[repr(C)]
-pub struct TelemetryBridgeMessageV2 {
+pub struct TelemetryWireV2 {
     pub type_hash: u64,
     pub type_name: Cow<'static, str>,
     pub flattened_msg_meta: (Vec<u8>, Vec<u8>),
-    pub payload_encoding: TelemetryBridgePayloadEncoding,
+    pub payload_encoding: TelemetryWirePayloadEncoding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum TelemetryBridgePayloadEncoding {
+pub enum TelemetryWirePayloadEncoding {
     Uncompressed,
     Zstd { data_len: u64, metadata_len: u64 },
 }
 
-impl TelemetryBridgeMessage {
+impl TelemetryWire {
     pub fn new(type_hash: u64, type_name: String) -> Self {
         Self { type_hash, type_name: Cow::Owned(type_name), flattened_msg_meta: (vec![], vec![]) }
     }
@@ -60,9 +60,9 @@ impl TelemetryBridgeMessage {
     /// reader can validate the decoded size exactly.
     ///
     /// ```
-    /// use flux_versioned_types::TelemetryBridgeMessage;
+    /// use flux_versioned_types::TelemetryWire;
     ///
-    /// let mut msg = TelemetryBridgeMessage::new(7, "test".to_string());
+    /// let mut msg = TelemetryWire::new(7, "test".to_string());
     /// msg.push(b"payload-data".repeat(64), b"metadata".repeat(64));
     /// let compressed = msg.to_zstd_v2(0).unwrap();
     /// let back = compressed.into_uncompressed_message().unwrap();
@@ -70,31 +70,31 @@ impl TelemetryBridgeMessage {
     /// assert_eq!(back.flattened_msg_meta.1, b"metadata".repeat(64));
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn to_zstd_v2(&self, zstd_level: i32) -> io::Result<TelemetryBridgeMessageV2> {
+    pub fn to_zstd_v2(&self, zstd_level: i32) -> io::Result<TelemetryWireV2> {
         let data_len = self.flattened_msg_meta.0.len() as u64;
         let metadata_len = self.flattened_msg_meta.1.len() as u64;
-        Ok(TelemetryBridgeMessageV2 {
+        Ok(TelemetryWireV2 {
             type_hash: self.type_hash,
             type_name: self.type_name.clone(),
             flattened_msg_meta: (
                 compress_vec(&self.flattened_msg_meta.0, zstd_level)?,
                 compress_vec(&self.flattened_msg_meta.1, zstd_level)?,
             ),
-            payload_encoding: TelemetryBridgePayloadEncoding::Zstd { data_len, metadata_len },
+            payload_encoding: TelemetryWirePayloadEncoding::Zstd { data_len, metadata_len },
         })
     }
 }
 
-impl TelemetryBridgeMessageV2 {
-    pub fn into_uncompressed_message(self) -> io::Result<TelemetryBridgeMessage> {
+impl TelemetryWireV2 {
+    pub fn into_uncompressed_message(self) -> io::Result<TelemetryWire> {
         let (data, metadata) = match self.payload_encoding {
-            TelemetryBridgePayloadEncoding::Uncompressed => self.flattened_msg_meta,
-            TelemetryBridgePayloadEncoding::Zstd { data_len, metadata_len } => (
+            TelemetryWirePayloadEncoding::Uncompressed => self.flattened_msg_meta,
+            TelemetryWirePayloadEncoding::Zstd { data_len, metadata_len } => (
                 decompress_vec(&self.flattened_msg_meta.0, data_len)?,
                 decompress_vec(&self.flattened_msg_meta.1, metadata_len)?,
             ),
         };
-        Ok(TelemetryBridgeMessage {
+        Ok(TelemetryWire {
             type_hash: self.type_hash,
             type_name: self.type_name,
             flattened_msg_meta: (data, metadata),
@@ -102,22 +102,22 @@ impl TelemetryBridgeMessageV2 {
     }
 }
 
-impl From<TelemetryBridgeMessage> for TelemetryBridgeMessageV2 {
-    fn from(msg: TelemetryBridgeMessage) -> Self {
+impl From<TelemetryWire> for TelemetryWireV2 {
+    fn from(msg: TelemetryWire) -> Self {
         Self {
             type_hash: msg.type_hash,
             type_name: msg.type_name,
             flattened_msg_meta: msg.flattened_msg_meta,
-            payload_encoding: TelemetryBridgePayloadEncoding::Uncompressed,
+            payload_encoding: TelemetryWirePayloadEncoding::Uncompressed,
         }
     }
 }
 
-impl std::fmt::Display for TelemetryBridgeMessage {
+impl std::fmt::Display for TelemetryWire {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "TelemetryBridgeMessage(type_hash={}, type_name={}, {}Kb)",
+            "TelemetryWire(type_hash={}, type_name={}, {}Kb)",
             self.type_hash,
             self.type_name,
             (self.flattened_msg_meta.0.len() + self.flattened_msg_meta.1.len()) / 1000
@@ -131,7 +131,7 @@ fn compress_vec(bytes: &[u8], zstd_level: i32) -> io::Result<Vec<u8>> {
 
 fn decompress_vec(bytes: &[u8], expected_len: u64) -> io::Result<Vec<u8>> {
     let read_limit = expected_len.checked_add(1).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "telemetry bridge payload length overflow")
+        io::Error::new(io::ErrorKind::InvalidData, "telemetry wire payload length overflow")
     })?;
     let mut reader = zstd::stream::read::Decoder::new(bytes)?.take(read_limit);
     let mut out = Vec::new();
@@ -140,7 +140,7 @@ fn decompress_vec(bytes: &[u8], expected_len: u64) -> io::Result<Vec<u8>> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "telemetry bridge payload decoded to {} bytes, expected {expected_len}",
+                "telemetry wire payload decoded to {} bytes, expected {expected_len}",
                 out.len()
             ),
         ));
