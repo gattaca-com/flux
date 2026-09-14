@@ -494,6 +494,16 @@ impl<T: TypeHash + Copy, const N: usize> TypeHash for ArrayVec<T, N> {
     };
 }
 
+impl<const N: usize> TypeHash for ArrayStr<N> {
+    const TYPE_HASH: u64 = {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        h = fnv1a64_str(h, "ArrayStr");
+        h = hash_u64(h, N as u64);
+        h = hash_layout_of::<Self>(h);
+        h
+    };
+}
+
 mod serde_impl {
     use core::fmt;
 
