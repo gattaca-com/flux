@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "flux"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bitcode",
  "core_affinity",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "flux-communication"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "directories",
  "flux-timing",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "flux-ctl"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "crossterm",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "flux-disk"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "flux-timing",
  "flux-utils",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "flux-network"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "core_affinity",
  "criterion",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "flux-profiler"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytesize",
  "clap",
@@ -1441,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "flux-profiler-macros"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "flux-timekeeper"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "auto_impl",
  "bitflags 2.10.0",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "flux-timing"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bitcode",
  "chrono",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "flux-utils"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "flux-versioned-types"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "flux-versioned-types-macros"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3171,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "spine-derive"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3486,7 +3486,7 @@ dependencies = [
 
 [[package]]
 name = "type-hash"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "uuid",
@@ -3494,7 +3494,7 @@ dependencies = [
 
 [[package]]
 name = "type-hash-derive"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
