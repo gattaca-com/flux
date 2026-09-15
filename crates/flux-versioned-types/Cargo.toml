@@ -11,15 +11,15 @@ keywords = ["schema", "versioning", "migration", "serde"]
 categories = ["data-structures", "encoding"]
 
 [dependencies]
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
 bincode.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
 flux-versioned-types-macros.workspace = true
 serde.workspace = true
 tracing.workspace = true
-type-hash.workspace = true
-uuid.workspace = true
+type-hash = { workspace = true, features = ["alloy", "uuid"] }
+uuid = { workspace = true, features = ["serde"] }
 zstd.workspace = true
 
 [dev-dependencies]

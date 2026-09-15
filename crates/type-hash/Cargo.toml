@@ -11,8 +11,12 @@ version.workspace = true
 [features]
 default = ["std"]
 std = []
+alloy = ["dep:alloy-primitives"]
+uuid = ["dep:uuid"]
 
 [dependencies]
+alloy-primitives = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [lints]
 workspace = true

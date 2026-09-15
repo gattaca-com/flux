@@ -136,3 +136,61 @@ mod std_impls {
         };
     }
 }
+
+#[cfg(feature = "uuid")]
+mod uuid_impls {
+    use super::{TypeHash, fnv1a64_str, hash_layout_of};
+
+    impl TypeHash for uuid::Uuid {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            h = fnv1a64_str(h, "Uuid");
+            h = hash_layout_of::<Self>(h);
+            h
+        };
+    }
+}
+
+#[cfg(feature = "alloy")]
+mod alloy_impls {
+    use super::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};
+
+    impl<const N: usize> TypeHash for alloy_primitives::FixedBytes<N> {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            h = fnv1a64_str(h, "FixedBytes");
+            h = hash_u64(h, N as u64);
+            h = hash_layout_of::<Self>(h);
+            h
+        };
+    }
+
+    impl<const BITS: usize, const LIMBS: usize> TypeHash for alloy_primitives::Uint<BITS, LIMBS> {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            h = fnv1a64_str(h, "Uint");
+            h = hash_u64(h, BITS as u64);
+            h = hash_layout_of::<Self>(h);
+            h
+        };
+    }
+
+    impl<const BITS: usize, const LIMBS: usize> TypeHash for alloy_primitives::Signed<BITS, LIMBS> {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            h = fnv1a64_str(h, "Signed");
+            h = hash_u64(h, BITS as u64);
+            h = hash_layout_of::<Self>(h);
+            h
+        };
+    }
+
+    impl TypeHash for alloy_primitives::Address {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            h = fnv1a64_str(h, "Address");
+            h = hash_layout_of::<Self>(h);
+            h
+        };
+    }
+}
