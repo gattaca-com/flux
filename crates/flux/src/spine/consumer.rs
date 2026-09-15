@@ -221,8 +221,6 @@ pub enum DCacheRead<T, R> {
     Ok((T, R)),
     /// Message consumed but no dcache ref present; payload not read.
     NoRef(T),
-    /// Queue was empty.
-    Empty,
     /// Consumer got sped past.
     SpedPast,
     /// A message was dequeued but the payload could not be safely read
@@ -268,67 +266,70 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
     }
 
     #[inline]
-    pub fn consume<P, R, F>(&mut self, producers: &mut P, mut read: F) -> DCacheRead<T, R>
+    pub(crate) fn consume<P, R, F>(
+        &mut self,
+        producers: &mut P,
+        mut read: F,
+    ) -> Option<DCacheRead<T, R>>
     where
         P: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
     {
-        match self.consume_internal_message(producers, |msg, payload| read(**msg, payload)) {
-            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
-            DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
-            DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
-            DCacheRead::Empty => DCacheRead::Empty,
-            DCacheRead::SpedPast => DCacheRead::SpedPast,
-        }
+        self.consume_internal_message(producers, |msg, payload| read(**msg, payload)).map(|res| {
+            match res {
+                DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
+                DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
+                DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
+                DCacheRead::SpedPast => DCacheRead::SpedPast,
+            }
+        })
     }
 
     #[inline]
-    pub fn consume_collaborative<P, R, F>(
+    pub(crate) fn consume_collaborative<P, R, F>(
         &mut self,
         producers: &mut P,
         mut read: F,
-    ) -> DCacheRead<T, R>
+    ) -> Option<DCacheRead<T, R>>
     where
         P: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
     {
-        match self
-            .consume_collaborative_internal_message(producers, |msg, payload| read(**msg, payload))
-        {
-            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
-            DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
-            DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
-            DCacheRead::Empty => DCacheRead::Empty,
-            DCacheRead::SpedPast => DCacheRead::SpedPast,
-        }
+        self.consume_collaborative_internal_message(producers, |msg, payload| read(**msg, payload))
+            .map(|res| match res {
+                DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
+                DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
+                DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
+                DCacheRead::SpedPast => DCacheRead::SpedPast,
+            })
     }
 
     #[inline]
-    pub fn consume_collaborative_internal_message<P, R, F>(
+    pub(crate) fn consume_collaborative_internal_message<P, R, F>(
         &mut self,
         producers: &mut P,
         mut read: F,
-    ) -> DCacheRead<InternalMessage<T>, R>
+    ) -> Option<DCacheRead<InternalMessage<T>, R>>
     where
         P: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
-        match self.inner.try_consume_with_epoch_collaborative() {
+        Some(match self.inner.try_consume_with_epoch_collaborative() {
             Ok((&msg, slot_pos, slot_ver)) => {
                 let ingestion_t = msg.ingestion_time();
                 *producers.timestamp_mut().ingestion_t_mut() = ingestion_t;
                 let dref = msg.data().dref;
                 if dref.is_none() {
-                    return DCacheRead::NoRef(msg.with_data(msg.data().data));
+                    return Some(DCacheRead::NoRef(msg.with_data(msg.data().data)));
                 }
                 let user_msg = msg.with_data(msg.data().data);
                 self.timer.start();
                 let Ok(extracted) = self.dcache.map(dref, |payload| read(&user_msg, payload))
                 else {
-                    return DCacheRead::Lost(user_msg);
+                    return Some(DCacheRead::Lost(user_msg));
                 };
                 if self.inner.slot_version(slot_pos) != slot_ver {
-                    return DCacheRead::Lost(user_msg);
+                    return Some(DCacheRead::Lost(user_msg));
                 }
                 self.timer.record_processing_and_latency_from(ingestion_t.into());
                 DCacheRead::Ok((user_msg, extracted))
@@ -337,46 +338,45 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
                 self.inner.recover_collaborative_after_error();
                 DCacheRead::SpedPast
             }
-            Err(ReadError::Empty) => DCacheRead::Empty,
-        }
+            Err(ReadError::Empty) => return None,
+        })
     }
 
     #[inline]
-    pub fn consume_internal_message<P, R, F>(
+    pub(crate) fn consume_internal_message<P, R, F>(
         &mut self,
         producers: &mut P,
         mut read: F,
-    ) -> DCacheRead<InternalMessage<T>, R>
+    ) -> Option<DCacheRead<InternalMessage<T>, R>>
     where
         P: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
     {
-        loop {
-            match self.inner.try_consume_with_epoch() {
-                Ok((&msg, slot_pos, slot_ver)) => {
-                    let ingestion_t = msg.ingestion_time();
-                    *producers.timestamp_mut().ingestion_t_mut() = ingestion_t;
-                    let dref = msg.data().dref;
-                    if dref.is_none() {
-                        return DCacheRead::NoRef(msg.with_data(msg.data().data));
-                    }
-                    let user_msg = msg.with_data(msg.data().data);
-                    self.timer.start();
-                    let Ok(extracted) = self.dcache.map(dref, |payload| read(&user_msg, payload))
-                    else {
-                        return DCacheRead::Lost(user_msg);
-                    };
-                    if self.inner.slot_version(slot_pos) != slot_ver {
-                        return DCacheRead::Lost(user_msg);
-                    }
-                    self.timer.record_processing_and_latency_from(ingestion_t.into());
-                    return DCacheRead::Ok((user_msg, extracted));
+        match self.inner.try_consume_with_epoch() {
+            Ok((&msg, slot_pos, slot_ver)) => {
+                let ingestion_t = msg.ingestion_time();
+                *producers.timestamp_mut().ingestion_t_mut() = ingestion_t;
+                let dref = msg.data().dref;
+                if dref.is_none() {
+                    return Some(DCacheRead::NoRef(msg.with_data(msg.data().data)));
                 }
-                Err(ReadError::SpedPast) => {
-                    self.inner.recover_after_error();
+                let user_msg = msg.with_data(msg.data().data);
+                self.timer.start();
+                let Ok(extracted) = self.dcache.map(dref, |payload| read(&user_msg, payload))
+                else {
+                    return Some(DCacheRead::Lost(user_msg));
+                };
+                if self.inner.slot_version(slot_pos) != slot_ver {
+                    return Some(DCacheRead::Lost(user_msg));
                 }
-                Err(ReadError::Empty) => return DCacheRead::Empty,
+                self.timer.record_processing_and_latency_from(ingestion_t.into());
+                Some(DCacheRead::Ok((user_msg, extracted)))
             }
+            Err(ReadError::SpedPast) => {
+                self.inner.recover_after_error();
+                Some(DCacheRead::SpedPast)
+            }
+            Err(ReadError::Empty) => None,
         }
     }
 }

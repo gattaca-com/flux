@@ -243,7 +243,9 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
-    pub fn consume_with_dcache<T, R, F, G>(&mut self, mut read: F, mut handle: G)
+    /// Drains the queue, passing every outcome except an empty queue to
+    /// `handle`. Returns whether `handle` ran at least once.
+    pub fn consume_with_dcache<T, R, F, G>(&mut self, mut read: F, mut handle: G) -> bool
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
@@ -252,19 +254,23 @@ impl<S: FluxSpine> SpineAdapter<S> {
         G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        loop {
-            let result = c.consume(&mut self.producers, &mut read);
-            let is_empty = matches!(result, DCacheRead::Empty);
-            self.did_work |= !(is_empty || matches!(result, DCacheRead::SpedPast));
+        let mut handled = false;
+        while let Some(result) = c.consume(&mut self.producers, &mut read) {
+            self.did_work |= !matches!(result, DCacheRead::SpedPast);
             handle(result, &mut self.producers);
-            if is_empty {
-                break;
-            }
+            handled = true;
         }
+        handled
     }
 
     #[inline]
-    pub fn consume_with_dcache_collaborative<T, R, F, G>(&mut self, mut read: F, mut handle: G)
+    /// Consumes at most one message, passing it to `handle`. Returns whether
+    /// `handle` ran.
+    pub fn consume_with_dcache_collaborative<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> bool
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
@@ -273,13 +279,21 @@ impl<S: FluxSpine> SpineAdapter<S> {
         G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_collaborative(&mut self.producers, &mut read);
-        self.did_work |= !matches!(result, DCacheRead::Empty | DCacheRead::SpedPast);
+        let Some(result) = c.consume_collaborative(&mut self.producers, &mut read) else {
+            return false;
+        };
+        self.did_work |= !matches!(result, DCacheRead::SpedPast);
         handle(result, &mut self.producers);
+        true
     }
 
     #[inline]
-    pub fn consume_with_dcache_internal_message<T, R, F, G>(&mut self, mut read: F, mut handle: G)
+    /// Internal-message variant of [`Self::consume_with_dcache`].
+    pub fn consume_with_dcache_internal_message<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> bool
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
@@ -288,23 +302,24 @@ impl<S: FluxSpine> SpineAdapter<S> {
         G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        loop {
-            let result = c.consume_internal_message(&mut self.producers, &mut read);
-            let is_empty = matches!(result, DCacheRead::Empty);
-            self.did_work |= !(is_empty || matches!(result, DCacheRead::SpedPast));
+        let mut handled = false;
+        while let Some(result) = c.consume_internal_message(&mut self.producers, &mut read) {
+            self.did_work |= !matches!(result, DCacheRead::SpedPast);
             handle(result, &mut self.producers);
-            if is_empty {
-                break;
-            }
+            handled = true;
         }
+        handled
     }
 
     #[inline]
+    /// Internal-message variant of
+    /// [`Self::consume_with_dcache_collaborative`].
     pub fn consume_with_dcache_collaborative_internal_message<T, R, F, G>(
         &mut self,
         mut read: F,
         mut handle: G,
-    ) where
+    ) -> bool
+    where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
@@ -312,9 +327,13 @@ impl<S: FluxSpine> SpineAdapter<S> {
         G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let result = c.consume_collaborative_internal_message(&mut self.producers, &mut read);
-        self.did_work |= !matches!(result, DCacheRead::Empty | DCacheRead::SpedPast);
+        let Some(result) = c.consume_collaborative_internal_message(&mut self.producers, &mut read)
+        else {
+            return false;
+        };
+        self.did_work |= !matches!(result, DCacheRead::SpedPast);
         handle(result, &mut self.producers);
+        true
     }
 
     /// Override the collaborative group label for queue `T`. By default each
