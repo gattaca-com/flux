@@ -70,7 +70,9 @@ fn run_mp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
                     sum += reader.map(r, read_ts).unwrap();
                     seen += 1;
                 }
-                Err(ReadError::SpedPast) => c.recover_after_error(),
+                Err(ReadError::SpedPast) => {
+                    c.recover_after_error();
+                }
                 Err(ReadError::Empty) => {}
             }
         }
@@ -128,7 +130,9 @@ fn run_mp_mc(
                         sum += reader.map(r, read_ts).unwrap();
                         seen += 1;
                     }
-                    Err(ReadError::SpedPast) => c.recover_after_error(),
+                    Err(ReadError::SpedPast) => {
+                        c.recover_after_error();
+                    }
                     Err(ReadError::Empty) => {}
                 }
             }
@@ -182,7 +186,9 @@ fn run_sp(n_producers: usize, msg_size: usize, per_producer: usize) -> Duration 
                     sum += readers[slot.ds_ix].map(slot.r, read_ts).unwrap();
                     seen += 1;
                 }
-                Err(ReadError::SpedPast) => c.recover_after_error(),
+                Err(ReadError::SpedPast) => {
+                    c.recover_after_error();
+                }
                 Err(ReadError::Empty) => {}
             }
         }
@@ -242,7 +248,9 @@ fn run_sp_mc(
                         sum += readers[slot.ds_ix].map(slot.r, read_ts).unwrap();
                         seen += 1;
                     }
-                    Err(ReadError::SpedPast) => c.recover_after_error(),
+                    Err(ReadError::SpedPast) => {
+                        c.recover_after_error();
+                    }
                     Err(ReadError::Empty) => {}
                 }
             }
