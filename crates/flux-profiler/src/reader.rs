@@ -260,6 +260,67 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Synthetic closes retain calls whose real closes were lost. Allow one
+    /// extra accounted mark per gap because this producer never nests calls.
+    #[test]
+    fn stress_loss_accounting_does_not_exceed_production() {
+        const CALLS: u64 = 10_000_000;
+        const ATTEMPTS: usize = 5;
+        let _guard = ShmemGuard::new();
+        let mut lossy_run = None;
+        for attempt in 0..ATTEMPTS {
+            let reader = InProcessReader::start();
+            let producer = format!("stress-producer-{attempt}");
+            thread::Builder::new()
+                .name(producer.clone())
+                .spawn(|| {
+                    for _ in 0..CALLS {
+                        record_open("stress_work");
+                        record_close("stress_work");
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+
+            let events = reader.collect();
+            // Scheduling can let the reader keep pace. Keep each retry's
+            // accounting isolated to its uniquely named producer thread.
+            if events.threads().any(|t| t.name == producer && t.loss.is_lossy()) {
+                lossy_run = Some((events, producer));
+                break;
+            }
+        }
+        let (events, producer) =
+            lossy_run.expect("no attempt overran the ring despite lapping it many times over");
+        let thread = events.threads().find(|t| t.name == producer).expect("producer reported");
+        let closes = |name| {
+            thread
+                .marks
+                .iter()
+                .filter(|mark| {
+                    !mark.is_open() && events.meta().names.get(&mark.id).is_some_and(|n| n == name)
+                })
+                .count() as u64
+        };
+        let retained = closes("stress_work");
+        let gaps = closes("<missed>");
+        let missed = thread.loss.missed;
+        let dropped = thread.loss.dropped;
+        let produced_marks = 2 * CALLS;
+        println!(
+            "produced={produced_marks} retained_calls={retained} missed={missed} \
+             dropped={dropped} gaps={gaps}"
+        );
+        assert!(retained > 0, "reader retained nothing despite polling throughout");
+        assert!(retained <= CALLS, "more calls retained than were made");
+        assert!(
+            missed + 2 * retained + dropped <= produced_marks + gaps,
+            "reported loss exceeds production: missed={missed} retained_calls={retained} \
+             dropped={dropped} gaps={gaps} produced_marks={produced_marks}"
+        );
+    }
+
     #[test]
     fn overrun_is_reported_as_missed_events() {
         let guard = ShmemGuard::new();
