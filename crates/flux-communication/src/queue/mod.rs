@@ -776,8 +776,10 @@ impl<T: Copy> ConsumerBare<T> {
     }
 
     #[inline]
-    pub fn recover_after_error(&mut self) {
-        self.set_broadcast_pos(self.queue.count());
+    pub fn recover_after_error(&mut self) -> usize {
+        let count = self.queue.count();
+        self.set_broadcast_pos(count);
+        count
     }
 
     #[inline]

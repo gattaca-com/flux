@@ -31,6 +31,10 @@ impl<T: RingEntry> RingDrainer<T> {
     }
 
     fn drain(&mut self) -> bool {
+        self.drain_after_recover(|| {})
+    }
+
+    fn drain_after_recover(&mut self, mut after_recover: impl FnMut()) -> bool {
         const DRAIN_BATCH: usize = 512;
 
         let mut scratch = T::default();
@@ -42,8 +46,8 @@ impl<T: RingEntry> RingDrainer<T> {
                 }
                 Err(ReadError::Empty) => return false,
                 Err(ReadError::SpedPast) => {
-                    self.consumer.recover_after_error();
-                    let head = self.consumer.queue_message_count() as u64;
+                    let head = self.consumer.recover_after_error() as u64;
+                    after_recover();
                     self.missed += head.saturating_sub(self.next_seq) + self.pending.len() as u64;
                     self.next_seq = head.max(self.next_seq);
                     self.pending.clear();
@@ -123,6 +127,32 @@ mod tests {
 
     use super::*;
     use crate::{queue_dir::RING_CAPACITY, test_shmem::ShmemGuard};
+
+    #[test]
+    fn production_during_recovery_is_not_counted_as_missed_and_retained() {
+        let guard = ShmemGuard::new();
+        let dir = QueueDir::new(guard.app());
+        let mut producer = Producer::from(dir.ring::<Mark>("recovery-race"));
+        let mut drainer = RingDrainer::<Mark>::open(&dir, "recovery-race").unwrap();
+        let mark = Mark::from_parts(1, 0, true);
+        let before_recovery = RING_CAPACITY as u64 + 5;
+        for _ in 0..before_recovery {
+            producer.produce(&mark);
+        }
+
+        let mut after_recovery = 0;
+        drainer.drain_after_recover(|| {
+            producer.produce(&mark);
+            producer.produce(&mark);
+            after_recovery += 2;
+        });
+        let mut retained = 0;
+        while drainer.pop_ready(u64::MAX).is_some() {
+            retained += 1;
+        }
+        assert_eq!(retained, after_recovery);
+        assert_eq!(drainer.missed + retained, before_recovery + after_recovery);
+    }
 
     #[test]
     fn overrun_is_counted_exactly_and_indexing_resumes_at_the_head() {
