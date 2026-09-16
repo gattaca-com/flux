@@ -76,12 +76,10 @@ impl<T: Copy, const N: usize> ArrayVec<T, N> {
 
     /// Panics if full.
     #[inline(always)]
-    pub fn push(&mut self, value: T) {
+    pub const fn push(&mut self, value: T) {
         let len = self.len();
         assert!(len < N, "push capacity overflow");
-        unsafe {
-            self.data.get_unchecked_mut(len).write(value);
-        }
+        self.data[len].write(value);
         self.len = len + 1;
     }
 
@@ -383,21 +381,24 @@ impl<const N: usize> ArrayStr<N> {
 
     /// Push str, truncating at char boundary if exceeds capacity.
     #[inline]
-    pub fn push_str_truncate(&mut self, s: &str) {
+    pub const fn push_str_truncate(&mut self, s: &str) {
         let avail = N - self.buf.len();
-        let mut take = s.len().min(avail);
+        let mut take = if s.len() < avail { s.len() } else { avail };
         // Truncate at char boundary to preserve UTF-8 validity.
         while take > 0 && !s.is_char_boundary(take) {
             take -= 1;
         }
-        for &b in &s.as_bytes()[..take] {
-            self.buf.push(b);
+        let bytes = s.as_bytes().split_at(take).0;
+        let mut i = 0;
+        while i < bytes.len() {
+            self.buf.push(bytes[i]);
+            i += 1;
         }
     }
 
     /// Create from str, truncating at char boundary if exceeds capacity.
     #[inline]
-    pub fn from_str_truncate(s: &str) -> Self {
+    pub const fn from_str_truncate(s: &str) -> Self {
         let mut out = Self::new();
         out.push_str_truncate(s);
         out
@@ -835,7 +836,7 @@ mod tests {
 
         #[test]
         fn from_str_truncate() {
-            let s = ArrayStr::<16>::from_str_truncate("hello");
+            let s = const { ArrayStr::<16>::from_str_truncate("hello") };
             assert_eq!(s.as_str(), "hello");
             assert_eq!(s.len(), 5);
         }
