@@ -135,6 +135,21 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
+    /// Subscribe to broadcast messages of type `T` without consuming them.
+    ///
+    /// Reads include messages published after subscription, subject to queue
+    /// capacity. Repeated calls preserve pending messages. Otherwise,
+    /// subscription begins on the first read. Do not combine this with
+    /// collaborative consumption of the same consumer.
+    #[inline]
+    pub fn subscribe_broadcast<T: 'static + Copy>(&mut self)
+    where
+        S::Consumers: AsMut<SpineConsumer<T>>,
+    {
+        let c = self.consumers.as_mut();
+        c.inner.subscribe_broadcast();
+    }
+
     #[inline]
     pub fn consume<T, F>(&mut self, mut f: F)
     where

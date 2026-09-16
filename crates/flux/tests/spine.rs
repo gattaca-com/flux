@@ -169,3 +169,56 @@ fn all_shmem_files_reside_in_base_dir() {
 
     cleanup_shmem(base);
 }
+
+#[test]
+fn on_attach_subscribes_before_runner_starts() {
+    struct Subscriber {
+        attaching_thread: std::thread::ThreadId,
+        attached: Arc<AtomicU64>,
+        received: Arc<AtomicU64>,
+    }
+
+    impl Tile<TestSpine> for Subscriber {
+        fn on_attach(&mut self, adapter: &mut SpineAdapter<TestSpine>) {
+            assert_eq!(std::thread::current().id(), self.attaching_thread);
+            self.attached.fetch_add(1, Ordering::Relaxed);
+            adapter.subscribe_broadcast::<MsgA>();
+        }
+
+        fn try_init(&mut self, _: &mut SpineAdapter<TestSpine>) -> bool {
+            assert_eq!(self.attached.load(Ordering::Relaxed), 1);
+            true
+        }
+
+        fn loop_body(&mut self, adapter: &mut SpineAdapter<TestSpine>) {
+            adapter.consume(|msg: MsgA, _| {
+                self.received.fetch_add(msg.0, Ordering::Relaxed);
+            });
+            adapter.request_stop_scope();
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spine = TestSpine::new_with_base_dir(tmp.path(), None);
+    let attached = Arc::new(AtomicU64::new(0));
+    let received = Arc::new(AtomicU64::new(0));
+    std::thread::scope(|scope| {
+        let mut scoped = flux::spine::ScopedSpine::new(&mut spine, scope, None, None);
+        let run = flux::tile::tile_runner(
+            Subscriber {
+                attaching_thread: std::thread::current().id(),
+                attached: attached.clone(),
+                received: received.clone(),
+            },
+            &mut scoped,
+            TileConfig::background(None, None).without_metrics(),
+        );
+        assert_eq!(attached.load(Ordering::Relaxed), 1);
+        let mut producer = SpineAdapter::connect_tile(&Writer, scoped.spine);
+        producer.produce(MsgA(42));
+        scope.spawn(run).join().unwrap();
+    });
+    assert_eq!(attached.load(Ordering::Relaxed), 1);
+    assert_eq!(received.load(Ordering::Relaxed), 42);
+    cleanup_shmem(tmp.path());
+}

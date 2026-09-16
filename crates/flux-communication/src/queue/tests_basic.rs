@@ -253,3 +253,32 @@ fn max_writable_msgs_matches_safe_writes_before_overwrite() {
         assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
     }
 }
+
+#[test]
+fn explicit_subscription_preserves_messages_before_first_read() {
+    for typ in [QueueType::SPMC, QueueType::MPMC] {
+        let q = Queue::new(16, typ);
+        let mut p = Producer::from(q);
+        let mut subscribed = ConsumerBare::new(q, "explicit");
+        let mut lazy = ConsumerBare::new(q, "lazy");
+        p.produce(&1u64);
+        subscribed.subscribe_broadcast();
+        p.produce(&2);
+        subscribed.subscribe_broadcast();
+        let mut msg = 0;
+        subscribed.try_consume(&mut msg).unwrap();
+        assert_eq!(msg, 2);
+        assert_eq!(lazy.try_consume(&mut msg), Err(ReadError::Empty));
+        p.produce(&3);
+        subscribed.subscribe_broadcast();
+        subscribed.try_consume(&mut msg).unwrap();
+        assert_eq!(msg, 3);
+        lazy.try_consume(&mut msg).unwrap();
+        assert_eq!(msg, 3);
+        assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::Empty));
+        for value in 0..32 {
+            p.produce(&value);
+        }
+        assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::SpedPast));
+    }
+}
