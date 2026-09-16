@@ -423,7 +423,7 @@ impl TcpManager {
 
     #[inline]
     pub(crate) fn force_reconnect(&mut self) {
-        self.reconnector.reset();
+        self.reconnector.force_fire();
         self.maybe_reconnect();
     }
 
