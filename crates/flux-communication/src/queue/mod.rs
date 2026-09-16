@@ -817,13 +817,9 @@ impl<T: Copy> ConsumerBare<T> {
         self.acquire_specific_slot(delta);
     }
 
-    /// Establish the broadcast starting position without consuming a message.
-    ///
-    /// Reads start with messages published after subscription, subject to queue
-    /// capacity. Repeated calls preserve the existing cursor and pending
-    /// messages. Without this call, the first broadcast read establishes
-    /// the starting position. Use this only with broadcast consumption, not
-    /// collaborative consumption.
+    /// Start at the current write head without consuming; repeated calls are
+    /// no-ops. Otherwise, subscription starts on the first read. Queue
+    /// overwrite still applies. For broadcast consumption only.
     #[inline]
     pub fn subscribe_broadcast(&mut self) {
         self.try_init_broadcast();
@@ -990,8 +986,7 @@ impl<T: 'static + Copy> Consumer<T> {
         Self::from_bare(ConsumerBare::new_collaborative_test(queue, label))
     }
 
-    /// Establish the broadcast starting position without consuming a message.
-    /// See [`ConsumerBare::subscribe_broadcast`] for subscription semantics.
+    /// Subscribe without consuming; see [`ConsumerBare::subscribe_broadcast`].
     #[inline]
     pub fn subscribe_broadcast(&mut self) {
         self.bare.subscribe_broadcast();

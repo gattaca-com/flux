@@ -135,12 +135,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Subscribe to broadcast messages of type `T` without consuming them.
-    ///
-    /// Reads include messages published after subscription, subject to queue
-    /// capacity. Repeated calls preserve pending messages. Otherwise,
-    /// subscription begins on the first read. Do not combine this with
-    /// collaborative consumption of the same consumer.
+    /// Subscribe to future broadcasts of `T` without consuming; repeated calls
+    /// are no-ops.
     #[inline]
     pub fn subscribe_broadcast<T: 'static + Copy>(&mut self)
     where

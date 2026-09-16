@@ -49,13 +49,9 @@ pub trait Tile<S: FluxSpine>: Send + Sized {
     /// `adapter.mark_work()`.
     fn loop_body(&mut self, _adapter: &mut SpineAdapter<S>);
 
-    /// Called once, synchronously during runner construction, after the adapter
-    /// is connected.
-    ///
-    /// Establish broadcast subscriptions here to receive messages published
-    /// before the first read. Attach subscribing tiles before starting
-    /// their producers; this hook does not order other tiles. Runs on the
-    /// attaching thread, before worker setup and [`Self::try_init`].
+    /// Called once on the attaching thread after adapter construction, before
+    /// the worker starts. Use this to establish broadcast subscriptions
+    /// before starting producers.
     fn on_attach(&mut self, _adapter: &mut SpineAdapter<S>) {}
 
     /// User init before loop. State setup etc.
