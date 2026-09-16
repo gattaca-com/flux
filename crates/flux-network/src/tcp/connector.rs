@@ -138,6 +138,22 @@ impl TcpManager {
         }
     }
 
+    pub(crate) fn clear_backlog(&mut self, token: Token) -> usize {
+        if let Some((_, Variant::Outbound(tcp))) =
+            self.to_be_reconnected.iter_mut().find(|(t, _)| *t == token)
+        {
+            let dropped = tcp.send_backlog.len();
+            tcp.clear_send_backlog();
+            return dropped;
+        }
+        match self.conns.iter_mut().find(|(t, _)| *t == token) {
+            Some((_, Variant::Outbound(tcp) | Variant::Inbound(tcp))) => {
+                tcp.drop_queued(&self.registry)
+            }
+            _ => 0,
+        }
+    }
+
     #[inline]
     fn broadcast(&mut self, payload: &[u8]) {
         let max_backlog = self.config.max_backlog;

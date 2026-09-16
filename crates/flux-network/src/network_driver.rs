@@ -327,6 +327,15 @@ impl NetworkDriver {
         }
     }
 
+    /// Drops the frames queued for `token`, returning how many. A partially
+    /// written frame is kept. TCP only.
+    pub fn clear_backlog(&mut self, token: Token) -> usize {
+        match &mut self.inner {
+            Inner::Tcp(m) => m.clear_backlog(token),
+            Inner::Udp(_) => 0,
+        }
+    }
+
     /// Initiates (or schedules) an outbound connection to `addr`.
     ///
     /// Returns the token for this connection if the connection becomes

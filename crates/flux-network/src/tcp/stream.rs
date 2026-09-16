@@ -718,6 +718,21 @@ impl TcpStream {
         self.backlog_exceeded_since = None;
     }
 
+    /// Keeps a partially written frame so the peer never reads a torn stream.
+    pub(crate) fn drop_queued(&mut self, registry: &Registry) -> usize {
+        let in_flight = usize::from(self.send_cursor > 0);
+        let dropped = self.send_backlog.len().saturating_sub(in_flight);
+        self.send_backlog.truncate(in_flight);
+        self.backlog_exceeded_since = None;
+        if self.send_backlog.is_empty() &&
+            self.writable_armed &&
+            registry.reregister(&mut self.stream, self.token, Interest::READABLE).is_ok()
+        {
+            self.writable_armed = false;
+        }
+        dropped
+    }
+
     pub(crate) fn peer(&self) -> SocketAddr {
         self.peer_addr
     }
