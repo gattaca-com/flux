@@ -55,6 +55,9 @@ use mio::Token;
 
 use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore};
 
+/// Record overhead allowance on top of a full-size request; see `group`.
+const TLS_MARGIN_BYTES: usize = 64 * 1024;
+
 pub enum HttpEvent<'a> {
     Accepted { token: Token, peer_addr: SocketAddr },
     Connected { token: Token },
@@ -262,7 +265,13 @@ impl HttpNetwork {
                 framing: Framing::Raw,
                 socket_buf_size: *socket_buf_size,
                 max_frame_size: usize::MAX,
-                max_backlog_bytes: Some(max_head_bytes.saturating_add(*max_body_bytes)),
+                // The backlog counts wire bytes, which are ciphertext on a
+                // TLS endpoint: a record adds a header and a tag per 16KB.
+                // The margin keeps a full-size request from tripping the cap
+                // on its own overhead.
+                max_backlog_bytes: Some(
+                    max_head_bytes.saturating_add(*max_body_bytes).saturating_add(TLS_MARGIN_BYTES),
+                ),
                 backlog_warn_bytes: None,
                 ..Default::default()
             })

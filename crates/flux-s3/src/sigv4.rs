@@ -22,8 +22,8 @@ pub struct Signer {
     access: String,
     secret: String,
     region: String,
-    /// Whether bodies are hashed instead of sent as `UNSIGNED-PAYLOAD`.
-    hash_payloads: bool,
+    /// Whether bodies travel as `UNSIGNED-PAYLOAD` instead of being hashed.
+    unsigned_payloads: bool,
 }
 
 impl Signer {
@@ -33,14 +33,14 @@ impl Signer {
             access: access.to_owned(),
             secret: secret.to_owned(),
             region: region.to_owned(),
-            hash_payloads: false,
+            unsigned_payloads: false,
         }
     }
-    /// Binds bodies to their signature with a `SHA256` hash, for endpoints
-    /// reached without TLS.
+    /// Stops binding bodies to their signature with a `SHA256` hash. Only
+    /// for endpoints reached over TLS, which protects the body itself.
     #[must_use]
-    pub fn hashing_payloads(mut self) -> Self {
-        self.hash_payloads = true;
+    pub fn unsigned_payloads(mut self) -> Self {
+        self.unsigned_payloads = true;
         self
     }
     pub fn set_credentials(&mut self, access: &str, secret: &str) {
@@ -65,8 +65,11 @@ impl Signer {
         date: &str,
         body: &[u8],
     ) -> (String, String) {
-        let payload =
-            if self.hash_payloads { hex(&Sha256::digest(body)[..]) } else { UNSIGNED.to_owned() };
+        let payload = if self.unsigned_payloads {
+            UNSIGNED.to_owned()
+        } else {
+            hex(&Sha256::digest(body)[..])
+        };
         let canonical = format!(
             "{method}\n{resource}\n{query}\nhost:{}\nx-amz-content-sha256:{payload}\n\
              x-amz-date:{date}\n\nhost;x-amz-content-sha256;x-amz-date\n{payload}",

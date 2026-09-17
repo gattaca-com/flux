@@ -28,6 +28,9 @@ mod enabled {
 
     use flux_timing::{Duration, Instant};
     pub use rustls::ClientConfig;
+
+    /// Socket read size; one syscall feeds many TLS records.
+    const CIPHER_CHUNK: usize = 32 * 1024;
     use rustls::{ClientConnection, RootCertStore, pki_types::ServerName};
 
     /// The shared default: Mozilla roots over the ring provider.
@@ -55,6 +58,7 @@ mod enabled {
         started: Option<Instant>,
         /// Whether the completed handshake has been reported once.
         announced: bool,
+        cipher: Vec<u8>,
         plain: Vec<u8>,
         read: usize,
     }
@@ -69,6 +73,7 @@ mod enabled {
                 conn: None,
                 started: None,
                 announced: false,
+                cipher: Vec::new(),
                 plain: Vec::new(),
                 read: 0,
             }
@@ -101,11 +106,13 @@ mod enabled {
         pub fn announced(&self) -> bool {
             self.announced
         }
-        /// True once, the first time the handshake is seen complete.
-        pub fn take_handshake_completed(&mut self) -> bool {
-            let completed = !self.is_handshaking() && !self.announced;
-            self.announced |= completed;
-            completed
+        /// Whether the handshake finished but has not been announced yet.
+        pub fn handshake_completed(&self) -> bool {
+            !self.is_handshaking() && !self.announced
+        }
+        /// Records that the completed handshake has been reported.
+        pub fn mark_announced(&mut self) {
+            self.announced = true;
         }
         /// True when the handshake has been stuck longer than `timeout`.
         pub fn handshake_stalled(&self, timeout: Duration) -> bool {
@@ -155,25 +162,32 @@ mod enabled {
                 }
             }
         }
-        /// Pulls one ciphertext read through the session, appending whatever
+        /// Pulls one socket read through the session, appending whatever
         /// plaintext it yields. Returns the ciphertext byte count.
         fn fill<R: io::Read>(&mut self, socket: &mut R) -> io::Result<usize> {
             use std::io::Read as _;
-            let Self { conn, plain, .. } = self;
+            let Self { conn, cipher, plain, .. } = self;
             let Some(conn) = conn.as_mut() else {
                 return Err(io::Error::other("TLS bytes before the handshake started"))
             };
-            // read_tls takes one <=4KB read and refuses entry once ~16KB of
-            // plaintext is undrained, so process and drain after every read.
-            let read = conn.read_tls(socket)?;
+            // One syscall per fill: rustls reads at most 4KB per read_tls, so
+            // feeding it the socket directly would cost a syscall per record.
+            cipher.resize(CIPHER_CHUNK, 0);
+            let read = socket.read(cipher)?;
             if read == 0 {
                 return Ok(0)
             }
-            conn.process_new_packets().map_err(io::Error::other)?;
-            match conn.reader().read_to_end(plain) {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
+            // read_tls also refuses entry once ~16KB of plaintext is
+            // undrained, so process and drain after every slice read.
+            let mut pending = &cipher[..read];
+            while !pending.is_empty() {
+                conn.read_tls(&mut pending)?;
+                conn.process_new_packets().map_err(io::Error::other)?;
+                match conn.reader().read_to_end(plain) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
             }
             Ok(read)
         }
@@ -199,7 +213,10 @@ mod disabled {
         pub fn start(&mut self, _out: &mut Vec<u8>) {
             unreachable!("the tls feature is off, so no session exists")
         }
-        pub fn take_handshake_completed(&mut self) -> bool {
+        pub fn handshake_completed(&self) -> bool {
+            unreachable!("the tls feature is off, so no session exists")
+        }
+        pub fn mark_announced(&mut self) {
             unreachable!("the tls feature is off, so no session exists")
         }
         pub fn handshake_stalled(&self, _timeout: Duration) -> bool {

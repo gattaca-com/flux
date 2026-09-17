@@ -463,30 +463,32 @@ impl NetworkState {
     /// Drops TLS connections whose handshake never finished. They are
     /// redialled by the usual reconnect sweep; no lifecycle event is emitted
     /// because none was ever announced.
-    fn drop_stalled_handshakes(&mut self) {
-        for index in 0..self.connections.len() {
-            let timeout = self.config(self.connections[index].group).handshake_timeout;
-            if !self.connections[index]
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.handshake_stalled(timeout))
-            {
-                continue;
-            }
-            let peer_addr = self.connections[index].peer_addr;
-            warn!(%peer_addr, ?timeout, "tls handshake timed out");
-            self.disconnect_index(index, false);
+    /// Drops a TLS connection whose handshake never finished, so the sweep
+    /// below redials it. Nothing is emitted: it was never announced.
+    fn drop_stalled_handshake(&mut self, index: usize) {
+        let timeout = self.config(self.connections[index].group).handshake_timeout;
+        if !self.connections[index].tls.as_ref().is_some_and(|tls| tls.handshake_stalled(timeout)) {
+            return;
         }
+        let peer_addr = self.connections[index].peer_addr;
+        warn!(%peer_addr, ?timeout, "tls handshake timed out");
+        self.disconnect_index(index, false);
     }
 
     fn maybe_reconnect(&mut self) {
-        self.drop_stalled_handshakes();
         let now = Instant::now();
         for group_index in 0..self.groups.len() {
             if !self.groups[group_index].reconnector.fired_at(now) {
                 continue;
             }
             let group = TcpGroup(group_index);
+            // Swept on the reconnect tick, so a poll with no reconnect work
+            // pays nothing for it; the timeout is coarse by that interval.
+            for index in 0..self.connections.len() {
+                if self.connections[index].group == group {
+                    self.drop_stalled_handshake(index);
+                }
+            }
             for index in 0..self.connections.len() {
                 if self.connections[index].group == group &&
                     self.connections[index].kind == ConnectionKind::Outbound &&
@@ -740,17 +742,17 @@ impl NetworkState {
             self.disconnect_index(index, false);
         } else if self.connections[index].close_when_drained && queue_empty {
             self.disconnect_index(index, true);
-        } else if self.connections[index]
-            .tls
-            .as_mut()
-            .is_some_and(Session::take_handshake_completed)
-        {
+        } else if self.connections[index].tls.as_ref().is_some_and(Session::handshake_completed) {
             // The encrypted connection is usable now; `on_connect_msg` goes
             // out through the normal send path so it is encrypted too.
             if let Some(message) = self.groups[group.0].config.on_connect_msg.clone() &&
                 !self.send_with(token, |buf| buf.extend_from_slice(&message))
             {
                 return;
+            }
+            // Marked only here, so anything dropped earlier stays silent.
+            if let Some(tls) = self.connections[index].tls.as_mut() {
+                tls.mark_announced();
             }
             handler(TcpEvent::Connected { group, token, peer_addr });
         }

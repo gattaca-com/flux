@@ -81,7 +81,7 @@ impl S3 {
             pool: http.pool(net, addr, connections),
             // Plain HTTP has no transport integrity, so the payload hash is
             // the only thing binding a body to its signature.
-            signer: sigv4::Signer::new(&addr.to_string(), "", "", "us-east-1").hashing_payloads(),
+            signer: sigv4::Signer::new(&addr.to_string(), "", "", "us-east-1"),
         }
     }
     /// Like [`Self::new`] but over TLS to `addr`, sending and signing
@@ -96,7 +96,8 @@ impl S3 {
     ) -> Self {
         Self {
             pool: http.pool_tls(net, addr, host, connections),
-            signer: sigv4::Signer::new(host, "", "", "us-east-1"),
+            // TLS already protects the body, so it is not hashed twice.
+            signer: sigv4::Signer::new(host, "", "", "us-east-1").unsigned_payloads(),
         }
     }
     pub fn with_credentials(mut self, access: &str, secret: &str) -> Self {
