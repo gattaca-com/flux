@@ -13,7 +13,7 @@
 pub mod copybinary;
 mod scram;
 
-use std::{collections::VecDeque, net::SocketAddr, ops::DerefMut};
+use std::{collections::VecDeque, net::SocketAddr};
 
 use flux_network::{
     Token,
@@ -282,8 +282,8 @@ impl Postgres {
         self
     }
 
-    /// Bound on queued body bytes, exceeded by at most one request; the
-    /// oldest queued requests are dropped to stay under it.
+    /// Bound on queued body bytes; a request that would exceed it is
+    /// refused, so accepted work is never dropped.
     pub fn with_max_queued_bytes(mut self, max_queued_bytes: usize) -> Self {
         self.max_queued_bytes = max_queued_bytes;
         self
@@ -308,26 +308,27 @@ impl Postgres {
     }
 
     /// Encodes `rows` as `COPY BINARY` and queues them for `table`, naming
-    /// the columns after the row's fields. Empty batches and full queues
-    /// return `None`; unencodable rows panic.
-    pub fn copy_rows<T: Serialize>(&mut self, table: &str, rows: &[T]) -> Option<QueryId> {
-        let first = rows.first()?;
-        if self.full_for(0) {
-            return None;
-        }
-        let sql = copybinary::copy_statement(table, first).expect("COPY BINARY row");
+    /// the columns after the row's fields. A full queue hands the encoded
+    /// body back for a later [`Postgres::copy`]. Panics on an empty batch,
+    /// an unencodable row, or rows whose columns differ.
+    pub fn copy_rows<T: Serialize>(&mut self, table: &str, rows: &[T]) -> Result<QueryId, Vec<u8>> {
+        let sql = copybinary::copy_statement(table, &rows[0]).expect("COPY BINARY row");
         let mut body = Vec::new();
         copybinary::header(&mut body);
+        let (mut columns, mut expected) = (Vec::new(), Vec::new());
         for row in rows {
-            let statement = copybinary::copy_statement(table, row).expect("COPY BINARY row");
-            assert_eq!(statement, sql, "COPY rows must share the same columns");
-            copybinary::encode(&mut body, row).expect("COPY BINARY row");
+            copybinary::encode_columns(&mut body, row, &mut columns).expect("COPY BINARY row");
+            if expected.is_empty() {
+                std::mem::swap(&mut expected, &mut columns);
+            } else {
+                assert_eq!(columns, expected, "COPY rows must share the same columns");
+            }
         }
         copybinary::trailer(&mut body);
         if self.full_for(sql.len() + body.len()) {
-            return None;
+            return Err(body);
         }
-        Some(self.enqueue(sql, Some(body)))
+        Ok(self.enqueue(sql, Some(body)))
     }
 
     fn enqueue(&mut self, sql: String, data: Option<Vec<u8>>) -> QueryId {
@@ -411,9 +412,8 @@ impl Postgres {
 
     /// Sends queued requests on idle connections, then delivers each finished
     /// request's outcome to `handler` exactly once.
-    pub fn drive<N, F>(&mut self, net: &mut N, mut handler: F)
+    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
     where
-        N: DerefMut<Target = TcpNetworkCore>,
         F: FnMut(QueryId, Result<Output, Error>),
     {
         self.ensure_conns(net);

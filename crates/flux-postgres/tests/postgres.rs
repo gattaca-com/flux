@@ -5,12 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flux_network::{
     Token,
     tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork},
 };
 use flux_postgres::{Error, Output, Postgres, QueryId, copybinary};
+use hmac::{Hmac, Mac};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 fn srv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut msg = vec![tag];
@@ -93,7 +96,7 @@ fn copy_in() -> Vec<u8> {
 enum ClientMsg {
     Startup(Vec<(String, String)>),
     Query(String),
-    Password,
+    Password(Vec<u8>),
     CopyData(Vec<u8>),
     CopyDone,
 }
@@ -155,7 +158,7 @@ impl FakeServer {
                 b'Q' => msgs.push(ClientMsg::Query(
                     String::from_utf8_lossy(&body[..body.len() - 1]).into_owned(),
                 )),
-                b'p' => msgs.push(ClientMsg::Password),
+                b'p' => msgs.push(ClientMsg::Password(body.to_vec())),
                 b'd' => msgs.push(ClientMsg::CopyData(body.to_vec())),
                 b'c' => msgs.push(ClientMsg::CopyDone),
                 _ => panic!("unexpected client message {tag}"),
@@ -190,8 +193,9 @@ fn tick(
     server: &mut FakeServer,
     outcomes: &mut Vec<(QueryId, Result<Output, Error>)>,
     seen: &mut Vec<ClientMsg>,
-    mut on_msg: impl FnMut(&mut FakeServer, Token, ClientMsg),
+    mut on_msg: impl FnMut(&mut FakeServer, Token, ClientMsg) -> bool,
 ) {
+    let mut drop = Vec::new();
     net.poll_with(|event| {
         if pg.on_event(&event) {
             return;
@@ -208,7 +212,9 @@ fn tick(
             TcpEvent::Message { group, token, payload, .. } if group == server_group => {
                 for msg in server.push(token, payload) {
                     seen.push(msg.clone());
-                    on_msg(server, token, msg);
+                    if on_msg(server, token, msg) {
+                        drop.push(token);
+                    }
                 }
             }
             _ => {}
@@ -217,6 +223,9 @@ fn tick(
     pg.drive(net, |id, result| outcomes.push((id, result)));
     for (token, bytes) in server.drain() {
         net.send_with(token, |buf| buf.extend_from_slice(&bytes));
+    }
+    for token in drop {
+        net.disconnect(token);
     }
 }
 
@@ -285,39 +294,42 @@ fn query_copy_and_error_byte_at_a_time() {
             &mut server,
             &mut outcomes,
             &mut seen,
-            |server, token, msg| match msg {
-                ClientMsg::Startup(_) => {
-                    let mut reply = auth(0, &[]);
-                    reply.extend_from_slice(&param("client_encoding", "UTF8"));
-                    reply.extend_from_slice(&param("server_version", "18.6"));
-                    reply.extend_from_slice(&srv(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
-                    reply.extend_from_slice(&srv(b'N', &[b'S', b'W', 0, 0]));
-                    reply.extend_from_slice(&ready());
-                    server.reply(token, &reply);
+            |server, token, msg| {
+                match msg {
+                    ClientMsg::Startup(_) => {
+                        let mut reply = auth(0, &[]);
+                        reply.extend_from_slice(&param("client_encoding", "UTF8"));
+                        reply.extend_from_slice(&param("server_version", "18.6"));
+                        reply.extend_from_slice(&srv(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
+                        reply.extend_from_slice(&srv(b'N', &[b'S', b'W', 0, 0]));
+                        reply.extend_from_slice(&ready());
+                        server.reply(token, &reply);
+                    }
+                    ClientMsg::Query(sql) if sql == "SELECT 1" => {
+                        let mut reply = row_desc(&[("one", 23)]);
+                        reply.extend_from_slice(&data_row(&[Some(&1i32.to_be_bytes())]));
+                        reply.extend_from_slice(&complete("SELECT 1"));
+                        reply.extend_from_slice(&ready());
+                        server.reply(token, &reply);
+                    }
+                    ClientMsg::Query(sql) if sql == "SELEC" => {
+                        let mut reply = error_msg("42601", "syntax error at end of input");
+                        reply.extend_from_slice(&ready());
+                        server.reply(token, &reply);
+                    }
+                    ClientMsg::Query(sql) => {
+                        assert!(sql.starts_with("COPY t "), "unexpected query {sql}");
+                        server.reply(token, &copy_in());
+                    }
+                    ClientMsg::CopyData(data) => copied.extend_from_slice(&data),
+                    ClientMsg::CopyDone => {
+                        let mut reply = complete("COPY 2");
+                        reply.extend_from_slice(&ready());
+                        server.reply(token, &reply);
+                    }
+                    ClientMsg::Password(_) => panic!("no password expected"),
                 }
-                ClientMsg::Query(sql) if sql == "SELECT 1" => {
-                    let mut reply = row_desc(&[("one", 23)]);
-                    reply.extend_from_slice(&data_row(&[Some(&1i32.to_be_bytes())]));
-                    reply.extend_from_slice(&complete("SELECT 1"));
-                    reply.extend_from_slice(&ready());
-                    server.reply(token, &reply);
-                }
-                ClientMsg::Query(sql) if sql == "SELEC" => {
-                    let mut reply = error_msg("42601", "syntax error at end of input");
-                    reply.extend_from_slice(&ready());
-                    server.reply(token, &reply);
-                }
-                ClientMsg::Query(sql) => {
-                    assert!(sql.starts_with("COPY t "), "unexpected query {sql}");
-                    server.reply(token, &copy_in());
-                }
-                ClientMsg::CopyData(data) => copied.extend_from_slice(&data),
-                ClientMsg::CopyDone => {
-                    let mut reply = complete("COPY 2");
-                    reply.extend_from_slice(&ready());
-                    server.reply(token, &reply);
-                }
-                ClientMsg::Password => panic!("no password expected"),
+                false
             },
         );
         thread::sleep(Duration::from_millis(1));
@@ -350,4 +362,115 @@ fn query_copy_and_error_byte_at_a_time() {
         assert!(params.contains(&("user".to_owned(), "postgres".to_owned())));
         assert!(params.contains(&("database".to_owned(), "db".to_owned())));
     }
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn scram_server_check(transcript: &[Vec<u8>], salt: &[u8], client_final: &[u8]) -> Vec<u8> {
+    let client_final = String::from_utf8_lossy(client_final).into_owned();
+    let without_proof = client_final.split(",p=").next().unwrap().to_owned();
+    let proof = STANDARD.decode(client_final.split(",p=").nth(1).unwrap()).unwrap();
+    let mut salted_input = salt.to_vec();
+    salted_input.extend_from_slice(&1u32.to_be_bytes());
+    let mut salted = hmac_sha256(b"pencil", &salted_input);
+    let mut prev = salted;
+    for _ in 1..4096 {
+        prev = hmac_sha256(b"pencil", &prev);
+        for (acc, byte) in salted.iter_mut().zip(prev) {
+            *acc ^= byte;
+        }
+    }
+    let auth_message = format!(
+        "{},{},{}",
+        String::from_utf8_lossy(&transcript[0]),
+        String::from_utf8_lossy(&transcript[1]),
+        without_proof
+    );
+    let client_key = hmac_sha256(&salted, b"Client Key");
+    let signature = hmac_sha256(&Sha256::digest(client_key), auth_message.as_bytes());
+    let expected: Vec<u8> = client_key.iter().zip(signature).map(|(key, sig)| key ^ sig).collect();
+    assert_eq!(proof, expected);
+    let server_sig = hmac_sha256(&hmac_sha256(&salted, b"Server Key"), auth_message.as_bytes());
+    format!("v={}", STANDARD.encode(server_sig)).into_bytes()
+}
+
+#[test]
+fn scram_login_then_disconnect_recovers() {
+    let (mut net, server_group, addr) = setup();
+    let mut pg = Postgres::new(addr).with_credentials("user", "pencil");
+    let mut server = FakeServer::paced(usize::MAX);
+    let mut outcomes = Vec::new();
+    let mut seen = Vec::new();
+    let salt = b"fixed-salt-16byte";
+    let mut transcript = Vec::new();
+    let mut dropped = false;
+    let first = pg.query("SELECT 1").unwrap();
+    let mut second = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && outcomes.len() < 2 {
+        tick(
+            &mut net,
+            &mut pg,
+            server_group,
+            &mut server,
+            &mut outcomes,
+            &mut seen,
+            |server, token, msg| {
+                match msg {
+                    ClientMsg::Startup(_) => {
+                        let mut body = Vec::from(&b"SCRAM-SHA-256\0"[..]);
+                        body.push(0);
+                        server.reply(token, &auth(10, &body));
+                    }
+                    ClientMsg::Password(message) => {
+                        if transcript.is_empty() {
+                            assert!(message.starts_with(b"SCRAM-SHA-256\0"));
+                            let len =
+                                u32::from_be_bytes(message[14..18].try_into().unwrap()) as usize;
+                            let first = &message[18..18 + len];
+                            let cnonce = first.strip_prefix(b"n,,n=user,r=").unwrap();
+                            let server_first = format!(
+                                "r={},s={},i=4096",
+                                String::from_utf8_lossy(cnonce).into_owned() + "SERVER123",
+                                STANDARD.encode(salt),
+                            );
+                            transcript.push(first[3..].to_vec());
+                            transcript.push(server_first.as_bytes().to_vec());
+                            server.reply(token, &auth(11, server_first.as_bytes()));
+                        } else {
+                            let server_final = scram_server_check(&transcript, salt, &message);
+                            transcript.clear();
+                            let mut reply = auth(12, &server_final);
+                            reply.extend_from_slice(&auth(0, &[]));
+                            reply.extend_from_slice(&ready());
+                            server.reply(token, &reply);
+                        }
+                    }
+                    ClientMsg::Query(_) if !dropped => {
+                        dropped = true;
+                        return true;
+                    }
+                    ClientMsg::Query(_) => {
+                        let mut reply = complete("SELECT 1");
+                        reply.extend_from_slice(&ready());
+                        server.reply(token, &reply);
+                    }
+                    msg => panic!("unexpected {msg:?}"),
+                }
+                false
+            },
+        );
+        if dropped && second.is_none() {
+            second = pg.query("SELECT 1");
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (_, result) = outcome_of(&outcomes, first);
+    assert_eq!(result.as_ref().unwrap_err(), &Error::Disconnected);
+    let (_, result) = outcome_of(&outcomes, second.unwrap());
+    assert_eq!(result.as_ref().unwrap().tag, "SELECT 1");
 }

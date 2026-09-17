@@ -1,7 +1,8 @@
 //! `COPY ... (FORMAT BINARY)` encoding of `serde::Serialize` rows.
 //!
 //! [`encode`] appends one tuple to a body framed by [`header`] and
-//! [`trailer`]; [`copy_statement`] names the columns after the row's fields.
+//! [`trailer`]; [`copy_statement`] and [`encode_columns`] name the columns
+//! after the row's fields.
 //! Integers are big-endian and widen to the smallest holding Postgres type
 //! (`u128`/`i128` to `numeric`); enums, `char`, maps, and sequences are
 //! rejected; wrap byte strings in [`crate::Bytea`].
@@ -42,9 +43,27 @@ pub fn trailer(out: &mut Vec<u8>) {
 }
 
 pub fn encode<T: Serialize + ?Sized>(out: &mut Vec<u8>, row: &T) -> Result<(), Error> {
+    encode_inner(out, row, None)
+}
+
+/// Encodes one tuple and replaces `columns` with its column names.
+pub fn encode_columns<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    row: &T,
+    columns: &mut Vec<&'static str>,
+) -> Result<(), Error> {
+    columns.clear();
+    encode_inner(out, row, Some(columns))
+}
+
+fn encode_inner<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    row: &T,
+    columns: Option<&mut Vec<&'static str>>,
+) -> Result<(), Error> {
     let pos = out.len();
     out.extend_from_slice(&[0, 0]);
-    let mut encoder = Encoder { out, columns: None, depth: 0, fields: 0 };
+    let mut encoder = Encoder { out, columns, depth: 0, fields: 0 };
     row.serialize(&mut encoder)?;
     let count =
         i16::try_from(encoder.fields).map_err(|_| Error("row has too many fields".to_owned()))?;
@@ -54,9 +73,8 @@ pub fn encode<T: Serialize + ?Sized>(out: &mut Vec<u8>, row: &T) -> Result<(), E
 
 pub fn copy_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<String, Error> {
     let mut scratch = Vec::new();
-    let mut encoder = Encoder { out: &mut scratch, columns: Some(Vec::new()), depth: 0, fields: 0 };
-    row.serialize(&mut encoder)?;
-    let columns = encoder.columns.take().unwrap_or_default();
+    let mut columns = Vec::new();
+    encode_columns(&mut scratch, row, &mut columns)?;
     if columns.is_empty() {
         return Err(unsupported("a row that is not a struct"))
     }
@@ -70,7 +88,7 @@ pub fn copy_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<Str
 
 struct Encoder<'a> {
     out: &'a mut Vec<u8>,
-    columns: Option<Vec<&'static str>>,
+    columns: Option<&'a mut Vec<&'static str>>,
     depth: usize,
     fields: usize,
 }
