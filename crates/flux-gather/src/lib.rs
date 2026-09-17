@@ -16,7 +16,8 @@
 //! See `tests/e2e.rs` for the complete example.
 //! Tiles do not park by default. Do not opt `BlobReceiver` or a tile that
 //! drives `BlobShipper`/`BlobWriter` into parking: nothing on the spine wakes
-//! a tile that waits on a socket or a disk ring.
+//! a tile that waits on a socket or a disk ring. Dead endpoints that never
+//! connected shed their backlog automatically.
 pub mod queues;
 pub mod reader;
 pub mod receiver;
