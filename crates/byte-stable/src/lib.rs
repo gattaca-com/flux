@@ -210,6 +210,6 @@ unsafe impl<const BITS: usize, const LIMBS: usize> ByteStable
         }
         let mut limb = [0u8; 8];
         limb.copy_from_slice(&bytes[bytes.len() - 8..]);
-        u64::from_le_bytes(limb) & !Self::MASK == 0
+        u64::from_ne_bytes(limb) & !Self::MASK == 0
     }
 }
