@@ -248,12 +248,23 @@ macro_rules! __versioned_enum_inner {
 /// Like [`versioned_struct`], but the latest version also derives
 /// [`TelemetrySchema`] so it is queryable. With `persist = "dir"` the type
 /// also gets a [`VersionedPersistable`] home under that directory.
+/// Accepts the same `#[wire_name = ".."]` and `persist` forms as
+/// [`versioned_struct`] and [`versioned_enum`].
 ///
 /// Schema-only field attributes (`#[telemetry_schema(..)]`) may be written
 /// on any version; they describe the final shape and are stripped from older
 /// versions' expansions.
 #[macro_export]
 macro_rules! versioned_telemetry {
+    (#[wire_name = $wire:literal] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {
+        $crate::__versioned_telemetry_inner!(#[wire_name = $wire] $name => $($tokens)*);
+        impl $crate::VersionedPersistable for $name {
+            const PERSIST_DIR: &'static str = $dir;
+        }
+    };
+    (#[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::__versioned_telemetry_inner!(#[wire_name = $wire] $name => $($tokens)*);
+    };
     ($name:ident, persist = $dir:expr => $($tokens:tt)*) => {
         $crate::__versioned_telemetry_inner!($name => $($tokens)*);
         impl $crate::VersionedPersistable for $name {
@@ -268,6 +279,17 @@ macro_rules! versioned_telemetry {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __versioned_telemetry_inner {
+    (#[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_struct! {
+            #[wire_name = $wire]
+            roll_into $name
+            final_attrs {
+                #[derive($crate::TelemetrySchema)]
+            }
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
     ($name:ident => $($tokens:tt)*) => {
         $crate::evolve_struct! {
             roll_into $name
