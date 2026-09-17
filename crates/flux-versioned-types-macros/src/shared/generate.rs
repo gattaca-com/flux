@@ -54,9 +54,56 @@ pub(crate) fn without_schema_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
     attrs.iter().filter(|attr| !attr.path().is_ident("telemetry_schema")).cloned().collect()
 }
 
+// `#[wire_skip]` on a version block opts that version out of the byte-stable
+// wire; stripped before the version's item is emitted.
+pub(crate) fn version_wire_skip(attrs: &[Attribute]) -> Option<&Attribute> {
+    attrs.iter().find(|attr| attr.path().is_ident("wire_skip"))
+}
+
+pub(crate) fn strip_wire_skip(attrs: &[Attribute]) -> Vec<Attribute> {
+    attrs.iter().filter(|attr| !attr.path().is_ident("wire_skip")).cloned().collect()
+}
+
+// Reads per-version `#[wire_skip]` markers, reporting redundant markers and
+// a skipped newest version. Returns base + evolution markers in order.
+fn version_skips<B: Named, E: Named>(
+    input: &EvolveInputGeneric<B, E>,
+    errors: &mut TokenStream2,
+) -> (bool, Vec<bool>) {
+    let base = version_wire_skip(input.base.attrs()).is_some();
+    let evos: Vec<bool> =
+        input.evolutions.iter().map(|ev| version_wire_skip(ev.attrs()).is_some()).collect();
+    if input.wire_skip {
+        if let Some(attr) = version_wire_skip(input.base.attrs()) {
+            errors.extend(
+                syn::Error::new_spanned(attr, "chain is already wire_skip").to_compile_error(),
+            );
+        }
+        for ev in &input.evolutions {
+            if let Some(attr) = version_wire_skip(ev.attrs()) {
+                errors.extend(
+                    syn::Error::new_spanned(attr, "chain is already wire_skip").to_compile_error(),
+                );
+            }
+        }
+    } else {
+        let newest = input.evolutions.last().map_or_else(|| input.base.attrs(), |ev| ev.attrs());
+        if let Some(attr) = newest.iter().find(|attr| attr.path().is_ident("wire_skip")) {
+            errors.extend(
+                syn::Error::new_spanned(
+                    attr,
+                    "the newest version cannot be wire_skip; use a chain-level #[wire_skip]",
+                )
+                .to_compile_error(),
+            );
+        }
+    }
+    (base, evos)
+}
+
 pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     input: &mut EvolveInputGeneric<B, E>,
-    generate_base: impl FnOnce(&EvolveInputGeneric<B, E>) -> (TokenStream2, Vec<Item>),
+    generate_base: impl FnOnce(&EvolveInputGeneric<B, E>, bool) -> (TokenStream2, Vec<Item>),
     generate_step: impl Fn(&E, &[Attribute], &[Item], &Ident, bool, bool) -> (TokenStream2, Vec<Item>),
 ) -> TokenStream2 {
     if input.wire_skip && input.wire_name.is_some() {
@@ -90,11 +137,19 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
             );
         }
     }
+    let (base_skipped, evo_skipped) = version_skips(input, &mut errors);
     if !errors.is_empty() {
         return errors;
     }
+    // Not a real Rust attribute: strip before emitting version items.
+    let kept = strip_wire_skip(input.base.attrs());
+    *input.base.attrs_mut() = kept;
+    for ev in &mut input.evolutions {
+        let kept = strip_wire_skip(ev.attrs());
+        *ev.attrs_mut() = kept;
+    }
 
-    let (base_output, mut current) = generate_base(input);
+    let (base_output, mut current) = generate_base(input, input.wire_skip || base_skipped);
     let mut output = base_output;
     let mut prev_name = input.base.name().clone();
 
@@ -106,7 +161,7 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
             &current,
             &prev_name,
             is_final,
-            input.wire_skip,
+            input.wire_skip || evo_skipped[index],
         );
         output.extend(ev_output);
         current = new_items;
@@ -118,11 +173,14 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
         for ev in &input.evolutions {
             version_names.push(ev.name().clone());
         }
+        let mut skipped = vec![input.wire_skip || base_skipped];
+        skipped.extend(evo_skipped.iter().map(|skipped| input.wire_skip || *skipped));
         output.extend(crate::rolling::generate::generate_roll_chain(
             roll_name,
             &version_names,
             input.wire_name.as_ref(),
             input.wire_skip,
+            &skipped,
         ));
     }
 

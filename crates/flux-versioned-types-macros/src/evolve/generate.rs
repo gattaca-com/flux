@@ -76,7 +76,10 @@ pub(crate) fn generate_struct_def(
     }
 }
 
-pub(crate) fn generate_base_struct(input: &EvolveInput) -> (TokenStream2, Vec<FieldInfo>) {
+pub(crate) fn generate_base_struct(
+    input: &EvolveInput,
+    wire_skip: bool,
+) -> (TokenStream2, Vec<FieldInfo>) {
     let is_final = input.evolutions.is_empty();
     let fields: Vec<_> = input
         .base
@@ -96,7 +99,7 @@ pub(crate) fn generate_base_struct(input: &EvolveInput) -> (TokenStream2, Vec<Fi
         &input.default_attrs,
         &input.base.attrs,
         &fields,
-        input.wire_skip,
+        wire_skip,
     );
 
     let field_infos = input.base.items.iter().map(FieldInfo::from_struct_field).collect();

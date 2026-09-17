@@ -79,7 +79,8 @@ macro_rules! impl_versioned_deserialize {
 /// Define an evolving struct and its hash-directed decoder.
 ///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
-/// padding-free `Copy`; it excludes `#[wire_name]`.
+/// padding-free `Copy`; it excludes `#[wire_name]`. A `#[wire_skip]` on one
+/// version opts just that version out.
 #[macro_export]
 macro_rules! versioned_struct {
     (#[wire_skip] #[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
@@ -132,7 +133,8 @@ macro_rules! versioned_struct {
 /// home under that directory.
 ///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
-/// padding-free `Copy`; it excludes `#[wire_name]`.
+/// padding-free `Copy`; it excludes `#[wire_name]`. A `#[wire_skip]` on one
+/// version opts just that version out.
 #[macro_export]
 macro_rules! versioned_enum {
     (#[wire_skip] #[wire_name = $wire:literal] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {

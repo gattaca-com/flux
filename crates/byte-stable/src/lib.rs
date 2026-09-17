@@ -86,7 +86,7 @@ macro_rules! impl_any_pattern {
     )*};
 }
 
-impl_any_pattern!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+impl_any_pattern!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);
 
 // Safety: one byte, valid iff 0 or 1.
 unsafe impl ByteStable for bool {

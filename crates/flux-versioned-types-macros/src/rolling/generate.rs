@@ -50,6 +50,7 @@ pub(crate) fn generate_roll_chain(
     version_names: &[Ident],
     wire_name: Option<&syn::LitStr>,
     wire_skip: bool,
+    version_skipped: &[bool],
 ) -> TokenStream2 {
     let version_refs: Vec<&Ident> = version_names.iter().collect();
     let Some(ctx) = RollChainContext::new(roll_into, &version_refs) else {
@@ -58,7 +59,12 @@ pub(crate) fn generate_roll_chain(
     let mut output = generate_type_alias_and_codec(&ctx);
     output.extend(generate_transitive_into_impls(&version_refs));
     if !wire_skip {
-        output.extend(generate_versioned_impls(roll_into, &version_refs, wire_name));
+        output.extend(generate_versioned_impls(
+            roll_into,
+            &version_refs,
+            wire_name,
+            version_skipped,
+        ));
     }
     output
 }
@@ -67,13 +73,22 @@ fn generate_versioned_impls(
     alias: &Ident,
     versions: &[&Ident],
     wire_name: Option<&syn::LitStr>,
+    version_skipped: &[bool],
 ) -> TokenStream2 {
     let Some(&last) = versions.last() else {
         return TokenStream2::new();
     };
     let name_tokens =
         wire_name.map_or_else(|| quote! { stringify!(#alias) }, |lit| quote! { #lit });
-    let decode_arms = versions.iter().map(|version| {
+    // Skipped versions keep the bincode path only: no size or decode arms,
+    // so both fall through to `None` / `UnknownTypeHash`.
+    let wired: Vec<&Ident> = versions
+        .iter()
+        .zip(version_skipped.iter().chain(std::iter::repeat(&false)))
+        .filter(|(_, skipped)| !**skipped)
+        .map(|(version, _)| *version)
+        .collect();
+    let decode_arms = wired.iter().map(|version| {
         let migrate = if *version == last {
             quote! { Ok(slice.to_vec()) }
         } else {
@@ -113,11 +128,11 @@ fn generate_versioned_impls(
         impl ::flux_versioned_types::Versioned for #last {
             const NAME: &'static str = #name_tokens;
             const VERSION_HASHES: &'static [u64] = &[
-                #(<#versions as flux::type_hash::TypeHash>::TYPE_HASH,)*
+                #(<#wired as flux::type_hash::TypeHash>::TYPE_HASH,)*
             ];
             fn version_size(type_hash: u64) -> Option<usize> {
                 match type_hash {
-                    #(<#versions as flux::type_hash::TypeHash>::TYPE_HASH => Some(::core::mem::size_of::<#versions>()),)*
+                    #(<#wired as flux::type_hash::TypeHash>::TYPE_HASH => Some(::core::mem::size_of::<#wired>()),)*
                     _ => None,
                 }
             }

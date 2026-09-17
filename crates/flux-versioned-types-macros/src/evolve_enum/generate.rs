@@ -216,14 +216,17 @@ fn generate_into_impl(
     }
 }
 
-pub(crate) fn generate_base_enum(input: &EvolveEnumInput) -> (TokenStream2, Vec<EnumVariant>) {
+pub(crate) fn generate_base_enum(
+    input: &EvolveEnumInput,
+    wire_skip: bool,
+) -> (TokenStream2, Vec<EnumVariant>) {
     let output = generate_enum_def(
         &input.base.name,
         &input.default_attrs,
         &input.base.attrs,
         &input.base.items,
         input.evolutions.is_empty(),
-        input.wire_skip,
+        wire_skip,
     );
 
     (output, input.base.items.clone())
