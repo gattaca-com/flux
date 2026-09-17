@@ -73,8 +73,11 @@ enum Family {
 }
 ```
 
-Family variants are newtypes of leaves or families; the same field type twice
-is an error.
+Family variants are newtypes of leaves or families. A blob is identified by
+its wire name (which message) and its type hash (which version). The name is
+the leaf's `NAME` unless the variant sets `#[leaves(name = "..")]`, so one
+leaf type can sit at several positions; names must be unique across the tree
+and the derive checks that at compile time.
 
 ## Zero-copy blobs
 

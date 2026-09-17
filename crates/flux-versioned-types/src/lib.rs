@@ -18,8 +18,32 @@ pub use blob::{
 };
 pub use byte_stable::{self, ByteStable};
 pub use byte_stable_derive::ByteStable;
+/// A leaf type reachable under one wire name from two variants does not build:
+///
+/// ```compile_fail
+/// use flux::type_hash_derive::type_hash_lock;
+/// use flux_versioned_types::{VersionedLeaves, versioned_struct};
+/// versioned_struct!(Leaf => #[type_hash_lock(hash = 10148638565996157175)] LeafV1 { pub v: u64 });
+/// #[derive(Clone, Copy, VersionedLeaves)]
+/// enum Sub { A(Leaf) }
+/// #[derive(Clone, Copy, VersionedLeaves)]
+/// enum Fam { S(Sub), L(Leaf) }
+/// ```
+///
+/// A name override on a variant that holds a sub-family does not build:
+///
+/// ```compile_fail
+/// use flux::type_hash_derive::type_hash_lock;
+/// use flux_versioned_types::{VersionedLeaves, versioned_struct};
+/// versioned_struct!(Leaf => #[type_hash_lock(hash = 10148638565996157175)] LeafV1 { pub v: u64 });
+/// #[derive(Clone, Copy, VersionedLeaves)]
+/// enum Sub { A(Leaf) }
+/// #[derive(Clone, Copy, VersionedLeaves)]
+/// enum Fam { #[leaves(name = "x")] S(Sub) }
+/// ```
+pub use flux_versioned_types_macros::VersionedLeaves;
 pub use flux_versioned_types_macros::{
-    TelemetrySchema, VersionedLeaves, evolve_enum, evolve_struct, roll_chain_into,
+    TelemetrySchema, evolve_enum, evolve_struct, roll_chain_into,
 };
 pub use leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf};
 pub use raw::{Blob, BlobCache, BlobHeader, DecodeError, Scratch};

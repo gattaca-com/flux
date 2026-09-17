@@ -51,12 +51,30 @@ enum Sub {
     Ignored,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
+enum Tx {
+    #[leaves(name = "Tx.Included")]
+    Included(Flag),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
+enum Bundle {
+    #[leaves(name = "Bundle.Included")]
+    Included(Flag),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
+enum Telemetry {
+    Bundle(Bundle),
+    Tx(Tx),
+}
+
 struct Counter {
     n: usize,
 }
 
 impl VisitorVersionedLeaf for Counter {
-    fn visit_leaf<L: Versioned>(&mut self, _leaf: &L) {
+    fn visit_leaf<L: Versioned>(&mut self, _name: &'static str, _leaf: &L) {
         self.n += 1;
     }
 }
@@ -322,6 +340,30 @@ fn family_blobs_decode_to_variants() {
         }
     }
     assert!(saw_leaf && saw_kind);
+
+    // The same leaf type at two positions with distinct names stays apart.
+    let mut cache = BlobCache::new();
+    cache.push(&InternalMessage::new(
+        stamp(4, 4),
+        Telemetry::Bundle(Bundle::Included(Flag { ok: true })),
+    ));
+    cache.push(&InternalMessage::new(stamp(5, 5), Telemetry::Tx(Tx::Included(Flag { ok: false }))));
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
+    assert_eq!(blobs.len(), 2);
+    let mut decoded = Vec::new();
+    for bytes in &blobs {
+        let blob = a.load(bytes).unwrap();
+        assert!(blob.is::<Flag>());
+        let (_, msgs) = Telemetry::decode_blob::<MetaV1>(blob, &mut b).unwrap().unwrap();
+        decoded.push((blob.type_name().to_owned(), *msgs[0].data()));
+    }
+    decoded.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(decoded, vec![
+        ("Bundle.Included".to_owned(), Telemetry::Bundle(Bundle::Included(Flag { ok: true }))),
+        ("Tx.Included".to_owned(), Telemetry::Tx(Tx::Included(Flag { ok: false }))),
+    ]);
+    assert_eq!(Telemetry::LEAF_NAMES, &["Bundle.Included", "Tx.Included"]);
 
     let mut counter = Counter { n: 0 };
     Fam::Unrelated.visit_leaf(&mut counter);

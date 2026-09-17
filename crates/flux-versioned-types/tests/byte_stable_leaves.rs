@@ -62,8 +62,8 @@ struct Rec {
 }
 
 impl VisitorVersionedLeaf for Rec {
-    fn visit_leaf<L: Versioned>(&mut self, _leaf: &L) {
-        self.names.push(L::NAME);
+    fn visit_leaf<L: Versioned>(&mut self, name: &'static str, _leaf: &L) {
+        self.names.push(name);
     }
 }
 

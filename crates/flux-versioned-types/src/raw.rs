@@ -289,7 +289,7 @@ fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[TrackingTimestampWire], De
 }
 
 struct TypedBuffer {
-    name: &'static str,
+    type_hash: u64,
     n_messages: u32,
     publish_t_first: Nanos,
     publish_t_last: Nanos,
@@ -301,7 +301,7 @@ struct TypedBuffer {
 /// per type.
 #[derive(Default)]
 pub struct BlobCache {
-    buffers: HashMap<u64, TypedBuffer>,
+    buffers: HashMap<&'static str, TypedBuffer>,
     build: Scratch,
 }
 
@@ -333,7 +333,7 @@ impl BlobCache {
         zstd_level: i32,
         mut sink: impl FnMut(&Blob),
     ) {
-        let mut keys: Vec<u64> = self
+        let mut keys: Vec<&'static str> = self
             .buffers
             .iter()
             .filter(|(_, buf)| buf.n_messages > 0)
@@ -341,8 +341,8 @@ impl BlobCache {
             .collect();
         keys.sort_unstable();
         let Self { buffers, build } = self;
-        for key in keys {
-            let buf = &buffers[&key];
+        for name in keys {
+            let buf = &buffers[name];
             let meta_bytes = ByteStable::as_bytes(user_meta);
             let meta_pad = meta_bytes.len().next_multiple_of(ALIGN);
             let mut plain = Vec::with_capacity(buf.timestamps.len() + buf.leaves.len());
@@ -357,13 +357,13 @@ impl BlobCache {
                 metadata_len: meta_bytes.len() as u32,
                 n_messages: buf.n_messages,
                 _reserved: 0,
-                type_hash: key,
+                type_hash: buf.type_hash,
                 metadata_type_hash: U::TYPE_HASH,
                 compressed_len: comp.len() as u64,
                 decompressed_len: plain.len() as u64,
                 publish_t_first: buf.publish_t_first,
                 publish_t_last: buf.publish_t_last,
-                type_name: ArrayStr::from_str_truncate(buf.name),
+                type_name: ArrayStr::from_str_truncate(name),
             };
             build.resize(size_of::<BlobHeader>() + meta_pad + comp_pad);
             let (head, tail) = build.as_mut_bytes().split_at_mut(size_of::<BlobHeader>());
@@ -387,11 +387,11 @@ struct Push<'a> {
 }
 
 impl VisitorVersionedLeaf for Push<'_> {
-    fn visit_leaf<L: Versioned>(&mut self, leaf: &L) {
+    fn visit_leaf<L: Versioned>(&mut self, name: &'static str, leaf: &L) {
         const { assert!(align_of::<L>() <= ALIGN) };
         let timestamp = self.timestamp;
-        let buf = self.cache.buffers.entry(L::TYPE_HASH).or_insert_with(|| TypedBuffer {
-            name: L::NAME,
+        let buf = self.cache.buffers.entry(name).or_insert_with(|| TypedBuffer {
+            type_hash: L::TYPE_HASH,
             n_messages: 0,
             publish_t_first: Nanos(0),
             publish_t_last: Nanos(0),

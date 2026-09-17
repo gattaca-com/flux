@@ -1,6 +1,7 @@
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as Tokens;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, parse_macro_input};
+use syn::{Data, DeriveInput, Fields, LitStr, parse_macro_input};
 
 pub fn derive_versioned_leaves(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -10,7 +11,123 @@ pub fn derive_versioned_leaves(input: TokenStream) -> TokenStream {
     }
 }
 
-fn generate(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+struct Kept<'a> {
+    variant: &'a syn::Ident,
+    ty: &'a syn::Type,
+    name: Option<LitStr>,
+}
+
+type Skipped<'a> = (&'a syn::Ident, &'a Fields);
+
+impl Kept<'_> {
+    /// The wire names this variant contributes.
+    fn names(&self) -> Tokens {
+        let ty = self.ty;
+        self.name.as_ref().map_or_else(
+            || quote! { <#ty as ::flux_versioned_types::HasVersionedLeaves>::LEAF_NAMES },
+            |n| quote! { &[#n] },
+        )
+    }
+
+    fn names_len(&self) -> Tokens {
+        let ty = self.ty;
+        self.name.as_ref().map_or_else(
+            || quote! { <#ty as ::flux_versioned_types::HasVersionedLeaves>::LEAF_NAMES.len() },
+            |_| quote! { 1 },
+        )
+    }
+
+    fn visit_arm(&self) -> Tokens {
+        let (v, ty) = (self.variant, self.ty);
+        // Calling the visitor directly needs `ty: Versioned`, so a name
+        // override on a sub-family variant is a type error.
+        self.name.as_ref().map_or_else(
+            || quote! { Self::#v(x) => x.visit_leaf(visitor) },
+            |n| quote! { Self::#v(x) => visitor.visit_leaf::<#ty>(#n, x) },
+        )
+    }
+
+    fn decode_step(&self) -> Tokens {
+        let (v, ty) = (self.variant, self.ty);
+        let wrap = quote! {
+            |(meta, msgs): (U, Vec<_>)| (meta, msgs.into_iter().map(|m| m.map(Self::#v)).collect())
+        };
+        self.name.as_ref().map_or_else(
+            || {
+                quote! {
+                    if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob::<U>(blob, scratch) {
+                        return Some(found.map(#wrap));
+                    }
+                }
+            },
+            |n| {
+                quote! {
+                    if blob.type_name() == #n && blob.is::<#ty>() {
+                        return Some(blob.decode::<U, #ty>(scratch).map(#wrap));
+                    }
+                }
+            },
+        )
+    }
+}
+
+fn parse_variants(data: &syn::DataEnum) -> syn::Result<(Vec<Kept<'_>>, Vec<Skipped<'_>>)> {
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for variant in &data.variants {
+        let mut skip = false;
+        let mut name = None;
+        for attr in variant.attrs.iter().filter(|a| a.path().is_ident("leaves")) {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("skip") {
+                    skip = true;
+                } else if meta.path.is_ident("name") {
+                    name = Some(meta.value()?.parse::<LitStr>()?);
+                } else {
+                    return Err(meta.error("expected `skip` or `name = \"..\"`"));
+                }
+                Ok(())
+            })?;
+        }
+        if skip {
+            skipped.push((&variant.ident, &variant.fields));
+            continue;
+        }
+        let ty = match &variant.fields {
+            Fields::Unnamed(f) if f.unnamed.len() == 1 => &f.unnamed[0].ty,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &variant.ident,
+                    "VersionedLeaves variants must have exactly one unnamed field; use #[leaves(skip)] to exclude",
+                ));
+            }
+        };
+        kept.push(Kept { variant: &variant.ident, ty, name });
+    }
+    Ok((kept, skipped))
+}
+
+fn checks(family: &str, kept: &[Kept<'_>]) -> Tokens {
+    let pairs = kept.iter().enumerate().flat_map(|(i, a)| {
+        kept.iter().skip(i + 1).map(move |b| {
+            let msg = format!(
+                "family `{family}`: variants `{}` and `{}` reach the same wire name; set #[leaves(name = \"..\")] on one",
+                a.variant, b.variant
+            );
+            let (na, nb) = (a.names(), b.names());
+            quote! { assert!(::flux_versioned_types::leaves::names_disjoint(#na, #nb), #msg); }
+        })
+    });
+    let fits = kept.iter().filter_map(|k| {
+        let n = k.name.as_ref()?;
+        let msg =
+            format!("family `{family}`: wire name of `{}` is longer than TYPE_NAME_LEN", k.variant);
+        Some(quote! { assert!(::flux_versioned_types::leaves::name_fits(#n), #msg); })
+    });
+    quote! { #(#pairs)* #(#fits)* }
+}
+
+fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
     let Data::Enum(data) = &input.data else {
         return Err(syn::Error::new_spanned(
             &input.ident,
@@ -19,85 +136,47 @@ fn generate(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     };
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let (kept, skipped) = parse_variants(data)?;
 
-    let mut kept: Vec<(&syn::Ident, &syn::Type)> = Vec::new();
-    let mut skipped: Vec<(&syn::Ident, &Fields)> = Vec::new();
-    let mut seen: std::collections::HashMap<String, &syn::Ident> = std::collections::HashMap::new();
-    for variant in &data.variants {
-        let mut skip = false;
-        for attr in &variant.attrs {
-            if attr.path().is_ident("leaves") {
-                attr.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("skip") {
-                        skip = true;
-                        Ok(())
-                    } else {
-                        Err(meta.error("expected `skip`"))
+    let visit_kept = kept.iter().map(Kept::visit_arm);
+    let visit_skipped = skipped.iter().map(|(v, fields)| match fields {
+        Fields::Named(_) => quote! { Self::#v { .. } => {} },
+        Fields::Unnamed(_) => quote! { Self::#v(..) => {} },
+        Fields::Unit => quote! { Self::#v => {} },
+    });
+    let leaf_names = kept.iter().map(Kept::names);
+    let leaf_names_len = kept.iter().map(Kept::names_len);
+    let decode_steps = kept.iter().map(Kept::decode_step);
+    // `From` only for field types that appear once; a repeated type has no
+    // single variant to map to.
+    let type_key = |ty: &syn::Type| quote! { #ty }.to_string();
+    let from_impls = kept
+        .iter()
+        .filter(|k| kept.iter().filter(|o| type_key(o.ty) == type_key(k.ty)).count() == 1)
+        .map(|k| {
+            let (v, ty) = (k.variant, k.ty);
+            quote! {
+                impl #impl_generics From<#ty> for #name #ty_generics #where_clause {
+                    fn from(x: #ty) -> Self {
+                        Self::#v(x)
                     }
-                })?;
-            }
-        }
-        if skip {
-            skipped.push((&variant.ident, &variant.fields));
-            continue;
-        }
-        let Fields::Unnamed(fields) = &variant.fields else {
-            return Err(syn::Error::new_spanned(
-                &variant.ident,
-                "VersionedLeaves variants must have exactly one unnamed field; use #[leaves(skip)] to exclude",
-            ));
-        };
-        if fields.unnamed.len() != 1 {
-            return Err(syn::Error::new_spanned(
-                &variant.ident,
-                "VersionedLeaves variants must have exactly one unnamed field; use #[leaves(skip)] to exclude",
-            ));
-        }
-        let ty = &fields.unnamed[0].ty;
-        let key = quote! { #ty }.to_string();
-        if let Some(first) = seen.get(&key) {
-            return Err(syn::Error::new_spanned(
-                &variant.ident,
-                format!("duplicate leaf type also used by variant `{first}`; ambiguous `From`",),
-            ));
-        }
-        seen.insert(key, &variant.ident);
-        kept.push((&variant.ident, ty));
-    }
-
-    let visit_kept = kept.iter().map(|(vname, _)| {
-        quote! { Self::#vname(x) => x.visit_leaf(visitor) }
-    });
-    let visit_skipped = skipped.iter().map(|(vname, fields)| match fields {
-        Fields::Named(_) => quote! { Self::#vname { .. } => {} },
-        Fields::Unnamed(_) => quote! { Self::#vname(..) => {} },
-        Fields::Unit => quote! { Self::#vname => {} },
-    });
-    let decode_steps = kept.iter().map(|(_, ty)| {
-        quote! {
-            if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob::<U>(blob, scratch) {
-                return Some(found.map(|(meta, msgs)| {
-                    (meta, msgs.into_iter().map(|m| m.map(Self::from)).collect())
-                }));
-            }
-        }
-    });
-    let from_impls = kept.iter().map(|(vname, ty)| {
-        quote! {
-            impl #impl_generics From<#ty> for #name #ty_generics #where_clause {
-                fn from(x: #ty) -> Self {
-                    Self::#vname(x)
                 }
             }
-        }
-    });
+        });
+    let checks = checks(&name.to_string(), &kept);
+    let eager = input.generics.params.is_empty().then(|| quote! { const _: () = { #checks }; });
 
     Ok(quote! {
+        #eager
         impl #impl_generics ::flux_versioned_types::HasVersionedLeaves for #name #ty_generics #where_clause {
+            const LEAF_NAMES: &'static [&'static str] = &::flux_versioned_types::leaves::concat_names::<
+                { 0 #(+ #leaf_names_len)* }
+            >(&[#(#leaf_names),*]);
             fn visit_leaf<V: ::flux_versioned_types::VisitorVersionedLeaf>(
                 &self,
                 visitor: &mut V,
             ) {
+                const { #checks };
                 match self {
                     #(#visit_kept,)*
                     #(#visit_skipped,)*

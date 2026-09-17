@@ -132,18 +132,24 @@ fn generate_versioned_impls(
             }
         }
 
+        const _: () = assert!(
+            ::flux_versioned_types::leaves::name_fits(#name_tokens),
+            "wire name longer than TYPE_NAME_LEN"
+        );
+
         impl ::flux_versioned_types::HasVersionedLeaves for #last {
+            const LEAF_NAMES: &'static [&'static str] = &[#name_tokens];
             fn visit_leaf<V: ::flux_versioned_types::VisitorVersionedLeaf>(
                 &self,
                 visitor: &mut V,
             ) {
-                visitor.visit_leaf(self);
+                visitor.visit_leaf(#name_tokens, self);
             }
             fn decode_blob<U: ::flux_versioned_types::Versioned>(
                 blob: &::flux_versioned_types::Blob,
                 scratch: &mut ::flux_versioned_types::Scratch,
             ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
-                if blob.is::<Self>() {
+                if blob.type_name() == #name_tokens && blob.is::<Self>() {
                     Some(blob.decode::<U, Self>(scratch))
                 } else {
                     None
