@@ -31,14 +31,14 @@ pub(crate) fn generate_type_alias_and_codec(ctx: &RollChainContext) -> TokenStre
 
         impl #last {
             #[inline]
-            pub fn versioned_deserialize_vec(type_hash: u64, bytes: &[u8]) -> bincode::Result<Vec<Self>> {
+            pub fn versioned_deserialize_vec(type_hash: u64, bytes: &[u8]) -> ::flux_versioned_types::bincode::Result<Vec<Self>> {
                 match type_hash ^ 123456 {
                     #(<#previous as flux::type_hash::TypeHash>::TYPE_HASH => {
-                        let v: Vec<#previous> = bincode::deserialize(bytes)?;
+                        let v: Vec<#previous> = ::flux_versioned_types::bincode::deserialize(bytes)?;
                         Ok(v.into_iter().map(Into::into).collect())
                     },)*
-                    <#last as flux::type_hash::TypeHash>::TYPE_HASH => Ok(bincode::deserialize(bytes)?),
-                    _ => Err(Box::new(bincode::ErrorKind::Custom(format!("Invalid type hash: {}", type_hash)))),
+                    <#last as flux::type_hash::TypeHash>::TYPE_HASH => Ok(::flux_versioned_types::bincode::deserialize(bytes)?),
+                    _ => Err(Box::new(::flux_versioned_types::bincode::ErrorKind::Custom(format!("Invalid type hash: {}", type_hash)))),
                 }
             }
         }
