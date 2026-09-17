@@ -68,12 +68,10 @@ impl GatherSender {
         let meta = GatherMeta {
             slot,
             flush_t: Nanos::now(),
-            n_blobs: 0,
+            n_blobs: self.cache.n_blobs() as u64,
             instance_id: self.meta.instance_id,
             app: self.meta.app,
         };
-        // TODO(merge): use BlobCache::n_blobs — set meta.n_blobs from cache.n_blobs()
-        // after merge.
         self.cache.flush(&meta, self.zstd_level, |blob| {
             if !self.wire_skip.iter().any(|skip| skip.as_str() == blob.type_name()) {
                 if let Some(shipper) = self.shipper.as_mut() {

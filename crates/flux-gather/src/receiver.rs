@@ -30,8 +30,9 @@ pub struct IncomingBlob {
 pub struct GatherReceiverSpine {
     /// Tile registry.
     pub tile_info: ShmemData<TileInfo>,
-    /// `BlobReceiver` to `BlobRouter`. dcache = size x mtu bytes (zeroed alloc,
-    /// lazily backed).
+    /// `BlobReceiver` to `BlobRouter`. The dcache is a byte ring of
+    /// `size x mtu` bytes; a frame is only rejected when it exceeds the whole
+    /// ring.
     #[queue(size(2usize.pow(9)), mtu(16 * 1024 * 1024))]
     pub blobs: SpineQueue<IncomingBlob>,
     /// `BlobRouter` to `BlobReceiver`: peers to force-close (they did not send
@@ -44,33 +45,19 @@ pub struct GatherReceiverSpine {
 pub struct BlobReceiver {
     listen: SocketAddr,
     socket_buf_size: usize,
-    max_frame_size: usize,
     driver: Option<NetworkDriver>,
 }
 
 impl BlobReceiver {
-    /// Defaults: `64 MiB` socket buffer, `16 MiB` max frame matching the spine
-    /// dcache mtu.
+    /// Default `64 MiB` kernel socket buffer.
     pub fn new(listen: SocketAddr) -> Self {
-        Self {
-            listen,
-            socket_buf_size: 64 * 1024 * 1024,
-            max_frame_size: 16 * 1024 * 1024,
-            driver: None,
-        }
+        Self { listen, socket_buf_size: 64 * 1024 * 1024, driver: None }
     }
 
     /// Kernel `SO_SNDBUF`/`SO_RCVBUF` applied to the listener and accepted
     /// streams.
     pub fn with_socket_buf_size(mut self, bytes: usize) -> Self {
         self.socket_buf_size = bytes;
-        self
-    }
-
-    /// Largest accepted frame payload. Stored for symmetry with the sender-side
-    /// dcache mtu; the driver itself enforces no limit.
-    pub fn with_max_frame_size(mut self, bytes: usize) -> Self {
-        self.max_frame_size = bytes;
         self
     }
 }
