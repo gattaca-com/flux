@@ -28,7 +28,7 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
     let get = s3.get_object(&mut http, "bucket", "key").unwrap();
     let missing = s3.get_object(&mut http, "bucket", "missing").unwrap();
     let delete = s3.delete_object(&mut http, "bucket", "key").unwrap();
-    let list = s3.list_objects(&mut http, "bucket", Some("a/b")).unwrap();
+    let list = s3.list_objects(&mut http, "bucket", Some("a/b"), Some("t0ken")).unwrap();
     let mut requests = Vec::new();
     let mut outcomes = Vec::new();
     let mut puts = 0;
@@ -97,5 +97,9 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
     assert_eq!(puts.len(), 2);
     assert_eq!(puts[0].1, "/bucket/some%20key%2Ba/b");
     assert_eq!((&puts[0].2, &puts[0].4), (&puts[1].2, &puts[1].4));
-    assert!(requests.iter().any(|request| request.1 == "/bucket?list-type=2&prefix=a/b"));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.1 == "/bucket?continuation-token=t0ken&list-type=2&prefix=a/b")
+    );
 }

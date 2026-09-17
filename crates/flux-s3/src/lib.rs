@@ -34,6 +34,15 @@ pub enum Error<'a> {
     TimedOut,
 }
 
+impl From<Failure> for Error<'_> {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Disconnected => Self::Disconnected,
+            Failure::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
 impl<'a> Error<'a> {
     fn check(response: &HttpResponse<'a>) -> Result<&'a [u8], Self> {
         if (200..=299).contains(&response.status) {
@@ -70,7 +79,9 @@ impl S3 {
     ) -> Self {
         Self {
             pool: http.pool(net, addr, connections),
-            signer: sigv4::Signer::new(&addr.to_string(), "", "", "us-east-1"),
+            // Plain HTTP has no transport integrity, so the payload hash is
+            // the only thing binding a body to its signature.
+            signer: sigv4::Signer::new(&addr.to_string(), "", "", "us-east-1").hashing_payloads(),
         }
     }
     /// Like [`Self::new`] but over TLS to `addr`, sending and signing
@@ -126,16 +137,20 @@ impl S3 {
     ) -> Result<RequestId, Vec<u8>> {
         self.send(http, "DELETE", &object_resource(bucket, key), "", Vec::new())
     }
-    /// Queues a `ListObjectsV2` of `bucket`, returning the raw XML.
+    /// Queues a `ListObjectsV2` of `bucket`, returning the raw XML. A
+    /// truncated listing carries a `NextContinuationToken`; pass it back as
+    /// `continuation_token` for the next page.
     pub fn list_objects(
         &self,
         http: &mut HttpNetwork,
         bucket: &str,
         prefix: Option<&str>,
+        continuation_token: Option<&str>,
     ) -> Result<RequestId, Vec<u8>> {
         let mut resource = String::from("/");
         resource.push_str(bucket);
-        self.send(http, "GET", &resource, &list_query(prefix), Vec::new())
+        let query = list_query(prefix, continuation_token);
+        self.send(http, "GET", &resource, &query, Vec::new())
     }
     /// This client's result in a network event, if the event was one of its
     /// requests completing.
@@ -143,19 +158,8 @@ impl S3 {
         &self,
         event: &HttpEvent<'a>,
     ) -> Option<(RequestId, Result<&'a [u8], Error<'a>>)> {
-        match *event {
-            HttpEvent::Response { id: Some(id), ref response, .. } if id.pool() == self.pool => {
-                Some((id, Error::check(response)))
-            }
-            HttpEvent::Failed { id, reason } if id.pool() == self.pool => Some((
-                id,
-                Err(match reason {
-                    Failure::Disconnected => Error::Disconnected,
-                    Failure::TimedOut => Error::TimedOut,
-                }),
-            )),
-            _ => None,
-        }
+        let (id, result) = event.outcome(self.pool)?;
+        Some((id, result.map_err(Error::from).and_then(Error::check)))
     }
     fn send(
         &self,
@@ -193,9 +197,15 @@ fn object_resource(bucket: &str, key: &str) -> String {
     resource
 }
 
-/// `ListObjectsV2` parameters, already sorted by name.
-fn list_query(prefix: Option<&str>) -> String {
-    let mut query = String::from("list-type=2");
+/// `ListObjectsV2` parameters, written in the name order `SigV4` signs.
+fn list_query(prefix: Option<&str>, continuation_token: Option<&str>) -> String {
+    let mut query = String::new();
+    if let Some(token) = continuation_token {
+        query.push_str("continuation-token=");
+        sigv4::encode_query(&mut query, token);
+        query.push('&');
+    }
+    query.push_str("list-type=2");
     if let Some(prefix) = prefix {
         query.push_str("&prefix=");
         sigv4::encode_query(&mut query, prefix);

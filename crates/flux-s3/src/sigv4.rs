@@ -1,7 +1,10 @@
 //! `SigV4` signing for path-style S3 requests.
 //!
 //! The signed headers are `host`, `x-amz-content-sha256`, and `x-amz-date`;
-//! S3 rejects requests without the payload-hash header. Paths encode every
+//! S3 rejects requests without the payload-hash header. Over TLS the hash is
+//! `UNSIGNED-PAYLOAD`, since the transport already protects the body and
+//! hashing it costs about a millisecond per megabyte on the poll thread.
+//! Paths encode every
 //! byte outside the unreserved set and keep `/`; query pairs sort by name
 //! and encode the same way but also keep `/`, which is how botocore signs
 //! S3 prefixes.
@@ -9,12 +12,16 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+const UNSIGNED: &str = "UNSIGNED-PAYLOAD";
+
 /// Signs requests for one endpoint and credential pair.
 pub struct Signer {
     host: String,
     access: String,
     secret: String,
     region: String,
+    /// Whether bodies are hashed instead of sent as `UNSIGNED-PAYLOAD`.
+    hash_payloads: bool,
 }
 
 impl Signer {
@@ -24,7 +31,15 @@ impl Signer {
             access: access.to_owned(),
             secret: secret.to_owned(),
             region: region.to_owned(),
+            hash_payloads: false,
         }
+    }
+    /// Binds bodies to their signature with a `SHA256` hash, for endpoints
+    /// reached without TLS.
+    #[must_use]
+    pub fn hashing_payloads(mut self) -> Self {
+        self.hash_payloads = true;
+        self
     }
     pub fn set_credentials(&mut self, access: &str, secret: &str) {
         access.clone_into(&mut self.access);
@@ -48,7 +63,8 @@ impl Signer {
         date: &str,
         body: &[u8],
     ) -> (String, String) {
-        let payload = hex(&Sha256::digest(body)[..]);
+        let payload =
+            if self.hash_payloads { hex(&Sha256::digest(body)[..]) } else { UNSIGNED.to_owned() };
         let canonical = format!(
             "{method}\n{resource}\n{query}\nhost:{}\nx-amz-content-sha256:{payload}\n\
              x-amz-date:{date}\n\nhost;x-amz-content-sha256;x-amz-date\n{payload}",

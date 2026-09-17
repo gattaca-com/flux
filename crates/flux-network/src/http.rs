@@ -63,6 +63,25 @@ pub enum HttpEvent<'a> {
     Disconnected { token: Token },
     Failed { id: RequestId, reason: Failure },
 }
+
+impl<'a> HttpEvent<'a> {
+    /// The outcome this event carries for `pool`, if it finishes one of its
+    /// requests. Clients over a pool dispatch on this instead of matching the
+    /// response and failure variants themselves.
+    pub fn outcome(
+        &self,
+        pool: HttpPool,
+    ) -> Option<(RequestId, Result<&HttpResponse<'a>, Failure>)> {
+        match self {
+            Self::Response { id: Some(id), response, .. } if id.pool() == pool => {
+                Some((*id, Ok(response)))
+            }
+            Self::Failed { id, reason } if id.pool() == pool => Some((*id, Err(*reason))),
+            _ => None,
+        }
+    }
+}
+/// Persistent connections to one address sharing a request queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpPool(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -82,7 +101,8 @@ pub enum Failure {
 }
 struct Queued {
     id: RequestId,
-    method: String,
+    /// Whether the request was a `HEAD`, whose response carries no body.
+    head_request: bool,
     head: Vec<u8>,
     body: Vec<u8>,
     retries: u8,
@@ -105,8 +125,19 @@ enum State {
     Draining,
 }
 enum Role {
-    Accepted { state: State, close: bool, continued: bool, head_request: bool },
-    Outbound { addr: SocketAddr, method: Option<String>, in_flight: Option<InFlight> },
+    Accepted {
+        state: State,
+        close: bool,
+        continued: bool,
+        head_request: bool,
+    },
+    /// `in_flight_head` is `Some` while a request is awaiting its response,
+    /// carrying whether that request was a `HEAD`.
+    Outbound {
+        addr: SocketAddr,
+        in_flight_head: Option<bool>,
+        in_flight: Option<InFlight>,
+    },
 }
 struct Conn {
     token: Token,
@@ -345,7 +376,7 @@ impl HttpNetwork {
                 if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) {
                     self.failed.push((in_flight.queued.id, Failure::TimedOut));
                 }
-                set_outbound_method(&mut self.conns[i].role, None);
+                set_outbound_head(&mut self.conns[i].role, None);
                 net.disconnect(self.conns[i].token);
             }
         }
@@ -372,7 +403,7 @@ impl HttpNetwork {
                         let answered = self.parse_eof_outbound(i, handler);
                         self.conns[i].buf.clear();
                         self.conns[i].dirty = false;
-                        set_outbound_method(&mut self.conns[i].role, None);
+                        set_outbound_head(&mut self.conns[i].role, None);
                         if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) &&
                             !answered
                         {
@@ -437,7 +468,7 @@ impl HttpNetwork {
             dirty: false,
             over_limit: false,
             last_activity: Instant::now(),
-            role: Role::Outbound { addr, method: None, in_flight: None },
+            role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
         });
         token
     }
@@ -518,18 +549,18 @@ impl HttpNetwork {
             return false
         }
         let Some(c) =
-            self.conns.iter_mut().find(|c| c.token == token && outbound_method(&c.role).is_none())
+            self.conns.iter_mut().find(|c| c.token == token && outbound_head(&c.role).is_none())
         else {
             return false
         };
         let Role::Outbound { addr, .. } = &c.role else { return false };
-        let host = addr.to_string();
+        let addr = *addr;
         let sent = net.send_with(token, |out| {
-            write_head(out, method, path, headers, &host, body.len());
+            write_head(out, method, path, headers, &addr, body.len());
             out.extend_from_slice(body);
         });
         if sent {
-            set_outbound_method(&mut c.role, Some(method.to_owned()));
+            set_outbound_head(&mut c.role, Some(method.eq_ignore_ascii_case("HEAD")));
         }
         sent
     }
@@ -550,14 +581,20 @@ impl HttpNetwork {
             return Err(body)
         }
         let mut head = Vec::new();
-        write_head(&mut head, method, path, headers, &p.addr.to_string(), body.len());
+        write_head(&mut head, method, path, headers, &p.addr, body.len());
         if p.queued_bytes + head.len() + body.len() > self.max_queued_bytes {
             return Err(body)
         }
         let id = RequestId { pool, seq: p.next_seq };
         p.next_seq += 1;
         p.queued_bytes += head.len() + body.len();
-        p.queue.push_back(Queued { id, method: method.to_owned(), head, body, retries });
+        p.queue.push_back(Queued {
+            id,
+            head_request: method.eq_ignore_ascii_case("HEAD"),
+            head,
+            body,
+            retries,
+        });
         Ok(id)
     }
     fn dispatch(&mut self, net: &mut TcpNetworkCore) {
@@ -567,7 +604,7 @@ impl HttpNetwork {
                 let Some(i) = self
                     .conns
                     .iter()
-                    .position(|c| c.token == token && outbound_method(&c.role).is_none())
+                    .position(|c| c.token == token && outbound_head(&c.role).is_none())
                 else {
                     continue
                 };
@@ -581,7 +618,7 @@ impl HttpNetwork {
                 }
                 let queued = self.pools[p].queue.pop_front().unwrap();
                 self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
-                set_outbound_method(&mut self.conns[i].role, Some(queued.method.clone()));
+                set_outbound_head(&mut self.conns[i].role, Some(queued.head_request));
                 if let Role::Outbound { in_flight, .. } = &mut self.conns[i].role {
                     *in_flight = Some(InFlight { queued, sent_at: Instant::now() });
                 }
@@ -601,7 +638,7 @@ impl HttpNetwork {
     fn fail_outbound(&mut self, net: &mut TcpNetworkCore, i: usize) {
         let token = self.conns[i].token;
         self.conns[i].buf.clear();
-        set_outbound_method(&mut self.conns[i].role, None);
+        set_outbound_head(&mut self.conns[i].role, None);
         net.disconnect(token);
     }
     fn buffer_limit(&self) -> usize {
@@ -776,7 +813,7 @@ impl HttpNetwork {
         F: for<'a> FnMut(HttpEvent<'a>),
     {
         self.conns[i].dirty = false;
-        while outbound_method(&self.conns[i].role).is_some() {
+        while outbound_head(&self.conns[i].role).is_some() {
             let b = &self.conns[i].buf;
             let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
             let mut response = httparse::Response::new(&mut hs);
@@ -797,7 +834,7 @@ impl HttpNetwork {
                 return
             }
             let status = response.code.unwrap_or(0);
-            let no_body = outbound_method(&self.conns[i].role).map(String::as_str) == Some("HEAD") ||
+            let no_body = outbound_head(&self.conns[i].role) == Some(true) ||
                 matches!(status, 100..=199 | 204 | 304);
             let chunked = transfer_chunked(response.headers);
             let content_length = response_content_length(response.headers);
@@ -866,7 +903,7 @@ impl HttpNetwork {
             handler(HttpEvent::Response { token, id, response: response_event });
             self.conns[i].buf.drain(..consumed);
             self.conns[i].dirty = !self.conns[i].buf.is_empty();
-            set_outbound_method(&mut self.conns[i].role, None);
+            set_outbound_head(&mut self.conns[i].role, None);
             take_in_flight(&mut self.conns[i].role);
             if close {
                 net.disconnect(token);
@@ -878,7 +915,7 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if outbound_method(&self.conns[i].role).is_none() {
+        if outbound_head(&self.conns[i].role).is_none() {
             return false
         }
         let b = &self.conns[i].buf;
@@ -889,7 +926,7 @@ impl HttpNetwork {
             return false
         }
         let status = response.code.unwrap_or(0);
-        let no_body = outbound_method(&self.conns[i].role).map(String::as_str) == Some("HEAD") ||
+        let no_body = outbound_head(&self.conns[i].role) == Some(true) ||
             matches!(status, 100..=199 | 204 | 304);
         if no_body ||
             transfer_chunked(response.headers) != Some(false) ||
@@ -1022,12 +1059,14 @@ fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
                 !n.eq_ignore_ascii_case("transfer-encoding")
         })
 }
+/// Writes a request head, defaulting `Host` to the endpoint address when the
+/// caller did not supply one.
 fn write_head(
     out: &mut impl io::Write,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
-    host: &str,
+    addr: &SocketAddr,
     body_len: usize,
 ) {
     write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
@@ -1037,7 +1076,7 @@ fn write_head(
         write!(out, "{n}: {v}\r\n").unwrap();
     }
     if !has_host {
-        write!(out, "Host: {host}\r\n").unwrap();
+        write!(out, "Host: {addr}\r\n").unwrap();
     }
     write!(out, "Content-Length: {body_len}\r\n\r\n").unwrap();
 }
@@ -1095,15 +1134,15 @@ fn set_accepted_head_request(role: &mut Role, head_request: bool) {
         *current = head_request;
     }
 }
-fn outbound_method(role: &Role) -> Option<&String> {
+fn outbound_head(role: &Role) -> Option<bool> {
     match role {
-        Role::Outbound { method, .. } => method.as_ref(),
+        Role::Outbound { in_flight_head, .. } => *in_flight_head,
         Role::Accepted { .. } => None,
     }
 }
-fn set_outbound_method(role: &mut Role, method: Option<String>) {
-    if let Role::Outbound { method: current, .. } = role {
-        *current = method;
+fn set_outbound_head(role: &mut Role, head_request: Option<bool>) {
+    if let Role::Outbound { in_flight_head: current, .. } = role {
+        *current = head_request;
     }
 }
 

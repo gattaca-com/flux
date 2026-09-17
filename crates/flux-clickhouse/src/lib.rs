@@ -16,6 +16,15 @@ pub enum Error<'a> {
     TimedOut,
 }
 
+impl From<Failure> for Error<'_> {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Disconnected => Self::Disconnected,
+            Failure::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
 impl<'a> Error<'a> {
     fn check(response: &HttpResponse<'a>) -> Result<&'a [u8], Self> {
         if response.status == 200 {
@@ -92,19 +101,8 @@ impl ClickHouse {
         &self,
         event: &HttpEvent<'a>,
     ) -> Option<(RequestId, Result<&'a [u8], Error<'a>>)> {
-        match *event {
-            HttpEvent::Response { id: Some(id), ref response, .. } if id.pool() == self.pool => {
-                Some((id, Error::check(response)))
-            }
-            HttpEvent::Failed { id, reason } if id.pool() == self.pool => Some((
-                id,
-                Err(match reason {
-                    Failure::Disconnected => Error::Disconnected,
-                    Failure::TimedOut => Error::TimedOut,
-                }),
-            )),
-            _ => None,
-        }
+        let (id, result) = event.outcome(self.pool)?;
+        Some((id, result.map_err(Error::from).and_then(Error::check)))
     }
     fn headers(&self) -> [(&str, &str); 2] {
         [("X-ClickHouse-User", &self.user), ("X-ClickHouse-Key", &self.key)]
