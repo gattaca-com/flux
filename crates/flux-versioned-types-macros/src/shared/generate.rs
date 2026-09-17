@@ -57,8 +57,13 @@ pub(crate) fn without_schema_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
 pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     input: &mut EvolveInputGeneric<B, E>,
     generate_base: impl FnOnce(&EvolveInputGeneric<B, E>) -> (TokenStream2, Vec<Item>),
-    generate_step: impl Fn(&E, &[Attribute], &[Item], &Ident, bool) -> (TokenStream2, Vec<Item>),
+    generate_step: impl Fn(&E, &[Attribute], &[Item], &Ident, bool, bool) -> (TokenStream2, Vec<Item>),
 ) -> TokenStream2 {
+    if input.wire_skip && input.wire_name.is_some() {
+        let name = input.wire_name.as_ref().expect("checked above");
+        return syn::Error::new(name.span(), "wire_skip and wire_name are mutually exclusive")
+            .to_compile_error();
+    }
     if input.evolutions.is_empty() {
         input.base.attrs_mut().extend(input.final_attrs.clone());
     } else if let Some(last) = input.evolutions.last_mut() {
@@ -95,8 +100,14 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
 
     for (index, evolution) in input.evolutions.iter().enumerate() {
         let is_final = index + 1 == input.evolutions.len();
-        let (ev_output, new_items) =
-            generate_step(evolution, &input.default_attrs, &current, &prev_name, is_final);
+        let (ev_output, new_items) = generate_step(
+            evolution,
+            &input.default_attrs,
+            &current,
+            &prev_name,
+            is_final,
+            input.wire_skip,
+        );
         output.extend(ev_output);
         current = new_items;
         prev_name = evolution.name().clone();
@@ -111,6 +122,7 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
             roll_name,
             &version_names,
             input.wire_name.as_ref(),
+            input.wire_skip,
         ));
     }
 

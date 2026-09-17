@@ -48,6 +48,11 @@ use syn::parse_macro_input;
 ///
 /// Pair this with `roll_chain_into!(MyEnum, [MyEnumV1, MyEnumV2])` to get
 /// the type alias and `versioned_deserialize_vec`.
+///
+/// With the `zerocopy` cargo feature every version also gets zerocopy derives
+/// and a `roll_into` chain gets `Versioned`/`HasVersionedLeaves` impls. A
+/// leading `#[wire_skip]` opts the whole input out: versions emit exactly the
+/// pre-zerocopy output. It is mutually exclusive with `#[wire_name = ".."]`.
 pub fn evolve_enum(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveEnumInput);
     input.ensure_default_attrs(crate::shared::default_enum_attrs);

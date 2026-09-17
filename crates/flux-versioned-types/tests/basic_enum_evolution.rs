@@ -4,6 +4,7 @@ use flux_versioned_types::evolve_enum;
 // ── base-only (no evolutions) ────────────────────────────────────────────────
 
 evolve_enum! {
+    #[wire_skip]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     #[type_hash_lock(hash = 14900722984128347129)]
     SimpleV1 {
@@ -27,6 +28,7 @@ fn test_base_enum() {
 // ── add variants ─────────────────────────────────────────────────────────────
 
 evolve_enum! {
+    #[wire_skip]
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
@@ -65,6 +67,7 @@ fn test_add_variants() {
 // ── remove variants (maps to Default::default()) ─────────────────────────────
 
 evolve_enum! {
+    #[wire_skip]
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
@@ -99,6 +102,7 @@ fn test_remove_variants() {
 // ── remove with rename (from pattern) ────────────────────────────────────────
 
 evolve_enum! {
+    #[wire_skip]
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
@@ -152,6 +156,7 @@ fn test_rename_unit() {
 // ───────────────────────────────────────────────────────────
 
 evolve_enum! {
+    #[wire_skip]
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
@@ -199,6 +204,7 @@ fn test_modify_unit_passthrough() {
 // ── combined: add + remove + modify ──────────────────────────────────────────
 
 evolve_enum! {
+    #[wire_skip]
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
     }
@@ -254,6 +260,7 @@ fn test_combo_v2_to_v3() {
 // ─────────────────────────────────
 
 evolve_enum! {
+    #[wire_skip]
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, TypeHash)]
         #[repr(u8)]

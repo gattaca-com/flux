@@ -49,6 +49,7 @@ pub(crate) fn generate_roll_chain(
     roll_into: &Ident,
     version_names: &[Ident],
     wire_name: Option<&syn::LitStr>,
+    wire_skip: bool,
 ) -> TokenStream2 {
     let version_refs: Vec<&Ident> = version_names.iter().collect();
     let Some(ctx) = RollChainContext::new(roll_into, &version_refs) else {
@@ -56,7 +57,9 @@ pub(crate) fn generate_roll_chain(
     };
     let mut output = generate_type_alias_and_codec(&ctx);
     output.extend(generate_transitive_into_impls(&version_refs));
-    output.extend(generate_versioned_impls(roll_into, &version_refs, wire_name));
+    if !wire_skip {
+        output.extend(generate_versioned_impls(roll_into, &version_refs, wire_name));
+    }
     output
 }
 

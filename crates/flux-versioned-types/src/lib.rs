@@ -50,8 +50,40 @@ macro_rules! impl_versioned_deserialize {
 }
 
 /// Define an evolving struct and its hash-directed decoder.
+///
+/// With the `zerocopy` cargo feature the chain also gets zerocopy derives plus
+/// `Versioned` and `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts
+/// out: the chain emits exactly the pre-zerocopy output (bincode codec only),
+/// for types with padding or non-`Copy` fields. It is mutually exclusive with
+/// `#[wire_name = ".."]`.
 #[macro_export]
 macro_rules! versioned_struct {
+    (#[wire_skip] #[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_struct! {
+            #[wire_skip]
+            #[wire_name = $wire]
+            roll_into $name
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
+    (#[wire_name = $wire:literal] #[wire_skip] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_struct! {
+            #[wire_name = $wire]
+            #[wire_skip]
+            roll_into $name
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
+    (#[wire_skip] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_struct! {
+            #[wire_skip]
+            roll_into $name
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
     (#[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
         $crate::evolve_struct! {
             #[wire_name = $wire]
@@ -74,8 +106,41 @@ macro_rules! versioned_struct {
 ///
 /// With `persist = "dir"` the type also gets a [`VersionedPersistable`]
 /// home under that directory.
+///
+/// With the `zerocopy` cargo feature the chain also gets zerocopy derives plus
+/// `Versioned` and `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts
+/// out: the chain emits exactly the pre-zerocopy output (bincode codec only),
+/// for types with padding or non-`Copy` fields. It is mutually exclusive with
+/// `#[wire_name = ".."]`.
 #[macro_export]
 macro_rules! versioned_enum {
+    (#[wire_skip] #[wire_name = $wire:literal] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_skip] #[wire_name = $wire] $name => $($tokens)*);
+        impl $crate::VersionedPersistable for $name {
+            const PERSIST_DIR: &'static str = $dir;
+        }
+    };
+    (#[wire_name = $wire:literal] #[wire_skip] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_name = $wire] #[wire_skip] $name => $($tokens)*);
+        impl $crate::VersionedPersistable for $name {
+            const PERSIST_DIR: &'static str = $dir;
+        }
+    };
+    (#[wire_skip] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_skip] $name => $($tokens)*);
+        impl $crate::VersionedPersistable for $name {
+            const PERSIST_DIR: &'static str = $dir;
+        }
+    };
+    (#[wire_skip] #[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_skip] #[wire_name = $wire] $name => $($tokens)*);
+    };
+    (#[wire_name = $wire:literal] #[wire_skip] $name:ident => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_name = $wire] #[wire_skip] $name => $($tokens)*);
+    };
+    (#[wire_skip] $name:ident => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_skip] $name => $($tokens)*);
+    };
     (#[wire_name = $wire:literal] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {
         $crate::__versioned_enum_inner!(#[wire_name = $wire] $name => $($tokens)*);
         impl $crate::VersionedPersistable for $name {
@@ -99,6 +164,41 @@ macro_rules! versioned_enum {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __versioned_enum_inner {
+    (#[wire_skip] #[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_enum! {
+            #[wire_skip]
+            #[wire_name = $wire]
+            roll_into $name
+            final_attrs {
+                #[derive($crate::TelemetrySchema)]
+            }
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
+    (#[wire_name = $wire:literal] #[wire_skip] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_enum! {
+            #[wire_name = $wire]
+            #[wire_skip]
+            roll_into $name
+            final_attrs {
+                #[derive($crate::TelemetrySchema)]
+            }
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
+    (#[wire_skip] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_enum! {
+            #[wire_skip]
+            roll_into $name
+            final_attrs {
+                #[derive($crate::TelemetrySchema)]
+            }
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
     (#[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
         $crate::evolve_enum! {
             #[wire_name = $wire]

@@ -8,6 +8,7 @@ use syn::{
 /// `default_attrs { ... }` block + base definition + evolution steps.
 pub(crate) struct EvolveInputGeneric<B, E> {
     pub wire_name: Option<LitStr>,
+    pub wire_skip: bool,
     pub roll_into: Option<Ident>,
     pub default_attrs: Vec<Attribute>,
     pub final_attrs: Vec<Attribute>,
@@ -17,7 +18,7 @@ pub(crate) struct EvolveInputGeneric<B, E> {
 
 impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
     fn parse(input: ParseStream) -> Result<Self> {
-        let wire_name = parse_wire_name(input)?;
+        let (wire_name, wire_skip) = parse_wire_attrs(input)?;
         let roll_into = parse_optional_keyword(input, "roll_into")?;
 
         let mut default_attrs = Vec::new();
@@ -42,7 +43,7 @@ impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
             evolutions.push(input.parse()?);
         }
 
-        Ok(Self { wire_name, roll_into, default_attrs, final_attrs, base, evolutions })
+        Ok(Self { wire_name, wire_skip, roll_into, default_attrs, final_attrs, base, evolutions })
     }
 }
 
@@ -54,33 +55,46 @@ impl<B, E> EvolveInputGeneric<B, E> {
     }
 }
 
-fn parse_wire_name(input: ParseStream) -> Result<Option<LitStr>> {
-    if !input.peek(Token![#]) {
-        return Ok(None);
-    }
-    let fork = input.fork();
-    let attrs: Vec<Attribute> = fork.call(Attribute::parse_outer)?;
-    if attrs.len() != 1 || !attrs[0].path().is_ident("wire_name") {
-        return Ok(None);
-    }
-    let lit = match &attrs[0].meta {
-        syn::Meta::NameValue(nv) => match &nv.value {
-            syn::Expr::Lit(el) => match &el.lit {
-                syn::Lit::Str(s) => s.clone(),
-                _ => {
-                    return Err(syn::Error::new_spanned(&attrs[0], "expected wire_name literal"));
-                }
-            },
-            _ => {
-                return Err(syn::Error::new_spanned(&attrs[0], "expected wire_name literal"));
-            }
-        },
-        _ => {
-            return Err(syn::Error::new_spanned(&attrs[0], "expected wire_name literal"));
+fn parse_wire_attrs(input: ParseStream) -> Result<(Option<LitStr>, bool)> {
+    let mut wire_name = None;
+    let mut wire_skip = false;
+    while input.peek(Token![#]) {
+        let (is_name, is_skip) = {
+            let fork = input.fork();
+            fork.parse::<Token![#]>()?;
+            let content;
+            syn::bracketed!(content in fork);
+            let path: syn::Path = content.parse()?;
+            (path.is_ident("wire_name"), path.is_ident("wire_skip"))
+        };
+        if !is_name && !is_skip {
+            break;
         }
-    };
-    let _: Vec<Attribute> = input.call(Attribute::parse_outer)?;
-    Ok(Some(lit))
+        input.parse::<Token![#]>()?;
+        let content;
+        syn::bracketed!(content in input);
+        let _: syn::Path = content.parse()?;
+        if is_name {
+            if wire_name.is_some() {
+                return Err(content.error("duplicate wire_name"));
+            }
+            content.parse::<Token![=]>()?;
+            let lit: LitStr = content.parse()?;
+            if !content.is_empty() {
+                return Err(content.error("expected wire_name literal"));
+            }
+            wire_name = Some(lit);
+        } else {
+            if !content.is_empty() {
+                return Err(content.error("wire_skip takes no arguments"));
+            }
+            if wire_skip {
+                return Err(content.error("duplicate wire_skip"));
+            }
+            wire_skip = true;
+        }
+    }
+    Ok((wire_name, wire_skip))
 }
 
 fn parse_optional_keyword(input: ParseStream, keyword: &str) -> Result<Option<Ident>> {

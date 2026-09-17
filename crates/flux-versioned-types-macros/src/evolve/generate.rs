@@ -62,8 +62,10 @@ pub(crate) fn generate_struct_def(
     default_attrs: &[Attribute],
     struct_attrs: &[Attribute],
     fields: &Vec<TokenStream2>,
+    wire_skip: bool,
 ) -> TokenStream2 {
-    let zerocopy_attrs = crate::shared::zerocopy_derive_attrs();
+    let zerocopy_attrs =
+        if wire_skip { Vec::new() } else { crate::shared::zerocopy_derive_attrs() };
     quote! {
         #(#default_attrs)*
         #(#struct_attrs)*
@@ -89,8 +91,13 @@ pub(crate) fn generate_base_struct(input: &EvolveInput) -> (TokenStream2, Vec<Fi
         })
         .collect();
 
-    let output =
-        generate_struct_def(&input.base.name, &input.default_attrs, &input.base.attrs, &fields);
+    let output = generate_struct_def(
+        &input.base.name,
+        &input.default_attrs,
+        &input.base.attrs,
+        &fields,
+        input.wire_skip,
+    );
 
     let field_infos = input.base.items.iter().map(FieldInfo::from_struct_field).collect();
 
@@ -234,6 +241,7 @@ pub(crate) fn generate_evolution(
     current_fields: &[FieldInfo],
     prev_name: &Ident,
     is_final: bool,
+    wire_skip: bool,
 ) -> (TokenStream2, Vec<FieldInfo>) {
     let ctx = EvolutionContext::from_evolution(evolution);
 
@@ -241,8 +249,13 @@ pub(crate) fn generate_evolution(
         current_fields.iter().filter(|f| !ctx.remove_names.contains(&f.name.to_string())).collect();
 
     let struct_fields = generate_evolved_struct_fields(&kept_fields, &ctx, is_final);
-    let struct_def =
-        generate_struct_def(&evolution.name, default_attrs, &evolution.attrs, &struct_fields);
+    let struct_def = generate_struct_def(
+        &evolution.name,
+        default_attrs,
+        &evolution.attrs,
+        &struct_fields,
+        wire_skip,
+    );
     let into_impl = generate_into_impl(prev_name, &evolution.name, &kept_fields, &ctx);
 
     let mut output = struct_def;

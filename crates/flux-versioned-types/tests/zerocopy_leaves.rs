@@ -2,8 +2,8 @@
 
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
 use flux_versioned_types::{
-    DecodeError, HasVersionedLeaves, Versioned, VisitorVersionedLeaf, versioned_enum,
-    versioned_struct, zerocopy::IntoBytes,
+    DecodeError, HasVersionedLeaves, Versioned, VersionedDeserialize, VisitorVersionedLeaf,
+    versioned_enum, versioned_struct, zerocopy::IntoBytes,
 };
 
 versioned_struct!(Leaf =>
@@ -26,6 +26,20 @@ versioned_enum!(Kind =>
 versioned_struct!(#[wire_name = "Relay.NewBidSubmission"] Wired =>
     #[type_hash_lock(hash = 334959009063145319)]
     WiredV1 { pub slot: u64 }
+);
+
+versioned_struct!(#[wire_skip] Skipped =>
+    default_attrs {
+        #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, flux::type_hash_derive::TypeHash)]
+    }
+
+    #[type_hash_lock(hash = 7388800780322383597)]
+    SkippedV1 { pub name: String }
+
+    #[type_hash_lock(hash = 12606373406282156926)]
+    SkippedV2 {
+        add { pub count: u32 = 0 }
+    }
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, HasVersionedLeaves)]
@@ -137,4 +151,25 @@ fn family_visit_reaches_leaf() {
     assert_eq!(fam2, fam);
     let fam3: Family = Kind::A.into();
     assert_eq!(fam3, Family::K(Kind::A));
+}
+
+#[test]
+fn wire_skip_chain_keeps_bincode_round_trip() {
+    // `Skipped` deliberately does NOT implement `Versioned`: `#[wire_skip]`
+    // emits exactly the pre-zerocopy output (bincode codec only), so there is
+    // no `decode_versions` to call here. A negative bound check is not
+    // expressible; the bincode round trip below is the behavioural contract.
+    let old = vec![SkippedV1 { name: "a".to_string() }];
+    let bytes = bincode::serialize(&old).unwrap();
+    let stored = SkippedV1::TYPE_HASH ^ 123_456;
+    let latest =
+        <Skipped as VersionedDeserialize>::versioned_deserialize_vec(stored, &bytes).unwrap();
+    assert_eq!(latest, vec![Skipped { name: "a".to_string(), count: 0 }]);
+
+    let latest_bytes = bincode::serialize(&latest).unwrap();
+    let stored_latest = SkippedV2::TYPE_HASH ^ 123_456;
+    let back =
+        <Skipped as VersionedDeserialize>::versioned_deserialize_vec(stored_latest, &latest_bytes)
+            .unwrap();
+    assert_eq!(back, latest);
 }

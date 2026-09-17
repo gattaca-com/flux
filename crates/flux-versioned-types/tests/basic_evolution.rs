@@ -4,6 +4,7 @@ use flux::type_hash_derive::{TypeHash, type_hash_lock};
 use flux_versioned_types::evolve_struct;
 
 evolve_struct! {
+    #[wire_skip]
     #[derive(Clone, Debug, PartialEq, Eq, TypeHash)]
     #[type_hash_lock(hash = 11423779886791362541)]
     TestV1 {
@@ -112,6 +113,7 @@ fn test_v4_to_v5_with_lambda_add() {
 }
 
 evolve_struct! {
+    #[wire_skip]
     #[derive(Clone, Debug, PartialEq, Eq, TypeHash)]
     #[type_hash_lock(hash = 10210870430544251810)]
     NonCopyV1 {
