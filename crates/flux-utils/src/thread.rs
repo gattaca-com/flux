@@ -53,7 +53,6 @@ fn set_thread_affinity(cores: &[usize]) {
     if cores.is_empty() {
         return;
     }
-    // ponytail: raw sched_setaffinity because core_affinity only pins a single core
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         for &core in cores {
