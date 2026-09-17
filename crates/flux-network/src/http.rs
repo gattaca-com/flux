@@ -2,9 +2,6 @@
 //!
 //! [`HttpNetwork`] can listen for requests and maintain outbound endpoints in
 //! one event loop. Events borrow parsed data only for the callback duration.
-//! An [`HttpPool`] shares a request queue across several connections to one
-//! address: [`HttpNetwork::send`] queues a request, its response carries the
-//! [`RequestId`], and [`HttpEvent::Failed`] reports one that gets no response.
 //!
 //! ```no_run
 //! use std::net::SocketAddr;
@@ -50,33 +47,13 @@ use mio::Token;
 use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork};
 
 pub enum HttpEvent<'a> {
-    Accepted {
-        token: Token,
-        peer_addr: SocketAddr,
-    },
-    Connected {
-        token: Token,
-    },
-    /// `id` is set for requests sent through a pool.
-    Response {
-        token: Token,
-        id: Option<RequestId>,
-        response: HttpResponse<'a>,
-    },
-    Request {
-        token: Token,
-        request: HttpRequest<'a>,
-    },
-    Disconnected {
-        token: Token,
-    },
-    /// A pooled request that will get no response.
-    Failed {
-        id: RequestId,
-        reason: Failure,
-    },
+    Accepted { token: Token, peer_addr: SocketAddr },
+    Connected { token: Token },
+    Response { token: Token, id: Option<RequestId>, response: HttpResponse<'a> },
+    Request { token: Token, request: HttpRequest<'a> },
+    Disconnected { token: Token },
+    Failed { id: RequestId, reason: Failure },
 }
-/// Persistent connections to one address sharing a request queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpPool(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -91,8 +68,6 @@ impl RequestId {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// The connection was lost after the request went out; the server may or
-    /// may not have handled it.
     Disconnected,
     TimedOut,
 }
@@ -217,14 +192,11 @@ impl HttpNetwork {
         self.idle_timeout = None;
         self
     }
-    /// Refuses pooled sends that would queue more than this many bytes.
     pub fn with_max_queued_bytes(mut self, max_queued_bytes: usize) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.max_queued_bytes = max_queued_bytes;
         self
     }
-    /// Fails a pooled request with no response after this long and cycles its
-    /// connection so a late response cannot be misattributed.
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.request_timeout = Some(request_timeout);
@@ -425,8 +397,6 @@ impl HttpNetwork {
         });
         token
     }
-    /// Opens `connections` persistent connections to `addr` that share one
-    /// request queue; see [`Self::send`].
     pub fn pool(&mut self, addr: SocketAddr, connections: usize) -> HttpPool {
         assert!(connections > 0, "a pool needs a connection");
         let pool = HttpPool(self.pools.len() as u32);
@@ -454,8 +424,7 @@ impl HttpNetwork {
         self.conns.retain(|conn| conn.token != token);
         true
     }
-    /// Queues one request on an outbound endpoint; bodies over
-    /// `max_body_bytes` are refused.
+    /// Queues one request on an outbound endpoint.
     pub fn request(
         &mut self,
         token: Token,
@@ -483,10 +452,6 @@ impl HttpNetwork {
         }
         sent
     }
-    /// Queues one request on a pool; it goes out on the first idle connection
-    /// and its response carries the returned id. `retries` is how many times
-    /// it is resent after its connection is lost. Returns the body back when
-    /// the request is invalid, over `max_body_bytes`, or the queue is full.
     pub fn send(
         &mut self,
         pool: HttpPool,

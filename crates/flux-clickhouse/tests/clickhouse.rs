@@ -30,7 +30,7 @@ const ROW: &[u8] = &[
 ];
 
 #[test]
-fn insert_survives_a_dropped_connection_and_errors_map() {
+fn pooled_inserts_and_queries() {
     let row = Row {
         name: "ab".to_owned(),
         maybe: Some(7),
@@ -45,16 +45,19 @@ fn insert_survives_a_dropped_connection_and_errors_map() {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    // One network is both the fake server and the client's pool.
-    let mut http = HttpNetwork::default();
+    let mut http = HttpNetwork::default()
+        .with_max_queued_bytes(4096)
+        .with_request_timeout(Duration::from_millis(300).into());
     http.listen(addr).unwrap();
     let ch = ClickHouse::new(&mut http, addr, 2).with_credentials("w", "s").with_database("db");
     let insert = ch.insert_rows(&mut http, "t", &[row]).unwrap();
     let bad = ch.query(&mut http, "SELEC").unwrap();
+    let hang = ch.query(&mut http, "hang").unwrap();
+    assert_eq!(ch.query(&mut http, &"x".repeat(4096)), Err(vec![b'x'; 4096]));
     let mut inserts = Vec::new();
     let mut outcomes = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && outcomes.len() < 2 {
+    while Instant::now() < deadline && outcomes.len() < 3 {
         let mut replies = Vec::new();
         http.poll_with(|event| {
             if let Some((id, result)) = ch.outcome(&event) {
@@ -63,24 +66,26 @@ fn insert_survives_a_dropped_connection_and_errors_map() {
                     Err(Error::Server { status, code, message }) => {
                         Err((status, code, message.to_vec()))
                     }
-                    Err(err) => panic!("{err:?}"),
+                    Err(Error::TimedOut) => Err((0, None, Vec::new())),
+                    Err(Error::Disconnected) => panic!("disconnected"),
                 }));
             } else if let HttpEvent::Request { token, request } = event {
-                if request.path.starts_with("/?query=") {
+                let is_insert = request.path.starts_with("/?query=");
+                if is_insert {
                     inserts.push((
                         request.path.to_owned(),
                         request.header("x-clickhouse-key").unwrap().to_vec(),
                         request.body.to_vec(),
                     ));
                 }
-                replies.push((token, request.path.starts_with("/?query=")));
+                replies.push((token, is_insert, request.body == b"hang"));
             }
         });
-        for (token, is_insert) in replies {
-            if !is_insert {
+        for (token, is_insert, is_hang) in replies {
+            if is_hang {
+            } else if !is_insert {
                 http.respond(token, 400, &[("X-ClickHouse-Exception-Code", "62")], b"Code: 62");
             } else if inserts.len() == 1 {
-                // The first attempt is cut off; the pool must resend it.
                 http.disconnect(token);
             } else {
                 http.respond(token, 200, &[], b"");
@@ -92,6 +97,7 @@ fn insert_survives_a_dropped_connection_and_errors_map() {
     assert_eq!(outcomes, [
         (insert, Ok(Vec::new())),
         (bad, Err((400, Some(62), b"Code: 62".to_vec()))),
+        (hang, Err((0, None, Vec::new()))),
     ]);
     assert_eq!(inserts.len(), 2);
     for (path, key, body) in &inserts {

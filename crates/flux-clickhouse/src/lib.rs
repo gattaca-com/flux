@@ -1,10 +1,3 @@
-//! `ClickHouse` over an [`HttpNetwork`] pool.
-//!
-//! [`ClickHouse::insert_rows`], [`ClickHouse::insert`], and
-//! [`ClickHouse::query`] queue requests on the network and return a
-//! [`RequestId`]; [`ClickHouse::outcome`] picks this client's results out of
-//! the network's events. Inserts cut off by a lost connection are resent.
-
 pub mod rowbinary;
 
 use std::{fmt::Write as _, net::SocketAddr};
@@ -15,13 +8,7 @@ use serde::Serialize;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<'a> {
-    /// Non-200 status with the `X-ClickHouse-Exception-Code` and body.
-    Server {
-        status: u16,
-        code: Option<u32>,
-        message: &'a [u8],
-    },
-    /// Lost before a response; the server may or may not have run the query.
+    Server { status: u16, code: Option<u32>, message: &'a [u8] },
     Disconnected,
     TimedOut,
 }
@@ -46,7 +33,6 @@ pub struct ClickHouse {
 }
 
 impl ClickHouse {
-    /// Opens `connections` to `addr` on `http`.
     pub fn new(http: &mut HttpNetwork, addr: SocketAddr, connections: usize) -> Self {
         Self {
             pool: http.pool(addr, connections),
@@ -63,7 +49,6 @@ impl ClickHouse {
     pub fn with_database(self, database: &str) -> Self {
         self.with_setting("database", database)
     }
-    /// Sets a query setting sent as a URL parameter.
     pub fn with_setting(mut self, name: &str, value: &str) -> Self {
         match self.settings.iter_mut().find(|(n, _)| n == name) {
             Some((_, v)) => value.clone_into(v),
@@ -71,13 +56,9 @@ impl ClickHouse {
         }
         self
     }
-    /// Queues `sql` as the request body; returns it back when the network
-    /// refuses it (full queue, or over `max_body_bytes`).
     pub fn query(&self, http: &mut HttpNetwork, sql: &str) -> Result<RequestId, Vec<u8>> {
         http.send(self.pool, "POST", &self.path(None), &self.headers(), sql.as_bytes().to_vec(), 0)
     }
-    /// Queues an `INSERT ... FORMAT <fmt>` statement with `body` as its data.
-    /// A lost connection resends it, so the server may see it more than once.
     pub fn insert(
         &self,
         http: &mut HttpNetwork,
@@ -86,9 +67,6 @@ impl ClickHouse {
     ) -> Result<RequestId, Vec<u8>> {
         http.send(self.pool, "POST", &self.path(Some(sql)), &self.headers(), body, 3)
     }
-    /// Encodes `rows` as `RowBinary` and queues them for `table`, naming the
-    /// columns after the row's fields. Panics on an empty batch or a row type
-    /// without a `RowBinary` encoding.
     pub fn insert_rows<T: Serialize>(
         &self,
         http: &mut HttpNetwork,
@@ -102,8 +80,6 @@ impl ClickHouse {
         }
         self.insert(http, &sql, body)
     }
-    /// This client's result in a network event, if the event was one of its
-    /// requests completing.
     pub fn outcome<'a>(
         &self,
         event: &HttpEvent<'a>,

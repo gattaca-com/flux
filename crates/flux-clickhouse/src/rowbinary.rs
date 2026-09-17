@@ -1,11 +1,3 @@
-//! `RowBinary` encoding of `serde::Serialize` rows.
-//!
-//! [`encode`] appends one row to an insert body; [`insert_statement`] names
-//! the columns after the row's fields. Integers and floats are little-endian,
-//! `bool` one byte, strings and bytes LEB128-length-prefixed, `Option` a
-//! `Nullable` flag byte, sequences a LEB128 count, tuples and nested structs
-//! bare elements. Enums, `char`, and maps are rejected.
-
 use std::fmt;
 
 use serde::{Serialize, ser};

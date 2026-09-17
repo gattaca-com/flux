@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::http::{Failure, HttpEvent, HttpNetwork};
+use flux_network::http::{HttpEvent, HttpNetwork};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -327,57 +327,6 @@ fn client_server_roundtrip() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(bodies, [b"hello".to_vec(), Vec::new()]);
-}
-
-#[test]
-fn pool_fans_out_resends_times_out_and_refuses() {
-    let (mut server, addr) = server();
-    let mut client = HttpNetwork::default()
-        .with_max_queued_bytes(4096)
-        .with_request_timeout(Duration::from_millis(300).into());
-    let pool = client.pool(addr, 2);
-    let echo = client.send(pool, "POST", "/", &[], b"echo".to_vec(), 0).unwrap();
-    let cut = client.send(pool, "POST", "/", &[], b"cut".to_vec(), 1).unwrap();
-    let hang = client.send(pool, "POST", "/", &[], b"hang".to_vec(), 0).unwrap();
-    assert_eq!(client.send(pool, "POST", "/", &[], vec![0; 4096], 0), Err(vec![0; 4096]));
-    let mut cuts = 0;
-    let mut got = Vec::new();
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && got.len() < 3 {
-        let mut replies = Vec::new();
-        server.poll_with(|e| {
-            if let HttpEvent::Request { token, request } = e {
-                replies.push((token, request.body.to_vec()));
-            }
-        });
-        for (token, body) in replies {
-            match body.as_slice() {
-                // The first attempt is cut off after it went out; the pool resends it.
-                b"cut" if cuts == 0 => {
-                    cuts += 1;
-                    server.disconnect(token);
-                }
-                b"hang" => {}
-                _ => {
-                    server.respond(token, 200, &[], &body);
-                }
-            }
-        }
-        client.poll_with(|e| match e {
-            HttpEvent::Response { id: Some(id), response, .. } => {
-                got.push((id, Ok(response.body.to_vec())));
-            }
-            HttpEvent::Failed { id, reason } => got.push((id, Err(reason))),
-            _ => {}
-        });
-        thread::sleep(Duration::from_millis(1));
-    }
-    got.sort_by_key(|(id, _)| *id);
-    assert_eq!(got, [
-        (echo, Ok(b"echo".to_vec())),
-        (cut, Ok(b"cut".to_vec())),
-        (hang, Err(Failure::TimedOut)),
-    ]);
 }
 
 #[test]
