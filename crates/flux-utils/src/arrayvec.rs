@@ -565,12 +565,15 @@ mod serde_impl {
         }
     }
 
+    // A string, not the byte sequence it is stored as: self-describing formats
+    // are unreadable otherwise, and bincode encodes both as a u64 length
+    // followed by the bytes, so the encoding is unchanged.
     impl<const N: usize> Serialize for super::ArrayStr<N> {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
-            self.buf.serialize(serializer)
+            serializer.serialize_str(self.as_str())
         }
     }
 
@@ -579,8 +582,21 @@ mod serde_impl {
         where
             D: Deserializer<'de>,
         {
-            ArrayVec::<u8, N>::deserialize(deserializer)
-                .and_then(|buf| Self::try_from(buf).map_err(D::Error::custom))
+            struct ArrayStrVisitor<const N: usize>;
+
+            impl<const N: usize> Visitor<'_> for ArrayStrVisitor<N> {
+                type Value = super::ArrayStr<N>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a string of at most {N} bytes")
+                }
+
+                fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
+                    Self::Value::try_from(v).map_err(E::custom)
+                }
+            }
+
+            deserializer.deserialize_str(ArrayStrVisitor::<N>)
         }
     }
 }
@@ -853,6 +869,25 @@ mod tests {
             let a = ArrayStr::<16>::from_str_truncate("abc");
             let b = a;
             assert_eq!(a.as_str(), b.as_str());
+        }
+
+        /// Records written while `ArrayStr` serialized as a byte sequence have
+        /// to keep loading, so the two encodings must stay identical.
+        #[test]
+        fn bincode_encoding_matches_a_byte_sequence() {
+            let value = ArrayStr::<16>::from_str_truncate("greedy");
+            let as_bytes: Vec<u8> = value.as_str().bytes().collect();
+
+            let bytes = bincode::serialize(&value).unwrap();
+            assert_eq!(bytes, bincode::serialize(&as_bytes).unwrap());
+            assert_eq!(bincode::deserialize::<ArrayStr<16>>(&bytes).unwrap().as_str(), "greedy");
+        }
+
+        #[test]
+        fn bincode_rejects_a_value_over_capacity() {
+            let bytes = bincode::serialize(&"abcde").unwrap();
+
+            assert!(bincode::deserialize::<ArrayStr<4>>(&bytes).is_err());
         }
     }
 }

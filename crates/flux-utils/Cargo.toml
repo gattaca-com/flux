@@ -23,6 +23,7 @@ type-hash.workspace = true
 wincode = { workspace = true, optional = true }
 
 [dev-dependencies]
+bincode.workspace = true
 criterion.workspace = true
 crossbeam-channel.workspace = true
 flux-communication.workspace = true

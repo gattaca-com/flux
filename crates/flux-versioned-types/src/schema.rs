@@ -116,8 +116,8 @@ impl<T: TelemetrySchema + Copy, const N: usize> TelemetrySchema for flux_utils::
 }
 
 impl<const N: usize> TelemetrySchema for flux_utils::ArrayStr<N> {
-    type Proxy = Vec<u8>;
-    type FlattenedProxy = Vec<u8>;
+    type Proxy = String;
+    type FlattenedProxy = String;
 }
 
 macro_rules! tuple_proxy {
