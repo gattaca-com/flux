@@ -6,20 +6,13 @@ use flux_versioned_types::Blob;
 use mio::Token;
 use tracing::warn;
 
-/// A never-established endpoint may sit disconnected this long before its
-/// backlog is shed. Covers slow receiver startups: a never-established peer
-/// holds at most this much of queued frames.
+/// A never-established peer holds at most this much backlog.
 const SHED_GRACE_SECS: u64 = 60;
-/// An endpoint must look live this long before it counts as established. A
-/// pending handshake looks exactly like a live connection until SYN timeout,
-/// worst case ~127 s, so anything shorter would exempt peers that never
-/// received a byte.
+/// A pending handshake looks live until SYN timeout (~127 s).
 const ESTABLISH_GRACE_SECS: u64 = 300;
 
 struct Endpoint {
     addr: SocketAddr,
-    /// `None` until `connect` returns a token; the driver then owns
-    /// reconnection.
     token: Option<Token>,
     established: bool,
     live_since: Option<(Token, Instant)>,
@@ -74,12 +67,6 @@ impl Endpoint {
     }
 }
 
-/// Ships blobs as bare TCP frames.
-///
-/// The first `drive()` dials every address; never-connected addrs are retried
-/// by drive until the first success, after which `NetworkDriver` owns
-/// reconnection. An endpoint that never held a live connection sheds its
-/// queued frames after `SHED_GRACE_SECS` disconnected.
 pub struct BlobShipper {
     driver: NetworkDriver,
     endpoints: Vec<Endpoint>,
@@ -87,7 +74,6 @@ pub struct BlobShipper {
 }
 
 impl BlobShipper {
-    /// TCP transport, nodelay: false, user timeout 5 s, no on-connect message.
     pub fn new(addrs: Vec<SocketAddr>) -> Self {
         let driver = NetworkDriver::default()
             .with_transport(Transport::Tcp(TcpConfig { nodelay: false, ..Default::default() }))
@@ -105,44 +91,25 @@ impl BlobShipper {
         Self { driver, endpoints, retry: Repeater::every(Duration::from_secs(2)) }
     }
 
-    /// Disconnects peers whose send backlog exceeds `frames` for `timeout`;
-    /// a disconnected outbound peer drops further frames until it reconnects.
-    /// Forwards to the `NetworkDriver` builder; call before the first
-    /// `drive()`.
     pub fn with_max_backlog(mut self, frames: usize, timeout: Duration) -> Self {
         let driver = std::mem::take(&mut self.driver);
         self.driver = driver.with_max_backlog(frames, timeout);
         self
     }
 
-    /// Drops queued outbound frames when a connection drops instead of
-    /// replaying them after reconnect; sends while disconnected are dropped.
-    /// Forwards to the `NetworkDriver` builder; call before the first
-    /// `drive()`.
     pub fn with_drop_outbound_backlog_on_disconnect(mut self, enabled: bool) -> Self {
         let driver = std::mem::take(&mut self.driver);
         self.driver = driver.with_drop_outbound_backlog_on_disconnect(enabled);
         self
     }
 
-    /// Broadcast the blob bytes as one frame.
-    ///
-    /// Frames shipped before any endpoint ever connected are dropped; an
-    /// endpoint that never held a live connection sheds its queued frames
-    /// after `SHED_GRACE_SECS` disconnected; an endpoint that was live for
-    /// `ESTABLISH_GRACE_SECS` keeps its backlog for gap-free replay, bounded
-    /// only by `with_max_backlog`/
-    /// `with_drop_outbound_backlog_on_disconnect`.
+    /// Dropped until an endpoint has connected once.
     pub fn ship(&mut self, blob: &Blob) {
         let bytes = blob.as_bytes();
         self.driver
             .write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(bytes));
     }
 
-    /// Dials never-connected addrs and sheds dead-endpoint backlogs (the
-    /// first call dials immediately: the retry timer starts at zero), then
-    /// polls. Returns whether the poll did network work, so a tile can
-    /// `adapter.mark_work()`.
     pub fn drive(&mut self) -> bool {
         if self.retry.fired() {
             let now = Instant::now();

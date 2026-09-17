@@ -1,10 +1,4 @@
-//! End-to-end gather path, and the complete usage example for the library:
-//! a user spine with `#[queue(gather)]` fields drains through the user's
-//! `Gatherer` tile (disk + TCP) into `BlobReceiver` + `BlobConsumer<TestMeta,
-//! RecordingHandler>` (disk + hook), and `BlobReader` reads both disks back.
-//! The user owns the metadata type (`TestMeta`), the flush rule (slot ends),
-//! and the on-disk layout (`TestMeta::path`).
-
+// `#[from_spine]` emits `extern "C"` FFI checks for queue message types.
 #![allow(improper_ctypes)]
 
 use std::{
@@ -61,7 +55,6 @@ enum Telemetry {
     SlotEnd(SlotEnd),
 }
 
-// The user's blob metadata: padding-free, 8 + 8 + 24 = 40 bytes.
 versioned_struct!(TestMeta =>
     #[type_hash_lock(hash = 2679133347977192113)]
     TestMetaV1 { pub slot: u64, pub n_blobs: u64, pub instance: ArrayStr<16> }
@@ -70,7 +63,6 @@ versioned_struct!(TestMeta =>
 const _: () = assert!(size_of::<TestMeta>() == 40);
 
 impl TestMeta {
-    // The user's on-disk layout: `<base>/<instance>/<type_name>/<slot>.bin`.
     fn path(&self, base: &Path, type_name: &str) -> PathBuf {
         base.join(self.instance.as_str()).join(type_name).join(format!("{}.bin", self.slot))
     }
@@ -90,12 +82,10 @@ struct GatherTestSpine {
     pub fills: SpineQueue<Fill>,
     #[queue(size(2usize.pow(10)))]
     pub ignored: SpineQueue<Ignored>,
-    // No `gather` attr: the user's tile consumes the slot-end queue by hand.
     #[queue(size(64))]
     pub slot_end: SpineQueue<SlotEnd>,
 }
 
-// The user's gather tile: owns when to flush and where each blob goes.
 struct Gatherer {
     ready: Arc<AtomicBool>,
     cache: BlobCache,
@@ -125,8 +115,7 @@ impl Tile<GatherTestSpine> for Gatherer {
         if adapter.consume_internal_message_one(|m: &mut InternalMessage<SlotEnd>, _| {
             boundary = Some(*m);
         }) {
-            // Queues are independent rings: re-drain so the rest of the closing
-            // slot lands in this flush, not the next one.
+            // rings are independent; drain again so the closing slot is complete
             GatherTestSpine::gather_into(adapter, &mut self.cache);
             let m = boundary.unwrap();
             self.cache.push(&m);
@@ -142,8 +131,6 @@ impl Tile<GatherTestSpine> for Gatherer {
         GatherTestSpine::gather_into(adapter, &mut self.cache);
         self.flush(self.last_slot + 1);
         self.writer.drain();
-        // NetworkDriver has no backlog-empty query, so drive blind for a bounded
-        // window.
         let deadline = Instant::now() + StdDuration::from_millis(200);
         while Instant::now() < deadline {
             self.shipper.drive();
@@ -169,7 +156,6 @@ struct Seen {
     n_messages: u32,
 }
 
-// The user's handler: owns receiver-side persistence and what to remember.
 struct RecordingHandler {
     writer: BlobWriter,
     base: PathBuf,
@@ -209,19 +195,11 @@ const PRICES_PER_SLOT: u64 = 5;
 const FILLS_PER_SLOT: u64 = 3;
 const IGNORED_PER_SLOT: u64 = 2;
 const PARTIAL_PRICES: u64 = 2;
-/// Slots 1..=3 ship Price/Fill/SlotEnd each; the teardown flush ships one
-/// Price.
 const EXPECTED_BLOBS: usize = 10;
 const DEADLINE: StdDuration = StdDuration::from_secs(20);
-/// Longer than the sender deadline, so a sender-deadline burst still lands on
-/// a live receiver instead of a closed port.
 const RECEIVER_DEADLINE: StdDuration = StdDuration::from_secs(30);
-/// Both tests pick a loopback port then bind later; serialize them so the
-/// second cannot take the first's port between pick and bind.
 static PORT_LOCK: Mutex<()> = Mutex::new(());
 
-/// Runs `cleanup_shmem` on drop so a failed assert does not leak /dev/shm
-/// backing.
 struct ShmemGuard(PathBuf);
 impl Drop for ShmemGuard {
     fn drop(&mut self) {
@@ -322,10 +300,7 @@ impl ProducerTile {
 impl Tile<GatherTestSpine> for ProducerTile {
     fn loop_body(&mut self, adapter: &mut SpineAdapter<GatherTestSpine>) {
         if !self.ready.load(Ordering::Relaxed) {
-            // Consumer cursors fix at first read, so the gather tile must run
-            // its first pass before anything is produced, else the first batch
-            // is silently skipped. Produce anyway after 5 s so a dead gatherer
-            // fails the test instead of hanging it.
+            // consumers subscribe at their first read
             if self.waited_since.elapsed() < StdDuration::from_secs(5) {
                 return;
             }
@@ -369,9 +344,6 @@ impl Tile<GatherTestSpine> for ProducerTile {
         } else if self.expired() ||
             Instant::now() > self.partial_at.unwrap() + StdDuration::from_millis(500)
         {
-            // The teardown flush ships the partial batch as slot 4; the
-            // receiver cannot acknowledge it before this scope stops, so stop
-            // on a grace period rather than waiting for it.
             adapter.request_stop_scope();
         }
     }
@@ -382,8 +354,6 @@ fn gather_end_to_end_sender_to_receiver() {
     let _port = PORT_LOCK.lock().unwrap();
     let send_base = tempfile::tempdir().expect("send base");
     let recv_base = tempfile::tempdir().expect("recv base");
-    // Disk roots live outside the shmem bases: cleanup_shmem removes the whole
-    // base tree, so a disk dir nested under it would vanish with the queues.
     let send_disk_tmp = tempfile::tempdir().expect("send disk");
     let recv_disk_tmp = tempfile::tempdir().expect("recv disk");
     let send_disk = send_disk_tmp.path().to_path_buf();

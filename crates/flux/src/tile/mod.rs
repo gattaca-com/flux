@@ -20,7 +20,6 @@ pub struct TileConfig {
     thread_niceness: Option<ThreadNiceness>,
     min_loop_duration: Option<Duration>,
     metrics: bool,
-    // Only read under the `park` feature; silence dead-code lint otherwise.
     #[cfg_attr(not(feature = "park"), allow(dead_code))]
     park: bool,
 }
@@ -57,11 +56,8 @@ impl TileConfig {
         self
     }
 
-    /// Opt in to futex parking under the `park` feature. A parked tile wakes
-    /// only when a spine producer signals, so this suits tiles fed exclusively
-    /// by queues. Tiles that poll sockets or an `io_uring` ring, or that pace
-    /// themselves with `min_loop_duration`, must stay unparked: nothing on the
-    /// spine would ever wake them.
+    /// Parked tiles wake only on spine producer signals; never for tiles that
+    /// poll sockets or disk.
     pub fn with_park(mut self) -> Self {
         self.park = true;
         self

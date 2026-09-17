@@ -4,25 +4,17 @@ use flux_disk::{DiskEvent, DiskIo, OpenOptions};
 use flux_versioned_types::Blob;
 use tracing::{error, warn};
 
-/// Persists each blob as the entire content of a caller-chosen file.
 #[derive(Default)]
 pub struct BlobWriter {
     disk: DiskIo,
 }
 
 impl BlobWriter {
-    /// Empty queue; buffers grow on first use.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Queues `blob` as the entire content of `path`: parent directories are
-    /// created (blocking, cheap), the file is created/truncated, written
-    /// through `io_uring`, closed. `false` + `warn!` when the directory or the
-    /// synchronous part of the open fails (`DiskIo::open` fails synchronously
-    /// only for a NUL byte in the path); real open failures surface
-    /// asynchronously through `poll` as `DiskEvent::Failed` for the open and
-    /// the operations queued behind it.
+    /// Open failures surface asynchronously through `poll`.
     pub fn write(&mut self, blob: &Blob, path: &Path) -> bool {
         if let Some(parent) = path.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
@@ -46,8 +38,6 @@ impl BlobWriter {
         true
     }
 
-    /// Reaps completions, `error!`-logging failures. Returns whether any
-    /// completion was reaped.
     pub fn poll(&mut self) -> bool {
         let mut reaped = false;
         self.disk.poll_with(|event| {
@@ -59,7 +49,6 @@ impl BlobWriter {
         reaped
     }
 
-    /// Polls until idle (1 ms sleeps between polls).
     pub fn drain(&mut self) {
         loop {
             self.poll();

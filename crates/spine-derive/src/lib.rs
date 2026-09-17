@@ -1,13 +1,3 @@
-// Make the following work:
-// #[from_spine("app")]
-// #[derive(Clone, Debug)]
-// pub struct Spine {
-//     #[queue(size(2usize.pow(15)), gather)]
-//     pub updates: SpineQueue<messages::Update>,
-// }
-
-// `#[from_spine]`: generates the spine struct plus consumers/producers, config,
-// and the `FluxSpine` impl from `SpineQueue<T>` field annotations.
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, quote_spanned};
 use syn::{
@@ -95,8 +85,6 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
                     if meta.input.peek(syn::token::Paren) {
                         let content;
                         parenthesized!(content in meta.input);
-                        // Consume whatever is inside; the error is raised at
-                        // the field site so it lands on the field span.
                         let _: proc_macro2::TokenStream = content.parse()?;
                         gather_with_args = true;
                     }
@@ -137,23 +125,13 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 /// Queue attributes (`#[queue(..)]` on `SpineQueue<T>` fields):
 /// - `size(..)`: queue capacity (default `2usize.pow(15)`).
 /// - `flavour("spmc")`: SPMC queue instead of MPMC.
-/// - `mtu(..)`: dcache-backed queue with the given max frame size. Only the
-///   fixed-size queue message is gathered; a dcache payload never enters a
-///   blob.
+/// - `mtu(..)`: dcache-backed queue with the given max frame size.
 /// - `gather`: drain this queue into a `BlobCache` via the generated
-///   `flux_gather::GatherQueues` impl. Every gathered message type must
-///   implement `flux_versioned_types::HasVersionedLeaves` (the bound surfaces
-///   through `BlobCache::push`). Plain and dcache queues are drained in
-///   declaration order. `gather` takes no arguments. Flush timing is the user's
-///   tile's job: a queue the user wants to react to (such as a slot-end queue)
-///   is consumed by hand in that tile and pushed with `cache.push` there. A
-///   boundary message orders only messages from the same producer thread, and
-///   queues are independent rings: after reading a boundary, drain the gathered
-///   queues once more before flushing, otherwise late messages of the closing
-///   batch land in the next one.
-///
-/// Using `gather` requires a direct dependency on `flux-gather`: the generated
-/// `GatherQueues` impl names `::flux_gather::` paths.
+///   `GatherQueues` impl; every gathered type must implement
+///   `HasVersionedLeaves` and the crate needs a direct `flux-gather`
+///   dependency. A boundary orders only its own producer thread's messages and
+///   rings are independent, so drain once more after a boundary before
+///   flushing.
 #[allow(clippy::too_many_lines)]
 #[proc_macro_attribute]
 pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -333,13 +311,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Drain passes for plain and dcache gathered fields in declaration order.
     let mut gather_passes = Vec::<proc_macro2::TokenStream>::new();
     for (inner_ty, is_dcache) in &gather_fields {
         let inner_ty_span = inner_ty.span();
         if *is_dcache {
-            // The fixed-size message comes from the queue, not the dcache, so
-            // it is intact even when the payload is `Lost` or absent (`NoRef`).
             gather_passes.push(quote_spanned! { inner_ty_span =>
                 adapter.consume_with_dcache_internal_message(
                     |_: &::flux::timing::InternalMessage<#inner_ty>, _payload: &[u8]| {},
@@ -614,7 +589,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        // start() spawns the spine scope and runs the user closure.
         impl #struct_ident {
             #generated_new_method_token_stream // Use the correctly generated new method
 

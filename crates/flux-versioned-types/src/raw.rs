@@ -326,7 +326,6 @@ impl BlobCache {
         self.buffers.values().map(|buf| buf.n_messages as usize).sum()
     }
 
-    /// Number of blobs `flush` would build: one per non-empty leaf type.
     pub fn n_blobs(&self) -> usize {
         self.buffers.values().filter(|buf| buf.n_messages > 0).count()
     }

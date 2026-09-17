@@ -1,23 +1,8 @@
-//! Building blocks for gathering versioned leaves into blobs, shipping them
-//! over TCP, persisting them to disk, and routing them back on receipt.
+//! Gather versioned leaves into blobs, ship them over TCP, and persist them to
+//! disk.
 //!
-//! One `Blob` is one TCP frame is one file: frame payloads and file contents
-//! are exactly `blob.as_bytes()`, so sender-side and receiver-side copies of
-//! a blob are byte-identical.
-//!
-//! On the sender side, declare queues with `#[queue(gather)]`, drain them in
-//! your tile with `S::gather_into(adapter, &mut cache)`, consume any queue
-//! you want to react to by hand, and when *you* decide, flush:
-//! `cache.flush(&your_meta, zstd_level, |blob| { shipper.ship(blob);
-//! writer.write(blob, &path) })`. On the receiver side, run a spine with an
-//! `IncomingBlob` dcache queue and a `Token` queue, listen with
-//! `BlobReceiver`, and hand `(&YourMeta, &Blob)` to your `BlobHandler` through
-//! `BlobConsumer::<YourMeta, _>::new(handler)`; `BlobReader` reads files back.
-//! See `tests/e2e.rs` for the complete example.
-//! Tiles do not park by default. Do not opt `BlobReceiver` or a tile that
-//! drives `BlobShipper`/`BlobWriter` into parking: nothing on the spine wakes
-//! a tile that waits on a socket or a disk ring. Dead endpoints that never
-//! connected shed their backlog automatically.
+//! One blob is one TCP frame is one file: frame payloads and file contents are
+//! `blob.as_bytes()`. See `tests/e2e.rs` for the complete usage example.
 pub mod queues;
 pub mod reader;
 pub mod receiver;

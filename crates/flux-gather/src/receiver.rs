@@ -12,38 +12,17 @@ use flux_versioned_types::{Blob, DecodeError, Scratch, Versioned};
 use mio::Token;
 use tracing::warn;
 
-/// A frame landed in the dcache. Message type of the receiver spine's dcache
-/// queue.
-///
-/// The dcache `mtu` is not enforced per frame: size it at least the largest
-/// blob a sender can emit. A frame larger than `mtu` weakens the ring's lap
-/// guarantee and surfaces as `Lost`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IncomingBlob {
-    /// Token of the connection the frame arrived on.
     pub token: Token,
 }
 
-/// Receives validated blobs.
-///
-/// Everything else in its life is an ordinary tile's:
-/// `BlobConsumer` forwards `on_attach`, `try_init`, `loop_body`, `teardown` and
-/// `name` to it, so I/O the handler owns (a `BlobWriter`, a replica spine's
-/// producers) is driven from its own `loop_body` and finished in its
-/// `teardown`.
 pub trait BlobHandler<S: FluxSpine, U>: Tile<S> {
-    /// One blob carrying `U` metadata arrived intact. `blob` lives in the
-    /// consumer's scratch until the next frame.
+    /// `blob` is valid until the next frame.
     fn on_blob(&mut self, meta: &U, blob: &Blob, adapter: &mut SpineAdapter<S>);
 }
 
-/// TCP listener feeding frames into the dcache. No deserialization, no
-/// per-connection state.
-///
-/// Tokens are per-driver integers starting at 0: run exactly one
-/// `BlobReceiver` per spine, or a second one's `disconnect: Token` values
-/// would address the wrong peer.
 pub struct BlobReceiver {
     listen: SocketAddr,
     socket_buf_size: usize,
@@ -51,13 +30,10 @@ pub struct BlobReceiver {
 }
 
 impl BlobReceiver {
-    /// Default `64 MiB` kernel socket buffer.
     pub fn new(listen: SocketAddr) -> Self {
         Self { listen, socket_buf_size: 64 * 1024 * 1024, driver: None }
     }
 
-    /// Kernel `SO_SNDBUF`/`SO_RCVBUF` applied to the listener and accepted
-    /// streams.
     pub fn with_socket_buf_size(mut self, bytes: usize) -> Self {
         self.socket_buf_size = bytes;
         self
@@ -92,31 +68,20 @@ where
     }
 }
 
-/// Validates dcache frames as blobs carrying `U` and hands them to the handler.
-/// Never disconnects a peer for a missing payload: `NoRef`/`Lost` are
-/// receiver-side faults.
-///
-/// Each frame is copied once into an internal scratch buffer while the dcache
-/// slot is still held, so the epoch check covers the copy and a torn slot can
-/// never reach the handler. `handle` does not copy: the caller owns the bytes.
+/// Copies each frame out of the dcache before the epoch check so a torn slot
+/// never reaches the handler.
 pub struct BlobConsumer<U: Versioned, H> {
     handler: H,
     scratch: Scratch,
-    // `fn() -> U` is always `Send`, so the tile stays `Send` with no `U:
-    // Send` bound.
     meta: PhantomData<fn() -> U>,
 }
 
 impl<U: Versioned, H> BlobConsumer<U, H> {
-    /// Route validated blobs into `handler`.
     pub fn new(handler: H) -> Self {
         Self { handler, scratch: Scratch::new(), meta: PhantomData }
     }
 
-    /// Validates one frame (`Blob::from_bytes`, then exactly one blob per
-    /// frame) and hands it to the handler. The caller owns `bytes`, so no copy
-    /// is made. `Err`: the peer is not sending our blobs. Also usable as a
-    /// component by an app that owns its own TCP tile.
+    /// `Err`: the peer is not sending our blobs.
     pub fn handle<S: FluxSpine>(
         &mut self,
         bytes: &[u8],
@@ -137,7 +102,6 @@ impl<U: Versioned, H> BlobConsumer<U, H> {
         Ok(())
     }
 
-    /// The handler, e.g. to inspect what it recorded.
     pub fn handler_mut(&mut self) -> &mut H {
         &mut self.handler
     }
@@ -149,7 +113,6 @@ where
     S::Producers: AsRef<SpineProducer<Token>>,
 {
     fn name(&self) -> TileName {
-        // The handler is the tile's identity in tile_info/metrics.
         self.handler.name()
     }
 
