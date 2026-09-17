@@ -13,12 +13,14 @@ pub mod raw;
 mod schema;
 pub mod wire;
 
-pub use blob::{InternalMetadata, InternalMetadataV1, VersionedBlob, VersionedPersistable};
+pub use blob::{
+    TrackingTimestampWire, TrackingTimestampWireV1, VersionedBlob, VersionedPersistable,
+};
 pub use flux_versioned_types_macros::{
     TelemetrySchema, VersionedLeaves, evolve_enum, evolve_struct, roll_chain_into,
 };
 pub use leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf};
-pub use raw::{Blob, BlobCache, DecodeError, Scratch};
+pub use raw::{Blob, BlobCache, BlobHeader, DecodeError, Scratch};
 pub use schema::TelemetrySchema;
 pub use wire::{
     DEFAULT_TELEMETRY_WIRE_ZSTD_LEVEL, TelemetryWire, TelemetryWirePayloadEncoding, TelemetryWireV2,

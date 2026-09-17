@@ -5,7 +5,7 @@
 //! cast in [`Blob::from_bytes`], and a disk file is a concatenation of blobs.
 //!
 //! ```text
-//! [header 128 B][user metadata, padded to 8][zstd( [InternalMetadata x n][Leaf x n] )]
+//! [header 128 B][user metadata, padded to 8][zstd( [TrackingTimestampWire x n][Leaf x n] )]
 //! ```
 //!
 //! * `header` - exactly 128 bytes, `repr(C)`, no padding. All integers are
@@ -16,7 +16,7 @@
 //!   `metadata_len` is its true size (`size_of::<U>()`); the section is padded
 //!   with zeros to a multiple of 8.
 //! * `compressed tail` - one zstd frame holding two homogeneous sections: the
-//!   portable timestamp projection of every message ([`InternalMetadata`],
+//!   portable timestamp projection of every message ([`TrackingTimestampWire`],
 //!   24-byte stride) followed by the leaves themselves at their own `size_of`
 //!   stride. Both sections have `n_messages` elements. `compressed_len` is the
 //!   true zstd length; the tail is padded with zeros to a multiple of 8, so
@@ -47,20 +47,17 @@ use flux_utils::ArrayStr;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::{
-    blob::InternalMetadata,
+    blob::TrackingTimestampWire,
     leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf},
 };
 
 /// Identifies a blob on disk and lets a receiver sniff blobs from legacy
 /// bincode frames, whose first bytes are a small enum index.
 pub const MAGIC: [u8; 8] = *b"FLUXBLOB";
-/// Format version. Version 1 = the header below + `InternalMetadata` timestamps
+/// Format version. Version 1 = the header below + `TrackingTimestampWire`
+/// timestamps
 /// + one zstd frame.
 pub const FORMAT_VERSION: u32 = 1;
-/// Fixed header size in bytes.
-pub const HEADER_LEN: usize = 128;
-/// Stride of the timestamp section.
-pub const TIMESTAMP_STRIDE: usize = 24;
 /// Capacity of [`Blob::type_name`].
 pub const TYPE_NAME_LEN: usize = 64;
 /// Alignment required of every blob and section. Leaves must not need more.
@@ -78,15 +75,10 @@ fn round8(n: u64) -> Option<u64> {
     n.checked_add(7).map(|m| m & !7)
 }
 
-/// One batch of a single leaf type. See the [module docs](self) for the layout.
-///
-/// Obtain one through [`Blob::from_bytes`], [`Scratch::load`] or
-/// [`BlobCache::flush`]. The derived `try_ref_from_bytes` only validates the
-/// header's own fields, not the declared lengths against the slice, so
-/// accessors on a blob obtained that way may panic on out-of-range lengths.
-#[derive(TryFromBytes, KnownLayout, Immutable)]
+/// Fixed header of a [`Blob`]: its first 128 bytes.
+#[derive(Clone, Copy, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
-pub struct Blob {
+pub struct BlobHeader {
     pub magic: [u8; 8],
     pub version: u32,
     /// Bytes of the user metadata value that follows the header.
@@ -105,8 +97,26 @@ pub struct Blob {
     pub decompressed_len: u64,
     /// Wire label of the leaf, [`Versioned::NAME`].
     pub type_name: ArrayStr<TYPE_NAME_LEN>,
-    /// `[user metadata, padded to 8][zstd tail]`.
-    tail: [u8],
+}
+
+// Wire-format pins. Changing either is a new `FORMAT_VERSION`.
+const _: () = assert!(size_of::<BlobHeader>() == 128 && align_of::<BlobHeader>() == ALIGN);
+
+/// One batch of a single leaf type. See the [module docs](self) for the layout.
+///
+/// Obtain one through [`Blob::from_bytes`], [`Scratch::load`] or
+/// [`BlobCache::flush`]. The derived `try_ref_from_bytes` only validates the
+/// header's own fields, not the declared lengths against the slice, so
+/// accessors on a blob obtained that way may panic on out-of-range lengths.
+#[derive(TryFromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct Blob {
+    pub header: BlobHeader,
+    /// `[user metadata, padded to 8][zstd tail, padded to 8]`. Words rather
+    /// than bytes so the type has no trailing padding at any length: that is
+    /// what makes `IntoBytes` derivable and rejects blobs that are not a
+    /// multiple of 8 at the cast.
+    tail: [u64],
 }
 
 /// Why a byte slice is not a valid blob, or a blob did not decode.
@@ -202,93 +212,87 @@ impl Blob {
         if !(bytes.as_ptr() as usize).is_multiple_of(ALIGN) {
             return Err(DecodeError::Unaligned);
         }
-        if bytes.len() < HEADER_LEN {
-            return Err(DecodeError::TooShort { needed: HEADER_LEN, got: bytes.len() });
+        let header_len = size_of::<BlobHeader>();
+        if bytes.len() < header_len {
+            return Err(DecodeError::TooShort { needed: header_len, got: bytes.len() });
         }
         // Before the cast, so a legacy bincode frame is `BadMagic`, not a
         // complaint about whatever bytes sit where `type_name` would be.
-        if bytes[..MAGIC.len()] != MAGIC {
+        let magic_at = core::mem::offset_of!(BlobHeader, magic);
+        if bytes[magic_at..magic_at + MAGIC.len()] != MAGIC {
             return Err(DecodeError::BadMagic);
         }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+        let version_at = core::mem::offset_of!(BlobHeader, version);
+        let version =
+            u32::from_le_bytes(bytes[version_at..version_at + 4].try_into().expect("4 bytes"));
         if version != FORMAT_VERSION {
             return Err(DecodeError::UnsupportedVersion(version));
         }
-        let head = Self::try_ref_from_bytes(&bytes[..HEADER_LEN]).map_err(|e| match e {
+        let header = BlobHeader::try_ref_from_bytes(&bytes[..header_len]).map_err(|e| match e {
             zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
             zerocopy::ConvertError::Size(_) => {
-                DecodeError::TooShort { needed: HEADER_LEN, got: bytes.len() }
+                DecodeError::TooShort { needed: header_len, got: bytes.len() }
             }
             zerocopy::ConvertError::Validity(_) => DecodeError::BadTypeName,
         })?;
-        let tail_len = round8(u64::from(head.metadata_len))
-            .and_then(|meta| round8(head.compressed_len).and_then(|comp| meta.checked_add(comp)))
-            .and_then(|tail| tail.checked_add(HEADER_LEN as u64))
+        let need = round8(u64::from(header.metadata_len))
+            .and_then(|meta| round8(header.compressed_len).and_then(|comp| meta.checked_add(comp)))
+            .and_then(|tail| tail.checked_add(header_len as u64))
             .and_then(|need| usize::try_from(need).ok());
-        let Some(need) = tail_len else {
+        let Some(need) = need else {
             return Err(DecodeError::TooShort { needed: usize::MAX, got: bytes.len() });
         };
         if bytes.len() < need {
             return Err(DecodeError::TooShort { needed: need, got: bytes.len() });
         }
-        let blob = Self::try_ref_from_bytes(&bytes[..need]).map_err(|e| match e {
+        Self::try_ref_from_bytes(&bytes[..need]).map_err(|e| match e {
             zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
             zerocopy::ConvertError::Size(_) => {
                 DecodeError::TooShort { needed: need, got: bytes.len() }
             }
             zerocopy::ConvertError::Validity(_) => DecodeError::BadTypeName,
-        })?;
-        Ok(blob)
+        })
     }
 
-    /// The exact bytes of this blob: header plus tail, no trailing padding.
+    /// The exact bytes of this blob: header plus tail.
     pub fn as_bytes(&self) -> &[u8] {
-        // No `IntoBytes` derive: it rejects the slice DST. Sound by
-        // construction: blobs only come from `from_bytes` over live bytes or
-        // from `flush`, which fills header plus tail completely, so every
-        // byte of the value is initialized.
-        unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::from_ref(self).cast::<u8>(),
-                HEADER_LEN + self.tail.len(),
-            )
-        }
+        IntoBytes::as_bytes(self)
     }
 
     /// True when `type_hash` is any version of `T`.
     pub fn is<T: Versioned>(&self) -> bool {
-        T::VERSION_HASHES.contains(&self.type_hash)
+        T::VERSION_HASHES.contains(&self.header.type_hash)
     }
 
     pub fn type_name(&self) -> &str {
-        self.type_name.as_str()
+        self.header.type_name.as_str()
     }
 
     /// The user metadata bytes, uncompressed. No decompression.
     pub fn user_metadata_bytes(&self) -> &[u8] {
-        &self.tail[..self.metadata_len as usize]
+        &self.tail.as_bytes()[..self.header.metadata_len as usize]
     }
 
     /// The zstd tail.
     pub fn compressed(&self) -> &[u8] {
-        let meta_pad = (self.metadata_len as usize).next_multiple_of(ALIGN);
-        let len = self.compressed_len as usize;
-        &self.tail[meta_pad..meta_pad + len]
+        let meta_pad = (self.header.metadata_len as usize).next_multiple_of(ALIGN);
+        let len = self.header.compressed_len as usize;
+        &self.tail.as_bytes()[meta_pad..meta_pad + len]
     }
 
     /// Decode the user metadata as `U`, migrating if it was written as an
     /// older version. No decompression.
     pub fn user_metadata<U: Versioned>(&self) -> Result<U, DecodeError> {
-        let Some(size) = U::version_size(self.metadata_type_hash) else {
-            return Err(DecodeError::UnknownTypeHash(self.metadata_type_hash));
+        let Some(size) = U::version_size(self.header.metadata_type_hash) else {
+            return Err(DecodeError::UnknownTypeHash(self.header.metadata_type_hash));
         };
-        if self.metadata_len as usize != size {
+        if self.header.metadata_len as usize != size {
             return Err(DecodeError::LengthMismatch {
                 expected: size,
-                got: self.metadata_len as usize,
+                got: self.header.metadata_len as usize,
             });
         }
-        let out = U::decode_versions(self.metadata_type_hash, self.user_metadata_bytes())?;
+        let out = U::decode_versions(self.header.metadata_type_hash, self.user_metadata_bytes())?;
         if out.len() != 1 {
             return Err(DecodeError::LengthMismatch { expected: 1, got: out.len() });
         }
@@ -307,20 +311,21 @@ impl Blob {
     /// value check fails.
     pub fn decode<U: Versioned, T: Versioned>(&self, scratch: &mut Scratch) -> Decoded<U, T> {
         if !self.is::<T>() {
-            return Err(DecodeError::UnknownTypeHash(self.type_hash));
+            return Err(DecodeError::UnknownTypeHash(self.header.type_hash));
         }
         let meta = self.user_metadata::<U>()?;
         // The header is untrusted: pin `decompressed_len` to what `n_messages`
         // of the writing version must occupy before allocating anything.
-        let n = u64::from(self.n_messages);
-        let leaf_size = T::version_size(self.type_hash)
-            .ok_or(DecodeError::UnknownTypeHash(self.type_hash))? as u64;
-        let ts_len = n * TIMESTAMP_STRIDE as u64;
+        let n = u64::from(self.header.n_messages);
+        let leaf_size = T::version_size(self.header.type_hash)
+            .ok_or(DecodeError::UnknownTypeHash(self.header.type_hash))?
+            as u64;
+        let ts_len = n * size_of::<TrackingTimestampWire>() as u64;
         let expected = ts_len + n * leaf_size;
-        if self.decompressed_len != expected {
+        if self.header.decompressed_len != expected {
             return Err(DecodeError::LengthMismatch {
                 expected: usize::try_from(expected).unwrap_or(usize::MAX),
-                got: usize::try_from(self.decompressed_len).unwrap_or(usize::MAX),
+                got: usize::try_from(self.header.decompressed_len).unwrap_or(usize::MAX),
             });
         }
         let expected_len = expected as usize;
@@ -333,7 +338,7 @@ impl Blob {
         let bytes = scratch.as_bytes();
         let (ts_bytes, leaf_bytes) = bytes.split_at(ts_len as usize);
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
-        let leaves = T::decode_versions(self.type_hash, leaf_bytes)?;
+        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes)?;
         if leaves.len() != n as usize {
             return Err(DecodeError::LengthMismatch { expected: n as usize, got: leaves.len() });
         }
@@ -348,18 +353,18 @@ impl Blob {
     }
 }
 
-fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[InternalMetadata], DecodeError> {
-    let stamps = <[InternalMetadata]>::ref_from_bytes(bytes).map_err(|e| match e {
+fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[TrackingTimestampWire], DecodeError> {
+    let stamps = <[TrackingTimestampWire]>::ref_from_bytes(bytes).map_err(|e| match e {
         zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
         zerocopy::ConvertError::Size(_) => DecodeError::LengthMismatch {
-            expected: n * size_of::<InternalMetadata>(),
+            expected: n * size_of::<TrackingTimestampWire>(),
             got: bytes.len(),
         },
         zerocopy::ConvertError::Validity(i) => match i {},
     })?;
     if stamps.len() != n {
         return Err(DecodeError::LengthMismatch {
-            expected: n * size_of::<InternalMetadata>(),
+            expected: n * size_of::<TrackingTimestampWire>(),
             got: bytes.len(),
         });
     }
@@ -370,7 +375,7 @@ fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[InternalMetadata], DecodeE
 struct TypedBuffer {
     name: &'static str,
     n_messages: u32,
-    /// `InternalMetadata` records, 24 bytes each.
+    /// `TrackingTimestampWire` records, 24 bytes each.
     timestamps: Vec<u8>,
     /// Leaf bytes at the leaf's `size_of` stride.
     leaves: Vec<u8>,
@@ -392,8 +397,10 @@ impl BlobCache {
 
     /// Resolve `msg` to its leaf and append it to that leaf's buffer.
     pub fn push<T: HasVersionedLeaves>(&mut self, msg: &InternalMessage<T>) {
-        let mut push =
-            Push { cache: &mut *self, timestamp: InternalMetadata::from(msg.tracking_timestamp()) };
+        let mut push = Push {
+            cache: &mut *self,
+            timestamp: TrackingTimestampWire::from(msg.tracking_timestamp()),
+        };
         msg.data().visit_leaf(&mut push);
     }
 
@@ -425,7 +432,6 @@ impl BlobCache {
         let Self { buffers, build } = self;
         for key in keys {
             let buf = &buffers[&key];
-            let stride = buf.leaves.len() / buf.n_messages as usize;
             let meta_bytes = <U as IntoBytes>::as_bytes(user_meta);
             let meta_pad = meta_bytes.len().next_multiple_of(ALIGN);
             let mut plain = Vec::with_capacity(buf.timestamps.len() + buf.leaves.len());
@@ -434,26 +440,24 @@ impl BlobCache {
             let comp =
                 zstd::bulk::compress(&plain, zstd_level).expect("zstd bulk compression failed");
             let comp_pad = comp.len().next_multiple_of(ALIGN);
+            let header = BlobHeader {
+                magic: MAGIC,
+                version: FORMAT_VERSION,
+                metadata_len: meta_bytes.len() as u32,
+                n_messages: buf.n_messages,
+                _reserved: 0,
+                type_hash: key,
+                metadata_type_hash: U::TYPE_HASH,
+                compressed_len: comp.len() as u64,
+                decompressed_len: plain.len() as u64,
+                type_name: ArrayStr::from_str_truncate(buf.name),
+            };
             // `resize` zero-fills, so the metadata and tail padding are zeros.
-            build.resize(HEADER_LEN + meta_pad + comp_pad);
-            let out = build.as_mut_bytes();
-            out[..MAGIC.len()].copy_from_slice(&MAGIC);
-            out[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-            out[12..16].copy_from_slice(&(size_of::<U>() as u32).to_le_bytes());
-            out[16..20].copy_from_slice(&buf.n_messages.to_le_bytes());
-            out[24..32].copy_from_slice(&key.to_le_bytes());
-            out[32..40].copy_from_slice(&U::TYPE_HASH.to_le_bytes());
-            out[40..48].copy_from_slice(&(comp.len() as u64).to_le_bytes());
-            out[48..56].copy_from_slice(
-                &(u64::from(buf.n_messages) * (TIMESTAMP_STRIDE as u64 + stride as u64))
-                    .to_le_bytes(),
-            );
-            let type_name = ArrayStr::<TYPE_NAME_LEN>::from_str_truncate(buf.name);
-            out[56..HEADER_LEN]
-                .copy_from_slice(<ArrayStr<TYPE_NAME_LEN> as IntoBytes>::as_bytes(&type_name));
-            out[HEADER_LEN..HEADER_LEN + meta_bytes.len()].copy_from_slice(meta_bytes);
-            let tail = HEADER_LEN + meta_pad;
-            out[tail..tail + comp.len()].copy_from_slice(&comp);
+            build.resize(size_of::<BlobHeader>() + meta_pad + comp_pad);
+            let (head, tail) = build.as_mut_bytes().split_at_mut(size_of::<BlobHeader>());
+            head.copy_from_slice(header.as_bytes());
+            tail[..meta_bytes.len()].copy_from_slice(meta_bytes);
+            tail[meta_pad..meta_pad + comp.len()].copy_from_slice(&comp);
             let blob = Blob::from_bytes(build.as_bytes()).expect("freshly built blob is valid");
             sink(blob);
         }
@@ -467,7 +471,7 @@ impl BlobCache {
 
 struct Push<'a> {
     cache: &'a mut BlobCache,
-    timestamp: InternalMetadata,
+    timestamp: TrackingTimestampWire,
 }
 
 impl VisitorVersionedLeaf for Push<'_> {
@@ -482,7 +486,8 @@ impl VisitorVersionedLeaf for Push<'_> {
             timestamps: Vec::new(),
             leaves: Vec::new(),
         });
-        buf.timestamps.extend_from_slice(<InternalMetadata as IntoBytes>::as_bytes(&timestamp));
+        buf.timestamps
+            .extend_from_slice(<TrackingTimestampWire as IntoBytes>::as_bytes(&timestamp));
         buf.leaves.extend_from_slice(<L as IntoBytes>::as_bytes(leaf));
         buf.n_messages += 1;
     }

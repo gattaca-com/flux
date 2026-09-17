@@ -59,6 +59,17 @@ required; the locked zerocopy-derive only accepts a bare ident for its
 be a padding-free `repr(C)` struct or `repr(u8)` fieldless enum; padded
 types fail to compile at the derive, which is intended.
 
+Every field must implement the zerocopy traits too. Rust's orphan rule means
+flux cannot provide them for foreign types the way it provides `TypeHash`
+(both trait and type would be foreign). Of the usual suspects, `uuid` derives
+them only behind its unstable `--cfg uuid_unstable` flag, and
+`alloy-primitives`/`ruint` have no zerocopy support at all. Until upstream
+features exist, a leaf stores the underlying array (`[u8; 16]` for `Uuid`,
+`[u8; 32]` for `B256`, `[u8; 20]` for `Address`, `[u64; 4]` for `U256` limbs)
+and converts at the boundary (`Uuid::from_bytes`, `B256::from`,
+`U256::from_limbs`); the layout on the wire is identical either way. A chain
+that keeps the foreign types opts out with `#[wire_skip]`.
+
 Each `versioned_struct!`/`versioned_enum!` chain then also implements
 `Versioned` (plain `TYPE_HASH`es in `VERSION_HASHES`, oldest first, and a
 `decode_versions` that casts raw bytes as the stored version and migrates)
@@ -111,7 +122,7 @@ format. A `Blob` is an unsized `repr(C)` struct whose bytes in memory *are*
 the format:
 
 ```text
-[header 128 B][user metadata, padded to 8][zstd( [InternalMetadata x n][Leaf x n] )]
+[header 128 B][user metadata, padded to 8][zstd( [TrackingTimestampWire x n][Leaf x n] )]
 ```
 
 The header is exactly 128 bytes with no padding: magic `b"FLUXBLOB"`, format

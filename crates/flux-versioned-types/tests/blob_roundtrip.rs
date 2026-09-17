@@ -4,9 +4,9 @@ use flux_timing::{
 };
 use flux_utils::ArrayStr;
 use flux_versioned_types::{
-    Blob, BlobCache, DecodeError, HasVersionedLeaves, InternalMetadata, InternalMetadataV1,
-    Scratch, Versioned, VersionedLeaves, VisitorVersionedLeaf,
-    raw::{FORMAT_VERSION, HEADER_LEN, MAGIC, TIMESTAMP_STRIDE},
+    Blob, BlobCache, BlobHeader, DecodeError, HasVersionedLeaves, Scratch, TrackingTimestampWire,
+    TrackingTimestampWireV1, Versioned, VersionedLeaves, VisitorVersionedLeaf,
+    raw::{FORMAT_VERSION, MAGIC},
     versioned_enum, versioned_struct,
     zerocopy::IntoBytes,
 };
@@ -97,7 +97,7 @@ fn hand_build(
     leaf_stride: usize,
 ) -> Vec<u8> {
     let comp = zstd::bulk::compress(plain_tail, 3).unwrap();
-    let mut bytes = vec![0u8; HEADER_LEN];
+    let mut bytes = vec![0u8; size_of::<BlobHeader>()];
     bytes[..8].copy_from_slice(&MAGIC);
     bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     bytes[12..16].copy_from_slice(&(meta.len() as u32).to_le_bytes());
@@ -106,7 +106,8 @@ fn hand_build(
     bytes[32..40].copy_from_slice(&meta_hash.to_le_bytes());
     bytes[40..48].copy_from_slice(&(comp.len() as u64).to_le_bytes());
     bytes[48..56].copy_from_slice(
-        &(u64::from(n) * (TIMESTAMP_STRIDE as u64 + leaf_stride as u64)).to_le_bytes(),
+        &(u64::from(n) * (size_of::<TrackingTimestampWire>() as u64 + leaf_stride as u64))
+            .to_le_bytes(),
     );
     let name = leaf_name.as_bytes();
     bytes[56..64].copy_from_slice(&(name.len() as u64).to_le_bytes());
@@ -122,8 +123,8 @@ fn leaf_blob(n: u32) -> Vec<u8> {
     let mut stamps = Vec::new();
     let mut leaves = Vec::new();
     for i in 0..n {
-        stamps.extend_from_slice(<InternalMetadata as IntoBytes>::as_bytes(
-            &InternalMetadata::from(stamp(1, u64::from(i))),
+        stamps.extend_from_slice(<TrackingTimestampWire as IntoBytes>::as_bytes(
+            &TrackingTimestampWire::from(stamp(1, u64::from(i))),
         ));
         leaves.extend_from_slice(<Leaf as IntoBytes>::as_bytes(&Leaf {
             slot: u64::from(i),
@@ -192,7 +193,8 @@ fn end_to_end_cache_flush_decode() {
 
 #[test]
 fn hand_built_v1_blob_migrates_to_latest() {
-    let stamps = [InternalMetadata::from(stamp(3, 7)), InternalMetadata::from(stamp(4, 8))];
+    let stamps =
+        [TrackingTimestampWire::from(stamp(3, 7)), TrackingTimestampWire::from(stamp(4, 8))];
     let leaves = [LeafV1 { slot: 11 }, LeafV1 { slot: 22 }];
     let meta = MetaV1 { slot: 9, instance: ArrayStr::try_from("m").unwrap() };
     let bytes = hand_build(
@@ -201,7 +203,7 @@ fn hand_built_v1_blob_migrates_to_latest() {
         LeafV1::TYPE_HASH,
         Leaf::NAME,
         &[
-            <[InternalMetadata] as IntoBytes>::as_bytes(&stamps),
+            <[TrackingTimestampWire] as IntoBytes>::as_bytes(&stamps),
             <[LeafV1] as IntoBytes>::as_bytes(&leaves),
         ]
         .concat(),
@@ -259,14 +261,14 @@ fn rejects_type_and_payload_mismatches() {
     tampered[16..20].copy_from_slice(&2u32.to_le_bytes());
     let blob = b.load(&tampered).unwrap();
     assert!(matches!(blob.decode::<Meta, Leaf>(&mut a), Err(DecodeError::LengthMismatch { .. })));
-    let stamps = [InternalMetadata::from(stamp(1, 1))];
+    let stamps = [TrackingTimestampWire::from(stamp(1, 1))];
     let meta = MetaV1 { slot: 1, instance: ArrayStr::try_from("t").unwrap() };
     let bytes = hand_build(
         MetaV1::TYPE_HASH,
         &meta_bytes(&meta),
         FlagV1::TYPE_HASH,
         Flag::NAME,
-        &[<[InternalMetadata] as IntoBytes>::as_bytes(&stamps), [2u8].as_slice()].concat(),
+        &[<[TrackingTimestampWire] as IntoBytes>::as_bytes(&stamps), [2u8].as_slice()].concat(),
         1,
         size_of::<FlagV1>(),
     );
@@ -326,7 +328,9 @@ fn family_blobs_decode_to_variants() {
         OtherV1::TYPE_HASH,
         Other::NAME,
         &[
-            <[InternalMetadata] as IntoBytes>::as_bytes(&[InternalMetadata::from(stamp(9, 9))]),
+            <[TrackingTimestampWire] as IntoBytes>::as_bytes(&[TrackingTimestampWire::from(
+                stamp(9, 9),
+            )]),
             <[OtherV1] as IntoBytes>::as_bytes(&[OtherV1 { x: 1 }]),
         ]
         .concat(),
@@ -379,7 +383,7 @@ fn corrupt_zstd_tail_fails_decode() {
     let mut bytes = leaf_blob(2);
     // First byte of the zstd frame: flipping it breaks the frame magic, so
     // the decoder must fail instead of returning garbage.
-    let comp_off = HEADER_LEN + size_of::<MetaV1>().next_multiple_of(8);
+    let comp_off = size_of::<BlobHeader>() + size_of::<MetaV1>().next_multiple_of(8);
     bytes[comp_off] ^= 0xff;
     let mut a = Scratch::new();
     let mut b = Scratch::new();
@@ -393,7 +397,7 @@ fn corrupt_zstd_tail_fails_decode() {
 #[test]
 fn bogus_metadata_hash_rejected_for_meta_and_decode() {
     const BOGUS: u64 = 0xB0B0_1234_5678_9ABC;
-    let stamps = [InternalMetadata::from(stamp(1, 1))];
+    let stamps = [TrackingTimestampWire::from(stamp(1, 1))];
     let leaves = [Leaf { slot: 5, extra: 0, flags: 0 }];
     let meta = MetaV1 { slot: 1, instance: ArrayStr::try_from("t").unwrap() };
     let bytes = hand_build(
@@ -402,7 +406,7 @@ fn bogus_metadata_hash_rejected_for_meta_and_decode() {
         Leaf::TYPE_HASH,
         Leaf::NAME,
         &[
-            <[InternalMetadata] as IntoBytes>::as_bytes(&stamps),
+            <[TrackingTimestampWire] as IntoBytes>::as_bytes(&stamps),
             <[Leaf] as IntoBytes>::as_bytes(&leaves),
         ]
         .concat(),
@@ -433,7 +437,7 @@ fn wrong_decompressed_len_fails_without_allocating() {
     let blob = a.load(&bytes).unwrap();
     match blob.decode::<Meta, Leaf>(&mut b) {
         Err(DecodeError::LengthMismatch { expected, got }) => {
-            assert_eq!(expected, TIMESTAMP_STRIDE + size_of::<Leaf>());
+            assert_eq!(expected, size_of::<TrackingTimestampWire>() + size_of::<Leaf>());
             assert_eq!(got, 1usize << 40);
         }
         other => panic!("expected LengthMismatch, got {other:?}"),
@@ -467,14 +471,18 @@ fn flushed_blob_padding_is_zero() {
     assert_eq!(blobs.len(), 1);
     let mut scratch = Scratch::new();
     let blob = scratch.load(&blobs[0]).unwrap();
-    let meta_len = blob.metadata_len as usize;
-    let comp_len = blob.compressed_len as usize;
+    let meta_len = blob.header.metadata_len as usize;
+    let comp_len = blob.header.compressed_len as usize;
     assert_eq!(meta_len, size_of::<FlagV1>());
     let meta_pad = meta_len.next_multiple_of(8);
     assert_eq!(meta_pad - meta_len, 7);
     let bytes = blob.as_bytes();
-    assert!(bytes[HEADER_LEN + meta_len..HEADER_LEN + meta_pad].iter().all(|b| *b == 0));
-    let tail = HEADER_LEN + meta_pad;
+    assert!(
+        bytes[size_of::<BlobHeader>() + meta_len..size_of::<BlobHeader>() + meta_pad]
+            .iter()
+            .all(|b| *b == 0)
+    );
+    let tail = size_of::<BlobHeader>() + meta_pad;
     assert_eq!(bytes.len(), tail + comp_len.next_multiple_of(8));
     assert!(bytes[tail + comp_len..].iter().all(|b| *b == 0));
 }
@@ -502,23 +510,23 @@ fn fresh_flush_blobs_are_8_aligned() {
 #[test]
 fn internal_metadata_bincode_layout_is_pinned() {
     let stamp = TrackingTimestamp::new(3);
-    let meta = InternalMetadata::from(stamp);
+    let meta = TrackingTimestampWire::from(stamp);
     let bytes = bincode::serialize(&meta).unwrap();
     // 8-byte ingestion + 8-byte publish + 2-byte tile id; the 6-byte zerocopy
     // pad is serde-skipped so legacy blobs are unchanged.
     assert_eq!(bytes.len(), 18);
-    let back: InternalMetadata = bincode::deserialize(&bytes).unwrap();
+    let back: TrackingTimestampWire = bincode::deserialize(&bytes).unwrap();
     assert_eq!(back.ingestion_t_real, meta.ingestion_t_real);
     assert_eq!(back.publish_t_real, meta.publish_t_real);
     assert_eq!(back.tile_id, meta.tile_id);
 
-    let v1 = InternalMetadataV1 {
+    let v1 = TrackingTimestampWireV1 {
         ingestion_t_real: stamp.ingestion_t().real(),
         publish_t_real: stamp.publish_t(),
     };
     let v1_bytes = bincode::serialize(&v1).unwrap();
-    let v1_back: InternalMetadataV1 = bincode::deserialize(&v1_bytes).unwrap();
-    let up: InternalMetadata = v1_back.into();
+    let v1_back: TrackingTimestampWireV1 = bincode::deserialize(&v1_bytes).unwrap();
+    let up: TrackingTimestampWire = v1_back.into();
     assert_eq!(up.ingestion_t_real, v1.ingestion_t_real);
     assert_eq!(up.publish_t_real, v1.publish_t_real);
     assert_eq!(up.tile_id, 0);
