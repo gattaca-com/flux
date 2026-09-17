@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_clickhouse::{ClickHouse, Error, QueryId, rowbinary};
+use flux_clickhouse::{ClickHouse, Error};
 use flux_network::http::{HttpEvent, HttpNetwork};
 use serde::Serialize;
 
@@ -30,7 +30,7 @@ const ROW: &[u8] = &[
 ];
 
 #[test]
-fn insert_and_error_through_one_network() {
+fn insert_survives_a_dropped_connection_and_errors_map() {
     let row = Row {
         name: "ab".to_owned(),
         maybe: Some(7),
@@ -42,11 +42,6 @@ fn insert_and_error_through_one_network() {
         tags: vec![9, 8],
         note: None,
     };
-    let sql = rowbinary::insert_statement("t", &row).unwrap();
-    let mut body = Vec::new();
-    rowbinary::encode(&mut body, &row).unwrap();
-    assert_eq!(body, ROW);
-
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
@@ -55,56 +50,52 @@ fn insert_and_error_through_one_network() {
     http.listen(addr).unwrap();
     let mut ch =
         ClickHouse::new(addr).with_credentials("w", "s").with_database("db").with_connections(2);
-    let (mut insert, mut bad) = (None, None);
-    let mut requests = Vec::new();
+    let insert = ch.insert_rows("t", &[row]).unwrap();
+    let bad = ch.query("SELEC");
+    let mut inserts = Vec::new();
     let mut outcomes = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.len() < 2 {
         let mut replies = Vec::new();
         http.poll_with(|event| {
-            if ch.on_event(&event, |id, result| {
-                outcomes.push((id, match result {
-                    Ok(response) => Ok(response.body.to_vec()),
-                    Err(Error::Server { status, code, message }) => {
-                        Err((status, code, message.to_vec()))
-                    }
-                    Err(Error::Disconnected) => panic!("disconnected"),
-                }));
-            }) {
+            if ch.on_event(&event) {
                 return
             }
             if let HttpEvent::Request { token, request } = event {
-                requests.push((
-                    request.path.to_owned(),
-                    request.header("x-clickhouse-key").unwrap().to_vec(),
-                    request.body.to_vec(),
-                ));
+                if request.path.starts_with("/?query=") {
+                    inserts.push((
+                        request.path.to_owned(),
+                        request.header("x-clickhouse-key").unwrap().to_vec(),
+                        request.body.to_vec(),
+                    ));
+                }
                 replies.push((token, request.path.starts_with("/?query=")));
             }
         });
         for (token, is_insert) in replies {
-            if is_insert {
-                http.respond(token, 200, &[], b"");
-            } else {
+            if !is_insert {
                 http.respond(token, 400, &[("X-ClickHouse-Exception-Code", "62")], b"Code: 62");
+            } else if inserts.len() == 1 {
+                // The first attempt is cut off; the client must resend it.
+                http.disconnect(token);
+            } else {
+                http.respond(token, 200, &[], b"");
             }
         }
-        if insert.is_none() {
-            insert = ch.insert(&mut http, &sql, &body);
-        }
-        if bad.is_none() {
-            bad = ch.query(&mut http, "SELEC");
-        }
+        ch.drive(&mut http, |id, outcome| outcomes.push((id, outcome)));
         thread::sleep(Duration::from_millis(1));
     }
-    let outcome =
-        |id: Option<QueryId>| outcomes.iter().find(|(i, _)| Some(*i) == id).unwrap().1.clone();
-    assert_eq!(outcome(insert), Ok(Vec::new()));
-    assert_eq!(outcome(bad), Err((400, Some(62), b"Code: 62".to_vec())));
-    let (path, key, sent) = requests.iter().find(|(p, ..)| p.starts_with("/?query=")).unwrap();
-    assert_eq!(
-        path,
-        "/?query=INSERT%20INTO%20t%20%28name%2C%20maybe%2C%20count%2C%20wide%2C%20small%2C%20flag%2C%20ratio%2C%20tags%2C%20note%29%20FORMAT%20RowBinary&wait_end_of_query=1&database=db"
-    );
-    assert_eq!((key.as_slice(), sent), (&b"s"[..], &body));
+    outcomes.sort_by_key(|(id, _)| *id);
+    assert_eq!(outcomes, [
+        (insert, Ok(Vec::new())),
+        (bad, Err(Error::Server { status: 400, code: Some(62), message: b"Code: 62".to_vec() })),
+    ]);
+    assert_eq!(inserts.len(), 2);
+    for (path, key, body) in &inserts {
+        assert_eq!(
+            path,
+            "/?query=INSERT%20INTO%20t%20%28name%2C%20maybe%2C%20count%2C%20wide%2C%20small%2C%20flag%2C%20ratio%2C%20tags%2C%20note%29%20FORMAT%20RowBinary&wait_end_of_query=1&database=db"
+        );
+        assert_eq!((key.as_slice(), body.as_slice()), (&b"s"[..], ROW));
+    }
 }
