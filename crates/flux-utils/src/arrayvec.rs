@@ -8,6 +8,9 @@ use std::{
 };
 
 use type_hash::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};
+use zerocopy::{
+    BecauseImmutable, Immutable, IntoBytes, KnownLayout, Maybe, TryFromBytes, invariant,
+};
 
 /// Creates an [`ArrayVec`] with the given elements.
 ///
@@ -338,51 +341,123 @@ impl<T: Copy, const N: usize> FromIterator<T> for ArrayVec<T, N> {
     }
 }
 
-/// Fixed-capacity UTF-8 string.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// Fixed-capacity UTF-8 string with fully-initialized storage.
+///
+/// Bytes past `len` are always zero, so the whole value is initialized memory
+/// that can be shipped as raw bytes. `N` must be a multiple of 8: `len` is a
+/// `usize` followed by `[u8; N]`, so any other `N` leaves trailing padding.
+#[derive(Clone, Copy, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct ArrayStr<const N: usize> {
-    buf: ArrayVec<u8, N>,
+    len: usize,
+    data: [u8; N],
+}
+
+impl<const N: usize> Default for ArrayStr<N> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// `IntoBytes` is manual: the derive requires all fields to be `Unaligned` on
+// generic structs, which `len: usize` is not. The manual impl is sound only
+// when the layout has no padding, i.e. `N % 8 == 0`; anything else fails to
+// compile at the first `as_bytes` use.
+unsafe impl<const N: usize> IntoBytes for ArrayStr<N> {
+    fn only_derive_is_allowed_to_implement_this_trait()
+    where
+        Self: Sized,
+    {
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8]
+    where
+        Self: Immutable,
+    {
+        // Forces compile-time evaluation of the padding assertion below;
+        // any `N` that is not a multiple of 8 fails to compile here.
+        let () = Self::ASSERT_PADDING_FREE;
+        // Safety: the assertion guarantees padding-free layout, and every
+        // constructor leaves the whole value initialized (bytes past `len`
+        // are zero, `Copy` preserves bytes).
+        unsafe {
+            core::slice::from_raw_parts(core::ptr::from_ref(self).cast::<u8>(), size_of::<Self>())
+        }
+    }
+}
+
+// `TryFromBytes` is manual: the derived impl would accept any `len` and any
+// bytes, but `as_str` borrows `data[..len]` as `str` unchecked, so length
+// and UTF-8 must be validated on read. Bytes past `len` are ignored.
+unsafe impl<const N: usize> TryFromBytes for ArrayStr<N> {
+    fn only_derive_is_allowed_to_implement_this_trait()
+    where
+        Self: Sized,
+    {
+    }
+
+    fn is_bit_valid<A: invariant::Alignment>(candidate: Maybe<'_, Self, A>) -> bool {
+        let bytes: &[u8] = candidate.as_bytes::<BecauseImmutable>().unaligned_as_ref();
+        let Some(len_bytes) = bytes.get(..size_of::<usize>()) else { return false };
+        let len = usize::from_ne_bytes(len_bytes.try_into().unwrap());
+        len <= N &&
+            core::str::from_utf8(&bytes[size_of::<usize>()..size_of::<usize>() + len]).is_ok()
+    }
 }
 
 impl<const N: usize> ArrayStr<N> {
+    const ASSERT_PADDING_FREE: () =
+        assert!(N.is_multiple_of(8), "ArrayStr<N> has padding unless N is a multiple of 8");
+
     #[inline]
     pub const fn new() -> Self {
-        Self { buf: ArrayVec::new() }
+        assert!(N < MAX_SIZE);
+        Self { len: 0, data: [0; N] }
     }
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        // Safety: we only ever write valid UTF-8 into buf.
-        unsafe { core::str::from_utf8_unchecked(self.buf.as_slice()) }
+        // Safety: every mutation path only writes valid UTF-8 (`push_byte`
+        // is ASCII-only, `push_str_truncate` stops at a char boundary, the
+        // `TryFrom` impls validate), and `len <= N` always holds.
+        unsafe { core::str::from_utf8_unchecked(self.as_slice()) }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.len
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len == 0
     }
 
     #[inline]
     pub const fn is_full(&self) -> bool {
-        self.buf.is_full()
+        self.len == N
     }
 
     /// Push a single ASCII byte. Panics if full or non-ASCII.
     #[inline]
     pub(crate) fn push_byte(&mut self, b: u8) {
         debug_assert!(b.is_ascii());
-        self.buf.push(b);
+        assert!(self.len < N, "push capacity overflow");
+        self.data[self.len] = b;
+        self.len += 1;
     }
 
     /// Push str, truncating at char boundary if exceeds capacity.
     #[inline]
     pub const fn push_str_truncate(&mut self, s: &str) {
-        let avail = N - self.buf.len();
+        let avail = N - self.len;
         let mut take = if s.len() < avail { s.len() } else { avail };
         // Truncate at char boundary to preserve UTF-8 validity.
         while take > 0 && !s.is_char_boundary(take) {
@@ -391,7 +466,8 @@ impl<const N: usize> ArrayStr<N> {
         let bytes = s.as_bytes().split_at(take).0;
         let mut i = 0;
         while i < bytes.len() {
-            self.buf.push(bytes[i]);
+            self.data[self.len] = bytes[i];
+            self.len += 1;
             i += 1;
         }
     }
@@ -431,7 +507,10 @@ impl<const N: usize> TryFrom<ArrayVec<u8, N>> for ArrayStr<N> {
     #[inline]
     fn try_from(buf: ArrayVec<u8, N>) -> Result<Self, Self::Error> {
         core::str::from_utf8(buf.as_slice())?;
-        Ok(Self { buf })
+        let mut out = Self::new();
+        out.data[..buf.len()].copy_from_slice(buf.as_slice());
+        out.len = buf.len();
+        Ok(out)
     }
 }
 
@@ -463,17 +542,26 @@ impl<const N: usize> core::fmt::Debug for ArrayStr<N> {
     }
 }
 
+impl<const N: usize> PartialEq for ArrayStr<N> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<const N: usize> Eq for ArrayStr<N> {}
+
 impl<const N: usize> core::hash::Hash for ArrayStr<N> {
     #[inline]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.buf.hash(state);
+        self.as_slice().hash(state);
     }
 }
 
 impl<const N: usize> Ord for ArrayStr<N> {
     #[inline]
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.buf.cmp(&other.buf)
+        self.as_slice().cmp(other.as_slice())
     }
 }
 
@@ -570,7 +658,7 @@ mod serde_impl {
         where
             S: Serializer,
         {
-            self.buf.serialize(serializer)
+            self.as_slice().serialize(serializer)
         }
     }
 
@@ -737,12 +825,16 @@ mod wincode_impl {
 
         #[inline]
         fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
-            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::size_of(&src.buf)
+            let mut tmp = ArrayVec::<u8, N>::new();
+            tmp.extend(src.as_slice().iter().copied());
+            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::size_of(&tmp)
         }
 
         #[inline]
         fn write(writer: impl Writer, src: &Self::Src) -> wincode::WriteResult<()> {
-            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::write(writer, &src.buf)
+            let mut tmp = ArrayVec::<u8, N>::new();
+            tmp.extend(src.as_slice().iter().copied());
+            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::write(writer, &tmp)
         }
     }
 

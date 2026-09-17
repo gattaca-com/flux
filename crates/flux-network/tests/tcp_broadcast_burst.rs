@@ -27,6 +27,11 @@ fn spawn_receiver(addr: SocketAddr) -> thread::JoinHandle<Vec<Vec<u8>>> {
         while !disconnected && std::time::Instant::now() < deadline {
             conn.poll_with(|event| match event {
                 PollEvent::Message { payload: bytes, .. } => {
+                    assert_eq!(
+                        bytes.as_ptr() as usize % 8,
+                        0,
+                        "tcp payload must be 8-byte aligned"
+                    );
                     frames.push(bytes.to_vec());
                 }
                 PollEvent::Disconnect { .. } => {

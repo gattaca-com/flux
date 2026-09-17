@@ -1419,6 +1419,7 @@ dependencies = [
  "tracing",
  "wincode",
  "wincode-derive",
+ "zerocopy",
 ]
 
 [[package]]

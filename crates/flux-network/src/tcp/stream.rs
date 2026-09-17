@@ -9,13 +9,16 @@ use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_communication::Timer;
 use flux_timing::{Instant, Nanos};
 use flux_utils::{DCache, DCacheRef};
+use zerocopy::IntoBytes;
 
 pub const DEFAULT_TCP_USER_TIMEOUT_MS: u32 = 10_000;
 const DEFAULT_TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 5;
 const DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS: libc::c_int = 2;
 const DEFAULT_TCP_KEEPALIVE_PROBES: libc::c_int = 3;
+// The heap buffer is word-backed so every payload starts at an 8-byte-aligned
+// address and can be cast to 8-aligned zero-copy types without copying.
 enum RxBuf {
-    Heap(Vec<u8>),
+    Heap(Vec<u64>),
     DCache,
 }
 use mio::{Interest, Registry, Token, event::Event};
@@ -78,6 +81,10 @@ pub(crate) fn write_frame_header(
 /// ahead of the write and stamped with `write_frame_ts` once they go out.
 #[inline]
 pub(crate) fn write_frame_len(header: &mut [u8], payload_len: usize) {
+    assert!(
+        u32::try_from(payload_len).is_ok(),
+        "tcp payload too large for 4-byte frame header: {payload_len} bytes"
+    );
     header[..LEN_HEADER_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
 }
 
@@ -153,6 +160,9 @@ impl Default for RxState {
 ///     with the deserialised T.
 ///   - Continues reading frames until `WouldBlock` (no more messages are
 ///     ready).
+///   - The payload slice starts at an 8-byte-aligned address (the heap buffer
+///     is word-backed), so receivers can cast it to 8-aligned zero-copy types
+///     without copying.
 ///
 /// Recconect handling:
 ///   - If `ConnState::Disconnected` is returned caller must treat the
@@ -207,7 +217,8 @@ impl TcpStream {
                 Some(TcpTimers::new(app_name, &steam_label))
             }
         };
-        let rx_buf = if use_dcache { RxBuf::DCache } else { RxBuf::Heap(vec![0; RX_BUF_SIZE]) };
+        let rx_buf =
+            if use_dcache { RxBuf::DCache } else { RxBuf::Heap(vec![0u64; RX_BUF_SIZE / 8]) };
 
         Self {
             stream,
@@ -570,14 +581,14 @@ impl TcpStream {
                                                 }
                                             }
                                         }
-                                        RxBuf::Heap(buf) => {
-                                            if msg_len > buf.len() {
+                                        RxBuf::Heap(words) => {
+                                            if msg_len > words.as_bytes().len() {
                                                 debug!(
-                                                    buf_len = buf.len(),
+                                                    buf_len = words.as_bytes().len(),
                                                     need_len = msg_len,
                                                     "tcp: buffer resized"
                                                 );
-                                                buf.resize(msg_len, 0);
+                                                words.resize(msg_len.div_ceil(8), 0);
                                             }
                                             None
                                         }
@@ -617,8 +628,8 @@ impl TcpStream {
                                 }
                             }
                         } else {
-                            let RxBuf::Heap(buf) = &mut self.rx_buf else { unreachable!() };
-                            self.stream.read(&mut buf[offset..msg_len])
+                            let RxBuf::Heap(words) = &mut self.rx_buf else { unreachable!() };
+                            self.stream.read(&mut words.as_mut_bytes()[offset..msg_len])
                         };
                         match result {
                             Ok(0) => return ReadOutcome::Disconnected,
@@ -640,8 +651,10 @@ impl TcpStream {
                                             len: msg_len,
                                         })
                                     } else {
-                                        let RxBuf::Heap(buf) = &self.rx_buf else { unreachable!() };
-                                        MessagePayload::Raw(&buf[..msg_len])
+                                        let RxBuf::Heap(words) = &self.rx_buf else {
+                                            unreachable!()
+                                        };
+                                        MessagePayload::Raw(&words.as_bytes()[..msg_len])
                                     };
                                     return ReadOutcome::PayloadDone { payload, send_ts };
                                 }

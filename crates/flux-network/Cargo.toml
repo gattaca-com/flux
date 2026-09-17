@@ -19,6 +19,7 @@ mio.workspace = true
 serde.workspace = true
 tracing.workspace = true
 wincode = { workspace = true, optional = true }
+zerocopy.workspace = true
 
 [dev-dependencies]
 core_affinity.workspace = true
