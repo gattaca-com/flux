@@ -96,3 +96,46 @@ the same field type in two variants is an error (ambiguous `From`). The derive
 generates `HasVersionedLeaves` (matching `visit_leaf` down to the leaf,
 `decode_blob` trying each variant in order) plus `From<Field> for Enum` for
 each kept variant.
+
+## Zero-copy blobs (`Blob`, `Scratch`, `BlobCache`)
+
+`flux_versioned_types::raw` batches versioned leaves into one wire and disk
+format. A `Blob` is an unsized `repr(C)` struct whose bytes in memory *are*
+the format:
+
+```text
+[header 128 B][user metadata, padded to 8][zstd( [InternalMetadata x n][Leaf x n] )]
+```
+
+The header is exactly 128 bytes with no padding: magic `b"FLUXBLOB"`, format
+version, user metadata length, message count, the leaf's latest `TYPE_HASH`,
+the user metadata's latest `TYPE_HASH`, compressed and decompressed tail
+lengths, and the leaf's `NAME` truncated to 64 bytes. The user metadata
+section carries one uncompressed `Versioned` value (e.g. slot and instance)
+so routers can read it without decompressing; both it and the zstd tail are
+zero-padded to a multiple of 8, so every blob's total length is a multiple
+of 8 and concatenated blobs in a file stay aligned.
+
+Sending is a memcpy of `Blob::as_bytes`; receiving is a validated cast in
+`Blob::from_bytes`, which checks alignment, magic, version, header lengths,
+and `type_name`. The leaf section decodes through `Versioned::decode_versions`,
+so a blob written as an older version migrates on read. `BlobCache`
+accumulates `InternalMessage`s per leaf type (`push` appends the message's
+projected timestamp and the leaf's bytes, no serialization) and `flush`
+builds one `Blob` per non-empty leaf type with a caller-chosen user metadata
+value and zstd level. `Scratch` is the 8-aligned buffer behind both
+decompression and blob building, and behind `load` for realigning
+untrusted input.
+
+```rust
+use flux_versioned_types::{BlobCache, Scratch};
+
+let mut cache = BlobCache::new();
+// cache.push(&msg);
+let meta = NewBidSubmission { value: 7 };
+let mut scratch = Scratch::new();
+cache.flush(&meta, 3, |blob| {
+    assert_eq!(blob.user_metadata::<NewBidSubmission>().unwrap(), meta);
+    let (_, msgs) = blob.decode::<NewBidSubmission, Bid>(&mut scratch).unwrap();
+});
+```

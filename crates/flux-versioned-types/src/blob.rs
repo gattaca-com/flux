@@ -327,12 +327,77 @@ impl VersionedBlob {
 
 /// Portable timing metadata sent over the wire. Wall-clock `Nanos`, safe
 /// across machines with different RDTSC rates.
+///
+/// The zerocopy blob format (`crate::raw`) stores these as 24-byte records:
+/// 8 + 8 + 2 bytes of fields plus 6 bytes of explicit zero padding, so the
+/// record is padding-free and every bit pattern is valid.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[repr(C)]
 pub struct InternalMetadata {
     pub ingestion_t_real: flux_timing::Nanos,
     pub publish_t_real: flux_timing::Nanos,
     pub tile_id: u16,
+    /// Zero padding to the 24-byte record stride. Skipped by serde so the
+    /// bincode layout of legacy blobs is unchanged; always zero on write.
+    /// Private so it cannot be set to anything else by hand.
+    #[serde(skip)]
+    _pad: [u8; 6],
+}
+
+const _: () = assert!(
+    size_of::<InternalMetadata>() == crate::raw::TIMESTAMP_STRIDE,
+    "InternalMetadata must be exactly one timestamp record with no padding",
+);
+
+// Manual zerocopy impls: the derives would require them on `Nanos` too,
+// which lives in flux-timing. Every field is an int newtype or byte array
+// and the struct has no padding (see the assertion above), so all of these
+// hold: any 24 bytes are a valid value, all bytes initialized, no interior
+// mutability.
+unsafe impl zerocopy::Immutable for InternalMetadata {
+    fn only_derive_is_allowed_to_implement_this_trait()
+    where
+        Self: Sized,
+    {
+    }
+}
+
+unsafe impl zerocopy::TryFromBytes for InternalMetadata {
+    fn only_derive_is_allowed_to_implement_this_trait()
+    where
+        Self: Sized,
+    {
+    }
+
+    fn is_bit_valid<A: zerocopy::invariant::Alignment>(
+        _candidate: zerocopy::Maybe<'_, Self, A>,
+    ) -> bool {
+        true
+    }
+}
+
+unsafe impl zerocopy::FromZeros for InternalMetadata {
+    fn only_derive_is_allowed_to_implement_this_trait()
+    where
+        Self: Sized,
+    {
+    }
+}
+
+unsafe impl zerocopy::FromBytes for InternalMetadata {
+    fn only_derive_is_allowed_to_implement_this_trait()
+    where
+        Self: Sized,
+    {
+    }
+}
+
+unsafe impl zerocopy::IntoBytes for InternalMetadata {
+    fn only_derive_is_allowed_to_implement_this_trait()
+    where
+        Self: Sized,
+    {
+    }
 }
 
 /// Pre-tile-id metadata format. Deserialization fallback for payloads written
@@ -346,7 +411,12 @@ pub struct InternalMetadataV1 {
 
 impl From<InternalMetadataV1> for InternalMetadata {
     fn from(v: InternalMetadataV1) -> Self {
-        Self { ingestion_t_real: v.ingestion_t_real, publish_t_real: v.publish_t_real, tile_id: 0 }
+        Self {
+            ingestion_t_real: v.ingestion_t_real,
+            publish_t_real: v.publish_t_real,
+            tile_id: 0,
+            _pad: [0; 6],
+        }
     }
 }
 
@@ -373,6 +443,7 @@ impl From<TrackingTimestamp> for InternalMetadata {
             ingestion_t_real: t.ingestion_t().real(),
             publish_t_real: t.publish_t(),
             tile_id: t.tile_id(),
+            _pad: [0; 6],
         }
     }
 }
