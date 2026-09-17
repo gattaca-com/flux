@@ -15,16 +15,18 @@ use std::{
 
 use flux::{
     communication::{ShmemData, cleanup_shmem},
-    spine::{ScopedSpine, SpineAdapter, SpineQueue},
+    spine::{ScopedSpine, SpineAdapter, SpineProducer, SpineQueue},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
 use flux_gather::{
     Blob, BlobCache, BlobConsumer, BlobHandler, BlobReader, BlobReceiver, BlobShipper, BlobWriter,
     GatherQueues, IncomingBlob, ReadError, Token,
 };
-use flux_timing::{Duration, InternalMessage};
+use flux_timing::{Duration, InternalMessage, Nanos};
 use flux_utils::ArrayStr;
-use flux_versioned_types::{Versioned, VersionedLeaves, versioned_struct};
+use flux_versioned_types::{
+    HasVersionedLeaves, Scratch, Versioned, VersionedLeaves, versioned_struct,
+};
 use spine_derive::from_spine;
 use type_hash_derive::type_hash_lock;
 
@@ -147,6 +149,8 @@ struct RecvSpine {
     pub blobs: SpineQueue<IncomingBlob>,
     #[queue(size(64))]
     pub disconnect: SpineQueue<Token>,
+    #[queue(size(1 << 10))]
+    pub telemetry: SpineQueue<Telemetry>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +165,7 @@ struct RecordingHandler {
     base: PathBuf,
     seen: Arc<Mutex<Vec<Seen>>>,
     done: Arc<AtomicBool>,
+    scratch: Scratch,
 }
 
 impl Tile<RecvSpine> for RecordingHandler {
@@ -176,16 +181,25 @@ impl Tile<RecvSpine> for RecordingHandler {
 }
 
 impl BlobHandler<RecvSpine, TestMeta> for RecordingHandler {
-    fn on_blob(&mut self, meta: &TestMeta, blob: &Blob, _adapter: &mut SpineAdapter<RecvSpine>) {
+    fn on_blob(&mut self, meta: &TestMeta, blob: &Blob, adapter: &mut SpineAdapter<RecvSpine>) {
         self.writer.write(blob, &meta.path(&self.base, blob.type_name()));
-        let mut seen = self.seen.lock().unwrap();
-        seen.push(Seen {
-            meta: *meta,
-            type_name: blob.type_name().to_owned(),
-            n_messages: blob.header.n_messages,
-        });
-        if seen.len() >= EXPECTED_BLOBS {
-            self.done.store(true, Ordering::Relaxed);
+        {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(Seen {
+                meta: *meta,
+                type_name: blob.type_name().to_owned(),
+                n_messages: blob.header.n_messages,
+            });
+            if seen.len() >= EXPECTED_BLOBS {
+                self.done.store(true, Ordering::Relaxed);
+            }
+        }
+        let decoded = Telemetry::decode_blob::<TestMeta>(blob, &mut self.scratch)
+            .expect("gathered blobs hold Telemetry leaves")
+            .expect("blob decodes");
+        let replica: &SpineProducer<Telemetry> = adapter.producers.as_ref();
+        for msg in &decoded.1 {
+            replica.produce_without_first(msg);
         }
     }
 }
@@ -196,6 +210,20 @@ const FILLS_PER_SLOT: u64 = 3;
 const IGNORED_PER_SLOT: u64 = 2;
 const PARTIAL_PRICES: u64 = 2;
 const EXPECTED_BLOBS: usize = 10;
+const EXPECTED_REPLICA_MSGS: usize =
+    (N_SLOTS * (PRICES_PER_SLOT + FILLS_PER_SLOT + 1) + PARTIAL_PRICES) as usize;
+
+struct ReplicaReader {
+    seen: Arc<Mutex<Vec<InternalMessage<Telemetry>>>>,
+}
+
+impl Tile<RecvSpine> for ReplicaReader {
+    fn loop_body(&mut self, adapter: &mut SpineAdapter<RecvSpine>) {
+        adapter.consume_internal_message(|m: &mut InternalMessage<Telemetry>, _| {
+            self.seen.lock().unwrap().push(*m);
+        });
+    }
+}
 const DEADLINE: StdDuration = StdDuration::from_secs(20);
 const RECEIVER_DEADLINE: StdDuration = StdDuration::from_secs(30);
 static PORT_LOCK: Mutex<()> = Mutex::new(());
@@ -220,15 +248,15 @@ fn background() -> TileConfig {
 
 struct StopTile {
     stop: Arc<AtomicBool>,
-    seen: Arc<Mutex<Vec<Seen>>>,
-    want_blobs: usize,
+    replica: Arc<Mutex<Vec<InternalMessage<Telemetry>>>>,
+    want_replica: usize,
     receiver_done: Arc<AtomicBool>,
     deadline: Instant,
 }
 
 impl Tile<RecvSpine> for StopTile {
     fn loop_body(&mut self, adapter: &mut SpineAdapter<RecvSpine>) {
-        if self.seen.lock().unwrap().len() >= self.want_blobs ||
+        if self.replica.lock().unwrap().len() >= self.want_replica ||
             self.stop.load(Ordering::Relaxed) ||
             Instant::now() > self.deadline
         {
@@ -244,10 +272,11 @@ fn spawn_receiver(
     disk: PathBuf,
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
+    replica: Arc<Mutex<Vec<InternalMessage<Telemetry>>>>,
     stop: Arc<AtomicBool>,
     receiver_done: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
-    want_blobs: usize,
+    want_replica: usize,
     deadline: Instant,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -258,14 +287,16 @@ fn spawn_receiver(
                 BlobConsumer::new(RecordingHandler {
                     writer: BlobWriter::new(),
                     base: disk,
-                    seen: seen.clone(),
+                    seen,
                     done,
+                    scratch: Scratch::new(),
                 }),
                 scoped,
                 background(),
             );
+            attach_tile(ReplicaReader { seen: replica.clone() }, scoped, background());
             attach_tile(
-                StopTile { stop, seen, want_blobs, receiver_done, deadline },
+                StopTile { stop, replica, want_replica, receiver_done, deadline },
                 scoped,
                 background(),
             );
@@ -363,6 +394,7 @@ fn gather_end_to_end_sender_to_receiver() {
     let addr = free_loopback();
 
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+    let replica: Arc<Mutex<Vec<InternalMessage<Telemetry>>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let receiver_done = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
@@ -374,13 +406,15 @@ fn gather_end_to_end_sender_to_receiver() {
         recv_disk.clone(),
         addr,
         seen.clone(),
+        replica.clone(),
         stop,
         receiver_done.clone(),
         done.clone(),
-        EXPECTED_BLOBS,
+        EXPECTED_REPLICA_MSGS,
         Instant::now() + RECEIVER_DEADLINE,
     );
     std::thread::sleep(StdDuration::from_millis(500));
+    let t0 = Nanos::now();
 
     let mut spine = GatherTestSpine::new_with_base_dir(send_base.path(), None);
     std::thread::scope(|scope| {
@@ -413,12 +447,15 @@ fn gather_end_to_end_sender_to_receiver() {
         );
     });
     receiver.join().expect("receiver thread");
+    let t1 = Nanos::now();
 
     let seen: Vec<Seen> = seen.lock().unwrap().clone();
     assert_hook_records(&seen);
     assert_disk_identity(&send_disk, &recv_disk);
     assert_decoded_content(&send_disk, &recv_disk);
     assert_single_blob_replay(&recv_disk);
+    let replica: Vec<InternalMessage<Telemetry>> = replica.lock().unwrap().clone();
+    assert_replica_round_trip(&replica, t0, t1);
 
     cleanup_shmem(send_base.path());
 }
@@ -543,6 +580,54 @@ fn assert_single_blob_replay(recv_disk: &Path) {
     assert_eq!(count, 1);
 }
 
+fn assert_replica_round_trip(replica: &[InternalMessage<Telemetry>], t0: Nanos, t1: Nanos) {
+    assert_eq!(replica.len(), EXPECTED_REPLICA_MSGS, "replica messages: {replica:?}");
+    let mut prices = Vec::new();
+    let mut fills = Vec::new();
+    let mut slots = Vec::new();
+    for msg in replica {
+        assert!(
+            msg.publish_t() >= t0 && msg.publish_t() <= t1,
+            "publish_t outside window: {msg:?}"
+        );
+        assert!(
+            msg.ingestion_time().real() >= t0 && msg.ingestion_time().real() <= t1,
+            "ingestion real outside window: {msg:?}"
+        );
+        match msg.data() {
+            Telemetry::Price(price) => prices.push((msg.publish_t(), price.id)),
+            Telemetry::Fill(fill) => fills.push((msg.publish_t(), fill.id)),
+            Telemetry::SlotEnd(slot_end) => slots.push((msg.publish_t(), slot_end.slot)),
+        }
+    }
+    let mut expected_prices = Vec::new();
+    for slot in 1..=N_SLOTS {
+        for i in 0..PRICES_PER_SLOT {
+            expected_prices.push(slot * 100 + i);
+        }
+    }
+    for i in 0..PARTIAL_PRICES {
+        expected_prices.push(400 + i);
+    }
+    let price_ids: Vec<u64> = prices.iter().map(|(_, id)| *id).collect();
+    assert_eq!(price_ids, expected_prices, "price ids in production order");
+    let mut expected_fills = Vec::new();
+    for slot in 1..=N_SLOTS {
+        for i in 0..FILLS_PER_SLOT {
+            expected_fills.push(slot * 1000 + i);
+        }
+    }
+    let fill_ids: Vec<u64> = fills.iter().map(|(_, id)| *id).collect();
+    assert_eq!(fill_ids, expected_fills, "fill ids in production order");
+    let slot_ids: Vec<u64> = slots.iter().map(|(_, slot)| *slot).collect();
+    assert_eq!(slot_ids, vec![1, 2, 3], "slot ends in order");
+    for series in [&prices, &fills, &slots] {
+        for w in series.windows(2) {
+            assert!(w[1].0.0 + 1_000 >= w[0].0.0, "publish_t went backwards: {:?}", (w[0], w[1]));
+        }
+    }
+}
+
 #[test]
 fn non_blob_peer_is_disconnected() {
     let _port = PORT_LOCK.lock().unwrap();
@@ -558,11 +643,13 @@ fn non_blob_peer_is_disconnected() {
     let done = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + DEADLINE;
 
+    let replica: Arc<Mutex<Vec<InternalMessage<Telemetry>>>> = Arc::new(Mutex::new(Vec::new()));
     let receiver = spawn_receiver(
         recv_base.path().to_path_buf(),
         recv_disk,
         addr,
         seen.clone(),
+        replica,
         stop.clone(),
         receiver_done,
         done,
