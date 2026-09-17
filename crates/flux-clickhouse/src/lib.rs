@@ -11,13 +11,20 @@
 //! and the caller keeps its batch for a later poll.
 //!
 //! ```no_run
-//! use flux_clickhouse::ClickHouse;
+//! use flux_clickhouse::{ClickHouse, rowbinary};
 //! use flux_network::http::HttpNetwork;
+//! #[derive(serde::Serialize)]
+//! struct Event { slot: u64, kind: String }
 //! let mut http = HttpNetwork::default();
 //! let mut ch = ClickHouse::new("127.0.0.1:8123".parse().unwrap())
 //!     .with_credentials("default", "")
 //!     .with_database("telemetry");
-//! let rows: Vec<u8> = Vec::new(); // RowBinary-encoded batch
+//! let events = vec![Event { slot: 1, kind: "fill".to_owned() }];
+//! let sql = rowbinary::insert_statement("events", &events[0]).unwrap();
+//! let mut body = Vec::new();
+//! for event in &events {
+//!     rowbinary::encode(&mut body, event).unwrap();
+//! }
 //! let mut pending = None;
 //! loop {
 //!     http.poll_with(|event| {
@@ -30,14 +37,15 @@
 //!         // events for the caller's other endpoints and listeners
 //!     });
 //!     if pending.is_none() {
-//!         pending = ch.insert(&mut http, "INSERT INTO events FORMAT RowBinary", &rows);
+//!         pending = ch.insert(&mut http, &sql, &body);
 //!     }
 //! }
 //! ```
 //!
 //! Every request is a `POST`: `query` sends the SQL as the body, `insert` puts
 //! it in the `query` URL parameter and sends the data as the body so binary
-//! formats stay intact. Settings, including the database, travel as URL
+//! formats stay intact. [`rowbinary`] encodes `serde::Serialize` rows into
+//! such a body. Settings, including the database, travel as URL
 //! parameters; credentials as `X-ClickHouse-User` and `X-ClickHouse-Key`.
 //! `wait_end_of_query=1` is set by default so a failing query yields a non-200
 //! status instead of an error appended to a 200 body.
@@ -50,6 +58,8 @@
 //! [`Error::Disconnected`]. `ClickHouse`
 //! closes idle keep-alive connections after its `keep_alive_timeout`; the
 //! network reconnects on its own and sends return `None` until it has.
+
+pub mod rowbinary;
 
 use std::{fmt, net::SocketAddr};
 

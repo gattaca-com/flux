@@ -4,8 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_clickhouse::{ClickHouse, Error, HttpResponse, QueryId};
+use flux_clickhouse::{ClickHouse, Error, HttpResponse, QueryId, rowbinary};
 use flux_network::http::{HttpEvent, HttpNetwork};
+use serde::Serialize;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -237,4 +238,121 @@ fn live_large_insert_lands_whole() {
     assert_eq!(outcomes[1], Outcome::Ok(Vec::new()));
     let sum: u64 = (0..n).sum();
     assert_eq!(outcomes[2], Outcome::Ok(format!("{n}\t{sum}\n").into_bytes()));
+}
+
+/// Every field type the builder's telemetry rows use, in DDL order.
+#[derive(Serialize)]
+struct Row {
+    name: String,
+    maybe: Option<u64>,
+    count: u64,
+    wide: u128,
+    small: u8,
+    flag: bool,
+    ratio: f64,
+    tags: Vec<u8>,
+    note: Option<String>,
+    s16: u16,
+    s32: u32,
+    nwide: Option<u128>,
+    nflag: Option<bool>,
+}
+
+const ROW_DDL: &str = "name String, maybe Nullable(UInt64), count UInt64, wide UInt128, small UInt8, \
+    flag Bool, ratio Float64, tags Array(UInt8), note Nullable(String), s16 UInt16, s32 UInt32, \
+    nwide Nullable(UInt128), nflag Nullable(Bool)";
+
+fn rows_of_every_type() -> Vec<Row> {
+    vec![
+        Row {
+            name: String::new(),
+            maybe: None,
+            count: 1,
+            wide: u128::MAX,
+            small: 0,
+            flag: false,
+            ratio: -0.25,
+            tags: Vec::new(),
+            note: Some("x".to_owned()),
+            s16: 0,
+            s32: u32::MAX,
+            nwide: None,
+            nflag: Some(true),
+        },
+        Row {
+            name: "ab".to_owned(),
+            maybe: Some(7),
+            count: 2,
+            wide: 2,
+            small: 3,
+            flag: true,
+            ratio: 1.5,
+            tags: vec![9, 8],
+            note: None,
+            s16: 65535,
+            s32: 4,
+            nwide: Some(5),
+            nflag: Some(false),
+        },
+        Row {
+            name: "n".repeat(200),
+            maybe: Some(u64::MAX),
+            count: 3,
+            wide: 0,
+            small: 255,
+            flag: true,
+            ratio: f64::MAX,
+            tags: vec![1; 300],
+            note: Some(String::new()),
+            s16: 1,
+            s32: 0,
+            nwide: Some(u128::MAX),
+            nflag: None,
+        },
+    ]
+}
+
+fn encode_all(rows: &[Row]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for row in rows {
+        rowbinary::encode(&mut body, row).unwrap();
+    }
+    body
+}
+
+#[test]
+fn rowbinary_matches_server_encoding() {
+    // Captured from ClickHouse 26.3: SELECT <the second row's values> FORMAT
+    // RowBinary.
+    let server: &[u8] = &[
+        0x02, 0x61, 0x62, 0x00, 0x07, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03, 0x01, 0, 0, 0, 0, 0, 0, 0xf8, 0x3f, 0x02,
+        0x09, 0x08, 0x01, 0xff, 0xff, 0x04, 0, 0, 0, 0x00, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0x00, 0x00,
+    ];
+    assert_eq!(encode_all(&rows_of_every_type()[1..2]), server);
+    assert_eq!(
+        rowbinary::insert_statement("t", &rows_of_every_type()[0]).unwrap(),
+        "INSERT INTO t (name, maybe, count, wide, small, flag, ratio, tags, note, s16, s32, nwide, nflag) FORMAT RowBinary"
+    );
+    assert_eq!(
+        rowbinary::insert_statement("t", &[1u8, 2]).unwrap_err(),
+        rowbinary::Error::Unsupported("a row that is not a struct with named fields")
+    );
+}
+
+#[test]
+#[ignore = "needs a ClickHouse server; set CLICKHOUSE_ADDR (default 127.0.0.1:8123)"]
+fn live_rows_roundtrip_through_rowbinary() {
+    let table = format!("flux_clickhouse_rows_{}", std::process::id());
+    let rows = rows_of_every_type();
+    let body = encode_all(&rows);
+    let outcomes = live_run(&mut HttpNetwork::default(), &[
+        (&format!("CREATE TABLE {table} ({ROW_DDL}) ENGINE = Memory"), None),
+        (&rowbinary::insert_statement(&table, &rows[0]).unwrap(), Some(&body)),
+        (&format!("SELECT * FROM {table} ORDER BY count FORMAT RowBinary"), None),
+        (&format!("DROP TABLE {table}"), None),
+    ]);
+    assert_eq!(outcomes[1], Outcome::Ok(Vec::new()));
+    assert_eq!(outcomes[2], Outcome::Ok(body));
 }
