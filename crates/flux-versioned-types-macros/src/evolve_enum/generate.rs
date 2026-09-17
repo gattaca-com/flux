@@ -14,6 +14,7 @@ fn generate_enum_def(
     enum_attrs: &[Attribute],
     variants: &[EnumVariant],
     is_final: bool,
+    wire_skip: bool,
 ) -> TokenStream2 {
     let emit_attrs = |attrs: &[Attribute]| {
         if is_final { attrs.to_vec() } else { without_schema_attrs(attrs) }
@@ -41,9 +42,12 @@ fn generate_enum_def(
         })
         .collect();
 
+    let byte_stable_attrs =
+        if wire_skip { Vec::new() } else { crate::shared::byte_stable_derive_attrs() };
     quote! {
         #(#default_attrs)*
         #(#enum_attrs)*
+        #(#byte_stable_attrs)*
         pub enum #name {
             #(#variant_tokens,)*
         }
@@ -219,6 +223,7 @@ pub(crate) fn generate_base_enum(input: &EvolveEnumInput) -> (TokenStream2, Vec<
         &input.base.attrs,
         &input.base.items,
         input.evolutions.is_empty(),
+        input.wire_skip,
     );
 
     (output, input.base.items.clone())
@@ -230,6 +235,7 @@ pub(crate) fn generate_evolution(
     current_variants: &[EnumVariant],
     prev_name: &Ident,
     is_final: bool,
+    wire_skip: bool,
 ) -> (TokenStream2, Vec<EnumVariant>) {
     let mut add_variants = Vec::new();
     let mut remove_map = FxHashMap::default();
@@ -286,6 +292,7 @@ pub(crate) fn generate_evolution(
         &evolution.attrs,
         &new_variants,
         is_final,
+        wire_skip,
     );
     let into_impl = generate_into_impl(
         prev_name,

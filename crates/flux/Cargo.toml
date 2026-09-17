@@ -10,6 +10,8 @@ version.workspace = true
 
 [dependencies]
 bitcode.workspace = true
+byte-stable.workspace = true
+byte-stable-derive.workspace = true
 core_affinity.workspace = true
 flux-communication.workspace = true
 flux-timing.workspace = true

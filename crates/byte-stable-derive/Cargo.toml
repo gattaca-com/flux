@@ -1,0 +1,26 @@
+[package]
+name = "byte-stable-derive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Derive macro for byte-stable"
+repository.workspace = true
+keywords = ["zero-copy", "wire-format", "derive"]
+categories = ["encoding"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate.workspace = true
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+byte-stable.workspace = true

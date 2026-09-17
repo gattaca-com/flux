@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+byte-stable.workspace = true
 flux.workspace = true
 flux-communication.workspace = true
 flux-timing.workspace = true

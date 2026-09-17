@@ -88,6 +88,7 @@ impl From<Nanos> for IngestionTime {
     #[inline]
     fn from(value: Nanos) -> Self {
         let curt = Instant::now();
-        Self { internal: curt - Duration::from(value.elapsed()), real: value }
+        // Another host's clock can sit slightly ahead of ours.
+        Self { internal: curt - Duration::from(value.elapsed_saturating()), real: value }
     }
 }

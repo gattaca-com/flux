@@ -579,6 +579,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
 
 [[package]]
+name = "byte-stable"
+version = "0.3.2"
+dependencies = [
+ "alloy-primitives",
+ "byte-stable-derive",
+ "uuid",
+]
+
+[[package]]
+name = "byte-stable-derive"
+version = "0.3.2"
+dependencies = [
+ "byte-stable",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1335,6 +1355,8 @@ name = "flux"
 version = "0.3.2"
 dependencies = [
  "bitcode",
+ "byte-stable",
+ "byte-stable-derive",
  "core_affinity",
  "flux-communication",
  "flux-timing",
@@ -1401,9 +1423,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-gather"
+version = "0.3.2"
+dependencies = [
+ "flux",
+ "flux-disk",
+ "flux-network",
+ "flux-timing",
+ "flux-utils",
+ "flux-versioned-types",
+ "mio",
+ "serde",
+ "spine-derive",
+ "tempfile",
+ "tracing",
+ "type-hash-derive",
+]
+
+[[package]]
 name = "flux-network"
 version = "0.3.2"
 dependencies = [
+ "byte-stable",
  "core_affinity",
  "criterion",
  "flux",
@@ -1467,6 +1508,8 @@ name = "flux-timing"
 version = "0.3.2"
 dependencies = [
  "bitcode",
+ "byte-stable",
+ "byte-stable-derive",
  "chrono",
  "governor",
  "humantime",
@@ -1485,6 +1528,7 @@ name = "flux-utils"
 version = "0.3.2"
 dependencies = [
  "bincode",
+ "byte-stable",
  "bytes",
  "core_affinity",
  "criterion",
@@ -1509,6 +1553,8 @@ version = "0.3.2"
 dependencies = [
  "alloy-primitives",
  "bincode",
+ "byte-stable",
+ "byte-stable-derive",
  "flux",
  "flux-timing",
  "flux-utils",

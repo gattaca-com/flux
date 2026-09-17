@@ -1,5 +1,5 @@
 use syn::{
-    Attribute, Ident, Result, Token, braced,
+    Attribute, Ident, LitStr, Result, Token, braced,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
 };
@@ -7,6 +7,8 @@ use syn::{
 /// Generic macro input: optional `roll_into Name`, optional
 /// `default_attrs { ... }` block + base definition + evolution steps.
 pub(crate) struct EvolveInputGeneric<B, E> {
+    pub wire_name: Option<LitStr>,
+    pub wire_skip: bool,
     pub roll_into: Option<Ident>,
     pub default_attrs: Vec<Attribute>,
     pub final_attrs: Vec<Attribute>,
@@ -16,6 +18,7 @@ pub(crate) struct EvolveInputGeneric<B, E> {
 
 impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
     fn parse(input: ParseStream) -> Result<Self> {
+        let (wire_name, wire_skip) = parse_wire_attrs(input)?;
         let roll_into = parse_optional_keyword(input, "roll_into")?;
 
         let mut default_attrs = Vec::new();
@@ -40,7 +43,7 @@ impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
             evolutions.push(input.parse()?);
         }
 
-        Ok(Self { roll_into, default_attrs, final_attrs, base, evolutions })
+        Ok(Self { wire_name, wire_skip, roll_into, default_attrs, final_attrs, base, evolutions })
     }
 }
 
@@ -50,6 +53,48 @@ impl<B, E> EvolveInputGeneric<B, E> {
             self.default_attrs = defaults();
         }
     }
+}
+
+fn parse_wire_attrs(input: ParseStream) -> Result<(Option<LitStr>, bool)> {
+    let mut wire_name = None;
+    let mut wire_skip = false;
+    while input.peek(Token![#]) {
+        let (is_name, is_skip) = {
+            let fork = input.fork();
+            fork.parse::<Token![#]>()?;
+            let content;
+            syn::bracketed!(content in fork);
+            let path: syn::Path = content.parse()?;
+            (path.is_ident("wire_name"), path.is_ident("wire_skip"))
+        };
+        if !is_name && !is_skip {
+            break;
+        }
+        input.parse::<Token![#]>()?;
+        let content;
+        syn::bracketed!(content in input);
+        let _: syn::Path = content.parse()?;
+        if is_name {
+            if wire_name.is_some() {
+                return Err(content.error("duplicate wire_name"));
+            }
+            content.parse::<Token![=]>()?;
+            let lit: LitStr = content.parse()?;
+            if !content.is_empty() {
+                return Err(content.error("expected wire_name literal"));
+            }
+            wire_name = Some(lit);
+        } else {
+            if !content.is_empty() {
+                return Err(content.error("wire_skip takes no arguments"));
+            }
+            if wire_skip {
+                return Err(content.error("duplicate wire_skip"));
+            }
+            wire_skip = true;
+        }
+    }
+    Ok((wire_name, wire_skip))
 }
 
 fn parse_optional_keyword(input: ParseStream, keyword: &str) -> Result<Option<Ident>> {

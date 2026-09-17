@@ -6,6 +6,7 @@ use flux_versioned_types::{evolve_enum, evolve_struct};
 #[test]
 fn final_attrs_apply_only_to_final_struct() {
     evolve_struct! {
+        #[wire_skip]
         default_attrs { #[derive(Clone, TypeHash)] }
         final_attrs { #[derive(Debug)] }
         #[type_hash_lock(hash = 12263633316478600747)]
@@ -20,6 +21,7 @@ fn final_attrs_apply_only_to_final_struct() {
 #[test]
 fn final_attrs_coexist_with_custom_enum_defaults() {
     evolve_enum! {
+        #[wire_skip]
         final_attrs { #[derive(Debug)] }
         default_attrs { #[derive(Clone, Default, TypeHash)] }
         #[type_hash_lock(hash = 9657512568175020449)]

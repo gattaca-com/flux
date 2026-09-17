@@ -31,28 +31,132 @@ pub(crate) fn generate_type_alias_and_codec(ctx: &RollChainContext) -> TokenStre
 
         impl #last {
             #[inline]
-            pub fn versioned_deserialize_vec(type_hash: u64, bytes: &[u8]) -> bincode::Result<Vec<Self>> {
+            pub fn versioned_deserialize_vec(type_hash: u64, bytes: &[u8]) -> ::flux_versioned_types::bincode::Result<Vec<Self>> {
                 match type_hash ^ 123456 {
                     #(<#previous as flux::type_hash::TypeHash>::TYPE_HASH => {
-                        let v: Vec<#previous> = bincode::deserialize(bytes)?;
+                        let v: Vec<#previous> = ::flux_versioned_types::bincode::deserialize(bytes)?;
                         Ok(v.into_iter().map(Into::into).collect())
                     },)*
-                    <#last as flux::type_hash::TypeHash>::TYPE_HASH => Ok(bincode::deserialize(bytes)?),
-                    _ => Err(Box::new(bincode::ErrorKind::Custom(format!("Invalid type hash: {}", type_hash)))),
+                    <#last as flux::type_hash::TypeHash>::TYPE_HASH => Ok(::flux_versioned_types::bincode::deserialize(bytes)?),
+                    _ => Err(Box::new(::flux_versioned_types::bincode::ErrorKind::Custom(format!("Invalid type hash: {}", type_hash)))),
                 }
             }
         }
     }
 }
 
-pub(crate) fn generate_roll_chain(roll_into: &Ident, version_names: &[Ident]) -> TokenStream2 {
+pub(crate) fn generate_roll_chain(
+    roll_into: &Ident,
+    version_names: &[Ident],
+    wire_name: Option<&syn::LitStr>,
+    wire_skip: bool,
+) -> TokenStream2 {
     let version_refs: Vec<&Ident> = version_names.iter().collect();
     let Some(ctx) = RollChainContext::new(roll_into, &version_refs) else {
         return TokenStream2::new();
     };
     let mut output = generate_type_alias_and_codec(&ctx);
     output.extend(generate_transitive_into_impls(&version_refs));
+    if !wire_skip {
+        output.extend(generate_versioned_impls(roll_into, &version_refs, wire_name));
+    }
     output
+}
+
+fn generate_versioned_impls(
+    alias: &Ident,
+    versions: &[&Ident],
+    wire_name: Option<&syn::LitStr>,
+) -> TokenStream2 {
+    let Some(&last) = versions.last() else {
+        return TokenStream2::new();
+    };
+    let name_tokens =
+        wire_name.map_or_else(|| quote! { stringify!(#alias) }, |lit| quote! { #lit });
+    let decode_arms = versions.iter().map(|version| {
+        let migrate = if *version == last {
+            quote! { Ok(slice.to_vec()) }
+        } else {
+            quote! { Ok(slice.iter().copied().map(::core::convert::Into::into).collect()) }
+        };
+        quote! {
+            <#version as flux::type_hash::TypeHash>::TYPE_HASH => {
+                match ::flux_versioned_types::byte_stable::cast_slice::<#version>(bytes) {
+                    Ok(slice) => #migrate,
+                    Err(::flux_versioned_types::byte_stable::CastError::Unaligned) => {
+                        Err(::flux_versioned_types::DecodeError::Unaligned)
+                    }
+                    Err(::flux_versioned_types::byte_stable::CastError::Length { got, size }) => {
+                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                            expected: if size == 0 {
+                                0
+                            } else {
+                                size.saturating_mul(got / size + 1)
+                            },
+                            got,
+                        })
+                    }
+                    Err(::flux_versioned_types::byte_stable::CastError::Invalid { .. }) => {
+                        Err(::flux_versioned_types::DecodeError::InvalidValue)
+                    }
+                    Err(::flux_versioned_types::byte_stable::CastError::ZeroSized) => {
+                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                            expected: 0,
+                            got: bytes.len(),
+                        })
+                    }
+                }
+            }
+        }
+    });
+    quote! {
+        impl ::flux_versioned_types::Versioned for #last {
+            const NAME: &'static str = #name_tokens;
+            const VERSION_HASHES: &'static [u64] = &[
+                #(<#versions as flux::type_hash::TypeHash>::TYPE_HASH,)*
+            ];
+            fn version_size(type_hash: u64) -> Option<usize> {
+                match type_hash {
+                    #(<#versions as flux::type_hash::TypeHash>::TYPE_HASH => Some(::core::mem::size_of::<#versions>()),)*
+                    _ => None,
+                }
+            }
+            fn decode_versions(
+                type_hash: u64,
+                bytes: &[u8],
+            ) -> Result<Vec<Self>, ::flux_versioned_types::DecodeError> {
+                match type_hash {
+                    #(#decode_arms,)*
+                    _ => Err(::flux_versioned_types::DecodeError::UnknownTypeHash(type_hash)),
+                }
+            }
+        }
+
+        const _: () = assert!(
+            ::flux_versioned_types::leaves::name_fits(#name_tokens),
+            "wire name longer than TYPE_NAME_LEN"
+        );
+
+        impl ::flux_versioned_types::HasVersionedLeaves for #last {
+            const LEAF_NAMES: &'static [&'static str] = &[#name_tokens];
+            fn visit_leaf<V: ::flux_versioned_types::VisitorVersionedLeaf>(
+                &self,
+                visitor: &mut V,
+            ) {
+                visitor.visit_leaf(#name_tokens, self);
+            }
+            fn decode_blob<U: ::flux_versioned_types::Versioned>(
+                blob: &::flux_versioned_types::Blob,
+                scratch: &mut ::flux_versioned_types::Scratch,
+            ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
+                if blob.type_name() == #name_tokens && blob.is::<Self>() {
+                    Some(blob.decode::<U, Self>(scratch))
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn generate_transitive_into_impls(versions: &[&Ident]) -> TokenStream2 {

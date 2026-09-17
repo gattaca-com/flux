@@ -1,7 +1,7 @@
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
 use flux_versioned_types::{VersionedDeserialize, versioned_enum, versioned_struct};
 
-versioned_struct!(Reading =>
+versioned_struct!(#[wire_skip] Reading =>
     #[type_hash_lock(hash = 17013878556110425249)]
     ReadingV1 { pub value: u32 }
 
@@ -12,7 +12,7 @@ versioned_struct!(Reading =>
     }
 );
 
-versioned_enum!(Status =>
+versioned_enum!(#[wire_skip] Status =>
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, flux::type_hash_derive::TypeHash)]
         #[type_hash(skip_typename_on_derive)]

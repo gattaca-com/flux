@@ -338,51 +338,92 @@ impl<T: Copy, const N: usize> FromIterator<T> for ArrayVec<T, N> {
     }
 }
 
-/// Fixed-capacity UTF-8 string.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// Bytes past `len` are zero. Byte views need `N % 8 == 0` (no trailing
+/// padding).
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ArrayStr<const N: usize> {
-    buf: ArrayVec<u8, N>,
+    len: usize,
+    data: [u8; N],
+}
+
+impl<const N: usize> Default for ArrayStr<N> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Safety: zeroed tail, UTF-8 validated below, plain data.
+unsafe impl<const N: usize> byte_stable::ByteStable for ArrayStr<N> {
+    const LAYOUT_PROOF: () = assert!(
+        N.is_multiple_of(8) && size_of::<Self>() == size_of::<usize>() + N,
+        "ArrayStr<N> can only be shipped as bytes when N is a multiple of 8"
+    );
+
+    #[inline]
+    fn is_valid(bytes: &[u8]) -> bool {
+        let Some(len_bytes) = bytes.get(..size_of::<usize>()) else { return false };
+        let len = usize::from_ne_bytes(len_bytes.try_into().unwrap());
+        len <= N &&
+            bytes
+                .get(size_of::<usize>()..size_of::<usize>() + len)
+                .is_some_and(|s| core::str::from_utf8(s).is_ok())
+    }
 }
 
 impl<const N: usize> ArrayStr<N> {
     #[inline]
     pub const fn new() -> Self {
-        Self { buf: ArrayVec::new() }
+        assert!(N < MAX_SIZE);
+        Self { len: 0, data: [0; N] }
+    }
+
+    /// Inherent so it wins over `ByteStable::as_bytes` (the whole value).
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_slice()
     }
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        // Safety: we only ever write valid UTF-8 into buf.
-        unsafe { core::str::from_utf8_unchecked(self.buf.as_slice()) }
+        // Safety: every writer keeps `data[..len]` valid UTF-8.
+        unsafe { core::str::from_utf8_unchecked(self.as_slice()) }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.len
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len == 0
     }
 
     #[inline]
     pub const fn is_full(&self) -> bool {
-        self.buf.is_full()
+        self.len == N
     }
 
     /// Push a single ASCII byte. Panics if full or non-ASCII.
     #[inline]
     pub(crate) fn push_byte(&mut self, b: u8) {
-        debug_assert!(b.is_ascii());
-        self.buf.push(b);
+        assert!(b.is_ascii(), "push_byte requires ASCII");
+        assert!(self.len < N, "push capacity overflow");
+        self.data[self.len] = b;
+        self.len += 1;
     }
 
     /// Push str, truncating at char boundary if exceeds capacity.
     #[inline]
     pub const fn push_str_truncate(&mut self, s: &str) {
-        let avail = N - self.buf.len();
+        let avail = N - self.len;
         let mut take = if s.len() < avail { s.len() } else { avail };
         // Truncate at char boundary to preserve UTF-8 validity.
         while take > 0 && !s.is_char_boundary(take) {
@@ -391,7 +432,8 @@ impl<const N: usize> ArrayStr<N> {
         let bytes = s.as_bytes().split_at(take).0;
         let mut i = 0;
         while i < bytes.len() {
-            self.buf.push(bytes[i]);
+            self.data[self.len] = bytes[i];
+            self.len += 1;
             i += 1;
         }
     }
@@ -431,7 +473,10 @@ impl<const N: usize> TryFrom<ArrayVec<u8, N>> for ArrayStr<N> {
     #[inline]
     fn try_from(buf: ArrayVec<u8, N>) -> Result<Self, Self::Error> {
         core::str::from_utf8(buf.as_slice())?;
-        Ok(Self { buf })
+        let mut out = Self::new();
+        out.data[..buf.len()].copy_from_slice(buf.as_slice());
+        out.len = buf.len();
+        Ok(out)
     }
 }
 
@@ -463,17 +508,26 @@ impl<const N: usize> core::fmt::Debug for ArrayStr<N> {
     }
 }
 
+impl<const N: usize> PartialEq for ArrayStr<N> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<const N: usize> Eq for ArrayStr<N> {}
+
 impl<const N: usize> core::hash::Hash for ArrayStr<N> {
     #[inline]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.buf.hash(state);
+        self.as_slice().hash(state);
     }
 }
 
 impl<const N: usize> Ord for ArrayStr<N> {
     #[inline]
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.buf.cmp(&other.buf)
+        self.as_slice().cmp(other.as_slice())
     }
 }
 
@@ -753,12 +807,16 @@ mod wincode_impl {
 
         #[inline]
         fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
-            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::size_of(&src.buf)
+            let mut tmp = ArrayVec::<u8, N>::new();
+            tmp.extend(src.as_slice().iter().copied());
+            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::size_of(&tmp)
         }
 
         #[inline]
         fn write(writer: impl Writer, src: &Self::Src) -> wincode::WriteResult<()> {
-            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::write(writer, &src.buf)
+            let mut tmp = ArrayVec::<u8, N>::new();
+            tmp.extend(src.as_slice().iter().copied());
+            <ArrayVec<u8, N> as wincode::SchemaWrite<C>>::write(writer, &tmp)
         }
     }
 

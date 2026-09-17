@@ -2,6 +2,7 @@ use flux::type_hash_derive::{TypeHash, type_hash_lock};
 use flux_versioned_types::evolve_struct;
 
 evolve_struct! {
+    #[wire_skip]
     default_attrs {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
         #[repr(C)]

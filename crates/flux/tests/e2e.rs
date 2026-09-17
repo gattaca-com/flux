@@ -5,7 +5,6 @@ use std::sync::{
 
 use flux::{
     communication::{ShmemData, cleanup_shmem},
-    persistence::Persistable,
     spine::{SpineAdapter, SpineQueue},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
@@ -17,24 +16,17 @@ use spine_derive::from_spine;
 #[repr(C)]
 struct TestMsg(u64);
 
-impl Persistable for TestMsg {
-    const PERSIST_DIR: &'static str = "test_msg";
-}
-
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
 #[repr(C)]
 struct OtherTestMsg(u8);
 
-impl Persistable for OtherTestMsg {
-    const PERSIST_DIR: &'static str = "other_test_msg";
-}
 #[from_spine("test-app")]
 #[derive(Debug)]
 struct MySpine {
     pub tile_info: ShmemData<TileInfo>,
-    #[queue(persist, size(2usize.pow(14)))]
+    #[queue(size(2usize.pow(14)))]
     pub q: SpineQueue<TestMsg>,
-    #[queue(persist, size(2usize.pow(14)))]
+    #[queue(size(2usize.pow(14)))]
     pub q2: SpineQueue<OtherTestMsg>,
 }
 

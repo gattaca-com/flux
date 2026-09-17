@@ -21,5 +21,5 @@ use parse::RollChainInput;
 /// - Transitive `Into` impls for version migration (V1→V2→V3, V1→V3)
 pub fn roll_chain_into(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as RollChainInput);
-    generate::generate_roll_chain(&input.name, &input.versions).into()
+    generate::generate_roll_chain(&input.name, &input.versions, None, false).into()
 }

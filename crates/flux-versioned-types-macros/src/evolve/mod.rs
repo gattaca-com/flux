@@ -47,6 +47,9 @@ use syn::parse_macro_input;
 /// - `MyTypeV1 { a: u32, b }` with `default_attrs` + `type_hash_lock`
 /// - `MyTypeV2 { a: u32, b, c }` with `Into<MyTypeV2> for MyTypeV1`
 /// - `MyTypeV3 { a: u64, c, d }` with `Into<MyTypeV3> for MyTypeV2`
+///
+/// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
+/// padding-free `Copy`; it excludes `#[wire_name]`.
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveInput);
     input.ensure_default_attrs(crate::shared::default_struct_attrs);

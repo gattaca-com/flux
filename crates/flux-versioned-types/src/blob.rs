@@ -5,7 +5,7 @@
 //! the generated `versioned_deserialize_vec` expects), so any reader can
 //! detect the version and migrate it. Data and per-item metadata travel as
 //! two byte strings; for [`InternalMessage`] vectors the metadata is the
-//! portable [`InternalMetadata`] projection of each tracking timestamp.
+//! portable [`TrackingTimestampWire`] projection of each tracking timestamp.
 //!
 //! The on-disk format is a magic header (`GTCVBLB`) with the type hash and
 //! payload lengths, followed by zstd-compressed data and metadata. There is
@@ -110,13 +110,13 @@ impl VersionedBlob {
     }
 
     /// Pack an [`InternalMessage`] slice, projecting each tracking timestamp
-    /// to portable [`InternalMetadata`].
+    /// to portable [`TrackingTimestampWire`].
     pub fn from_tracked<T: TypeHash + Serialize>(vals: &[InternalMessage<T>]) -> Self {
         Self::from_parts::<T, _, _>(
             &vals.iter().map(InternalMessage::data).collect::<Vec<_>>(),
             &vals
                 .iter()
-                .map(|m| InternalMetadata::from(m.tracking_timestamp()))
+                .map(|m| TrackingTimestampWire::from(m.tracking_timestamp()))
                 .collect::<Vec<_>>(),
         )
     }
@@ -134,10 +134,10 @@ impl VersionedBlob {
     /// Decode to [`InternalMessage`]s, reattaching portable timing metadata.
     /// Falls back to pre-`tile_id` metadata for payloads written before it.
     pub fn to_tracked<T: VersionedDeserialize>(&self) -> Option<Vec<InternalMessage<T>>> {
-        let meta: Vec<InternalMetadata> = bincode::deserialize(&self.metadata)
+        let meta: Vec<TrackingTimestampWire> = bincode::deserialize(&self.metadata)
             .or_else(|_| -> Result<_, bincode::Error> {
-                let old: Vec<InternalMetadataV1> = bincode::deserialize(&self.metadata)?;
-                Ok(old.into_iter().map(InternalMetadata::from).collect())
+                let old: Vec<TrackingTimestampWireV1> = bincode::deserialize(&self.metadata)?;
+                Ok(old.into_iter().map(TrackingTimestampWire::from).collect())
             })
             .inspect_err(|e| {
                 tracing::error!("metadata deserialize failed: {e}");
@@ -327,30 +327,41 @@ impl VersionedBlob {
 
 /// Portable timing metadata sent over the wire. Wall-clock `Nanos`, safe
 /// across machines with different RDTSC rates.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, byte_stable_derive::ByteStable)]
 #[repr(C)]
-pub struct InternalMetadata {
+pub struct TrackingTimestampWire {
     pub ingestion_t_real: flux_timing::Nanos,
     pub publish_t_real: flux_timing::Nanos,
     pub tile_id: u16,
+    /// Pads to the 24-byte wire stride; `serde(skip)` keeps legacy bincode
+    /// bytes unchanged.
+    #[serde(skip)]
+    _pad: [u8; 6],
 }
+
+const _: () = assert!(size_of::<TrackingTimestampWire>() == 24);
 
 /// Pre-tile-id metadata format. Deserialization fallback for payloads written
 /// before `tile_id` was added.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[repr(C)]
-pub struct InternalMetadataV1 {
+pub struct TrackingTimestampWireV1 {
     pub ingestion_t_real: flux_timing::Nanos,
     pub publish_t_real: flux_timing::Nanos,
 }
 
-impl From<InternalMetadataV1> for InternalMetadata {
-    fn from(v: InternalMetadataV1) -> Self {
-        Self { ingestion_t_real: v.ingestion_t_real, publish_t_real: v.publish_t_real, tile_id: 0 }
+impl From<TrackingTimestampWireV1> for TrackingTimestampWire {
+    fn from(v: TrackingTimestampWireV1) -> Self {
+        Self {
+            ingestion_t_real: v.ingestion_t_real,
+            publish_t_real: v.publish_t_real,
+            tile_id: 0,
+            _pad: [0; 6],
+        }
     }
 }
 
-impl InternalMetadata {
+impl TrackingTimestampWire {
     /// Reconstruct a local `TrackingTimestamp` from portable wall-clock values.
     pub fn to_tracking_timestamp(self) -> TrackingTimestamp {
         let ingestion = IngestionTime::from(self.ingestion_t_real);
@@ -367,12 +378,13 @@ impl InternalMetadata {
     }
 }
 
-impl From<TrackingTimestamp> for InternalMetadata {
+impl From<TrackingTimestamp> for TrackingTimestampWire {
     fn from(t: TrackingTimestamp) -> Self {
         Self {
             ingestion_t_real: t.ingestion_t().real(),
             publish_t_real: t.publish_t(),
             tile_id: t.tile_id(),
+            _pad: [0; 6],
         }
     }
 }

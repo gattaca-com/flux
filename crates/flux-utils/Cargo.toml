@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+byte-stable.workspace = true
 bytes = { workspace = true, optional = true }
 core_affinity.workspace = true
 directories.workspace = true

@@ -5,6 +5,8 @@ pub mod spine;
 pub mod tile;
 mod timer;
 
+pub use byte_stable;
+pub use byte_stable_derive;
 pub use core_affinity;
 pub use flux_communication as communication;
 #[cfg(feature = "park")]

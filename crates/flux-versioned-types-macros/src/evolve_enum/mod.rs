@@ -48,6 +48,9 @@ use syn::parse_macro_input;
 ///
 /// Pair this with `roll_chain_into!(MyEnum, [MyEnumV1, MyEnumV2])` to get
 /// the type alias and `versioned_deserialize_vec`.
+///
+/// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
+/// padding-free `Copy`; it excludes `#[wire_name]`.
 pub fn evolve_enum(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveEnumInput);
     input.ensure_default_attrs(crate::shared::default_enum_attrs);

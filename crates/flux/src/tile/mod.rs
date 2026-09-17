@@ -20,11 +20,19 @@ pub struct TileConfig {
     thread_niceness: Option<ThreadNiceness>,
     min_loop_duration: Option<Duration>,
     metrics: bool,
+    #[cfg_attr(not(feature = "park"), allow(dead_code))]
+    park: bool,
 }
 
 impl TileConfig {
     pub fn new(core: usize, thread_niceness: Option<ThreadNiceness>) -> Self {
-        Self { cores: vec![core], thread_niceness, min_loop_duration: None, metrics: true }
+        Self {
+            cores: vec![core],
+            thread_niceness,
+            min_loop_duration: None,
+            metrics: true,
+            park: false,
+        }
     }
 
     /// Boot a tile with a background (non-hot-path) config.
@@ -35,7 +43,7 @@ impl TileConfig {
 
     /// Background config pinned to a set of cores. Empty pins nowhere.
     pub fn background_on_cores(cores: Vec<usize>, min_loop_duration: Option<Duration>) -> Self {
-        Self { cores, thread_niceness: None, min_loop_duration, metrics: true }
+        Self { cores, thread_niceness: None, min_loop_duration, metrics: true, park: false }
     }
 
     /// Cores the tile is pinned to on startup. Empty means unpinned.
@@ -45,6 +53,13 @@ impl TileConfig {
 
     pub fn without_metrics(mut self) -> Self {
         self.metrics = false;
+        self
+    }
+
+    /// Parked tiles wake only on spine producer signals; never for tiles that
+    /// poll sockets or disk.
+    pub fn with_park(mut self) -> Self {
+        self.park = true;
         self
     }
 }
@@ -164,7 +179,7 @@ where
 
             #[cfg(feature = "park")]
             {
-                if !worked && !adapter.waker_registered() {
+                if config.park && !worked && !adapter.waker_registered() {
                     crate::park::SIGNAL.park(expected);
                 }
                 expected = crate::park::SIGNAL.read_counter();

@@ -47,3 +47,60 @@ typehash *cargo_args:
 ```
 
 The script adds imports and locks only for versioned types that do not already have a lock. It does not replace an existing but incorrect hash, and it requires `jq`.
+
+## Zero-copy leaves
+
+Every `versioned_struct!`/`versioned_enum!` chain derives `ByteStable` and
+implements `Versioned` and `HasVersionedLeaves`. Versions must be padding-free
+`repr(C)` structs or `repr(u8)` fieldless enums of `ByteStable` fields; flux
+provides impls for ints, `bool`, arrays, `ArrayStr`, `Nanos`, and behind
+`byte-stable` features `Uuid`, `FixedBytes`/`B256`/`Address`, `Uint`/`U256`.
+Consumers need no direct `byte-stable` dependency. `#[wire_skip]` keeps the
+bincode codec only; `#[wire_name = ".."]` sets `Versioned::NAME`.
+
+```rust
+versioned_struct!(#[wire_name = "Relay.NewBidSubmission"] NewBidSubmission =>
+    #[type_hash_lock(hash = 17013878556110425249)]
+    NewBidSubmissionV1 { pub value: u64 }
+);
+
+#[derive(Clone, Copy, VersionedLeaves)]
+enum Family {
+    A(LeafA),
+    B(LeafB),
+    #[leaves(skip)]
+    Other,
+}
+```
+
+Family variants are newtypes of leaves or families. A blob is identified by
+its wire name (which message) and its type hash (which version). The name is
+the leaf's `NAME` unless the variant sets `#[leaves(name = "..")]`, so one
+leaf type can sit at several positions; names must be unique across the tree
+and the derive checks that at compile time.
+
+## Zero-copy blobs
+
+```text
+[BlobHeader 144 B][user metadata, padded to 8][zstd( [TrackingTimestampWire x n][Leaf x n] )]
+```
+
+The bytes of a `Blob` are the format: `as_bytes` to send, `from_bytes` to
+receive, concatenate for a file. The user metadata is one uncompressed
+`Versioned` value; `publish_t_first`/`publish_t_last` give the batch's time
+span without decompressing. `BlobCache::push` buffers `InternalMessage`s per
+leaf type; `flush` emits one `Blob` per type, valid only inside the callback.
+
+```rust
+let mut cache = BlobCache::new();
+cache.push(&msg);
+cache.flush(&meta, 3, |blob| {
+    let (_, msgs) = blob.decode::<Meta, Bid>(&mut scratch).unwrap();
+});
+```
+
+`from_bytes` needs an 8-aligned slice: `flux-network` payloads are, `DiskIo`
+reads are not (use `Scratch::load`). Receive families with
+`Family::decode_blob`, one call per blob. Files have no resync marker: rotate
+per slot. Rebuilt `publish_t` carries sub-millisecond clock noise across
+hosts; `ingestion_time().real()` and `tile_id` are exact.

@@ -13,6 +13,8 @@ categories = ["data-structures", "encoding"]
 [dependencies]
 alloy-primitives = { workspace = true, features = ["serde"] }
 bincode.workspace = true
+byte-stable = { workspace = true, features = ["alloy", "uuid"] }
+byte-stable-derive.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
 flux-versioned-types-macros.workspace = true
