@@ -8,6 +8,8 @@
 //! those stay downstream.
 
 pub mod blob;
+pub mod leaves;
+pub mod raw;
 mod schema;
 pub mod wire;
 
@@ -15,10 +17,15 @@ pub use blob::{InternalMetadata, InternalMetadataV1, VersionedBlob, VersionedPer
 pub use flux_versioned_types_macros::{
     TelemetrySchema, evolve_enum, evolve_struct, roll_chain_into,
 };
+pub use leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf};
+pub use raw::{Blob, BlobCache, DecodeError, Scratch};
 pub use schema::TelemetrySchema;
 pub use wire::{
     DEFAULT_TELEMETRY_WIRE_ZSTD_LEVEL, TelemetryWire, TelemetryWirePayloadEncoding, TelemetryWireV2,
 };
+/// Re-exported so macro-generated code can name zerocopy without the consumer
+/// crate depending on it directly.
+pub use zerocopy;
 
 /// A type whose historical bincode payloads can be migrated to its latest form.
 pub trait VersionedDeserialize: Sized {

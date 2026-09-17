@@ -20,7 +20,14 @@ serde.workspace = true
 tracing.workspace = true
 type-hash = { workspace = true, features = ["alloy", "uuid"] }
 uuid = { workspace = true, features = ["serde"] }
+zerocopy.workspace = true
 zstd.workspace = true
+
+[features]
+# Emit zerocopy derives plus `Versioned`/`HasVersionedLeaves` impls from
+# `versioned_struct!`/`versioned_enum!`. Requires every version to be a
+# padding-free `repr(C)` type; opt in per consumer crate.
+zerocopy = ["flux-versioned-types-macros/zerocopy"]
 
 [dev-dependencies]
 flux.workspace = true

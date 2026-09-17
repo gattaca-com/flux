@@ -1500,6 +1500,7 @@ dependencies = [
  "tracing",
  "type-hash",
  "wincode",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1516,6 +1517,7 @@ dependencies = [
  "tracing",
  "type-hash",
  "uuid",
+ "zerocopy",
  "zstd",
 ]
 

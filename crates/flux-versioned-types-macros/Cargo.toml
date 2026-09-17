@@ -19,5 +19,8 @@ quote.workspace = true
 rustc-hash.workspace = true
 syn = { workspace = true, features = ["parsing", "extra-traits"] }
 
+[features]
+zerocopy = []
+
 [lints]
 workspace = true

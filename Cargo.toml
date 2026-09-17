@@ -87,6 +87,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
 wincode = "0.5"
 wincode-derive = "0.4"
+zerocopy = { version = "0.8", features = ["derive"] }
 zstd = "0.13.2"
 
 [workspace.lints.clippy]
