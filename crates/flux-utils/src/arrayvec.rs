@@ -417,6 +417,14 @@ impl<const N: usize> ArrayStr<N> {
         Self { len: 0, data: [0; N] }
     }
 
+    /// The string's bytes. Inherent so `s.as_bytes()` keeps meaning this when
+    /// `zerocopy::IntoBytes` is in scope; the whole value's bytes are
+    /// `IntoBytes::as_bytes(&s)`.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+
     #[inline]
     pub fn as_str(&self) -> &str {
         // Safety: every mutation path only writes valid UTF-8 (`push_byte`
