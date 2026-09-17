@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "linux"))]
 use core_affinity::CoreId;
 use tracing::warn;
 
@@ -47,9 +48,32 @@ fn set_thread_niceness(niceness: Option<ThreadNiceness>) {
     }
 }
 
-fn set_thread_affinity(core: usize) {
-    if !core_affinity::set_for_current(CoreId { id: core }) {
-        warn!(?core, "couldn't set core affinity");
+#[cfg(target_os = "linux")]
+fn set_thread_affinity(cores: &[usize]) {
+    if cores.is_empty() {
+        return;
+    }
+    // ponytail: raw sched_setaffinity because core_affinity only pins a single core
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for &core in cores {
+            libc::CPU_SET(core, &mut set);
+        }
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
+            warn!(?cores, error = %std::io::Error::last_os_error(), "couldn't set core affinity");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_thread_affinity(cores: &[usize]) {
+    if let Some(&core) = cores.first() {
+        if cores.len() > 1 {
+            warn!(?cores, "core-set pinning only supported on linux; pinning to first core");
+        }
+        if !core_affinity::set_for_current(CoreId { id: core }) {
+            warn!(?core, "couldn't set core affinity");
+        }
     }
 }
 
@@ -63,10 +87,8 @@ pub fn get_tid() -> i64 {
     0
 }
 
-pub fn thread_boot(core: Option<usize>, niceness: Option<ThreadNiceness>) {
-    if let Some(core) = core {
-        set_thread_affinity(core);
-    }
+pub fn thread_boot(cores: &[usize], niceness: Option<ThreadNiceness>) {
+    set_thread_affinity(cores);
 
     set_thread_niceness(niceness);
 }

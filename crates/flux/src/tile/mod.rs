@@ -14,9 +14,9 @@ use crate::{
 pub type TileID = u16;
 pub type TileName = ShortTypename;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TileConfig {
-    core: Option<usize>,
+    cores: Vec<usize>,
     thread_niceness: Option<ThreadNiceness>,
     min_loop_duration: Option<Duration>,
     metrics: bool,
@@ -24,13 +24,28 @@ pub struct TileConfig {
 
 impl TileConfig {
     pub fn new(core: usize, thread_niceness: Option<ThreadNiceness>) -> Self {
-        Self { core: Some(core), thread_niceness, min_loop_duration: None, metrics: true }
+        Self::new_on_cores(vec![core], thread_niceness)
+    }
+
+    /// Pin the tile to a set of cores instead of a single core.
+    pub fn new_on_cores(cores: Vec<usize>, thread_niceness: Option<ThreadNiceness>) -> Self {
+        Self { cores, thread_niceness, min_loop_duration: None, metrics: true }
     }
 
     /// Boot a tile with a background (non-hot-path) config.
     /// Supports optional vsync pacing and inherits the process niceness.
     pub fn background(core: Option<usize>, min_loop_duration: Option<Duration>) -> Self {
-        Self { core, thread_niceness: None, min_loop_duration, metrics: true }
+        Self::background_on_cores(core.into_iter().collect(), min_loop_duration)
+    }
+
+    /// Background config pinned to a set of cores. Empty pins nowhere.
+    pub fn background_on_cores(cores: Vec<usize>, min_loop_duration: Option<Duration>) -> Self {
+        Self { cores, thread_niceness: None, min_loop_duration, metrics: true }
+    }
+
+    /// Cores the tile is pinned to on startup. Empty means unpinned.
+    pub fn cores(&self) -> &[usize] {
+        &self.cores
     }
 
     pub fn without_metrics(mut self) -> Self {
@@ -116,7 +131,7 @@ where
 
     move || {
         let _span = span!(Level::INFO, "", tile = %tile.name()).entered();
-        thread_boot(config.core, config.thread_niceness);
+        thread_boot(&config.cores, config.thread_niceness);
 
         while !tile.try_init(&mut adapter) {
             if stop_flag.load(Ordering::Relaxed) != 0 {
