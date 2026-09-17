@@ -1,0 +1,22 @@
+[package]
+name = "byte-stable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Copy types whose in-memory bytes are a stable, validated wire format"
+repository.workspace = true
+keywords = ["zero-copy", "wire-format", "serialization"]
+categories = ["encoding", "no-std"]
+
+[features]
+alloy = ["dep:alloy-primitives"]
+uuid = ["dep:uuid"]
+
+[dependencies]
+alloy-primitives = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[lints]
+workspace = true
