@@ -63,7 +63,6 @@ pub(crate) fn generate_roll_chain(
     output
 }
 
-#[cfg(feature = "zerocopy")]
 fn generate_versioned_impls(
     alias: &Ident,
     versions: &[&Ident],
@@ -143,15 +142,6 @@ fn generate_versioned_impls(
             }
         }
     }
-}
-
-#[cfg(not(feature = "zerocopy"))]
-fn generate_versioned_impls(
-    _alias: &Ident,
-    _versions: &[&Ident],
-    _wire_name: Option<&syn::LitStr>,
-) -> TokenStream2 {
-    TokenStream2::new()
 }
 
 pub(crate) fn generate_transitive_into_impls(versions: &[&Ident]) -> TokenStream2 {

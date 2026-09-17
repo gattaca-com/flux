@@ -48,14 +48,15 @@ typehash *cargo_args:
 
 The script adds imports and locks only for versioned types that do not already have a lock. It does not replace an existing but incorrect hash, and it requires `jq`.
 
-## Zero-copy leaves (`zerocopy` feature)
+## Zero-copy leaves
 
-Opt in per consumer crate with `flux-versioned-types/zerocopy`, plus a direct
-`zerocopy = { version = "0.8", features = ["derive"] }` dependency (needed for
-the generated `#[derive(::zerocopy::...)]` paths, just as `bincode` is already
+Every `versioned_struct!`/`versioned_enum!` chain is wire-ready by default.
+Consumer crates need a direct
+`zerocopy = { version = "0.8", features = ["derive"] }` dependency (for the
+generated `#[derive(::zerocopy::...)]` paths, just as `bincode` is already
 required; the locked zerocopy-derive only accepts a bare ident for its
 `crate` attribute, so the re-export cannot be used there). Every version must
-then be a padding-free `repr(C)` struct or `repr(u8)` fieldless enum; padded
+be a padding-free `repr(C)` struct or `repr(u8)` fieldless enum; padded
 types fail to compile at the derive, which is intended.
 
 Each `versioned_struct!`/`versioned_enum!` chain then also implements
@@ -95,11 +96,8 @@ enum Family {
 Every non-skipped variant must be a newtype with exactly one unnamed field;
 the same field type in two variants is an error (ambiguous `From`).
 
-The `zerocopy` cargo feature is unified across a workspace build: enabling
-it in one crate enables the derives for every `versioned_struct!` /
-`versioned_enum!` in the build. Chains that cannot satisfy padding-free
-`Copy` layouts (padding, `String`, ...) opt out with `#[wire_skip]` and keep
-the bincode codec only.
+Chains that cannot satisfy padding-free `Copy` layouts (padding, `String`,
+...) opt out with a leading `#[wire_skip]` and keep the bincode codec only.
 
 The derive
 generates `HasVersionedLeaves` (matching `visit_leaf` down to the leaf,

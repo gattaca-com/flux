@@ -48,10 +48,10 @@ use syn::parse_macro_input;
 /// - `MyTypeV2 { a: u32, b, c }` with `Into<MyTypeV2> for MyTypeV1`
 /// - `MyTypeV3 { a: u64, c, d }` with `Into<MyTypeV3> for MyTypeV2`
 ///
-/// With the `zerocopy` cargo feature every version also gets zerocopy derives
-/// and a `roll_into` chain gets `Versioned`/`HasVersionedLeaves` impls. A
-/// leading `#[wire_skip]` opts the whole input out: versions emit exactly the
-/// pre-zerocopy output. It is mutually exclusive with `#[wire_name = ".."]`.
+/// Every version also gets zerocopy derives and a `roll_into` chain gets
+/// `Versioned`/`HasVersionedLeaves` impls. A leading `#[wire_skip]` opts the
+/// whole input out (bincode codec only) for types that cannot be padding-free
+/// `Copy`. It is mutually exclusive with `#[wire_name = ".."]`.
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as EvolveInput);
     input.ensure_default_attrs(crate::shared::default_struct_attrs);

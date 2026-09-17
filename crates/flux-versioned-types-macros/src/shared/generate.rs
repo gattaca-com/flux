@@ -160,15 +160,9 @@ pub(crate) fn default_enum_attrs() -> Vec<Attribute> {
 // Locked zerocopy-derive only accepts a bare ident for `#[zerocopy(crate =
 // ...)]`, so a re-export path cannot be used here; consumers depend on zerocopy
 // directly.
-#[cfg(feature = "zerocopy")]
 pub(crate) fn zerocopy_derive_attrs() -> Vec<Attribute> {
     let tokens = quote! {
         #[derive(::zerocopy::IntoBytes, ::zerocopy::TryFromBytes, ::zerocopy::KnownLayout, ::zerocopy::Immutable)]
     };
     syn::parse2::<AttrsWrapper>(tokens).unwrap().0
-}
-
-#[cfg(not(feature = "zerocopy"))]
-pub(crate) fn zerocopy_derive_attrs() -> Vec<Attribute> {
-    Vec::new()
 }

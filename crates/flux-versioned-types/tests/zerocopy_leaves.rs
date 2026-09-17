@@ -1,5 +1,3 @@
-#![cfg(feature = "zerocopy")]
-
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
 use flux_versioned_types::{
     DecodeError, HasVersionedLeaves, Versioned, VersionedDeserialize, VersionedLeaves,

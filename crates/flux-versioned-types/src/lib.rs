@@ -51,11 +51,10 @@ macro_rules! impl_versioned_deserialize {
 
 /// Define an evolving struct and its hash-directed decoder.
 ///
-/// With the `zerocopy` cargo feature the chain also gets zerocopy derives plus
-/// `Versioned` and `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts
-/// out: the chain emits exactly the pre-zerocopy output (bincode codec only),
-/// for types with padding or non-`Copy` fields. It is mutually exclusive with
-/// `#[wire_name = ".."]`.
+/// The chain also gets zerocopy derives plus `Versioned` and
+/// `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts out (bincode
+/// codec only) for types with padding or non-`Copy` fields. It is mutually
+/// exclusive with `#[wire_name = ".."]`.
 #[macro_export]
 macro_rules! versioned_struct {
     (#[wire_skip] #[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
@@ -107,11 +106,10 @@ macro_rules! versioned_struct {
 /// With `persist = "dir"` the type also gets a [`VersionedPersistable`]
 /// home under that directory.
 ///
-/// With the `zerocopy` cargo feature the chain also gets zerocopy derives plus
-/// `Versioned` and `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts
-/// out: the chain emits exactly the pre-zerocopy output (bincode codec only),
-/// for types with padding or non-`Copy` fields. It is mutually exclusive with
-/// `#[wire_name = ".."]`.
+/// The chain also gets zerocopy derives plus `Versioned` and
+/// `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts out (bincode
+/// codec only) for types with padding or non-`Copy` fields. It is mutually
+/// exclusive with `#[wire_name = ".."]`.
 #[macro_export]
 macro_rules! versioned_enum {
     (#[wire_skip] #[wire_name = $wire:literal] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {

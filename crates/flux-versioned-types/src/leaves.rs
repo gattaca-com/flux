@@ -7,7 +7,7 @@
 //! leaf it holds (unpack) and rebuilds the family from a decoded blob (repack).
 //!
 //! Leaves get their [`Versioned`] and [`HasVersionedLeaves`] impls from
-//! `versioned_struct!`/`versioned_enum!` when the `zerocopy` feature is on.
+//! `versioned_struct!`/`versioned_enum!`; `#[wire_skip]` opts a chain out.
 //! Families use `#[derive(VersionedLeaves)]`.
 
 use flux_timing::InternalMessage;
