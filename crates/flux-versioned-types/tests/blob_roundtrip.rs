@@ -6,8 +6,8 @@ use flux_timing::{
 };
 use flux_utils::ArrayStr;
 use flux_versioned_types::{
-    Blob, BlobCache, DecodeError, HasVersionedLeaves, InternalMetadata, Scratch, Versioned,
-    VisitorVersionedLeaf,
+    Blob, BlobCache, DecodeError, HasVersionedLeaves, InternalMetadata, InternalMetadataV1,
+    Scratch, Versioned, VisitorVersionedLeaf,
     raw::{FORMAT_VERSION, HEADER_LEN, MAGIC, TIMESTAMP_STRIDE},
     versioned_enum, versioned_struct,
     zerocopy::IntoBytes,
@@ -374,4 +374,173 @@ fn concatenated_blobs_walk_off_disk() {
         }
     }
     assert_eq!((leaf_count, other_count), (1, 1));
+}
+
+#[test]
+fn corrupt_zstd_tail_fails_decode() {
+    let mut bytes = leaf_blob(2);
+    // First byte of the zstd frame: flipping it breaks the frame magic, so
+    // the decoder must fail instead of returning garbage.
+    let comp_off = HEADER_LEN + size_of::<MetaV1>().next_multiple_of(8);
+    bytes[comp_off] ^= 0xff;
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let blob = a.load(&bytes).unwrap();
+    assert!(matches!(
+        blob.decode::<Meta, Leaf>(&mut b),
+        Err(DecodeError::Zstd(_) | DecodeError::LengthMismatch { .. })
+    ));
+}
+
+#[test]
+fn bogus_metadata_hash_rejected_for_meta_and_decode() {
+    const BOGUS: u64 = 0xB0B0_1234_5678_9ABC;
+    let stamps = [InternalMetadata::from(stamp(1, 1))];
+    let leaves = [Leaf { slot: 5, extra: 0, flags: 0 }];
+    let meta = MetaV1 { slot: 1, instance: ArrayStr::try_from("t").unwrap() };
+    let bytes = hand_build(
+        BOGUS,
+        &meta_bytes(&meta),
+        Leaf::TYPE_HASH,
+        Leaf::NAME,
+        &[
+            <[InternalMetadata] as IntoBytes>::as_bytes(&stamps),
+            <[Leaf] as IntoBytes>::as_bytes(&leaves),
+        ]
+        .concat(),
+        1,
+        size_of::<Leaf>(),
+    );
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let blob = a.load(&bytes).unwrap();
+    assert!(matches!(
+        blob.user_metadata::<Meta>(),
+        Err(DecodeError::UnknownTypeHash(h)) if h == BOGUS
+    ));
+    assert!(matches!(
+        blob.decode::<Meta, Leaf>(&mut b),
+        Err(DecodeError::UnknownTypeHash(h)) if h == BOGUS
+    ));
+}
+
+#[test]
+fn wrong_decompressed_len_fails_without_allocating() {
+    let mut bytes = leaf_blob(1);
+    // 1 TiB: returning here proves the header was validated before any
+    // allocation, since actually allocating it would OOM the test.
+    bytes[48..56].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let blob = a.load(&bytes).unwrap();
+    match blob.decode::<Meta, Leaf>(&mut b) {
+        Err(DecodeError::LengthMismatch { expected, got }) => {
+            assert_eq!(expected, TIMESTAMP_STRIDE + size_of::<Leaf>());
+            assert_eq!(got, 1usize << 40);
+        }
+        other => panic!("expected LengthMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn wrong_metadata_len_rejected() {
+    let mut bytes = leaf_blob(1);
+    let meta_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    bytes[12..16].copy_from_slice(&(meta_len - 1).to_le_bytes());
+    let mut a = Scratch::new();
+    let blob = a.load(&bytes).unwrap();
+    match blob.user_metadata::<Meta>() {
+        Err(DecodeError::LengthMismatch { expected, got }) => {
+            assert_eq!(expected, size_of::<MetaV1>());
+            assert_eq!(got, meta_len as usize - 1);
+        }
+        other => panic!("expected LengthMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn flushed_blob_padding_is_zero() {
+    let mut cache = BlobCache::new();
+    cache.push(&InternalMessage::new(stamp(1, 1), Leaf { slot: 7, extra: 0, flags: 0 }));
+    // Single-byte metadata leaves a 7-byte pad; the asserts below are not vacuous.
+    let meta = Flag { ok: true };
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
+    assert_eq!(blobs.len(), 1);
+    let mut scratch = Scratch::new();
+    let blob = scratch.load(&blobs[0]).unwrap();
+    let meta_len = blob.metadata_len as usize;
+    let comp_len = blob.compressed_len as usize;
+    assert_eq!(meta_len, size_of::<FlagV1>());
+    let meta_pad = meta_len.next_multiple_of(8);
+    assert_eq!(meta_pad - meta_len, 7);
+    let bytes = blob.as_bytes();
+    assert!(bytes[HEADER_LEN + meta_len..HEADER_LEN + meta_pad].iter().all(|b| *b == 0));
+    let tail = HEADER_LEN + meta_pad;
+    assert_eq!(bytes.len(), tail + comp_len.next_multiple_of(8));
+    assert!(bytes[tail + comp_len..].iter().all(|b| *b == 0));
+}
+
+#[test]
+fn fresh_flush_blobs_are_8_aligned() {
+    let mut cache = BlobCache::new();
+    for i in 0..3u16 {
+        cache.push(&InternalMessage::new(stamp(i, u64::from(i)), Leaf {
+            slot: u64::from(i),
+            extra: 0,
+            flags: 0,
+        }));
+    }
+    let meta = Meta { slot: 1, instance: ArrayStr::try_from("a").unwrap() };
+    let mut n = 0;
+    cache.flush(&meta, 3, |blob| {
+        assert_eq!(blob.as_bytes().as_ptr() as usize % 8, 0);
+        assert_eq!(blob.as_bytes().len() % 8, 0);
+        n += 1;
+    });
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn internal_metadata_bincode_layout_is_pinned() {
+    let stamp = TrackingTimestamp::new(3);
+    let meta = InternalMetadata::from(stamp);
+    let bytes = bincode::serialize(&meta).unwrap();
+    // 8-byte ingestion + 8-byte publish + 2-byte tile id; the 6-byte zerocopy
+    // pad is serde-skipped so legacy blobs are unchanged.
+    assert_eq!(bytes.len(), 18);
+    let back: InternalMetadata = bincode::deserialize(&bytes).unwrap();
+    assert_eq!(back.ingestion_t_real, meta.ingestion_t_real);
+    assert_eq!(back.publish_t_real, meta.publish_t_real);
+    assert_eq!(back.tile_id, meta.tile_id);
+
+    let v1 = InternalMetadataV1 {
+        ingestion_t_real: stamp.ingestion_t().real(),
+        publish_t_real: stamp.publish_t(),
+    };
+    let v1_bytes = bincode::serialize(&v1).unwrap();
+    let v1_back: InternalMetadataV1 = bincode::deserialize(&v1_bytes).unwrap();
+    let up: InternalMetadata = v1_back.into();
+    assert_eq!(up.ingestion_t_real, v1.ingestion_t_real);
+    assert_eq!(up.publish_t_real, v1.publish_t_real);
+    assert_eq!(up.tile_id, 0);
+}
+
+#[test]
+fn scratch_load_tolerates_misalignment() {
+    let good = leaf_blob(1);
+    let mut backing = vec![0u8; good.len() + 8];
+    let base = backing.as_ptr() as usize;
+    let shift = (8 - base % 8) % 8 + 1;
+    backing[shift..shift + good.len()].copy_from_slice(&good);
+    let skewed = &backing[shift..shift + good.len()];
+    assert_ne!(skewed.as_ptr() as usize % 8, 0);
+    assert!(matches!(Blob::from_bytes(skewed), Err(DecodeError::Unaligned)));
+    let mut aligned = Scratch::new();
+    let mut work = Scratch::new();
+    let blob = aligned.load(skewed).unwrap();
+    let (meta, msgs): (Meta, Vec<InternalMessage<Leaf>>) = blob.decode(&mut work).unwrap();
+    assert_eq!(meta.slot, 1);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].data().slot, 0);
 }

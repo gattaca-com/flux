@@ -194,6 +194,10 @@ impl Blob {
     /// and `type_name`. Does not decompress. With trailing bytes (a disk file
     /// of concatenated blobs) returns the first blob; [`Blob::as_bytes`]
     /// gives its exact length.
+    ///
+    /// The slice must be 8-byte aligned: `flux-network` payloads already are,
+    /// while other read buffers (e.g. `DiskIo`) must go through
+    /// [`Scratch::load`], which copies into aligned storage first.
     pub fn from_bytes(bytes: &[u8]) -> Result<&Self, DecodeError> {
         if !(bytes.as_ptr() as usize).is_multiple_of(ALIGN) {
             return Err(DecodeError::Unaligned);
@@ -293,6 +297,10 @@ impl Blob {
 
     /// Decompress into `scratch`, decode the timestamps and leaves, and rebuild
     /// `InternalMessage`s with local tracking timestamps.
+    ///
+    /// Each timestamp is rebuilt from the live clock, so a `publish_t` that
+    /// crossed hosts carries sub-millisecond rebuild noise;
+    /// `ingestion_time().real()` and `tile_id` are exact.
     ///
     /// Errors when `type_hash` is not a version of `T`, when
     /// `metadata_type_hash` is not a version of `U`, or when any length or

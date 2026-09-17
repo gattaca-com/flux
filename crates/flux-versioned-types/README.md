@@ -92,7 +92,15 @@ enum Family {
 ```
 
 Every non-skipped variant must be a newtype with exactly one unnamed field;
-the same field type in two variants is an error (ambiguous `From`). The derive
+the same field type in two variants is an error (ambiguous `From`).
+
+The `zerocopy` cargo feature is unified across a workspace build: enabling
+it in one crate enables the derives for every `versioned_struct!` /
+`versioned_enum!` in the build. Chains that cannot satisfy padding-free
+`Copy` layouts (padding, `String`, ...) opt out with `#[wire_skip]` and keep
+the bincode codec only.
+
+The derive
 generates `HasVersionedLeaves` (matching `visit_leaf` down to the leaf,
 `decode_blob` trying each variant in order) plus `From<Field> for Enum` for
 each kept variant.
@@ -139,3 +147,36 @@ cache.flush(&meta, 3, |blob| {
     let (_, msgs) = blob.decode::<NewBidSubmission, Bid>(&mut scratch).unwrap();
 });
 ```
+
+### Receiving: alignment, families, and clocks
+
+`Blob::from_bytes` needs the slice 8-byte aligned. `flux-network`
+`TcpStream`/`NetworkDriver` payloads are 8-aligned, so blobs received there
+can be cast directly; `DiskIo` and other read buffers carry no such
+guarantee, so realign them through `Scratch::load` first (a misaligned
+`from_bytes` fails with `DecodeError::Unaligned`, while `load` copies and
+then decodes).
+
+`BlobCache::flush` emits one blob per non-empty leaf type, in stable
+(sorted) key order. Arrival order across types is not preserved (within one
+type it is), the `sink` may fire zero times when every buffer is empty, and
+the `&Blob` handed to `sink` borrows the cache's internal `Scratch`: it is
+valid only inside the callback, so copy `as_bytes` out if it must outlive
+the call.
+
+Receiving into a family mirrors the `family_blobs_decode_to_variants` test:
+for each incoming blob call `Family::decode_blob::<Meta>` and extend a
+single `Vec<InternalMessage<Family>>`, skipping blobs of unknown leaf types
+(`None`).
+
+`decode` rebuilds each `TrackingTimestamp` from the live clock, so a
+`publish_t` that crossed hosts carries sub-millisecond rebuild noise;
+`ingestion_time().real()` and `tile_id` are exact.
+
+Disk files are concatenated blobs with no resync marker: decoding walks
+blob to blob via `as_bytes().len()`, and a corrupt blob ends the walk.
+Writers should rotate files per slot so one bad blob cannot hide the rest.
+
+Leaf alignment must be at most 8, checked at compile time on `push`.
+`Scratch` is single-threaded: keep one per decoding thread, plus one for
+building if a thread also flushes.
