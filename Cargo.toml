@@ -36,6 +36,7 @@ version = "0.3.2"
 byte-stable = { path = "crates/byte-stable" }
 byte-stable-derive = { path = "crates/byte-stable-derive" }
 flux = { path = "crates/flux" }
+flux-clickhouse = { path = "crates/flux-clickhouse" }
 flux-communication = { path = "crates/flux-communication" }
 flux-disk = { path = "crates/flux-disk" }
 flux-network = { path = "crates/flux-network" }

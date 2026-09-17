@@ -6,8 +6,10 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use flux_clickhouse::ClickHouse;
 use flux_network::{
     Token,
+    http::{HttpEvent, HttpNetwork},
     tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork},
 };
 use flux_postgres::{Error, Output, Postgres, QueryId, copybinary};
@@ -229,10 +231,15 @@ fn tick(
     }
 }
 
-fn setup() -> (TcpNetwork, TcpGroup, std::net::SocketAddr) {
+fn free_addr() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
+    addr
+}
+
+fn setup() -> (TcpNetwork, TcpGroup, std::net::SocketAddr) {
+    let addr = free_addr();
     let mut net = TcpNetwork::default();
     let group = net.add_group(TcpGroupConfig {
         name: "fake-pg",
@@ -514,4 +521,90 @@ fn scram_login_then_disconnect_recovers() {
     assert_eq!(result.as_ref().unwrap_err(), &Error::Disconnected);
     let (_, result) = outcome_of(&outcomes, second.unwrap());
     assert_eq!(result.as_ref().unwrap().tag, "SELECT 1");
+}
+
+/// The acceptance case for the shared core: one poll loop carries a
+/// `Postgres` client and a `ClickHouse` client, and both report their own
+/// outcome.
+#[test]
+fn one_poll_serves_postgres_and_clickhouse() {
+    let (mut net, server_group, pg_addr) = setup();
+    let http_addr = free_addr();
+    let mut http = HttpNetwork::default();
+    http.listen(&mut net, http_addr).unwrap();
+    let ch = ClickHouse::new(&mut http, &mut net, http_addr, 1).with_database("telemetry");
+    let mut pg = Postgres::new(pg_addr).with_database("telemetry");
+    pg.connect(&mut net);
+
+    let rows = [Row { a: 7, b: "shared".to_owned(), c: Some(1), d: true, e: 2.5 }];
+    let copy = pg.copy_rows("fills", &rows).unwrap();
+    let insert = ch.insert_rows(&mut http, "fills", &rows).unwrap();
+
+    let mut server = FakeServer::paced(usize::MAX);
+    let mut pg_outcome = None;
+    let mut ch_outcome = None;
+    let mut copied = Vec::new();
+    let mut inserted = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && (pg_outcome.is_none() || ch_outcome.is_none()) {
+        net.poll_with(|event| {
+            if http.on_event(&event) || pg.on_event(&event) {
+                return;
+            }
+            match event {
+                TcpEvent::Accepted { group, token, .. } if group == server_group => {
+                    server.conns.push(ServerConn {
+                        token,
+                        input: Vec::new(),
+                        started: false,
+                        outbox: VecDeque::new(),
+                    });
+                }
+                TcpEvent::Message { group, token, payload, .. } if group == server_group => {
+                    for msg in server.push(token, payload) {
+                        match msg {
+                            ClientMsg::Startup(_) => server.reply(token, &hello()),
+                            ClientMsg::Query(_) => server.reply(token, &copy_in()),
+                            ClientMsg::CopyData(data) => copied.extend_from_slice(&data),
+                            ClientMsg::CopyDone => {
+                                let mut reply = complete("COPY 1");
+                                reply.extend_from_slice(&ready());
+                                server.reply(token, &reply);
+                            }
+                            ClientMsg::Password(_) => panic!("no password expected"),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+
+        let mut requests = Vec::new();
+        http.drive(&mut net, |event| {
+            if let Some((id, result)) = ch.outcome(&event) {
+                assert_eq!(id, insert);
+                ch_outcome = Some(result.map(<[u8]>::to_vec).map_err(|_| ()));
+            } else if let HttpEvent::Request { token, request } = event {
+                inserted.push(request.body.to_vec());
+                requests.push(token);
+            }
+        });
+        for token in requests {
+            http.respond(&mut net, token, 200, &[], b"");
+        }
+        pg.drive(&mut net, |id, result| {
+            assert_eq!(id, copy);
+            pg_outcome = Some(result.map(|output| output.tag).map_err(|_| ()));
+        });
+        for (token, bytes) in server.drain() {
+            net.send_with(token, |buf| buf.extend_from_slice(&bytes));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(pg_outcome, Some(Ok("COPY 1".to_owned())));
+    assert_eq!(ch_outcome, Some(Ok(Vec::new())));
+    assert_eq!(copied, binary_batch(&rows));
+    assert_eq!(inserted.len(), 1);
+    assert!(!inserted[0].is_empty());
 }

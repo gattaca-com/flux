@@ -16,5 +16,8 @@ serde.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+flux-clickhouse.workspace = true
+
 [lints]
 workspace = true

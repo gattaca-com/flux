@@ -1475,6 +1475,7 @@ name = "flux-postgres"
 version = "0.3.2"
 dependencies = [
  "base64",
+ "flux-clickhouse",
  "flux-network",
  "hmac",
  "rand 0.9.2",
