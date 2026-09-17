@@ -97,6 +97,7 @@ struct GatherTestSpine {
 
 // The user's gather tile: owns when to flush and where each blob goes.
 struct Gatherer {
+    ready: Arc<AtomicBool>,
     cache: BlobCache,
     shipper: BlobShipper,
     writer: BlobWriter,
@@ -134,6 +135,7 @@ impl Tile<GatherTestSpine> for Gatherer {
         if self.shipper.drive() | self.writer.poll() {
             adapter.mark_work();
         }
+        self.ready.store(true, Ordering::Relaxed);
     }
 
     fn teardown(mut self, adapter: &mut SpineAdapter<GatherTestSpine>) {
@@ -274,7 +276,8 @@ fn spawn_receiver(
 
 struct ProducerTile {
     next_slot: u64,
-    grace_until: Option<Instant>,
+    ready: Arc<AtomicBool>,
+    waited_since: Instant,
     partial_at: Option<Instant>,
     seen: Arc<Mutex<Vec<Seen>>>,
     done: Arc<AtomicBool>,
@@ -296,16 +299,14 @@ impl ProducerTile {
 
 impl Tile<GatherTestSpine> for ProducerTile {
     fn loop_body(&mut self, adapter: &mut SpineAdapter<GatherTestSpine>) {
-        if let Some(until) = self.grace_until {
-            if Instant::now() < until {
+        if !self.ready.load(Ordering::Relaxed) {
+            // Consumer cursors fix at first read, so the gather tile must run
+            // its first pass before anything is produced, else the first batch
+            // is silently skipped. Produce anyway after 5 s so a dead gatherer
+            // fails the test instead of hanging it.
+            if self.waited_since.elapsed() < StdDuration::from_secs(5) {
                 return;
             }
-        } else {
-            // Broadcast consumers start at the head on first read, so the
-            // gather tile must run its first (empty) pass before anything is
-            // produced, else the first batch is silently skipped.
-            self.grace_until = Some(Instant::now() + StdDuration::from_millis(500));
-            return;
         }
         if self.partial_at.is_none() {
             if self.next_slot <= N_SLOTS {
@@ -371,6 +372,7 @@ fn gather_end_to_end_sender_to_receiver() {
     let receiver_done = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + DEADLINE;
+    let ready = Arc::new(AtomicBool::new(false));
 
     let receiver = spawn_receiver(
         recv_base.path().to_path_buf(),
@@ -391,7 +393,8 @@ fn gather_end_to_end_sender_to_receiver() {
         attach_tile(
             ProducerTile {
                 next_slot: 1,
-                grace_until: None,
+                ready: ready.clone(),
+                waited_since: Instant::now(),
                 partial_at: None,
                 seen: seen.clone(),
                 done,
@@ -403,6 +406,7 @@ fn gather_end_to_end_sender_to_receiver() {
         );
         attach_tile(
             Gatherer {
+                ready: ready.clone(),
                 cache: BlobCache::new(),
                 shipper: BlobShipper::new(vec![addr]),
                 writer: BlobWriter::new(),
