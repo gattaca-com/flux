@@ -209,12 +209,6 @@ fn background() -> TileConfig {
     TileConfig::background(None, Some(Duration::from_millis(1)))
 }
 
-/// For tiles with no spine producer to wake them: they poll sockets, disk, or
-/// clocks, so they must not park.
-fn background_no_park() -> TileConfig {
-    background().without_park()
-}
-
 struct StopTile {
     stop: Arc<AtomicBool>,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -250,7 +244,7 @@ fn spawn_receiver(
     std::thread::spawn(move || {
         let spine = RecvSpine::new_with_base_dir(&base, None);
         spine.start(None, None, |scoped| {
-            attach_tile(BlobReceiver::new(addr), scoped, background_no_park());
+            attach_tile(BlobReceiver::new(addr), scoped, background());
             attach_tile(
                 BlobRouter::new(RecordingSink {
                     writer: BlobWriter::new(),
@@ -264,7 +258,7 @@ fn spawn_receiver(
             attach_tile(
                 StopTile { stop, seen, want_blobs, receiver_done, deadline },
                 scoped,
-                background_no_park(),
+                background(),
             );
         });
         cleanup_shmem(&base);
@@ -398,7 +392,7 @@ fn gather_end_to_end_sender_to_receiver() {
                 deadline,
             },
             &mut scoped,
-            background_no_park(),
+            background(),
         );
         attach_tile(
             Gatherer {
@@ -409,7 +403,7 @@ fn gather_end_to_end_sender_to_receiver() {
                 last_slot: 0,
             },
             &mut scoped,
-            background_no_park(),
+            background(),
         );
     });
     receiver.join().expect("receiver thread");

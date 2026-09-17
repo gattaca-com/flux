@@ -32,7 +32,7 @@ impl TileConfig {
             thread_niceness,
             min_loop_duration: None,
             metrics: true,
-            park: true,
+            park: false,
         }
     }
 
@@ -44,7 +44,7 @@ impl TileConfig {
 
     /// Background config pinned to a set of cores. Empty pins nowhere.
     pub fn background_on_cores(cores: Vec<usize>, min_loop_duration: Option<Duration>) -> Self {
-        Self { cores, thread_niceness: None, min_loop_duration, metrics: true, park: true }
+        Self { cores, thread_niceness: None, min_loop_duration, metrics: true, park: false }
     }
 
     /// Cores the tile is pinned to on startup. Empty means unpinned.
@@ -57,12 +57,13 @@ impl TileConfig {
         self
     }
 
-    /// Opt out of futex parking for tiles whose only input is external I/O the
-    /// spine cannot signal (e.g. a TCP listener polled with `mio`, an
-    /// `io_uring` completion ring): such a tile parks after one idle pass and
-    /// never wakes, so it must pace itself with `min_loop_duration` instead.
-    pub fn without_park(mut self) -> Self {
-        self.park = false;
+    /// Opt in to futex parking under the `park` feature. A parked tile wakes
+    /// only when a spine producer signals, so this suits tiles fed exclusively
+    /// by queues. Tiles that poll sockets or an `io_uring` ring, or that pace
+    /// themselves with `min_loop_duration`, must stay unparked: nothing on the
+    /// spine would ever wake them.
+    pub fn with_park(mut self) -> Self {
+        self.park = true;
         self
     }
 }

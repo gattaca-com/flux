@@ -14,11 +14,9 @@
 //! `BlobReceiver`, and hand `(&YourMeta, &Blob)` to your `BlobSink` through
 //! `BlobRouter::<YourMeta, _>::new(sink)`; `BlobReader` reads files back.
 //! See `tests/e2e.rs` for the complete example.
-//!
-//! Under the `park` feature, tiles that only poll sockets or disk must be
-//! attached with `TileConfig::without_park()`: with nothing to consume they
-//! would park after one idle pass and never wake.
-
+//! Tiles do not park by default. Do not opt `BlobReceiver` or a tile that
+//! drives `BlobShipper`/`BlobWriter` into parking: nothing on the spine wakes
+//! a tile that waits on a socket or a disk ring.
 pub mod queues;
 pub mod reader;
 pub mod receiver;
