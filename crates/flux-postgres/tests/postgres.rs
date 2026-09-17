@@ -10,7 +10,7 @@ use flux_network::{
     Token,
     tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork},
 };
-use flux_postgres::{Error, Output, Postgres, QueryId, copybinary};
+use flux_postgres::{Bytea, Error, Output, Postgres, QueryId, copybinary, insert};
 use hmac::{Hmac, Mac};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -197,7 +197,7 @@ fn tick(
 ) {
     let mut drop = Vec::new();
     net.poll_with(|event| {
-        if pg.on_event(&event, |id, result| outcomes.push((id, result))) {
+        if pg.on_event(&event) {
             return;
         }
         match event {
@@ -220,7 +220,7 @@ fn tick(
             _ => {}
         }
     });
-    pg.flush(net);
+    pg.drive(net, |id, result| outcomes.push((id, result)));
     for (token, bytes) in server.drain() {
         net.send_with(token, |buf| buf.extend_from_slice(&bytes));
     }
@@ -245,9 +245,9 @@ fn setup() -> (TcpNetwork, TcpGroup, std::net::SocketAddr) {
 
 fn outcome_of(
     outcomes: &[(QueryId, Result<Output, Error>)],
-    id: Option<QueryId>,
+    id: QueryId,
 ) -> &(QueryId, Result<Output, Error>) {
-    outcomes.iter().find(|(i, _)| Some(*i) == id).unwrap()
+    outcomes.iter().find(|(i, _)| *i == id).unwrap()
 }
 
 #[derive(Serialize)]
@@ -288,15 +288,23 @@ fn query_copy_and_error_byte_at_a_time() {
     let mut seen = Vec::new();
     let mut copied = Vec::new();
 
-    let row = Row { a: 1, b: "x".to_owned(), c: Some(2), d: false, e: 0.5 };
-    let sql = copybinary::copy_statement("t", &row).unwrap();
+    let rows = [Row { a: 1, b: "x".to_owned(), c: Some(2), d: false, e: 0.5 }, Row {
+        a: 1,
+        b: "x".to_owned(),
+        c: Some(2),
+        d: false,
+        e: 0.5,
+    }];
     let mut body = Vec::new();
     copybinary::header(&mut body);
-    copybinary::encode(&mut body, &row).unwrap();
-    copybinary::encode(&mut body, &row).unwrap();
+    for row in &rows {
+        copybinary::encode(&mut body, row).unwrap();
+    }
     copybinary::trailer(&mut body);
 
-    let (mut one, mut copy, mut bad) = (None, None, None);
+    let one = pg.query("SELECT 1");
+    let copy = pg.copy_rows("t", &rows).unwrap();
+    let bad = pg.query("SELEC");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.len() < 3 {
         tick(
@@ -344,15 +352,6 @@ fn query_copy_and_error_byte_at_a_time() {
                 false
             },
         );
-        if one.is_none() {
-            one = pg.query(&mut net, "SELECT 1");
-        }
-        if copy.is_none() {
-            copy = pg.copy(&mut net, &sql, &body);
-        }
-        if bad.is_none() {
-            bad = pg.query(&mut net, "SELEC");
-        }
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(outcomes.len(), 3);
@@ -391,7 +390,7 @@ fn password_flow(auth_reply: &[u8], expected_password: &[u8]) {
     let mut server = FakeServer::paced(usize::MAX);
     let mut outcomes = Vec::new();
     let mut seen = Vec::new();
-    let mut query = None;
+    let query = pg.query("SELECT 1");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.is_empty() {
         tick(
@@ -420,9 +419,6 @@ fn password_flow(auth_reply: &[u8], expected_password: &[u8]) {
                 false
             },
         );
-        if query.is_none() {
-            query = pg.query(&mut net, "SELECT 1");
-        }
         thread::sleep(Duration::from_millis(1));
     }
     let (_, result) = outcome_of(&outcomes, query);
@@ -483,7 +479,7 @@ fn scram_password() {
     let mut seen = Vec::new();
     let salt = b"fixed-salt-16byte";
     let mut transcript = Vec::new();
-    let mut query = None;
+    let query = pg.query("SELECT 1");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.is_empty() {
         tick(
@@ -533,9 +529,6 @@ fn scram_password() {
                 false
             },
         );
-        if query.is_none() {
-            query = pg.query(&mut net, "SELECT 1");
-        }
         thread::sleep(Duration::from_millis(1));
     }
     let (_, result) = outcome_of(&outcomes, query);
@@ -549,7 +542,7 @@ fn disconnect_mid_query_reports_and_recovers() {
     let mut server = FakeServer::paced(usize::MAX);
     let mut outcomes = Vec::new();
     let mut seen = Vec::new();
-    let mut first = None;
+    let first = pg.query("SELECT 1");
     let mut dropped = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.is_empty() {
@@ -574,9 +567,6 @@ fn disconnect_mid_query_reports_and_recovers() {
                 msg => panic!("unexpected {msg:?}"),
             },
         );
-        if first.is_none() {
-            first = pg.query(&mut net, "SELECT 1");
-        }
         thread::sleep(Duration::from_millis(1));
     }
     let (_, result) = outcome_of(&outcomes, first);
@@ -590,7 +580,7 @@ fn oversized_reply_reports_too_large() {
     let mut server = FakeServer::paced(usize::MAX);
     let mut outcomes = Vec::new();
     let mut seen = Vec::new();
-    let mut query = None;
+    let query = pg.query("SELECT 1");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.is_empty() {
         tick(
@@ -619,9 +609,6 @@ fn oversized_reply_reports_too_large() {
                 false
             },
         );
-        if query.is_none() {
-            query = pg.query(&mut net, "SELECT 1");
-        }
         thread::sleep(Duration::from_millis(1));
     }
     let (_, result) = outcome_of(&outcomes, query);
@@ -635,6 +622,7 @@ fn unsupported_auth_stays_silent() {
     let mut server = FakeServer::paced(usize::MAX);
     let mut outcomes = Vec::new();
     let mut seen = Vec::new();
+    let _query = pg.query("SELECT 1");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && !seen.iter().any(|msg| matches!(msg, ClientMsg::Startup(_)))
     {
@@ -653,7 +641,6 @@ fn unsupported_auth_stays_silent() {
                 false
             },
         );
-        pg.query(&mut net, "SELECT 1");
         thread::sleep(Duration::from_millis(1));
     }
     assert!(seen.iter().any(|msg| matches!(msg, ClientMsg::Startup(_))));
@@ -676,5 +663,184 @@ fn unsupported_auth_stays_silent() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(outcomes.is_empty());
-    assert!(pg.query(&mut net, "SELECT 1").is_none());
+}
+
+#[test]
+fn insert_builds_escaped_upsert() {
+    #[derive(Serialize)]
+    struct Evil {
+        blob: Vec<u8>,
+    }
+    #[derive(Serialize, Clone, Copy)]
+    struct RowNasty<'a> {
+        id: i32,
+        name: &'a str,
+        uni: &'a str,
+        maybe: Option<&'a str>,
+        some: Option<i64>,
+        flag: bool,
+        ratio: f64,
+        nan: f64,
+        inf: f32,
+        big: u128,
+        blob: Bytea<'a>,
+        neg: i64,
+    }
+    assert!(insert::rows("t", &[Evil { blob: vec![1] }], insert::OnConflict::DoNothing).is_err());
+
+    let row = RowNasty {
+        id: 42,
+        name: "O'Brien\\tab\there\nnew\rline",
+        uni: "héllo",
+        maybe: None,
+        some: Some(-7),
+        flag: true,
+        ratio: 1.5,
+        nan: f64::NAN,
+        inf: f32::INFINITY,
+        big: 1 << 100,
+        blob: Bytea(&[0xde, 0xad]),
+        neg: -1,
+    };
+    assert_eq!(
+        insert::rows("t", &[row], insert::OnConflict::DoNothing).unwrap(),
+        r"INSERT INTO t (id, name, uni, maybe, some, flag, ratio, nan, inf, big, blob, neg) VALUES (42,E'O''Brien\\tab\there\nnew\rline',E'héllo',NULL,-7,TRUE,1.5,E'NaN',E'Infinity',1267650600228229401496703205376,E'\\xdead',-1) ON CONFLICT DO NOTHING"
+    );
+    assert!(insert::rows("t", &[row], insert::OnConflict::None).unwrap().ends_with(')'));
+    assert!(insert::rows::<RowNasty>("t", &[], insert::OnConflict::DoNothing).is_err());
+    let nul = RowNasty { name: "a\0b", ..row };
+    assert!(insert::rows("t", &[nul], insert::OnConflict::DoNothing).is_err());
+}
+
+#[test]
+fn copy_cut_off_is_resent() {
+    let (mut net, server_group, addr) = setup();
+    let mut pg = Postgres::new(addr);
+    let mut server = FakeServer::paced(usize::MAX);
+    let mut outcomes = Vec::new();
+    let mut seen = Vec::new();
+    let mut copied = Vec::new();
+    let mut drops = 0;
+    let copy = pg.copy("COPY t (a) FROM STDIN (FORMAT BINARY)", vec![1, 2, 3]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && outcomes.is_empty() {
+        tick(
+            &mut net,
+            &mut pg,
+            server_group,
+            &mut server,
+            &mut outcomes,
+            &mut seen,
+            |server, token, msg| match msg {
+                ClientMsg::Startup(_) => {
+                    let mut reply = auth(0, &[]);
+                    reply.extend_from_slice(&ready());
+                    server.reply(token, &reply);
+                    false
+                }
+                ClientMsg::Query(_) if drops == 0 => {
+                    drops += 1;
+                    true
+                }
+                ClientMsg::Query(_) => {
+                    server.reply(token, &copy_in());
+                    false
+                }
+                ClientMsg::CopyData(data) => {
+                    copied.extend_from_slice(&data);
+                    false
+                }
+                ClientMsg::CopyDone => {
+                    let mut reply = complete("COPY 1");
+                    reply.extend_from_slice(&ready());
+                    server.reply(token, &reply);
+                    false
+                }
+                ClientMsg::Password(_) => panic!("unexpected password"),
+            },
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (_, result) = outcome_of(&outcomes, copy);
+    assert_eq!(result.as_ref().unwrap().tag, "COPY 1");
+    assert_eq!(copied, vec![1, 2, 3]);
+    assert_eq!(seen.iter().filter(|msg| matches!(msg, ClientMsg::Query(_))).count(), 2);
+}
+
+#[test]
+fn full_queue_evicts_oldest_as_dropped() {
+    let (mut net, server_group, addr) = setup();
+    let mut pg = Postgres::new(addr).with_max_queued_bytes(10);
+    let mut server = FakeServer::paced(usize::MAX);
+    let mut outcomes = Vec::new();
+    let mut seen = Vec::new();
+    let first = pg.query("SELECT 1");
+    pg.query("SELECT 2");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && outcomes.is_empty() {
+        tick(
+            &mut net,
+            &mut pg,
+            server_group,
+            &mut server,
+            &mut outcomes,
+            &mut seen,
+            |server, token, msg| {
+                match msg {
+                    ClientMsg::Startup(_) => {
+                        let mut reply = auth(0, &[]);
+                        reply.extend_from_slice(&ready());
+                        server.reply(token, &reply);
+                    }
+                    ClientMsg::Query(_) => {}
+                    msg => panic!("unexpected {msg:?}"),
+                }
+                false
+            },
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(outcomes, vec![(first, Err(Error::Dropped))]);
+}
+
+#[test]
+fn insert_do_nothing_survives_drop() {
+    #[derive(Serialize)]
+    struct Fill {
+        slot: i64,
+    }
+    let (mut net, server_group, addr) = setup();
+    let mut pg = Postgres::new(addr);
+    let mut server = FakeServer::paced(usize::MAX);
+    let mut outcomes = Vec::new();
+    let mut seen = Vec::new();
+    let mut drops = 0;
+    pg.insert_rows("t", &[Fill { slot: 1 }], insert::OnConflict::DoNothing).unwrap();
+    for _ in 0..30 {
+        tick(
+            &mut net,
+            &mut pg,
+            server_group,
+            &mut server,
+            &mut outcomes,
+            &mut seen,
+            |server, token, msg| match msg {
+                ClientMsg::Startup(_) => {
+                    let mut reply = auth(0, &[]);
+                    reply.extend_from_slice(&ready());
+                    server.reply(token, &reply);
+                    false
+                }
+                ClientMsg::Query(_) if drops == 0 => {
+                    drops += 1;
+                    true
+                }
+                msg => panic!("unexpected {msg:?}"),
+            },
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(drops, 1);
+    assert!(outcomes.is_empty());
+    assert_eq!(seen.iter().filter(|msg| matches!(msg, ClientMsg::Query(_))).count(), 1);
 }

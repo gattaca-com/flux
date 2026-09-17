@@ -1,14 +1,20 @@
-//! `COPY ... (FORMAT BINARY)` encoding of `serde::Serialize` rows.
+//! Multi-row `INSERT` statements for `serde::Serialize` rows.
 //!
-//! [`encode`] appends one tuple to a body framed by [`header`] and
-//! [`trailer`]; [`copy_statement`] names the columns after the row's fields.
-//! Integers are big-endian and widen to the smallest holding Postgres type
-//! (`u128`/`i128` to `numeric`); enums, `char`, maps, and sequences are
-//! rejected; wrap byte strings in [`crate::Bytea`].
+//! [`rows`] builds one `INSERT INTO ... VALUES ...` statement naming the
+//! columns after the row's fields. Values render as text literals; strings
+//! and bytes are escaped, `Option` is `NULL` or the bare value. Enums,
+//! `char`, maps, and sequences are rejected; wrap byte strings in
+//! [`crate::Bytea`].
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use serde::{Serialize, ser};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnConflict {
+    None,
+    DoNothing,
+}
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -28,86 +34,83 @@ impl ser::Error for Error {
 }
 
 fn unsupported(what: &str) -> Error {
-    Error(format!("{what} has no COPY BINARY encoding"))
+    Error(format!("{what} has no INSERT encoding"))
 }
 
-pub fn header(out: &mut Vec<u8>) {
-    out.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
-    out.extend_from_slice(&0u32.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
-}
-
-pub fn trailer(out: &mut Vec<u8>) {
-    out.extend_from_slice(&(-1i16).to_be_bytes());
-}
-
-pub fn encode<T: Serialize + ?Sized>(out: &mut Vec<u8>, row: &T) -> Result<(), Error> {
-    let pos = out.len();
-    out.extend_from_slice(&[0, 0]);
-    let mut encoder = Encoder { out, columns: None, depth: 0, fields: 0 };
-    row.serialize(&mut encoder)?;
-    let count =
-        i16::try_from(encoder.fields).map_err(|_| Error("row has too many fields".to_owned()))?;
-    encoder.out[pos..pos + 2].copy_from_slice(&count.to_be_bytes());
-    Ok(())
-}
-
-pub fn copy_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<String, Error> {
-    let mut scratch = Vec::new();
-    let mut encoder = Encoder { out: &mut scratch, columns: Some(Vec::new()), depth: 0, fields: 0 };
-    row.serialize(&mut encoder)?;
-    let columns = encoder.columns.take().unwrap_or_default();
-    if columns.is_empty() {
-        return Err(unsupported("a row that is not a struct"))
+pub fn rows<T: Serialize>(
+    table: &str,
+    rows: &[T],
+    on_conflict: OnConflict,
+) -> Result<String, Error> {
+    let first = rows.first().ok_or_else(|| ser::Error::custom("empty batch"))?;
+    let mut scratch = String::new();
+    let mut probe = Encoder {
+        out: &mut scratch,
+        columns: Some(Vec::new()),
+        named: false,
+        depth: 0,
+        first: true,
+    };
+    first.serialize(&mut probe)?;
+    let (named, columns) = (probe.named, probe.columns.take().unwrap_or_default());
+    if named && columns.is_empty() {
+        return Err(unsupported("a row without columns"));
     }
-    Ok(format!("COPY {table} ({}) FROM STDIN (FORMAT BINARY)", columns.join(", ")))
+    let mut out = format!("INSERT INTO {table} ");
+    if named {
+        write!(out, "({}) ", columns.join(", ")).unwrap();
+    }
+    out.push_str("VALUES ");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('(');
+        let mut encoder =
+            Encoder { out: &mut out, columns: None, named: false, depth: 0, first: true };
+        row.serialize(&mut encoder)?;
+        out.push(')');
+    }
+    match on_conflict {
+        OnConflict::None => {}
+        OnConflict::DoNothing => out.push_str(" ON CONFLICT DO NOTHING"),
+    }
+    Ok(out)
 }
 
 struct Encoder<'a> {
-    out: &'a mut Vec<u8>,
+    out: &'a mut String,
     columns: Option<Vec<&'static str>>,
+    named: bool,
     depth: usize,
-    fields: usize,
+    first: bool,
 }
 
 impl Encoder<'_> {
-    fn top_level(&mut self, len: usize) {
-        if self.depth == 0 {
-            self.fields = len;
+    fn value(&mut self) {
+        if !self.first {
+            self.out.push(',');
         }
+        self.first = false;
     }
-    fn single(&mut self) {
-        self.top_level(1);
-    }
-    fn sized(&mut self, len: usize, bytes: &[u8]) {
-        self.out.extend_from_slice(&(len as u32).to_be_bytes());
-        self.out.extend_from_slice(bytes);
-    }
-    fn numeric(&mut self, negative: bool, mut abs: u128) {
-        let mut digits = [0u16; 10];
-        let mut len = 0;
-        while abs > 0 {
-            digits[len] = (abs % 10000) as u16;
-            abs /= 10000;
-            len += 1;
+
+    fn text(&mut self, value: &str) -> Result<(), Error> {
+        if value.contains('\0') {
+            return Err(Error("string contains NUL".to_owned()));
         }
-        if len == 0 {
-            len = 1;
+        self.out.push_str("E'");
+        for c in value.chars() {
+            match c {
+                '\'' => self.out.push_str("''"),
+                '\\' => self.out.push_str("\\\\"),
+                '\n' => self.out.push_str("\\n"),
+                '\r' => self.out.push_str("\\r"),
+                '\t' => self.out.push_str("\\t"),
+                _ => self.out.push(c),
+            }
         }
-        let weight = len - 1;
-        let mut start = 0;
-        while len - start > 1 && digits[start] == 0 {
-            start += 1;
-        }
-        let kept = len - start;
-        self.out.extend_from_slice(&((8 + 2 * kept) as u32).to_be_bytes());
-        self.out.extend_from_slice(&(kept as u16).to_be_bytes());
-        self.out.extend_from_slice(&(weight as u16).to_be_bytes());
-        self.out.extend_from_slice(&(if negative { 0x4000u16 } else { 0 }).to_be_bytes());
-        self.out.extend_from_slice(&0u16.to_be_bytes());
-        for digit in digits[start..len].iter().rev() {
-            self.out.extend_from_slice(&digit.to_be_bytes());
-        }
+        self.out.push('\'');
+        Ok(())
     }
 }
 
@@ -123,92 +126,92 @@ impl ser::Serializer for &mut Encoder<'_> {
     type SerializeStructVariant = ser::Impossible<(), Error>;
 
     fn is_human_readable(&self) -> bool {
-        false
+        true
     }
     fn serialize_i8(self, v: i8) -> Result<(), Error> {
-        self.single();
-        self.sized(2, &(v as i16).to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_i16(self, v: i16) -> Result<(), Error> {
-        self.single();
-        self.sized(2, &v.to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_i32(self, v: i32) -> Result<(), Error> {
-        self.single();
-        self.sized(4, &v.to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_i64(self, v: i64) -> Result<(), Error> {
-        self.single();
-        self.sized(8, &v.to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_i128(self, v: i128) -> Result<(), Error> {
-        self.single();
-        self.numeric(v < 0, v.unsigned_abs());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_u8(self, v: u8) -> Result<(), Error> {
-        self.single();
-        self.sized(2, &(v as i16).to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_u16(self, v: u16) -> Result<(), Error> {
-        self.single();
-        self.sized(4, &(v as i32).to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_u32(self, v: u32) -> Result<(), Error> {
-        self.single();
-        self.sized(8, &(v as i64).to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_u64(self, v: u64) -> Result<(), Error> {
-        if v > i64::MAX as u64 {
-            return Err(Error(format!("u64 value {v} exceeds bigint")))
-        }
-        self.single();
-        self.sized(8, &(v as i64).to_be_bytes());
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_u128(self, v: u128) -> Result<(), Error> {
-        self.single();
-        self.numeric(false, v);
+        write!(self.out, "{v}").unwrap();
         Ok(())
     }
     fn serialize_f32(self, v: f32) -> Result<(), Error> {
-        self.single();
-        self.sized(4, &v.to_be_bytes());
+        if v.is_finite() {
+            write!(self.out, "{v}").unwrap();
+        } else if v.is_nan() {
+            self.out.push_str("E'NaN'");
+        } else if v > 0.0 {
+            self.out.push_str("E'Infinity'");
+        } else {
+            self.out.push_str("E'-Infinity'");
+        }
         Ok(())
     }
     fn serialize_f64(self, v: f64) -> Result<(), Error> {
-        self.single();
-        self.sized(8, &v.to_be_bytes());
+        if v.is_finite() {
+            write!(self.out, "{v}").unwrap();
+        } else if v.is_nan() {
+            self.out.push_str("E'NaN'");
+        } else if v > 0.0 {
+            self.out.push_str("E'Infinity'");
+        } else {
+            self.out.push_str("E'-Infinity'");
+        }
         Ok(())
     }
     fn serialize_bool(self, v: bool) -> Result<(), Error> {
-        self.single();
-        self.sized(1, &[u8::from(v)]);
+        self.out.push_str(if v { "TRUE" } else { "FALSE" });
         Ok(())
     }
     fn serialize_char(self, _: char) -> Result<(), Error> {
         Err(unsupported("char"))
     }
     fn serialize_str(self, v: &str) -> Result<(), Error> {
-        self.single();
-        self.sized(v.len(), v.as_bytes());
-        Ok(())
+        self.text(v)
     }
     fn serialize_bytes(self, v: &[u8]) -> Result<(), Error> {
-        self.single();
-        self.sized(v.len(), v);
+        self.out.push_str("E'\\\\x");
+        for byte in v {
+            write!(self.out, "{byte:02x}").unwrap();
+        }
+        self.out.push('\'');
         Ok(())
     }
     fn serialize_none(self) -> Result<(), Error> {
-        self.single();
-        self.out.extend_from_slice(&(-1i32).to_be_bytes());
+        self.out.push_str("NULL");
         Ok(())
     }
     fn serialize_some<T: Serialize + ?Sized>(self, v: &T) -> Result<(), Error> {
@@ -242,12 +245,12 @@ impl ser::Serializer for &mut Encoder<'_> {
     fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Error> {
         Err(unsupported("a sequence"))
     }
-    fn serialize_tuple(self, len: usize) -> Result<Self, Error> {
-        self.top_level(len);
+    fn serialize_tuple(self, _: usize) -> Result<Self, Error> {
+        self.first = true;
         Ok(self)
     }
-    fn serialize_tuple_struct(self, _: &'static str, len: usize) -> Result<Self, Error> {
-        self.top_level(len);
+    fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
+        self.first = true;
         Ok(self)
     }
     fn serialize_tuple_variant(
@@ -262,8 +265,11 @@ impl ser::Serializer for &mut Encoder<'_> {
     fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Error> {
         Err(unsupported("a map"))
     }
-    fn serialize_struct(self, _: &'static str, len: usize) -> Result<Self, Error> {
-        self.top_level(len);
+    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
+        if self.depth == 0 {
+            self.named = true;
+        }
+        self.first = true;
         self.depth += 1;
         Ok(self)
     }
@@ -284,6 +290,7 @@ macro_rules! elements {
             type Ok = ();
             type Error = Error;
             fn $method<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Error> {
+                self.value();
                 v.serialize(&mut **self)
             }
             fn end(self) -> Result<(), Error> {
@@ -308,6 +315,7 @@ impl ser::SerializeStruct for &mut Encoder<'_> {
         {
             columns.push(key);
         }
+        self.value();
         v.serialize(&mut **self)
     }
     fn end(self) -> Result<(), Error> {

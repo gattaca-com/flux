@@ -1,18 +1,21 @@
 //! Poll-driven `Postgres` client over a caller-owned [`TcpNetwork`].
 //!
-//! `query` and `copy` take an idle pooled connection and return a
-//! [`QueryId`], or `None` when none is idle: nothing is queued, retry after
-//! the next poll. Call [`Postgres::on_event`] from the network's `poll_with`
-//! handler and [`Postgres::flush`] after polling.
+//! Requests queue inside the client: [`Postgres::query`], [`Postgres::copy`],
+//! and [`Postgres::copy_rows`] return a [`QueryId`] at once;
+//! [`Postgres::on_event`], called from the network's `poll_with` handler,
+//! tracks the pooled connections; [`Postgres::drive`] sends queued requests
+//! on idle ones and delivers one outcome per id. Copies cut off by a lost
+//! connection are resent. The queue is bounded by bytes and evicts the
+//! oldest requests as [`Error::Dropped`].
 //!
 //! Authentication covers trust, cleartext, MD5, and SCRAM-SHA-256; anything
-//! else fails the connection without an outcome. A connection lost
-//! mid-request reports [`Error::Disconnected`] and reconnects on its own.
+//! else fails the connection without an outcome.
 
 pub mod copybinary;
+pub mod insert;
 mod scram;
 
-use std::net::SocketAddr;
+use std::{collections::VecDeque, net::SocketAddr};
 
 use flux_network::{
     Token,
@@ -20,6 +23,7 @@ use flux_network::{
 };
 use md5::Digest as _;
 use rand::Rng as _;
+use serde::{Serialize, ser::Error as _};
 use tracing::warn;
 
 const PROTOCOL_VERSION: i32 = 196_608;
@@ -27,9 +31,22 @@ const SCRAM_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 const NONCE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const SEND_CHUNK_BYTES: usize = 8 << 20;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 << 20;
+const DEFAULT_MAX_QUEUED_BYTES: usize = 256 << 20;
+const RETRIES: u8 = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueryId(u64);
+
+/// Byte string for `bytea` columns; plain `&[u8]` and `Vec<u8>` serialize
+/// as sequences, which the encoders reject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bytea<'a>(pub &'a [u8]);
+
+impl serde::Serialize for Bytea<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Column {
@@ -55,11 +72,26 @@ pub enum Error {
     UnsupportedAuth(String),
     /// The server's reply exceeded `max_output_bytes`.
     TooLarge,
+    /// Evicted from a full queue before being sent.
+    Dropped,
     /// A message arrived that fits no legal state.
     Protocol(&'static str),
 }
 
 type Outcome = (QueryId, Result<Output, Error>);
+
+struct Request {
+    id: QueryId,
+    sql: String,
+    data: Option<Vec<u8>>,
+    retries_left: u8,
+}
+
+impl Request {
+    fn queued_len(&self) -> usize {
+        self.sql.len() + self.data.as_ref().map_or(0, Vec::len)
+    }
+}
 
 struct ServerError {
     code: String,
@@ -67,7 +99,7 @@ struct ServerError {
 }
 
 struct QueryOut {
-    id: QueryId,
+    request: Request,
     columns: Vec<Column>,
     rows: Vec<Vec<Option<Vec<u8>>>>,
     tag: Option<String>,
@@ -76,8 +108,7 @@ struct QueryOut {
 }
 
 struct CopyOut {
-    id: QueryId,
-    data: Vec<u8>,
+    request: Request,
     sent: bool,
     tag: Option<String>,
     error: Option<ServerError>,
@@ -116,8 +147,8 @@ impl Conn {
 
     fn take_in_flight(&self) -> Option<QueryId> {
         match &self.state {
-            State::Query(query) => Some(query.id),
-            State::Copy(copy) => Some(copy.id),
+            State::Query(query) => Some(query.request.id),
+            State::Copy(copy) => Some(copy.request.id),
             _ => None,
         }
     }
@@ -206,8 +237,12 @@ pub struct Postgres {
     params: Vec<(String, String)>,
     connections: usize,
     max_output_bytes: usize,
+    max_queued_bytes: usize,
     group: Option<TcpGroup>,
     conns: Vec<Conn>,
+    queue: VecDeque<Request>,
+    queued_bytes: usize,
+    outcomes: Vec<Outcome>,
     next_id: u64,
 }
 
@@ -221,8 +256,12 @@ impl Postgres {
             params: Vec::new(),
             connections: 1,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
             group: None,
             conns: Vec::new(),
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            outcomes: Vec::new(),
             next_id: 0,
         }
     }
@@ -248,7 +287,7 @@ impl Postgres {
     }
 
     pub fn with_connections(mut self, connections: usize) -> Self {
-        assert!(connections > 0 && self.conns.is_empty(), "nonzero, before the first send");
+        assert!(connections > 0 && self.conns.is_empty(), "nonzero, before the first drive");
         self.connections = connections;
         self
     }
@@ -259,84 +298,105 @@ impl Postgres {
         self
     }
 
-    /// Runs `sql` as one simple-protocol statement.
-    pub fn query(&mut self, net: &mut TcpNetwork, sql: &str) -> Option<QueryId> {
-        let index = self.ready_conn(net)?;
-        let id = self.send_request(net, index, sql, None)?;
-        Some(id)
+    /// Bound on queued body bytes, exceeded by at most one request; the
+    /// oldest queued requests are dropped to stay under it.
+    pub fn with_max_queued_bytes(mut self, max_queued_bytes: usize) -> Self {
+        self.max_queued_bytes = max_queued_bytes;
+        self
     }
 
-    /// Streams `data` as the body of a `COPY ... FROM STDIN` statement built
-    /// by [`copybinary::copy_statement`]. The body is copied; keep your own
-    /// for retries after [`Error::Disconnected`].
-    pub fn copy(&mut self, net: &mut TcpNetwork, sql: &str, data: &[u8]) -> Option<QueryId> {
-        let index = self.ready_conn(net)?;
-        let id = self.send_request(net, index, sql, Some(data))?;
-        Some(id)
+    /// Queues `sql` as one simple-protocol statement; a lost connection
+    /// fails it.
+    pub fn query(&mut self, sql: &str) -> QueryId {
+        self.enqueue(sql.to_owned(), None, 0)
     }
 
-    fn ready_conn(&mut self, net: &mut TcpNetwork) -> Option<usize> {
-        if self.conns.is_empty() {
-            let group = *self.group.get_or_insert_with(|| {
-                net.add_group(TcpGroupConfig {
-                    name: "postgres",
-                    framing: Framing::Raw,
-                    ..Default::default()
-                })
-            });
-            for _ in 0..self.connections {
-                let token = net.connect(group, self.addr);
-                self.conns.push(Conn {
-                    token,
-                    state: State::Connecting,
-                    rx: Vec::new(),
-                    outbox: Vec::new(),
-                    out_sent: 0,
-                });
-            }
-        }
-        self.conns.iter().position(|conn| matches!(conn.state, State::Ready))
+    /// Queues `data` as the body of a `COPY ... FROM STDIN` statement; a
+    /// lost connection resends it, so the server may see it more than once.
+    pub fn copy(&mut self, sql: &str, data: Vec<u8>) -> QueryId {
+        self.enqueue(sql.to_owned(), Some(data), RETRIES)
     }
 
-    fn send_request(
+    /// Encodes `rows` as `COPY BINARY` and queues them for `table`, naming
+    /// the columns after the row's fields.
+    pub fn copy_rows<T: Serialize>(
         &mut self,
-        net: &mut TcpNetwork,
-        index: usize,
-        sql: &str,
-        data: Option<&[u8]>,
-    ) -> Option<QueryId> {
-        let prev = self.conns[index].outbox.len();
-        Self::queue_cstring(&mut self.conns[index].outbox, b'Q', sql.as_bytes());
-        if !self.send_pending(net, index) {
-            let conn = &mut self.conns[index];
-            conn.outbox.truncate(prev);
-            conn.out_sent = conn.out_sent.min(prev);
-            return None;
+        table: &str,
+        rows: &[T],
+    ) -> Result<QueryId, copybinary::Error> {
+        let first = rows.first().ok_or_else(|| copybinary::Error::custom("empty batch"))?;
+        let sql = copybinary::copy_statement(table, first)?;
+        let mut body = Vec::new();
+        copybinary::header(&mut body);
+        for row in rows {
+            copybinary::encode(&mut body, row)?;
         }
-        let id = QueryId(self.next_id);
+        copybinary::trailer(&mut body);
+        Ok(self.copy(&sql, body))
+    }
+
+    /// Builds a multi-row `INSERT` for `table` and queues it. With
+    /// [`insert::OnConflict::DoNothing`] a lost connection resends it, which
+    /// is safe because the statement is idempotent.
+    pub fn insert_rows<T: Serialize>(
+        &mut self,
+        table: &str,
+        rows: &[T],
+        on_conflict: insert::OnConflict,
+    ) -> Result<QueryId, insert::Error> {
+        let sql = insert::rows(table, rows, on_conflict)?;
+        let retries = match on_conflict {
+            insert::OnConflict::None => 0,
+            insert::OnConflict::DoNothing => RETRIES,
+        };
+        Ok(self.enqueue(sql, None, retries))
+    }
+
+    fn enqueue(&mut self, sql: String, data: Option<Vec<u8>>, retries_left: u8) -> QueryId {
+        let request = Request { id: QueryId(self.next_id), sql, data, retries_left };
         self.next_id += 1;
-        self.conns[index].state = data.map_or_else(
-            || {
-                State::Query(QueryOut {
-                    id,
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    tag: None,
-                    error: None,
-                    bytes: 0,
-                })
-            },
-            |data| {
-                State::Copy(CopyOut {
-                    id,
-                    data: data.to_vec(),
-                    sent: false,
-                    tag: None,
-                    error: None,
-                })
-            },
-        );
-        Some(id)
+        while self.queued_bytes + request.queued_len() > self.max_queued_bytes {
+            let Some(oldest) = self.pop_queued() else { break };
+            self.outcomes.push((oldest.id, Err(Error::Dropped)));
+        }
+        let id = request.id;
+        self.queued_bytes += request.queued_len();
+        self.queue.push_back(request);
+        id
+    }
+
+    fn pop_queued(&mut self) -> Option<Request> {
+        let request = self.queue.pop_front()?;
+        self.queued_bytes -= request.queued_len();
+        Some(request)
+    }
+
+    fn requeue_front(&mut self, request: Request) {
+        self.queued_bytes += request.queued_len();
+        self.queue.push_front(request);
+    }
+
+    fn ensure_conns(&mut self, net: &mut TcpNetwork) {
+        if !self.conns.is_empty() {
+            return;
+        }
+        let group = *self.group.get_or_insert_with(|| {
+            net.add_group(TcpGroupConfig {
+                name: "postgres",
+                framing: Framing::Raw,
+                ..Default::default()
+            })
+        });
+        for _ in 0..self.connections {
+            let token = net.connect(group, self.addr);
+            self.conns.push(Conn {
+                token,
+                state: State::Connecting,
+                rx: Vec::new(),
+                outbox: Vec::new(),
+                out_sent: 0,
+            });
+        }
     }
 
     fn send_pending(&mut self, net: &mut TcpNetwork, index: usize) -> bool {
@@ -360,15 +420,51 @@ impl Postgres {
         true
     }
 
-    /// Sends queued handshake and COPY bytes, which cannot be sent from inside
-    /// the poll handler; call after every poll.
-    pub fn flush(&mut self, net: &mut TcpNetwork) {
+    /// Sends queued requests on idle connections, then delivers each finished
+    /// request's outcome to `handler` exactly once.
+    pub fn drive<F>(&mut self, net: &mut TcpNetwork, mut handler: F)
+    where
+        F: FnMut(QueryId, Result<Output, Error>),
+    {
+        self.ensure_conns(net);
         for index in 0..self.conns.len() {
             if matches!(self.conns[index].state, State::Dead) {
                 net.disconnect(self.conns[index].token);
             } else {
                 self.send_pending(net, index);
             }
+        }
+        for index in 0..self.conns.len() {
+            if !matches!(self.conns[index].state, State::Ready) {
+                continue;
+            }
+            let Some(request) = self.pop_queued() else { break };
+            let prev = self.conns[index].outbox.len();
+            Self::queue_cstring(&mut self.conns[index].outbox, b'Q', request.sql.as_bytes());
+            if !self.send_pending(net, index) {
+                let conn = &mut self.conns[index];
+                conn.outbox.truncate(prev);
+                conn.out_sent = conn.out_sent.min(prev);
+                self.requeue_front(request);
+                break;
+            }
+            let is_copy = request.data.is_some();
+            if is_copy {
+                self.conns[index].state =
+                    State::Copy(CopyOut { request, sent: false, tag: None, error: None });
+            } else {
+                self.conns[index].state = State::Query(QueryOut {
+                    request,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    tag: None,
+                    error: None,
+                    bytes: 0,
+                });
+            }
+        }
+        for (id, outcome) in self.outcomes.drain(..) {
+            handler(id, outcome);
         }
     }
 
@@ -379,39 +475,50 @@ impl Postgres {
         self.conns.iter().position(|conn| conn.token == token)
     }
 
-    /// Returns whether the event belonged to this client; a completed
-    /// request's outcome is delivered to `handler` exactly once.
-    pub fn on_event<F>(&mut self, event: &TcpEvent, handler: F) -> bool
-    where
-        F: FnOnce(QueryId, Result<Output, Error>),
-    {
+    /// Returns whether the event belonged to this client. Outcomes queue
+    /// inside and are delivered by [`Postgres::drive`].
+    pub fn on_event(&mut self, event: &TcpEvent) -> bool {
         match *event {
             TcpEvent::Accepted { .. } => false,
             TcpEvent::Connected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
-                let Self { conns, user, database, params, .. } = self;
+                let Self { conns, outcomes, user, database, params, .. } = self;
                 let conn = &mut conns[index];
                 let stale = conn.take_in_flight();
                 conn.reset(State::Startup(Startup::AwaitAuth));
                 Self::queue_startup(&mut conn.outbox, user, database, params);
                 if let Some(id) = stale {
-                    handler(id, Err(Error::Disconnected));
+                    outcomes.push((id, Err(Error::Disconnected)));
                 }
                 true
             }
             TcpEvent::Disconnected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
-                let conn = &mut self.conns[index];
-                let in_flight = conn.take_in_flight();
-                conn.reset(State::Connecting);
-                if let Some(id) = in_flight {
-                    handler(id, Err(Error::Disconnected));
+                let request = {
+                    let conn = &mut self.conns[index];
+                    let state = std::mem::replace(&mut conn.state, State::Connecting);
+                    conn.rx.clear();
+                    conn.outbox.clear();
+                    conn.out_sent = 0;
+                    match state {
+                        State::Query(query) => Some(query.request),
+                        State::Copy(copy) => Some(copy.request),
+                        _ => None,
+                    }
+                };
+                match request {
+                    Some(mut request) if request.retries_left > 0 => {
+                        request.retries_left -= 1;
+                        self.requeue_front(request);
+                    }
+                    Some(request) => self.outcomes.push((request.id, Err(Error::Disconnected))),
+                    None => {}
                 }
                 true
             }
             TcpEvent::Message { group, token, payload, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
-                let Self { conns, user, password, max_output_bytes, .. } = self;
+                let Self { conns, outcomes, user, password, max_output_bytes, .. } = self;
                 let max_output_bytes = *max_output_bytes;
                 let conn = &mut conns[index];
                 if matches!(conn.state, State::Dead) {
@@ -452,8 +559,8 @@ impl Postgres {
                         conn.rx = rx;
                     }
                 }
-                if let Some((id, result)) = outcome {
-                    handler(id, result);
+                if let Some(outcome) = outcome {
+                    outcomes.push(outcome);
                 }
                 true
             }
@@ -489,7 +596,7 @@ impl Postgres {
             }
             State::Query(query) => match Self::query_msg(query, max_output, tag, body)? {
                 Some(result) => {
-                    let id = query.id;
+                    let id = query.request.id;
                     *state = State::Ready;
                     Ok(Some((id, result)))
                 }
@@ -497,7 +604,7 @@ impl Postgres {
             },
             State::Copy(copy) => match Self::copy_msg(copy, outbox, tag, body)? {
                 Some(result) => {
-                    let id = copy.id;
+                    let id = copy.request.id;
                     *state = State::Ready;
                     Ok(Some((id, result)))
                 }
@@ -718,7 +825,7 @@ impl Postgres {
                     return Err(Error::Protocol("second COPY FROM STDIN in one copy()"));
                 }
                 copy.sent = true;
-                Self::queue_raw(outbox, b'd', &copy.data);
+                Self::queue_raw(outbox, b'd', copy.request.data.as_deref().unwrap_or(&[]));
                 Self::queue_raw(outbox, b'c', &[]);
                 Ok(None)
             }
