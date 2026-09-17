@@ -583,6 +583,7 @@ name = "byte-stable"
 version = "0.3.2"
 dependencies = [
  "alloy-primitives",
+ "byte-stable-derive",
  "uuid",
 ]
 
@@ -590,6 +591,7 @@ dependencies = [
 name = "byte-stable-derive"
 version = "0.3.2"
 dependencies = [
+ "byte-stable",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -1353,6 +1355,8 @@ name = "flux"
 version = "0.3.2"
 dependencies = [
  "bitcode",
+ "byte-stable",
+ "byte-stable-derive",
  "core_affinity",
  "flux-communication",
  "flux-timing",

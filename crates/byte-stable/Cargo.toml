@@ -20,3 +20,6 @@ uuid = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+byte-stable-derive.workspace = true

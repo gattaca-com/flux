@@ -141,6 +141,75 @@ unsafe impl<T: ByteStable, const N: usize> ByteStable for [T; N] {
     }
 }
 
-// W-A: `#[cfg(feature = "uuid")]` impl for `uuid::Uuid` and
-// `#[cfg(feature = "alloy")]` impls for `FixedBytes<N>`, `Address`,
-// `Uint<BITS, LIMBS>` go here.
+// Safety: points 1-3 of the trait contract. (1) `Uuid` is `repr(transparent)`
+// over `[u8; 16]`, pinned below, so every byte is initialized. (2) Every
+// 16-byte pattern is a valid `Uuid`. (3) It contains no `UnsafeCell`.
+#[cfg(feature = "uuid")]
+unsafe impl ByteStable for uuid::Uuid {
+    #[inline]
+    fn is_valid(_bytes: &[u8]) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "uuid")]
+const _: () = ::core::assert!(
+    ::core::mem::size_of::<uuid::Uuid>() == 16 && ::core::mem::align_of::<uuid::Uuid>() == 1
+);
+
+// Safety: points 1-3 of the trait contract. (1) `FixedBytes<N>` is
+// `repr(transparent)` over `[u8; N]`, pinned per instantiation below, so every
+// byte is initialized. (2) Every byte pattern is valid. (3) It contains no
+// `UnsafeCell`.
+#[cfg(feature = "alloy")]
+unsafe impl<const N: usize> ByteStable for alloy_primitives::FixedBytes<N> {
+    #[inline]
+    fn is_valid(_bytes: &[u8]) -> bool {
+        const {
+            ::core::assert!(
+                ::core::mem::size_of::<Self>() == N && ::core::mem::align_of::<Self>() == 1
+            );
+        }
+        true
+    }
+}
+
+// Safety: points 1-3 of the trait contract. (1) `Address` is
+// `repr(transparent)` over `FixedBytes<20>`, pinned below, so every byte is
+// initialized. (2) Every 20-byte pattern is a valid address. (3) It contains
+// no `UnsafeCell`.
+#[cfg(feature = "alloy")]
+unsafe impl ByteStable for alloy_primitives::Address {
+    #[inline]
+    fn is_valid(_bytes: &[u8]) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "alloy")]
+const _: () = ::core::assert!(
+    ::core::mem::size_of::<alloy_primitives::Address>() == 20 &&
+        ::core::mem::align_of::<alloy_primitives::Address>() == 1
+);
+
+// Safety: points 1-3 of the trait contract. (1) `Uint` is `repr(transparent)`
+// over `[u64; LIMBS]`, pinned per instantiation below, so every byte is
+// initialized. (2) Validity is exact: the value is in range iff the top limb
+// fits `MASK`. (3) It contains no `UnsafeCell`.
+#[cfg(feature = "alloy")]
+unsafe impl<const BITS: usize, const LIMBS: usize> ByteStable
+    for alloy_primitives::Uint<BITS, LIMBS>
+{
+    #[inline]
+    fn is_valid(bytes: &[u8]) -> bool {
+        const {
+            ::core::assert!(::core::mem::size_of::<Self>() == 8 * LIMBS);
+        }
+        if LIMBS == 0 {
+            return true;
+        }
+        let mut limb = [0u8; 8];
+        limb.copy_from_slice(&bytes[bytes.len() - 8..]);
+        u64::from_le_bytes(limb) & !Self::MASK == 0
+    }
+}
