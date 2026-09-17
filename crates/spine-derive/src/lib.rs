@@ -1,12 +1,11 @@
 // Make the following work:
-// #[from_spine]
+// #[from_spine("app")]
 // #[derive(Clone, Debug)]
 // pub struct Spine {
-//     persistence_dir: PathBuf,
-//     #[queue(persist, size=2usize.pow(15))]
-//     pub update_pool: Queue<messages::UpdatePool>,
-//     #[queue(persist)]
-//     pub arb_path:    Queue<messages::ArbPath>,
+//     #[queue(size(2usize.pow(15)), gather)]
+//     pub updates: SpineQueue<messages::Update>,
+//     #[queue(gather(boundary))]
+//     pub boundary: SpineQueue<messages::Boundary>,
 // }
 
 // spine_derive/src/lib.rs   (only the changed parts are shown)
@@ -84,23 +83,38 @@ impl FromSpineArg {
 
 // Helper types and parser for #[queue(...)] attributes
 mod kw {
-    syn::custom_keyword!(persist);
+    syn::custom_keyword!(gather);
+    syn::custom_keyword!(boundary);
     syn::custom_keyword!(size);
     syn::custom_keyword!(flavour);
     syn::custom_keyword!(mtu);
 }
 
-fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>) {
-    let mut is_persistent = false;
+fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>, bool) {
+    let mut is_gather = false;
     let mut size_expr: Option<Expr> = None;
     let mut is_spmc = false;
     let mut mtu_expr: Option<Expr> = None;
+    let mut is_boundary = false;
 
     for attr in attrs {
         if attr.path().is_ident("queue") {
             attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("persist") {
-                    is_persistent = true;
+                if meta.path.is_ident("gather") {
+                    is_gather = true;
+                    if meta.input.peek(syn::token::Paren) {
+                        let content;
+                        parenthesized!(content in meta.input);
+                        let kind: Ident = content.parse()?;
+                        if kind == "boundary" {
+                            is_boundary = true;
+                        } else {
+                            return Err(syn::Error::new_spanned(
+                                kind,
+                                "expected `gather` or `gather(boundary)`",
+                            ));
+                        }
+                    }
                     return Ok(());
                 }
                 if meta.path.is_ident("size") {
@@ -130,8 +144,29 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
         }
     }
 
-    (is_persistent, size_expr, is_spmc, mtu_expr)
+    (is_gather, size_expr, is_spmc, mtu_expr, is_boundary)
 }
+/// Generate a spine struct plus consumers/producers, config, and the
+/// `FluxSpine` impl.
+///
+/// Queue attributes (`#[queue(..)]` on `SpineQueue<T>` fields):
+/// - `size(..)`: queue capacity (default `2usize.pow(15)`).
+/// - `flavour("spmc")`: SPMC queue instead of MPMC.
+/// - `mtu(..)`: dcache-backed queue with the given max frame size. Only the
+///   fixed-size queue message is gathered; a dcache payload never enters a
+///   blob.
+/// - `gather`: drain this queue into a `BlobCache` on every pass via the
+///   generated `flux_gather::GatherQueues` impl. Every gathered message type
+///   must implement `flux_versioned_types::HasVersionedLeaves` (the bound
+///   surfaces through `BlobCache::push`). Plain and dcache queues are drained
+///   in declaration order.
+/// - `gather(boundary)`: the single queue whose messages close a batch. It must
+///   be a plain queue (combining it with `mtu(..)` is a compile error) and is
+///   always drained last; `flux_gather::Boundary::gather_boundary` on each
+///   message decides the flushed slot.
+///
+/// Using `gather` requires a direct dependency on `flux-gather`: the generated
+/// `GatherQueues` impl names `::flux_gather::` paths.
 #[allow(clippy::too_many_lines)]
 #[proc_macro_attribute]
 pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -152,7 +187,9 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut as_ref_impls = Vec::<proc_macro2::TokenStream>::new();
     let mut as_mut_impls = Vec::<proc_macro2::TokenStream>::new();
     let mut spine_as_ref_impls = Vec::<proc_macro2::TokenStream>::new();
-    let mut persisting = Vec::<proc_macro2::TokenStream>::new();
+    let mut gather_fields = Vec::<(Type, bool)>::new();
+    let mut gather_boundary = Option::<Type>::None;
+    let mut first_gather_field = Option::<Ident>::None;
     let mut message_types = Vec::<proc_macro2::TokenStream>::new();
     let mut ffi_check_items = Vec::<proc_macro2::TokenStream>::new();
 
@@ -174,16 +211,32 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             ffi_check_items
                 .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
 
-            let (is_persistent, _size_expr_opt, _is_spmc, mtu_expr) =
+            let (is_gather, _size_expr_opt, _is_spmc, mtu_expr, is_boundary) =
                 get_queue_config(&field.attrs);
 
-            if is_persistent && mtu_expr.is_some() {
+            if is_boundary && mtu_expr.is_some() {
                 return syn::Error::new_spanned(
                     field_ident,
-                    "persist and mtu cannot be combined: PersistingQueueTile does not support dcache-backed queues",
+                    "gather(boundary) and mtu cannot be combined: the boundary queue carries no dcache payload",
                 )
                 .to_compile_error()
                 .into();
+            }
+            if is_gather && first_gather_field.is_none() {
+                first_gather_field = Some(field_ident.clone());
+            }
+            if is_boundary {
+                if gather_boundary.is_some() {
+                    return syn::Error::new_spanned(
+                        field_ident,
+                        "more than one gather(boundary) field: only one boundary queue is allowed",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                gather_boundary = Some(inner_ty.clone());
+            } else if is_gather {
+                gather_fields.push((inner_ty.clone(), mtu_expr.is_some()));
             }
 
             if mtu_expr.is_some() {
@@ -299,21 +352,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 });
             }
-
-            if is_persistent {
-                persisting.push(quote! {
-                                let last_core = ::flux::core_affinity::get_core_ids().unwrap().last().unwrap().id;
-                                let cfg = ::flux::tile::TileConfig::background(
-                                    Some(last_core),
-                                    Some(::flux::timing::Duration::from_millis(10)),
-                                );
-                                ::flux::tile::attach_tile(
-                                    ::flux::persistence::PersistingQueueTile::<#inner_ty>::new_with_base_dir(&scoped.spine.base_dir),
-                                    &mut scoped,
-                                    cfg,
-                                );
-                            });
-            }
         } else if let Type::Path(tp) = &field.ty &&
             let Some(last_seg) = tp.path.segments.last() &&
             let PathArguments::AngleBracketed(args) = &last_seg.arguments &&
@@ -325,6 +363,59 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
         }
     }
+
+    if gather_boundary.is_none() {
+        if let Some(field) = first_gather_field.as_ref() {
+            return syn::Error::new_spanned(
+                field,
+                "gather queues require exactly one gather(boundary) queue",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+
+    // Drain passes for plain and dcache gathered fields in declaration order;
+    // the boundary field is always drained last (see below).
+    let mut gather_passes = Vec::<proc_macro2::TokenStream>::new();
+    for (inner_ty, is_dcache) in &gather_fields {
+        if *is_dcache {
+            gather_passes.push(quote! {
+                adapter.consume_with_dcache_internal_message(
+                    |m: &::flux::timing::InternalMessage<#inner_ty>, _payload: &[u8]| cache.push(m),
+                    |_, _| {},
+                );
+            });
+        } else {
+            gather_passes.push(quote! {
+                adapter.consume_internal_message(
+                    |m: &mut ::flux::timing::InternalMessage<#inner_ty>, _| cache.push(&*m),
+                );
+            });
+        }
+    }
+    let gather_impl = gather_boundary.as_ref().map(|boundary_ty| {
+        quote! {
+            impl ::flux_gather::GatherQueues for #struct_ident {
+                fn gather_into(
+                    adapter: &mut ::flux::spine::SpineAdapter<Self>,
+                    cache: &mut ::flux_gather::BlobCache,
+                ) -> Option<u64> {
+                    #(#gather_passes)*
+                    let mut boundary = None;
+                    adapter.consume_internal_message(
+                        |m: &mut ::flux::timing::InternalMessage<#boundary_ty>, _| {
+                            cache.push(&*m);
+                            if let Some(slot) = ::flux_gather::Boundary::gather_boundary(m.data()) {
+                                boundary = Some(slot);
+                            }
+                        },
+                    );
+                    boundary
+                }
+            }
+        }
+    });
 
     // ---- Build `new_with_base_dir` body as explicit let-bindings ----
     // This allows dcache queue fields to destructure a tuple (queue, dcache_ptr)
@@ -350,7 +441,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             new_struct_field_names.push(quote! { tile_info });
         } else if let Type::Path(tp) = &field.ty {
             if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
-                let (_is_persistent, size_expr_opt, is_spmc, mtu_expr_opt) =
+                let (_is_gather, size_expr_opt, is_spmc, mtu_expr_opt, _is_boundary) =
                     get_queue_config(&field.attrs);
                 let size_arg = size_expr_opt
                     .map_or_else(|| quote! { 2usize.pow(15) }, |expr| quote! { #expr });
@@ -456,7 +547,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                         tp.path.segments.last().unwrap().arguments &&
                     let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
                 {
-                    let (_, _, _, mtu_opt) = get_queue_config(&f.attrs);
+                    let (_, _, _, mtu_opt, _) = get_queue_config(&f.attrs);
                     if mtu_opt.is_some() {
                         let dcache_ident = format_ident!("{}_dcache", ident.as_ref().unwrap());
                         let new_ty = quote! {
@@ -537,6 +628,8 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#as_mut_impls)*
         #(#spine_as_ref_impls)*
 
+        #gather_impl
+
         impl ::flux::spine::FluxSpine for #struct_ident {
             type Consumers = #consumers_ident;
             type Producers = #producers_ident;
@@ -566,7 +659,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        // start() method with only the necessary PersistingQueues
+        // start() spawns the spine scope and runs the user closure.
         impl #struct_ident {
             #generated_new_method_token_stream // Use the correctly generated new method
 
@@ -577,23 +670,16 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 std::thread::scope(|s| {
                     let mut scoped = ::flux::spine::ScopedSpine::new(&mut self, s, on_panic, custom_signal_handler);
                     f(&mut scoped);
-
-                    ::flux::core_affinity::set_for_current(*::flux::core_affinity::get_core_ids().unwrap().last().unwrap());
-
-                    #(#persisting)*     // ← injected only for #[persist] fields
                 });
                 ::flux::tracing::info!("Finished…");
             }
 
             #[::flux::tracing::instrument(skip_all, fields(system = "Spine"))]
-            pub fn start_no_persist<F>(mut self, on_panic: Option<Box<dyn Fn(&::std::panic::PanicHookInfo<'_>) + Sync + Send>>, custom_signal_handler: Option<::std::time::Duration>, f: F)
+            pub fn start_no_persist<F>(self, on_panic: Option<Box<dyn Fn(&::std::panic::PanicHookInfo<'_>) + Sync + Send>>, custom_signal_handler: Option<::std::time::Duration>, f: F)
             where
                 F: FnOnce(&mut ::flux::spine::ScopedSpine<'_, '_, #struct_ident>),
             {
-                std::thread::scope(|s| {
-                    let mut scoped = ::flux::spine::ScopedSpine::new(&mut self, s, on_panic, custom_signal_handler);
-                    f(&mut scoped);
-                })
+                self.start(on_panic, custom_signal_handler, f);
             }
 
             pub fn message_names(&self) -> Vec<String>
