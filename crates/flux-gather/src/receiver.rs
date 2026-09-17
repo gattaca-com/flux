@@ -1,47 +1,48 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{marker::PhantomData, net::SocketAddr};
 
 use flux::{
-    communication::ShmemData,
     spine::{
         DCacheRead, FluxSpine, SpineAdapter, SpineConsumer, SpineDCacheConsumer, SpineProducer,
-        SpineProducerWithDCache, SpineProducers, SpineQueue,
+        SpineProducerWithDCache, SpineProducers,
     },
-    tile::{Tile, TileInfo},
+    tile::Tile,
 };
 use flux_network::{NetworkDriver, PollEvent, TcpConfig, Transport};
-use flux_versioned_types::{Blob, DecodeError};
+use flux_versioned_types::{Blob, DecodeError, Versioned};
 use mio::Token;
-use spine_derive::from_spine;
 use tracing::warn;
 
-use crate::{meta::GatherMeta, writer::BlobWriter};
-
-/// A frame landed in the dcache.
-#[derive(Clone, Copy, Debug)]
+/// A frame landed in the dcache. Message type of the receiver spine's dcache
+/// queue.
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct IncomingBlob {
     /// Token of the connection the frame arrived on.
     pub token: Token,
 }
 
-/// Ready-made spine for a plain receiver process.
-#[from_spine("gather-receiver")]
-#[derive(Debug)]
-pub struct GatherReceiverSpine {
-    /// Tile registry.
-    pub tile_info: ShmemData<TileInfo>,
-    /// `BlobReceiver` to `BlobRouter`. The dcache is a byte ring of
-    /// `size x mtu` bytes; a frame is only rejected when it exceeds the whole
-    /// ring.
-    #[queue(size(2usize.pow(9)), mtu(16 * 1024 * 1024))]
-    pub blobs: SpineQueue<IncomingBlob>,
-    /// `BlobRouter` to `BlobReceiver`: peers to force-close (they did not send
-    /// blobs).
-    #[queue(size(64))]
-    pub disconnect: SpineQueue<Token>,
+/// Where [`BlobRouter`] delivers validated blobs.
+pub trait BlobSink<U> {
+    /// A blob carrying `U` metadata arrived intact.
+    fn on_blob(&mut self, meta: &U, blob: &Blob);
+    /// Called once per router loop; progress your own I/O here (e.g.
+    /// `BlobWriter::poll`). Returns whether you did work.
+    fn drive(&mut self) -> bool {
+        false
+    }
+    /// Called from the router's teardown (e.g. `BlobWriter::drain`).
+    fn finish(&mut self) {}
 }
 
-/// TCP listener. No deserialization, no per-connection state.
+/// Closures are sinks with no I/O of their own.
+impl<U, F: FnMut(&U, &Blob)> BlobSink<U> for F {
+    fn on_blob(&mut self, meta: &U, blob: &Blob) {
+        self(meta, blob);
+    }
+}
+
+/// TCP listener feeding frames into the dcache. No deserialization, no
+/// per-connection state.
 pub struct BlobReceiver {
     listen: SocketAddr,
     socket_buf_size: usize,
@@ -81,47 +82,48 @@ where
     fn loop_body(&mut self, adapter: &mut SpineAdapter<S>) {
         let Some(driver) = self.driver.as_mut() else { return };
         adapter.consume(|token: Token, _| driver.disconnect(token));
-        driver.poll_with_produce(&mut adapter.producers, |event| match event {
+        if driver.poll_with_produce(&mut adapter.producers, |event| match event {
             PollEvent::Message { token, .. } => Some(IncomingBlob { token }),
             _ => None,
-        });
+        }) {
+            adapter.mark_work();
+        }
     }
 }
 
-/// Validates frames as blobs, persists them, hands them to the app hook.
-pub struct BlobRouter<H: FnMut(&GatherMeta, &Blob)> {
-    writer: Option<BlobWriter>,
-    hook: H,
+/// Validates dcache frames as blobs carrying `U`, hands them to the sink,
+/// disconnects peers that send anything else.
+pub struct BlobRouter<U: Versioned, K: BlobSink<U>> {
+    sink: K,
+    // `fn() -> U` is always `Send`, so the tile stays `Send` with no `U:
+    // Send` bound.
+    meta: PhantomData<fn() -> U>,
 }
 
-impl<H: FnMut(&GatherMeta, &Blob)> BlobRouter<H> {
-    /// `disk_dir` enables receiver-side persistence; `hook` sees every valid
-    /// blob.
-    pub fn new(disk_dir: Option<PathBuf>, hook: H) -> Self {
-        Self { writer: disk_dir.map(BlobWriter::new), hook }
+impl<U: Versioned, K: BlobSink<U>> BlobRouter<U, K> {
+    /// Route validated blobs into `sink`.
+    pub fn new(sink: K) -> Self {
+        Self { sink, meta: PhantomData }
     }
 
-    /// Zero-copy: dcache slots are 64-byte aligned, so `from_bytes` borrows
-    /// directly. Err means the peer is not sending blobs.
+    /// `Blob::from_bytes(bytes)?` (zero-copy: dcache slots are 64-byte
+    /// aligned), then `blob.user_metadata::<U>()?`, then
+    /// `sink.on_blob(&meta, blob)`. `Err`: the peer is not sending our blobs.
+    /// Also usable as a component by an app that owns its own TCP tile.
     pub fn handle(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
         let blob = Blob::from_bytes(bytes)?;
-        let meta = blob.user_metadata::<GatherMeta>()?;
-        if let Some(writer) = self.writer.as_mut() {
-            writer.write(blob);
-        }
-        (self.hook)(&meta, blob);
+        let meta = blob.user_metadata::<U>()?;
+        self.sink.on_blob(&meta, blob);
         Ok(())
     }
 
-    /// Reap disk completions.
-    pub fn drive(&mut self) {
-        if let Some(writer) = self.writer.as_mut() {
-            writer.poll();
-        }
+    /// The sink, e.g. to inspect what it recorded.
+    pub fn sink_mut(&mut self) -> &mut K {
+        &mut self.sink
     }
 }
 
-impl<S: FluxSpine, H: FnMut(&GatherMeta, &Blob) + Send> Tile<S> for BlobRouter<H>
+impl<S: FluxSpine, U: Versioned, K: BlobSink<U> + Send> Tile<S> for BlobRouter<U, K>
 where
     S::Consumers: AsMut<SpineDCacheConsumer<IncomingBlob>>,
     S::Producers: AsRef<SpineProducer<Token>>,
@@ -141,12 +143,12 @@ where
                 }
             },
         );
-        self.drive();
+        if self.sink.drive() {
+            adapter.mark_work();
+        }
     }
 
     fn teardown(mut self, _adapter: &mut SpineAdapter<S>) {
-        if let Some(writer) = self.writer.as_mut() {
-            writer.drain();
-        }
+        self.sink.finish();
     }
 }

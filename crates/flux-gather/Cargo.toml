@@ -1,5 +1,5 @@
 [package]
-description = "Generic data-gather sender, receiver, and disk persister over versioned blobs"
+description = "Gather versioned leaves into blobs: ship them over TCP, persist them to disk"
 edition.workspace = true
 keywords = ["communication", "low-latency", "performance"]
 license.workspace = true
@@ -14,20 +14,14 @@ flux.workspace = true
 flux-disk.workspace = true
 flux-network.workspace = true
 flux-timing.workspace = true
-flux-utils.workspace = true
 flux-versioned-types.workspace = true
-bincode.workspace = true
 mio.workspace = true
-serde.workspace = true
-spine-derive.workspace = true
 tracing.workspace = true
-type-hash-derive.workspace = true
 
 [dev-dependencies]
+flux-utils.workspace = true
 tempfile.workspace = true
+type-hash-derive.workspace = true
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-machete]
-ignored = ["bincode"]

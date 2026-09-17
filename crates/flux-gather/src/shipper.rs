@@ -35,8 +35,9 @@ impl BlobShipper {
             .write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(bytes));
     }
 
-    /// Retry never-connected addrs, then poll.
-    pub fn drive(&mut self) {
+    /// Retries never-connected addrs, then polls. Returns whether the poll
+    /// did network work, so a tile can `adapter.mark_work()`.
+    pub fn drive(&mut self) -> bool {
         if self.tokens.iter().any(Option::is_none) && self.retry.fired() {
             for (addr, token) in self.addrs.iter().zip(self.tokens.iter_mut()) {
                 if token.is_none() {
@@ -44,6 +45,6 @@ impl BlobShipper {
                 }
             }
         }
-        self.driver.poll_with(|_| {});
+        self.driver.poll_with(|_| {})
     }
 }

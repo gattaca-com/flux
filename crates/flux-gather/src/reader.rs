@@ -1,24 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use flux_timing::InternalMessage;
-use flux_versioned_types::{Blob, DecodeError, HasVersionedLeaves, Scratch};
+use flux_versioned_types::{Blob, DecodeError, HasVersionedLeaves, Scratch, Versioned};
 
-use crate::meta::GatherMeta;
-
-/// A persisted gather file that is not a blob of leaves of T.
+/// A persisted gather file that is not a blob of leaves of `T`.
 #[derive(Debug)]
 pub enum ReadError {
     /// The file could not be read.
     Io(std::io::Error),
     /// A blob in the file failed to decode.
     Decode(DecodeError),
-    /// A blob in the file holds no leaf of T.
+    /// A blob in the file holds no leaf of `T`.
     ForeignType { type_name: String },
 }
 
-/// Reads back files written by `BlobWriter`.
+/// Reads back files written by [`BlobWriter`](crate::BlobWriter).
+#[derive(Default)]
 pub struct BlobReader {
-    file_bytes: Scratch,
+    file: Scratch,
     decode: Scratch,
 }
 
@@ -28,64 +27,58 @@ impl BlobReader {
         Self::default()
     }
 
-    /// Files for one `(instance_id, app, type_name, slot)` under `base`, sorted
-    /// by `flush_t`. Missing directory => empty `Vec`, not an error.
-    pub fn slot_files(
-        base: &Path,
-        instance_id: &str,
-        app: &str,
-        type_name: &str,
-        slot: u64,
-    ) -> std::io::Result<Vec<PathBuf>> {
-        let dir = base.join(instance_id).join(app).join(type_name);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let prefix = format!("{slot}_");
-        let mut stamped = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(rest) = name.strip_prefix(&prefix) else { continue };
-            let Some(stamp) = rest.strip_suffix(".bin") else { continue };
-            let Ok(flush_t) = stamp.parse::<u64>() else { continue };
-            stamped.push((flush_t, entry.path()));
-        }
-        stamped.sort_unstable_by_key(|(flush_t, _)| *flush_t);
-        Ok(stamped.into_iter().map(|(_, path)| path).collect())
-    }
-
-    /// Decode every blob in `path` as leaves of `T`.
-    // The return nests exactly what `decode_blob` yields per blob; a type alias
-    // would only rename it.
-    #[allow(clippy::type_complexity)]
-    pub fn read<T: HasVersionedLeaves>(
+    /// Loads `path` into aligned storage and calls `f` on each blob in it (a
+    /// file may hold concatenated blobs). `f` returning `Err` stops with
+    /// `ReadError::Decode`. Replay a file to the wire with
+    /// `reader.for_each_blob(path, |b| { shipper.ship(b); Ok(()) })`.
+    pub fn for_each_blob(
         &mut self,
         path: &Path,
-    ) -> Result<Vec<(GatherMeta, Vec<InternalMessage<T>>)>, ReadError> {
+        mut f: impl FnMut(&Blob) -> Result<(), DecodeError>,
+    ) -> Result<(), ReadError> {
         let bytes = std::fs::read(path).map_err(ReadError::Io)?;
-        self.file_bytes.resize(bytes.len());
-        self.file_bytes.as_mut_bytes().copy_from_slice(&bytes);
+        self.file.resize(bytes.len());
+        self.file.as_mut_bytes().copy_from_slice(&bytes);
+        visit_blobs(self.file.as_bytes(), |blob| f(blob).map_err(ReadError::Decode))
+    }
+
+    /// Decodes every blob in `path` as `U` metadata plus leaves of `T` (via
+    /// `T::decode_blob::<U>`). A blob holding no leaf of `T` is
+    /// `ReadError::ForeignType`.
+    // The return nests exactly what `decode_blob` yields per blob; a type
+    // alias would only rename it.
+    #[allow(clippy::type_complexity)]
+    pub fn read<U: Versioned, T: HasVersionedLeaves>(
+        &mut self,
+        path: &Path,
+    ) -> Result<Vec<(U, Vec<InternalMessage<T>>)>, ReadError> {
+        let bytes = std::fs::read(path).map_err(ReadError::Io)?;
+        // Split borrows: blobs borrow `file` while decoding into `decode`.
+        let Self { file, decode } = self;
+        file.resize(bytes.len());
+        file.as_mut_bytes().copy_from_slice(&bytes);
         let mut out = Vec::new();
-        let mut rest: &[u8] = self.file_bytes.as_bytes();
-        while !rest.is_empty() {
-            let blob = Blob::from_bytes(rest).map_err(ReadError::Decode)?;
-            let Some(decoded) = T::decode_blob::<GatherMeta>(blob, &mut self.decode) else {
+        visit_blobs(file.as_bytes(), |blob| {
+            let Some(decoded) = T::decode_blob::<U>(blob, decode) else {
                 return Err(ReadError::ForeignType { type_name: blob.type_name().to_owned() });
             };
-            let decoded = decoded.map_err(ReadError::Decode)?;
-            rest = &rest[blob.as_bytes().len()..];
-            out.push(decoded);
-        }
+            out.push(decoded.map_err(ReadError::Decode)?);
+            Ok(())
+        })?;
         Ok(out)
     }
 }
 
-impl Default for BlobReader {
-    fn default() -> Self {
-        Self { file_bytes: Scratch::new(), decode: Scratch::new() }
+/// Walks the concatenated blobs in `bytes`, stopping at the first error.
+fn visit_blobs(
+    bytes: &[u8],
+    mut f: impl FnMut(&Blob) -> Result<(), ReadError>,
+) -> Result<(), ReadError> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let blob = Blob::from_bytes(rest).map_err(ReadError::Decode)?;
+        f(blob)?;
+        rest = &rest[blob.as_bytes().len()..];
     }
+    Ok(())
 }

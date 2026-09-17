@@ -1426,7 +1426,6 @@ dependencies = [
 name = "flux-gather"
 version = "0.3.2"
 dependencies = [
- "bincode",
  "flux",
  "flux-disk",
  "flux-network",
@@ -1434,8 +1433,6 @@ dependencies = [
  "flux-utils",
  "flux-versioned-types",
  "mio",
- "serde",
- "spine-derive",
  "tempfile",
  "tracing",
  "type-hash-derive",
