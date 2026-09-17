@@ -327,25 +327,18 @@ impl VersionedBlob {
 
 /// Portable timing metadata sent over the wire. Wall-clock `Nanos`, safe
 /// across machines with different RDTSC rates.
-///
-/// The blob format (`crate::raw`) stores these as 24-byte records:
-/// 8 + 8 + 2 bytes of fields plus 6 bytes of explicit zero padding, so the
-/// record is padding-free and every bit pattern is valid.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, byte_stable_derive::ByteStable)]
 #[repr(C)]
 pub struct TrackingTimestampWire {
     pub ingestion_t_real: flux_timing::Nanos,
     pub publish_t_real: flux_timing::Nanos,
     pub tile_id: u16,
-    /// Zero padding to the 24-byte record stride. Skipped by serde so the
-    /// bincode layout of legacy blobs is unchanged; always zero on write.
-    /// Private so it cannot be set to anything else by hand.
+    /// Pads to the 24-byte wire stride; `serde(skip)` keeps legacy bincode
+    /// bytes unchanged.
     #[serde(skip)]
     _pad: [u8; 6],
 }
 
-// Wire-format pin: the timestamp section stride. Changing it is a new
-// `raw::FORMAT_VERSION`.
 const _: () = assert!(size_of::<TrackingTimestampWire>() == 24);
 
 /// Pre-tile-id metadata format. Deserialization fallback for payloads written

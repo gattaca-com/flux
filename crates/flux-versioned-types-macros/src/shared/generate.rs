@@ -157,8 +157,6 @@ pub(crate) fn default_enum_attrs() -> Vec<Attribute> {
     default_attrs_with_repr(&quote!(u8))
 }
 
-// Our derive accepts a crate path, so generated code names the re-export and
-// consumers need no direct dependency.
 pub(crate) fn byte_stable_derive_attrs() -> Vec<Attribute> {
     let tokens = quote! {
         #[derive(::flux_versioned_types::ByteStable)]

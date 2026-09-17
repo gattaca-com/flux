@@ -155,10 +155,7 @@ fn family_visit_reaches_leaf() {
 
 #[test]
 fn wire_skip_chain_keeps_bincode_round_trip() {
-    // `Skipped` deliberately does NOT implement `Versioned`: `#[wire_skip]`
-    // emits exactly the bincode-only output (no `ByteStable` derive), so there
-    // is no `decode_versions` to call here. A negative bound check is not
-    // expressible; the bincode round trip below is the behavioural contract.
+    // `#[wire_skip]` chains have no `Versioned` impl; only bincode applies.
     let old = vec![SkippedV1 { name: "a".to_string() }];
     let bytes = bincode::serialize(&old).unwrap();
     let stored = SkippedV1::TYPE_HASH ^ 123_456;

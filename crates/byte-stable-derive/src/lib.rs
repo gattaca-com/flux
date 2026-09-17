@@ -1,5 +1,3 @@
-//! `#[derive(ByteStable)]`. See `byte-stable` for the trait it implements.
-
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use quote::{ToTokens, quote};
@@ -8,44 +6,13 @@ use syn::{
     MetaNameValue, parse_macro_input, punctuated::Punctuated, token::Comma,
 };
 
-/// Implements `ByteStable` for a `repr(C)`/`repr(transparent)` struct or a
-/// `repr(u8)` fieldless enum.
+/// Implements `ByteStable` for `repr(C)`/`repr(transparent)` structs and
+/// `repr(u8)` fieldless enums.
 ///
-/// # Requirements
-///
-/// - Structs must carry `#[repr(C)]` or `#[repr(transparent)]`; enums must
-///   carry `#[repr(u8)]` and have only fieldless variants.
-/// - Unions and lifetime parameters are rejected with a compile error.
-/// - Every field type must implement `ByteStable`. Generic type parameters get
-///   a `where T: ByteStable` bound automatically.
-///
-/// # What it proves
-///
-/// For structs the derive emits a `size_of` equality,
-/// `size_of::<S>() == size_of::<F1>() + ...`, which fails `cargo check` for
-/// any padded type (for `repr(C)` the equality holds iff there is no padding
-/// anywhere, including trailing padding). Non-generic types get the assertion
-/// at item level; generic types get it in an inline `const` inside `is_valid`,
-/// checked at monomorphisation.
-///
-/// # Crate path
-///
-/// Every emitted path goes through one root: `#[byte_stable(crate =
-/// "::some::path")]` on the item overrides it, otherwise the `byte-stable`
-/// dependency of the calling crate is used (`proc_macro_crate`), falling back
-/// to `::flux::byte_stable`. No import is assumed in the caller.
-///
-/// # Soundness argument (covers the generated `unsafe impl`)
-///
-/// 1. No padding: the required `repr` gives a defined layout and the `size_of`
-///    proof rules out padding, so every byte is initialized.
-/// 2. Exact validation: `is_valid` checks each field over its disjoint
-///    `offset_of` range, tiling the whole value (enums check discriminant
-///    membership), so only valid values pass.
-/// 3. No interior mutability: every field type is `ByteStable`, which already
-///    rules out `UnsafeCell`, so the property holds transitively.
-///
-/// Padding is rejected:
+/// `LAYOUT_PROOF` is `size_of::<S>() == sum of field sizes`, so padded types
+/// do not build. `#[byte_stable(crate = "::path")]` overrides the trait path;
+/// the default is the caller's `byte-stable` dependency, then
+/// `::flux::byte_stable`.
 ///
 /// ```compile_fail
 /// use byte_stable_derive::ByteStable;
@@ -58,8 +25,6 @@ use syn::{
 ///     b: u64,
 /// }
 /// ```
-///
-/// A missing `repr` is rejected:
 ///
 /// ```compile_fail
 /// use byte_stable_derive::ByteStable;
@@ -170,8 +135,7 @@ fn derive_struct(
             "ByteStable derive requires #[repr(C)] or #[repr(transparent)] on structs",
         ));
     }
-    // `packed` removes the padding the proof looks for but leaves fields
-    // misaligned, which every `&field` read would then violate.
+    // `packed` passes the size proof but misaligns fields.
     if has_repr(&input.attrs, "packed") {
         return Err(syn::Error::new_spanned(name, "ByteStable derive rejects #[repr(packed)]"));
     }
@@ -220,9 +184,8 @@ fn derive_struct(
         });
         quote!(#(#checks)&&*)
     };
-    // Field proofs first so a padded field reports at its own type; then the
-    // size sum, which for `repr(C)` is zero padding. Non-generic types also
-    // get an item-level copy so the failure surfaces at `cargo check`.
+    // Item-level copy for non-generic types so the failure surfaces at `cargo
+    // check`.
     let proof = quote!({
         #(let () = <#tys as #root::ByteStable>::LAYOUT_PROOF;)*
         ::core::assert!(#size == #sum);

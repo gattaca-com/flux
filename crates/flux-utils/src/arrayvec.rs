@@ -338,11 +338,8 @@ impl<T: Copy, const N: usize> FromIterator<T> for ArrayVec<T, N> {
     }
 }
 
-/// Fixed-capacity UTF-8 string with fully-initialized storage.
-///
-/// Bytes past `len` are always zero, so the whole value is initialized memory
-/// that can be shipped as raw bytes. `N` must be a multiple of 8: `len` is a
-/// `usize` followed by `[u8; N]`, so any other `N` leaves trailing padding.
+/// Bytes past `len` are zero. Byte views need `N % 8 == 0` (no trailing
+/// padding).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ArrayStr<const N: usize> {
@@ -357,15 +354,8 @@ impl<const N: usize> Default for ArrayStr<N> {
     }
 }
 
-// Safety: 1. every constructor leaves the whole value initialized (bytes
-// past `len` are zero, `Copy` preserves bytes) and the inline assertions
-// below keep the layout padding-free (`len: usize` followed by `[u8; N]`);
-// 2. `is_valid` accepts only `len <= N` with valid UTF-8 in `data[..len]`,
-// exactly what `as_str` borrows unchecked; 3. the fields are plain data with
-// no interior mutability.
+// Safety: zeroed tail, UTF-8 validated below, plain data.
 unsafe impl<const N: usize> byte_stable::ByteStable for ArrayStr<N> {
-    // `{ len: usize, data: [u8; N] }` has trailing padding unless `N % 8 == 0`.
-    // Other `N` stay usable as strings; only their byte views fail to build.
     const LAYOUT_PROOF: () = assert!(
         N.is_multiple_of(8) && size_of::<Self>() == size_of::<usize>() + N,
         "ArrayStr<N> can only be shipped as bytes when N is a multiple of 8"
@@ -389,9 +379,7 @@ impl<const N: usize> ArrayStr<N> {
         Self { len: 0, data: [0; N] }
     }
 
-    /// The string's bytes. Inherent so `s.as_bytes()` keeps meaning this when
-    /// `byte_stable::ByteStable` is in scope; the whole value's bytes are
-    /// `ByteStable::as_bytes(&s)`.
+    /// Inherent so it wins over `ByteStable::as_bytes` (the whole value).
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         self.as_slice()
@@ -399,9 +387,7 @@ impl<const N: usize> ArrayStr<N> {
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        // Safety: every mutation path only writes valid UTF-8 (`push_byte`
-        // is ASCII-only, `push_str_truncate` stops at a char boundary, the
-        // `TryFrom` impls validate), and `len <= N` always holds.
+        // Safety: every writer keeps `data[..len]` valid UTF-8.
         unsafe { core::str::from_utf8_unchecked(self.as_slice()) }
     }
 
@@ -428,7 +414,6 @@ impl<const N: usize> ArrayStr<N> {
     /// Push a single ASCII byte. Panics if full or non-ASCII.
     #[inline]
     pub(crate) fn push_byte(&mut self, b: u8) {
-        // `as_str` relies on this for `from_utf8_unchecked`; it must hold in release.
         assert!(b.is_ascii(), "push_byte requires ASCII");
         assert!(self.len < N, "push capacity overflow");
         self.data[self.len] = b;

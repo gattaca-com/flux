@@ -14,8 +14,7 @@ pub const DEFAULT_TCP_USER_TIMEOUT_MS: u32 = 10_000;
 const DEFAULT_TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 5;
 const DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS: libc::c_int = 2;
 const DEFAULT_TCP_KEEPALIVE_PROBES: libc::c_int = 3;
-// The heap buffer is word-backed so every payload starts at an 8-byte-aligned
-// address and can be cast to 8-aligned zero-copy types without copying.
+// Word-backed so payloads are 8-aligned.
 enum RxBuf {
     Heap(Vec<u64>),
     DCache,
@@ -79,9 +78,7 @@ pub(crate) fn write_frame_header(
 /// Write only the `[len]` half of a frame header. Used when frames are staged
 /// ahead of the write and stamped with `write_frame_ts` once they go out.
 ///
-/// # Panics
-/// If `payload_len` exceeds `u32::MAX`. The header cannot express it and a
-/// truncated length would corrupt the stream, so this is a caller bug.
+/// Panics above `u32::MAX`: a truncated length would corrupt the stream.
 #[inline]
 pub(crate) fn write_frame_len(header: &mut [u8], payload_len: usize) {
     assert!(
@@ -163,9 +160,7 @@ impl Default for RxState {
 ///     with the deserialised T.
 ///   - Continues reading frames until `WouldBlock` (no more messages are
 ///     ready).
-///   - The payload slice starts at an 8-byte-aligned address (the heap buffer
-///     is word-backed), so receivers can cast it to 8-aligned zero-copy types
-///     without copying.
+///   - Payload slices are 8-byte aligned.
 ///
 /// Recconect handling:
 ///   - If `ConnState::Disconnected` is returned caller must treat the

@@ -70,10 +70,7 @@ enum Fam {
 }
 
 fn stamp(tile: u16, slot: u64) -> TrackingTimestamp {
-    // Wall clocks must be near-live and in the past: `IngestionTime::from`
-    // projects them back onto the TSC, which saturates for times far in the
-    // past, and `elapsed` panics for times in the future (including the
-    // publish time 5ms later).
+    // Near-live and in the past: `IngestionTime::from` projects onto the TSC.
     let ingestion = IngestionTime::new(
         Nanos(Nanos::now().0 - 10_000_000 - slot * 1_000_000),
         Instant(1_000_000 + u64::from(tile) * 1_000 + slot),
@@ -101,8 +98,6 @@ fn hand_build(
 ) -> Vec<u8> {
     let comp = zstd::bulk::compress(plain_tail, 3).unwrap();
     let mut bytes = vec![0u8; size_of::<BlobHeader>()];
-    // Field offsets come from the header type, values are written by hand,
-    // so this stays independent of `BlobCache` while following the layout.
     let mut put = |at: usize, v: &[u8]| bytes[at..at + v.len()].copy_from_slice(v);
     put(offset_of!(BlobHeader, magic), &MAGIC);
     put(offset_of!(BlobHeader, version), &FORMAT_VERSION.to_le_bytes());
@@ -199,8 +194,7 @@ fn end_to_end_cache_flush_decode() {
         assert_eq!(got.data(), want.data());
         assert_eq!(got.ingestion_time().real(), want.ingestion_time().real());
         assert_eq!(got.tile_id(), want.tile_id());
-        // The portable record keeps nanosecond wall clocks, but rebuilding a
-        // local timestamp re-reads the live clock, so allow a tiny drift.
+        // Rebuilding the timestamp re-reads the live clock.
         let drift = got.publish_t().0 as i64 - want.publish_t().0 as i64;
         assert!(drift.abs() <= 1_000_000, "publish_t drifted by {drift}ns");
     }
@@ -392,8 +386,6 @@ fn concatenated_blobs_walk_off_disk() {
 #[test]
 fn corrupt_zstd_tail_fails_decode() {
     let mut bytes = leaf_blob(2);
-    // First byte of the zstd frame: flipping it breaks the frame magic, so
-    // the decoder must fail instead of returning garbage.
     let comp_off = size_of::<BlobHeader>() + size_of::<MetaV1>().next_multiple_of(8);
     bytes[comp_off] ^= 0xff;
     let mut a = Scratch::new();
@@ -436,8 +428,7 @@ fn bogus_metadata_hash_rejected_for_meta_and_decode() {
 #[test]
 fn wrong_decompressed_len_fails_without_allocating() {
     let mut bytes = leaf_blob(1);
-    // 1 TiB: returning here proves the header was validated before any
-    // allocation, since actually allocating it would OOM the test.
+    // 1 TiB: allocating it would OOM, so returning proves the pre-check.
     let at = offset_of!(BlobHeader, decompressed_len);
     bytes[at..at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
     let mut a = Scratch::new();
@@ -473,7 +464,6 @@ fn wrong_metadata_len_rejected() {
 fn flushed_blob_padding_is_zero() {
     let mut cache = BlobCache::new();
     cache.push(&InternalMessage::new(stamp(1, 1), Leaf { slot: 7, extra: 0, flags: 0 }));
-    // Single-byte metadata leaves a 7-byte pad; the asserts below are not vacuous.
     let meta = Flag { ok: true };
     let mut blobs: Vec<Vec<u8>> = Vec::new();
     cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
@@ -521,8 +511,6 @@ fn internal_metadata_bincode_layout_is_pinned() {
     let stamp = TrackingTimestamp::new(3);
     let meta = TrackingTimestampWire::from(stamp);
     let bytes = bincode::serialize(&meta).unwrap();
-    // 8-byte ingestion + 8-byte publish + 2-byte tile id; the 6-byte
-    // pad is serde-skipped so legacy blobs are unchanged.
     assert_eq!(bytes.len(), 18);
     let back: TrackingTimestampWire = bincode::deserialize(&bytes).unwrap();
     assert_eq!(back.ingestion_t_real, meta.ingestion_t_real);
