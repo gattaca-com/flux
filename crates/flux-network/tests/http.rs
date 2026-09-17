@@ -330,6 +330,41 @@ fn client_server_roundtrip() {
 }
 
 #[test]
+fn client_oversize_body_rejected_without_disconnect() {
+    let (mut server, addr) = server();
+    let mut client = HttpNetwork::default().with_max_body_bytes(8);
+    let token = client.connect(addr);
+    let mut sent = false;
+    let mut body = None;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && body.is_none() {
+        let mut replies = Vec::new();
+        server.poll_with(|e| {
+            if let HttpEvent::Request { token, request } = e {
+                replies.push((token, request.body.to_vec()));
+            }
+        });
+        for (token, b) in replies {
+            server.respond(token, 200, &[], &b);
+        }
+        let mut connected = false;
+        client.poll_with(|e| match e {
+            HttpEvent::Connected { .. } => connected = true,
+            HttpEvent::Disconnected { .. } => panic!("an oversize body must not disconnect"),
+            HttpEvent::Response { response, .. } => body = Some(response.body.to_vec()),
+            _ => {}
+        });
+        if connected && !sent {
+            assert!(!client.request(token, "POST", "/", &[], &[0; 9]));
+            assert!(client.request(token, "POST", "/", &[], b"fits"));
+            sent = true;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(body.unwrap(), b"fits");
+}
+
+#[test]
 fn client_chunked_response() {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();

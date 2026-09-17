@@ -147,6 +147,10 @@ impl HttpNetwork {
         self.idle_timeout = None;
         self
     }
+    /// Largest request or response body this network accepts.
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes
+    }
     fn group(&mut self) -> TcpGroup {
         let Self { network, group, name, max_head_bytes, max_body_bytes, socket_buf_size, .. } =
             self;
@@ -329,7 +333,9 @@ impl HttpNetwork {
         self.conns.retain(|conn| conn.token != token);
         true
     }
-    /// Queues one request on an outbound endpoint.
+    /// Queues one request on an outbound endpoint. Returns `false` for invalid
+    /// input or a body larger than `max_body_bytes`, which the send backlog
+    /// could never hold.
     pub fn request(
         &mut self,
         token: Token,
@@ -341,6 +347,7 @@ impl HttpNetwork {
         if !valid_token(method) ||
             path.is_empty() ||
             path.contains(['\r', '\n', ' ']) ||
+            body.len() > self.max_body_bytes ||
             headers.iter().any(|(n, v)| {
                 !valid_token(n) ||
                     v.contains(['\r', '\n']) ||

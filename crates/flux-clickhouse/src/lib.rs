@@ -45,7 +45,9 @@
 //! # Limitations
 //! No TLS, compression, streaming, or cancellation. Response bodies and,
 //! through the send backlog, insert bodies are bounded by the network's
-//! `max_body_bytes`: size it to the largest batch you insert. `ClickHouse`
+//! `max_body_bytes`: size it to the largest batch you insert, `insert` panics
+//! on a larger one, and a result larger than it arrives as
+//! [`Error::Disconnected`]. `ClickHouse`
 //! closes idle keep-alive connections after its `keep_alive_timeout`; the
 //! network reconnects on its own and sends return `None` until it has.
 
@@ -177,11 +179,20 @@ impl ClickHouse {
     }
     /// Sends an `INSERT ... FORMAT <fmt>` statement with `data` as its body.
     /// Returns `None` like [`Self::query`].
+    ///
+    /// Panics if `data` exceeds the network's `max_body_bytes`: the network
+    /// could never queue it, so batches must be split to fit.
     pub fn insert(&mut self, http: &mut HttpNetwork, sql: &str, data: &[u8]) -> Option<QueryId> {
         let path = self.path(Some(sql));
         self.send(http, &path, data)
     }
     fn send(&mut self, http: &mut HttpNetwork, path: &str, body: &[u8]) -> Option<QueryId> {
+        assert!(
+            body.len() <= http.max_body_bytes(),
+            "body of {} bytes exceeds the network's max_body_bytes of {}; split the batch or raise HttpNetwork::with_max_body_bytes",
+            body.len(),
+            http.max_body_bytes()
+        );
         self.connect(http);
         let conn = self.conns.iter_mut().find(|conn| conn.connected && conn.in_flight.is_none())?;
         let headers =

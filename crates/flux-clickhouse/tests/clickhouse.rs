@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::Ipv4Addr,
     thread,
     time::{Duration, Instant},
 };
@@ -156,32 +156,28 @@ fn dropped_connection_fails_in_flight_query_then_reconnects() {
     ]);
 }
 
-#[test]
-#[ignore = "needs a ClickHouse server; set CLICKHOUSE_ADDR (default 127.0.0.1:8123)"]
-fn live_server_roundtrip() {
-    let addr: SocketAddr = std::env::var("CLICKHOUSE_ADDR")
+/// `RowBinary` rows for a `(id UInt64, value UInt32)` table with `value == id`.
+fn rows(n: u64) -> Vec<u8> {
+    let mut rows = Vec::with_capacity(n as usize * 12);
+    for i in 0..n {
+        rows.extend_from_slice(&i.to_le_bytes());
+        rows.extend_from_slice(&(i as u32).to_le_bytes());
+    }
+    rows
+}
+
+/// Runs `steps` one at a time against `CLICKHOUSE_ADDR` (default
+/// `127.0.0.1:8123`); a step with data is an insert, otherwise a query.
+fn live_run(http: &mut HttpNetwork, steps: &[(&str, Option<&[u8]>)]) -> Vec<Outcome> {
+    let addr = std::env::var("CLICKHOUSE_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8123".to_owned())
         .parse()
         .unwrap();
-    let mut http = HttpNetwork::default();
     let mut ch = ClickHouse::new(addr);
-    let table = format!("flux_clickhouse_test_{}", std::process::id());
-    let sql = [
-        format!("CREATE TABLE {table} (id UInt64, value UInt32) ENGINE = Memory"),
-        format!("INSERT INTO {table} FORMAT RowBinary"),
-        format!("SELECT sum(id), sum(value) FROM {table} FORMAT TabSeparated"),
-        "SELEC".to_owned(),
-        format!("DROP TABLE {table}"),
-    ];
-    let mut rows = Vec::new();
-    for (id, value) in [(1u64, 10u32), (2, 20), (3, 30)] {
-        rows.extend_from_slice(&id.to_le_bytes());
-        rows.extend_from_slice(&value.to_le_bytes());
-    }
     let mut outcomes = Vec::new();
     let mut pending = None;
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && outcomes.len() < sql.len() {
+    while Instant::now() < deadline && outcomes.len() < steps.len() {
         http.poll_with(|event| {
             assert!(ch.on_event(&event, |id, result| {
                 assert_eq!(Some(id), pending);
@@ -189,20 +185,56 @@ fn live_server_roundtrip() {
                 outcomes.push(record(&result));
             }));
         });
-        if pending.is_none() && outcomes.len() < sql.len() {
-            let step = outcomes.len();
-            pending = if step == 1 {
-                ch.insert(&mut http, &sql[1], &rows)
-            } else {
-                ch.query(&mut http, &sql[step])
+        if pending.is_none() && outcomes.len() < steps.len() {
+            pending = match steps[outcomes.len()] {
+                (sql, Some(data)) => ch.insert(http, sql, data),
+                (sql, None) => ch.query(http, sql),
             };
         }
         thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(outcomes.len(), sql.len(), "{outcomes:?}");
+    assert_eq!(outcomes.len(), steps.len(), "{outcomes:?}");
+    outcomes
+}
+
+#[test]
+#[ignore = "needs a ClickHouse server; set CLICKHOUSE_ADDR (default 127.0.0.1:8123)"]
+fn live_server_roundtrip() {
+    let table = format!("flux_clickhouse_test_{}", std::process::id());
+    let rows = rows(4);
+    let outcomes = live_run(&mut HttpNetwork::default(), &[
+        (&format!("CREATE TABLE {table} (id UInt64, value UInt32) ENGINE = Memory"), None),
+        (&format!("INSERT INTO {table} FORMAT RowBinary"), Some(&rows)),
+        (&format!("SELECT sum(id), sum(value) FROM {table} FORMAT TabSeparated"), None),
+        ("SELEC", None),
+        (&format!("DROP TABLE {table}"), None),
+    ]);
     assert_eq!(outcomes[0], Outcome::Ok(Vec::new()));
     assert_eq!(outcomes[1], Outcome::Ok(Vec::new()));
-    assert_eq!(outcomes[2], Outcome::Ok(b"6\t60\n".to_vec()));
+    assert_eq!(outcomes[2], Outcome::Ok(b"6\t6\n".to_vec()));
     assert!(matches!(&outcomes[3], Outcome::Server { code: Some(62), .. }), "{:?}", outcomes[3]);
     assert_eq!(outcomes[4], Outcome::Ok(Vec::new()));
+}
+
+#[test]
+#[ignore = "needs a ClickHouse server; set CLICKHOUSE_ADDR (default 127.0.0.1:8123)"]
+fn live_large_insert_lands_whole() {
+    let table = format!("flux_clickhouse_large_{}", std::process::id());
+    let n = 5_000_000;
+    let rows = rows(n);
+    let mut http = HttpNetwork::default().with_max_body_bytes(2 * rows.len());
+    let outcomes = live_run(&mut http, &[
+        (
+            &format!(
+                "CREATE TABLE {table} (id UInt64, value UInt32) ENGINE = MergeTree ORDER BY id"
+            ),
+            None,
+        ),
+        (&format!("INSERT INTO {table} FORMAT RowBinary"), Some(&rows)),
+        (&format!("SELECT count(), sum(value) FROM {table} FORMAT TabSeparated"), None),
+        (&format!("DROP TABLE {table}"), None),
+    ]);
+    assert_eq!(outcomes[1], Outcome::Ok(Vec::new()));
+    let sum: u64 = (0..n).sum();
+    assert_eq!(outcomes[2], Outcome::Ok(format!("{n}\t{sum}\n").into_bytes()));
 }
