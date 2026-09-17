@@ -147,7 +147,6 @@ impl HttpNetwork {
         self.idle_timeout = None;
         self
     }
-    /// Largest request or response body this network accepts.
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
     }
@@ -333,9 +332,8 @@ impl HttpNetwork {
         self.conns.retain(|conn| conn.token != token);
         true
     }
-    /// Queues one request on an outbound endpoint. Returns `false` for invalid
-    /// input or a body larger than `max_body_bytes`, which the send backlog
-    /// could never hold.
+    /// Queues one request on an outbound endpoint; bodies over
+    /// `max_body_bytes` are refused.
     pub fn request(
         &mut self,
         token: Token,

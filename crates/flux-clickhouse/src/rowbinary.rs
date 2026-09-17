@@ -1,32 +1,21 @@
-//! `RowBinary` encoding of [`serde::Serialize`] rows for insert bodies.
+//! `RowBinary` encoding of `serde::Serialize` rows.
 //!
-//! Field order is column order, so name the columns in the statement:
-//! [`insert_statement`] builds `INSERT INTO t (a, b, ...) FORMAT RowBinary`
-//! from a row's field names and [`encode`] appends one row to a body.
-//!
-//! Integers and floats are little-endian, `bool` is one byte, `str` and bytes
-//! are a LEB128 length then the bytes (`String` or `Array(UInt8)`), `Option`
-//! is a `Nullable` flag byte then the value, sequences and maps are a LEB128
-//! count then the elements, and tuples and nested structs are their elements
-//! back to back (`Tuple`). Enums, `char`, unit, and sequences of unknown
-//! length are rejected.
+//! [`encode`] appends one row to an insert body; [`insert_statement`] names
+//! the columns after the row's fields. Integers and floats are little-endian,
+//! `bool` one byte, strings and bytes LEB128-length-prefixed, `Option` a
+//! `Nullable` flag byte, sequences a LEB128 count, tuples and nested structs
+//! bare elements. Enums, `char`, and maps are rejected.
 
 use std::fmt;
 
 use serde::{Serialize, ser};
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-    Unsupported(&'static str),
-    Custom(String),
-}
+#[derive(Debug)]
+pub struct Error(String);
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported(what) => write!(f, "{what} has no RowBinary encoding"),
-            Self::Custom(message) => f.write_str(message),
-        }
+        f.write_str(&self.0)
     }
 }
 
@@ -34,24 +23,25 @@ impl std::error::Error for Error {}
 
 impl ser::Error for Error {
     fn custom<T: fmt::Display>(message: T) -> Self {
-        Self::Custom(message.to_string())
+        Self(message.to_string())
     }
 }
 
-/// Appends `row` to `out`.
+fn unsupported(what: &str) -> Error {
+    Error(format!("{what} has no RowBinary encoding"))
+}
+
 pub fn encode<T: Serialize + ?Sized>(out: &mut Vec<u8>, row: &T) -> Result<(), Error> {
     row.serialize(&mut Encoder { out, columns: None, depth: 0 })
 }
 
-/// Builds `INSERT INTO <table> (<fields>) FORMAT RowBinary` from the field
-/// names of `row`, which must be a struct.
 pub fn insert_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<String, Error> {
     let mut scratch = Vec::new();
     let mut encoder = Encoder { out: &mut scratch, columns: Some(Vec::new()), depth: 0 };
     row.serialize(&mut encoder)?;
     let columns = encoder.columns.take().unwrap_or_default();
     if columns.is_empty() {
-        return Err(Error::Unsupported("a row that is not a struct with named fields"))
+        return Err(unsupported("a row that is not a struct"))
     }
     Ok(format!("INSERT INTO {table} ({}) FORMAT RowBinary", columns.join(", ")))
 }
@@ -75,7 +65,7 @@ impl Encoder<'_> {
         }
     }
     fn count(&mut self, len: Option<usize>) -> Result<(), Error> {
-        let len = len.ok_or(Error::Unsupported("a sequence of unknown length"))?;
+        let len = len.ok_or_else(|| unsupported("a sequence of unknown length"))?;
         self.leb128(len as u64);
         Ok(())
     }
@@ -97,7 +87,7 @@ impl ser::Serializer for &mut Encoder<'_> {
     type SerializeTuple = Self;
     type SerializeTupleStruct = Self;
     type SerializeTupleVariant = ser::Impossible<(), Error>;
-    type SerializeMap = Self;
+    type SerializeMap = ser::Impossible<(), Error>;
     type SerializeStruct = Self;
     type SerializeStructVariant = ser::Impossible<(), Error>;
 
@@ -114,7 +104,7 @@ impl ser::Serializer for &mut Encoder<'_> {
         Ok(())
     }
     fn serialize_char(self, _: char) -> Result<(), Error> {
-        Err(Error::Unsupported("char"))
+        Err(unsupported("char"))
     }
     fn serialize_str(self, v: &str) -> Result<(), Error> {
         self.serialize_bytes(v.as_bytes())
@@ -133,13 +123,13 @@ impl ser::Serializer for &mut Encoder<'_> {
         v.serialize(self)
     }
     fn serialize_unit(self) -> Result<(), Error> {
-        Err(Error::Unsupported("unit"))
+        Err(unsupported("unit"))
     }
     fn serialize_unit_struct(self, _: &'static str) -> Result<(), Error> {
-        Err(Error::Unsupported("a unit struct"))
+        Err(unsupported("a unit struct"))
     }
     fn serialize_unit_variant(self, _: &'static str, _: u32, _: &'static str) -> Result<(), Error> {
-        Err(Error::Unsupported("an enum"))
+        Err(unsupported("an enum"))
     }
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
         self,
@@ -155,7 +145,7 @@ impl ser::Serializer for &mut Encoder<'_> {
         _: &'static str,
         _: &T,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported("an enum"))
+        Err(unsupported("an enum"))
     }
     fn serialize_seq(self, len: Option<usize>) -> Result<Self, Error> {
         self.count(len)?;
@@ -174,11 +164,10 @@ impl ser::Serializer for &mut Encoder<'_> {
         _: &'static str,
         _: usize,
     ) -> Result<Self::SerializeTupleVariant, Error> {
-        Err(Error::Unsupported("an enum"))
+        Err(unsupported("an enum"))
     }
-    fn serialize_map(self, len: Option<usize>) -> Result<Self, Error> {
-        self.count(len)?;
-        Ok(self)
+    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Error> {
+        Err(unsupported("a map"))
     }
     fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
         self.depth += 1;
@@ -191,56 +180,30 @@ impl ser::Serializer for &mut Encoder<'_> {
         _: &'static str,
         _: usize,
     ) -> Result<Self::SerializeStructVariant, Error> {
-        Err(Error::Unsupported("an enum"))
+        Err(unsupported("an enum"))
     }
 }
 
-impl ser::SerializeSeq for &mut Encoder<'_> {
-    type Ok = ();
-    type Error = Error;
-    fn serialize_element<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut **self)
-    }
-    fn end(self) -> Result<(), Error> {
-        Ok(())
-    }
+macro_rules! elements {
+    ($($trait:ident::$method:ident),* $(,)?) => {$(
+        impl ser::$trait for &mut Encoder<'_> {
+            type Ok = ();
+            type Error = Error;
+            fn $method<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Error> {
+                v.serialize(&mut **self)
+            }
+            fn end(self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+    )*};
 }
 
-impl ser::SerializeTuple for &mut Encoder<'_> {
-    type Ok = ();
-    type Error = Error;
-    fn serialize_element<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut **self)
-    }
-    fn end(self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-impl ser::SerializeTupleStruct for &mut Encoder<'_> {
-    type Ok = ();
-    type Error = Error;
-    fn serialize_field<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut **self)
-    }
-    fn end(self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-impl ser::SerializeMap for &mut Encoder<'_> {
-    type Ok = ();
-    type Error = Error;
-    fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
-        key.serialize(&mut **self)
-    }
-    fn serialize_value<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut **self)
-    }
-    fn end(self) -> Result<(), Error> {
-        Ok(())
-    }
-}
+elements!(
+    SerializeSeq::serialize_element,
+    SerializeTuple::serialize_element,
+    SerializeTupleStruct::serialize_field,
+);
 
 impl ser::SerializeStruct for &mut Encoder<'_> {
     type Ok = ();
