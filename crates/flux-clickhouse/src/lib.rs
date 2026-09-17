@@ -3,7 +3,10 @@ pub mod rowbinary;
 use std::{fmt::Write as _, net::SocketAddr};
 
 pub use flux_network::http::RequestId;
-use flux_network::http::{Failure, HttpEvent, HttpNetwork, HttpPool, HttpResponse};
+use flux_network::{
+    http::{Failure, HttpEvent, HttpNetwork, HttpPool, HttpResponse},
+    tcp::TcpNetworkCore,
+};
 use serde::Serialize;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,9 +36,14 @@ pub struct ClickHouse {
 }
 
 impl ClickHouse {
-    pub fn new(http: &mut HttpNetwork, addr: SocketAddr, connections: usize) -> Self {
+    pub fn new(
+        http: &mut HttpNetwork,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        connections: usize,
+    ) -> Self {
         Self {
-            pool: http.pool(addr, connections),
+            pool: http.pool(net, addr, connections),
             user: "default".to_owned(),
             key: String::new(),
             settings: vec![("wait_end_of_query".to_owned(), "1".to_owned())],

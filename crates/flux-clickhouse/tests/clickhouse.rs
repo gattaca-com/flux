@@ -5,7 +5,10 @@ use std::{
 };
 
 use flux_clickhouse::{ClickHouse, Error};
-use flux_network::http::{HttpEvent, HttpNetwork};
+use flux_network::{
+    http::{HttpEvent, HttpNetwork},
+    tcp::TcpNetwork,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -45,11 +48,14 @@ fn pooled_inserts_and_queries() {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
+    let mut net = TcpNetwork::default();
     let mut http = HttpNetwork::default()
         .with_max_queued_bytes(4096)
         .with_request_timeout(Duration::from_millis(300).into());
-    http.listen(addr).unwrap();
-    let ch = ClickHouse::new(&mut http, addr, 2).with_credentials("w", "s").with_database("db");
+    http.listen(&mut net, addr).unwrap();
+    let ch = ClickHouse::new(&mut http, &mut net, addr, 2)
+        .with_credentials("w", "s")
+        .with_database("db");
     let insert = ch.insert_rows(&mut http, "t", &[row]).unwrap();
     let bad = ch.query(&mut http, "SELEC").unwrap();
     let hang = ch.query(&mut http, "hang").unwrap();
@@ -59,7 +65,10 @@ fn pooled_inserts_and_queries() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.len() < 3 {
         let mut replies = Vec::new();
-        http.poll_with(|event| {
+        net.poll_with(|event| {
+            http.on_event(&event);
+        });
+        http.drive(&mut net, |event| {
             if let Some((id, result)) = ch.outcome(&event) {
                 outcomes.push((id, match result {
                     Ok(body) => Ok(body.to_vec()),
@@ -84,11 +93,17 @@ fn pooled_inserts_and_queries() {
         for (token, is_insert, is_hang) in replies {
             if is_hang {
             } else if !is_insert {
-                http.respond(token, 400, &[("X-ClickHouse-Exception-Code", "62")], b"Code: 62");
+                http.respond(
+                    &mut net,
+                    token,
+                    400,
+                    &[("X-ClickHouse-Exception-Code", "62")],
+                    b"Code: 62",
+                );
             } else if inserts.len() == 1 {
-                http.disconnect(token);
+                http.disconnect(&mut net, token);
             } else {
-                http.respond(token, 200, &[], b"");
+                http.respond(&mut net, token, 200, &[], b"");
             }
         }
         thread::sleep(Duration::from_millis(1));

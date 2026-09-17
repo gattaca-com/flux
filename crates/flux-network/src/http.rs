@@ -1,24 +1,31 @@
-//! Poll-driven HTTP over [`crate::tcp::TcpNetwork`].
+//! Poll-driven HTTP over a caller-owned [`crate::tcp::TcpNetworkCore`],
+//! sharing one poll with the tile's other traffic.
 //!
 //! [`HttpNetwork`] can listen for requests and maintain outbound endpoints in
-//! one event loop. Events borrow parsed data only for the callback duration.
+//! one event loop: [`HttpNetwork::on_event`] claims its group's events from
+//! the network's handler and [`HttpNetwork::drive`] delivers them and sends
+//! queued requests. Events borrow parsed data only for the callback duration.
 //!
 //! ```no_run
 //! use std::net::SocketAddr;
-//! use flux_network::http::{HttpEvent, HttpNetwork};
+//! use flux_network::{http::{HttpEvent, HttpNetwork}, tcp::TcpNetwork};
+//! let mut net = TcpNetwork::default();
 //! let mut http = HttpNetwork::default();
-//! http.listen("127.0.0.1:8080".parse::<SocketAddr>().unwrap())?;
-//! let peer = http.connect("127.0.0.1:8081".parse::<SocketAddr>().unwrap());
+//! http.listen(&mut net, "127.0.0.1:8080".parse::<SocketAddr>().unwrap())?;
+//! let peer = http.connect(&mut net, "127.0.0.1:8081".parse::<SocketAddr>().unwrap());
 //! loop {
 //!     let mut response = None;
 //!     let mut request = false;
-//!     http.poll_with(|event| match event {
+//!     net.poll_with(|event| {
+//!         http.on_event(&event);
+//!     });
+//!     http.drive(&mut net, |event| match event {
 //!         HttpEvent::Request { token, .. } => response = Some(token),
 //!         HttpEvent::Connected { token } if token == peer => request = true,
 //!         _ => {}
 //!     });
-//!     if let Some(token) = response { http.respond(token, 200, &[], b"hello"); }
-//!     if request { http.request(peer, "GET", "/", &[], &[]); }
+//!     if let Some(token) = response { http.respond(&mut net, token, 200, &[], b"hello"); }
+//!     if request { http.request(&mut net, peer, "GET", "/", &[], &[]); }
 //! }
 //! # Ok::<(), std::io::Error>(())
 //! ```
@@ -44,7 +51,7 @@ use std::{
 use flux_timing::{Duration, Instant};
 use mio::Token;
 
-use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork};
+use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore};
 
 pub enum HttpEvent<'a> {
     Accepted { token: Token, peer_addr: SocketAddr },
@@ -113,7 +120,6 @@ enum Lifecycle {
     Disconnected(Token),
 }
 pub struct HttpNetwork {
-    network: TcpNetwork,
     group: Option<TcpGroup>,
     name: &'static str,
     max_head_bytes: usize,
@@ -131,7 +137,6 @@ pub struct HttpNetwork {
 impl Default for HttpNetwork {
     fn default() -> Self {
         Self {
-            network: TcpNetwork::default(),
             group: None,
             name: "http",
             max_head_bytes: 16 * 1024,
@@ -205,11 +210,10 @@ impl HttpNetwork {
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
     }
-    fn group(&mut self) -> TcpGroup {
-        let Self { network, group, name, max_head_bytes, max_body_bytes, socket_buf_size, .. } =
-            self;
+    fn group(&mut self, net: &mut TcpNetworkCore) -> TcpGroup {
+        let Self { group, name, max_head_bytes, max_body_bytes, socket_buf_size, .. } = self;
         *group.get_or_insert_with(|| {
-            network.add_group(TcpGroupConfig {
+            net.add_group(TcpGroupConfig {
                 name,
                 framing: Framing::Raw,
                 socket_buf_size: *socket_buf_size,
@@ -220,34 +224,25 @@ impl HttpNetwork {
             })
         })
     }
-    pub fn listen(&mut self, addr: SocketAddr) -> io::Result<()> {
-        let group = self.group();
-        self.network.listen(group, addr)
+    pub fn listen(&mut self, net: &mut TcpNetworkCore, addr: SocketAddr) -> io::Result<()> {
+        let group = self.group(net);
+        net.listen(group, addr)
     }
     /// Immediately disconnects an accepted client.
-    pub fn disconnect(&mut self, token: Token) -> bool {
+    pub fn disconnect(&mut self, net: &mut TcpNetworkCore, token: Token) -> bool {
         self.group.is_some() &&
             self.conns
                 .iter()
                 .any(|conn| conn.token == token && matches!(conn.role, Role::Accepted { .. })) &&
-            self.network.disconnect(token)
+            net.disconnect(token)
     }
-    /// Polls the network and delivers connection, request, and response events.
-    ///
-    /// A request event remains pending until [`Self::respond`] is called. The
-    /// handler may defer that call until a later poll; requests behind it stay
-    /// buffered until the response is sent.
-    pub fn poll_with<F>(&mut self, mut handler: F)
-    where
-        F: for<'a> FnMut(HttpEvent<'a>),
-    {
-        let Some(group) = self.group else { return };
-        let limit = self.buffer_limit();
-        let conns = &mut self.conns;
-        let lifecycle = &mut self.lifecycle;
-        self.network.poll_with(|event| match event {
+    /// Takes in one network event; returns whether it belonged to this
+    /// layer's group. Call from the network's `poll_with` handler.
+    pub fn on_event(&mut self, event: &TcpEvent<'_>) -> bool {
+        let Some(group) = self.group else { return false };
+        match *event {
             TcpEvent::Accepted { group: event_group, token, peer_addr } if event_group == group => {
-                conns.push(Conn {
+                self.conns.push(Conn {
                     token,
                     buf: Vec::new(),
                     dirty: false,
@@ -260,15 +255,16 @@ impl HttpNetwork {
                         head_request: false,
                     },
                 });
-                lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
+                self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
             TcpEvent::Connected { group: event_group, token, .. } if event_group == group => {
-                lifecycle.push(Lifecycle::Connected(token, None));
+                self.lifecycle.push(Lifecycle::Connected(token, None));
             }
             TcpEvent::Message { group: event_group, token, payload, .. }
                 if event_group == group =>
             {
-                if let Some(conn) = conns.iter_mut().find(|conn| conn.token == token) &&
+                let limit = self.buffer_limit();
+                if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
                     !is_draining(&conn.role) &&
                     !conn.over_limit
                 {
@@ -284,17 +280,30 @@ impl HttpNetwork {
                 }
             }
             TcpEvent::Disconnected { group: event_group, token, .. } if event_group == group => {
-                lifecycle.push(Lifecycle::Disconnected(token));
+                self.lifecycle.push(Lifecycle::Disconnected(token));
             }
-            _ => {}
-        });
-        for event in std::mem::take(&mut self.lifecycle) {
-            self.emit_lifecycle(event, &mut handler);
+            _ => return false,
         }
-        self.parse_dirty(&mut handler);
+        true
+    }
+    /// Delivers the events taken in since the last call, sweeps idle and
+    /// timed-out connections, and sends queued requests on idle pooled
+    /// connections. Call once per poll, after the network's `poll_with`.
+    ///
+    /// A request event remains pending until [`Self::respond`] is called. The
+    /// handler may defer that call until a later drive; requests behind it
+    /// stay buffered until the response is sent.
+    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        for event in std::mem::take(&mut self.lifecycle) {
+            self.emit_lifecycle(net, event, &mut handler);
+        }
+        self.parse_dirty(net, &mut handler);
         for conn in &mut self.conns {
             if conn.over_limit && !is_draining(&conn.role) {
-                self.network.disconnect(conn.token);
+                net.disconnect(conn.token);
                 conn.over_limit = false;
             }
         }
@@ -309,7 +318,7 @@ impl HttpNetwork {
                 .map(|conn| conn.token)
                 .collect();
             for token in expired {
-                self.network.disconnect(token);
+                net.disconnect(token);
             }
         }
         if let Some(timeout) = self.request_timeout {
@@ -324,15 +333,15 @@ impl HttpNetwork {
                     self.failed.push((in_flight.queued.id, Failure::TimedOut));
                 }
                 set_outbound_method(&mut self.conns[i].role, None);
-                self.network.disconnect(self.conns[i].token);
+                net.disconnect(self.conns[i].token);
             }
         }
         for (id, reason) in std::mem::take(&mut self.failed) {
             handler(HttpEvent::Failed { id, reason });
         }
-        self.dispatch();
+        self.dispatch(net);
     }
-    fn emit_lifecycle<F>(&mut self, event: Lifecycle, handler: &mut F)
+    fn emit_lifecycle<F>(&mut self, net: &mut TcpNetworkCore, event: Lifecycle, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -344,7 +353,7 @@ impl HttpNetwork {
             Lifecycle::Disconnected(token) => {
                 if let Some(i) = self.conns.iter().position(|conn| conn.token == token) {
                     if self.conns[i].dirty {
-                        self.parse_connection(i, handler);
+                        self.parse_connection(net, i, handler);
                     }
                     if matches!(self.conns[i].role, Role::Outbound { .. }) {
                         let answered = self.parse_eof_outbound(i, handler);
@@ -364,29 +373,29 @@ impl HttpNetwork {
             }
         }
     }
-    fn parse_dirty<F>(&mut self, handler: &mut F)
+    fn parse_dirty<F>(&mut self, net: &mut TcpNetworkCore, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
         for i in 0..self.conns.len() {
             if self.conns[i].dirty {
-                self.parse_connection(i, handler);
+                self.parse_connection(net, i, handler);
             }
         }
     }
-    fn parse_connection<F>(&mut self, i: usize, handler: &mut F)
+    fn parse_connection<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
         if matches!(self.conns[i].role, Role::Accepted { .. }) {
-            self.parse_and_emit(i, handler);
+            self.parse_and_emit(net, i, handler);
         } else {
-            self.parse_outbound(i, handler);
+            self.parse_outbound(net, i, handler);
         }
     }
-    pub fn connect(&mut self, addr: SocketAddr) -> Token {
-        let group = self.group();
-        let token = self.network.connect(group, addr);
+    pub fn connect(&mut self, net: &mut TcpNetworkCore, addr: SocketAddr) -> Token {
+        let group = self.group(net);
+        let token = net.connect(group, addr);
         self.conns.push(Conn {
             token,
             buf: Vec::new(),
@@ -397,10 +406,15 @@ impl HttpNetwork {
         });
         token
     }
-    pub fn pool(&mut self, addr: SocketAddr, connections: usize) -> HttpPool {
+    pub fn pool(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        connections: usize,
+    ) -> HttpPool {
         assert!(connections > 0, "a pool needs a connection");
         let pool = HttpPool(self.pools.len() as u32);
-        let tokens = (0..connections).map(|_| self.connect(addr)).collect();
+        let tokens = (0..connections).map(|_| self.connect(net, addr)).collect();
         self.pools.push(Pool {
             addr,
             tokens,
@@ -410,23 +424,32 @@ impl HttpNetwork {
         });
         pool
     }
+    /// Removes every connection and outbound endpoint; pending requests and
+    /// responses are dropped without events. Listeners stay registered, as
+    /// [`TcpNetworkCore`] has no way to remove them.
+    pub fn close(self, net: &mut TcpNetworkCore) {
+        for conn in &self.conns {
+            net.remove(conn.token);
+        }
+    }
     /// Permanently removes an outbound endpoint and stops it reconnecting.
-    pub fn remove(&mut self, token: Token) -> bool {
+    pub fn remove(&mut self, net: &mut TcpNetworkCore, token: Token) -> bool {
         if self.group.is_none() ||
             !self
                 .conns
                 .iter()
                 .any(|conn| conn.token == token && matches!(conn.role, Role::Outbound { .. })) ||
-            !self.network.remove(token)
+            !net.remove(token)
         {
             return false
         }
         self.conns.retain(|conn| conn.token != token);
         true
     }
-    /// Queues one request on an outbound endpoint.
+    /// Sends one request on an outbound endpoint.
     pub fn request(
         &mut self,
+        net: &mut TcpNetworkCore,
         token: Token,
         method: &str,
         path: &str,
@@ -443,7 +466,7 @@ impl HttpNetwork {
         };
         let Role::Outbound { addr, .. } = &c.role else { return false };
         let host = addr.to_string();
-        let sent = self.network.send_with(token, |out| {
+        let sent = net.send_with(token, |out| {
             write_head(out, method, path, headers, &host, body.len());
             out.extend_from_slice(body);
         });
@@ -452,6 +475,9 @@ impl HttpNetwork {
         }
         sent
     }
+    /// Queues one request on a pool for the next [`Self::drive`] to send,
+    /// handing the body back when it exceeds `max_body_bytes` or the queue
+    /// is full.
     pub fn send(
         &mut self,
         pool: HttpPool,
@@ -474,10 +500,9 @@ impl HttpNetwork {
         p.next_seq += 1;
         p.queued_bytes += head.len() + body.len();
         p.queue.push_back(Queued { id, method: method.to_owned(), head, body, retries });
-        self.dispatch();
         Ok(id)
     }
-    fn dispatch(&mut self) {
+    fn dispatch(&mut self, net: &mut TcpNetworkCore) {
         for p in 0..self.pools.len() {
             for t in 0..self.pools[p].tokens.len() {
                 let token = self.pools[p].tokens[t];
@@ -488,10 +513,10 @@ impl HttpNetwork {
                 else {
                     continue
                 };
-                let Some(next) = self.pools[p].queue.front() else { break };
-                let sent = self.network.send_with(token, |out| {
-                    out.extend_from_slice(&next.head);
-                    out.extend_from_slice(&next.body);
+                let Some(front) = self.pools[p].queue.front() else { break };
+                let sent = net.send_with(token, |out| {
+                    out.extend_from_slice(&front.head);
+                    out.extend_from_slice(&front.body);
                 });
                 if !sent {
                     continue
@@ -515,16 +540,16 @@ impl HttpNetwork {
         pool.queued_bytes += queued.head.len() + queued.body.len();
         pool.queue.push_front(queued);
     }
-    fn fail_outbound(&mut self, i: usize) {
+    fn fail_outbound(&mut self, net: &mut TcpNetworkCore, i: usize) {
         let token = self.conns[i].token;
         self.conns[i].buf.clear();
         set_outbound_method(&mut self.conns[i].role, None);
-        self.network.disconnect(token);
+        net.disconnect(token);
     }
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
     }
-    fn parse_and_emit<F>(&mut self, i: usize, handler: &mut F)
+    fn parse_and_emit<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -536,54 +561,52 @@ impl HttpNetwork {
         let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
         let mut req = httparse::Request::new(&mut hs);
         let Ok(state) = req.parse(buf) else {
-            self.error(i, 400);
+            self.error(net, i, 400);
             return
         };
         let httparse::Status::Complete(head) = state else {
             // A partial parse means every buffered byte is still head bytes.
             if !crlf_only(buf) {
-                self.error(i, 400);
+                self.error(net, i, 400);
             } else if over_limit || buf.len() > self.max_head_bytes {
-                self.error(i, 431);
+                self.error(net, i, 431);
             }
             return
         };
         if !crlf_only(&buf[..head]) {
-            self.error(i, 400);
+            self.error(net, i, 400);
             return
         }
         if head > self.max_head_bytes {
-            self.error(i, 431);
+            self.error(net, i, 431);
             return
         }
         let Some(len) = request_content_length(req.headers) else {
-            self.error(i, 400);
+            self.error(net, i, 400);
             return
         };
         if req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("transfer-encoding")) {
-            self.error(i, 501);
+            self.error(net, i, 501);
             return
         }
         if len > self.max_body_bytes {
-            self.error(i, 413);
+            self.error(net, i, 413);
             return
         }
         let Some(end) = head.checked_add(len) else {
-            self.error(i, 413);
+            self.error(net, i, 413);
             return
         };
         if buf.len() < end {
             if over_limit {
-                self.error(i, 413);
+                self.error(net, i, 413);
                 return
             }
             if has_token(req.headers, "expect", b"100-continue") &&
                 !accepted_continued_mut(&self.conns[i].role)
             {
                 let token = self.conns[i].token;
-                if self
-                    .network
-                    .send_with(token, |out| write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap())
+                if net.send_with(token, |out| write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap())
                 {
                     set_accepted_continued(&mut self.conns[i].role, true);
                 }
@@ -609,19 +632,20 @@ impl HttpNetwork {
         set_accepted_continued(&mut self.conns[i].role, false);
         set_accepted_head_request(&mut self.conns[i].role, head_request);
     }
-    fn error(&mut self, i: usize, status: u16) {
+    fn error(&mut self, net: &mut TcpNetworkCore, i: usize, status: u16) {
         set_accepted_state(&mut self.conns[i].role, State::Pending);
         set_accepted_close(&mut self.conns[i].role, true);
         let token = self.conns[i].token;
-        let _ = self.respond(token, status, &[], &[]);
+        let _ = self.respond(net, token, status, &[], &[]);
     }
     /// Sends the response for a pending request and returns whether it was
     /// queued.
     ///
-    /// Call this from a request handler or later from the poll loop. Each call
-    /// completes exactly one request for `token`.
+    /// Call this after the drive that delivered the request, or from a later
+    /// one. Each call completes exactly one request for `token`.
     pub fn respond(
         &mut self,
+        net: &mut TcpNetworkCore,
         token: Token,
         status: u16,
         headers: &[(&str, &str)],
@@ -651,7 +675,7 @@ impl HttpNetwork {
         let suppress_body =
             accepted_head_request(&self.conns[i].role) || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
-        let ok = self.network.send_with(token, |out| {
+        let ok = net.send_with(token, |out| {
             write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
             // Caller Connection headers only feed the close decision; exactly
             // one canonical Connection header is always written below.
@@ -684,12 +708,12 @@ impl HttpNetwork {
                 if close { State::Draining } else { State::Idle },
             );
             if close {
-                self.network.disconnect_when_drained(token);
+                net.disconnect_when_drained(token);
             }
         }
         ok
     }
-    fn parse_outbound<F>(&mut self, i: usize, handler: &mut F)
+    fn parse_outbound<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -700,18 +724,18 @@ impl HttpNetwork {
             let mut response = httparse::Response::new(&mut hs);
             let parsed = response.parse(b);
             let Ok(state) = parsed else {
-                self.fail_outbound(i);
+                self.fail_outbound(net, i);
                 return
             };
             let httparse::Status::Complete(head) = state else {
                 // A partial parse means every buffered byte is still head bytes.
                 if !crlf_only(b) || b.len() > self.max_head_bytes {
-                    self.fail_outbound(i);
+                    self.fail_outbound(net, i);
                 }
                 return
             };
             if !crlf_only(&b[..head]) || head > self.max_head_bytes {
-                self.fail_outbound(i);
+                self.fail_outbound(net, i);
                 return
             }
             let status = response.code.unwrap_or(0);
@@ -726,7 +750,7 @@ impl HttpNetwork {
                 (!no_body &&
                     matches!(content_length, ContentLength::Present(length) if length > self.max_body_bytes))
             {
-                self.fail_outbound(i);
+                self.fail_outbound(net, i);
                 return
             }
             let (consumed, decoded) = if no_body {
@@ -735,20 +759,20 @@ impl HttpNetwork {
                 match Self::decode_chunked(&b[head..], self.max_body_bytes, self.max_headers) {
                     Ok(Some((consumed, decoded))) => {
                         let Some(consumed) = head.checked_add(consumed) else {
-                            self.fail_outbound(i);
+                            self.fail_outbound(net, i);
                             return
                         };
                         (consumed, Some(decoded))
                     }
                     Ok(None) => return,
                     Err(()) => {
-                        self.fail_outbound(i);
+                        self.fail_outbound(net, i);
                         return
                     }
                 }
             } else if let ContentLength::Present(length) = content_length {
                 let Some(consumed) = head.checked_add(length) else {
-                    self.fail_outbound(i);
+                    self.fail_outbound(net, i);
                     return
                 };
                 if b.len() < consumed {
@@ -787,7 +811,7 @@ impl HttpNetwork {
             set_outbound_method(&mut self.conns[i].role, None);
             take_in_flight(&mut self.conns[i].role);
             if close {
-                self.network.disconnect(token);
+                net.disconnect(token);
                 return
             }
         }
