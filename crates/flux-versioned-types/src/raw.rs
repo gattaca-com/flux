@@ -23,13 +23,16 @@
 //!   every blob's total byte length is a multiple of 8 and concatenated blobs
 //!   in a file stay aligned. [`Blob::as_bytes`] returns exactly `128 +
 //!   round8(metadata_len) + round8(compressed_len)` bytes.
-//! * `decompressed_len` is `n_messages * (24 + size_of::<Leaf>())` and is
-//!   validated after decompression.
+//! * `decompressed_len` is `n_messages * (24 + size_of::<LeafVn>())` for the
+//!   version that wrote the blob. Readers check it against
+//!   [`Versioned::version_size`] before allocating and again after
+//!   decompression, so a hostile header cannot drive an allocation.
 //!
-//! The leaf version is identified by `type_hash` (the leaf's latest
-//! `TYPE_HASH`, no XOR) and decoded through [`Versioned::decode_versions`],
-//! which casts the section as the stored version and migrates to the latest.
-//! `metadata_type_hash` is the user metadata's latest `TYPE_HASH`.
+//! The leaf version is identified by `type_hash`: the plain `TYPE_HASH` of
+//! the version that wrote the blob (any entry of [`Versioned::VERSION_HASHES`],
+//! no XOR). [`Versioned::decode_versions`] casts the section as that version
+//! and migrates to the latest. `metadata_type_hash` identifies the user
+//! metadata version the same way.
 //! `type_name` is [`Versioned::NAME`] truncated to 64 bytes; it is only a
 //! label, identity is always the hash. `version` pins everything else: header
 //! layout, timestamp record, zstd. Change any of those, bump it.
@@ -60,8 +63,14 @@ pub const HEADER_LEN: usize = 128;
 pub const TIMESTAMP_STRIDE: usize = 24;
 /// Capacity of [`Blob::type_name`].
 pub const TYPE_NAME_LEN: usize = 64;
-/// Alignment required of every blob and section.
+/// Alignment required of every blob and section. Leaves must not need more.
 pub const ALIGN: usize = 8;
+
+// The header is read by native reinterpretation, so the format is defined by
+// this layout and nothing else. All producers and consumers run on x86_64.
+const _: () = assert!(cfg!(target_endian = "little") && size_of::<usize>() == 8);
+// `ArrayStr` is only padding-free when `N % 8 == 0`; pin the one we embed.
+const _: () = assert!(size_of::<ArrayStr<TYPE_NAME_LEN>>() == size_of::<usize>() + TYPE_NAME_LEN);
 
 /// Round up to a multiple of 8. `None` on overflow; callers map that to
 /// [`DecodeError::TooShort`] with an unsatisfiable length.
@@ -70,6 +79,11 @@ fn round8(n: u64) -> Option<u64> {
 }
 
 /// One batch of a single leaf type. See the [module docs](self) for the layout.
+///
+/// Obtain one through [`Blob::from_bytes`], [`Scratch::load`] or
+/// [`BlobCache::flush`]. The derived `try_ref_from_bytes` only validates the
+/// header's own fields, not the declared lengths against the slice, so
+/// accessors on a blob obtained that way may panic on out-of-range lengths.
 #[derive(TryFromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct Blob {
@@ -79,6 +93,7 @@ pub struct Blob {
     pub metadata_len: u32,
     /// Elements in each of the two compressed sections.
     pub n_messages: u32,
+    /// Writers zero it, readers ignore it.
     _reserved: u32,
     /// `TYPE_HASH` of the leaf version that wrote this blob.
     pub type_hash: u64,
@@ -260,8 +275,14 @@ impl Blob {
     /// Decode the user metadata as `U`, migrating if it was written as an
     /// older version. No decompression.
     pub fn user_metadata<U: Versioned>(&self) -> Result<U, DecodeError> {
-        if !U::VERSION_HASHES.contains(&self.metadata_type_hash) {
+        let Some(size) = U::version_size(self.metadata_type_hash) else {
             return Err(DecodeError::UnknownTypeHash(self.metadata_type_hash));
+        };
+        if self.metadata_len as usize != size {
+            return Err(DecodeError::LengthMismatch {
+                expected: size,
+                got: self.metadata_len as usize,
+            });
         }
         let out = U::decode_versions(self.metadata_type_hash, self.user_metadata_bytes())?;
         if out.len() != 1 {
@@ -281,25 +302,20 @@ impl Blob {
             return Err(DecodeError::UnknownTypeHash(self.type_hash));
         }
         let meta = self.user_metadata::<U>()?;
-        // `decompressed_len` uses the stride of the version that wrote the
-        // blob, which may be older than `T`; `decode_versions` validates the
-        // leaf section against that stored stride.
+        // The header is untrusted: pin `decompressed_len` to what `n_messages`
+        // of the writing version must occupy before allocating anything.
         let n = u64::from(self.n_messages);
-        let Some(ts_len) = n.checked_mul(TIMESTAMP_STRIDE as u64) else {
+        let leaf_size = T::version_size(self.type_hash)
+            .ok_or(DecodeError::UnknownTypeHash(self.type_hash))? as u64;
+        let ts_len = n * TIMESTAMP_STRIDE as u64;
+        let expected = ts_len + n * leaf_size;
+        if self.decompressed_len != expected {
             return Err(DecodeError::LengthMismatch {
-                expected: usize::MAX,
-                got: self.decompressed_len as usize,
-            });
-        };
-        if self.decompressed_len < ts_len {
-            return Err(DecodeError::LengthMismatch {
-                expected: usize::try_from(ts_len).unwrap_or(usize::MAX),
-                got: self.decompressed_len as usize,
+                expected: usize::try_from(expected).unwrap_or(usize::MAX),
+                got: usize::try_from(self.decompressed_len).unwrap_or(usize::MAX),
             });
         }
-        let Ok(expected_len) = usize::try_from(self.decompressed_len) else {
-            return Err(DecodeError::LengthMismatch { expected: usize::MAX, got: usize::MAX });
-        };
+        let expected_len = expected as usize;
         scratch.resize(expected_len);
         let written = zstd::bulk::decompress_to_buffer(self.compressed(), scratch.as_mut_bytes())
             .map_err(DecodeError::Zstd)?;
@@ -448,6 +464,9 @@ struct Push<'a> {
 
 impl VisitorVersionedLeaf for Push<'_> {
     fn visit_leaf<L: Versioned>(&mut self, leaf: &L) {
+        // Sections start on 8-byte boundaries; a leaf needing more could never
+        // be cast back on the reader.
+        const { assert!(align_of::<L>() <= ALIGN) };
         let timestamp = self.timestamp;
         let buf = self.cache.buffers.entry(L::TYPE_HASH).or_insert_with(|| TypedBuffer {
             name: L::NAME,

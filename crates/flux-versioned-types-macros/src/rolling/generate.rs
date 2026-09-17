@@ -90,7 +90,7 @@ fn generate_versioned_impls(
                     Err(::flux_versioned_types::zerocopy::ConvertError::Size(_)) => {
                         let stride = ::core::mem::size_of::<#version>();
                         Err(::flux_versioned_types::DecodeError::LengthMismatch {
-                            expected: stride * (bytes.len() / stride + 1),
+                            expected: if stride == 0 { 0 } else { stride * (bytes.len() / stride + 1) },
                             got: bytes.len(),
                         })
                     }
@@ -107,6 +107,12 @@ fn generate_versioned_impls(
             const VERSION_HASHES: &'static [u64] = &[
                 #(<#versions as flux::type_hash::TypeHash>::TYPE_HASH,)*
             ];
+            fn version_size(type_hash: u64) -> Option<usize> {
+                match type_hash {
+                    #(<#versions as flux::type_hash::TypeHash>::TYPE_HASH => Some(::core::mem::size_of::<#versions>()),)*
+                    _ => None,
+                }
+            }
             fn decode_versions(
                 type_hash: u64,
                 bytes: &[u8],

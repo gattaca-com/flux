@@ -34,6 +34,10 @@ pub trait Versioned:
     /// `TYPE_HASH` of every version, oldest first, latest last.
     const VERSION_HASHES: &'static [u64];
 
+    /// `size_of` the version identified by `type_hash`, `None` when unknown.
+    /// Lets a reader validate section lengths before it allocates.
+    fn version_size(type_hash: u64) -> Option<usize>;
+
     /// Cast `bytes` as a slice of the version identified by `type_hash` and
     /// migrate each element to `Self`.
     ///
@@ -52,7 +56,8 @@ pub trait VisitorVersionedLeaf {
 ///
 /// Leaves implement it trivially (the leaf is itself). Families implement it
 /// by delegating to the variant they hold; `#[derive(HasVersionedLeaves)]`
-/// generates that, plus `From<Leaf> for Family` for every reachable leaf.
+/// generates that, plus `From<Field> for Family` for each kept variant
+/// (direct fields only; a nested family's leaves convert through it).
 pub trait HasVersionedLeaves: Copy {
     /// Unpack: hand the leaf inside `self` to `visitor`.
     fn visit_leaf<V: VisitorVersionedLeaf>(&self, visitor: &mut V);
@@ -60,6 +65,8 @@ pub trait HasVersionedLeaves: Copy {
     /// Repack: decode `blob` if it holds one of this type's leaves.
     ///
     /// `None` when the blob's type hash belongs to none of them. `Some(Err)`
-    /// when it does but the payload is invalid.
+    /// when it does but the payload is invalid. Variants are tried in
+    /// declaration order and the first match wins, so leaf types must be
+    /// unique across the whole reachable family.
     fn decode_blob<U: Versioned>(blob: &Blob, scratch: &mut Scratch) -> Option<Decoded<U, Self>>;
 }
