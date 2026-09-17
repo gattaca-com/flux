@@ -1,0 +1,24 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "flux-postgres"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64.workspace = true
+flux-network.workspace = true
+hmac.workspace = true
+md-5.workspace = true
+rand.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
