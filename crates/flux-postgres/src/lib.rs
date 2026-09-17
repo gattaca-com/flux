@@ -1,11 +1,12 @@
 //! Poll-driven `Postgres` client over a caller-owned TCP network, sharing
 //! one poll with the tile's other traffic.
 //!
-//! Requests queue inside the client; [`Postgres::on_event`], called from
-//! the network's event handler, tracks the pooled connections, and
-//! [`Postgres::drive`] sends queued requests on idle ones and delivers
-//! one outcome per id. A full queue refuses the new request instead of
-//! failing queued ones; queued requests wait out pool outages.
+//! Requests queue inside the client; [`Postgres::connect`] opens the pool,
+//! [`Postgres::on_event`], called from the network's event handler, tracks
+//! the pooled connections, and [`Postgres::drive`] sends queued requests on
+//! idle ones and delivers one outcome per id. A full queue refuses the new
+//! request instead of failing queued ones; queued requests wait out pool
+//! outages.
 //!
 //! Authentication covers trust, cleartext, and SCRAM-SHA-256; anything
 //! else fails the connection without an outcome.
@@ -73,6 +74,9 @@ pub enum Error {
 }
 
 type Outcome = (QueryId, Result<Output, Error>);
+
+/// Bytes a COPY body opens and closes with; `COPY TEXT` has neither.
+type Frame = (fn(&mut Vec<u8>), fn(&mut Vec<u8>));
 
 struct Request {
     id: QueryId,
@@ -249,21 +253,21 @@ impl Postgres {
     }
 
     pub fn with_credentials(mut self, user: &str, password: &str) -> Self {
-        assert!(self.group.is_none(), "configure before the first drive");
+        assert!(self.group.is_none(), "configure before connect");
         user.clone_into(&mut self.user);
         password.clone_into(&mut self.password);
         self
     }
 
     pub fn with_database(mut self, database: &str) -> Self {
-        assert!(self.group.is_none(), "configure before the first drive");
+        assert!(self.group.is_none(), "configure before connect");
         database.clone_into(&mut self.database);
         self
     }
 
     /// Sets a startup parameter such as `application_name`.
     pub fn with_parameter(mut self, name: &str, value: &str) -> Self {
-        assert!(self.group.is_none(), "configure before the first drive");
+        assert!(self.group.is_none(), "configure before connect");
         match self.params.iter_mut().find(|(n, _)| n == name) {
             Some((_, v)) => value.clone_into(v),
             None => self.params.push((name.to_owned(), value.to_owned())),
@@ -272,7 +276,7 @@ impl Postgres {
     }
 
     pub fn with_connections(mut self, connections: usize) -> Self {
-        assert!(connections > 0 && self.conns.is_empty(), "nonzero, before the first drive");
+        assert!(connections > 0 && self.conns.is_empty(), "nonzero, before connect");
         self.connections = connections;
         self
     }
@@ -313,23 +317,15 @@ impl Postgres {
     /// body back for a later [`Postgres::copy`]. Panics on an empty batch,
     /// an unencodable row, or rows whose columns differ.
     pub fn copy_rows<T: Serialize>(&mut self, table: &str, rows: &[T]) -> Result<QueryId, Vec<u8>> {
-        let sql = copybinary::copy_statement(table, &rows[0]).expect("COPY BINARY row");
-        let mut body = Vec::new();
-        copybinary::header(&mut body);
-        let (mut columns, mut expected) = (Vec::new(), Vec::new());
-        for row in rows {
-            copybinary::encode_columns(&mut body, row, &mut columns).expect("COPY BINARY row");
-            if expected.is_empty() {
-                std::mem::swap(&mut expected, &mut columns);
-            } else {
-                assert_eq!(columns, expected, "COPY rows must share the same columns");
-            }
-        }
-        copybinary::trailer(&mut body);
-        if self.full_for(sql.len() + body.len()) {
-            return Err(body);
-        }
-        Ok(self.enqueue(sql, Some(body)))
+        self.copy_batch(
+            table,
+            rows,
+            |table, row| copybinary::copy_statement(table, row).expect("COPY BINARY row"),
+            |out, row, columns| {
+                copybinary::encode_columns(out, row, columns).expect("COPY BINARY row");
+            },
+            (copybinary::header, copybinary::trailer),
+        )
     }
 
     /// Encodes `rows` as `COPY TEXT` and queues them for `table`, naming the
@@ -342,17 +338,39 @@ impl Postgres {
         table: &str,
         rows: &[T],
     ) -> Result<QueryId, Vec<u8>> {
-        let sql = copytext::copy_statement(table, &rows[0]).expect("COPY TEXT row");
+        self.copy_batch(
+            table,
+            rows,
+            |table, row| copytext::copy_statement(table, row).expect("COPY TEXT row"),
+            |out, row, columns| {
+                copytext::encode_columns(out, row, columns).expect("COPY TEXT row");
+            },
+            (|_| {}, |_| {}),
+        )
+    }
+
+    /// Encodes one batch, holding every row to the first row's columns.
+    fn copy_batch<T: Serialize>(
+        &mut self,
+        table: &str,
+        rows: &[T],
+        statement: impl Fn(&str, &T) -> String,
+        encode: impl Fn(&mut Vec<u8>, &T, &mut Vec<&'static str>),
+        frame: Frame,
+    ) -> Result<QueryId, Vec<u8>> {
+        let sql = statement(table, &rows[0]);
         let mut body = Vec::new();
+        frame.0(&mut body);
         let (mut columns, mut expected) = (Vec::new(), Vec::new());
         for row in rows {
-            copytext::encode_columns(&mut body, row, &mut columns).expect("COPY TEXT row");
+            encode(&mut body, row, &mut columns);
             if expected.is_empty() {
                 std::mem::swap(&mut expected, &mut columns);
             } else {
                 assert_eq!(columns, expected, "COPY rows must share the same columns");
             }
         }
+        frame.1(&mut body);
         if self.full_for(sql.len() + body.len()) {
             return Err(body);
         }
@@ -401,19 +419,18 @@ impl Postgres {
         out
     }
 
-    fn ensure_conns(&mut self, net: &mut TcpNetworkCore) {
-        if !self.conns.is_empty() {
-            return;
-        }
-        let group = *self.group.get_or_insert_with(|| {
-            net.add_group(TcpGroupConfig {
-                name: "postgres",
-                framing: Framing::Raw,
-                max_frame_size: usize::MAX,
-                on_connect_msg: Some(Self::startup_bytes(&self.user, &self.database, &self.params)),
-                ..Default::default()
-            })
+    /// Opens the pool; the builders must have run, and [`Postgres::drive`]
+    /// never opens anything itself.
+    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+        assert!(self.group.is_none(), "connect once");
+        let group = net.add_group(TcpGroupConfig {
+            name: "postgres",
+            framing: Framing::Raw,
+            max_frame_size: usize::MAX,
+            on_connect_msg: Some(Self::startup_bytes(&self.user, &self.database, &self.params)),
+            ..Default::default()
         });
+        self.group = Some(group);
         for _ in 0..self.connections {
             let token = net.connect(group, self.addr);
             self.conns.push(Conn {
@@ -444,7 +461,7 @@ impl Postgres {
     where
         F: FnMut(QueryId, Result<Output, Error>),
     {
-        self.ensure_conns(net);
+        assert!(self.group.is_some(), "connect before drive");
         for index in 0..self.conns.len() {
             if matches!(self.conns[index].state, State::Dead) {
                 net.disconnect(self.conns[index].token);

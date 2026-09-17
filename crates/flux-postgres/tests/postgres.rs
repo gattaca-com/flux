@@ -301,6 +301,7 @@ fn binary_batch(rows: &[Row]) -> Vec<u8> {
 fn query_copy_and_error_byte_at_a_time() {
     let (mut net, server_group, addr) = setup();
     let mut pg = Postgres::new(addr).with_database("db").with_connections(2);
+    pg.connect(&mut net);
     let mut server = FakeServer::paced(1);
     let mut outcomes = Vec::new();
     let mut seen = Vec::new();
@@ -441,6 +442,7 @@ fn scram_server_check(transcript: &[Vec<u8>], salt: &[u8], client_final: &[u8]) 
 fn scram_login_then_disconnect_recovers() {
     let (mut net, server_group, addr) = setup();
     let mut pg = Postgres::new(addr).with_credentials("user", "pencil");
+    pg.connect(&mut net);
     let mut server = FakeServer::paced(usize::MAX);
     let mut outcomes = Vec::new();
     let mut seen = Vec::new();
