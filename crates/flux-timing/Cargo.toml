@@ -32,4 +32,4 @@ wincode = ["dep:wincode", "dep:wincode-derive"]
 workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["type-hash", "wincode"]
+ignored = ["byte-stable", "type-hash", "wincode"]
