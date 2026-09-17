@@ -81,15 +81,6 @@ impl FromSpineArg {
     }
 }
 
-// Helper types and parser for #[queue(...)] attributes
-mod kw {
-    syn::custom_keyword!(gather);
-    syn::custom_keyword!(boundary);
-    syn::custom_keyword!(size);
-    syn::custom_keyword!(flavour);
-    syn::custom_keyword!(mtu);
-}
-
 fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>, bool) {
     let mut is_gather = false;
     let mut size_expr: Option<Expr> = None;

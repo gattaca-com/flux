@@ -13,6 +13,8 @@ pub mod raw;
 mod schema;
 pub mod wire;
 
+#[doc(hidden)]
+pub use bincode;
 pub use blob::{
     TrackingTimestampWire, TrackingTimestampWireV1, VersionedBlob, VersionedPersistable,
 };
@@ -67,7 +69,7 @@ macro_rules! impl_versioned_deserialize {
             fn versioned_deserialize_vec(
                 stored_type_hash: u64,
                 bytes: &[u8],
-            ) -> bincode::Result<Vec<Self>> {
+            ) -> $crate::bincode::Result<Vec<Self>> {
                 <$name>::versioned_deserialize_vec(stored_type_hash, bytes)
             }
         }
