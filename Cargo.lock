@@ -1426,6 +1426,7 @@ dependencies = [
 name = "flux-network"
 version = "0.3.2"
 dependencies = [
+ "byte-stable",
  "core_affinity",
  "criterion",
  "flux",
@@ -1441,7 +1442,6 @@ dependencies = [
  "tracing",
  "wincode",
  "wincode-derive",
- "zerocopy",
 ]
 
 [[package]]
@@ -1508,6 +1508,7 @@ dependencies = [
 name = "flux-utils"
 version = "0.3.2"
 dependencies = [
+ "byte-stable",
  "bytes",
  "core_affinity",
  "criterion",
@@ -1524,7 +1525,6 @@ dependencies = [
  "tracing",
  "type-hash",
  "wincode",
- "zerocopy",
 ]
 
 [[package]]

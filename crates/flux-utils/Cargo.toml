@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+byte-stable.workspace = true
 bytes = { workspace = true, optional = true }
 core_affinity.workspace = true
 directories.workspace = true
@@ -21,7 +22,6 @@ thiserror.workspace = true
 tracing.workspace = true
 type-hash.workspace = true
 wincode = { workspace = true, optional = true }
-zerocopy.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

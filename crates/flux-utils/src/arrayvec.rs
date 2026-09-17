@@ -8,9 +8,6 @@ use std::{
 };
 
 use type_hash::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};
-use zerocopy::{
-    BecauseImmutable, Immutable, IntoBytes, KnownLayout, Maybe, TryFromBytes, invariant,
-};
 
 /// Creates an [`ArrayVec`] with the given elements.
 ///
@@ -346,7 +343,7 @@ impl<T: Copy, const N: usize> FromIterator<T> for ArrayVec<T, N> {
 /// Bytes past `len` are always zero, so the whole value is initialized memory
 /// that can be shipped as raw bytes. `N` must be a multiple of 8: `len` is a
 /// `usize` followed by `[u8; N]`, so any other `N` leaves trailing padding.
-#[derive(Clone, Copy, KnownLayout, Immutable)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ArrayStr<const N: usize> {
     len: usize,
@@ -360,57 +357,30 @@ impl<const N: usize> Default for ArrayStr<N> {
     }
 }
 
-// `IntoBytes` is manual: the derive requires all fields to be `Unaligned` on
-// generic structs, which `len: usize` is not. The manual impl is sound only
-// when the layout has no padding, i.e. `N % 8 == 0`; anything else fails to
-// compile at the first `as_bytes` use.
-unsafe impl<const N: usize> IntoBytes for ArrayStr<N> {
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized,
-    {
-    }
-
+// Safety: 1. every constructor leaves the whole value initialized (bytes
+// past `len` are zero, `Copy` preserves bytes) and the inline assertions
+// below keep the layout padding-free (`len: usize` followed by `[u8; N]`);
+// 2. `is_valid` accepts only `len <= N` with valid UTF-8 in `data[..len]`,
+// exactly what `as_str` borrows unchecked; 3. the fields are plain data with
+// no interior mutability.
+unsafe impl<const N: usize> byte_stable::ByteStable for ArrayStr<N> {
     #[inline]
-    fn as_bytes(&self) -> &[u8]
-    where
-        Self: Immutable,
-    {
-        // Forces compile-time evaluation of the padding assertion below;
-        // any `N` that is not a multiple of 8 fails to compile here.
-        let () = Self::ASSERT_PADDING_FREE;
-        // Safety: the assertion guarantees padding-free layout, and every
-        // constructor leaves the whole value initialized (bytes past `len`
-        // are zero, `Copy` preserves bytes).
-        unsafe {
-            core::slice::from_raw_parts(core::ptr::from_ref(self).cast::<u8>(), size_of::<Self>())
-        }
-    }
-}
-
-// `TryFromBytes` is manual: the derived impl would accept any `len` and any
-// bytes, but `as_str` borrows `data[..len]` as `str` unchecked, so length
-// and UTF-8 must be validated on read. Bytes past `len` are ignored.
-unsafe impl<const N: usize> TryFromBytes for ArrayStr<N> {
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized,
-    {
-    }
-
-    fn is_bit_valid<A: invariant::Alignment>(candidate: Maybe<'_, Self, A>) -> bool {
-        let bytes: &[u8] = candidate.as_bytes::<BecauseImmutable>().unaligned_as_ref();
+    fn is_valid(bytes: &[u8]) -> bool {
+        const { assert!(N.is_multiple_of(8), "ArrayStr<N> has padding unless N is a multiple of 8") };
         let Some(len_bytes) = bytes.get(..size_of::<usize>()) else { return false };
         let len = usize::from_ne_bytes(len_bytes.try_into().unwrap());
         len <= N &&
             core::str::from_utf8(&bytes[size_of::<usize>()..size_of::<usize>() + len]).is_ok()
     }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        const { assert!(N.is_multiple_of(8), "ArrayStr<N> has padding unless N is a multiple of 8") };
+        byte_stable::slice_as_bytes(core::slice::from_ref(self))
+    }
 }
 
 impl<const N: usize> ArrayStr<N> {
-    const ASSERT_PADDING_FREE: () =
-        assert!(N.is_multiple_of(8), "ArrayStr<N> has padding unless N is a multiple of 8");
-
     #[inline]
     pub const fn new() -> Self {
         assert!(N < MAX_SIZE);
@@ -418,8 +388,8 @@ impl<const N: usize> ArrayStr<N> {
     }
 
     /// The string's bytes. Inherent so `s.as_bytes()` keeps meaning this when
-    /// `zerocopy::IntoBytes` is in scope; the whole value's bytes are
-    /// `IntoBytes::as_bytes(&s)`.
+    /// `byte_stable::ByteStable` is in scope; the whole value's bytes are
+    /// `ByteStable::as_bytes(&s)`.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         self.as_slice()

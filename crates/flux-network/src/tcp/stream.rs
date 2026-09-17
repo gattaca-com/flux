@@ -9,7 +9,6 @@ use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_communication::Timer;
 use flux_timing::{Instant, Nanos};
 use flux_utils::{DCache, DCacheRef};
-use zerocopy::IntoBytes;
 
 pub const DEFAULT_TCP_USER_TIMEOUT_MS: u32 = 10_000;
 const DEFAULT_TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 5;
@@ -586,9 +585,10 @@ impl TcpStream {
                                             }
                                         }
                                         RxBuf::Heap(words) => {
-                                            if msg_len > words.as_bytes().len() {
+                                            if msg_len > byte_stable::slice_as_bytes(words).len() {
                                                 debug!(
-                                                    buf_len = words.as_bytes().len(),
+                                                    buf_len =
+                                                        byte_stable::slice_as_bytes(words).len(),
                                                     need_len = msg_len,
                                                     "tcp: buffer resized"
                                                 );
@@ -633,7 +633,8 @@ impl TcpStream {
                             }
                         } else {
                             let RxBuf::Heap(words) = &mut self.rx_buf else { unreachable!() };
-                            self.stream.read(&mut words.as_mut_bytes()[offset..msg_len])
+                            self.stream
+                                .read(&mut byte_stable::words_as_bytes_mut(words)[offset..msg_len])
                         };
                         match result {
                             Ok(0) => return ReadOutcome::Disconnected,
@@ -658,7 +659,9 @@ impl TcpStream {
                                         let RxBuf::Heap(words) = &self.rx_buf else {
                                             unreachable!()
                                         };
-                                        MessagePayload::Raw(&words.as_bytes()[..msg_len])
+                                        MessagePayload::Raw(
+                                            &byte_stable::slice_as_bytes(words)[..msg_len],
+                                        )
                                     };
                                     return ReadOutcome::PayloadDone { payload, send_ts };
                                 }
