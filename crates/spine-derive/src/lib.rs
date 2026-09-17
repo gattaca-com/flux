@@ -6,7 +6,8 @@
 //     pub updates: SpineQueue<messages::Update>,
 // }
 
-// spine_derive/src/lib.rs   (only the changed parts are shown)
+// `#[from_spine]`: generates the spine struct plus consumers/producers, config,
+// and the `FluxSpine` impl from `SpineQueue<T>` field annotations.
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, quote_spanned};
 use syn::{
@@ -143,11 +144,13 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 ///   `flux_gather::GatherQueues` impl. Every gathered message type must
 ///   implement `flux_versioned_types::HasVersionedLeaves` (the bound surfaces
 ///   through `BlobCache::push`). Plain and dcache queues are drained in
-///   declaration order. `gather` and `mtu` may combine: the fixed-size message
-///   is gathered, the dcache payload never enters a blob. `gather` takes no
-///   arguments. Flush timing is the user's tile's job: a queue the user wants
-///   to react to (such as a slot-end queue) is consumed by hand in that tile
-///   and pushed with `cache.push` there.
+///   declaration order. `gather` takes no arguments. Flush timing is the user's
+///   tile's job: a queue the user wants to react to (such as a slot-end queue)
+///   is consumed by hand in that tile and pushed with `cache.push` there. A
+///   boundary message orders only messages from the same producer thread, and
+///   queues are independent rings: after reading a boundary, drain the gathered
+///   queues once more before flushing, otherwise late messages of the closing
+///   batch land in the next one.
 ///
 /// Using `gather` requires a direct dependency on `flux-gather`: the generated
 /// `GatherQueues` impl names `::flux_gather::` paths.
@@ -333,15 +336,21 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Drain passes for plain and dcache gathered fields in declaration order.
     let mut gather_passes = Vec::<proc_macro2::TokenStream>::new();
     for (inner_ty, is_dcache) in &gather_fields {
+        let inner_ty_span = inner_ty.span();
         if *is_dcache {
-            gather_passes.push(quote! {
+            // The fixed-size message comes from the queue, not the dcache, so
+            // it is intact even when the payload is `Lost` or absent (`NoRef`).
+            gather_passes.push(quote_spanned! { inner_ty_span =>
                 adapter.consume_with_dcache_internal_message(
-                    |m: &::flux::timing::InternalMessage<#inner_ty>, _payload: &[u8]| cache.push(m),
-                    |_, _| {},
+                    |_: &::flux::timing::InternalMessage<#inner_ty>, _payload: &[u8]| {},
+                    |r, _| match r {
+                        ::flux::spine::DCacheRead::Ok((m, ())) | ::flux::spine::DCacheRead::NoRef(m) | ::flux::spine::DCacheRead::Lost(m) => cache.push(&m),
+                        ::flux::spine::DCacheRead::SpedPast => {}
+                    },
                 );
             });
         } else {
-            gather_passes.push(quote! {
+            gather_passes.push(quote_spanned! { inner_ty_span =>
                 adapter.consume_internal_message(
                     |m: &mut ::flux::timing::InternalMessage<#inner_ty>, _| cache.push(&*m),
                 );
@@ -616,6 +625,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 std::thread::scope(|s| {
                     let mut scoped = ::flux::spine::ScopedSpine::new(&mut self, s, on_panic, custom_signal_handler);
                     f(&mut scoped);
+                    ::flux::core_affinity::set_for_current(*::flux::core_affinity::get_core_ids().unwrap().last().unwrap());
                 });
                 ::flux::tracing::info!("Finished…");
             }
