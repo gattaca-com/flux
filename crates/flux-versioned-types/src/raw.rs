@@ -42,9 +42,9 @@
 
 use std::collections::HashMap;
 
+use byte_stable::ByteStable;
 use flux_timing::InternalMessage;
 use flux_utils::ArrayStr;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::{
     blob::TrackingTimestampWire,
@@ -76,7 +76,7 @@ fn round8(n: u64) -> Option<u64> {
 }
 
 /// Fixed header of a [`Blob`]: its first 128 bytes.
-#[derive(Clone, Copy, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(Clone, Copy, byte_stable_derive::ByteStable)]
 #[repr(C)]
 pub struct BlobHeader {
     pub magic: [u8; 8],
@@ -105,17 +105,12 @@ const _: () = assert!(size_of::<BlobHeader>() == 128 && align_of::<BlobHeader>()
 /// One batch of a single leaf type. See the [module docs](self) for the layout.
 ///
 /// Obtain one through [`Blob::from_bytes`], [`Scratch::load`] or
-/// [`BlobCache::flush`]. The derived `try_ref_from_bytes` only validates the
-/// header's own fields, not the declared lengths against the slice, so
-/// accessors on a blob obtained that way may panic on out-of-range lengths.
-#[derive(TryFromBytes, IntoBytes, KnownLayout, Immutable)]
+/// [`BlobCache::flush`].
 #[repr(C)]
 pub struct Blob {
     pub header: BlobHeader,
     /// `[user metadata, padded to 8][zstd tail, padded to 8]`. Words rather
-    /// than bytes so the type has no trailing padding at any length: that is
-    /// what makes `IntoBytes` derivable and rejects blobs that are not a
-    /// multiple of 8 at the cast.
+    /// than bytes so the type has no trailing padding at any length.
     tail: [u64],
 }
 
@@ -181,11 +176,11 @@ impl Scratch {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.words.as_slice().as_bytes()[..self.len]
+        &byte_stable::slice_as_bytes(&self.words)[..self.len]
     }
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
-        &mut self.words.as_mut_slice().as_mut_bytes()[..self.len]
+        &mut byte_stable::words_as_bytes_mut(&mut self.words)[..self.len]
     }
 
     /// Copy `bytes` in and return them as a blob. For inputs whose alignment
@@ -228,13 +223,22 @@ impl Blob {
         if version != FORMAT_VERSION {
             return Err(DecodeError::UnsupportedVersion(version));
         }
-        let header = BlobHeader::try_ref_from_bytes(&bytes[..header_len]).map_err(|e| match e {
-            zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
-            zerocopy::ConvertError::Size(_) => {
-                DecodeError::TooShort { needed: header_len, got: bytes.len() }
+        // `type_name` is the only header field that can be invalid.
+        if !BlobHeader::is_valid(&bytes[..header_len]) {
+            return Err(DecodeError::BadTypeName);
+        }
+        // The header is valid, so only alignment and length can still fail;
+        // both were checked above.
+        let header = match byte_stable::cast_slice::<BlobHeader>(&bytes[..header_len]) {
+            Ok(headers) => headers[0],
+            Err(byte_stable::CastError::Unaligned) => return Err(DecodeError::Unaligned),
+            Err(byte_stable::CastError::Length { .. } | byte_stable::CastError::ZeroSized) => {
+                return Err(DecodeError::TooShort { needed: header_len, got: bytes.len() });
             }
-            zerocopy::ConvertError::Validity(_) => DecodeError::BadTypeName,
-        })?;
+            Err(byte_stable::CastError::Invalid { .. }) => {
+                return Err(DecodeError::BadTypeName);
+            }
+        };
         let need = round8(u64::from(header.metadata_len))
             .and_then(|meta| round8(header.compressed_len).and_then(|comp| meta.checked_add(comp)))
             .and_then(|tail| tail.checked_add(header_len as u64))
@@ -245,18 +249,28 @@ impl Blob {
         if bytes.len() < need {
             return Err(DecodeError::TooShort { needed: need, got: bytes.len() });
         }
-        Self::try_ref_from_bytes(&bytes[..need]).map_err(|e| match e {
-            zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
-            zerocopy::ConvertError::Size(_) => {
-                DecodeError::TooShort { needed: need, got: bytes.len() }
-            }
-            zerocopy::ConvertError::Validity(_) => DecodeError::BadTypeName,
-        })
+        let words = (need - header_len) / ALIGN;
+        // `from_bytes` checked 8-byte alignment above.
+        #[allow(clippy::cast_ptr_alignment)]
+        let ptr =
+            core::ptr::slice_from_raw_parts(bytes.as_ptr().cast::<u64>(), words) as *const Self;
+        // Safety: `bytes` holds `need` initialized bytes, 8-aligned and borrowed for
+        // the returned lifetime; the header is validated and the `u64` tail accepts
+        // every pattern. The pointer is the blob start, its length the tail word count.
+        Ok(unsafe { &*ptr })
     }
 
     /// The exact bytes of this blob: header plus tail.
     pub fn as_bytes(&self) -> &[u8] {
-        IntoBytes::as_bytes(self)
+        // Safety: contract 1 (no padding: the header is `ByteStable`, the tail
+        // is `u64`s) makes every byte initialized, and contract 3 (no interior
+        // mutability) keeps them from changing under the borrow.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(self).cast::<u8>(),
+                size_of::<BlobHeader>() + self.tail.len() * ALIGN,
+            )
+        }
     }
 
     /// True when `type_hash` is any version of `T`.
@@ -270,14 +284,14 @@ impl Blob {
 
     /// The user metadata bytes, uncompressed. No decompression.
     pub fn user_metadata_bytes(&self) -> &[u8] {
-        &self.tail.as_bytes()[..self.header.metadata_len as usize]
+        &byte_stable::slice_as_bytes(&self.tail)[..self.header.metadata_len as usize]
     }
 
     /// The zstd tail.
     pub fn compressed(&self) -> &[u8] {
         let meta_pad = (self.header.metadata_len as usize).next_multiple_of(ALIGN);
         let len = self.header.compressed_len as usize;
-        &self.tail.as_bytes()[meta_pad..meta_pad + len]
+        &byte_stable::slice_as_bytes(&self.tail)[meta_pad..meta_pad + len]
     }
 
     /// Decode the user metadata as `U`, migrating if it was written as an
@@ -354,13 +368,17 @@ impl Blob {
 }
 
 fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[TrackingTimestampWire], DecodeError> {
-    let stamps = <[TrackingTimestampWire]>::ref_from_bytes(bytes).map_err(|e| match e {
-        zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
-        zerocopy::ConvertError::Size(_) => DecodeError::LengthMismatch {
+    let stamps = byte_stable::cast_slice::<TrackingTimestampWire>(bytes).map_err(|e| match e {
+        byte_stable::CastError::Unaligned => DecodeError::Unaligned,
+        byte_stable::CastError::Length { .. } => DecodeError::LengthMismatch {
             expected: n * size_of::<TrackingTimestampWire>(),
             got: bytes.len(),
         },
-        zerocopy::ConvertError::Validity(i) => match i {},
+        // Unreachable for a 24-byte type; `Invalid` cannot happen either
+        // because every timestamp pattern is valid.
+        byte_stable::CastError::Invalid { .. } | byte_stable::CastError::ZeroSized => {
+            DecodeError::InvalidValue
+        }
     })?;
     if stamps.len() != n {
         return Err(DecodeError::LengthMismatch {
@@ -432,7 +450,7 @@ impl BlobCache {
         let Self { buffers, build } = self;
         for key in keys {
             let buf = &buffers[&key];
-            let meta_bytes = <U as IntoBytes>::as_bytes(user_meta);
+            let meta_bytes = ByteStable::as_bytes(user_meta);
             let meta_pad = meta_bytes.len().next_multiple_of(ALIGN);
             let mut plain = Vec::with_capacity(buf.timestamps.len() + buf.leaves.len());
             plain.extend_from_slice(&buf.timestamps);
@@ -455,7 +473,7 @@ impl BlobCache {
             // `resize` zero-fills, so the metadata and tail padding are zeros.
             build.resize(size_of::<BlobHeader>() + meta_pad + comp_pad);
             let (head, tail) = build.as_mut_bytes().split_at_mut(size_of::<BlobHeader>());
-            head.copy_from_slice(header.as_bytes());
+            head.copy_from_slice(ByteStable::as_bytes(&header));
             tail[..meta_bytes.len()].copy_from_slice(meta_bytes);
             tail[meta_pad..meta_pad + comp.len()].copy_from_slice(&comp);
             let blob = Blob::from_bytes(build.as_bytes()).expect("freshly built blob is valid");
@@ -486,9 +504,8 @@ impl VisitorVersionedLeaf for Push<'_> {
             timestamps: Vec::new(),
             leaves: Vec::new(),
         });
-        buf.timestamps
-            .extend_from_slice(<TrackingTimestampWire as IntoBytes>::as_bytes(&timestamp));
-        buf.leaves.extend_from_slice(<L as IntoBytes>::as_bytes(leaf));
+        buf.timestamps.extend_from_slice(ByteStable::as_bytes(&timestamp));
+        buf.leaves.extend_from_slice(ByteStable::as_bytes(leaf));
         buf.n_messages += 1;
     }
 }

@@ -11,7 +11,6 @@
 //! Families use `#[derive(VersionedLeaves)]`.
 
 use flux_timing::InternalMessage;
-use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::raw::{Blob, DecodeError, Scratch};
 
@@ -24,9 +23,7 @@ pub type Decoded<U, T> = Result<(U, Vec<InternalMessage<T>>), DecodeError>;
 /// written as is and validated on read. The stored [`type_hash`](Blob) of a
 /// blob is the plain `TYPE_HASH` of the version that wrote it (no XOR, unlike
 /// legacy bincode blobs).
-pub trait Versioned:
-    type_hash::TypeHash + Copy + IntoBytes + TryFromBytes + KnownLayout + Immutable + 'static
-{
+pub trait Versioned: type_hash::TypeHash + byte_stable::ByteStable {
     /// Wire label carried in [`Blob::type_name`]. Defaults to the alias name of
     /// the roll chain; override with `#[wire_name = ".."]`.
     const NAME: &'static str;

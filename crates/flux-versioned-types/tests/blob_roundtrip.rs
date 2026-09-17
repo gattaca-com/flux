@@ -4,11 +4,12 @@ use flux_timing::{
 };
 use flux_utils::ArrayStr;
 use flux_versioned_types::{
-    Blob, BlobCache, BlobHeader, DecodeError, HasVersionedLeaves, Scratch, TrackingTimestampWire,
-    TrackingTimestampWireV1, Versioned, VersionedLeaves, VisitorVersionedLeaf,
+    Blob, BlobCache, BlobHeader, ByteStable, DecodeError, HasVersionedLeaves, Scratch,
+    TrackingTimestampWire, TrackingTimestampWireV1, Versioned, VersionedLeaves,
+    VisitorVersionedLeaf,
+    byte_stable::slice_as_bytes,
     raw::{FORMAT_VERSION, MAGIC},
     versioned_enum, versioned_struct,
-    zerocopy::IntoBytes,
 };
 
 versioned_struct!(Leaf =>
@@ -84,7 +85,7 @@ fn stamp(tile: u16, slot: u64) -> TrackingTimestamp {
 }
 
 fn meta_bytes(meta: &MetaV1) -> Vec<u8> {
-    <MetaV1 as IntoBytes>::as_bytes(meta).to_vec()
+    ByteStable::as_bytes(meta).to_vec()
 }
 
 fn hand_build(
@@ -123,10 +124,11 @@ fn leaf_blob(n: u32) -> Vec<u8> {
     let mut stamps = Vec::new();
     let mut leaves = Vec::new();
     for i in 0..n {
-        stamps.extend_from_slice(<TrackingTimestampWire as IntoBytes>::as_bytes(
-            &TrackingTimestampWire::from(stamp(1, u64::from(i))),
-        ));
-        leaves.extend_from_slice(<Leaf as IntoBytes>::as_bytes(&Leaf {
+        stamps.extend_from_slice(ByteStable::as_bytes(&TrackingTimestampWire::from(stamp(
+            1,
+            u64::from(i),
+        ))));
+        leaves.extend_from_slice(ByteStable::as_bytes(&Leaf {
             slot: u64::from(i),
             extra: 0,
             flags: 0,
@@ -202,11 +204,7 @@ fn hand_built_v1_blob_migrates_to_latest() {
         &meta_bytes(&meta),
         LeafV1::TYPE_HASH,
         Leaf::NAME,
-        &[
-            <[TrackingTimestampWire] as IntoBytes>::as_bytes(&stamps),
-            <[LeafV1] as IntoBytes>::as_bytes(&leaves),
-        ]
-        .concat(),
+        &[slice_as_bytes(&stamps), slice_as_bytes(&leaves)].concat(),
         2,
         size_of::<LeafV1>(),
     );
@@ -268,7 +266,7 @@ fn rejects_type_and_payload_mismatches() {
         &meta_bytes(&meta),
         FlagV1::TYPE_HASH,
         Flag::NAME,
-        &[<[TrackingTimestampWire] as IntoBytes>::as_bytes(&stamps), [2u8].as_slice()].concat(),
+        &[slice_as_bytes(&stamps), [2u8].as_slice()].concat(),
         1,
         size_of::<FlagV1>(),
     );
@@ -328,10 +326,8 @@ fn family_blobs_decode_to_variants() {
         OtherV1::TYPE_HASH,
         Other::NAME,
         &[
-            <[TrackingTimestampWire] as IntoBytes>::as_bytes(&[TrackingTimestampWire::from(
-                stamp(9, 9),
-            )]),
-            <[OtherV1] as IntoBytes>::as_bytes(&[OtherV1 { x: 1 }]),
+            slice_as_bytes(&[TrackingTimestampWire::from(stamp(9, 9))]),
+            slice_as_bytes(&[OtherV1 { x: 1 }]),
         ]
         .concat(),
         1,
@@ -405,11 +401,7 @@ fn bogus_metadata_hash_rejected_for_meta_and_decode() {
         &meta_bytes(&meta),
         Leaf::TYPE_HASH,
         Leaf::NAME,
-        &[
-            <[TrackingTimestampWire] as IntoBytes>::as_bytes(&stamps),
-            <[Leaf] as IntoBytes>::as_bytes(&leaves),
-        ]
-        .concat(),
+        &[slice_as_bytes(&stamps), slice_as_bytes(&leaves)].concat(),
         1,
         size_of::<Leaf>(),
     );
@@ -512,7 +504,7 @@ fn internal_metadata_bincode_layout_is_pinned() {
     let stamp = TrackingTimestamp::new(3);
     let meta = TrackingTimestampWire::from(stamp);
     let bytes = bincode::serialize(&meta).unwrap();
-    // 8-byte ingestion + 8-byte publish + 2-byte tile id; the 6-byte zerocopy
+    // 8-byte ingestion + 8-byte publish + 2-byte tile id; the 6-byte
     // pad is serde-skipped so legacy blobs are unchanged.
     assert_eq!(bytes.len(), 18);
     let back: TrackingTimestampWire = bincode::deserialize(&bytes).unwrap();
@@ -549,4 +541,34 @@ fn scratch_load_tolerates_misalignment() {
     assert_eq!(meta.slot, 1);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].data().slot, 0);
+}
+
+versioned_struct!(Foreign =>
+    #[type_hash_lock(hash = 2268921598638542771)]
+    ForeignV1 { pub id: uuid::Uuid, pub hash: alloy_primitives::B256 }
+);
+
+#[test]
+fn foreign_leaf_fields_round_trip() {
+    let mut cache = BlobCache::new();
+    let first = Foreign {
+        id: uuid::Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0),
+        hash: alloy_primitives::B256::from([0xabu8; 32]),
+    };
+    let second = Foreign { id: uuid::Uuid::nil(), hash: alloy_primitives::B256::ZERO };
+    cache.push(&InternalMessage::new(stamp(1, 1), first));
+    cache.push(&InternalMessage::new(stamp(2, 2), second));
+    let meta = MetaV1 { slot: 7, instance: ArrayStr::try_from("foreign").unwrap() };
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
+    assert_eq!(blobs.len(), 1);
+
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let blob = a.load(&blobs[0]).unwrap();
+    assert_eq!(blob.user_metadata::<Meta>().unwrap().slot, 7);
+    let (_, msgs): (Meta, Vec<InternalMessage<Foreign>>) = blob.decode(&mut b).unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].data(), &first);
+    assert_eq!(msgs[1].data(), &second);
 }

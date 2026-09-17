@@ -25,10 +25,7 @@ use crate::{
     Hash,
     PartialEq,
     TypeHash,
-    zerocopy::FromBytes,
-    zerocopy::IntoBytes,
-    zerocopy::KnownLayout,
-    zerocopy::Immutable,
+    byte_stable_derive::ByteStable,
 )]
 #[cfg_attr(feature = "wincode", derive(wincode_derive::SchemaRead, wincode_derive::SchemaWrite,))]
 #[repr(C)]

@@ -157,12 +157,12 @@ pub(crate) fn default_enum_attrs() -> Vec<Attribute> {
     default_attrs_with_repr(&quote!(u8))
 }
 
-// Locked zerocopy-derive only accepts a bare ident for `#[zerocopy(crate =
-// ...)]`, so a re-export path cannot be used here; consumers depend on zerocopy
-// directly.
-pub(crate) fn zerocopy_derive_attrs() -> Vec<Attribute> {
+// Our derive accepts a crate path, so generated code names the re-export and
+// consumers need no direct dependency.
+pub(crate) fn byte_stable_derive_attrs() -> Vec<Attribute> {
     let tokens = quote! {
-        #[derive(::zerocopy::IntoBytes, ::zerocopy::TryFromBytes, ::zerocopy::KnownLayout, ::zerocopy::Immutable)]
+        #[derive(::flux_versioned_types::ByteStable)]
+        #[byte_stable(crate = "::flux_versioned_types::byte_stable")]
     };
     syn::parse2::<AttrsWrapper>(tokens).unwrap().0
 }

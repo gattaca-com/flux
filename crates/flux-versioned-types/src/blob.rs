@@ -328,20 +328,10 @@ impl VersionedBlob {
 /// Portable timing metadata sent over the wire. Wall-clock `Nanos`, safe
 /// across machines with different RDTSC rates.
 ///
-/// The zerocopy blob format (`crate::raw`) stores these as 24-byte records:
+/// The blob format (`crate::raw`) stores these as 24-byte records:
 /// 8 + 8 + 2 bytes of fields plus 6 bytes of explicit zero padding, so the
 /// record is padding-free and every bit pattern is valid.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-    zerocopy::FromBytes,
-    zerocopy::IntoBytes,
-    zerocopy::KnownLayout,
-    zerocopy::Immutable,
-)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, byte_stable_derive::ByteStable)]
 #[repr(C)]
 pub struct TrackingTimestampWire {
     pub ingestion_t_real: flux_timing::Nanos,

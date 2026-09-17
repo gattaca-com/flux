@@ -1490,6 +1490,8 @@ name = "flux-timing"
 version = "0.3.2"
 dependencies = [
  "bitcode",
+ "byte-stable",
+ "byte-stable-derive",
  "chrono",
  "governor",
  "humantime",
@@ -1501,7 +1503,6 @@ dependencies = [
  "type-hash-derive",
  "wincode",
  "wincode-derive",
- "zerocopy",
 ]
 
 [[package]]
@@ -1533,6 +1534,8 @@ version = "0.3.2"
 dependencies = [
  "alloy-primitives",
  "bincode",
+ "byte-stable",
+ "byte-stable-derive",
  "flux",
  "flux-timing",
  "flux-utils",
@@ -1541,7 +1544,6 @@ dependencies = [
  "tracing",
  "type-hash",
  "uuid",
- "zerocopy",
  "zstd",
 ]
 

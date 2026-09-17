@@ -64,12 +64,12 @@ pub(crate) fn generate_struct_def(
     fields: &Vec<TokenStream2>,
     wire_skip: bool,
 ) -> TokenStream2 {
-    let zerocopy_attrs =
-        if wire_skip { Vec::new() } else { crate::shared::zerocopy_derive_attrs() };
+    let byte_stable_attrs =
+        if wire_skip { Vec::new() } else { crate::shared::byte_stable_derive_attrs() };
     quote! {
         #(#default_attrs)*
         #(#struct_attrs)*
-        #(#zerocopy_attrs)*
+        #(#byte_stable_attrs)*
         pub struct #name {
             #(#fields),*
         }

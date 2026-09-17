@@ -50,25 +50,16 @@ The script adds imports and locks only for versioned types that do not already h
 
 ## Zero-copy leaves
 
-Every `versioned_struct!`/`versioned_enum!` chain is wire-ready by default.
-Consumer crates need a direct
-`zerocopy = { version = "0.8", features = ["derive"] }` dependency (for the
-generated `#[derive(::zerocopy::...)]` paths, just as `bincode` is already
-required; the locked zerocopy-derive only accepts a bare ident for its
-`crate` attribute, so the re-export cannot be used there). Every version must
-be a padding-free `repr(C)` struct or `repr(u8)` fieldless enum; padded
-types fail to compile at the derive, which is intended.
+Every `versioned_struct!`/`versioned_enum!` chain is wire-ready by default:
+the generated code names the re-exported `ByteStable` derive, so consumers
+need no direct `byte-stable` dependency. Every version must be a padding-free
+`repr(C)` struct or `repr(u8)` fieldless enum; padded types fail to compile
+at the derive, which is intended.
 
-Every field must implement the zerocopy traits too. Rust's orphan rule means
-flux cannot provide them for foreign types the way it provides `TypeHash`
-(both trait and type would be foreign). Of the usual suspects, `uuid` derives
-them only behind its unstable `--cfg uuid_unstable` flag, and
-`alloy-primitives`/`ruint` have no zerocopy support at all. Until upstream
-features exist, a leaf stores the underlying array (`[u8; 16]` for `Uuid`,
-`[u8; 32]` for `B256`, `[u8; 20]` for `Address`, `[u64; 4]` for `U256` limbs)
-and converts at the boundary (`Uuid::from_bytes`, `B256::from`,
-`U256::from_limbs`); the layout on the wire is identical either way. A chain
-that keeps the foreign types opts out with `#[wire_skip]`.
+Every field must implement `ByteStable` too. Flux provides it for ints, bool,
+arrays, `ArrayStr`, `Nanos`, and — behind `byte-stable` features — `Uuid`,
+`FixedBytes`/`B256`/`Address`, and `Uint`/`U256`. Foreign types are supported
+through these flux-owned impls, so leaves can name them directly.
 
 Each `versioned_struct!`/`versioned_enum!` chain then also implements
 `Versioned` (plain `TYPE_HASH`es in `VERSION_HASHES`, oldest first, and a

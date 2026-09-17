@@ -10,6 +10,8 @@ version.workspace = true
 
 [dependencies]
 bitcode.workspace = true
+byte-stable.workspace = true
+byte-stable-derive.workspace = true
 chrono.workspace = true
 governor.workspace = true
 humantime.workspace = true
@@ -21,7 +23,6 @@ type-hash.workspace = true
 type-hash-derive.workspace = true
 wincode = { workspace = true, optional = true }
 wincode-derive = { workspace = true, optional = true }
-zerocopy.workspace = true
 
 [features]
 default = []

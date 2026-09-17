@@ -1,7 +1,9 @@
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
 use flux_versioned_types::{
     DecodeError, HasVersionedLeaves, Versioned, VersionedDeserialize, VersionedLeaves,
-    VisitorVersionedLeaf, versioned_enum, versioned_struct, zerocopy::IntoBytes,
+    VisitorVersionedLeaf,
+    byte_stable::{slice_as_bytes, words_as_bytes_mut},
+    versioned_enum, versioned_struct,
 };
 
 versioned_struct!(Leaf =>
@@ -74,13 +76,13 @@ const _: fn(
 fn struct_versions_decode_and_migrate() {
     assert_eq!(Leaf::VERSION_HASHES, &[LeafV1::TYPE_HASH, LeafV2::TYPE_HASH]);
     let vals = [LeafV1 { slot: 1 }, LeafV1 { slot: 2 }, LeafV1 { slot: 3 }];
-    let bytes = vals.as_slice().as_bytes();
+    let bytes = slice_as_bytes(vals.as_slice());
     let out = Leaf::decode_versions(LeafV1::TYPE_HASH, bytes).unwrap();
     assert_eq!(out, vals.iter().map(|v| (*v).into()).collect::<Vec<Leaf>>());
     assert_eq!(out[0].extra, 0);
 
     let latest = [Leaf { slot: 9, extra: 1, flags: 2 }];
-    let latest_bytes = latest.as_slice().as_bytes();
+    let latest_bytes = slice_as_bytes(latest.as_slice());
     let back = Leaf::decode_versions(LeafV2::TYPE_HASH, latest_bytes).unwrap();
     assert_eq!(back, latest);
 }
@@ -88,7 +90,7 @@ fn struct_versions_decode_and_migrate() {
 #[test]
 fn struct_decode_rejects_bad_input() {
     let vals = [LeafV1 { slot: 7 }];
-    let bytes = vals.as_slice().as_bytes().to_vec();
+    let bytes = slice_as_bytes(vals.as_slice()).to_vec();
     assert!(matches!(
         Leaf::decode_versions(0xDEAD_BEEF, &bytes),
         Err(DecodeError::UnknownTypeHash(0xDEAD_BEEF))
@@ -98,7 +100,7 @@ fn struct_decode_rejects_bad_input() {
         Err(DecodeError::LengthMismatch { .. })
     ));
     let mut backing = vec![0u64; 8];
-    let wide = backing.as_mut_slice().as_mut_bytes();
+    let wide = words_as_bytes_mut(backing.as_mut_slice());
     wide[1..=bytes.len()].copy_from_slice(&bytes);
     let misaligned = &wide[1..=bytes.len()];
     assert!(matches!(
@@ -111,7 +113,7 @@ fn struct_decode_rejects_bad_input() {
 fn enum_versions_decode_and_validate() {
     assert_eq!(Kind::VERSION_HASHES, &[KindV1::TYPE_HASH, KindV2::TYPE_HASH]);
     let vals = [KindV1::A, KindV1::B, KindV1::A];
-    let bytes = vals.as_slice().as_bytes();
+    let bytes = slice_as_bytes(vals.as_slice());
     let out = Kind::decode_versions(KindV1::TYPE_HASH, bytes).unwrap();
     assert_eq!(out, vec![Kind::A, Kind::B, Kind::A]);
     assert!(matches!(
@@ -154,8 +156,8 @@ fn family_visit_reaches_leaf() {
 #[test]
 fn wire_skip_chain_keeps_bincode_round_trip() {
     // `Skipped` deliberately does NOT implement `Versioned`: `#[wire_skip]`
-    // emits exactly the pre-zerocopy output (bincode codec only), so there is
-    // no `decode_versions` to call here. A negative bound check is not
+    // emits exactly the bincode-only output (no `ByteStable` derive), so there
+    // is no `decode_versions` to call here. A negative bound check is not
     // expressible; the bincode round trip below is the behavioural contract.
     let old = vec![SkippedV1 { name: "a".to_string() }];
     let bytes = bincode::serialize(&old).unwrap();

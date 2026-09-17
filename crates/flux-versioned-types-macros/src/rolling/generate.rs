@@ -81,20 +81,29 @@ fn generate_versioned_impls(
         };
         quote! {
             <#version as flux::type_hash::TypeHash>::TYPE_HASH => {
-                match <[#version] as ::flux_versioned_types::zerocopy::TryFromBytes>::try_ref_from_bytes(bytes) {
+                match ::flux_versioned_types::byte_stable::cast_slice::<#version>(bytes) {
                     Ok(slice) => #migrate,
-                    Err(::flux_versioned_types::zerocopy::ConvertError::Alignment(_)) => {
+                    Err(::flux_versioned_types::byte_stable::CastError::Unaligned) => {
                         Err(::flux_versioned_types::DecodeError::Unaligned)
                     }
-                    Err(::flux_versioned_types::zerocopy::ConvertError::Size(_)) => {
-                        let stride = ::core::mem::size_of::<#version>();
+                    Err(::flux_versioned_types::byte_stable::CastError::Length { got, size }) => {
                         Err(::flux_versioned_types::DecodeError::LengthMismatch {
-                            expected: if stride == 0 { 0 } else { stride * (bytes.len() / stride + 1) },
-                            got: bytes.len(),
+                            expected: if size == 0 {
+                                0
+                            } else {
+                                size * (got / size + 1)
+                            },
+                            got,
                         })
                     }
-                    Err(::flux_versioned_types::zerocopy::ConvertError::Validity(_)) => {
+                    Err(::flux_versioned_types::byte_stable::CastError::Invalid { .. }) => {
                         Err(::flux_versioned_types::DecodeError::InvalidValue)
+                    }
+                    Err(::flux_versioned_types::byte_stable::CastError::ZeroSized) => {
+                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                            expected: 0,
+                            got: bytes.len(),
+                        })
                     }
                 }
             }

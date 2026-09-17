@@ -16,6 +16,13 @@ pub mod wire;
 pub use blob::{
     TrackingTimestampWire, TrackingTimestampWireV1, VersionedBlob, VersionedPersistable,
 };
+/// Re-exported so macro-generated code can name `ByteStable` without the
+/// consumer crate depending on it directly.
+pub use byte_stable;
+/// The trait and the derive share one name in different namespaces:
+/// `flux_versioned_types::ByteStable` names both, like serde's `Serialize`.
+pub use byte_stable::ByteStable;
+pub use byte_stable_derive::ByteStable;
 pub use flux_versioned_types_macros::{
     TelemetrySchema, VersionedLeaves, evolve_enum, evolve_struct, roll_chain_into,
 };
@@ -25,9 +32,6 @@ pub use schema::TelemetrySchema;
 pub use wire::{
     DEFAULT_TELEMETRY_WIRE_ZSTD_LEVEL, TelemetryWire, TelemetryWirePayloadEncoding, TelemetryWireV2,
 };
-/// Re-exported so macro-generated code can name zerocopy without the consumer
-/// crate depending on it directly.
-pub use zerocopy;
 
 /// A type whose historical bincode payloads can be migrated to its latest form.
 pub trait VersionedDeserialize: Sized {
@@ -53,7 +57,7 @@ macro_rules! impl_versioned_deserialize {
 
 /// Define an evolving struct and its hash-directed decoder.
 ///
-/// The chain also gets zerocopy derives plus `Versioned` and
+/// The chain also gets the `ByteStable` derive plus `Versioned` and
 /// `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts out (bincode
 /// codec only) for types with padding or non-`Copy` fields. It is mutually
 /// exclusive with `#[wire_name = ".."]`.
@@ -108,7 +112,7 @@ macro_rules! versioned_struct {
 /// With `persist = "dir"` the type also gets a [`VersionedPersistable`]
 /// home under that directory.
 ///
-/// The chain also gets zerocopy derives plus `Versioned` and
+/// The chain also gets the `ByteStable` derive plus `Versioned` and
 /// `HasVersionedLeaves` impls. A leading `#[wire_skip]` opts out (bincode
 /// codec only) for types with padding or non-`Copy` fields. It is mutually
 /// exclusive with `#[wire_name = ".."]`.

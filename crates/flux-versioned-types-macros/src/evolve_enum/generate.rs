@@ -42,12 +42,12 @@ fn generate_enum_def(
         })
         .collect();
 
-    let zerocopy_attrs =
-        if wire_skip { Vec::new() } else { crate::shared::zerocopy_derive_attrs() };
+    let byte_stable_attrs =
+        if wire_skip { Vec::new() } else { crate::shared::byte_stable_derive_attrs() };
     quote! {
         #(#default_attrs)*
         #(#enum_attrs)*
-        #(#zerocopy_attrs)*
+        #(#byte_stable_attrs)*
         pub enum #name {
             #(#variant_tokens,)*
         }
