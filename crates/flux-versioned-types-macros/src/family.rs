@@ -47,23 +47,20 @@ impl Kept<'_> {
         )
     }
 
-    fn decode_step(&self) -> Tokens {
+    fn visit_step(&self) -> Tokens {
         let (v, ty) = (self.variant, self.ty);
-        let wrap = quote! {
-            |(meta, msgs): (U, Vec<_>)| (meta, msgs.into_iter().map(|m| m.map(Self::#v)).collect())
-        };
         self.name.as_ref().map_or_else(
             || {
                 quote! {
-                    if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob::<U>(blob, scratch) {
-                        return Some(found.map(#wrap));
+                    if let Some(out) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::visit_leaf_types(visitor, &|x| wrap(Self::#v(x))) {
+                        return Some(out);
                     }
                 }
             },
             |n| {
                 quote! {
-                    if blob.type_name() == #n && blob.is::<#ty>() {
-                        return Some(blob.decode::<U, #ty>(scratch).map(#wrap));
+                    if let Some(out) = visitor.visit_type::<#ty>(#n, &|x| wrap(Self::#v(x))) {
+                        return Some(out);
                     }
                 }
             },
@@ -146,7 +143,7 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
     });
     let leaf_names = kept.iter().map(Kept::names);
     let leaf_names_len = kept.iter().map(Kept::names_len);
-    let decode_steps = kept.iter().map(Kept::decode_step);
+    let visit_steps = kept.iter().map(Kept::visit_step);
     // `From` only for field types that appear once; a repeated type has no
     // single variant to map to.
     let type_key = |ty: &syn::Type| quote! { #ty }.to_string();
@@ -182,11 +179,11 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
                     #(#visit_skipped,)*
                 }
             }
-            fn decode_blob<U: ::flux_versioned_types::Versioned>(
-                blob: &::flux_versioned_types::Blob,
-                scratch: &mut ::flux_versioned_types::Scratch,
-            ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
-                #(#decode_steps)*
+            fn visit_leaf_types<Root, V: ::flux_versioned_types::VisitorLeafType<Root>>(
+                visitor: &mut V,
+                wrap: &dyn Fn(Self) -> Root,
+            ) -> Option<V::Out> {
+                #(#visit_steps)*
                 None
             }
         }

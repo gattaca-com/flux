@@ -74,7 +74,9 @@ const _: fn(
 
 #[test]
 fn struct_versions_decode_and_migrate() {
-    assert_eq!(Leaf::VERSION_HASHES, &[LeafV1::TYPE_HASH, LeafV2::TYPE_HASH]);
+    assert_eq!(Leaf::version_size(LeafV1::TYPE_HASH), Some(size_of::<LeafV1>()));
+    assert_eq!(Leaf::version_size(LeafV2::TYPE_HASH), Some(size_of::<LeafV2>()));
+    assert_eq!(Leaf::version_size(0), None);
     let vals = [LeafV1 { slot: 1 }, LeafV1 { slot: 2 }, LeafV1 { slot: 3 }];
     let bytes = slice_as_bytes(vals.as_slice());
     let out = Leaf::decode_versions(LeafV1::TYPE_HASH, bytes).unwrap();
@@ -111,7 +113,9 @@ fn struct_decode_rejects_bad_input() {
 
 #[test]
 fn enum_versions_decode_and_validate() {
-    assert_eq!(Kind::VERSION_HASHES, &[KindV1::TYPE_HASH, KindV2::TYPE_HASH]);
+    assert_eq!(Kind::version_size(KindV1::TYPE_HASH), Some(size_of::<KindV1>()));
+    assert_eq!(Kind::version_size(KindV2::TYPE_HASH), Some(size_of::<KindV2>()));
+    assert_eq!(Kind::version_size(0), None);
     let vals = [KindV1::A, KindV1::B, KindV1::A];
     let bytes = slice_as_bytes(vals.as_slice());
     let out = Kind::decode_versions(KindV1::TYPE_HASH, bytes).unwrap();

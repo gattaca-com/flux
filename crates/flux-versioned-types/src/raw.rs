@@ -189,7 +189,7 @@ impl Blob {
     }
 
     pub fn is<T: Versioned>(&self) -> bool {
-        T::VERSION_HASHES.contains(&self.header.type_hash)
+        T::version_size(self.header.type_hash).is_some()
     }
 
     pub fn type_name(&self) -> &str {
