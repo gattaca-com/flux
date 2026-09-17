@@ -2,6 +2,9 @@
 //!
 //! [`HttpNetwork`] can listen for requests and maintain outbound endpoints in
 //! one event loop. Events borrow parsed data only for the callback duration.
+//! An [`HttpPool`] shares a request queue across several connections to one
+//! address: [`HttpNetwork::send`] queues a request, its response carries the
+//! [`RequestId`], and [`HttpEvent::Failed`] reports one that gets no response.
 //!
 //! ```no_run
 //! use std::net::SocketAddr;
@@ -36,6 +39,7 @@
 //! per connection.
 
 use std::{
+    collections::VecDeque,
     io::{self, Write as _},
     net::SocketAddr,
 };
@@ -46,11 +50,69 @@ use mio::Token;
 use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork};
 
 pub enum HttpEvent<'a> {
-    Accepted { token: Token, peer_addr: SocketAddr },
-    Connected { token: Token },
-    Response { token: Token, response: HttpResponse<'a> },
-    Request { token: Token, request: HttpRequest<'a> },
-    Disconnected { token: Token },
+    Accepted {
+        token: Token,
+        peer_addr: SocketAddr,
+    },
+    Connected {
+        token: Token,
+    },
+    /// `id` is set for requests sent through a pool.
+    Response {
+        token: Token,
+        id: Option<RequestId>,
+        response: HttpResponse<'a>,
+    },
+    Request {
+        token: Token,
+        request: HttpRequest<'a>,
+    },
+    Disconnected {
+        token: Token,
+    },
+    /// A pooled request that will get no response.
+    Failed {
+        id: RequestId,
+        reason: Failure,
+    },
+}
+/// Persistent connections to one address sharing a request queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HttpPool(u32);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestId {
+    pool: HttpPool,
+    seq: u64,
+}
+impl RequestId {
+    pub fn pool(self) -> HttpPool {
+        self.pool
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The connection was lost after the request went out; the server may or
+    /// may not have handled it.
+    Disconnected,
+    TimedOut,
+}
+struct Queued {
+    id: RequestId,
+    method: String,
+    head: Vec<u8>,
+    body: Vec<u8>,
+    retries: u8,
+}
+struct InFlight {
+    queued: Queued,
+    sent_at: Instant,
+}
+struct Pool {
+    addr: SocketAddr,
+    tokens: Vec<Token>,
+    queue: VecDeque<Queued>,
+    queued_bytes: usize,
+    next_seq: u64,
 }
 #[derive(Clone, Copy)]
 enum State {
@@ -60,7 +122,7 @@ enum State {
 }
 enum Role {
     Accepted { state: State, close: bool, continued: bool, head_request: bool },
-    Outbound { addr: SocketAddr, method: Option<String> },
+    Outbound { addr: SocketAddr, method: Option<String>, in_flight: Option<InFlight> },
 }
 struct Conn {
     token: Token,
@@ -86,6 +148,10 @@ pub struct HttpNetwork {
     socket_buf_size: Option<usize>,
     conns: Vec<Conn>,
     lifecycle: Vec<Lifecycle>,
+    pools: Vec<Pool>,
+    max_queued_bytes: usize,
+    request_timeout: Option<Duration>,
+    failed: Vec<(RequestId, Failure)>,
 }
 impl Default for HttpNetwork {
     fn default() -> Self {
@@ -100,6 +166,10 @@ impl Default for HttpNetwork {
             socket_buf_size: None,
             conns: Vec::new(),
             lifecycle: Vec::new(),
+            pools: Vec::new(),
+            max_queued_bytes: usize::MAX,
+            request_timeout: None,
+            failed: Vec::new(),
         }
     }
 }
@@ -145,6 +215,19 @@ impl HttpNetwork {
     pub fn without_idle_timeout(mut self) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.idle_timeout = None;
+        self
+    }
+    /// Refuses pooled sends that would queue more than this many bytes.
+    pub fn with_max_queued_bytes(mut self, max_queued_bytes: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_queued_bytes = max_queued_bytes;
+        self
+    }
+    /// Fails a pooled request with no response after this long and cycles its
+    /// connection so a late response cannot be misattributed.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.request_timeout = Some(request_timeout);
         self
     }
     pub fn max_body_bytes(&self) -> usize {
@@ -257,6 +340,25 @@ impl HttpNetwork {
                 self.network.disconnect(token);
             }
         }
+        if let Some(timeout) = self.request_timeout {
+            for i in 0..self.conns.len() {
+                let Role::Outbound { in_flight: Some(in_flight), .. } = &self.conns[i].role else {
+                    continue
+                };
+                if in_flight.sent_at.elapsed() < timeout {
+                    continue
+                }
+                if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) {
+                    self.failed.push((in_flight.queued.id, Failure::TimedOut));
+                }
+                set_outbound_method(&mut self.conns[i].role, None);
+                self.network.disconnect(self.conns[i].token);
+            }
+        }
+        for (id, reason) in std::mem::take(&mut self.failed) {
+            handler(HttpEvent::Failed { id, reason });
+        }
+        self.dispatch();
     }
     fn emit_lifecycle<F>(&mut self, event: Lifecycle, handler: &mut F)
     where
@@ -273,10 +375,15 @@ impl HttpNetwork {
                         self.parse_connection(i, handler);
                     }
                     if matches!(self.conns[i].role, Role::Outbound { .. }) {
-                        self.parse_eof_outbound(i, handler);
+                        let answered = self.parse_eof_outbound(i, handler);
                         self.conns[i].buf.clear();
                         self.conns[i].dirty = false;
                         set_outbound_method(&mut self.conns[i].role, None);
+                        if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) &&
+                            !answered
+                        {
+                            self.requeue_or_fail(in_flight.queued);
+                        }
                     } else {
                         self.conns.remove(i);
                     }
@@ -314,9 +421,24 @@ impl HttpNetwork {
             dirty: false,
             over_limit: false,
             last_activity: Instant::now(),
-            role: Role::Outbound { addr, method: None },
+            role: Role::Outbound { addr, method: None, in_flight: None },
         });
         token
+    }
+    /// Opens `connections` persistent connections to `addr` that share one
+    /// request queue; see [`Self::send`].
+    pub fn pool(&mut self, addr: SocketAddr, connections: usize) -> HttpPool {
+        assert!(connections > 0, "a pool needs a connection");
+        let pool = HttpPool(self.pools.len() as u32);
+        let tokens = (0..connections).map(|_| self.connect(addr)).collect();
+        self.pools.push(Pool {
+            addr,
+            tokens,
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            next_seq: 0,
+        });
+        pool
     }
     /// Permanently removes an outbound endpoint and stops it reconnecting.
     pub fn remove(&mut self, token: Token) -> bool {
@@ -342,17 +464,7 @@ impl HttpNetwork {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        if !valid_token(method) ||
-            path.is_empty() ||
-            path.contains(['\r', '\n', ' ']) ||
-            body.len() > self.max_body_bytes ||
-            headers.iter().any(|(n, v)| {
-                !valid_token(n) ||
-                    v.contains(['\r', '\n']) ||
-                    n.eq_ignore_ascii_case("content-length") ||
-                    n.eq_ignore_ascii_case("transfer-encoding")
-            })
-        {
+        if !valid_request(method, path, headers) || body.len() > self.max_body_bytes {
             return false
         }
         let Some(c) =
@@ -363,25 +475,80 @@ impl HttpNetwork {
         let Role::Outbound { addr, .. } = &c.role else { return false };
         let host = addr.to_string();
         let sent = self.network.send_with(token, |out| {
-            write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
-            let mut has_host = false;
-            for (n, v) in headers {
-                has_host |= n.eq_ignore_ascii_case("host");
-                out.extend_from_slice(n.as_bytes());
-                out.extend_from_slice(b": ");
-                out.extend_from_slice(v.as_bytes());
-                out.extend_from_slice(b"\r\n");
-            }
-            if !has_host {
-                write!(out, "Host: {host}\r\n").unwrap();
-            }
-            write!(out, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
+            write_head(out, method, path, headers, &host, body.len());
             out.extend_from_slice(body);
         });
         if sent {
             set_outbound_method(&mut c.role, Some(method.to_owned()));
         }
         sent
+    }
+    /// Queues one request on a pool; it goes out on the first idle connection
+    /// and its response carries the returned id. `retries` is how many times
+    /// it is resent after its connection is lost. Returns the body back when
+    /// the request is invalid, over `max_body_bytes`, or the queue is full.
+    pub fn send(
+        &mut self,
+        pool: HttpPool,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+        retries: u8,
+    ) -> Result<RequestId, Vec<u8>> {
+        let p = &mut self.pools[pool.0 as usize];
+        if !valid_request(method, path, headers) || body.len() > self.max_body_bytes {
+            return Err(body)
+        }
+        let mut head = Vec::new();
+        write_head(&mut head, method, path, headers, &p.addr.to_string(), body.len());
+        if p.queued_bytes + head.len() + body.len() > self.max_queued_bytes {
+            return Err(body)
+        }
+        let id = RequestId { pool, seq: p.next_seq };
+        p.next_seq += 1;
+        p.queued_bytes += head.len() + body.len();
+        p.queue.push_back(Queued { id, method: method.to_owned(), head, body, retries });
+        self.dispatch();
+        Ok(id)
+    }
+    fn dispatch(&mut self) {
+        for p in 0..self.pools.len() {
+            for t in 0..self.pools[p].tokens.len() {
+                let token = self.pools[p].tokens[t];
+                let Some(i) = self
+                    .conns
+                    .iter()
+                    .position(|c| c.token == token && outbound_method(&c.role).is_none())
+                else {
+                    continue
+                };
+                let Some(next) = self.pools[p].queue.front() else { break };
+                let sent = self.network.send_with(token, |out| {
+                    out.extend_from_slice(&next.head);
+                    out.extend_from_slice(&next.body);
+                });
+                if !sent {
+                    continue
+                }
+                let queued = self.pools[p].queue.pop_front().unwrap();
+                self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
+                set_outbound_method(&mut self.conns[i].role, Some(queued.method.clone()));
+                if let Role::Outbound { in_flight, .. } = &mut self.conns[i].role {
+                    *in_flight = Some(InFlight { queued, sent_at: Instant::now() });
+                }
+            }
+        }
+    }
+    fn requeue_or_fail(&mut self, mut queued: Queued) {
+        if queued.retries == 0 {
+            self.failed.push((queued.id, Failure::Disconnected));
+            return
+        }
+        queued.retries -= 1;
+        let pool = &mut self.pools[queued.id.pool.0 as usize];
+        pool.queued_bytes += queued.head.len() + queued.body.len();
+        pool.queue.push_front(queued);
     }
     fn fail_outbound(&mut self, i: usize) {
         let token = self.conns[i].token;
@@ -632,6 +799,7 @@ impl HttpNetwork {
                 continue
             }
             let token = self.conns[i].token;
+            let id = in_flight_id(&self.conns[i].role);
             let close = response.version == Some(0) &&
                 !has_token(response.headers, "connection", b"keep-alive") ||
                 has_token(response.headers, "connection", b"close");
@@ -648,29 +816,30 @@ impl HttpNetwork {
                     &b[head..consumed]
                 },
             };
-            handler(HttpEvent::Response { token, response: response_event });
+            handler(HttpEvent::Response { token, id, response: response_event });
             self.conns[i].buf.drain(..consumed);
             self.conns[i].dirty = !self.conns[i].buf.is_empty();
             set_outbound_method(&mut self.conns[i].role, None);
+            take_in_flight(&mut self.conns[i].role);
             if close {
                 self.network.disconnect(token);
                 return
             }
         }
     }
-    fn parse_eof_outbound<F>(&self, i: usize, handler: &mut F)
+    fn parse_eof_outbound<F>(&self, i: usize, handler: &mut F) -> bool
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
         if outbound_method(&self.conns[i].role).is_none() {
-            return
+            return false
         }
         let b = &self.conns[i].buf;
         let mut headers = vec![httparse::EMPTY_HEADER; self.max_headers];
         let mut response = httparse::Response::new(&mut headers);
-        let Ok(httparse::Status::Complete(head)) = response.parse(b) else { return };
+        let Ok(httparse::Status::Complete(head)) = response.parse(b) else { return false };
         if !crlf_only(&b[..head]) || head > self.max_head_bytes {
-            return
+            return false
         }
         let status = response.code.unwrap_or(0);
         let no_body = outbound_method(&self.conns[i].role).map(String::as_str) == Some("HEAD") ||
@@ -680,11 +849,12 @@ impl HttpNetwork {
             !matches!(response_content_length(response.headers), ContentLength::Absent) ||
             b.len() - head > self.max_body_bytes
         {
-            return
+            return false
         }
         let token = self.conns[i].token;
         handler(HttpEvent::Response {
             token,
+            id: in_flight_id(&self.conns[i].role),
             response: HttpResponse {
                 version: response.version.unwrap_or(1),
                 status,
@@ -693,6 +863,7 @@ impl HttpNetwork {
                 body: &b[head..],
             },
         });
+        true
     }
     fn decode_chunked(
         bytes: &[u8],
@@ -792,6 +963,48 @@ fn has_value_token(value: &[u8], wanted: &[u8]) -> bool {
 fn valid_token(value: &str) -> bool {
     !value.is_empty() &&
         value.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
+    valid_token(method) &&
+        !path.is_empty() &&
+        !path.contains(['\r', '\n', ' ']) &&
+        headers.iter().all(|(n, v)| {
+            valid_token(n) &&
+                !v.contains(['\r', '\n']) &&
+                !n.eq_ignore_ascii_case("content-length") &&
+                !n.eq_ignore_ascii_case("transfer-encoding")
+        })
+}
+fn write_head(
+    out: &mut impl io::Write,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    host: &str,
+    body_len: usize,
+) {
+    write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
+    let mut has_host = false;
+    for (n, v) in headers {
+        has_host |= n.eq_ignore_ascii_case("host");
+        write!(out, "{n}: {v}\r\n").unwrap();
+    }
+    if !has_host {
+        write!(out, "Host: {host}\r\n").unwrap();
+    }
+    write!(out, "Content-Length: {body_len}\r\n\r\n").unwrap();
+}
+fn in_flight_id(role: &Role) -> Option<RequestId> {
+    match role {
+        Role::Outbound { in_flight: Some(in_flight), .. } => Some(in_flight.queued.id),
+        _ => None,
+    }
+}
+fn take_in_flight(role: &mut Role) -> Option<InFlight> {
+    match role {
+        Role::Outbound { in_flight, .. } => in_flight.take(),
+        Role::Accepted { .. } => None,
+    }
 }
 fn accepted_state(role: &Role) -> State {
     match role {

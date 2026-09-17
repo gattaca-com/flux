@@ -48,20 +48,24 @@ fn insert_survives_a_dropped_connection_and_errors_map() {
     // One network is both the fake server and the client's pool.
     let mut http = HttpNetwork::default();
     http.listen(addr).unwrap();
-    let mut ch =
-        ClickHouse::new(addr).with_credentials("w", "s").with_database("db").with_connections(2);
-    let insert = ch.insert_rows("t", &[row]).unwrap();
-    let bad = ch.query("SELEC");
+    let ch = ClickHouse::new(&mut http, addr, 2).with_credentials("w", "s").with_database("db");
+    let insert = ch.insert_rows(&mut http, "t", &[row]).unwrap();
+    let bad = ch.query(&mut http, "SELEC").unwrap();
     let mut inserts = Vec::new();
     let mut outcomes = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && outcomes.len() < 2 {
         let mut replies = Vec::new();
         http.poll_with(|event| {
-            if ch.on_event(&event) {
-                return
-            }
-            if let HttpEvent::Request { token, request } = event {
+            if let Some((id, result)) = ch.outcome(&event) {
+                outcomes.push((id, match result {
+                    Ok(body) => Ok(body.to_vec()),
+                    Err(Error::Server { status, code, message }) => {
+                        Err((status, code, message.to_vec()))
+                    }
+                    Err(err) => panic!("{err:?}"),
+                }));
+            } else if let HttpEvent::Request { token, request } = event {
                 if request.path.starts_with("/?query=") {
                     inserts.push((
                         request.path.to_owned(),
@@ -76,19 +80,18 @@ fn insert_survives_a_dropped_connection_and_errors_map() {
             if !is_insert {
                 http.respond(token, 400, &[("X-ClickHouse-Exception-Code", "62")], b"Code: 62");
             } else if inserts.len() == 1 {
-                // The first attempt is cut off; the client must resend it.
+                // The first attempt is cut off; the pool must resend it.
                 http.disconnect(token);
             } else {
                 http.respond(token, 200, &[], b"");
             }
         }
-        ch.drive(&mut http, |id, outcome| outcomes.push((id, outcome)));
         thread::sleep(Duration::from_millis(1));
     }
     outcomes.sort_by_key(|(id, _)| *id);
     assert_eq!(outcomes, [
         (insert, Ok(Vec::new())),
-        (bad, Err(Error::Server { status: 400, code: Some(62), message: b"Code: 62".to_vec() })),
+        (bad, Err((400, Some(62), b"Code: 62".to_vec()))),
     ]);
     assert_eq!(inserts.len(), 2);
     for (path, key, body) in &inserts {
