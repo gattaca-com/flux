@@ -1479,6 +1479,7 @@ dependencies = [
  "type-hash-derive",
  "wincode",
  "wincode-derive",
+ "zerocopy",
 ]
 
 [[package]]

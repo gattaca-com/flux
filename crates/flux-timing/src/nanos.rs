@@ -16,7 +16,20 @@ use crate::{
 };
 
 /// Nanos since unix epoch, good till 2554 or so
-#[derive(Copy, Clone, Debug, Default, Serialize, Hash, PartialEq, TypeHash)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Hash,
+    PartialEq,
+    TypeHash,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 #[cfg_attr(feature = "wincode", derive(wincode_derive::SchemaRead, wincode_derive::SchemaWrite,))]
 #[repr(C)]
 pub struct Nanos(pub u64);

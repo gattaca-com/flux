@@ -21,6 +21,7 @@ type-hash.workspace = true
 type-hash-derive.workspace = true
 wincode = { workspace = true, optional = true }
 wincode-derive = { workspace = true, optional = true }
+zerocopy.workspace = true
 
 [features]
 default = []

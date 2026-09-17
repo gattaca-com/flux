@@ -331,7 +331,17 @@ impl VersionedBlob {
 /// The zerocopy blob format (`crate::raw`) stores these as 24-byte records:
 /// 8 + 8 + 2 bytes of fields plus 6 bytes of explicit zero padding, so the
 /// record is padding-free and every bit pattern is valid.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 #[repr(C)]
 pub struct InternalMetadata {
     pub ingestion_t_real: flux_timing::Nanos,
@@ -348,57 +358,6 @@ const _: () = assert!(
     size_of::<InternalMetadata>() == crate::raw::TIMESTAMP_STRIDE,
     "InternalMetadata must be exactly one timestamp record with no padding",
 );
-
-// Manual zerocopy impls: the derives would require them on `Nanos` too,
-// which lives in flux-timing. Every field is an int newtype or byte array
-// and the struct has no padding (see the assertion above), so all of these
-// hold: any 24 bytes are a valid value, all bytes initialized, no interior
-// mutability.
-unsafe impl zerocopy::Immutable for InternalMetadata {
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized,
-    {
-    }
-}
-
-unsafe impl zerocopy::TryFromBytes for InternalMetadata {
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized,
-    {
-    }
-
-    fn is_bit_valid<A: zerocopy::invariant::Alignment>(
-        _candidate: zerocopy::Maybe<'_, Self, A>,
-    ) -> bool {
-        true
-    }
-}
-
-unsafe impl zerocopy::FromZeros for InternalMetadata {
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized,
-    {
-    }
-}
-
-unsafe impl zerocopy::FromBytes for InternalMetadata {
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized,
-    {
-    }
-}
-
-unsafe impl zerocopy::IntoBytes for InternalMetadata {
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized,
-    {
-    }
-}
 
 /// Pre-tile-id metadata format. Deserialization fallback for payloads written
 /// before `tile_id` was added.

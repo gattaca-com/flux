@@ -41,7 +41,7 @@ use std::collections::HashMap;
 
 use flux_timing::InternalMessage;
 use flux_utils::ArrayStr;
-use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::{
     blob::InternalMetadata,
@@ -186,6 +186,15 @@ impl Blob {
         if bytes.len() < HEADER_LEN {
             return Err(DecodeError::TooShort { needed: HEADER_LEN, got: bytes.len() });
         }
+        // Before the cast, so a legacy bincode frame is `BadMagic`, not a
+        // complaint about whatever bytes sit where `type_name` would be.
+        if bytes[..MAGIC.len()] != MAGIC {
+            return Err(DecodeError::BadMagic);
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+        if version != FORMAT_VERSION {
+            return Err(DecodeError::UnsupportedVersion(version));
+        }
         let head = Self::try_ref_from_bytes(&bytes[..HEADER_LEN]).map_err(|e| match e {
             zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
             zerocopy::ConvertError::Size(_) => {
@@ -210,12 +219,6 @@ impl Blob {
             }
             zerocopy::ConvertError::Validity(_) => DecodeError::BadTypeName,
         })?;
-        if blob.magic != MAGIC {
-            return Err(DecodeError::BadMagic);
-        }
-        if blob.version != FORMAT_VERSION {
-            return Err(DecodeError::UnsupportedVersion(blob.version));
-        }
         Ok(blob)
     }
 
@@ -321,22 +324,22 @@ impl Blob {
     }
 }
 
-/// Reinterpret timestamp bytes as records. Needs no zerocopy bound on
-/// [`InternalMetadata`]: every bit pattern is a valid record and the struct
-/// has no padding, so alignment plus an exact length is a sound cast.
 fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[InternalMetadata], DecodeError> {
-    if !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<InternalMetadata>()) {
-        return Err(DecodeError::Unaligned);
-    }
-    if bytes.len() != n * size_of::<InternalMetadata>() {
+    let stamps = <[InternalMetadata]>::ref_from_bytes(bytes).map_err(|e| match e {
+        zerocopy::ConvertError::Alignment(_) => DecodeError::Unaligned,
+        zerocopy::ConvertError::Size(_) => DecodeError::LengthMismatch {
+            expected: n * size_of::<InternalMetadata>(),
+            got: bytes.len(),
+        },
+        zerocopy::ConvertError::Validity(i) => match i {},
+    })?;
+    if stamps.len() != n {
         return Err(DecodeError::LengthMismatch {
             expected: n * size_of::<InternalMetadata>(),
             got: bytes.len(),
         });
     }
-    // Safety: alignment and length checked above; all byte patterns are valid
-    // records and there is no padding (asserted in `blob.rs`).
-    Ok(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast(), n) })
+    Ok(stamps)
 }
 
 /// Per-leaf-type byte buffers filled by [`BlobCache::push`].
