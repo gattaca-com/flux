@@ -1,18 +1,15 @@
 //! Poll-driven `Postgres` client over a caller-owned [`TcpNetwork`].
 //!
-//! Requests queue inside the client: [`Postgres::query`], [`Postgres::copy`],
-//! and [`Postgres::copy_rows`] return a [`QueryId`] at once;
-//! [`Postgres::on_event`], called from the network's `poll_with` handler,
-//! tracks the pooled connections; [`Postgres::drive`] sends queued requests
-//! on idle ones and delivers one outcome per id. Copies cut off by a lost
-//! connection are resent. The queue is bounded by bytes and evicts the
-//! oldest requests as [`Error::Dropped`].
+//! Requests queue inside the client; [`Postgres::on_event`], called from
+//! the network's `poll_with` handler, tracks the pooled connections, and
+//! [`Postgres::drive`] sends queued requests on idle ones and delivers
+//! one outcome per id. A full queue refuses the new request instead of
+//! failing queued ones.
 //!
-//! Authentication covers trust, cleartext, MD5, and SCRAM-SHA-256; anything
+//! Authentication covers trust, cleartext, and SCRAM-SHA-256; anything
 //! else fails the connection without an outcome.
 
 pub mod copybinary;
-pub mod insert;
 mod scram;
 
 use std::{collections::VecDeque, net::SocketAddr};
@@ -21,18 +18,15 @@ use flux_network::{
     Token,
     tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork},
 };
-use md5::Digest as _;
 use rand::Rng as _;
-use serde::{Serialize, ser::Error as _};
+use serde::Serialize;
 use tracing::warn;
 
 const PROTOCOL_VERSION: i32 = 196_608;
 const SCRAM_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 const NONCE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-const SEND_CHUNK_BYTES: usize = 8 << 20;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 << 20;
 const DEFAULT_MAX_QUEUED_BYTES: usize = 256 << 20;
-const RETRIES: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueryId(u64);
@@ -72,8 +66,6 @@ pub enum Error {
     UnsupportedAuth(String),
     /// The server's reply exceeded `max_output_bytes`.
     TooLarge,
-    /// Evicted from a full queue before being sent.
-    Dropped,
     /// A message arrived that fits no legal state.
     Protocol(&'static str),
 }
@@ -84,7 +76,6 @@ struct Request {
     id: QueryId,
     sql: String,
     data: Option<Vec<u8>>,
-    retries_left: u8,
 }
 
 impl Request {
@@ -109,7 +100,6 @@ struct QueryOut {
 
 struct CopyOut {
     request: Request,
-    sent: bool,
     tag: Option<String>,
     error: Option<ServerError>,
 }
@@ -134,7 +124,6 @@ struct Conn {
     state: State,
     rx: Vec<u8>,
     outbox: Vec<u8>,
-    out_sent: usize,
 }
 
 impl Conn {
@@ -142,7 +131,6 @@ impl Conn {
         self.state = state;
         self.rx.clear();
         self.outbox.clear();
-        self.out_sent = 0;
     }
 
     fn take_in_flight(&self) -> Option<QueryId> {
@@ -173,15 +161,7 @@ impl Conn {
             }
             return None;
         }
-        match Postgres::dispatch_inner(
-            &mut self.state,
-            &mut self.outbox,
-            user,
-            password,
-            max_output,
-            tag,
-            body,
-        ) {
+        match self.state.on_message(&mut self.outbox, user, password, max_output, tag, body) {
             Ok(outcome) => outcome,
             Err(error) => self.fatal(error),
         }
@@ -267,18 +247,21 @@ impl Postgres {
     }
 
     pub fn with_credentials(mut self, user: &str, password: &str) -> Self {
+        assert!(self.group.is_none(), "configure before the first drive");
         user.clone_into(&mut self.user);
         password.clone_into(&mut self.password);
         self
     }
 
     pub fn with_database(mut self, database: &str) -> Self {
+        assert!(self.group.is_none(), "configure before the first drive");
         database.clone_into(&mut self.database);
         self
     }
 
     /// Sets a startup parameter such as `application_name`.
     pub fn with_parameter(mut self, name: &str, value: &str) -> Self {
+        assert!(self.group.is_none(), "configure before the first drive");
         match self.params.iter_mut().find(|(n, _)| n == name) {
             Some((_, v)) => value.clone_into(v),
             None => self.params.push((name.to_owned(), value.to_owned())),
@@ -305,64 +288,53 @@ impl Postgres {
         self
     }
 
-    /// Queues `sql` as one simple-protocol statement; a lost connection
-    /// fails it.
-    pub fn query(&mut self, sql: &str) -> QueryId {
-        self.enqueue(sql.to_owned(), None, 0)
+    /// Queues `sql` as one simple-protocol statement, or `None` when the
+    /// queue is full.
+    pub fn query(&mut self, sql: &str) -> Option<QueryId> {
+        if self.full_for(sql.len()) {
+            return None;
+        }
+        Some(self.enqueue(sql.to_owned(), None))
     }
 
-    /// Queues `data` as the body of a `COPY ... FROM STDIN` statement; a
-    /// lost connection resends it, so the server may see it more than once.
-    pub fn copy(&mut self, sql: &str, data: Vec<u8>) -> QueryId {
-        self.enqueue(sql.to_owned(), Some(data), RETRIES)
+    /// Queues `data` as the body of a `COPY ... FROM STDIN` statement,
+    /// handing it back when the queue is full.
+    pub fn copy(&mut self, sql: &str, data: Vec<u8>) -> Result<QueryId, Vec<u8>> {
+        if self.full_for(sql.len() + data.len()) {
+            return Err(data);
+        }
+        Ok(self.enqueue(sql.to_owned(), Some(data)))
     }
 
     /// Encodes `rows` as `COPY BINARY` and queues them for `table`, naming
-    /// the columns after the row's fields.
-    pub fn copy_rows<T: Serialize>(
-        &mut self,
-        table: &str,
-        rows: &[T],
-    ) -> Result<QueryId, copybinary::Error> {
-        let first = rows.first().ok_or_else(|| copybinary::Error::custom("empty batch"))?;
-        let sql = copybinary::copy_statement(table, first)?;
+    /// the columns after the row's fields. Empty batches and full queues
+    /// return `None`; unencodable rows panic.
+    pub fn copy_rows<T: Serialize>(&mut self, table: &str, rows: &[T]) -> Option<QueryId> {
+        let first = rows.first()?;
+        let sql = copybinary::copy_statement(table, first).expect("COPY BINARY row");
         let mut body = Vec::new();
         copybinary::header(&mut body);
         for row in rows {
-            copybinary::encode(&mut body, row)?;
+            copybinary::encode(&mut body, row).expect("COPY BINARY row");
         }
         copybinary::trailer(&mut body);
-        Ok(self.copy(&sql, body))
-    }
-
-    /// Builds a multi-row `INSERT` for `table` and queues it. With
-    /// [`insert::OnConflict::DoNothing`] a lost connection resends it, which
-    /// is safe because the statement is idempotent.
-    pub fn insert_rows<T: Serialize>(
-        &mut self,
-        table: &str,
-        rows: &[T],
-        on_conflict: insert::OnConflict,
-    ) -> Result<QueryId, insert::Error> {
-        let sql = insert::rows(table, rows, on_conflict)?;
-        let retries = match on_conflict {
-            insert::OnConflict::None => 0,
-            insert::OnConflict::DoNothing => RETRIES,
-        };
-        Ok(self.enqueue(sql, None, retries))
-    }
-
-    fn enqueue(&mut self, sql: String, data: Option<Vec<u8>>, retries_left: u8) -> QueryId {
-        let request = Request { id: QueryId(self.next_id), sql, data, retries_left };
-        self.next_id += 1;
-        while self.queued_bytes + request.queued_len() > self.max_queued_bytes {
-            let Some(oldest) = self.pop_queued() else { break };
-            self.outcomes.push((oldest.id, Err(Error::Dropped)));
+        if self.full_for(sql.len() + body.len()) {
+            return None;
         }
-        let id = request.id;
+        Some(self.enqueue(sql, Some(body)))
+    }
+
+    fn enqueue(&mut self, sql: String, data: Option<Vec<u8>>) -> QueryId {
+        let id = QueryId(self.next_id);
+        self.next_id += 1;
+        let request = Request { id, sql, data };
         self.queued_bytes += request.queued_len();
         self.queue.push_back(request);
         id
+    }
+
+    fn full_for(&self, len: usize) -> bool {
+        self.queued_bytes + len > self.max_queued_bytes
     }
 
     fn pop_queued(&mut self) -> Option<Request> {
@@ -371,9 +343,27 @@ impl Postgres {
         Some(request)
     }
 
-    fn requeue_front(&mut self, request: Request) {
-        self.queued_bytes += request.queued_len();
-        self.queue.push_front(request);
+    fn startup_bytes(user: &str, database: &str, params: &[(String, String)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        let mut param = |name: &str, value: &str| {
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        };
+        param("user", user);
+        if !database.is_empty() {
+            param("database", database);
+        }
+        for (name, value) in params {
+            param(name, value);
+        }
+        body.push(0);
+        let mut out = Vec::with_capacity(body.len() + 4);
+        out.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
     }
 
     fn ensure_conns(&mut self, net: &mut TcpNetwork) {
@@ -384,6 +374,8 @@ impl Postgres {
             net.add_group(TcpGroupConfig {
                 name: "postgres",
                 framing: Framing::Raw,
+                max_frame_size: usize::MAX,
+                on_connect_msg: Some(Self::startup_bytes(&self.user, &self.database, &self.params)),
                 ..Default::default()
             })
         });
@@ -394,29 +386,20 @@ impl Postgres {
                 state: State::Connecting,
                 rx: Vec::new(),
                 outbox: Vec::new(),
-                out_sent: 0,
             });
         }
     }
 
     fn send_pending(&mut self, net: &mut TcpNetwork, index: usize) -> bool {
-        let token = self.conns[index].token;
-        loop {
-            let conn = &self.conns[index];
-            if conn.out_sent >= conn.outbox.len() {
-                break;
-            }
-            let start = conn.out_sent;
-            let end = (start + SEND_CHUNK_BYTES).min(conn.outbox.len());
-            let outbox = &self.conns[index].outbox;
-            if !net.send_with(token, |buf| buf.extend_from_slice(&outbox[start..end])) {
-                return false;
-            }
-            self.conns[index].out_sent = end;
+        let outbox = &self.conns[index].outbox;
+        if outbox.is_empty() {
+            return true;
         }
-        let conn = &mut self.conns[index];
-        conn.outbox.clear();
-        conn.out_sent = 0;
+        let token = self.conns[index].token;
+        if !net.send_with(token, |buf| buf.extend_from_slice(outbox)) {
+            return false;
+        }
+        self.conns[index].outbox.clear();
         true
     }
 
@@ -439,19 +422,27 @@ impl Postgres {
                 continue;
             }
             let Some(request) = self.pop_queued() else { break };
-            let prev = self.conns[index].outbox.len();
-            Self::queue_cstring(&mut self.conns[index].outbox, b'Q', request.sql.as_bytes());
-            if !self.send_pending(net, index) {
-                let conn = &mut self.conns[index];
-                conn.outbox.truncate(prev);
-                conn.out_sent = conn.out_sent.min(prev);
-                self.requeue_front(request);
+            let token = self.conns[index].token;
+            let sent = net.send_with(token, |buf| {
+                buf.push(b'Q');
+                buf.extend_from_slice(&((request.sql.len() + 5) as u32).to_be_bytes());
+                buf.extend_from_slice(request.sql.as_bytes());
+                buf.push(0);
+                if let Some(data) = &request.data {
+                    buf.push(b'd');
+                    buf.extend_from_slice(&((data.len() + 4) as u32).to_be_bytes());
+                    buf.extend_from_slice(data);
+                    buf.push(b'c');
+                    buf.extend_from_slice(&4u32.to_be_bytes());
+                }
+            });
+            if !sent {
+                self.queued_bytes += request.queued_len();
+                self.queue.push_front(request);
                 break;
             }
-            let is_copy = request.data.is_some();
-            if is_copy {
-                self.conns[index].state =
-                    State::Copy(CopyOut { request, sent: false, tag: None, error: None });
+            if request.data.is_some() {
+                self.conns[index].state = State::Copy(CopyOut { request, tag: None, error: None });
             } else {
                 self.conns[index].state = State::Query(QueryOut {
                     request,
@@ -482,11 +473,10 @@ impl Postgres {
             TcpEvent::Accepted { .. } => false,
             TcpEvent::Connected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
-                let Self { conns, outcomes, user, database, params, .. } = self;
+                let Self { conns, outcomes, .. } = self;
                 let conn = &mut conns[index];
                 let stale = conn.take_in_flight();
                 conn.reset(State::Startup(Startup::AwaitAuth));
-                Self::queue_startup(&mut conn.outbox, user, database, params);
                 if let Some(id) = stale {
                     outcomes.push((id, Err(Error::Disconnected)));
                 }
@@ -494,25 +484,11 @@ impl Postgres {
             }
             TcpEvent::Disconnected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
-                let request = {
-                    let conn = &mut self.conns[index];
-                    let state = std::mem::replace(&mut conn.state, State::Connecting);
-                    conn.rx.clear();
-                    conn.outbox.clear();
-                    conn.out_sent = 0;
-                    match state {
-                        State::Query(query) => Some(query.request),
-                        State::Copy(copy) => Some(copy.request),
-                        _ => None,
-                    }
-                };
-                match request {
-                    Some(mut request) if request.retries_left > 0 => {
-                        request.retries_left -= 1;
-                        self.requeue_front(request);
-                    }
-                    Some(request) => self.outcomes.push((request.id, Err(Error::Disconnected))),
-                    None => {}
+                let conn = &mut self.conns[index];
+                let in_flight = conn.take_in_flight();
+                conn.reset(State::Connecting);
+                if let Some(id) = in_flight {
+                    self.outcomes.push((id, Err(Error::Disconnected)));
                 }
                 true
             }
@@ -564,294 +540,6 @@ impl Postgres {
                 }
                 true
             }
-        }
-    }
-
-    fn dispatch_inner(
-        state: &mut State,
-        outbox: &mut Vec<u8>,
-        user: &str,
-        password: &str,
-        max_output: usize,
-        tag: u8,
-        body: &[u8],
-    ) -> Result<Option<Outcome>, Error> {
-        match state {
-            State::Connecting => Err(Error::Protocol("message arrived before connect completed")),
-            State::Dead => Ok(None),
-            State::Ready => match tag {
-                b'Z' => Ok(None),
-                b'E' => {
-                    let error = Self::parse_error(body);
-                    warn!(code = %error.code, message = %error.message, "postgres errored while idle");
-                    Err(Error::Protocol("server error with no query in flight"))
-                }
-                _ => Err(Error::Protocol("message arrived with no query in flight")),
-            },
-            State::Startup(startup) => {
-                if Self::startup(startup, outbox, user, password, tag, body)? {
-                    *state = State::Ready;
-                }
-                Ok(None)
-            }
-            State::Query(query) => match Self::query_msg(query, max_output, tag, body)? {
-                Some(result) => {
-                    let id = query.request.id;
-                    *state = State::Ready;
-                    Ok(Some((id, result)))
-                }
-                None => Ok(None),
-            },
-            State::Copy(copy) => match Self::copy_msg(copy, outbox, tag, body)? {
-                Some(result) => {
-                    let id = copy.request.id;
-                    *state = State::Ready;
-                    Ok(Some((id, result)))
-                }
-                None => Ok(None),
-            },
-        }
-    }
-
-    fn startup(
-        startup: &mut Startup,
-        outbox: &mut Vec<u8>,
-        user: &str,
-        password: &str,
-        tag: u8,
-        body: &[u8],
-    ) -> Result<bool, Error> {
-        match tag {
-            b'R' => Self::auth(startup, outbox, user, password, body),
-            b'E' => {
-                let error = Self::parse_error(body);
-                warn!(code = %error.code, message = %error.message, "postgres rejected the connection");
-                Err(Error::Server { code: error.code, message: error.message })
-            }
-            b'Z' => match startup {
-                Startup::AwaitReady => Ok(true),
-                _ => Err(Error::Protocol("ready arrived before authentication completed")),
-            },
-            b'T' | b'D' | b'C' | b'I' => {
-                Err(Error::Protocol("query results arrived during startup"))
-            }
-            b'G' | b'H' | b'W' | b'c' | b'd' => {
-                Err(Error::Protocol("COPY message arrived during startup"))
-            }
-            _ => Ok(false),
-        }
-    }
-
-    fn auth(
-        startup: &mut Startup,
-        outbox: &mut Vec<u8>,
-        user: &str,
-        password: &str,
-        body: &[u8],
-    ) -> Result<bool, Error> {
-        let mut cursor = Cursor(body);
-        let method = cursor.i32().ok_or(Error::Protocol("truncated authentication message"))?;
-        match startup {
-            Startup::AwaitAuth => match method {
-                0 => {
-                    *startup = Startup::AwaitReady;
-                    Ok(false)
-                }
-                3 => {
-                    Self::queue_cstring(outbox, b'p', password.as_bytes());
-                    Ok(false)
-                }
-                5 => {
-                    let salt = cursor.bytes(4).ok_or(Error::Protocol("truncated MD5 salt"))?;
-                    Self::queue_cstring(
-                        outbox,
-                        b'p',
-                        Self::md5_password(password, user, salt).as_bytes(),
-                    );
-                    Ok(false)
-                }
-                10 => {
-                    let mut mechanisms = Vec::new();
-                    let mut scram = false;
-                    while let Some(name) = cursor.cstring() {
-                        if name.is_empty() {
-                            break;
-                        }
-                        scram |= name == SCRAM_MECHANISM;
-                        mechanisms.push(String::from_utf8_lossy(name).into_owned());
-                    }
-                    if !scram {
-                        warn!(
-                            mechanisms = mechanisms.join(","),
-                            "postgres offered no supported SASL mechanism"
-                        );
-                        return Err(Error::UnsupportedAuth(format!(
-                            "SASL({})",
-                            mechanisms.join(",")
-                        )));
-                    }
-                    let cnonce: String = {
-                        let mut rng = rand::rng();
-                        (0..24)
-                            .map(|_| {
-                                NONCE_ALPHABET[rng.random_range(0..NONCE_ALPHABET.len())] as char
-                            })
-                            .collect()
-                    };
-                    let (exchange, response) = scram::Exchange::start(user, &cnonce);
-                    Self::queue_raw(outbox, b'p', &response);
-                    *startup = Startup::Sasl(exchange);
-                    Ok(false)
-                }
-                _ => {
-                    let name = match method {
-                        2 => "KerberosV5".to_owned(),
-                        6 => "SCM credential".to_owned(),
-                        7 => "GSS".to_owned(),
-                        8 => "GSS continue".to_owned(),
-                        9 => "SSPI".to_owned(),
-                        _ => format!("authentication type {method}"),
-                    };
-                    warn!(method, "postgres asked for an unsupported authentication method");
-                    Err(Error::UnsupportedAuth(name))
-                }
-            },
-            Startup::Sasl(exchange) => match method {
-                11 => {
-                    let response =
-                        exchange.client_final(password, cursor.rest()).map_err(|message| {
-                            warn!(%message, "SCRAM exchange failed");
-                            Error::Protocol(message)
-                        })?;
-                    Self::queue_raw(outbox, b'p', &response);
-                    Ok(false)
-                }
-                12 => {
-                    exchange.verify_server_final(cursor.rest()).map_err(|message| {
-                        warn!(%message, "SCRAM exchange failed");
-                        Error::Protocol(message)
-                    })?;
-                    *startup = Startup::AwaitReady;
-                    Ok(false)
-                }
-                _ => Err(Error::Protocol("authentication message out of sequence")),
-            },
-            Startup::AwaitReady => match method {
-                0 => Ok(false),
-                _ => Err(Error::Protocol("authentication message out of sequence")),
-            },
-        }
-    }
-
-    fn md5_password(password: &str, user: &str, salt: &[u8]) -> String {
-        let inner = format!("{:x}", md5::Md5::digest(format!("{password}{user}")));
-        let mut outer = md5::Md5::new();
-        outer.update(inner.as_bytes());
-        outer.update(salt);
-        format!("md5{:x}", outer.finalize())
-    }
-
-    fn query_msg(
-        query: &mut QueryOut,
-        max_output: usize,
-        tag: u8,
-        body: &[u8],
-    ) -> Result<Option<Result<Output, Error>>, Error> {
-        match tag {
-            b'T' => {
-                let columns = Self::parse_columns(body)?;
-                query.bytes += body.len();
-                if query.bytes > max_output {
-                    return Err(Error::TooLarge);
-                }
-                if query.tag.is_some() {
-                    query.columns.clear();
-                    query.rows.clear();
-                    query.tag = None;
-                }
-                query.columns = columns;
-                Ok(None)
-            }
-            b'D' => {
-                let row = Self::parse_row(body)?;
-                query.bytes += body.len();
-                if query.bytes > max_output {
-                    return Err(Error::TooLarge);
-                }
-                query.rows.push(row);
-                Ok(None)
-            }
-            b'C' => {
-                query.tag = Some(Self::command_tag(body)?);
-                Ok(None)
-            }
-            b'I' => {
-                if query.tag.is_none() {
-                    query.tag = Some(String::new());
-                }
-                Ok(None)
-            }
-            b'E' => {
-                query.error = Some(Self::parse_error(body));
-                Ok(None)
-            }
-            b'Z' => {
-                let result = match query.error.take() {
-                    Some(error) => Err(Error::Server { code: error.code, message: error.message }),
-                    None => Ok(Output {
-                        tag: query.tag.take().unwrap_or_default(),
-                        columns: std::mem::take(&mut query.columns),
-                        rows: std::mem::take(&mut query.rows),
-                    }),
-                };
-                Ok(Some(result))
-            }
-            b'R' => Err(Error::Protocol("authentication message outside startup")),
-            b'G' => Err(Error::Protocol("COPY FROM STDIN needs copy(), not query()")),
-            b'H' | b'W' | b'c' | b'd' => Err(Error::Protocol("COPY TO STDOUT is not supported")),
-            _ => Ok(None),
-        }
-    }
-
-    fn copy_msg(
-        copy: &mut CopyOut,
-        outbox: &mut Vec<u8>,
-        tag: u8,
-        body: &[u8],
-    ) -> Result<Option<Result<Output, Error>>, Error> {
-        match tag {
-            b'G' => {
-                if copy.sent {
-                    return Err(Error::Protocol("second COPY FROM STDIN in one copy()"));
-                }
-                copy.sent = true;
-                Self::queue_raw(outbox, b'd', copy.request.data.as_deref().unwrap_or(&[]));
-                Self::queue_raw(outbox, b'c', &[]);
-                Ok(None)
-            }
-            b'C' => {
-                copy.tag = Some(Self::command_tag(body)?);
-                Ok(None)
-            }
-            b'E' => {
-                copy.error = Some(Self::parse_error(body));
-                Ok(None)
-            }
-            b'Z' => {
-                let result = match copy.error.take() {
-                    Some(error) => Err(Error::Server { code: error.code, message: error.message }),
-                    None => Ok(Output {
-                        tag: copy.tag.take().unwrap_or_default(),
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                    }),
-                };
-                Ok(Some(result))
-            }
-            b'R' => Err(Error::Protocol("authentication message outside startup")),
-            b'T' | b'D' | b'I' => Err(Error::Protocol("query results arrived in COPY")),
-            b'H' | b'W' | b'c' | b'd' => Err(Error::Protocol("COPY TO STDOUT is not supported")),
-            _ => Ok(None),
         }
     }
 
@@ -931,36 +619,276 @@ impl Postgres {
         outbox.extend_from_slice(value);
         outbox.push(0);
     }
+}
 
-    fn queue_startup(
+impl State {
+    fn on_message(
+        &mut self,
         outbox: &mut Vec<u8>,
         user: &str,
-        database: &str,
-        params: &[(String, String)],
-    ) {
-        let mut len = 4 + 4 + "user".len() + 1 + user.len() + 1 + 1;
-        if !database.is_empty() {
-            len += "database".len() + 1 + database.len() + 1;
+        password: &str,
+        max_output: usize,
+        tag: u8,
+        body: &[u8],
+    ) -> Result<Option<Outcome>, Error> {
+        match self {
+            Self::Connecting => Err(Error::Protocol("message arrived before connect completed")),
+            Self::Dead => Ok(None),
+            Self::Ready => match tag {
+                b'Z' => Ok(None),
+                b'E' => {
+                    let error = Postgres::parse_error(body);
+                    warn!(code = %error.code, message = %error.message, "postgres errored while idle");
+                    Err(Error::Protocol("server error with no query in flight"))
+                }
+                _ => Err(Error::Protocol("message arrived with no query in flight")),
+            },
+            Self::Startup(startup) => {
+                if startup.on_message(outbox, user, password, tag, body)? {
+                    *self = Self::Ready;
+                }
+                Ok(None)
+            }
+            Self::Query(query) => match query.on_message(max_output, tag, body)? {
+                Some(result) => {
+                    let id = query.request.id;
+                    *self = Self::Ready;
+                    Ok(Some((id, result)))
+                }
+                None => Ok(None),
+            },
+            Self::Copy(copy) => match copy.on_message(tag, body)? {
+                Some(result) => {
+                    let id = copy.request.id;
+                    *self = Self::Ready;
+                    Ok(Some((id, result)))
+                }
+                None => Ok(None),
+            },
         }
-        for (name, value) in params {
-            len += name.len() + 1 + value.len() + 1;
+    }
+}
+
+impl Startup {
+    fn on_message(
+        &mut self,
+        outbox: &mut Vec<u8>,
+        user: &str,
+        password: &str,
+        tag: u8,
+        body: &[u8],
+    ) -> Result<bool, Error> {
+        match tag {
+            b'R' => self.auth(outbox, user, password, body),
+            b'E' => {
+                let error = Postgres::parse_error(body);
+                warn!(code = %error.code, message = %error.message, "postgres rejected the connection");
+                Err(Error::Server { code: error.code, message: error.message })
+            }
+            b'Z' => match self {
+                Self::AwaitReady => Ok(true),
+                _ => Err(Error::Protocol("ready arrived before authentication completed")),
+            },
+            b'T' | b'D' | b'C' | b'I' => {
+                Err(Error::Protocol("query results arrived during startup"))
+            }
+            b'G' | b'H' | b'W' | b'c' | b'd' => {
+                Err(Error::Protocol("COPY message arrived during startup"))
+            }
+            _ => Ok(false),
         }
-        outbox.extend_from_slice(&(len as u32).to_be_bytes());
-        outbox.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        Self::queue_param(outbox, "user", user);
-        if !database.is_empty() {
-            Self::queue_param(outbox, "database", database);
-        }
-        for (name, value) in params {
-            Self::queue_param(outbox, name, value);
-        }
-        outbox.push(0);
     }
 
-    fn queue_param(outbox: &mut Vec<u8>, name: &str, value: &str) {
-        outbox.extend_from_slice(name.as_bytes());
-        outbox.push(0);
-        outbox.extend_from_slice(value.as_bytes());
-        outbox.push(0);
+    fn auth(
+        &mut self,
+        outbox: &mut Vec<u8>,
+        user: &str,
+        password: &str,
+        body: &[u8],
+    ) -> Result<bool, Error> {
+        let mut cursor = Cursor(body);
+        let method = cursor.i32().ok_or(Error::Protocol("truncated authentication message"))?;
+        match self {
+            Self::AwaitAuth => match method {
+                0 => {
+                    *self = Self::AwaitReady;
+                    Ok(false)
+                }
+                3 => {
+                    Postgres::queue_cstring(outbox, b'p', password.as_bytes());
+                    Ok(false)
+                }
+                10 => {
+                    let mut mechanisms = Vec::new();
+                    let mut scram = false;
+                    while let Some(name) = cursor.cstring() {
+                        if name.is_empty() {
+                            break;
+                        }
+                        scram |= name == SCRAM_MECHANISM;
+                        mechanisms.push(String::from_utf8_lossy(name).into_owned());
+                    }
+                    if !scram {
+                        warn!(
+                            mechanisms = mechanisms.join(","),
+                            "postgres offered no supported SASL mechanism"
+                        );
+                        return Err(Error::UnsupportedAuth(format!(
+                            "SASL({})",
+                            mechanisms.join(",")
+                        )));
+                    }
+                    let cnonce: String = {
+                        let mut rng = rand::rng();
+                        (0..24)
+                            .map(|_| {
+                                NONCE_ALPHABET[rng.random_range(0..NONCE_ALPHABET.len())] as char
+                            })
+                            .collect()
+                    };
+                    let (exchange, response) = scram::Exchange::start(user, &cnonce);
+                    Postgres::queue_raw(outbox, b'p', &response);
+                    *self = Self::Sasl(exchange);
+                    Ok(false)
+                }
+                _ => {
+                    let name = match method {
+                        2 => "KerberosV5".to_owned(),
+                        5 => "MD5".to_owned(),
+                        6 => "SCM credential".to_owned(),
+                        7 => "GSS".to_owned(),
+                        8 => "GSS continue".to_owned(),
+                        9 => "SSPI".to_owned(),
+                        _ => format!("authentication type {method}"),
+                    };
+                    warn!(method, "postgres asked for an unsupported authentication method");
+                    Err(Error::UnsupportedAuth(name))
+                }
+            },
+            Self::Sasl(exchange) => match method {
+                11 => {
+                    let response =
+                        exchange.client_final(password, cursor.rest()).map_err(|message| {
+                            warn!(%message, "SCRAM exchange failed");
+                            Error::Protocol(message)
+                        })?;
+                    Postgres::queue_raw(outbox, b'p', &response);
+                    Ok(false)
+                }
+                12 => {
+                    exchange.verify_server_final(cursor.rest()).map_err(|message| {
+                        warn!(%message, "SCRAM exchange failed");
+                        Error::Protocol(message)
+                    })?;
+                    *self = Self::AwaitReady;
+                    Ok(false)
+                }
+                _ => Err(Error::Protocol("authentication message out of sequence")),
+            },
+            Self::AwaitReady => match method {
+                0 => Ok(false),
+                _ => Err(Error::Protocol("authentication message out of sequence")),
+            },
+        }
+    }
+}
+
+impl QueryOut {
+    fn on_message(
+        &mut self,
+        max_output: usize,
+        tag: u8,
+        body: &[u8],
+    ) -> Result<Option<Result<Output, Error>>, Error> {
+        match tag {
+            b'T' => {
+                let columns = Postgres::parse_columns(body)?;
+                self.bytes += body.len();
+                if self.bytes > max_output {
+                    return Err(Error::TooLarge);
+                }
+                if self.tag.is_some() {
+                    self.columns.clear();
+                    self.rows.clear();
+                    self.tag = None;
+                }
+                self.columns = columns;
+                Ok(None)
+            }
+            b'D' => {
+                let row = Postgres::parse_row(body)?;
+                self.bytes += body.len();
+                if self.bytes > max_output {
+                    return Err(Error::TooLarge);
+                }
+                self.rows.push(row);
+                Ok(None)
+            }
+            b'C' => {
+                self.tag = Some(Postgres::command_tag(body)?);
+                Ok(None)
+            }
+            b'I' => {
+                if self.tag.is_none() {
+                    self.tag = Some(String::new());
+                }
+                Ok(None)
+            }
+            b'E' => {
+                self.error = Some(Postgres::parse_error(body));
+                Ok(None)
+            }
+            b'Z' => {
+                let result = match self.error.take() {
+                    Some(error) => Err(Error::Server { code: error.code, message: error.message }),
+                    None => Ok(Output {
+                        tag: self.tag.take().unwrap_or_default(),
+                        columns: std::mem::take(&mut self.columns),
+                        rows: std::mem::take(&mut self.rows),
+                    }),
+                };
+                Ok(Some(result))
+            }
+            b'R' => Err(Error::Protocol("authentication message outside startup")),
+            b'G' => Err(Error::Protocol("COPY FROM STDIN needs copy(), not query()")),
+            b'H' | b'W' | b'c' | b'd' => Err(Error::Protocol("COPY TO STDOUT is not supported")),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl CopyOut {
+    fn on_message(&mut self, tag: u8, body: &[u8]) -> Result<Option<Result<Output, Error>>, Error> {
+        match tag {
+            b'G' => {
+                if self.tag.is_some() || self.error.is_some() {
+                    return Err(Error::Protocol("second COPY FROM STDIN in one copy()"));
+                }
+                Ok(None)
+            }
+            b'C' => {
+                self.tag = Some(Postgres::command_tag(body)?);
+                Ok(None)
+            }
+            b'E' => {
+                self.error = Some(Postgres::parse_error(body));
+                Ok(None)
+            }
+            b'Z' => {
+                let result = match self.error.take() {
+                    Some(error) => Err(Error::Server { code: error.code, message: error.message }),
+                    None => Ok(Output {
+                        tag: self.tag.take().unwrap_or_default(),
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                    }),
+                };
+                Ok(Some(result))
+            }
+            b'R' => Err(Error::Protocol("authentication message outside startup")),
+            b'T' | b'D' | b'I' => Err(Error::Protocol("query results arrived in COPY")),
+            b'H' | b'W' | b'c' | b'd' => Err(Error::Protocol("COPY TO STDOUT is not supported")),
+            _ => Ok(None),
+        }
     }
 }
