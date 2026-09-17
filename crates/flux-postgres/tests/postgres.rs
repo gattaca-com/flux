@@ -259,6 +259,44 @@ struct Row {
     e: f64,
 }
 
+#[derive(Serialize)]
+struct TextRow {
+    name: &'static str,
+    amount: Option<i64>,
+}
+
+/// `COPY TEXT` as `Postgres` reads it: tab-separated, `\N` for NULL,
+/// control characters backslash-escaped.
+const TEXT_BODY: &str = "a\\tb\t-1\nc\t\\N\n";
+
+fn hello() -> Vec<u8> {
+    let mut reply = auth(0, &[]);
+    reply.extend_from_slice(&param("client_encoding", "UTF8"));
+    reply.extend_from_slice(&param("server_version", "18.6"));
+    reply.extend_from_slice(&srv(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
+    reply.extend_from_slice(&srv(b'N', &[b'S', b'W', 0, 0]));
+    reply.extend_from_slice(&ready());
+    reply
+}
+
+fn one_row() -> Vec<u8> {
+    let mut reply = row_desc(&[("one", 23)]);
+    reply.extend_from_slice(&data_row(&[Some(&1i32.to_be_bytes())]));
+    reply.extend_from_slice(&complete("SELECT 1"));
+    reply.extend_from_slice(&ready());
+    reply
+}
+
+fn binary_batch(rows: &[Row]) -> Vec<u8> {
+    let mut body = Vec::new();
+    copybinary::header(&mut body);
+    for row in rows {
+        copybinary::encode(&mut body, row).unwrap();
+    }
+    copybinary::trailer(&mut body);
+    body
+}
+
 #[test]
 fn query_copy_and_error_byte_at_a_time() {
     let (mut net, server_group, addr) = setup();
@@ -266,7 +304,8 @@ fn query_copy_and_error_byte_at_a_time() {
     let mut server = FakeServer::paced(1);
     let mut outcomes = Vec::new();
     let mut seen = Vec::new();
-    let mut copied = Vec::new();
+    let mut copies: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut open: Vec<(Token, String, Vec<u8>)> = Vec::new();
 
     let rows = [Row { a: 1, b: "x".to_owned(), c: Some(2), d: false, e: 0.5 }, Row {
         a: 1,
@@ -275,18 +314,16 @@ fn query_copy_and_error_byte_at_a_time() {
         d: false,
         e: 0.5,
     }];
-    let mut body = Vec::new();
-    copybinary::header(&mut body);
-    for row in &rows {
-        copybinary::encode(&mut body, row).unwrap();
-    }
-    copybinary::trailer(&mut body);
+
+    let text_rows =
+        [TextRow { name: "a\tb", amount: Some(-1) }, TextRow { name: "c", amount: None }];
 
     let one = pg.query("SELECT 1").unwrap();
     let copy = pg.copy_rows("t", &rows).unwrap();
+    let text = pg.copy_text_rows("t", &text_rows).unwrap();
     let bad = pg.query("SELEC").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && outcomes.len() < 3 {
+    while Instant::now() < deadline && outcomes.len() < 4 {
         tick(
             &mut net,
             &mut pg,
@@ -296,21 +333,9 @@ fn query_copy_and_error_byte_at_a_time() {
             &mut seen,
             |server, token, msg| {
                 match msg {
-                    ClientMsg::Startup(_) => {
-                        let mut reply = auth(0, &[]);
-                        reply.extend_from_slice(&param("client_encoding", "UTF8"));
-                        reply.extend_from_slice(&param("server_version", "18.6"));
-                        reply.extend_from_slice(&srv(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
-                        reply.extend_from_slice(&srv(b'N', &[b'S', b'W', 0, 0]));
-                        reply.extend_from_slice(&ready());
-                        server.reply(token, &reply);
-                    }
+                    ClientMsg::Startup(_) => server.reply(token, &hello()),
                     ClientMsg::Query(sql) if sql == "SELECT 1" => {
-                        let mut reply = row_desc(&[("one", 23)]);
-                        reply.extend_from_slice(&data_row(&[Some(&1i32.to_be_bytes())]));
-                        reply.extend_from_slice(&complete("SELECT 1"));
-                        reply.extend_from_slice(&ready());
-                        server.reply(token, &reply);
+                        server.reply(token, &one_row());
                     }
                     ClientMsg::Query(sql) if sql == "SELEC" => {
                         let mut reply = error_msg("42601", "syntax error at end of input");
@@ -319,10 +344,17 @@ fn query_copy_and_error_byte_at_a_time() {
                     }
                     ClientMsg::Query(sql) => {
                         assert!(sql.starts_with("COPY t "), "unexpected query {sql}");
+                        open.push((token, sql, Vec::new()));
                         server.reply(token, &copy_in());
                     }
-                    ClientMsg::CopyData(data) => copied.extend_from_slice(&data),
+                    ClientMsg::CopyData(data) => {
+                        let open = open.iter_mut().find(|(other, ..)| *other == token).unwrap();
+                        open.2.extend_from_slice(&data);
+                    }
                     ClientMsg::CopyDone => {
+                        let index = open.iter().position(|(other, ..)| *other == token).unwrap();
+                        let (_, sql, body) = open.swap_remove(index);
+                        copies.push((sql, body));
                         let mut reply = complete("COPY 2");
                         reply.extend_from_slice(&ready());
                         server.reply(token, &reply);
@@ -334,7 +366,7 @@ fn query_copy_and_error_byte_at_a_time() {
         );
         thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes.len(), 4);
     let (_, result) = outcome_of(&outcomes, one);
     let output = result.as_ref().unwrap();
     assert_eq!(output.tag, "SELECT 1");
@@ -342,14 +374,21 @@ fn query_copy_and_error_byte_at_a_time() {
     assert_eq!(output.columns[0].name, "one");
     assert_eq!(output.columns[0].oid, 23);
     assert_eq!(output.rows, vec![vec![Some(1i32.to_be_bytes().to_vec())]]);
-    let (_, result) = outcome_of(&outcomes, copy);
-    assert_eq!(result.as_ref().unwrap().tag, "COPY 2");
     let (_, result) = outcome_of(&outcomes, bad);
     assert_eq!(result.as_ref().unwrap_err(), &Error::Server {
         code: "42601".to_owned(),
         message: "syntax error at end of input".to_owned()
     });
-    assert_eq!(copied, body);
+    let body_of = |prefix: &str| {
+        let (_, body) = copies.iter().find(|(sql, _)| sql.starts_with(prefix)).unwrap();
+        body.clone()
+    };
+    assert_eq!(body_of("COPY t (\"a\""), binary_batch(&rows));
+    assert_eq!(String::from_utf8(body_of("COPY t (\"name\"")).unwrap(), TEXT_BODY);
+    for id in [copy, text] {
+        let (_, result) = outcome_of(&outcomes, id);
+        assert_eq!(result.as_ref().unwrap().tag, "COPY 2");
+    }
     let startups: Vec<_> = seen
         .iter()
         .filter_map(|msg| match msg {

@@ -11,6 +11,7 @@
 //! else fails the connection without an outcome.
 
 pub mod copybinary;
+pub mod copytext;
 mod scram;
 
 use std::{collections::VecDeque, net::SocketAddr};
@@ -325,6 +326,33 @@ impl Postgres {
             }
         }
         copybinary::trailer(&mut body);
+        if self.full_for(sql.len() + body.len()) {
+            return Err(body);
+        }
+        Ok(self.enqueue(sql, Some(body)))
+    }
+
+    /// Encodes `rows` as `COPY TEXT` and queues them for `table`, naming the
+    /// columns after the row's fields. Slower server-side than
+    /// [`Postgres::copy_rows`], but it carries the types that only have a
+    /// text form, such as timestamps, numerics, and enum labels. Panics and
+    /// refuses like [`Postgres::copy_rows`].
+    pub fn copy_text_rows<T: Serialize>(
+        &mut self,
+        table: &str,
+        rows: &[T],
+    ) -> Result<QueryId, Vec<u8>> {
+        let sql = copytext::copy_statement(table, &rows[0]).expect("COPY TEXT row");
+        let mut body = Vec::new();
+        let (mut columns, mut expected) = (Vec::new(), Vec::new());
+        for row in rows {
+            copytext::encode_columns(&mut body, row, &mut columns).expect("COPY TEXT row");
+            if expected.is_empty() {
+                std::mem::swap(&mut expected, &mut columns);
+            } else {
+                assert_eq!(columns, expected, "COPY rows must share the same columns");
+            }
+        }
         if self.full_for(sql.len() + body.len()) {
             return Err(body);
         }
