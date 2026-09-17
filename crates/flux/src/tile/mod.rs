@@ -24,12 +24,7 @@ pub struct TileConfig {
 
 impl TileConfig {
     pub fn new(core: usize, thread_niceness: Option<ThreadNiceness>) -> Self {
-        Self::new_on_cores(vec![core], thread_niceness)
-    }
-
-    /// Pin the tile to a set of cores instead of a single core.
-    pub fn new_on_cores(cores: Vec<usize>, thread_niceness: Option<ThreadNiceness>) -> Self {
-        Self { cores, thread_niceness, min_loop_duration: None, metrics: true }
+        Self { cores: vec![core], thread_niceness, min_loop_duration: None, metrics: true }
     }
 
     /// Boot a tile with a background (non-hot-path) config.
