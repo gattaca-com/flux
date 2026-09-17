@@ -7,7 +7,7 @@ use flux_timing::{
 use flux_utils::ArrayStr;
 use flux_versioned_types::{
     Blob, BlobCache, DecodeError, HasVersionedLeaves, InternalMetadata, InternalMetadataV1,
-    Scratch, Versioned, VisitorVersionedLeaf,
+    Scratch, Versioned, VersionedLeaves, VisitorVersionedLeaf,
     raw::{FORMAT_VERSION, HEADER_LEN, MAGIC, TIMESTAMP_STRIDE},
     versioned_enum, versioned_struct,
     zerocopy::IntoBytes,
@@ -43,7 +43,7 @@ versioned_struct!(Flag =>
     FlagV1 { pub ok: bool }
 );
 
-#[derive(Clone, Copy, Debug, PartialEq, HasVersionedLeaves)]
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 enum Sub {
     A(Leaf),
     #[leaves(skip)]
@@ -60,7 +60,7 @@ impl VisitorVersionedLeaf for Counter {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, HasVersionedLeaves)]
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 enum Fam {
     S(Sub),
     K(Kind),

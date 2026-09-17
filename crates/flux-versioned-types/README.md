@@ -76,13 +76,14 @@ assert_eq!(NewBidSubmission::NAME, "Relay.NewBidSubmission");
 `#[wire_name = "..."]` overrides `Versioned::NAME`; without it `NAME` is the
 alias name. Existing callers without the attribute compile unchanged.
 
-Family enums (an enum of leaves or other families) use the derive, re-exported
-as `flux_versioned_types::HasVersionedLeaves`:
+Family enums (an enum of leaves or other families) use the `VersionedLeaves`
+derive, re-exported from `flux_versioned_types`; it implements the
+`HasVersionedLeaves` trait:
 
 ```rust
-use flux_versioned_types::HasVersionedLeaves;
+use flux_versioned_types::VersionedLeaves;
 
-#[derive(Clone, Copy, HasVersionedLeaves)]
+#[derive(Clone, Copy, VersionedLeaves)]
 enum Family {
     A(LeafA),
     B(LeafB),

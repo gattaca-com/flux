@@ -2,8 +2,8 @@
 
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
 use flux_versioned_types::{
-    DecodeError, HasVersionedLeaves, Versioned, VersionedDeserialize, VisitorVersionedLeaf,
-    versioned_enum, versioned_struct, zerocopy::IntoBytes,
+    DecodeError, HasVersionedLeaves, Versioned, VersionedDeserialize, VersionedLeaves,
+    VisitorVersionedLeaf, versioned_enum, versioned_struct, zerocopy::IntoBytes,
 };
 
 versioned_struct!(Leaf =>
@@ -42,14 +42,14 @@ versioned_struct!(#[wire_skip] Skipped =>
     }
 );
 
-#[derive(Clone, Copy, Debug, PartialEq, HasVersionedLeaves)]
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 pub enum Sub {
     A(Leaf),
     #[leaves(skip)]
     Ignored,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, HasVersionedLeaves)]
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 pub enum Family {
     S(Sub),
     K(Kind),

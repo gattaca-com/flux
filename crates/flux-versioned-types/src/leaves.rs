@@ -8,7 +8,7 @@
 //!
 //! Leaves get their [`Versioned`] and [`HasVersionedLeaves`] impls from
 //! `versioned_struct!`/`versioned_enum!` when the `zerocopy` feature is on.
-//! Families use `#[derive(HasVersionedLeaves)]`.
+//! Families use `#[derive(VersionedLeaves)]`.
 
 use flux_timing::InternalMessage;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
@@ -55,7 +55,7 @@ pub trait VisitorVersionedLeaf {
 /// A message type that resolves to exactly one [`Versioned`] leaf.
 ///
 /// Leaves implement it trivially (the leaf is itself). Families implement it
-/// by delegating to the variant they hold; `#[derive(HasVersionedLeaves)]`
+/// by delegating to the variant they hold; `#[derive(VersionedLeaves)]`
 /// generates that, plus `From<Field> for Family` for each kept variant
 /// (direct fields only; a nested family's leaves convert through it).
 pub trait HasVersionedLeaves: Copy {

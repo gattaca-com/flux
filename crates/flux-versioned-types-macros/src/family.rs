@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
-pub fn derive_has_versioned_leaves(input: TokenStream) -> TokenStream {
+pub fn derive_versioned_leaves(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match generate(&input) {
         Ok(tokens) => tokens.into(),
@@ -14,7 +14,7 @@ fn generate(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let Data::Enum(data) = &input.data else {
         return Err(syn::Error::new_spanned(
             &input.ident,
-            "HasVersionedLeaves can only be derived for enums",
+            "VersionedLeaves can only be derived for enums",
         ));
     };
     let name = &input.ident;
@@ -44,13 +44,13 @@ fn generate(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let Fields::Unnamed(fields) = &variant.fields else {
             return Err(syn::Error::new_spanned(
                 &variant.ident,
-                "HasVersionedLeaves variants must have exactly one unnamed field; use #[leaves(skip)] to exclude",
+                "VersionedLeaves variants must have exactly one unnamed field; use #[leaves(skip)] to exclude",
             ));
         };
         if fields.unnamed.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &variant.ident,
-                "HasVersionedLeaves variants must have exactly one unnamed field; use #[leaves(skip)] to exclude",
+                "VersionedLeaves variants must have exactly one unnamed field; use #[leaves(skip)] to exclude",
             ));
         }
         let ty = &fields.unnamed[0].ty;
