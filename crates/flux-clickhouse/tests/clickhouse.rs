@@ -16,11 +16,11 @@ enum Outcome {
     Disconnected,
 }
 
-fn record(result: Result<HttpResponse<'_>, Error<'_>>) -> Outcome {
+fn record(result: &Result<HttpResponse<'_>, Error<'_>>) -> Outcome {
     match result {
         Ok(response) => Outcome::Ok(response.body.to_vec()),
         Err(Error::Server { status, code, message }) => {
-            Outcome::Server { status, code, message: message.to_vec() }
+            Outcome::Server { status: *status, code: *code, message: message.to_vec() }
         }
         Err(Error::Disconnected) => Outcome::Disconnected,
     }
@@ -33,25 +33,33 @@ struct Request {
     body: Vec<u8>,
 }
 
-/// A fake `ClickHouse`: answers by request content and records what it saw.
-struct FakeServer {
+/// One `HttpNetwork` plays both sides: it listens as a fake `ClickHouse` and
+/// hosts the client's pool, so the client must share the caller's network and
+/// hand back every event that is not its own.
+struct Harness {
     http: HttpNetwork,
+    ch: ClickHouse,
     requests: Vec<Request>,
+    outcomes: Vec<(QueryId, Outcome)>,
 }
 
-impl FakeServer {
-    fn start() -> (Self, SocketAddr) {
+impl Harness {
+    fn start(configure: impl FnOnce(ClickHouse) -> ClickHouse) -> Self {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let mut http = HttpNetwork::default();
         http.listen(addr).unwrap();
-        (Self { http, requests: Vec::new() }, addr)
+        let ch = configure(ClickHouse::new(addr));
+        Self { http, ch, requests: Vec::new(), outcomes: Vec::new() }
     }
-    fn poll(&mut self) {
+    fn tick(&mut self) {
+        let Self { http, ch, requests, outcomes } = self;
         let mut replies = Vec::new();
-        let requests = &mut self.requests;
-        self.http.poll_with(|event| {
+        http.poll_with(|event| {
+            if ch.on_event(&event, |id, result| outcomes.push((id, record(&result)))) {
+                return
+            }
             if let HttpEvent::Request { token, request } = event {
                 requests.push(Request {
                     path: request.path.to_owned(),
@@ -64,14 +72,14 @@ impl FakeServer {
         });
         for (token, path, body) in replies {
             if path.starts_with("/?query=INSERT") {
-                assert!(self.http.respond(token, 200, &[], b""));
+                assert!(http.respond(token, 200, &[], b""));
             } else if body == b"SELECT 42" {
-                assert!(self.http.respond(token, 200, &[], b"42\n"));
+                assert!(http.respond(token, 200, &[], b"42\n"));
             } else if body == b"SELECT sleep(1)" {
-                assert!(self.http.disconnect(token));
+                assert!(http.disconnect(token));
             } else {
                 let headers = [("X-ClickHouse-Exception-Code", "62")];
-                assert!(self.http.respond(
+                assert!(http.respond(
                     token,
                     400,
                     &headers,
@@ -79,47 +87,45 @@ impl FakeServer {
                 ));
             }
         }
+        thread::sleep(Duration::from_millis(1));
+    }
+    fn outcome(&self, id: Option<QueryId>) -> Outcome {
+        self.outcomes.iter().find(|(i, _)| Some(*i) == id).map(|(_, o)| o.clone()).unwrap()
     }
 }
 
 #[test]
-fn pooled_requests_map_to_their_outcomes() {
-    let (mut server, addr) = FakeServer::start();
-    let mut ch = ClickHouse::new(addr)
-        .with_credentials("writer", "secret")
-        .with_database("telemetry")
-        .with_setting("async_insert", "1")
-        .with_connections(2);
+fn pooled_requests_share_the_network_and_map_to_their_outcomes() {
+    let mut h = Harness::start(|ch| {
+        ch.with_credentials("writer", "secret")
+            .with_database("telemetry")
+            .with_setting("async_insert", "1")
+            .with_connections(2)
+    });
     let rows = b"\x01\x00\n\xff\x00";
     let (mut insert, mut select, mut bad) = (None, None, None);
-    let mut outcomes = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && outcomes.len() < 3 {
-        server.poll();
-        ch.poll_with(|id, result| outcomes.push((id, record(result))));
+    while Instant::now() < deadline && h.outcomes.len() < 3 {
+        h.tick();
         if insert.is_none() {
-            insert = ch.insert("INSERT INTO t FORMAT RowBinary", rows);
+            insert = h.ch.insert(&mut h.http, "INSERT INTO t FORMAT RowBinary", rows);
         }
         if select.is_none() {
-            select = ch.query("SELECT 42");
+            select = h.ch.query(&mut h.http, "SELECT 42");
         }
         if bad.is_none() {
-            bad = ch.query("SELEC");
+            bad = h.ch.query(&mut h.http, "SELEC");
         }
-        thread::sleep(Duration::from_millis(1));
     }
-    let outcome = |id: Option<QueryId>| {
-        outcomes.iter().find(|(i, _)| Some(*i) == id).map(|(_, o)| o.clone()).unwrap()
-    };
-    assert_eq!(outcome(insert), Outcome::Ok(Vec::new()));
-    assert_eq!(outcome(select), Outcome::Ok(b"42\n".to_vec()));
-    assert_eq!(outcome(bad), Outcome::Server {
+    assert_eq!(h.outcome(insert), Outcome::Ok(Vec::new()));
+    assert_eq!(h.outcome(select), Outcome::Ok(b"42\n".to_vec()));
+    assert_eq!(h.outcome(bad), Outcome::Server {
         status: 400,
         code: Some(62),
         message: b"Code: 62. DB::Exception: Syntax error".to_vec(),
     });
 
-    let insert_request = server.requests.iter().find(|r| r.path.starts_with("/?query=")).unwrap();
+    let insert_request = h.requests.iter().find(|r| r.path.starts_with("/?query=")).unwrap();
     assert_eq!(
         insert_request.path,
         "/?query=INSERT%20INTO%20t%20FORMAT%20RowBinary&wait_end_of_query=1&database=telemetry&async_insert=1"
@@ -127,28 +133,24 @@ fn pooled_requests_map_to_their_outcomes() {
     assert_eq!(insert_request.body, rows);
     assert_eq!(insert_request.user, b"writer");
     assert_eq!(insert_request.key, b"secret");
-    let select_request = server.requests.iter().find(|r| r.body == b"SELECT 42").unwrap();
+    let select_request = h.requests.iter().find(|r| r.body == b"SELECT 42").unwrap();
     assert_eq!(select_request.path, "/?wait_end_of_query=1&database=telemetry&async_insert=1");
 }
 
 #[test]
 fn dropped_connection_fails_in_flight_query_then_reconnects() {
-    let (mut server, addr) = FakeServer::start();
-    let mut ch = ClickHouse::new(addr);
+    let mut h = Harness::start(|ch| ch);
     let (mut dropped, mut retry) = (None, None);
-    let mut outcomes = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && outcomes.len() < 2 {
-        server.poll();
-        ch.poll_with(|id, result| outcomes.push((id, record(result))));
+    while Instant::now() < deadline && h.outcomes.len() < 2 {
+        h.tick();
         if dropped.is_none() {
-            dropped = ch.query("SELECT sleep(1)");
-        } else if outcomes.len() == 1 && retry.is_none() {
-            retry = ch.query("SELECT 42");
+            dropped = h.ch.query(&mut h.http, "SELECT sleep(1)");
+        } else if h.outcomes.len() == 1 && retry.is_none() {
+            retry = h.ch.query(&mut h.http, "SELECT 42");
         }
-        thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(outcomes, [
+    assert_eq!(h.outcomes, [
         (dropped.unwrap(), Outcome::Disconnected),
         (retry.unwrap(), Outcome::Ok(b"42\n".to_vec()))
     ]);
@@ -157,10 +159,11 @@ fn dropped_connection_fails_in_flight_query_then_reconnects() {
 #[test]
 #[ignore = "needs a ClickHouse server; set CLICKHOUSE_ADDR (default 127.0.0.1:8123)"]
 fn live_server_roundtrip() {
-    let addr = std::env::var("CLICKHOUSE_ADDR")
+    let addr: SocketAddr = std::env::var("CLICKHOUSE_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8123".to_owned())
         .parse()
         .unwrap();
+    let mut http = HttpNetwork::default();
     let mut ch = ClickHouse::new(addr);
     let table = format!("flux_clickhouse_test_{}", std::process::id());
     let sql = [
@@ -179,14 +182,20 @@ fn live_server_roundtrip() {
     let mut pending = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && outcomes.len() < sql.len() {
-        ch.poll_with(|id, result| {
-            assert_eq!(Some(id), pending);
-            pending = None;
-            outcomes.push(record(result));
+        http.poll_with(|event| {
+            assert!(ch.on_event(&event, |id, result| {
+                assert_eq!(Some(id), pending);
+                pending = None;
+                outcomes.push(record(&result));
+            }));
         });
         if pending.is_none() && outcomes.len() < sql.len() {
             let step = outcomes.len();
-            pending = if step == 1 { ch.insert(&sql[1], &rows) } else { ch.query(&sql[step]) };
+            pending = if step == 1 {
+                ch.insert(&mut http, &sql[1], &rows)
+            } else {
+                ch.query(&mut http, &sql[step])
+            };
         }
         thread::sleep(Duration::from_millis(1));
     }

@@ -1,27 +1,36 @@
 //! Poll-driven `ClickHouse` client over its HTTP interface.
 //!
-//! [`ClickHouse`] keeps a pool of persistent connections to one server and is
-//! driven from the caller's event loop like [`HttpNetwork`]:
-//! [`ClickHouse::query`] and [`ClickHouse::insert`] hand one request to an idle
-//! connection and return a [`QueryId`]; [`ClickHouse::poll_with`] delivers each
-//! outcome exactly once. Nothing blocks or queues: when every connection is
-//! busy or disconnected a send returns `None` and the caller keeps its batch
-//! for a later poll.
+//! [`ClickHouse`] is a protocol layer on a caller-owned [`HttpNetwork`]: it
+//! keeps a pool of persistent connections to one server on that network and
+//! shares its poll with every other endpoint and listener the caller runs
+//! there. [`ClickHouse::query`] and [`ClickHouse::insert`] hand one request to
+//! an idle connection and return a [`QueryId`]; [`ClickHouse::on_event`],
+//! called from the network's `poll_with` handler, delivers each outcome
+//! exactly once and leaves unrelated events to the caller. Nothing blocks or
+//! queues: when every connection is busy or disconnected a send returns `None`
+//! and the caller keeps its batch for a later poll.
 //!
 //! ```no_run
 //! use flux_clickhouse::ClickHouse;
+//! use flux_network::http::HttpNetwork;
+//! let mut http = HttpNetwork::default();
 //! let mut ch = ClickHouse::new("127.0.0.1:8123".parse().unwrap())
 //!     .with_credentials("default", "")
 //!     .with_database("telemetry");
 //! let rows: Vec<u8> = Vec::new(); // RowBinary-encoded batch
 //! let mut pending = None;
 //! loop {
-//!     ch.poll_with(|id, result| match result {
-//!         Ok(response) => println!("{id:?} ok: {} bytes", response.body.len()),
-//!         Err(err) => eprintln!("{id:?} failed: {err}"),
+//!     http.poll_with(|event| {
+//!         if ch.on_event(&event, |id, result| match result {
+//!             Ok(response) => println!("{id:?} ok: {} bytes", response.body.len()),
+//!             Err(err) => eprintln!("{id:?} failed: {err}"),
+//!         }) {
+//!             return
+//!         }
+//!         // events for the caller's other endpoints and listeners
 //!     });
 //!     if pending.is_none() {
-//!         pending = ch.insert("INSERT INTO events FORMAT RowBinary", &rows);
+//!         pending = ch.insert(&mut http, "INSERT INTO events FORMAT RowBinary", &rows);
 //!     }
 //! }
 //! ```
@@ -34,10 +43,11 @@
 //! status instead of an error appended to a 200 body.
 //!
 //! # Limitations
-//! No TLS, compression, streaming, or cancellation. Bodies in both directions
-//! are bounded by [`ClickHouse::with_max_body_bytes`]. `ClickHouse` closes
-//! idle keep-alive connections after its `keep_alive_timeout`; the client
-//! reconnects on its own and sends return `None` until it has.
+//! No TLS, compression, streaming, or cancellation. Response bodies and,
+//! through the send backlog, insert bodies are bounded by the network's
+//! `max_body_bytes`: size it to the largest batch you insert. `ClickHouse`
+//! closes idle keep-alive connections after its `keep_alive_timeout`; the
+//! network reconnects on its own and sends return `None` until it has.
 
 use std::{fmt, net::SocketAddr};
 
@@ -47,7 +57,7 @@ use flux_network::{
     http::{HttpEvent, HttpNetwork},
 };
 
-/// Correlates a sent request with its outcome in [`ClickHouse::poll_with`].
+/// Correlates a sent request with its outcome in [`ClickHouse::on_event`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct QueryId(u64);
 
@@ -101,7 +111,6 @@ impl Conn {
 }
 
 pub struct ClickHouse {
-    http: HttpNetwork,
     addr: SocketAddr,
     user: String,
     key: String,
@@ -114,7 +123,6 @@ pub struct ClickHouse {
 impl ClickHouse {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
-            http: HttpNetwork::default().with_name("clickhouse"),
             addr,
             user: "default".to_owned(),
             key: String::new(),
@@ -147,42 +155,38 @@ impl ClickHouse {
     /// a time.
     pub fn with_connections(mut self, connections: usize) -> Self {
         assert!(connections > 0, "at least one connection");
-        assert!(self.conns.is_empty(), "configure before polling or sending");
+        assert!(self.conns.is_empty(), "configure before connecting");
         self.connections = connections;
         self
     }
-    /// Bounds response bodies and, through the send backlog, insert bodies:
-    /// size it to the largest batch you insert. Defaults to 1 MiB.
-    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
-        self.http = std::mem::take(&mut self.http).with_max_body_bytes(max_body_bytes);
-        self
-    }
-    fn connect(&mut self) {
+    /// Opens the connection pool on `http`. Otherwise the first `query` or
+    /// `insert` opens it and returns `None` while it connects.
+    pub fn connect(&mut self, http: &mut HttpNetwork) {
         if self.conns.is_empty() {
             for _ in 0..self.connections {
-                let token = self.http.connect(self.addr);
+                let token = http.connect(self.addr);
                 self.conns.push(Conn { token, connected: false, in_flight: None });
             }
         }
     }
     /// Sends `sql` on an idle connection. Returns `None` when none is idle and
     /// connected; nothing is queued, so the caller retries after a poll.
-    pub fn query(&mut self, sql: &str) -> Option<QueryId> {
+    pub fn query(&mut self, http: &mut HttpNetwork, sql: &str) -> Option<QueryId> {
         let path = self.path(None);
-        self.send(&path, sql.as_bytes())
+        self.send(http, &path, sql.as_bytes())
     }
     /// Sends an `INSERT ... FORMAT <fmt>` statement with `data` as its body.
     /// Returns `None` like [`Self::query`].
-    pub fn insert(&mut self, sql: &str, data: &[u8]) -> Option<QueryId> {
+    pub fn insert(&mut self, http: &mut HttpNetwork, sql: &str, data: &[u8]) -> Option<QueryId> {
         let path = self.path(Some(sql));
-        self.send(&path, data)
+        self.send(http, &path, data)
     }
-    fn send(&mut self, path: &str, body: &[u8]) -> Option<QueryId> {
-        self.connect();
+    fn send(&mut self, http: &mut HttpNetwork, path: &str, body: &[u8]) -> Option<QueryId> {
+        self.connect(http);
         let conn = self.conns.iter_mut().find(|conn| conn.connected && conn.in_flight.is_none())?;
         let headers =
             [("X-ClickHouse-User", self.user.as_str()), ("X-ClickHouse-Key", self.key.as_str())];
-        if !self.http.request(conn.token, "POST", path, &headers, body) {
+        if !http.request(conn.token, "POST", path, &headers, body) {
             return None
         }
         let id = QueryId(self.next_id);
@@ -206,35 +210,34 @@ impl ClickHouse {
         }
         path
     }
-    /// Polls the connections and delivers the outcome of each completed
-    /// request exactly once.
-    pub fn poll_with<F>(&mut self, mut handler: F)
+    /// Handles one event from the network's `poll_with`. Returns whether the
+    /// event belonged to this client's connections; the outcome of a completed
+    /// request is delivered to `handler` exactly once.
+    pub fn on_event<'a, F>(&mut self, event: &HttpEvent<'a>, handler: F) -> bool
     where
-        F: for<'a> FnMut(QueryId, Result<HttpResponse<'a>, Error<'a>>),
+        F: FnOnce(QueryId, Result<HttpResponse<'a>, Error<'a>>),
     {
-        self.connect();
-        let conns = &mut self.conns;
-        self.http.poll_with(|event| match event {
+        match *event {
             HttpEvent::Connected { token } => {
-                if let Some(conn) = Conn::find(conns, token) {
-                    conn.connected = true;
-                }
+                let Some(conn) = Conn::find(&mut self.conns, token) else { return false };
+                conn.connected = true;
             }
             HttpEvent::Disconnected { token } => {
-                if let Some(conn) = Conn::find(conns, token) {
-                    conn.connected = false;
-                    if let Some(id) = conn.in_flight.take() {
-                        handler(id, Err(Error::Disconnected));
-                    }
+                let Some(conn) = Conn::find(&mut self.conns, token) else { return false };
+                conn.connected = false;
+                if let Some(id) = conn.in_flight.take() {
+                    handler(id, Err(Error::Disconnected));
                 }
             }
             HttpEvent::Response { token, response } => {
-                if let Some(id) = Conn::find(conns, token).and_then(|conn| conn.in_flight.take()) {
+                let Some(conn) = Conn::find(&mut self.conns, token) else { return false };
+                if let Some(id) = conn.in_flight.take() {
                     handler(id, Error::check(response));
                 }
             }
-            HttpEvent::Accepted { .. } | HttpEvent::Request { .. } => {}
-        });
+            HttpEvent::Accepted { .. } | HttpEvent::Request { .. } => return false,
+        }
+        true
     }
 }
 

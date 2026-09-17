@@ -912,6 +912,7 @@ impl<'a> HttpRequest<'a> {
         self.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value)
     }
 }
+#[derive(Clone, Copy)]
 pub struct HttpResponse<'a> {
     pub version: u8,
     pub status: u16,
