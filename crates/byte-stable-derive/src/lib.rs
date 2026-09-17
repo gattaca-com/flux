@@ -170,6 +170,11 @@ fn derive_struct(
             "ByteStable derive requires #[repr(C)] or #[repr(transparent)] on structs",
         ));
     }
+    // `packed` removes the padding the proof looks for but leaves fields
+    // misaligned, which every `&field` read would then violate.
+    if has_repr(&input.attrs, "packed") {
+        return Err(syn::Error::new_spanned(name, "ByteStable derive rejects #[repr(packed)]"));
+    }
     let mut members: Vec<(proc_macro2::TokenStream, syn::Type)> = Vec::new();
     match &data.fields {
         Fields::Named(named) => {
@@ -215,30 +220,25 @@ fn derive_struct(
         });
         quote!(#(#checks)&&*)
     };
-    let proof = quote!(::core::assert!(#size == #sum););
-    if input.generics.params.is_empty() {
-        Ok(quote!(
-            const _: () = #proof
-            unsafe impl #impl_generics #root::ByteStable for #name #ty_generics #where_clause {
-                #[inline]
-                fn is_valid(bytes: &[u8]) -> bool {
-                    #body
-                }
+    // Field proofs first so a padded field reports at its own type; then the
+    // size sum, which for `repr(C)` is zero padding. Non-generic types also
+    // get an item-level copy so the failure surfaces at `cargo check`.
+    let proof = quote!({
+        #(let () = <#tys as #root::ByteStable>::LAYOUT_PROOF;)*
+        ::core::assert!(#size == #sum);
+    });
+    let eager = input.generics.params.is_empty().then(|| quote!(const _: () = #proof;));
+    Ok(quote!(
+        #eager
+        unsafe impl #impl_generics #root::ByteStable for #name #ty_generics #where_clause {
+            const LAYOUT_PROOF: () = #proof;
+
+            #[inline]
+            fn is_valid(bytes: &[u8]) -> bool {
+                #body
             }
-        ))
-    } else {
-        Ok(quote!(
-            unsafe impl #impl_generics #root::ByteStable for #name #ty_generics #where_clause {
-                #[inline]
-                fn is_valid(bytes: &[u8]) -> bool {
-                    const {
-                        #proof
-                    };
-                    #body
-                }
-            }
-        ))
-    }
+        }
+    ))
 }
 
 fn derive_enum(
@@ -267,12 +267,15 @@ fn derive_enum(
         quote!(let _ = bytes; false)
     } else {
         quote!(
-            ::core::matches!(bytes[0], discriminant if #(discriminant == Self::#variants as u8)||*)
+            ::core::matches!(bytes.first(), ::core::option::Option::Some(&discriminant) if #(discriminant == Self::#variants as u8)||*)
         )
     };
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     Ok(quote!(
+        const _: () = ::core::assert!(::core::mem::size_of::<#name>() == 1);
         unsafe impl #impl_generics #root::ByteStable for #name #ty_generics #where_clause {
+            const LAYOUT_PROOF: () = ::core::assert!(::core::mem::size_of::<Self>() == 1);
+
             #[inline]
             fn is_valid(bytes: &[u8]) -> bool {
                 #body

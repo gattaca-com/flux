@@ -364,19 +364,21 @@ impl<const N: usize> Default for ArrayStr<N> {
 // exactly what `as_str` borrows unchecked; 3. the fields are plain data with
 // no interior mutability.
 unsafe impl<const N: usize> byte_stable::ByteStable for ArrayStr<N> {
+    // `{ len: usize, data: [u8; N] }` has trailing padding unless `N % 8 == 0`.
+    // Other `N` stay usable as strings; only their byte views fail to build.
+    const LAYOUT_PROOF: () = assert!(
+        N.is_multiple_of(8) && size_of::<Self>() == size_of::<usize>() + N,
+        "ArrayStr<N> can only be shipped as bytes when N is a multiple of 8"
+    );
+
     #[inline]
     fn is_valid(bytes: &[u8]) -> bool {
-        const { assert!(N.is_multiple_of(8), "ArrayStr<N> has padding unless N is a multiple of 8") };
         let Some(len_bytes) = bytes.get(..size_of::<usize>()) else { return false };
         let len = usize::from_ne_bytes(len_bytes.try_into().unwrap());
         len <= N &&
-            core::str::from_utf8(&bytes[size_of::<usize>()..size_of::<usize>() + len]).is_ok()
-    }
-
-    #[inline]
-    fn as_bytes(&self) -> &[u8] {
-        const { assert!(N.is_multiple_of(8), "ArrayStr<N> has padding unless N is a multiple of 8") };
-        byte_stable::slice_as_bytes(core::slice::from_ref(self))
+            bytes
+                .get(size_of::<usize>()..size_of::<usize>() + len)
+                .is_some_and(|s| core::str::from_utf8(s).is_ok())
     }
 }
 
@@ -426,7 +428,8 @@ impl<const N: usize> ArrayStr<N> {
     /// Push a single ASCII byte. Panics if full or non-ASCII.
     #[inline]
     pub(crate) fn push_byte(&mut self, b: u8) {
-        debug_assert!(b.is_ascii());
+        // `as_str` relies on this for `from_utf8_unchecked`; it must hold in release.
+        assert!(b.is_ascii(), "push_byte requires ASCII");
         assert!(self.len < N, "push capacity overflow");
         self.data[self.len] = b;
         self.len += 1;

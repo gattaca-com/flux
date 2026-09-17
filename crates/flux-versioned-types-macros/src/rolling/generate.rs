@@ -91,7 +91,7 @@ fn generate_versioned_impls(
                             expected: if size == 0 {
                                 0
                             } else {
-                                size * (got / size + 1)
+                                size.saturating_mul(got / size + 1)
                             },
                             got,
                         })

@@ -32,6 +32,13 @@ use core::{mem, slice};
 /// 3. **No interior mutability.** `Self` contains no `UnsafeCell`, so the bytes
 ///    behind a shared reference cannot change while borrowed.
 pub unsafe trait ByteStable: Copy + 'static {
+    /// Compile-time proof of contract point 1: a `const` that panics unless
+    /// `size_of::<Self>()` equals the sum of the field sizes (no padding) and
+    /// any other layout facts the impl relies on hold. Both byte views
+    /// evaluate it, so a padded instantiation cannot build. The derive
+    /// generates it; manual impls write the assertion themselves.
+    const LAYOUT_PROOF: ();
+
     /// Whether `bytes` is a valid `Self`. See the trait's safety contract for
     /// what the caller guarantees about `bytes`.
     fn is_valid(bytes: &[u8]) -> bool;
@@ -39,11 +46,7 @@ pub unsafe trait ByteStable: Copy + 'static {
     /// The value's bytes.
     #[inline]
     fn as_bytes(&self) -> &[u8] {
-        // Safety: contract 1 makes every byte of `*self` initialized, and
-        // contract 3 keeps them from changing under the borrow.
-        unsafe {
-            slice::from_raw_parts(core::ptr::from_ref(self).cast::<u8>(), mem::size_of::<Self>())
-        }
+        slice_as_bytes(slice::from_ref(self))
     }
 }
 
@@ -92,9 +95,11 @@ pub fn cast_slice<T: ByteStable>(bytes: &[u8]) -> Result<&[T], CastError> {
 /// The bytes of a slice of `T`.
 #[inline]
 pub fn slice_as_bytes<T: ByteStable>(values: &[T]) -> &[u8] {
-    // Safety: contract 1 for every element; slices have no inter-element
-    // padding because `size_of` already includes trailing padding, which
-    // contract 1 rules out.
+    let () = T::LAYOUT_PROOF;
+    // Safety: contract 1 (proven above) for every element makes every byte
+    // initialized, and there is no inter-element padding because `size_of`
+    // already includes trailing padding, which contract 1 rules out;
+    // contract 3 keeps the bytes from changing under the borrow.
     unsafe { slice::from_raw_parts(values.as_ptr().cast::<u8>(), mem::size_of_val(values)) }
 }
 
@@ -113,6 +118,8 @@ macro_rules! impl_any_pattern {
         // Safety: primitive integers are padding-free and every bit pattern
         // is valid.
         unsafe impl ByteStable for $t {
+            const LAYOUT_PROOF: () = ();
+
             #[inline]
             fn is_valid(_bytes: &[u8]) -> bool {
                 true
@@ -125,15 +132,19 @@ impl_any_pattern!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
 
 // Safety: one byte, valid iff 0 or 1.
 unsafe impl ByteStable for bool {
+    const LAYOUT_PROOF: () = ();
+
     #[inline]
     fn is_valid(bytes: &[u8]) -> bool {
-        bytes[0] < 2
+        bytes.first().is_some_and(|b| *b < 2)
     }
 }
 
 // Safety: arrays are `repr(C)` sequences of `T` with no padding beyond
 // `T`'s own, which contract 1 on `T` rules out; validity is elementwise.
 unsafe impl<T: ByteStable, const N: usize> ByteStable for [T; N] {
+    const LAYOUT_PROOF: () = T::LAYOUT_PROOF;
+
     #[inline]
     fn is_valid(bytes: &[u8]) -> bool {
         let size = mem::size_of::<T>();
@@ -146,16 +157,13 @@ unsafe impl<T: ByteStable, const N: usize> ByteStable for [T; N] {
 // 16-byte pattern is a valid `Uuid`. (3) It contains no `UnsafeCell`.
 #[cfg(feature = "uuid")]
 unsafe impl ByteStable for uuid::Uuid {
+    const LAYOUT_PROOF: () = assert!(mem::size_of::<Self>() == 16 && mem::align_of::<Self>() == 1);
+
     #[inline]
     fn is_valid(_bytes: &[u8]) -> bool {
         true
     }
 }
-
-#[cfg(feature = "uuid")]
-const _: () = ::core::assert!(
-    ::core::mem::size_of::<uuid::Uuid>() == 16 && ::core::mem::align_of::<uuid::Uuid>() == 1
-);
 
 // Safety: points 1-3 of the trait contract. (1) `FixedBytes<N>` is
 // `repr(transparent)` over `[u8; N]`, pinned per instantiation below, so every
@@ -163,13 +171,10 @@ const _: () = ::core::assert!(
 // `UnsafeCell`.
 #[cfg(feature = "alloy")]
 unsafe impl<const N: usize> ByteStable for alloy_primitives::FixedBytes<N> {
+    const LAYOUT_PROOF: () = assert!(mem::size_of::<Self>() == N && mem::align_of::<Self>() == 1);
+
     #[inline]
     fn is_valid(_bytes: &[u8]) -> bool {
-        const {
-            ::core::assert!(
-                ::core::mem::size_of::<Self>() == N && ::core::mem::align_of::<Self>() == 1
-            );
-        }
         true
     }
 }
@@ -180,17 +185,13 @@ unsafe impl<const N: usize> ByteStable for alloy_primitives::FixedBytes<N> {
 // no `UnsafeCell`.
 #[cfg(feature = "alloy")]
 unsafe impl ByteStable for alloy_primitives::Address {
+    const LAYOUT_PROOF: () = assert!(mem::size_of::<Self>() == 20 && mem::align_of::<Self>() == 1);
+
     #[inline]
     fn is_valid(_bytes: &[u8]) -> bool {
         true
     }
 }
-
-#[cfg(feature = "alloy")]
-const _: () = ::core::assert!(
-    ::core::mem::size_of::<alloy_primitives::Address>() == 20 &&
-        ::core::mem::align_of::<alloy_primitives::Address>() == 1
-);
 
 // Safety: points 1-3 of the trait contract. (1) `Uint` is `repr(transparent)`
 // over `[u64; LIMBS]`, pinned per instantiation below, so every byte is
@@ -200,16 +201,21 @@ const _: () = ::core::assert!(
 unsafe impl<const BITS: usize, const LIMBS: usize> ByteStable
     for alloy_primitives::Uint<BITS, LIMBS>
 {
+    // `LIMBS == BITS.div_ceil(64)` is what makes the top-limb mask an exact
+    // validity check; ruint enforces it at construction, pin it here too.
+    const LAYOUT_PROOF: () =
+        assert!(mem::size_of::<Self>() == 8 * LIMBS && LIMBS == BITS.div_ceil(64));
+
     #[inline]
     fn is_valid(bytes: &[u8]) -> bool {
-        const {
-            ::core::assert!(::core::mem::size_of::<Self>() == 8 * LIMBS);
-        }
         if LIMBS == 0 {
             return true;
         }
+        let Some(top) = bytes.len().checked_sub(8).and_then(|at| bytes.get(at..)) else {
+            return false;
+        };
         let mut limb = [0u8; 8];
-        limb.copy_from_slice(&bytes[bytes.len() - 8..]);
+        limb.copy_from_slice(top);
         u64::from_ne_bytes(limb) & !Self::MASK == 0
     }
 }
