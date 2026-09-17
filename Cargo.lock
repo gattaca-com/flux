@@ -1484,6 +1484,7 @@ dependencies = [
 name = "flux-utils"
 version = "0.3.2"
 dependencies = [
+ "bincode",
  "bytes",
  "core_affinity",
  "criterion",
