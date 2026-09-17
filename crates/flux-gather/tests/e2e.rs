@@ -1,7 +1,7 @@
 //! End-to-end gather path, and the complete usage example for the library:
 //! a user spine with `#[queue(gather)]` fields drains through the user's
-//! `Gatherer` tile (disk + TCP) into `BlobReceiver` + `BlobRouter<TestMeta,
-//! RecordingSink>` (disk + hook), and `BlobReader` reads both disks back.
+//! `Gatherer` tile (disk + TCP) into `BlobReceiver` + `BlobConsumer<TestMeta,
+//! RecordingHandler>` (disk + hook), and `BlobReader` reads both disks back.
 //! The user owns the metadata type (`TestMeta`), the flush rule (slot ends),
 //! and the on-disk layout (`TestMeta::path`).
 
@@ -25,7 +25,7 @@ use flux::{
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
 use flux_gather::{
-    Blob, BlobCache, BlobReader, BlobReceiver, BlobRouter, BlobShipper, BlobSink, BlobWriter,
+    Blob, BlobCache, BlobConsumer, BlobHandler, BlobReader, BlobReceiver, BlobShipper, BlobWriter,
     GatherQueues, IncomingBlob, ReadError, Token,
 };
 use flux_timing::{Duration, InternalMessage};
@@ -169,16 +169,28 @@ struct Seen {
     n_messages: u32,
 }
 
-// The user's sink: owns receiver-side persistence and what to remember.
-struct RecordingSink {
+// The user's handler: owns receiver-side persistence and what to remember.
+struct RecordingHandler {
     writer: BlobWriter,
     base: PathBuf,
     seen: Arc<Mutex<Vec<Seen>>>,
     done: Arc<AtomicBool>,
 }
 
-impl BlobSink<TestMeta> for RecordingSink {
-    fn on_blob(&mut self, meta: &TestMeta, blob: &Blob) {
+impl Tile<RecvSpine> for RecordingHandler {
+    fn loop_body(&mut self, adapter: &mut SpineAdapter<RecvSpine>) {
+        if self.writer.poll() {
+            adapter.mark_work();
+        }
+    }
+
+    fn teardown(mut self, _adapter: &mut SpineAdapter<RecvSpine>) {
+        self.writer.drain();
+    }
+}
+
+impl BlobHandler<RecvSpine, TestMeta> for RecordingHandler {
+    fn on_blob(&mut self, meta: &TestMeta, blob: &Blob, _adapter: &mut SpineAdapter<RecvSpine>) {
         self.writer.write(blob, &meta.path(&self.base, blob.type_name()));
         let mut seen = self.seen.lock().unwrap();
         seen.push(Seen {
@@ -189,14 +201,6 @@ impl BlobSink<TestMeta> for RecordingSink {
         if seen.len() >= EXPECTED_BLOBS {
             self.done.store(true, Ordering::Relaxed);
         }
-    }
-
-    fn drive(&mut self) -> bool {
-        self.writer.poll()
-    }
-
-    fn finish(&mut self) {
-        self.writer.drain();
     }
 }
 
@@ -273,7 +277,7 @@ fn spawn_receiver(
         spine.start(None, None, |scoped| {
             attach_tile(BlobReceiver::new(addr), scoped, background());
             attach_tile(
-                BlobRouter::new(RecordingSink {
+                BlobConsumer::new(RecordingHandler {
                     writer: BlobWriter::new(),
                     base: disk,
                     seen: seen.clone(),

@@ -11,8 +11,8 @@
 //! `cache.flush(&your_meta, zstd_level, |blob| { shipper.ship(blob);
 //! writer.write(blob, &path) })`. On the receiver side, run a spine with an
 //! `IncomingBlob` dcache queue and a `Token` queue, listen with
-//! `BlobReceiver`, and hand `(&YourMeta, &Blob)` to your `BlobSink` through
-//! `BlobRouter::<YourMeta, _>::new(sink)`; `BlobReader` reads files back.
+//! `BlobReceiver`, and hand `(&YourMeta, &Blob)` to your `BlobHandler` through
+//! `BlobConsumer::<YourMeta, _>::new(handler)`; `BlobReader` reads files back.
 //! See `tests/e2e.rs` for the complete example.
 //! Tiles do not park by default. Do not opt `BlobReceiver` or a tile that
 //! drives `BlobShipper`/`BlobWriter` into parking: nothing on the spine wakes
@@ -29,6 +29,6 @@ pub use flux_versioned_types::{
 pub use mio::Token;
 pub use queues::GatherQueues;
 pub use reader::{BlobReader, ReadError};
-pub use receiver::{BlobReceiver, BlobRouter, BlobSink, IncomingBlob};
+pub use receiver::{BlobConsumer, BlobHandler, BlobReceiver, IncomingBlob};
 pub use shipper::BlobShipper;
 pub use writer::BlobWriter;

@@ -5,7 +5,7 @@ use flux::{
         DCacheRead, FluxSpine, SpineAdapter, SpineConsumer, SpineDCacheConsumer, SpineProducer,
         SpineProducerWithDCache, SpineProducers,
     },
-    tile::Tile,
+    tile::{Tile, TileName},
 };
 use flux_network::{NetworkDriver, PollEvent, TcpConfig, Transport};
 use flux_versioned_types::{Blob, DecodeError, Scratch, Versioned};
@@ -25,24 +25,17 @@ pub struct IncomingBlob {
     pub token: Token,
 }
 
-/// Where [`BlobRouter`] delivers validated blobs.
-pub trait BlobSink<U> {
-    /// A blob carrying `U` metadata arrived intact.
-    fn on_blob(&mut self, meta: &U, blob: &Blob);
-    /// Called once per router loop; progress your own I/O here (e.g.
-    /// `BlobWriter::poll`). Returns whether you did work.
-    fn drive(&mut self) -> bool {
-        false
-    }
-    /// Called from the router's teardown (e.g. `BlobWriter::drain`).
-    fn finish(&mut self) {}
-}
-
-/// Closures are sinks with no I/O of their own.
-impl<U, F: FnMut(&U, &Blob)> BlobSink<U> for F {
-    fn on_blob(&mut self, meta: &U, blob: &Blob) {
-        self(meta, blob);
-    }
+/// Receives validated blobs.
+///
+/// Everything else in its life is an ordinary tile's:
+/// `BlobConsumer` forwards `on_attach`, `try_init`, `loop_body`, `teardown` and
+/// `name` to it, so I/O the handler owns (a `BlobWriter`, a replica spine's
+/// producers) is driven from its own `loop_body` and finished in its
+/// `teardown`.
+pub trait BlobHandler<S: FluxSpine, U>: Tile<S> {
+    /// One blob carrying `U` metadata arrived intact. `blob` lives in the
+    /// consumer's scratch until the next frame.
+    fn on_blob(&mut self, meta: &U, blob: &Blob, adapter: &mut SpineAdapter<S>);
 }
 
 /// TCP listener feeding frames into the dcache. No deserialization, no
@@ -99,32 +92,39 @@ where
     }
 }
 
-/// Validates dcache frames as blobs carrying `U` and hands them to the sink.
+/// Validates dcache frames as blobs carrying `U` and hands them to the handler.
 /// Never disconnects a peer for a missing payload: `NoRef`/`Lost` are
 /// receiver-side faults.
 ///
 /// Each frame is copied once into an internal scratch buffer while the dcache
 /// slot is still held, so the epoch check covers the copy and a torn slot can
-/// never reach the sink. `handle` does not copy: the caller owns the bytes.
-pub struct BlobRouter<U: Versioned, K: BlobSink<U>> {
-    sink: K,
+/// never reach the handler. `handle` does not copy: the caller owns the bytes.
+pub struct BlobConsumer<U: Versioned, H> {
+    handler: H,
     scratch: Scratch,
     // `fn() -> U` is always `Send`, so the tile stays `Send` with no `U:
     // Send` bound.
     meta: PhantomData<fn() -> U>,
 }
 
-impl<U: Versioned, K: BlobSink<U>> BlobRouter<U, K> {
-    /// Route validated blobs into `sink`.
-    pub fn new(sink: K) -> Self {
-        Self { sink, scratch: Scratch::new(), meta: PhantomData }
+impl<U: Versioned, H> BlobConsumer<U, H> {
+    /// Route validated blobs into `handler`.
+    pub fn new(handler: H) -> Self {
+        Self { handler, scratch: Scratch::new(), meta: PhantomData }
     }
 
     /// Validates one frame (`Blob::from_bytes`, then exactly one blob per
-    /// frame) and hands it to the sink. The caller owns `bytes`, so no copy
+    /// frame) and hands it to the handler. The caller owns `bytes`, so no copy
     /// is made. `Err`: the peer is not sending our blobs. Also usable as a
     /// component by an app that owns its own TCP tile.
-    pub fn handle(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
+    pub fn handle<S: FluxSpine>(
+        &mut self,
+        bytes: &[u8],
+        adapter: &mut SpineAdapter<S>,
+    ) -> Result<(), DecodeError>
+    where
+        H: BlobHandler<S, U>,
+    {
         let blob = Blob::from_bytes(bytes)?;
         if blob.as_bytes().len() != bytes.len() {
             return Err(DecodeError::LengthMismatch {
@@ -133,21 +133,34 @@ impl<U: Versioned, K: BlobSink<U>> BlobRouter<U, K> {
             });
         }
         let meta = blob.user_metadata::<U>()?;
-        self.sink.on_blob(&meta, blob);
+        self.handler.on_blob(&meta, blob, adapter);
         Ok(())
     }
 
-    /// The sink, e.g. to inspect what it recorded.
-    pub fn sink_mut(&mut self) -> &mut K {
-        &mut self.sink
+    /// The handler, e.g. to inspect what it recorded.
+    pub fn handler_mut(&mut self) -> &mut H {
+        &mut self.handler
     }
 }
 
-impl<S: FluxSpine, U: Versioned, K: BlobSink<U> + Send> Tile<S> for BlobRouter<U, K>
+impl<S: FluxSpine, U: Versioned, H: BlobHandler<S, U>> Tile<S> for BlobConsumer<U, H>
 where
     S::Consumers: AsMut<SpineDCacheConsumer<IncomingBlob>>,
     S::Producers: AsRef<SpineProducer<Token>>,
 {
+    fn name(&self) -> TileName {
+        // The handler is the tile's identity in tile_info/metrics.
+        self.handler.name()
+    }
+
+    fn on_attach(&mut self, adapter: &mut SpineAdapter<S>) {
+        self.handler.on_attach(adapter);
+    }
+
+    fn try_init(&mut self, adapter: &mut SpineAdapter<S>) -> bool {
+        self.handler.try_init(adapter)
+    }
+
     fn loop_body(&mut self, adapter: &mut SpineAdapter<S>) {
         loop {
             let mut pending: Option<U> = None;
@@ -184,19 +197,17 @@ where
             if let Some(meta) = pending {
                 let blob = Blob::from_bytes(self.scratch.as_bytes())
                     .expect("copied from a validated blob");
-                self.sink.on_blob(&meta, blob);
+                self.handler.on_blob(&meta, blob, adapter);
             }
             if !more {
                 break;
             }
         }
-        if self.sink.drive() {
-            adapter.mark_work();
-        }
+        self.handler.loop_body(adapter);
     }
 
     fn teardown(mut self, adapter: &mut SpineAdapter<S>) {
         self.loop_body(adapter);
-        self.sink.finish();
+        self.handler.teardown(adapter);
     }
 }
