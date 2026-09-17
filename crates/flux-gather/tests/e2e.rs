@@ -142,7 +142,13 @@ impl Tile<GatherTestSpine> for Gatherer {
         GatherTestSpine::gather_into(adapter, &mut self.cache);
         self.flush(self.last_slot + 1);
         self.writer.drain();
-        self.shipper.drive();
+        // NetworkDriver has no backlog-empty query, so drive blind for a bounded
+        // window.
+        let deadline = Instant::now() + StdDuration::from_millis(200);
+        while Instant::now() < deadline {
+            self.shipper.drive();
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
     }
 }
 
@@ -206,6 +212,18 @@ const DEADLINE: StdDuration = StdDuration::from_secs(20);
 /// Longer than the sender deadline, so a sender-deadline burst still lands on
 /// a live receiver instead of a closed port.
 const RECEIVER_DEADLINE: StdDuration = StdDuration::from_secs(30);
+/// Both tests pick a loopback port then bind later; serialize them so the
+/// second cannot take the first's port between pick and bind.
+static PORT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Runs `cleanup_shmem` on drop so a failed assert does not leak /dev/shm
+/// backing.
+struct ShmemGuard(PathBuf);
+impl Drop for ShmemGuard {
+    fn drop(&mut self) {
+        cleanup_shmem(&self.0);
+    }
+}
 
 fn free_loopback() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
@@ -357,6 +375,7 @@ impl Tile<GatherTestSpine> for ProducerTile {
 
 #[test]
 fn gather_end_to_end_sender_to_receiver() {
+    let _port = PORT_LOCK.lock().unwrap();
     let send_base = tempfile::tempdir().expect("send base");
     let recv_base = tempfile::tempdir().expect("recv base");
     // Disk roots live outside the shmem bases: cleanup_shmem removes the whole
@@ -365,6 +384,8 @@ fn gather_end_to_end_sender_to_receiver() {
     let recv_disk_tmp = tempfile::tempdir().expect("recv disk");
     let send_disk = send_disk_tmp.path().to_path_buf();
     let recv_disk = recv_disk_tmp.path().to_path_buf();
+    let _send_shmem = ShmemGuard(send_base.path().to_path_buf());
+    let _recv_shmem = ShmemGuard(recv_base.path().to_path_buf());
     let addr = free_loopback();
 
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
@@ -550,9 +571,11 @@ fn assert_single_blob_replay(recv_disk: &Path) {
 
 #[test]
 fn non_blob_peer_is_disconnected() {
+    let _port = PORT_LOCK.lock().unwrap();
     let recv_base = tempfile::tempdir().expect("recv base");
     let recv_disk_tmp = tempfile::tempdir().expect("recv disk");
     let recv_disk = recv_disk_tmp.path().to_path_buf();
+    let _recv_shmem = ShmemGuard(recv_base.path().to_path_buf());
     let addr = free_loopback();
 
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
@@ -600,10 +623,10 @@ fn non_blob_peer_is_disconnected() {
             }
         }
     };
+    stop.store(true, Ordering::Relaxed);
     assert!(dropped, "receiver kept the non-blob peer connected");
     assert!(seen.lock().unwrap().is_empty(), "hook saw blobs from a non-blob peer");
 
-    stop.store(true, Ordering::Relaxed);
     receiver.join().expect("receiver thread");
     cleanup_shmem(recv_base.path());
 }
