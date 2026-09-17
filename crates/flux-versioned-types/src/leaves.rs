@@ -1,3 +1,5 @@
+//! Leaves and the families that hold them.
+//!
 //! A *leaf* is a `ByteStable` type with a roll chain ([`Versioned`]). A
 //! *family* is an enum of newtype variants holding leaves or other families
 //! ([`HasVersionedLeaves`], derived with `#[derive(VersionedLeaves)]`).
