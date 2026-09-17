@@ -6,8 +6,8 @@
 //! network's events. Every request is SigV4-signed; all operations are
 //! idempotent, so one cut off by a lost connection is resent.
 //!
-//! There is no TLS, so this talks to plain-HTTP endpoints (`MinIO`,
-//! `LocalStack`, or an HTTP gateway), not AWS directly.
+//! [`S3::new_tls`] speaks HTTPS to real endpoints; [`S3::new`] talks to
+//! plain-HTTP ones (`MinIO`, `LocalStack`, or an HTTP gateway).
 
 pub mod sigv4;
 
@@ -73,6 +73,21 @@ impl S3 {
             signer: sigv4::Signer::new(&addr.to_string(), "", "", "us-east-1"),
         }
     }
+    /// Like [`Self::new`] but over TLS to `addr`, sending and signing
+    /// SNI/`Host` `host` (path-style: one pool serves every bucket). Panics
+    /// if `host` is not a valid DNS name or IP.
+    pub fn new_tls(
+        http: &mut HttpNetwork,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        host: &str,
+        connections: usize,
+    ) -> Self {
+        Self {
+            pool: http.pool_tls(net, addr, host, connections),
+            signer: sigv4::Signer::new(host, "", "", "us-east-1"),
+        }
+    }
     pub fn with_credentials(mut self, access: &str, secret: &str) -> Self {
         self.signer.set_credentials(access, secret);
         self
@@ -82,7 +97,8 @@ impl S3 {
         self
     }
     /// Queues a PUT of `body` to `bucket/key`; returns it back when the
-    /// network refuses it (full queue, or over `max_body_bytes`).
+    /// network refuses it (full queue, or over `max_body_bytes`). S3 answers
+    /// `503 SlowDown` under load; back off and resend on it.
     pub fn put_object(
         &self,
         http: &mut HttpNetwork,
@@ -150,13 +166,18 @@ impl S3 {
         body: Vec<u8>,
     ) -> Result<RequestId, Vec<u8>> {
         let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let authorization = self.signer.sign(method, resource, query, &date, &body);
+        let (authorization, payload) = self.signer.sign(method, resource, query, &date, &body);
         let mut path = resource.to_owned();
         if !query.is_empty() {
             path.push('?');
             path.push_str(query);
         }
-        let headers = [("X-Amz-Date", date.as_str()), ("Authorization", authorization.as_str())];
+        let headers = [
+            ("X-Amz-Date", date.as_str()),
+            ("Authorization", authorization.as_str()),
+            ("X-Amz-Content-Sha256", payload.as_str()),
+            ("Host", self.signer.host()),
+        ];
         http.send(self.pool, method, &path, &headers, body, RETRIES)
     }
 }

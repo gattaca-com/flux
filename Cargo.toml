@@ -83,7 +83,9 @@ quanta = "0.12.3"
 quote = "1"
 rand = "0.9.0"
 ratatui = "0.29.0"
+rcgen = "0.14"
 rustc-hash = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { features = ["derive"], version = "1.0" }
 serde_json = "1.0.135"
 sha2 = "0.10"
@@ -98,6 +100,7 @@ tinyvec = "1.10.0"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
+webpki-roots = "1"
 wincode = "0.5"
 wincode-derive = "0.4"
 zstd = "0.13.2"

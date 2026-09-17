@@ -36,12 +36,14 @@
 //! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
-//! TLS, HTTP/2, compression, trailer exposure, upgrades, and `WebSockets` are
-//! not supported. Valid response trailers are parsed and discarded. There is no
-//! half-close support. After an error response, the connection closes without a
-//! lingering-close delay. Pipelined requests are served strictly one at a time
-//! per connection.
+//! Server-side TLS, HTTP/2, compression, trailer exposure, upgrades, and
+//! `WebSockets` are not supported. Valid response trailers are parsed and
+//! discarded. There is no half-close support. After an error response, the
+//! connection closes without a lingering-close delay. Pipelined requests are
+//! served strictly one at a time per connection.
 
+#[cfg(feature = "tls")]
+use std::sync::Arc;
 use std::{
     collections::VecDeque,
     io::{self, Write as _},
@@ -132,6 +134,8 @@ pub struct HttpNetwork {
     pools: Vec<Pool>,
     max_queued_bytes: usize,
     request_timeout: Option<Duration>,
+    #[cfg(feature = "tls")]
+    tls_config: Option<Arc<crate::tls::ClientConfig>>,
     failed: Vec<(RequestId, Failure)>,
 }
 impl Default for HttpNetwork {
@@ -149,6 +153,8 @@ impl Default for HttpNetwork {
             pools: Vec::new(),
             max_queued_bytes: usize::MAX,
             request_timeout: None,
+            #[cfg(feature = "tls")]
+            tls_config: None,
             failed: Vec::new(),
         }
     }
@@ -205,6 +211,13 @@ impl HttpNetwork {
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.request_timeout = Some(request_timeout);
+        self
+    }
+    /// Trusts `config` for TLS endpoints instead of the default Mozilla
+    /// roots. Applies to connections opened after the call.
+    #[cfg(feature = "tls")]
+    pub fn with_tls_config(mut self, config: Arc<crate::tls::ClientConfig>) -> Self {
+        self.tls_config = Some(config);
         self
     }
     pub fn max_body_bytes(&self) -> usize {
@@ -396,6 +409,28 @@ impl HttpNetwork {
     pub fn connect(&mut self, net: &mut TcpNetworkCore, addr: SocketAddr) -> Token {
         let group = self.group(net);
         let token = net.connect(group, addr);
+        self.track_outbound(token, addr)
+    }
+    /// Like [`Self::connect`] but negotiates TLS once the TCP connect
+    /// completes, verifying against the Mozilla roots and sending SNI
+    /// `server`. Panics if `server` is not a valid DNS name or IP.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        server: &str,
+    ) -> Token {
+        let session = crate::tls::Session::new(server);
+        let session = match &self.tls_config {
+            Some(config) => session.with_config(config.clone()),
+            None => session,
+        };
+        let group = self.group(net);
+        let token = net.connect_tls(group, addr, session);
+        self.track_outbound(token, addr)
+    }
+    fn track_outbound(&mut self, token: Token, addr: SocketAddr) -> Token {
         self.conns.push(Conn {
             token,
             buf: Vec::new(),
@@ -406,15 +441,38 @@ impl HttpNetwork {
         });
         token
     }
+    /// Opens `connections` persistent connections to `addr` that share one
+    /// request queue; see [`Self::send`].
     pub fn pool(
         &mut self,
         net: &mut TcpNetworkCore,
         addr: SocketAddr,
         connections: usize,
     ) -> HttpPool {
+        self.pool_with(net, addr, connections, |http, net| http.connect(net, addr))
+    }
+    /// Like [`Self::pool`] but negotiates TLS on every connection; see
+    /// [`Self::connect_tls`].
+    #[cfg(feature = "tls")]
+    pub fn pool_tls(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        server: &str,
+        connections: usize,
+    ) -> HttpPool {
+        self.pool_with(net, addr, connections, |http, net| http.connect_tls(net, addr, server))
+    }
+    fn pool_with(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        connections: usize,
+        mut open: impl FnMut(&mut Self, &mut TcpNetworkCore) -> Token,
+    ) -> HttpPool {
         assert!(connections > 0, "a pool needs a connection");
         let pool = HttpPool(self.pools.len() as u32);
-        let tokens = (0..connections).map(|_| self.connect(net, addr)).collect();
+        let tokens = (0..connections).map(|_| open(self, net)).collect();
         self.pools.push(Pool {
             addr,
             tokens,

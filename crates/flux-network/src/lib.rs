@@ -1,6 +1,7 @@
 pub mod http;
 pub mod network_driver;
 pub mod tcp;
+pub mod tls;
 pub mod udp;
 
 pub use mio::Token;

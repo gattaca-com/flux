@@ -17,17 +17,27 @@ flux-utils.workspace = true
 httparse.workspace = true
 libc.workspace = true
 mio.workspace = true
+rustls = { workspace = true, optional = true }
 serde.workspace = true
 tracing.workspace = true
+webpki-roots = { workspace = true, optional = true }
 wincode = { workspace = true, optional = true }
 
 [dev-dependencies]
 core_affinity.workspace = true
 criterion.workspace = true
+rcgen.workspace = true
 spine-derive.workspace = true
 tempfile.workspace = true
 wincode = { workspace = true }
 wincode-derive = { workspace = true }
+
+[features]
+tls = ["dep:rustls", "dep:webpki-roots"]
+
+[[test]]
+name = "http_tls"
+required-features = ["tls"]
 
 [[bench]]
 harness = false

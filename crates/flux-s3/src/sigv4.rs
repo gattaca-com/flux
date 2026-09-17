@@ -1,9 +1,10 @@
 //! `SigV4` signing for path-style S3 requests.
 //!
-//! The signed headers are `host` and `x-amz-date`, like botocore; the payload
-//! hash still anchors the canonical request. Paths encode every byte outside
-//! the unreserved set and keep `/`; query pairs sort by name and encode the
-//! same way but also keep `/`, which is how botocore signs S3 prefixes.
+//! The signed headers are `host`, `x-amz-content-sha256`, and `x-amz-date`;
+//! S3 rejects requests without the payload-hash header. Paths encode every
+//! byte outside the unreserved set and keep `/`; query pairs sort by name
+//! and encode the same way but also keep `/`, which is how botocore signs
+//! S3 prefixes.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -32,8 +33,13 @@ impl Signer {
     pub fn set_region(&mut self, region: &str) {
         region.clone_into(&mut self.region);
     }
+    /// The `Host` this signer signs for.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
     /// Signs one request; `date` is `YYYYMMDDTHHMMSSZ`, `resource` the path
-    /// without its query, `query` the sorted `name=value` pairs.
+    /// without its query, `query` the sorted `name=value` pairs. Returns the
+    /// `Authorization` value and the payload hash for `x-amz-content-sha256`.
     pub fn sign(
         &self,
         method: &str,
@@ -41,10 +47,11 @@ impl Signer {
         query: &str,
         date: &str,
         body: &[u8],
-    ) -> String {
+    ) -> (String, String) {
         let payload = hex(&Sha256::digest(body)[..]);
         let canonical = format!(
-            "{method}\n{resource}\n{query}\nhost:{}\nx-amz-date:{date}\n\nhost;x-amz-date\n{payload}",
+            "{method}\n{resource}\n{query}\nhost:{}\nx-amz-content-sha256:{payload}\n\
+             x-amz-date:{date}\n\nhost;x-amz-content-sha256;x-amz-date\n{payload}",
             self.host
         );
         let scope = format!("{}/{}/s3/aws4_request", &date[..8], self.region);
@@ -57,11 +64,13 @@ impl Signer {
         for part in [self.region.as_bytes(), b"s3".as_slice(), b"aws4_request".as_slice()] {
             key = hmac(&key, part);
         }
-        format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders=host;x-amz-date, Signature={}",
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={}",
             self.access,
             hex(&hmac(&key, to_sign.as_bytes()))
-        )
+        );
+        (authorization, payload)
     }
 }
 
