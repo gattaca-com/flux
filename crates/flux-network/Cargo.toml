@@ -39,6 +39,10 @@ tls = ["dep:rustls", "dep:webpki-roots"]
 name = "http_tls"
 required-features = ["tls"]
 
+[[test]]
+name = "tcp_network_tls"
+required-features = ["tls"]
+
 [[bench]]
 harness = false
 name = "connector"

@@ -192,7 +192,7 @@ fn object_resource(bucket: &str, key: &str) -> String {
     resource.push_str(bucket);
     for segment in key.split('/') {
         resource.push('/');
-        sigv4::encode_segment(&mut resource, segment);
+        sigv4::encode(&mut resource, segment);
     }
     resource
 }
@@ -202,13 +202,13 @@ fn list_query(prefix: Option<&str>, continuation_token: Option<&str>) -> String 
     let mut query = String::new();
     if let Some(token) = continuation_token {
         query.push_str("continuation-token=");
-        sigv4::encode_query(&mut query, token);
+        sigv4::encode(&mut query, token);
         query.push('&');
     }
     query.push_str("list-type=2");
     if let Some(prefix) = prefix {
         query.push_str("&prefix=");
-        sigv4::encode_query(&mut query, prefix);
+        sigv4::encode(&mut query, prefix);
     }
     query
 }

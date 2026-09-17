@@ -5,9 +5,11 @@
 //! `UNSIGNED-PAYLOAD`, since the transport already protects the body and
 //! hashing it costs about a millisecond per megabyte on the poll thread.
 //! Paths encode every
-//! byte outside the unreserved set and keep `/`; query pairs sort by name
-//! and encode the same way but also keep `/`, which is how botocore signs
-//! S3 prefixes.
+//! byte outside the unreserved set but keep `/`, which separates key
+//! segments. Query pairs sort by name and encode `/` as `%2F` too: S3
+//! re-canonicalises the request from the decoded parameters, so a prefix or
+//! continuation token signed with a raw `/` fails with
+//! `SignatureDoesNotMatch`.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -106,19 +108,12 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Encodes one path segment: every byte outside the RFC 3986 unreserved set.
-pub fn encode_segment(out: &mut String, segment: &str) {
-    encode(out, segment, false);
-}
-
-/// Encodes one query name or value; `/` stays raw, like botocore.
-pub fn encode_query(out: &mut String, value: &str) {
-    encode(out, value, true);
-}
-
-fn encode(out: &mut String, value: &str, slash: bool) {
+/// Encodes one path segment or query component: every byte outside the
+/// RFC 3986 unreserved set, `/` included. Callers keep the separators they
+/// mean by encoding each segment or value on its own.
+pub fn encode(out: &mut String, value: &str) {
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) || (slash && byte == b'/') {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
             out.push(byte as char);
         } else {
             use std::fmt::Write as _;
