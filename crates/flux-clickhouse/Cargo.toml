@@ -1,0 +1,16 @@
+[package]
+description = "Poll-driven ClickHouse HTTP client over flux-network"
+edition.workspace = true
+keywords = ["clickhouse", "low-latency", "performance"]
+license.workspace = true
+name = "flux-clickhouse"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flux-network.workspace = true
+
+[lints]
+workspace = true

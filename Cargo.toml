@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/flux",
+  "crates/flux-clickhouse",
   "crates/flux-communication",
   "crates/flux-ctl",
   "crates/flux-disk",
