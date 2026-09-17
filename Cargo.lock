@@ -1511,6 +1511,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-s3"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "flux-network",
+ "hmac",
+ "sha2",
+]
+
+[[package]]
 name = "flux-timekeeper"
 version = "0.3.2"
 dependencies = [

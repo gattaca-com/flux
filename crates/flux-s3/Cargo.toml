@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "flux-s3"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+flux-network.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

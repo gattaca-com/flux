@@ -10,6 +10,7 @@ members = [
   "crates/flux-postgres",
   "crates/flux-profiler",
   "crates/flux-profiler-macros",
+  "crates/flux-s3",
   "crates/flux-timekeeper",
   "crates/flux-timing",
   "crates/flux-utils",
