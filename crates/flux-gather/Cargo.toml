@@ -20,8 +20,13 @@ tracing.workspace = true
 
 [dev-dependencies]
 flux-utils.workspace = true
+serde.workspace = true
+spine-derive.workspace = true
 tempfile.workspace = true
 type-hash-derive.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["serde"]
 
 [lints]
 workspace = true

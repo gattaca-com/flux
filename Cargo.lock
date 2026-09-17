@@ -1433,6 +1433,8 @@ dependencies = [
  "flux-utils",
  "flux-versioned-types",
  "mio",
+ "serde",
+ "spine-derive",
  "tempfile",
  "tracing",
  "type-hash-derive",

@@ -18,7 +18,7 @@ impl BlobWriter {
 
     /// Queues `blob` as the entire content of `path`: parent directories are
     /// created (blocking, cheap), the file is created/truncated, written
-    /// through io_uring, closed. `false` + `warn!` when the open fails.
+    /// through `io_uring`, closed. `false` + `warn!` when the open fails.
     pub fn write(&mut self, blob: &Blob, path: &Path) -> bool {
         if let Some(parent) = path.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {

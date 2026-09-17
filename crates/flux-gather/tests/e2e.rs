@@ -1,6 +1,11 @@
-//! End-to-end gather path: a sender spine with `#[queue(gather)]` fields
-//! drains through `GatherTile` (disk + TCP) into `BlobReceiver` +
-//! `BlobRouter` (disk + hook), and `BlobReader` reads both disks back.
+//! End-to-end gather path, and the complete usage example for the library:
+//! a user spine with `#[queue(gather)]` fields drains through the user's
+//! `Gatherer` tile (disk + TCP) into `BlobReceiver` + `BlobRouter<TestMeta,
+//! RecordingSink>` (disk + hook), and `BlobReader` reads both disks back.
+//! The user owns the metadata type (`TestMeta`), the flush rule (slot ends),
+//! and the on-disk layout (`TestMeta::path`).
+
+#![allow(improper_ctypes)]
 
 use std::{
     fs,
@@ -20,12 +25,12 @@ use flux::{
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
 use flux_gather::{
-    Blob, BlobReader, BlobReceiver, BlobRouter, Boundary, GatherConfig, GatherMeta,
-    GatherReceiverSpine, GatherTile, ReadError,
+    Blob, BlobCache, BlobReader, BlobReceiver, BlobRouter, BlobShipper, BlobSink, BlobWriter,
+    GatherQueues, IncomingBlob, ReadError, Token,
 };
-use flux_timing::Duration;
+use flux_timing::{Duration, InternalMessage};
+use flux_utils::ArrayStr;
 use flux_versioned_types::{Versioned, VersionedLeaves, versioned_struct};
-use mio::Token;
 use spine_derive::from_spine;
 use type_hash_derive::type_hash_lock;
 
@@ -56,10 +61,23 @@ enum Telemetry {
     SlotEnd(SlotEnd),
 }
 
-impl Boundary for SlotEnd {
-    fn gather_boundary(&self) -> Option<u64> {
-        Some(self.slot)
+// The user's blob metadata: padding-free, 8 + 8 + 24 = 40 bytes.
+versioned_struct!(TestMeta =>
+    #[type_hash_lock(hash = 2679133347977192113)]
+    TestMetaV1 { pub slot: u64, pub n_blobs: u64, pub instance: ArrayStr<16> }
+);
+
+const _: () = assert!(size_of::<TestMeta>() == 40);
+
+impl TestMeta {
+    // The user's on-disk layout: `<base>/<instance>/<type_name>/<slot>.bin`.
+    fn path(&self, base: &Path, type_name: &str) -> PathBuf {
+        base.join(self.instance.as_str()).join(type_name).join(format!("{}.bin", self.slot))
     }
+}
+
+fn test_meta(slot: u64, n_blobs: u64) -> TestMeta {
+    TestMeta { slot, n_blobs, instance: ArrayStr::from_str_truncate("inst") }
 }
 
 #[from_spine("gather-test")]
@@ -72,15 +90,99 @@ struct GatherTestSpine {
     pub fills: SpineQueue<Fill>,
     #[queue(size(2usize.pow(10)))]
     pub ignored: SpineQueue<Ignored>,
-    #[queue(size(64), gather(boundary))]
+    // No `gather` attr: the user's tile consumes the slot-end queue by hand.
+    #[queue(size(64))]
     pub slot_end: SpineQueue<SlotEnd>,
 }
 
+// The user's gather tile: owns when to flush and where each blob goes.
+struct Gatherer {
+    cache: BlobCache,
+    shipper: BlobShipper,
+    writer: BlobWriter,
+    base: PathBuf,
+    last_slot: u64,
+}
+
+impl Gatherer {
+    fn flush(&mut self, slot: u64) {
+        let meta = test_meta(slot, self.cache.n_blobs() as u64);
+        self.cache.flush(&meta, 1, |blob| {
+            self.shipper.ship(blob);
+            if blob.type_name() != Fill::NAME {
+                self.writer.write(blob, &meta.path(&self.base, blob.type_name()));
+            }
+        });
+        self.last_slot = slot;
+    }
+}
+
+impl Tile<GatherTestSpine> for Gatherer {
+    fn loop_body(&mut self, adapter: &mut SpineAdapter<GatherTestSpine>) {
+        GatherTestSpine::gather_into(adapter, &mut self.cache);
+        adapter.consume_internal_message(|m: &mut InternalMessage<SlotEnd>, _| {
+            self.cache.push(&*m);
+            self.flush(m.slot);
+        });
+        if self.shipper.drive() | self.writer.poll() {
+            adapter.mark_work();
+        }
+    }
+
+    fn teardown(mut self, adapter: &mut SpineAdapter<GatherTestSpine>) {
+        GatherTestSpine::gather_into(adapter, &mut self.cache);
+        self.flush(self.last_slot + 1);
+        self.writer.drain();
+        self.shipper.drive();
+    }
+}
+
+#[from_spine("gather-test-recv")]
+#[derive(Debug)]
+struct RecvSpine {
+    pub tile_info: ShmemData<TileInfo>,
+    #[queue(size(64), mtu(1 << 20))]
+    pub blobs: SpineQueue<IncomingBlob>,
+    #[queue(size(64))]
+    pub disconnect: SpineQueue<Token>,
+}
+
 #[derive(Clone, Debug)]
-struct BlobRecord {
-    meta: GatherMeta,
+struct Seen {
+    meta: TestMeta,
     type_name: String,
     n_messages: u32,
+}
+
+// The user's sink: owns receiver-side persistence and what to remember.
+struct RecordingSink {
+    writer: BlobWriter,
+    base: PathBuf,
+    seen: Arc<Mutex<Vec<Seen>>>,
+    done: Arc<AtomicBool>,
+}
+
+impl BlobSink<TestMeta> for RecordingSink {
+    fn on_blob(&mut self, meta: &TestMeta, blob: &Blob) {
+        self.writer.write(blob, &meta.path(&self.base, blob.type_name()));
+        let mut seen = self.seen.lock().unwrap();
+        seen.push(Seen {
+            meta: *meta,
+            type_name: blob.type_name().to_owned(),
+            n_messages: blob.header.n_messages,
+        });
+        if seen.len() >= EXPECTED_BLOBS {
+            self.done.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn drive(&mut self) -> bool {
+        self.writer.poll()
+    }
+
+    fn finish(&mut self) {
+        self.writer.drain();
+    }
 }
 
 const N_SLOTS: u64 = 3;
@@ -107,28 +209,22 @@ fn background() -> TileConfig {
     TileConfig::background(None, Some(Duration::from_millis(1)))
 }
 
+/// For tiles with no spine producer to wake them: they poll sockets, disk, or
+/// clocks, so they must not park.
+fn background_no_park() -> TileConfig {
+    background().without_park()
+}
+
 struct StopTile {
     stop: Arc<AtomicBool>,
-    seen: Arc<Mutex<Vec<BlobRecord>>>,
+    seen: Arc<Mutex<Vec<Seen>>>,
     want_blobs: usize,
     receiver_done: Arc<AtomicBool>,
     deadline: Instant,
-    last_beat: Option<Instant>,
 }
 
-impl Tile<GatherReceiverSpine> for StopTile {
-    fn loop_body(&mut self, adapter: &mut SpineAdapter<GatherReceiverSpine>) {
-        // Time-driven tile: never park, so the stop checks below run even
-        // when no other tile signals.
-        adapter.mark_work();
-        // Periodic no-op produce keeps parked IO tiles polling under the park
-        // feature: each produce wakes every parked tile process-wide, and the
-        // receiver consumes the heartbeat as work before polling the socket.
-        // disconnect() is a no-op for unknown tokens.
-        if self.last_beat.is_none_or(|beat| beat.elapsed() >= StdDuration::from_millis(10)) {
-            adapter.produce(Token(usize::MAX));
-            self.last_beat = Some(Instant::now());
-        }
+impl Tile<RecvSpine> for StopTile {
+    fn loop_body(&mut self, adapter: &mut SpineAdapter<RecvSpine>) {
         if self.seen.lock().unwrap().len() >= self.want_blobs ||
             self.stop.load(Ordering::Relaxed) ||
             Instant::now() > self.deadline
@@ -144,32 +240,31 @@ fn spawn_receiver(
     base: PathBuf,
     disk: PathBuf,
     addr: SocketAddr,
-    seen: Arc<Mutex<Vec<BlobRecord>>>,
+    seen: Arc<Mutex<Vec<Seen>>>,
     stop: Arc<AtomicBool>,
     receiver_done: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
     want_blobs: usize,
     deadline: Instant,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let spine = GatherReceiverSpine::new_with_base_dir(&base, None);
+        let spine = RecvSpine::new_with_base_dir(&base, None);
         spine.start(None, None, |scoped| {
-            attach_tile(BlobReceiver::new(addr), scoped, background());
-            let hook_seen = seen.clone();
+            attach_tile(BlobReceiver::new(addr), scoped, background_no_park());
             attach_tile(
-                BlobRouter::new(Some(disk), move |meta: &GatherMeta, blob: &Blob| {
-                    hook_seen.lock().unwrap().push(BlobRecord {
-                        meta: *meta,
-                        type_name: blob.type_name().to_owned(),
-                        n_messages: blob.header.n_messages,
-                    });
+                BlobRouter::new(RecordingSink {
+                    writer: BlobWriter::new(),
+                    base: disk,
+                    seen: seen.clone(),
+                    done,
                 }),
                 scoped,
                 background(),
             );
             attach_tile(
-                StopTile { stop, seen, want_blobs, receiver_done, deadline, last_beat: None },
+                StopTile { stop, seen, want_blobs, receiver_done, deadline },
                 scoped,
-                background(),
+                background_no_park(),
             );
         });
         cleanup_shmem(&base);
@@ -180,7 +275,8 @@ struct ProducerTile {
     next_slot: u64,
     grace_until: Option<Instant>,
     partial_at: Option<Instant>,
-    seen: Arc<Mutex<Vec<BlobRecord>>>,
+    seen: Arc<Mutex<Vec<Seen>>>,
+    done: Arc<AtomicBool>,
     receiver_done: Arc<AtomicBool>,
     deadline: Instant,
 }
@@ -191,23 +287,22 @@ impl ProducerTile {
     }
 
     fn expired(&self) -> bool {
-        self.receiver_done.load(Ordering::Relaxed) || Instant::now() > self.deadline
+        self.done.load(Ordering::Relaxed) ||
+            self.receiver_done.load(Ordering::Relaxed) ||
+            Instant::now() > self.deadline
     }
 }
 
 impl Tile<GatherTestSpine> for ProducerTile {
     fn loop_body(&mut self, adapter: &mut SpineAdapter<GatherTestSpine>) {
-        // Time-driven tile: never park, so pacing/deadline checks below run
-        // even when no other tile signals.
-        adapter.mark_work();
         if let Some(until) = self.grace_until {
             if Instant::now() < until {
                 return;
             }
         } else {
-            // Broadcast consumers start at the head on first read, so the gather
-            // tile must run its first (empty) pass before anything is produced,
-            // else the first batch is silently skipped.
+            // Broadcast consumers start at the head on first read, so the
+            // gather tile must run its first (empty) pass before anything is
+            // produced, else the first batch is silently skipped.
             self.grace_until = Some(Instant::now() + StdDuration::from_millis(500));
             return;
         }
@@ -250,9 +345,9 @@ impl Tile<GatherTestSpine> for ProducerTile {
         } else if self.expired() ||
             Instant::now() > self.partial_at.unwrap() + StdDuration::from_millis(500)
         {
-            // The teardown flush ships the partial batch as slot 4; the receiver
-            // cannot acknowledge it before this scope stops, so stop on a grace
-            // period rather than waiting for it.
+            // The teardown flush ships the partial batch as slot 4; the
+            // receiver cannot acknowledge it before this scope stops, so stop
+            // on a grace period rather than waiting for it.
             adapter.request_stop_scope();
         }
     }
@@ -270,9 +365,10 @@ fn gather_end_to_end_sender_to_receiver() {
     let recv_disk = recv_disk_tmp.path().to_path_buf();
     let addr = free_loopback();
 
-    let seen: Arc<Mutex<Vec<BlobRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let receiver_done = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + DEADLINE;
 
     let receiver = spawn_receiver(
@@ -282,6 +378,7 @@ fn gather_end_to_end_sender_to_receiver() {
         seen.clone(),
         stop,
         receiver_done.clone(),
+        done.clone(),
         EXPECTED_BLOBS,
         Instant::now() + RECEIVER_DEADLINE,
     );
@@ -296,53 +393,51 @@ fn gather_end_to_end_sender_to_receiver() {
                 grace_until: None,
                 partial_at: None,
                 seen: seen.clone(),
+                done,
                 receiver_done,
                 deadline,
             },
             &mut scoped,
-            background(),
+            background_no_park(),
         );
         attach_tile(
-            GatherTile::new(GatherConfig {
-                instance_id: "inst".into(),
-                addrs: vec![addr],
-                disk_dir: Some(send_disk.clone()),
-                zstd_level: 1,
-                disk_skip: vec![Fill::NAME.to_string()],
-                ..Default::default()
-            }),
+            Gatherer {
+                cache: BlobCache::new(),
+                shipper: BlobShipper::new(vec![addr]),
+                writer: BlobWriter::new(),
+                base: send_disk.clone(),
+                last_slot: 0,
+            },
             &mut scoped,
-            background(),
+            background_no_park(),
         );
     });
     receiver.join().expect("receiver thread");
 
-    let seen: Vec<BlobRecord> = seen.lock().unwrap().clone();
+    let seen: Vec<Seen> = seen.lock().unwrap().clone();
     assert_hook_records(&seen);
     assert_disk_identity(&send_disk, &recv_disk);
     assert_decoded_content(&send_disk, &recv_disk);
+    assert_single_blob_replay(&recv_disk);
 
     cleanup_shmem(send_base.path());
 }
 
-fn assert_hook_records(seen: &[BlobRecord]) {
+fn assert_hook_records(seen: &[Seen]) {
     assert_eq!(seen.len(), EXPECTED_BLOBS, "hook records: {seen:?}");
     for record in seen {
-        assert_eq!(record.meta.instance_id.as_str(), "inst", "{record:?}");
-        assert_eq!(record.meta.app.as_str(), "gather-test", "{record:?}");
+        assert_eq!(record.meta.instance.as_str(), "inst", "{record:?}");
     }
     for slot in 1..=N_SLOTS {
-        let batch: Vec<&BlobRecord> = seen.iter().filter(|r| r.meta.slot == slot).collect();
+        let batch: Vec<&Seen> = seen.iter().filter(|r| r.meta.slot == slot).collect();
         assert_eq!(batch.len(), 3, "slot {slot}: {batch:?}");
         let mut names: Vec<&str> = batch.iter().map(|r| r.type_name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, [Fill::NAME, Price::NAME, SlotEnd::NAME], "slot {slot}");
-        let flush_t = batch[0].meta.flush_t;
-        assert!(batch.iter().all(|r| r.meta.flush_t == flush_t), "slot {slot}");
         assert!(batch.iter().all(|r| r.meta.n_blobs == 3), "slot {slot}: {batch:?}");
         assert!(!batch.iter().any(|r| r.type_name == Ignored::NAME), "slot {slot}");
     }
-    let tail: Vec<&BlobRecord> = seen.iter().filter(|r| r.meta.slot == N_SLOTS + 1).collect();
+    let tail: Vec<&Seen> = seen.iter().filter(|r| r.meta.slot == N_SLOTS + 1).collect();
     assert_eq!(tail.len(), 1, "slot 4: {tail:?}");
     assert_eq!(tail[0].type_name, Price::NAME);
     assert_eq!(tail[0].meta.n_blobs, 1);
@@ -352,51 +447,38 @@ fn assert_hook_records(seen: &[BlobRecord]) {
 fn assert_disk_identity(send_disk: &Path, recv_disk: &Path) {
     for slot in 1..=N_SLOTS {
         for name in [Price::NAME, SlotEnd::NAME] {
-            let send_files = BlobReader::slot_files(send_disk, "inst", "gather-test", name, slot)
-                .expect("send slot files");
-            let recv_files = BlobReader::slot_files(recv_disk, "inst", "gather-test", name, slot)
-                .expect("recv slot files");
-            assert_eq!(send_files.len(), 1, "{name} slot {slot}");
-            assert_eq!(recv_files.len(), 1, "{name} slot {slot}");
+            let send_file = test_meta(slot, 3).path(send_disk, name);
+            let recv_file = test_meta(slot, 3).path(recv_disk, name);
             assert_eq!(
-                fs::read(&send_files[0]).expect("read send file"),
-                fs::read(&recv_files[0]).expect("read recv file"),
+                fs::read(&send_file).expect("read send file"),
+                fs::read(&recv_file).expect("read recv file"),
                 "{name} slot {slot} byte identity"
             );
         }
         assert!(
-            BlobReader::slot_files(send_disk, "inst", "gather-test", Fill::NAME, slot)
-                .expect("send fill files")
-                .is_empty(),
-            "Fill is disk-skipped on the sender"
+            !test_meta(slot, 3).path(send_disk, Fill::NAME).exists(),
+            "Fill is disk-skipped on the sender, slot {slot}"
         );
-        let recv_fills = BlobReader::slot_files(recv_disk, "inst", "gather-test", Fill::NAME, slot)
-            .expect("recv fill files");
-        assert_eq!(recv_fills.len(), 1, "Fill slot {slot}");
+        assert!(
+            test_meta(slot, 3).path(recv_disk, Fill::NAME).exists(),
+            "Fill slot {slot} on the receiver"
+        );
     }
-    let send_tail =
-        BlobReader::slot_files(send_disk, "inst", "gather-test", Price::NAME, N_SLOTS + 1)
-            .expect("send slot-4 files");
-    let recv_tail =
-        BlobReader::slot_files(recv_disk, "inst", "gather-test", Price::NAME, N_SLOTS + 1)
-            .expect("recv slot-4 files");
-    assert_eq!(send_tail.len(), 1);
-    assert_eq!(recv_tail.len(), 1);
     assert_eq!(
-        fs::read(&send_tail[0]).expect("read send slot 4"),
-        fs::read(&recv_tail[0]).expect("read recv slot 4")
+        fs::read(test_meta(N_SLOTS + 1, 1).path(send_disk, Price::NAME)).expect("read send slot 4"),
+        fs::read(test_meta(N_SLOTS + 1, 1).path(recv_disk, Price::NAME)).expect("read recv slot 4")
     );
 }
 
 fn assert_decoded_content(send_disk: &Path, recv_disk: &Path) {
     let mut reader = BlobReader::new();
     for slot in 1..=N_SLOTS {
-        let files = BlobReader::slot_files(recv_disk, "inst", "gather-test", Price::NAME, slot)
-            .expect("recv price files");
-        let decoded = reader.read::<Telemetry>(&files[0]).expect("decode price file");
+        let file = test_meta(slot, 3).path(recv_disk, Price::NAME);
+        let decoded = reader.read::<TestMeta, Telemetry>(&file).expect("decode price file");
         assert_eq!(decoded.len(), 1);
         let (meta, msgs) = &decoded[0];
         assert_eq!(meta.slot, slot);
+        assert_eq!(meta.n_blobs, 3);
         assert_eq!(msgs.len(), PRICES_PER_SLOT as usize);
         for (i, msg) in msgs.iter().enumerate() {
             let i = i as u64;
@@ -408,7 +490,7 @@ fn assert_decoded_content(send_disk: &Path, recv_disk: &Path) {
                 other => panic!("slot {slot} price file held {other:?}"),
             }
         }
-        let leaves = reader.read::<Price>(&files[0]).expect("decode price leaves");
+        let leaves = reader.read::<TestMeta, Price>(&file).expect("decode price leaves");
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].1.len(), PRICES_PER_SLOT as usize);
         for (i, msg) in leaves[0].1.iter().enumerate() {
@@ -417,13 +499,12 @@ fn assert_decoded_content(send_disk: &Path, recv_disk: &Path) {
             assert_eq!(msg.data().value, i);
         }
         assert!(
-            matches!(reader.read::<Ignored>(&files[0]), Err(ReadError::ForeignType { .. })),
+            matches!(reader.read::<TestMeta, Ignored>(&file), Err(ReadError::ForeignType { .. })),
             "price file is foreign to Ignored"
         );
 
-        let fill_files = BlobReader::slot_files(recv_disk, "inst", "gather-test", Fill::NAME, slot)
-            .expect("recv fill files");
-        let decoded = reader.read::<Fill>(&fill_files[0]).expect("decode fill file");
+        let fill_file = test_meta(slot, 3).path(recv_disk, Fill::NAME);
+        let decoded = reader.read::<TestMeta, Fill>(&fill_file).expect("decode fill file");
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].1.len(), FILLS_PER_SLOT as usize);
         for (i, msg) in decoded[0].1.iter().enumerate() {
@@ -432,21 +513,34 @@ fn assert_decoded_content(send_disk: &Path, recv_disk: &Path) {
             assert_eq!(msg.data().qty, i);
         }
     }
-    let tail = BlobReader::slot_files(recv_disk, "inst", "gather-test", Price::NAME, N_SLOTS + 1)
-        .expect("recv slot-4 files");
-    assert_eq!(tail.len(), 1);
-    let decoded = reader.read::<Telemetry>(&tail[0]).expect("decode slot-4 file");
+    let tail = test_meta(N_SLOTS + 1, 1).path(recv_disk, Price::NAME);
+    let decoded = reader.read::<TestMeta, Telemetry>(&tail).expect("decode slot-4 file");
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].0.slot, N_SLOTS + 1);
     assert_eq!(decoded[0].1.len(), PARTIAL_PRICES as usize);
 
     for disk in [send_disk, recv_disk] {
         assert!(
-            !disk.join("inst").join("gather-test").join(Ignored::NAME).exists(),
+            !disk.join("inst").join(Ignored::NAME).exists(),
             "no ignored dir under {}",
             disk.display()
         );
     }
+}
+
+fn assert_single_blob_replay(recv_disk: &Path) {
+    let file = test_meta(1, 3).path(recv_disk, Price::NAME);
+    let bytes = fs::read(&file).expect("read price file");
+    let mut reader = BlobReader::new();
+    let mut count = 0;
+    reader
+        .for_each_blob(&file, |blob| {
+            count += 1;
+            assert_eq!(blob.as_bytes(), bytes.as_slice());
+            Ok(())
+        })
+        .expect("walk blobs");
+    assert_eq!(count, 1);
 }
 
 #[test]
@@ -456,9 +550,10 @@ fn non_blob_peer_is_disconnected() {
     let recv_disk = recv_disk_tmp.path().to_path_buf();
     let addr = free_loopback();
 
-    let seen: Arc<Mutex<Vec<BlobRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let receiver_done = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + DEADLINE;
 
     let receiver = spawn_receiver(
@@ -468,6 +563,7 @@ fn non_blob_peer_is_disconnected() {
         seen.clone(),
         stop.clone(),
         receiver_done,
+        done,
         usize::MAX,
         deadline,
     );
