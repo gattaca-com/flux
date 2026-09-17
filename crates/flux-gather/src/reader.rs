@@ -36,9 +36,7 @@ impl BlobReader {
         path: &Path,
         mut f: impl FnMut(&Blob) -> Result<(), DecodeError>,
     ) -> Result<(), ReadError> {
-        let bytes = std::fs::read(path).map_err(ReadError::Io)?;
-        self.file.resize(bytes.len());
-        self.file.as_mut_bytes().copy_from_slice(&bytes);
+        load_file(&mut self.file, path)?;
         visit_blobs(self.file.as_bytes(), |blob| f(blob).map_err(ReadError::Decode))
     }
 
@@ -52,11 +50,9 @@ impl BlobReader {
         &mut self,
         path: &Path,
     ) -> Result<Vec<(U, Vec<InternalMessage<T>>)>, ReadError> {
-        let bytes = std::fs::read(path).map_err(ReadError::Io)?;
         // Split borrows: blobs borrow `file` while decoding into `decode`.
         let Self { file, decode } = self;
-        file.resize(bytes.len());
-        file.as_mut_bytes().copy_from_slice(&bytes);
+        load_file(file, path)?;
         let mut out = Vec::new();
         visit_blobs(file.as_bytes(), |blob| {
             let Some(decoded) = T::decode_blob::<U>(blob, decode) else {
@@ -67,6 +63,23 @@ impl BlobReader {
         })?;
         Ok(out)
     }
+}
+
+/// Copies `path` straight into aligned scratch storage in a single read,
+/// falling back to `fs::read` + `load` when the file changed size between
+/// the metadata read and the read itself.
+fn load_file(scratch: &mut Scratch, path: &Path) -> Result<(), ReadError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        scratch.resize(meta.len() as usize);
+        if let Ok(mut file) = std::fs::File::open(path) {
+            use std::io::Read as _;
+            if file.read_exact(scratch.as_mut_bytes()).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    let bytes = std::fs::read(path).map_err(ReadError::Io)?;
+    scratch.load(&bytes).map(|_| ()).map_err(ReadError::Decode)
 }
 
 /// Walks the concatenated blobs in `bytes`, stopping at the first error.
