@@ -1423,6 +1423,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-gather"
+version = "0.3.2"
+dependencies = [
+ "bincode",
+ "flux",
+ "flux-disk",
+ "flux-network",
+ "flux-timing",
+ "flux-utils",
+ "flux-versioned-types",
+ "mio",
+ "serde",
+ "spine-derive",
+ "tempfile",
+ "tracing",
+ "type-hash-derive",
+]
+
+[[package]]
 name = "flux-network"
 version = "0.3.2"
 dependencies = [

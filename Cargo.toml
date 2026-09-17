@@ -4,6 +4,7 @@ members = [
   "crates/flux-communication",
   "crates/flux-ctl",
   "crates/flux-disk",
+  "crates/flux-gather",
   "crates/flux-network",
   "crates/flux-profiler",
   "crates/flux-profiler-macros",
@@ -41,6 +42,7 @@ flux-profiler-macros = { path = "crates/flux-profiler-macros" }
 flux-timekeeper = { path = "crates/flux-timekeeper" }
 flux-timing = { path = "crates/flux-timing" }
 flux-utils = { path = "crates/flux-utils" }
+flux-versioned-types = { path = "crates/flux-versioned-types" }
 flux-versioned-types-macros = { path = "crates/flux-versioned-types-macros" }
 spine-derive = { path = "crates/spine-derive" }
 type-hash = { path = "crates/type-hash" }
