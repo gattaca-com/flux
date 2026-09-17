@@ -120,10 +120,17 @@ impl Gatherer {
 impl Tile<GatherTestSpine> for Gatherer {
     fn loop_body(&mut self, adapter: &mut SpineAdapter<GatherTestSpine>) {
         GatherTestSpine::gather_into(adapter, &mut self.cache);
-        adapter.consume_internal_message(|m: &mut InternalMessage<SlotEnd>, _| {
-            self.cache.push(&*m);
+        let mut boundary = None;
+        if adapter.consume_internal_message_one(|m: &mut InternalMessage<SlotEnd>, _| {
+            boundary = Some(*m);
+        }) {
+            // Queues are independent rings: re-drain so the rest of the closing
+            // slot lands in this flush, not the next one.
+            GatherTestSpine::gather_into(adapter, &mut self.cache);
+            let m = boundary.unwrap();
+            self.cache.push(&m);
             self.flush(m.slot);
-        });
+        }
         if self.shipper.drive() | self.writer.poll() {
             adapter.mark_work();
         }
