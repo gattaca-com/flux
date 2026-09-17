@@ -1,10 +1,11 @@
-//! Poll-driven `Postgres` client over a caller-owned [`TcpNetwork`].
+//! Poll-driven `Postgres` client over a caller-owned TCP network, sharing
+//! one poll with the tile's other traffic.
 //!
 //! Requests queue inside the client; [`Postgres::on_event`], called from
-//! the network's `poll_with` handler, tracks the pooled connections, and
+//! the network's event handler, tracks the pooled connections, and
 //! [`Postgres::drive`] sends queued requests on idle ones and delivers
 //! one outcome per id. A full queue refuses the new request instead of
-//! failing queued ones.
+//! failing queued ones; queued requests wait out pool outages.
 //!
 //! Authentication covers trust, cleartext, and SCRAM-SHA-256; anything
 //! else fails the connection without an outcome.
@@ -12,11 +13,11 @@
 pub mod copybinary;
 mod scram;
 
-use std::{collections::VecDeque, net::SocketAddr};
+use std::{collections::VecDeque, net::SocketAddr, ops::DerefMut};
 
 use flux_network::{
     Token,
-    tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork},
+    tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore},
 };
 use rand::Rng as _;
 use serde::Serialize;
@@ -311,10 +312,15 @@ impl Postgres {
     /// return `None`; unencodable rows panic.
     pub fn copy_rows<T: Serialize>(&mut self, table: &str, rows: &[T]) -> Option<QueryId> {
         let first = rows.first()?;
+        if self.full_for(0) {
+            return None;
+        }
         let sql = copybinary::copy_statement(table, first).expect("COPY BINARY row");
         let mut body = Vec::new();
         copybinary::header(&mut body);
         for row in rows {
+            let statement = copybinary::copy_statement(table, row).expect("COPY BINARY row");
+            assert_eq!(statement, sql, "COPY rows must share the same columns");
             copybinary::encode(&mut body, row).expect("COPY BINARY row");
         }
         copybinary::trailer(&mut body);
@@ -366,7 +372,7 @@ impl Postgres {
         out
     }
 
-    fn ensure_conns(&mut self, net: &mut TcpNetwork) {
+    fn ensure_conns(&mut self, net: &mut TcpNetworkCore) {
         if !self.conns.is_empty() {
             return;
         }
@@ -390,7 +396,7 @@ impl Postgres {
         }
     }
 
-    fn send_pending(&mut self, net: &mut TcpNetwork, index: usize) -> bool {
+    fn send_pending(&mut self, net: &mut TcpNetworkCore, index: usize) -> bool {
         let outbox = &self.conns[index].outbox;
         if outbox.is_empty() {
             return true;
@@ -405,8 +411,9 @@ impl Postgres {
 
     /// Sends queued requests on idle connections, then delivers each finished
     /// request's outcome to `handler` exactly once.
-    pub fn drive<F>(&mut self, net: &mut TcpNetwork, mut handler: F)
+    pub fn drive<N, F>(&mut self, net: &mut N, mut handler: F)
     where
+        N: DerefMut<Target = TcpNetworkCore>,
         F: FnMut(QueryId, Result<Output, Error>),
     {
         self.ensure_conns(net);
@@ -421,7 +428,7 @@ impl Postgres {
             if !matches!(self.conns[index].state, State::Ready) {
                 continue;
             }
-            let Some(request) = self.pop_queued() else { break };
+            let Some(mut request) = self.pop_queued() else { break };
             let token = self.conns[index].token;
             let sent = net.send_with(token, |buf| {
                 buf.push(b'Q');
@@ -442,6 +449,7 @@ impl Postgres {
                 break;
             }
             if request.data.is_some() {
+                request.data = None;
                 self.conns[index].state = State::Copy(CopyOut { request, tag: None, error: None });
             } else {
                 self.conns[index].state = State::Query(QueryOut {
@@ -456,6 +464,14 @@ impl Postgres {
         }
         for (id, outcome) in self.outcomes.drain(..) {
             handler(id, outcome);
+        }
+    }
+
+    /// Removes every pooled endpoint; queued and in-flight requests are
+    /// dropped without outcomes.
+    pub fn close(self, net: &mut TcpNetworkCore) {
+        for conn in &self.conns {
+            net.remove(conn.token);
         }
     }
 

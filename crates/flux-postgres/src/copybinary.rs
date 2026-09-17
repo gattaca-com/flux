@@ -60,7 +60,12 @@ pub fn copy_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<Str
     if columns.is_empty() {
         return Err(unsupported("a row that is not a struct"))
     }
-    Ok(format!("COPY {table} ({}) FROM STDIN (FORMAT BINARY)", columns.join(", ")))
+    let quoted = columns
+        .iter()
+        .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("COPY {table} ({quoted}) FROM STDIN (FORMAT BINARY)"))
 }
 
 struct Encoder<'a> {
@@ -77,7 +82,9 @@ impl Encoder<'_> {
         }
     }
     fn single(&mut self) {
-        self.top_level(1);
+        if self.depth == 0 && self.fields == 0 {
+            self.fields = 1;
+        }
     }
     fn sized(&mut self, len: usize, bytes: &[u8]) {
         self.out.extend_from_slice(&(len as u32).to_be_bytes());
