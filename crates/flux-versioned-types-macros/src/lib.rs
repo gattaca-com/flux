@@ -2,6 +2,7 @@ use proc_macro::TokenStream;
 
 mod evolve;
 mod evolve_enum;
+mod family;
 mod rolling;
 mod schema;
 mod shared;
@@ -19,6 +20,11 @@ pub fn evolve_enum(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn roll_chain_into(input: TokenStream) -> TokenStream {
     rolling::roll_chain_into(input)
+}
+
+#[proc_macro_derive(HasVersionedLeaves, attributes(leaves))]
+pub fn derive_has_versioned_leaves(input: TokenStream) -> TokenStream {
+    family::derive_has_versioned_leaves(input)
 }
 
 #[proc_macro_derive(TelemetrySchema, attributes(serde, telemetry_schema))]

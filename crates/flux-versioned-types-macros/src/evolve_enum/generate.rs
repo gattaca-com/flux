@@ -41,9 +41,11 @@ fn generate_enum_def(
         })
         .collect();
 
+    let zerocopy_attrs = crate::shared::zerocopy_derive_attrs();
     quote! {
         #(#default_attrs)*
         #(#enum_attrs)*
+        #(#zerocopy_attrs)*
         pub enum #name {
             #(#variant_tokens,)*
         }

@@ -63,9 +63,11 @@ pub(crate) fn generate_struct_def(
     struct_attrs: &[Attribute],
     fields: &Vec<TokenStream2>,
 ) -> TokenStream2 {
+    let zerocopy_attrs = crate::shared::zerocopy_derive_attrs();
     quote! {
         #(#default_attrs)*
         #(#struct_attrs)*
+        #(#zerocopy_attrs)*
         pub struct #name {
             #(#fields),*
         }

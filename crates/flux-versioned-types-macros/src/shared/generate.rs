@@ -107,7 +107,11 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
         for ev in &input.evolutions {
             version_names.push(ev.name().clone());
         }
-        output.extend(crate::rolling::generate::generate_roll_chain(roll_name, &version_names));
+        output.extend(crate::rolling::generate::generate_roll_chain(
+            roll_name,
+            &version_names,
+            input.wire_name.as_ref(),
+        ));
     }
 
     output
@@ -139,4 +143,20 @@ pub(crate) fn default_struct_attrs() -> Vec<Attribute> {
 
 pub(crate) fn default_enum_attrs() -> Vec<Attribute> {
     default_attrs_with_repr(&quote!(u8))
+}
+
+// Locked zerocopy-derive only accepts a bare ident for `#[zerocopy(crate =
+// ...)]`, so a re-export path cannot be used here; consumers depend on zerocopy
+// directly.
+#[cfg(feature = "zerocopy")]
+pub(crate) fn zerocopy_derive_attrs() -> Vec<Attribute> {
+    let tokens = quote! {
+        #[derive(::zerocopy::IntoBytes, ::zerocopy::TryFromBytes, ::zerocopy::KnownLayout, ::zerocopy::Immutable)]
+    };
+    syn::parse2::<AttrsWrapper>(tokens).unwrap().0
+}
+
+#[cfg(not(feature = "zerocopy"))]
+pub(crate) fn zerocopy_derive_attrs() -> Vec<Attribute> {
+    Vec::new()
 }

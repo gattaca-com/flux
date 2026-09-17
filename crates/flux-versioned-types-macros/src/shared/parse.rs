@@ -1,5 +1,5 @@
 use syn::{
-    Attribute, Ident, Result, Token, braced,
+    Attribute, Ident, LitStr, Result, Token, braced,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
 };
@@ -7,6 +7,7 @@ use syn::{
 /// Generic macro input: optional `roll_into Name`, optional
 /// `default_attrs { ... }` block + base definition + evolution steps.
 pub(crate) struct EvolveInputGeneric<B, E> {
+    pub wire_name: Option<LitStr>,
     pub roll_into: Option<Ident>,
     pub default_attrs: Vec<Attribute>,
     pub final_attrs: Vec<Attribute>,
@@ -16,6 +17,7 @@ pub(crate) struct EvolveInputGeneric<B, E> {
 
 impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
     fn parse(input: ParseStream) -> Result<Self> {
+        let wire_name = parse_wire_name(input)?;
         let roll_into = parse_optional_keyword(input, "roll_into")?;
 
         let mut default_attrs = Vec::new();
@@ -40,7 +42,7 @@ impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
             evolutions.push(input.parse()?);
         }
 
-        Ok(Self { roll_into, default_attrs, final_attrs, base, evolutions })
+        Ok(Self { wire_name, roll_into, default_attrs, final_attrs, base, evolutions })
     }
 }
 
@@ -50,6 +52,35 @@ impl<B, E> EvolveInputGeneric<B, E> {
             self.default_attrs = defaults();
         }
     }
+}
+
+fn parse_wire_name(input: ParseStream) -> Result<Option<LitStr>> {
+    if !input.peek(Token![#]) {
+        return Ok(None);
+    }
+    let fork = input.fork();
+    let attrs: Vec<Attribute> = fork.call(Attribute::parse_outer)?;
+    if attrs.len() != 1 || !attrs[0].path().is_ident("wire_name") {
+        return Ok(None);
+    }
+    let lit = match &attrs[0].meta {
+        syn::Meta::NameValue(nv) => match &nv.value {
+            syn::Expr::Lit(el) => match &el.lit {
+                syn::Lit::Str(s) => s.clone(),
+                _ => {
+                    return Err(syn::Error::new_spanned(&attrs[0], "expected wire_name literal"));
+                }
+            },
+            _ => {
+                return Err(syn::Error::new_spanned(&attrs[0], "expected wire_name literal"));
+            }
+        },
+        _ => {
+            return Err(syn::Error::new_spanned(&attrs[0], "expected wire_name literal"));
+        }
+    };
+    let _: Vec<Attribute> = input.call(Attribute::parse_outer)?;
+    Ok(Some(lit))
 }
 
 fn parse_optional_keyword(input: ParseStream, keyword: &str) -> Result<Option<Ident>> {

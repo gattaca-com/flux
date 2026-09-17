@@ -47,3 +47,52 @@ typehash *cargo_args:
 ```
 
 The script adds imports and locks only for versioned types that do not already have a lock. It does not replace an existing but incorrect hash, and it requires `jq`.
+
+## Zero-copy leaves (`zerocopy` feature)
+
+Opt in per consumer crate with `flux-versioned-types/zerocopy`, plus a direct
+`zerocopy = { version = "0.8", features = ["derive"] }` dependency (needed for
+the generated `#[derive(::zerocopy::...)]` paths, just as `bincode` is already
+required; the locked zerocopy-derive only accepts a bare ident for its
+`crate` attribute, so the re-export cannot be used there). Every version must
+then be a padding-free `repr(C)` struct or `repr(u8)` fieldless enum; padded
+types fail to compile at the derive, which is intended.
+
+Each `versioned_struct!`/`versioned_enum!` chain then also implements
+`Versioned` (plain `TYPE_HASH`es in `VERSION_HASHES`, oldest first, and a
+`decode_versions` that casts raw bytes as the stored version and migrates)
+and the trivial `HasVersionedLeaves` (the leaf is itself).
+
+```rust
+use flux_versioned_types::versioned_struct;
+
+versioned_struct!(#[wire_name = "Relay.NewBidSubmission"] NewBidSubmission =>
+    #[type_hash_lock(hash = 17013878556110425249)]
+    NewBidSubmissionV1 { pub value: u64 }
+);
+assert_eq!(NewBidSubmission::NAME, "Relay.NewBidSubmission");
+```
+
+`#[wire_name = "..."]` overrides `Versioned::NAME`; without it `NAME` is the
+alias name. Existing callers without the attribute compile unchanged.
+
+Family enums (an enum of leaves or other families) use the derive, re-exported
+as `flux_versioned_types::HasVersionedLeaves`:
+
+```rust
+use flux_versioned_types::HasVersionedLeaves;
+
+#[derive(Clone, Copy, HasVersionedLeaves)]
+enum Family {
+    A(LeafA),
+    B(LeafB),
+    #[leaves(skip)]
+    Other,
+}
+```
+
+Every non-skipped variant must be a newtype with exactly one unnamed field;
+the same field type in two variants is an error (ambiguous `From`). The derive
+generates `HasVersionedLeaves` (matching `visit_leaf` down to the leaf,
+`decode_blob` trying each variant in order) plus `From<Field> for Enum` for
+each kept variant.

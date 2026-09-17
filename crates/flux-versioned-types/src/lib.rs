@@ -15,7 +15,7 @@ pub mod wire;
 
 pub use blob::{InternalMetadata, InternalMetadataV1, VersionedBlob, VersionedPersistable};
 pub use flux_versioned_types_macros::{
-    TelemetrySchema, evolve_enum, evolve_struct, roll_chain_into,
+    HasVersionedLeaves, TelemetrySchema, evolve_enum, evolve_struct, roll_chain_into,
 };
 pub use leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf};
 pub use raw::{Blob, BlobCache, DecodeError, Scratch};
@@ -52,6 +52,14 @@ macro_rules! impl_versioned_deserialize {
 /// Define an evolving struct and its hash-directed decoder.
 #[macro_export]
 macro_rules! versioned_struct {
+    (#[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_struct! {
+            #[wire_name = $wire]
+            roll_into $name
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
     ($name:ident => $($tokens:tt)*) => {
         $crate::evolve_struct! {
             roll_into $name
@@ -68,6 +76,15 @@ macro_rules! versioned_struct {
 /// home under that directory.
 #[macro_export]
 macro_rules! versioned_enum {
+    (#[wire_name = $wire:literal] $name:ident, persist = $dir:expr => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_name = $wire] $name => $($tokens)*);
+        impl $crate::VersionedPersistable for $name {
+            const PERSIST_DIR: &'static str = $dir;
+        }
+    };
+    (#[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::__versioned_enum_inner!(#[wire_name = $wire] $name => $($tokens)*);
+    };
     ($name:ident, persist = $dir:expr => $($tokens:tt)*) => {
         $crate::__versioned_enum_inner!($name => $($tokens)*);
         impl $crate::VersionedPersistable for $name {
@@ -82,6 +99,17 @@ macro_rules! versioned_enum {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __versioned_enum_inner {
+    (#[wire_name = $wire:literal] $name:ident => $($tokens:tt)*) => {
+        $crate::evolve_enum! {
+            #[wire_name = $wire]
+            roll_into $name
+            final_attrs {
+                #[derive($crate::TelemetrySchema)]
+            }
+            $($tokens)*
+        }
+        $crate::impl_versioned_deserialize!($name);
+    };
     ($name:ident => $($tokens:tt)*) => {
         $crate::evolve_enum! {
             roll_into $name
