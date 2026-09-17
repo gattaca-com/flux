@@ -113,13 +113,15 @@ format. A `Blob` is an unsized `repr(C)` struct whose bytes in memory *are*
 the format:
 
 ```text
-[header 128 B][user metadata, padded to 8][zstd( [TrackingTimestampWire x n][Leaf x n] )]
+[header 144 B][user metadata, padded to 8][zstd( [TrackingTimestampWire x n][Leaf x n] )]
 ```
 
-The header is exactly 128 bytes with no padding: magic `b"FLUXBLOB"`, format
-version, user metadata length, message count, the leaf's latest `TYPE_HASH`,
-the user metadata's latest `TYPE_HASH`, compressed and decompressed tail
-lengths, and the leaf's `NAME` truncated to 64 bytes. The user metadata
+The header is exactly 144 bytes with no padding: magic `b"FLUXBLOB"`, format
+version, user metadata length, message count, the `TYPE_HASH` of the leaf
+version that wrote the blob, the user metadata's `TYPE_HASH`, compressed and
+decompressed tail lengths, the earliest and latest publish wall clocks in the
+batch (`publish_t_first`/`publish_t_last`, advisory, for ordering and
+indexing without decompressing), and the leaf's `NAME` truncated to 64 bytes. The user metadata
 section carries one uncompressed `Versioned` value (e.g. slot and instance)
 so routers can read it without decompressing; both it and the zstd tail are
 zero-padded to a multiple of 8, so every blob's total length is a multiple

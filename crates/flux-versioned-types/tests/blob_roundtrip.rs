@@ -1,3 +1,5 @@
+use core::mem::offset_of;
+
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
 use flux_timing::{
     Duration, IngestionTime, Instant, InternalMessage, Nanos, PublishDelta, TrackingTimestamp,
@@ -99,20 +101,27 @@ fn hand_build(
 ) -> Vec<u8> {
     let comp = zstd::bulk::compress(plain_tail, 3).unwrap();
     let mut bytes = vec![0u8; size_of::<BlobHeader>()];
-    bytes[..8].copy_from_slice(&MAGIC);
-    bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-    bytes[12..16].copy_from_slice(&(meta.len() as u32).to_le_bytes());
-    bytes[16..20].copy_from_slice(&n.to_le_bytes());
-    bytes[24..32].copy_from_slice(&leaf_hash.to_le_bytes());
-    bytes[32..40].copy_from_slice(&meta_hash.to_le_bytes());
-    bytes[40..48].copy_from_slice(&(comp.len() as u64).to_le_bytes());
-    bytes[48..56].copy_from_slice(
+    // Field offsets come from the header type, values are written by hand,
+    // so this stays independent of `BlobCache` while following the layout.
+    let mut put = |at: usize, v: &[u8]| bytes[at..at + v.len()].copy_from_slice(v);
+    put(offset_of!(BlobHeader, magic), &MAGIC);
+    put(offset_of!(BlobHeader, version), &FORMAT_VERSION.to_le_bytes());
+    put(offset_of!(BlobHeader, metadata_len), &(meta.len() as u32).to_le_bytes());
+    put(offset_of!(BlobHeader, n_messages), &n.to_le_bytes());
+    put(offset_of!(BlobHeader, type_hash), &leaf_hash.to_le_bytes());
+    put(offset_of!(BlobHeader, metadata_type_hash), &meta_hash.to_le_bytes());
+    put(offset_of!(BlobHeader, compressed_len), &(comp.len() as u64).to_le_bytes());
+    put(
+        offset_of!(BlobHeader, decompressed_len),
         &(u64::from(n) * (size_of::<TrackingTimestampWire>() as u64 + leaf_stride as u64))
             .to_le_bytes(),
     );
+    put(offset_of!(BlobHeader, publish_t_first), &1u64.to_le_bytes());
+    put(offset_of!(BlobHeader, publish_t_last), &2u64.to_le_bytes());
     let name = leaf_name.as_bytes();
-    bytes[56..64].copy_from_slice(&(name.len() as u64).to_le_bytes());
-    bytes[64..64 + name.len()].copy_from_slice(name);
+    let name_at = offset_of!(BlobHeader, type_name);
+    put(name_at, &(name.len() as u64).to_le_bytes());
+    put(name_at + 8, name);
     bytes.extend_from_slice(meta);
     bytes.resize(bytes.len().next_multiple_of(8), 0);
     bytes.extend_from_slice(&comp);
@@ -176,6 +185,10 @@ fn end_to_end_cache_flush_decode() {
     assert_eq!(blob.type_name(), Leaf::NAME);
     assert_eq!(blob.user_metadata::<Meta>().unwrap(), meta);
     assert_eq!(blob.as_bytes(), blobs[0].as_slice());
+    let publishes: Vec<Nanos> = originals.iter().map(InternalMessage::publish_t).collect();
+    assert_eq!(blob.header.publish_t_first, *publishes.iter().min().unwrap());
+    assert_eq!(blob.header.publish_t_last, *publishes.iter().max().unwrap());
+    assert!(blob.header.publish_t_first < blob.header.publish_t_last);
 
     let mut work = Scratch::new();
     let blob = work.load(&blobs[0]).unwrap();
@@ -238,13 +251,15 @@ fn rejects_misaligned_truncated_and_bad_header() {
     bad[0] ^= 0xff;
     assert!(matches!(Blob::from_bytes(&bad), Err(DecodeError::BadMagic)));
     let mut bad = good.clone();
-    bad[8..12].copy_from_slice(&2u32.to_le_bytes());
+    let at = offset_of!(BlobHeader, version);
+    bad[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
     assert!(matches!(Blob::from_bytes(&bad), Err(DecodeError::UnsupportedVersion(2))));
+    let name_at = offset_of!(BlobHeader, type_name);
     let mut bad = good.clone();
-    bad[64] = 0xff;
+    bad[name_at + 8] = 0xff;
     assert!(matches!(Blob::from_bytes(&bad), Err(DecodeError::BadTypeName)));
     let mut bad = good;
-    bad[56..64].copy_from_slice(&65u64.to_le_bytes());
+    bad[name_at..name_at + 8].copy_from_slice(&65u64.to_le_bytes());
     assert!(matches!(Blob::from_bytes(&bad), Err(DecodeError::BadTypeName)));
 }
 
@@ -423,7 +438,8 @@ fn wrong_decompressed_len_fails_without_allocating() {
     let mut bytes = leaf_blob(1);
     // 1 TiB: returning here proves the header was validated before any
     // allocation, since actually allocating it would OOM the test.
-    bytes[48..56].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    let at = offset_of!(BlobHeader, decompressed_len);
+    bytes[at..at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
     let mut a = Scratch::new();
     let mut b = Scratch::new();
     let blob = a.load(&bytes).unwrap();
@@ -439,8 +455,9 @@ fn wrong_decompressed_len_fails_without_allocating() {
 #[test]
 fn wrong_metadata_len_rejected() {
     let mut bytes = leaf_blob(1);
-    let meta_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-    bytes[12..16].copy_from_slice(&(meta_len - 1).to_le_bytes());
+    let at = offset_of!(BlobHeader, metadata_len);
+    let meta_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    bytes[at..at + 4].copy_from_slice(&(meta_len - 1).to_le_bytes());
     let mut a = Scratch::new();
     let blob = a.load(&bytes).unwrap();
     match blob.user_metadata::<Meta>() {

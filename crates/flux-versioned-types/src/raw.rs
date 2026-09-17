@@ -5,12 +5,16 @@
 //! cast in [`Blob::from_bytes`], and a disk file is a concatenation of blobs.
 //!
 //! ```text
-//! [header 128 B][user metadata, padded to 8][zstd( [TrackingTimestampWire x n][Leaf x n] )]
+//! [header 144 B][user metadata, padded to 8][zstd( [TrackingTimestampWire x n][Leaf x n] )]
 //! ```
 //!
-//! * `header` - exactly 128 bytes, `repr(C)`, no padding. All integers are
+//! * `header` - exactly 144 bytes, `repr(C)`, no padding. All integers are
 //!   little-endian; pointers are never stored, so the layout is the native
 //!   `x86_64` one. `magic` is `b"FLUXBLOB"`, `version` is [`FORMAT_VERSION`].
+//!   `publish_t_first`/`publish_t_last` are the earliest and latest publish
+//!   wall clocks in the batch, so a router or persister can order and index
+//!   blobs by time span without decompressing. They are advisory: written by
+//!   the sender's clock and not validated on read.
 //! * `user metadata` - one [`Versioned`] value chosen by the sender (e.g. slot
 //!   and instance), uncompressed so routers can read it without decompressing.
 //!   `metadata_len` is its true size (`size_of::<U>()`); the section is padded
@@ -21,7 +25,7 @@
 //!   stride. Both sections have `n_messages` elements. `compressed_len` is the
 //!   true zstd length; the tail is padded with zeros to a multiple of 8, so
 //!   every blob's total byte length is a multiple of 8 and concatenated blobs
-//!   in a file stay aligned. [`Blob::as_bytes`] returns exactly `128 +
+//!   in a file stay aligned. [`Blob::as_bytes`] returns exactly `144 +
 //!   round8(metadata_len) + round8(compressed_len)` bytes.
 //! * `decompressed_len` is `n_messages * (24 + size_of::<LeafVn>())` for the
 //!   version that wrote the blob. Readers check it against
@@ -43,7 +47,7 @@
 use std::collections::HashMap;
 
 use byte_stable::ByteStable;
-use flux_timing::InternalMessage;
+use flux_timing::{InternalMessage, Nanos};
 use flux_utils::ArrayStr;
 
 use crate::{
@@ -75,7 +79,7 @@ fn round8(n: u64) -> Option<u64> {
     n.checked_add(7).map(|m| m & !7)
 }
 
-/// Fixed header of a [`Blob`]: its first 128 bytes.
+/// Fixed header of a [`Blob`]: its first 144 bytes.
 #[derive(Clone, Copy, byte_stable_derive::ByteStable)]
 #[repr(C)]
 pub struct BlobHeader {
@@ -95,12 +99,16 @@ pub struct BlobHeader {
     pub compressed_len: u64,
     /// Length of the decompressed tail: `n_messages x (24 + size_of leaf)`.
     pub decompressed_len: u64,
+    /// Earliest publish wall clock among the batch's messages. Advisory.
+    pub publish_t_first: Nanos,
+    /// Latest publish wall clock among the batch's messages. Advisory.
+    pub publish_t_last: Nanos,
     /// Wire label of the leaf, [`Versioned::NAME`].
     pub type_name: ArrayStr<TYPE_NAME_LEN>,
 }
 
 // Wire-format pins. Changing either is a new `FORMAT_VERSION`.
-const _: () = assert!(size_of::<BlobHeader>() == 128 && align_of::<BlobHeader>() == ALIGN);
+const _: () = assert!(size_of::<BlobHeader>() == 144 && align_of::<BlobHeader>() == ALIGN);
 
 /// One batch of a single leaf type. See the [module docs](self) for the layout.
 ///
@@ -393,6 +401,8 @@ fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[TrackingTimestampWire], De
 struct TypedBuffer {
     name: &'static str,
     n_messages: u32,
+    publish_t_first: Nanos,
+    publish_t_last: Nanos,
     /// `TrackingTimestampWire` records, 24 bytes each.
     timestamps: Vec<u8>,
     /// Leaf bytes at the leaf's `size_of` stride.
@@ -468,6 +478,8 @@ impl BlobCache {
                 metadata_type_hash: U::TYPE_HASH,
                 compressed_len: comp.len() as u64,
                 decompressed_len: plain.len() as u64,
+                publish_t_first: buf.publish_t_first,
+                publish_t_last: buf.publish_t_last,
                 type_name: ArrayStr::from_str_truncate(buf.name),
             };
             // `resize` zero-fills, so the metadata and tail padding are zeros.
@@ -501,9 +513,21 @@ impl VisitorVersionedLeaf for Push<'_> {
         let buf = self.cache.buffers.entry(L::TYPE_HASH).or_insert_with(|| TypedBuffer {
             name: L::NAME,
             n_messages: 0,
+            publish_t_first: Nanos(0),
+            publish_t_last: Nanos(0),
             timestamps: Vec::new(),
             leaves: Vec::new(),
         });
+        // Min/max rather than first/last pushed: one leaf type can arrive from
+        // several queues, so push order is not publish order.
+        let publish = timestamp.publish_t_real;
+        if buf.n_messages == 0 {
+            buf.publish_t_first = publish;
+            buf.publish_t_last = publish;
+        } else {
+            buf.publish_t_first = buf.publish_t_first.min(publish);
+            buf.publish_t_last = buf.publish_t_last.max(publish);
+        }
         buf.timestamps.extend_from_slice(ByteStable::as_bytes(&timestamp));
         buf.leaves.extend_from_slice(ByteStable::as_bytes(leaf));
         buf.n_messages += 1;
