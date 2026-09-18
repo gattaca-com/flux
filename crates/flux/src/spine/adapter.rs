@@ -10,7 +10,8 @@ use signal_hook::consts::SIGINT;
 use crate::{
     spine::{
         DCacheRead, FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer,
-        SpineProducerWithDCache, SpineProducers,
+        SpineProducerWithDCache, SpineProducers, SpineSpscConsumer, SpineSpscProducer,
+        SpscProduceError,
     },
     tile::Tile,
 };
@@ -88,6 +89,12 @@ impl<S: FluxSpine> SpineAdapter<S> {
         self.did_work
     }
 
+    /// SPSC peers can be in another process, outside the parking signal's
+    /// reach.
+    pub fn requires_polling(&self) -> bool {
+        S::requires_polling(&self.consumers, &self.producers)
+    }
+
     /// Manually mark work as done. Use for non-consume/produce work like
     /// business logic ticks.
     #[inline]
@@ -117,6 +124,66 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         self.producers.produce(d);
         self.did_work = true;
+    }
+
+    /// Try to publish to an SPSC queue. Only a successful publication counts as
+    /// work. Keep pending output in the tile and retry `Full` on a later loop.
+    #[inline]
+    pub fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
+    where
+        S::Producers: AsMut<SpineSpscProducer<T>>,
+    {
+        self.producers.try_produce(data)?;
+        self.did_work = true;
+        Ok(())
+    }
+
+    /// Consume all available SPSC messages. An empty queue is successful; a
+    /// second consumer receives an attachment error.
+    #[inline]
+    pub fn try_consume<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(T, &mut S::Producers),
+    {
+        while self.try_consume_one(&mut f)? {}
+        Ok(())
+    }
+
+    /// Consume at most one SPSC message, returning whether one was available.
+    #[inline]
+    pub fn try_consume_one<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(T, &mut S::Producers),
+    {
+        let consumed = self.consumers.as_mut().try_consume(&mut self.producers, f)?;
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    #[inline]
+    pub fn try_consume_internal_message_one<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(&mut InternalMessage<T>, &mut S::Producers),
+    {
+        let consumed =
+            self.consumers.as_mut().try_consume_internal_message(&mut self.producers, f)?;
+        self.did_work |= consumed;
+        Ok(consumed)
     }
 
     #[inline]

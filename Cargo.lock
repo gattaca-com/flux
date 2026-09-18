@@ -1495,6 +1495,7 @@ dependencies = [
  "signal-hook",
  "spine-derive",
  "tempfile",
+ "thiserror 1.0.69",
  "tracing",
  "type-hash",
  "type-hash-derive",

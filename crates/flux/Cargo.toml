@@ -21,6 +21,7 @@ mio = { workspace = true, optional = true }
 serde.workspace = true
 signal-hook.workspace = true
 spine-derive.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 type-hash.workspace = true
 type-hash-derive.workspace = true

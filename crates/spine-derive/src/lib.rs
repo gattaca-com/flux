@@ -70,23 +70,42 @@ impl FromSpineArg {
     }
 }
 
-fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>, bool) {
-    let mut is_gather = false;
-    let mut size_expr: Option<Expr> = None;
-    let mut is_spmc = false;
-    let mut mtu_expr: Option<Expr> = None;
-    let mut gather_with_args = false;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueFlavour {
+    Mpmc,
+    Spmc,
+    Spsc,
+}
+
+struct QueueConfig {
+    is_gather: bool,
+    size_expr: Option<Expr>,
+    flavour: QueueFlavour,
+    mtu_expr: Option<Expr>,
+    gather_with_args: bool,
+    spsc_span: Option<proc_macro2::Span>,
+}
+
+fn get_queue_config(attrs: &[Attribute]) -> Result<QueueConfig> {
+    let mut config = QueueConfig {
+        is_gather: false,
+        size_expr: None,
+        flavour: QueueFlavour::Mpmc,
+        mtu_expr: None,
+        gather_with_args: false,
+        spsc_span: None,
+    };
 
     for attr in attrs {
         if attr.path().is_ident("queue") {
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("gather") {
-                    is_gather = true;
+                    config.is_gather = true;
                     if meta.input.peek(syn::token::Paren) {
                         let content;
                         parenthesized!(content in meta.input);
                         let _: proc_macro2::TokenStream = content.parse()?;
-                        gather_with_args = true;
+                        config.gather_with_args = true;
                     }
                     return Ok(());
                 }
@@ -94,37 +113,82 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
                     let content;
                     parenthesized!(content in meta.input);
                     let lit: Expr = content.parse()?;
-                    size_expr = Some(lit);
+                    config.size_expr = Some(lit);
                     return Ok(());
                 }
                 if meta.path.is_ident("flavour") {
                     let content;
                     parenthesized!(content in meta.input);
                     let s: LitStr = content.parse()?;
-                    is_spmc = s.value() == "spmc";
+                    config.flavour = match s.value().as_str() {
+                        "mpmc" => QueueFlavour::Mpmc,
+                        "spmc" => QueueFlavour::Spmc,
+                        "spsc" => {
+                            config.spsc_span = Some(s.span());
+                            QueueFlavour::Spsc
+                        }
+                        flavour => {
+                            return Err(meta.error(format!(
+                                "unsupported queue flavour `{flavour}`; expected `mpmc`, `spmc`, or `spsc`"
+                            )));
+                        }
+                    };
                     return Ok(());
                 }
                 if meta.path.is_ident("mtu") {
                     let content;
                     parenthesized!(content in meta.input);
                     let lit: Expr = content.parse()?;
-                    mtu_expr = Some(lit);
+                    config.mtu_expr = Some(lit);
                     return Ok(());
                 }
-                Err(meta.error("unrecognized repr"))
-            })
-            .expect("couldn't parse attr");
+                Err(meta.error("unrecognized queue argument"))
+            })?;
         }
     }
 
-    (is_gather, size_expr, is_spmc, mtu_expr, gather_with_args)
+    if config.flavour == QueueFlavour::Spsc {
+        let span = config.spsc_span.unwrap_or_else(proc_macro2::Span::call_site);
+        if config.is_gather {
+            return Err(syn::Error::new(span, "SPSC queues cannot use `gather`"));
+        }
+        if config.mtu_expr.is_some() {
+            return Err(syn::Error::new(span, "SPSC queues cannot use `mtu(...)`"));
+        }
+    }
+
+    Ok(config)
+}
+
+fn last_path_type_arg(ty: &Type) -> Option<&Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|argument| match argument {
+        GenericArgument::Type(inner_ty) => Some(inner_ty),
+        _ => None,
+    })
+}
+
+fn spine_queue_inner_ty(ty: &Type) -> Option<&Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.path.segments.last()?.ident != "SpineQueue" {
+        return None;
+    }
+    last_path_type_arg(ty)
 }
 /// Generate a spine struct plus consumers/producers, config, and the
 /// `FluxSpine` impl.
 ///
 /// Queue attributes (`#[queue(..)]` on `SpineQueue<T>` fields):
 /// - `size(..)`: queue capacity (default `2usize.pow(15)`).
-/// - `flavour("spmc")`: SPMC queue instead of MPMC.
+/// - `flavour("mpmc")`, `flavour("spmc")`, or `flavour("spsc")`: queue flavour.
 /// - `mtu(..)`: dcache-backed queue with the given max frame size.
 /// - `gather`: drain this queue into a `BlobCache` via the generated
 ///   `GatherQueues` impl; every gathered type must implement
@@ -132,6 +196,12 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 ///   dependency. A boundary orders only its own producer thread's messages and
 ///   rings are independent, so drain once more after a boundary before
 ///   flushing.
+///
+/// SPSC queues return `Full` through `SpineAdapter::try_produce`; the caller
+/// keeps pending output and retries. Their endpoints are claimed on first use
+/// and cannot be cloned. They do not support `mtu` or `gather`. Spines
+/// containing SPSC queues have unsafe shared-memory constructors; see
+/// `SpineSpscQueue`.
 #[allow(clippy::too_many_lines)]
 #[proc_macro_attribute]
 pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -155,16 +225,14 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut gather_fields = Vec::<(Type, bool)>::new();
     let mut message_types = Vec::<proc_macro2::TokenStream>::new();
     let mut ffi_check_items = Vec::<proc_macro2::TokenStream>::new();
+    let mut has_spsc = false;
+    let mut spsc_fields = Vec::<Ident>::new();
 
     for field in &input.fields {
         let field_ident = field.ident.as_ref().expect("named field required");
 
         // recognise Queue<T>
-        if let Type::Path(tp) = &field.ty &&
-            tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") &&
-            let PathArguments::AngleBracketed(args) = &tp.path.segments[0].arguments &&
-            let Some(GenericArgument::Type(inner_ty)) = args.args.first()
-        {
+        if let Some(inner_ty) = spine_queue_inner_ty(&field.ty) {
             message_types.push(quote! {
                 ::flux::utils::short_typename::<#inner_ty>().to_string()
             });
@@ -174,8 +242,13 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             ffi_check_items
                 .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
 
-            let (is_gather, _size_expr_opt, _is_spmc, mtu_expr, gather_with_args) =
-                get_queue_config(&field.attrs);
+            let queue_config = match get_queue_config(&field.attrs) {
+                Ok(config) => config,
+                Err(error) => return error.into_compile_error().into(),
+            };
+            let is_gather = queue_config.is_gather;
+            let mtu_expr = queue_config.mtu_expr.as_ref();
+            let gather_with_args = queue_config.gather_with_args;
 
             if gather_with_args {
                 return syn::Error::new_spanned(field_ident, "expected `gather`")
@@ -186,7 +259,46 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 gather_fields.push((inner_ty.clone(), mtu_expr.is_some()));
             }
 
-            if mtu_expr.is_some() {
+            if queue_config.flavour == QueueFlavour::Spsc {
+                has_spsc = true;
+                spsc_fields.push(field_ident.clone());
+
+                consumer_fields.push(quote! {
+                    pub #field_ident : ::flux::spine::SpineSpscConsumer<#inner_ty>
+                });
+                producer_fields.push(quote! {
+                    pub #field_ident : ::flux::spine::SpineSpscProducer<#inner_ty>
+                });
+
+                consumer_init.push(quote! {
+                    #field_ident : ::flux::spine::SpineSpscConsumer::attach::<_, #struct_ident, _>(
+                        &spine.base_dir, tile, spine.#field_ident.clone())
+                });
+                producer_init.push(quote! {
+                    #field_ident : ::flux::spine::SpineSpscProducer::new(spine.#field_ident.clone())
+                });
+
+                as_mut_impls.push(quote! {
+                    impl AsMut<::flux::spine::SpineSpscConsumer<#inner_ty>> for #consumers_ident {
+                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineSpscConsumer<#inner_ty> {
+                            &mut self.#field_ident
+                        }
+                    }
+                    impl AsMut<::flux::spine::SpineSpscProducer<#inner_ty>> for #producers_ident {
+                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineSpscProducer<#inner_ty> {
+                            &mut self.#field_ident
+                        }
+                    }
+                });
+
+                spine_as_ref_impls.push(quote! {
+                    impl AsRef<::flux::spine::SpineSpscQueue<#inner_ty>> for #struct_ident {
+                        fn as_ref(&self) -> &::flux::spine::SpineSpscQueue<#inner_ty> {
+                            &self.#field_ident
+                        }
+                    }
+                });
+            } else if mtu_expr.is_some() {
                 // ── dcache-backed queue ───────────────────────────────────
                 let dcache_ident = format_ident!("{}_dcache", field_ident);
 
@@ -299,11 +411,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 });
             }
-        } else if let Type::Path(tp) = &field.ty &&
-            let Some(last_seg) = tp.path.segments.last() &&
-            let PathArguments::AngleBracketed(args) = &last_seg.arguments &&
-            let Some(GenericArgument::Type(inner_ty)) = args.args.first()
-        {
+        } else if let Some(inner_ty) = last_path_type_arg(&field.ty) {
             let check_fn = format_ident!("_ffi_check_{}_{}", struct_ident, field_ident);
             let inner_ty_span = inner_ty.span();
             ffi_check_items
@@ -369,56 +477,73 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ).expect("couldn't open or init tile info shmem");
             });
             new_struct_field_names.push(quote! { tile_info });
-        } else if let Type::Path(tp) = &field.ty {
-            if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
-                let (_is_gather, size_expr_opt, is_spmc, mtu_expr_opt, _gather_with_args) =
-                    get_queue_config(&field.attrs);
-                let size_arg = size_expr_opt
-                    .map_or_else(|| quote! { 2usize.pow(15) }, |expr| quote! { #expr });
-                let queue_type = if is_spmc {
-                    quote! { ::flux::communication::queue::QueueType::SPMC }
-                } else {
-                    quote! { ::flux::communication::queue::QueueType::MPMC }
-                };
-                if let Some(mtu_expr) = mtu_expr_opt {
-                    let dcache_ident = format_ident!("{}_dcache", field_ident);
-                    config_fields.push(quote! {
-                        pub #field_ident: ::flux::spine::DCacheQueueParams
-                    });
-                    config_defaults.push(quote! {
+        } else if let Some(inner_ty) = spine_queue_inner_ty(&field.ty) {
+            let queue_config = match get_queue_config(&field.attrs) {
+                Ok(config) => config,
+                Err(error) => return error.into_compile_error().into(),
+            };
+            let size_arg = queue_config
+                .size_expr
+                .as_ref()
+                .map_or_else(|| quote! { 2usize.pow(15) }, |expr| quote! { #expr });
+            let queue_type = match queue_config.flavour {
+                QueueFlavour::Mpmc => quote! { ::flux::communication::queue::QueueType::MPMC },
+                QueueFlavour::Spmc => quote! { ::flux::communication::queue::QueueType::SPMC },
+                QueueFlavour::Spsc => quote! {},
+            };
+            if queue_config.flavour == QueueFlavour::Spsc {
+                config_fields.push(quote! {
+                    pub #field_ident: ::flux::spine::QueueParams
+                });
+                config_defaults.push(quote! {
+                    #field_ident: ::flux::spine::QueueParams { size: #size_arg }
+                });
+                new_let_stmts.push(quote! {
+                    let #field_ident = unsafe {
+                        ::flux::spine::SpineSpscQueue::<#inner_ty>::create_or_open_shared_with_base_dir(
+                            &base_dir,
+                            &format!("{}{}", #app_name_tokens, path_suffix),
+                            stringify!(#field_ident),
+                            config.#field_ident.size,
+                        )
+                    };
+                });
+                new_struct_field_names.push(quote! { #field_ident });
+            } else if let Some(mtu_expr) = queue_config.mtu_expr.as_ref() {
+                let dcache_ident = format_ident!("{}_dcache", field_ident);
+                config_fields.push(quote! {
+                    pub #field_ident: ::flux::spine::DCacheQueueParams
+                });
+                config_defaults.push(quote! {
                         #field_ident: ::flux::spine::DCacheQueueParams { size: #size_arg, mtu: #mtu_expr }
                     });
-                    new_let_stmts.push(quote! {
-                        let (#field_ident, #dcache_ident) =
-                            ::flux::communication::shmem_queue_dcache_with_base_dir(
-                                &base_dir,
-                                &format!("{}{}", #app_name_tokens, path_suffix),
-                                config.#field_ident.size,
-                                config.#field_ident.mtu,
-                                #queue_type,
-                            );
-                    });
-                    new_struct_field_names.push(quote! { #field_ident });
-                    new_struct_field_names.push(quote! { #dcache_ident });
-                } else {
-                    config_fields.push(quote! {
-                        pub #field_ident: ::flux::spine::QueueParams
-                    });
-                    config_defaults.push(quote! {
-                        #field_ident: ::flux::spine::QueueParams { size: #size_arg }
-                    });
-                    new_let_stmts.push(quote! {
-                        let #field_ident = ::flux::communication::shmem_queue_with_base_dir(
+                new_let_stmts.push(quote! {
+                    let (#field_ident, #dcache_ident) =
+                        ::flux::communication::shmem_queue_dcache_with_base_dir(
                             &base_dir,
                             &format!("{}{}", #app_name_tokens, path_suffix),
                             config.#field_ident.size,
+                            config.#field_ident.mtu,
                             #queue_type,
                         );
-                    });
-                    new_struct_field_names.push(quote! { #field_ident });
-                }
+                });
+                new_struct_field_names.push(quote! { #field_ident });
+                new_struct_field_names.push(quote! { #dcache_ident });
             } else {
-                new_let_stmts.push(quote! { let #field_ident = Default::default(); });
+                config_fields.push(quote! {
+                    pub #field_ident: ::flux::spine::QueueParams
+                });
+                config_defaults.push(quote! {
+                    #field_ident: ::flux::spine::QueueParams { size: #size_arg }
+                });
+                new_let_stmts.push(quote! {
+                    let #field_ident = ::flux::communication::shmem_queue_with_base_dir(
+                        &base_dir,
+                        &format!("{}{}", #app_name_tokens, path_suffix),
+                        config.#field_ident.size,
+                        #queue_type,
+                    );
+                });
                 new_struct_field_names.push(quote! { #field_ident });
             }
         } else {
@@ -429,26 +554,80 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let config_ident = format_ident!("{}Config", struct_ident);
 
+    let constructor_unsafety = has_spsc.then(|| quote! { unsafe });
+    let constructor_docs = has_spsc.then(|| quote! {
+        #[doc = "# Safety"]
+        #[doc = ""]
+        #[doc = "All participants must use the same payload types, layout, architecture, and application schema."]
+        #[doc = "Values must be valid in every process, without process-local pointers or references."]
+        #[doc = "All mapping access must use the SPSC queue implementation. Endpoints inherited across `fork` must not be used or dropped in the child."]
+        #[doc = "See `flux::spine::SpineSpscQueue::create_or_open_shared_with_base_dir`."]
+    });
+    let call_constructor = |call| {
+        if has_spsc {
+            quote! { unsafe { #call } }
+        } else {
+            call
+        }
+    };
+    let new_default = call_constructor(quote! {
+        Self::new_with_base_dir(::flux::utils::directories::local_share_dir(), path_suffix)
+    });
+    let new_config = call_constructor(quote! {
+        Self::new_with_base_dir_and_config(
+            ::flux::utils::directories::local_share_dir(), path_suffix, config,
+        )
+    });
+    let new_base_dir = call_constructor(quote! {
+        Self::new_with_base_dir_and_config(base_dir, path_suffix, #config_ident::default())
+    });
     let generated_new_method_token_stream = quote! {
-        pub fn new(path_suffix: Option<&str>) -> Self {
-            Self::new_with_base_dir(::flux::utils::directories::local_share_dir(), path_suffix)
+        #constructor_docs
+        pub #constructor_unsafety fn new(path_suffix: Option<&str>) -> Self {
+            #new_default
         }
-        pub fn new_with_config(path_suffix: Option<&str>, config: #config_ident) -> Self {
-            Self::new_with_base_dir_and_config(::flux::utils::directories::local_share_dir(), path_suffix, config)
+        #constructor_docs
+        pub #constructor_unsafety fn new_with_config(path_suffix: Option<&str>, config: #config_ident) -> Self {
+            #new_config
         }
-        pub fn new_with_base_dir<D: AsRef<std::path::Path>>(base_dir: D, path_suffix: Option<&str>) -> Self {
-            Self::new_with_base_dir_and_config(base_dir, path_suffix, #config_ident::default())
+        #constructor_docs
+        pub #constructor_unsafety fn new_with_base_dir<D: AsRef<std::path::Path>>(
+            base_dir: D,
+            path_suffix: Option<&str>,
+        ) -> Self {
+            #new_base_dir
         }
-        pub fn new_with_base_dir_and_config<D: AsRef<std::path::Path>>(
+        #constructor_docs
+        pub #constructor_unsafety fn new_with_base_dir_and_config<D: AsRef<std::path::Path>>(
             base_dir: D,
             path_suffix: Option<&str>,
             config: #config_ident,
         ) -> Self {
-            let path_suffix = path_suffix.unwrap_or(&"");
+            let path_suffix = path_suffix.unwrap_or("");
             let base_dir = base_dir.as_ref().to_path_buf();
             #(#new_let_stmts)*
             Self { #(#new_struct_field_names),* }
         }
+    };
+
+    let bundle_derives = if has_spsc {
+        quote! { #[derive(Debug)] }
+    } else {
+        quote! { #[derive(Clone, Copy, Debug)] }
+    };
+    let requires_polling_impl = if has_spsc {
+        quote! {
+            fn requires_polling(consumers: &Self::Consumers, producers: &Self::Producers) -> bool {
+                false #(|| consumers.#spsc_fields.is_attached())* #(|| producers.#spsc_fields.is_attached())*
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let new_in_base_dir_body = if has_spsc {
+        quote! { unsafe { Self::new_with_base_dir(base_dir, None) } }
+    } else {
+        quote! { Self::new_with_base_dir(base_dir, None) }
     };
 
     // Reconstruct the input struct without #[queue] attributes on its fields.
@@ -469,16 +648,18 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let colon_token = &f.colon_token;
                 let ty = &f.ty;
 
-                // For dcache queue fields, rewrite SpineQueue<T> → SpineQueue<DCacheMsg<T>>
-                // and inject the private dcache handle field immediately after.
-                if let Type::Path(tp) = ty &&
-                    tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") &&
-                    let PathArguments::AngleBracketed(ref targs) =
-                        tp.path.segments.last().unwrap().arguments &&
-                    let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
-                {
-                    let (_, _, _, mtu_opt, _) = get_queue_config(&f.attrs);
-                    if mtu_opt.is_some() {
+                // Dcache and SPSC queues use storage types different from the input marker.
+                if let Some(inner_ty) = spine_queue_inner_ty(ty) {
+                    let queue_config = match get_queue_config(&f.attrs) {
+                        Ok(config) => config,
+                        Err(error) => return error.into_compile_error().into(),
+                    };
+                    if queue_config.flavour == QueueFlavour::Spsc {
+                        let new_ty = quote! {
+                            ::flux::spine::SpineSpscQueue<#inner_ty>
+                        };
+                        all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #new_ty });
+                    } else if queue_config.mtu_expr.is_some() {
                         let dcache_ident = format_ident!("{}_dcache", ident.as_ref().unwrap());
                         let new_ty = quote! {
                             ::flux::spine::SpineQueue<::flux::spine::DCacheMsg<#inner_ty>>
@@ -529,7 +710,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         // generated Consumers / Producers structs
-        #[derive(Clone, Copy, Debug)]
+        #bundle_derives
         #vis struct #consumers_ident { #consumer_fields }
         impl #consumers_ident {
             pub fn attach<Tl: ::flux::tile::Tile<#struct_ident>>(tile: &Tl, spine: &mut #struct_ident) -> Self {
@@ -537,7 +718,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        #[derive(Clone, Copy, Debug)]
+        #bundle_derives
         #vis struct #producers_ident { #producer_fields, timestamp: ::flux::timing::TrackingTimestamp }
         impl #producers_ident {
             pub fn attach<Tl: ::flux::tile::Tile<#struct_ident>>(tile: &Tl, spine:&mut #struct_ident)->Self {
@@ -576,9 +757,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 self.tile_info.register_tile(name)
             }
 
-            fn new_in_base_dir(base_dir: impl AsRef<std::path::Path>) -> Self {
-                Self::new_with_base_dir(base_dir, None)
+            unsafe fn new_in_base_dir(base_dir: impl AsRef<std::path::Path>) -> Self {
+                #new_in_base_dir_body
             }
+
+            #requires_polling_impl
 
             fn app_name() -> &'static str {
                 #app_name_tokens
@@ -625,4 +808,35 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueueFlavour, get_queue_config};
+
+    #[test]
+    fn parses_supported_queue_flavours() {
+        for (attribute, flavour) in [
+            (syn::parse_quote!(#[queue(flavour("mpmc"))]), QueueFlavour::Mpmc),
+            (syn::parse_quote!(#[queue(flavour("spmc"))]), QueueFlavour::Spmc),
+            (syn::parse_quote!(#[queue(flavour("spsc"))]), QueueFlavour::Spsc),
+        ] {
+            assert_eq!(get_queue_config(&[attribute]).unwrap().flavour, flavour);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_queue_flavour() {
+        let attribute = syn::parse_quote!(#[queue(flavour("broadcast"))]);
+        assert!(get_queue_config(&[attribute]).is_err());
+    }
+
+    #[test]
+    fn rejects_spsc_with_gather_or_mtu() {
+        let gather = syn::parse_quote!(#[queue(flavour("spsc"), gather)]);
+        assert!(get_queue_config(&[gather]).is_err());
+
+        let mtu = syn::parse_quote!(#[queue(flavour("spsc"), mtu(1500))]);
+        assert!(get_queue_config(&[mtu]).is_err());
+    }
 }
