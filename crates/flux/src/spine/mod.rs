@@ -1,6 +1,88 @@
+//! Typed queues connecting tiles.
+//!
+//! Select `#[queue(flavour("spsc"))]` for a bounded queue with one producer and
+//! one consumer across threads or processes. Use `try_produce` and
+//! `try_consume_one` (or `try_consume` to drain); `Full` leaves unread messages
+//! intact. Retain pending output and retry it before consuming more input.
+//!
+//! ```no_run
+//! # #![deny(unused_imports)]
+//! use flux::{
+//!     communication::ShmemData,
+//!     spine::{SpineAdapter, SpscProduceError},
+//!     tile::TileInfo,
+//! };
+//! use spine_derive::from_spine;
+//!
+//! #[derive(Clone, Copy, Debug)]
+//! #[repr(C)]
+//! struct Reading(u64);
+//!
+//! #[from_spine("readings")]
+//! struct Readings {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(size(1024), flavour("spsc"))]
+//!     readings: flux::spine::SpineQueue<Reading>,
+//! }
+//!
+//! fn publish_pending(adapter: &mut SpineAdapter<Readings>, pending: &mut Option<Reading>) {
+//!     if let Some(message) = *pending {
+//!         match adapter.try_produce(message) {
+//!             Ok(()) => *pending = None,
+//!             Err(SpscProduceError::Full) => {}, // retry on a later loop
+//!             Err(SpscProduceError::Attach(error)) => panic!("producer role: {error}"),
+//!         }
+//!     }
+//! }
+//!
+//! // SAFETY: participants use this exact schema and process-independent values,
+//! // only access the mapping through Flux, and do not inherit endpoints via fork.
+//! let spine = unsafe { Readings::new(None) };
+//! ```
+//!
+//! SPSC endpoints are claimed lazily, or explicitly with the generated field's
+//! `try_attach` in `Tile::on_attach`. Dropping a bundle releases its roles; an
+//! additional producer or consumer gets an attachment error. Endpoint bundles
+//! in SPSC-enabled spines cannot be cloned. Claimed roles keep their tile
+//! polling even with `TileConfig::with_park()`, since parking signals are
+//! process-local. A crashed owner leaves its role claimed; reset storage only
+//! after all peers have detached. SPSC mappings live under
+//! `app/shmem/spsc/<field>` and are not included in broadcast queue discovery.
+//! `mtu` and `gather` are unsupported.
+//!
+//! Constructing shared SPSC storage requires acknowledging the payload
+//! contract:
+//!
+//! ```compile_fail,E0133
+//! use flux::{communication::ShmemData, tile::TileInfo};
+//! use spine_derive::from_spine;
+//! #[from_spine("example")]
+//! struct App {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(flavour("spsc"))]
+//!     messages: flux::spine::SpineQueue<u64>,
+//! }
+//! let app = App::new(None);
+//! ```
+//!
+//! Owning a producer bundle does not allow duplicating its SPSC role:
+//!
+//! ```compile_fail,E0599
+//! use flux::{communication::ShmemData, tile::TileInfo};
+//! use spine_derive::from_spine;
+//! #[from_spine("example")]
+//! struct App {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(flavour("spsc"))]
+//!     messages: flux::spine::SpineQueue<u64>,
+//! }
+//! fn duplicate(producers: AppProducers) { let copy = producers.clone(); }
+//! ```
+
 mod adapter;
 mod consumer;
 mod scoped;
+mod spsc;
 mod standalone_producer;
 
 use std::path::Path;
@@ -10,6 +92,7 @@ pub use consumer::{DCacheRead, SpineConsumer, SpineDCacheConsumer};
 use flux_timing::{IngestionTime, InternalMessage, Nanos, TrackingTimestamp};
 use flux_utils::{DCacheError, DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
+pub use spsc::{SpineSpscConsumer, SpineSpscProducer, SpineSpscQueue, SpscProduceError};
 pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
 use crate::{
@@ -76,6 +159,38 @@ pub trait HasDCacheQueue<T: 'static + Copy> {
 pub trait SpineProducers {
     fn timestamp(&self) -> &TrackingTimestamp;
     fn timestamp_mut(&mut self) -> &mut TrackingTimestamp;
+
+    /// Publish to an SPSC queue, returning `Full` for caller-managed retry.
+    /// No message is published on error. Retain pending output in the tile
+    /// when forwarding from a consume callback; consumption is not rolled back.
+    fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
+    where
+        Self: AsMut<SpineSpscProducer<T>>,
+    {
+        let message = InternalMessage::new(self.timestamp().with_new_publish_delta(), data);
+        self.as_mut().try_produce(&message)
+    }
+
+    fn try_produce_with_ingestion<T: Copy>(
+        &mut self,
+        data: T,
+        ingestion_t: IngestionTime,
+    ) -> Result<(), SpscProduceError>
+    where
+        Self: AsMut<SpineSpscProducer<T>>,
+    {
+        let message = InternalMessage::new(self.timestamp().with_ingestion_t(ingestion_t), data);
+        self.as_mut().try_produce(&message)
+    }
+
+    /// Forward a message to an SPSC queue without changing its tracking
+    /// metadata.
+    fn try_forward<T: Copy>(&mut self, message: &InternalMessage<T>) -> Result<(), SpscProduceError>
+    where
+        Self: AsMut<SpineSpscProducer<T>>,
+    {
+        self.as_mut().try_produce(message)
+    }
 
     fn produce<T: Copy>(&self, d: T)
     where
@@ -145,12 +260,29 @@ pub trait SpineProducers {
 }
 
 pub trait FluxSpine: Sized + Send {
-    type Consumers: Clone + Send;
-    type Producers: SpineProducers + Clone + Send;
+    type Consumers: Send;
+    type Producers: SpineProducers + Send;
 
     fn attach_consumers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Consumers;
     fn attach_producers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Producers;
-    fn new_in_base_dir(base_dir: impl AsRef<Path>) -> Self;
+    /// Construct a spine with shared-memory queues.
+    ///
+    /// # Safety
+    /// For SPSC fields, all processes must agree on payload types, layout and
+    /// architecture, use process-independent values and access the mapping only
+    /// through the queue interface. Inherited endpoints must not be used or
+    /// dropped after `fork`. See
+    /// [`SpineSpscQueue::create_or_open_shared_with_base_dir`].
+    /// Broadcast-only generated spines also provide safe inherent constructors.
+    unsafe fn new_in_base_dir(base_dir: impl AsRef<Path>) -> Self;
+
+    /// Whether a tile has an endpoint whose progress requires polling.
+    /// Generated spines report claimed SPSC roles, including those used
+    /// directly through producer/consumer fields or from a consume
+    /// callback.
+    fn requires_polling(_consumers: &Self::Consumers, _producers: &Self::Producers) -> bool {
+        false
+    }
 
     fn register_tile(&mut self, name: TileName) -> u16;
     fn app_name() -> &'static str;
