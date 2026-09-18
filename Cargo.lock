@@ -1517,6 +1517,7 @@ dependencies = [
 name = "flux-communication"
 version = "0.5.0"
 dependencies = [
+ "core_affinity",
  "directories",
  "flux-timing",
  "flux-utils",
@@ -1524,6 +1525,7 @@ dependencies = [
  "mio",
  "rand 0.9.2",
  "shared_memory",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
