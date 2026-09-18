@@ -782,6 +782,36 @@ impl<T: Copy> ConsumerBare<T> {
         count
     }
 
+    /// Resume on the slot the consumer is already on, taking whatever the
+    /// producer has since written there. Returns the count it resumed on.
+    ///
+    /// [`Self::recover_after_error`] recovers from [`ReadError::SpedPast`] by
+    /// moving to the write head, which discards the ring. `resync` keeps the
+    /// ring position and moves only the expected version, so a consumer that
+    /// samples rather than follows a sequence keeps its distance from the
+    /// producer instead of being pushed up against it: the slot it is on was
+    /// last written `d` messages ago, leaving `n_slots - d` writes of headroom
+    /// to read forward from.
+    ///
+    /// A slot the producer is mid-write on resolves to the value that write is
+    /// replacing, so the next read faults once more and a second `resync`
+    /// lands on the completed one.
+    #[inline]
+    pub fn resync(&mut self) -> usize {
+        self.try_init_broadcast();
+        // Completed writes carry even versions and an in-flight one is a
+        // single increment higher, so rounding down names the last value the
+        // slot held in full.
+        let version = self.queue.load(self.pos).version() & !1;
+        if version < 2 {
+            // Never written, so there is nothing here to take.
+            return self.queue.count_at(self.pos, self.expected_version);
+        }
+        let count = self.queue.count_at(self.pos, version);
+        self.set_broadcast_pos(count);
+        count
+    }
+
     #[inline]
     fn set_pos(&mut self, count: usize) {
         self.pos = self.get_pos(count);
@@ -1096,6 +1126,12 @@ impl<T: 'static + Copy> Consumer<T> {
     #[inline]
     pub fn recover_after_error(&mut self) {
         self.bare.recover_after_error();
+    }
+
+    /// See [`ConsumerBare::resync`].
+    #[inline]
+    pub fn resync(&mut self) -> usize {
+        self.bare.resync()
     }
 
     #[inline]
