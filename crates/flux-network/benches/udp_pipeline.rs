@@ -11,6 +11,11 @@
 //!   MiB message. Recovery should resend one datagram, not the message.
 //! - `bcast`: one sender broadcasting to 8 receivers on one listener socket.
 //!
+//! `FLUX_BENCH_TRANSPORT=udp,uring` selects backends; `FLUX_BENCH_REVERSE=1`
+//! reverses their order. `FLUX_BENCH_SCALE=16` increases burst/broadcast sample
+//! counts. `FLUX_BENCH_SIZE=2m` filters paced/burst/broadcast sizes. CPU ns/B
+//! sums sender and receiver thread CPU time; it excludes the loss relay.
+//!
 //! Run with `cargo bench -p flux-network --bench udp_pipeline`.
 
 use std::{
@@ -53,8 +58,29 @@ fn udp_config() -> UdpConfig {
     UdpConfig { max_message_size: 4 * 1024 * 1024, ..UdpConfig::lan() }
 }
 
-fn transports() -> [(&'static str, Transport); 2] {
-    [("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))]
+fn transports() -> Vec<(&'static str, Transport)> {
+    let mut transports = vec![("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))];
+    #[cfg(target_os = "linux")]
+    transports.push((
+        "uring",
+        Transport::Udp(UdpConfig {
+            io: flux_network::udp::UdpIo::Uring(flux_network::udp::UringConfig::default()),
+            ..udp_config()
+        }),
+    ));
+    if let Ok(filter) = std::env::var("FLUX_BENCH_TRANSPORT") {
+        transports.retain(|(name, _)| filter.split(',').any(|selected| selected == *name));
+        assert!(!transports.is_empty(), "unknown FLUX_BENCH_TRANSPORT");
+    }
+    if std::env::var_os("FLUX_BENCH_REVERSE").is_some() {
+        transports.reverse();
+    }
+    transports
+}
+
+fn sizes() -> impl Iterator<Item = (&'static str, usize)> {
+    let filter = std::env::var("FLUX_BENCH_SIZE").ok();
+    SIZES.into_iter().filter(move |(name, _)| filter.as_deref().is_none_or(|s| s == *name))
 }
 
 fn connector(transport: Transport) -> NetworkDriver {
@@ -65,13 +91,17 @@ fn connector(transport: Transport) -> NetworkDriver {
 fn burst_plan(size: usize) -> (usize, usize) {
     let count = (64 * 1024 * 1024 / size).clamp(16, 4096);
     let window = (UdpConfig::default().send_window / 2 / size.div_ceil(1171)).clamp(1, 256);
-    (count, window)
+    let scale: usize = std::env::var("FLUX_BENCH_SCALE")
+        .map_or(1, |s| s.parse().expect("invalid FLUX_BENCH_SCALE"));
+    assert!((1..=64).contains(&scale));
+    (count * scale, window)
 }
 
 struct Stats {
     latencies_ns: Vec<u64>,
     elapsed: Duration,
     bytes: usize,
+    cpu: Duration,
 }
 
 impl Stats {
@@ -81,11 +111,12 @@ impl Stats {
         let pct = |p: f64| l[((l.len() - 1) as f64 * p) as usize] as f64 / 1000.0;
         let mibps = self.bytes as f64 / self.elapsed.as_secs_f64() / (1024.0 * 1024.0);
         println!(
-            "{name:<28} n={:<6} p50={:>9.1}µs p99={:>9.1}µs max={:>9.1}µs {mibps:>9.0} MiB/s {extra}",
+            "{name:<28} n={:<6} p50={:>9.1}µs p99={:>9.1}µs max={:>9.1}µs {mibps:>9.0} MiB/s cpu={:.3}ns/B {extra}",
             l.len(),
             pct(0.5),
             pct(0.99),
             pct(1.0),
+            self.cpu.as_nanos() as f64 / self.bytes as f64,
         );
     }
 }
@@ -136,6 +167,17 @@ struct Scenario {
     window: usize,
 }
 
+fn thread_cpu_time() -> Duration {
+    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, std::ptr::from_mut(&mut time))
+        },
+        0
+    );
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
 /// Sends `count` messages from the server while the receiver thread counts
 /// them and records one-way latency.
 fn run(sc: Scenario) -> Stats {
@@ -153,6 +195,7 @@ fn run(sc: Scenario) -> Stats {
         thread::spawn(move || {
             pin(0);
             let mut lat = Vec::with_capacity(expected);
+            let cpu_start = thread_cpu_time();
             while lat.len() < expected && !stop.load(Ordering::Relaxed) {
                 for r in &mut receivers {
                     r.poll_with(|e| {
@@ -164,12 +207,13 @@ fn run(sc: Scenario) -> Stats {
                 got.store(lat.len(), Ordering::Relaxed);
             }
             let _ = done_tx.send(());
-            lat
+            (lat, thread_cpu_time() - cpu_start)
         })
     };
 
     pin(1);
     let start = Instant::now();
+    let cpu_start = thread_cpu_time();
     let mut sent = 0;
     let mut next_send = start;
     while done_rx.try_recv().is_err() {
@@ -188,9 +232,10 @@ fn run(sc: Scenario) -> Stats {
         }
     }
     let elapsed = start.elapsed();
-    let latencies_ns = rx_thread.join().unwrap();
-    assert_eq!(latencies_ns.len(), expected, "receiver timed out");
-    Stats { latencies_ns, elapsed, bytes: expected * size }
+    let sender_cpu = thread_cpu_time() - cpu_start;
+    let (latencies_ns, receiver_cpu) = rx_thread.join().unwrap();
+    assert_eq!(latencies_ns.len(), expected, "receiver timed out after {sent} sends");
+    Stats { latencies_ns, elapsed, bytes: expected * size, cpu: sender_cpu + receiver_cpu }
 }
 
 /// Raises the relay's socket buffers so it never drops a burst itself.
@@ -276,7 +321,7 @@ impl Drop for Relay {
 fn main() {
     pin(usize::MAX);
     println!("== paced: one message per 100µs, one receiver ==");
-    for (size_name, size) in SIZES {
+    for (size_name, size) in sizes() {
         for (name, transport) in transports() {
             let addr = free_addr();
             let s = run(Scenario {
@@ -294,7 +339,7 @@ fn main() {
     }
 
     println!("\n== burst: bounded outstanding, one receiver ==");
-    for (size_name, size) in SIZES {
+    for (size_name, size) in sizes() {
         let (count, window) = burst_plan(size);
         for (name, transport) in transports() {
             let addr = free_addr();
@@ -313,12 +358,14 @@ fn main() {
     }
 
     println!("\n== loss1: one 2 MiB message, exactly one datagram dropped by a relay ==");
+    for (name, transport) in
+        transports().into_iter().filter(|(_, t)| matches!(t, Transport::Udp(_)))
     {
         let server_addr = free_addr();
         // Drop the 900th of 1789 data datagrams.
         let relay = Relay::start(server_addr, 900);
         let s = run(Scenario {
-            transport: Transport::Udp(udp_config()),
+            transport,
             listen: server_addr,
             dial: relay.addr,
             clients: 1,
@@ -330,11 +377,11 @@ fn main() {
         let data = relay.data.load(Ordering::Relaxed);
         let retx = relay.retransmits.load(Ordering::Relaxed);
         drop(relay);
-        s.row("loss1/udp/2m", &format!("datagrams={data} retransmitted={retx}"));
+        s.row(&format!("loss1/{name}/2m"), &format!("datagrams={data} retransmitted={retx}"));
     }
 
     println!("\n== bcast: one sender, {BCAST_PEERS} receivers on one listener ==");
-    for (size_name, size) in SIZES {
+    for (size_name, size) in sizes() {
         let (count, window) = burst_plan(size);
         let count = count / BCAST_PEERS;
         for (name, transport) in transports() {

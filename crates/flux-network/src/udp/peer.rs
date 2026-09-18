@@ -1,17 +1,17 @@
 //! Per-peer reliability state. One [`UdpPeer`] per remote address; the
 //! connector owns the sockets and passes them in.
 
-use std::{collections::VecDeque, io, net::SocketAddr, os::fd::AsRawFd};
+use std::{collections::VecDeque, io, net::SocketAddr};
 
 use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos};
 use flux_utils::{DCache, DCacheRef};
-use mio::{Token, net::UdpSocket};
+use mio::Token;
 use tracing::{debug, warn};
 
 use super::{
     UdpConfig,
-    sys::{BATCH, SendBatch, SockAddr},
+    sys::{BATCH, SendBatch, SockAddr, UdpSocket},
     wire::{HEADER_SIZE, Header, Kind, fragment_count, write_session},
 };
 
@@ -43,11 +43,12 @@ pub(crate) enum PushOutcome {
     TooLarge,
 }
 
-/// Sends a filled batch of `n` datagrams. Returns how many the kernel took;
-/// errors other than `WouldBlock` count as sent so the RTO path retries them.
+/// Sends a filled batch of `n` datagrams. Returns how many the socket backend
+/// accepted; errors other than `WouldBlock` count as sent so the RTO path
+/// retries them.
 #[inline]
-pub(crate) fn send_batch(batch: &mut SendBatch, fd: i32, n: usize) -> usize {
-    match batch.send(fd) {
+pub(crate) fn send_batch(batch: &mut SendBatch, socket: &UdpSocket, n: usize) -> usize {
+    match socket.send_batch(batch) {
         Ok(k) => k,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
         Err(e) => {
@@ -357,7 +358,7 @@ impl TxWindow {
         range: std::ops::Range<u64>,
         mut pred: impl FnMut(&Self, u64) -> bool,
         store: &MsgStore,
-        fd: i32,
+        socket: &UdpSocket,
         to: &SockAddr,
         batch: &mut SendBatch,
         now: Instant,
@@ -373,7 +374,7 @@ impl TxWindow {
             pushed[n] = seq;
             n += 1;
             if n == BATCH {
-                let accepted = send_batch(batch, fd, n);
+                let accepted = send_batch(batch, socket, n);
                 for &seq in &pushed[..accepted] {
                     self.mark_sent(seq, true, now);
                 }
@@ -385,7 +386,7 @@ impl TxWindow {
             }
         }
         if n != 0 {
-            let accepted = send_batch(batch, fd, n);
+            let accepted = send_batch(batch, socket, n);
             for &seq in &pushed[..accepted] {
                 self.mark_sent(seq, true, now);
             }
@@ -422,7 +423,7 @@ impl TxWindow {
         rto: Duration,
         reorder: Duration,
         store: &mut MsgStore,
-        fd: i32,
+        socket: &UdpSocket,
         to: &SockAddr,
         batch: &mut SendBatch,
         now: Instant,
@@ -487,7 +488,7 @@ impl TxWindow {
 
         if let Some(end) = self.hole_scan_end() {
             let pred = |tx: &Self, seq: u64| tx.is_hole(seq, rto, reorder, now);
-            let (_, blocked) = self.send_where(self.base..end, pred, store, fd, to, batch, now);
+            let (_, blocked) = self.send_where(self.base..end, pred, store, socket, to, batch, now);
             acked.blocked = blocked;
         }
         acked
@@ -529,7 +530,7 @@ impl TxWindow {
         max_rto: Duration,
         reorder: Duration,
         store: &MsgStore,
-        fd: i32,
+        socket: &UdpSocket,
         to: &SockAddr,
         batch: &mut SendBatch,
         now: Instant,
@@ -556,7 +557,7 @@ impl TxWindow {
             }
             false
         };
-        self.send_where(self.base..self.next_send, pred, store, fd, to, batch, now)
+        self.send_where(self.base..self.next_send, pred, store, socket, to, batch, now)
     }
 
     /// Restarts every retained message from its first fragment under
@@ -875,9 +876,12 @@ impl UdpPeer {
         }
         .encode(&mut self.ctrl);
         let n = self.rx.write_bitmap(n_bits, &mut self.ctrl[HEADER_SIZE..]);
-        self.ack_due = false;
-        self.last_send = now;
-        send_datagram(socket, self.addr, &self.ctrl[..HEADER_SIZE + n])
+        let outcome = send_datagram(socket, self.addr, &self.ctrl[..HEADER_SIZE + n]);
+        self.ack_due = outcome == SendOutcome::WouldBlock;
+        if outcome == SendOutcome::Done {
+            self.last_send = now;
+        }
+        outcome
     }
 
     /// Stages the message in store `slot`.
@@ -1098,7 +1102,7 @@ impl UdpPeer {
             self.rto.current(),
             self.rto.reorder_window(),
             store,
-            socket.as_raw_fd(),
+            socket,
             &self.native_addr,
             batch,
             now,
@@ -1133,7 +1137,7 @@ impl UdpPeer {
             self.config.max_rto,
             self.rto.reorder_window(),
             store,
-            socket.as_raw_fd(),
+            socket,
             &self.native_addr,
             batch,
             now,
@@ -1154,6 +1158,43 @@ impl UdpPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blocked_ack_is_retried_after_send_capacity_returns() {
+        use std::os::fd::AsRawFd;
+
+        use crate::udp::{UringConfig, sys::uring::Ring};
+
+        let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        remote.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let addr = remote.local_addr().unwrap();
+        let (mut socket, _) = sock();
+        socket.ring = Some(std::cell::RefCell::new(
+            Ring::new(socket.as_raw_fd(), UringConfig { send_entries: 1, recv_entries: 1 })
+                .unwrap(),
+        ));
+        let mut peer = UdpPeer::new(addr, Token(1), Token(0), 7, cfg(), None);
+        socket.send_to(b"occupy", addr).unwrap();
+        assert_eq!(peer.send_ack(&socket, Instant::now()), SendOutcome::WouldBlock);
+        assert!(peer.take_ack_due(), "backpressure must retain the pending ACK");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            socket.ring.as_ref().unwrap().borrow_mut().poll();
+            if peer.send_ack(&socket, Instant::now()) == SendOutcome::Done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        assert!(!peer.take_ack_due());
+        socket.ring.as_ref().unwrap().borrow_mut().submit();
+        let mut bytes = [0; 1200];
+        assert_eq!(remote.recv(&mut bytes).unwrap(), 6);
+        let n = remote.recv(&mut bytes).unwrap();
+        let header = Header::decode(&bytes[..n]).unwrap();
+        assert_eq!(header.kind, Kind::Ack);
+        assert_eq!(header.session, 7);
+    }
 
     fn cfg() -> UdpConfig {
         UdpConfig {
@@ -1203,13 +1244,13 @@ mod tests {
         let (s, to) = sock();
         let mut batch = SendBatch::new();
         let now = Instant::now();
-        let fd = s.as_raw_fd();
+        let socket = &s;
         send_all(&mut tx, 0..8);
         assert_eq!(tx.next_send, 8);
         // Ack 0..3 cumulatively, 5 and 7 selectively: 3, 4, 6 are holes.
         let bits = 0b0000_1010_u64.to_le_bytes();
         let zero = Duration::ZERO;
-        let acked = tx.on_ack(3, 8, &bits, zero, zero, &mut store, fd, &to, &mut batch, now);
+        let acked = tx.on_ack(3, 8, &bits, zero, zero, &mut store, socket, &to, &mut batch, now);
         assert!(!acked.blocked);
         assert!(acked.rtt.is_some());
         assert_eq!(tx.base, 3);
@@ -1217,7 +1258,7 @@ mod tests {
         assert_eq!(store.free.len(), 2);
         assert_eq!(tx.free(), 59, "slots of the unfinished message stay reserved");
         assert!(tx.is_acked(5) && tx.is_acked(7) && !tx.is_acked(4));
-        let acked = tx.on_ack(8, 0, &[], zero, zero, &mut store, fd, &to, &mut batch, now);
+        let acked = tx.on_ack(8, 0, &[], zero, zero, &mut store, socket, &to, &mut batch, now);
         assert!(acked.rtt.is_none(), "holes were retransmitted, no clean sample");
         assert_eq!(tx.free(), 64);
         assert!(tx.messages.is_empty());
@@ -1231,7 +1272,7 @@ mod tests {
         let mut store = MsgStore::new();
         let mut tx = TxWindow::new(config.send_window);
         let (s, to) = sock();
-        let fd = s.as_raw_fd();
+        let socket = &s;
         let mut batch = SendBatch::new();
         let now = Instant::now();
         let zero = Duration::ZERO;
@@ -1239,7 +1280,7 @@ mod tests {
             assert!(push(&mut tx, &mut store, stride, &[1]));
         }
         send_all(&mut tx, 0..64);
-        tx.on_ack(64, 0, &[], zero, zero, &mut store, fd, &to, &mut batch, now);
+        tx.on_ack(64, 0, &[], zero, zero, &mut store, socket, &to, &mut batch, now);
         assert_eq!(tx.base, 64);
         for _ in 0..8 {
             assert!(push(&mut tx, &mut store, stride, &[2]));
@@ -1247,7 +1288,7 @@ mod tests {
         send_all(&mut tx, 64..72);
         // Old ack: cumulative 1, selective bit for seq 2, which aliases seq 66.
         let bits = 0b1_u64.to_le_bytes();
-        tx.on_ack(1, 8, &bits, zero, zero, &mut store, fd, &to, &mut batch, now);
+        tx.on_ack(1, 8, &bits, zero, zero, &mut store, socket, &to, &mut batch, now);
         assert_eq!(tx.base, 64);
         assert!(!tx.is_acked(66));
     }
@@ -1259,13 +1300,13 @@ mod tests {
         let mut store = MsgStore::new();
         let mut tx = TxWindow::new(config.send_window);
         let (s, to) = sock();
-        let fd = s.as_raw_fd();
+        let socket = &s;
         let mut batch = SendBatch::new();
         let now = Instant::now();
         let zero = Duration::ZERO;
         assert!(push(&mut tx, &mut store, stride, &vec![0; stride * 4]));
         send_all(&mut tx, 0..4);
-        tx.on_ack(2, 0, &[], zero, zero, &mut store, fd, &to, &mut batch, now);
+        tx.on_ack(2, 0, &[], zero, zero, &mut store, socket, &to, &mut batch, now);
         assert_eq!(tx.base, 2);
         tx.rewind(0xabcd);
         assert_eq!((tx.base, tx.next_send), (0, 0), "restarts from the first fragment");

@@ -17,6 +17,38 @@ mod wire;
 
 pub(crate) use connector::UdpManager;
 
+/// Socket I/O implementation. The wire protocol is identical for both backends.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum UdpIo {
+    #[default]
+    Syscall,
+    /// Linux `io_uring` with bounded per-socket buffers. Requires synchronous
+    /// cancellation support (Linux 6.0+); socket creation fails if unavailable.
+    #[cfg(target_os = "linux")]
+    Uring(UringConfig),
+}
+
+/// Per-socket operation limits. Buffers are allocated when the socket opens.
+///
+/// Each entry reserves approximately 64 KiB; defaults use about 6 MiB/socket.
+/// `recv_entries` must be a power of two, both counts must be nonzero, and
+/// their sum must not exceed 4096.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub struct UringConfig {
+    /// Outstanding sends, including GSO groups and control packets.
+    pub send_entries: u16,
+    /// Buffers shared by the socket's multishot receive.
+    pub recv_entries: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for UringConfig {
+    fn default() -> Self {
+        Self { send_entries: 64, recv_entries: 32 }
+    }
+}
+
 /// Tuning for [`crate::Transport::Udp`].
 ///
 /// The retransmit timeout is measured from acks (RFC 6298) and clamped to
@@ -26,6 +58,9 @@ pub(crate) use connector::UdpManager;
 /// `max_datagram_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
+    /// Local I/O backend; peers may use different backends. Queued `io_uring`
+    /// sends progress through `NetworkDriver::poll_with`, like other backlogs.
+    pub io: UdpIo,
     /// Datagram size including the 29-byte header. 1200 stays under the
     /// 1280-byte IPv6 minimum MTU.
     pub max_datagram_size: usize,
@@ -52,6 +87,7 @@ pub struct UdpConfig {
 impl Default for UdpConfig {
     fn default() -> Self {
         Self {
+            io: UdpIo::Syscall,
             max_datagram_size: 1200,
             send_window: 16 * 1024,
             recv_window: 16 * 1024,
@@ -93,6 +129,11 @@ impl UdpConfig {
     }
 
     pub(crate) fn validate(&self) {
+        #[cfg(target_os = "linux")]
+        if let UdpIo::Uring(config) = self.io {
+            assert!(config.send_entries > 0 && config.recv_entries.is_power_of_two());
+            assert!(u32::from(config.send_entries) + u32::from(config.recv_entries) <= 4096);
+        }
         assert!(
             self.max_datagram_size > wire::HEADER_SIZE &&
                 self.max_datagram_size <= wire::MAX_DATAGRAM_SIZE,

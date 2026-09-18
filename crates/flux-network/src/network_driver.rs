@@ -96,8 +96,11 @@ impl Inner {
     }
 }
 
-/// Poll-driven message transport built on `mio`, over TCP or reliable UDP
+/// Poll-driven message transport over TCP or reliable UDP
 /// (see [`Transport`]). The API and events are identical for both.
+///
+/// TCP uses `mio`; UDP selects syscall or Linux `io_uring` I/O through
+/// [`UdpConfig`].
 ///
 /// Manages:
 /// - **Outbound (client) connections** created via [`connect`]. These are
@@ -245,7 +248,7 @@ impl NetworkDriver {
     ///
     /// This call:
     /// 1) attempts outbound reconnects if due
-    /// 2) polls `mio` with a zero timeout
+    /// 2) polls readiness or drains `io_uring` completions without waiting
     /// 3) for each event calls `handler` with the appropriate [`PollEvent`]
     /// 4) returns whether any IO events were processed
     ///
