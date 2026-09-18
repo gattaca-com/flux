@@ -20,6 +20,7 @@ pub struct TileConfig {
     thread_niceness: Option<ThreadNiceness>,
     min_loop_duration: Option<Duration>,
     metrics: bool,
+    idle_backoff: u32,
     #[cfg_attr(not(feature = "park"), allow(dead_code))]
     park: bool,
 }
@@ -31,6 +32,7 @@ impl TileConfig {
             thread_niceness,
             min_loop_duration: None,
             metrics: true,
+            idle_backoff: 0,
             park: false,
         }
     }
@@ -43,7 +45,14 @@ impl TileConfig {
 
     /// Background config pinned to a set of cores. Empty pins nowhere.
     pub fn background_on_cores(cores: Vec<usize>, min_loop_duration: Option<Duration>) -> Self {
-        Self { cores, thread_niceness: None, min_loop_duration, metrics: true, park: false }
+        Self {
+            cores,
+            thread_niceness: None,
+            min_loop_duration,
+            metrics: true,
+            idle_backoff: 0,
+            park: false,
+        }
     }
 
     /// Cores the tile is pinned to on startup. Empty means unpinned.
@@ -53,6 +62,16 @@ impl TileConfig {
 
     pub fn without_metrics(mut self) -> Self {
         self.metrics = false;
+        self
+    }
+
+    /// Issue `pauses` spin hints after an iteration with no recorded work.
+    /// Defaults to zero. This can reduce polling contention at the cost of
+    /// latency for new work after idle period; the delay depends on the CPU.
+    /// Report work outside adapter operations with [`SpineAdapter::mark_work`].
+    /// Parking takes precedence when enabled and eligible.
+    pub fn with_idle_backoff(mut self, pauses: u32) -> Self {
+        self.idle_backoff = pauses;
         self
     }
 
@@ -181,8 +200,16 @@ where
             {
                 if config.park && !worked && !adapter.waker_registered() {
                     crate::park::SIGNAL.park(expected);
+                    expected = crate::park::SIGNAL.read_counter();
+                    continue;
                 }
                 expected = crate::park::SIGNAL.read_counter();
+            }
+
+            if !worked {
+                for _ in 0..config.idle_backoff {
+                    std::hint::spin_loop();
+                }
             }
         }
 
