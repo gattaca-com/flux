@@ -59,12 +59,53 @@ use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore};
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
 
 pub enum HttpEvent<'a> {
-    Accepted { token: Token, peer_addr: SocketAddr },
-    Connected { token: Token },
-    Response { token: Token, id: Option<RequestId>, response: HttpResponse<'a> },
-    Request { token: Token, request: HttpRequest<'a> },
-    Disconnected { token: Token },
-    Failed { id: RequestId, reason: Failure },
+    Accepted {
+        token: Token,
+        peer_addr: SocketAddr,
+    },
+    Connected {
+        token: Token,
+    },
+    Response {
+        token: Token,
+        id: Option<RequestId>,
+        response: HttpResponse<'a>,
+    },
+    Request {
+        token: Token,
+        request: HttpRequest<'a>,
+    },
+    Disconnected {
+        token: Token,
+    },
+    Failed {
+        id: RequestId,
+        reason: Failure,
+    },
+    /// The head of a streaming response; see [`HttpNetwork::request_stream`].
+    ResponseHead {
+        token: Token,
+        status: u16,
+        headers: &'a [httparse::Header<'a>],
+    },
+    /// One piece of a streaming body, borrowed from the receive buffer.
+    Body {
+        token: Token,
+        chunk: &'a [u8],
+    },
+    StreamEnd {
+        token: Token,
+        reason: StreamEnd,
+    },
+}
+
+/// Why a streaming response stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The body reached its terminal chunk or its `Content-Length`.
+    Complete,
+    /// The connection went away first; bytes may be missing.
+    Disconnected,
 }
 
 impl<'a> HttpEvent<'a> {
@@ -149,6 +190,23 @@ struct Conn {
     over_limit: bool,
     last_activity: Instant,
     role: Role,
+    /// Set while a streaming request owns this connection.
+    stream: Option<Stream>,
+}
+
+/// A streaming request; `body` is set once its head has been delivered.
+struct Stream {
+    body: Option<StreamBody>,
+}
+
+/// How the rest of a streaming body is framed.
+#[derive(Clone, Copy)]
+enum StreamBody {
+    Chunked,
+    /// Bytes still owed by `Content-Length`.
+    Length(usize),
+    /// Everything until the connection closes.
+    Eof,
 }
 #[derive(Clone, Copy)]
 enum Lifecycle {
@@ -168,6 +226,8 @@ pub struct HttpNetwork {
     pools: Vec<Pool>,
     max_queued_bytes: usize,
     request_timeout: Option<Duration>,
+    stream_idle_timeout: Option<Duration>,
+    reconnect_interval: Option<Duration>,
     #[cfg(feature = "tls")]
     tls_config: Option<Arc<crate::tls::ClientConfig>>,
     failed: Vec<(RequestId, Failure)>,
@@ -187,6 +247,8 @@ impl Default for HttpNetwork {
             pools: Vec::new(),
             max_queued_bytes: usize::MAX,
             request_timeout: None,
+            stream_idle_timeout: None,
+            reconnect_interval: None,
             #[cfg(feature = "tls")]
             tls_config: None,
             failed: Vec::new(),
@@ -247,6 +309,20 @@ impl HttpNetwork {
         self.request_timeout = Some(request_timeout);
         self
     }
+    /// Drops a streaming response that has gone this long without a byte.
+    /// `request_timeout` stops applying once its head arrives, since a stream
+    /// is expected to outlive any single request deadline.
+    pub fn with_stream_idle_timeout(mut self, stream_idle_timeout: Duration) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.stream_idle_timeout = Some(stream_idle_timeout);
+        self
+    }
+    /// Retry interval for the outbound endpoints this layer opens.
+    pub fn with_reconnect_interval(mut self, reconnect_interval: Duration) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.reconnect_interval = Some(reconnect_interval);
+        self
+    }
     /// Trusts `config` for TLS endpoints instead of the default Mozilla
     /// roots. Applies to connections opened after the call.
     #[cfg(feature = "tls")]
@@ -258,12 +334,22 @@ impl HttpNetwork {
         self.max_body_bytes
     }
     fn group(&mut self, net: &mut TcpNetworkCore) -> TcpGroup {
-        let Self { group, name, max_head_bytes, max_body_bytes, socket_buf_size, .. } = self;
+        let Self {
+            group,
+            name,
+            max_head_bytes,
+            max_body_bytes,
+            socket_buf_size,
+            reconnect_interval,
+            ..
+        } = self;
         *group.get_or_insert_with(|| {
+            let defaults = TcpGroupConfig::default();
             net.add_group(TcpGroupConfig {
                 name,
                 framing: Framing::Raw,
                 socket_buf_size: *socket_buf_size,
+                reconnect_interval: reconnect_interval.unwrap_or(defaults.reconnect_interval),
                 max_frame_size: usize::MAX,
                 // The backlog counts wire bytes, which are ciphertext on a
                 // TLS endpoint: a record adds a header and a tag per 16KB.
@@ -307,6 +393,7 @@ impl HttpNetwork {
                         continued: false,
                         head_request: false,
                     },
+                    stream: None,
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
@@ -374,8 +461,20 @@ impl HttpNetwork {
                 net.disconnect(token);
             }
         }
+        if let Some(timeout) = self.stream_idle_timeout {
+            for i in 0..self.conns.len() {
+                if self.stream_body(i).is_some() && self.conns[i].last_activity.elapsed() >= timeout
+                {
+                    net.disconnect(self.conns[i].token);
+                }
+            }
+        }
         if let Some(timeout) = self.request_timeout {
             for i in 0..self.conns.len() {
+                // A stream outlives request deadlines once its head lands.
+                if self.stream_body(i).is_some() {
+                    continue
+                }
                 let Role::Outbound { in_flight: Some(in_flight), .. } = &self.conns[i].role else {
                     continue
                 };
@@ -408,7 +507,11 @@ impl HttpNetwork {
                     if self.conns[i].dirty {
                         self.parse_connection(net, i, handler);
                     }
-                    if matches!(self.conns[i].role, Role::Outbound { .. }) {
+                    if self.conns[i].stream.is_some() {
+                        self.conns[i].buf.clear();
+                        self.conns[i].dirty = false;
+                        self.end_stream(i, StreamEnd::Disconnected, handler);
+                    } else if matches!(self.conns[i].role, Role::Outbound { .. }) {
                         let answered = self.parse_eof_outbound(i, handler);
                         self.conns[i].buf.clear();
                         self.conns[i].dirty = false;
@@ -442,6 +545,8 @@ impl HttpNetwork {
     {
         if matches!(self.conns[i].role, Role::Accepted { .. }) {
             self.parse_and_emit(net, i, handler);
+        } else if self.conns[i].stream.is_some() {
+            self.parse_stream(net, i, handler);
         } else {
             self.parse_outbound(net, i, handler);
         }
@@ -478,6 +583,7 @@ impl HttpNetwork {
             over_limit: false,
             last_activity: Instant::now(),
             role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
+            stream: None,
         });
         token
     }
@@ -572,6 +678,38 @@ impl HttpNetwork {
             c.role.set_outbound_head(Some(method.eq_ignore_ascii_case("HEAD")));
         }
         sent
+    }
+    /// Sends one request whose response body is delivered incrementally as
+    /// [`HttpEvent::ResponseHead`], [`HttpEvent::Body`] and
+    /// [`HttpEvent::StreamEnd`], instead of being buffered into a single
+    /// [`HttpEvent::Response`].
+    ///
+    /// The stream ends at the terminal chunk, at `Content-Length` bytes, or
+    /// at disconnect, whichever the response uses. `max_body_bytes` becomes
+    /// the bound on undelivered bytes rather than on the whole body, and
+    /// `request_timeout` stops applying once the head arrives; use
+    /// [`Self::with_stream_idle_timeout`] for streams.
+    ///
+    /// Refused for a pooled token: a stream owns its connection for as long
+    /// as it runs, which would starve the pool.
+    pub fn request_stream(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        token: Token,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> bool {
+        if self.pools.iter().any(|pool| pool.tokens.contains(&token)) {
+            return false
+        }
+        if !self.request(net, token, method, path, headers, &[]) {
+            return false
+        }
+        if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) {
+            conn.stream = Some(Stream { body: None });
+        }
+        true
     }
     /// Queues one request on a pool for the next [`Self::drive`] to send,
     /// handing the body back when it exceeds `max_body_bytes` or the queue
@@ -817,6 +955,173 @@ impl HttpNetwork {
             }
         }
         ok
+    }
+    /// Delivers a streaming response: the head once, then body pieces
+    /// borrowed straight out of the receive buffer as they arrive.
+    fn parse_stream<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        self.conns[i].dirty = false;
+        let token = self.conns[i].token;
+        if self.stream_body(i).is_none() && !self.parse_stream_head(net, i, handler) {
+            return
+        }
+        loop {
+            let Some(body) = self.stream_body(i) else { return };
+            let buf = &self.conns[i].buf;
+            match body {
+                StreamBody::Eof => {
+                    if buf.is_empty() {
+                        return
+                    }
+                    handler(HttpEvent::Body { token, chunk: buf });
+                    self.conns[i].buf.clear();
+                    return
+                }
+                StreamBody::Length(remaining) => {
+                    let take = remaining.min(buf.len());
+                    if take > 0 {
+                        handler(HttpEvent::Body { token, chunk: &buf[..take] });
+                        self.conns[i].buf.drain(..take);
+                    }
+                    self.set_stream_body(i, StreamBody::Length(remaining - take));
+                    if remaining == take {
+                        self.end_stream(i, StreamEnd::Complete, handler);
+                    }
+                    return
+                }
+                StreamBody::Chunked => match httparse::parse_chunk_size(buf) {
+                    Err(_) => {
+                        self.fail_stream(net, i, handler);
+                        return
+                    }
+                    Ok(httparse::Status::Partial) => {
+                        if buf.len() > self.max_head_bytes {
+                            self.fail_stream(net, i, handler);
+                        }
+                        return
+                    }
+                    Ok(httparse::Status::Complete((consumed, 0))) => {
+                        self.conns[i].buf.drain(..consumed);
+                        self.end_stream(i, StreamEnd::Complete, handler);
+                        return
+                    }
+                    Ok(httparse::Status::Complete((consumed, size))) => {
+                        let Ok(size) = usize::try_from(size) else {
+                            self.fail_stream(net, i, handler);
+                            return
+                        };
+                        // A chunk is delivered whole, so one larger than the
+                        // undelivered bound could never be handed over.
+                        if size > self.max_body_bytes {
+                            self.fail_stream(net, i, handler);
+                            return
+                        }
+                        // The chunk data is followed by its own CRLF.
+                        let end = consumed + size + 2;
+                        if buf.len() < end {
+                            return
+                        }
+                        handler(HttpEvent::Body { token, chunk: &buf[consumed..consumed + size] });
+                        self.conns[i].buf.drain(..end);
+                    }
+                },
+            }
+        }
+    }
+    /// Parses and delivers a streaming response head; returns whether the
+    /// body may now be read.
+    fn parse_stream_head<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F) -> bool
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let token = self.conns[i].token;
+        let b = &self.conns[i].buf;
+        let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
+        let mut response = httparse::Response::new(&mut hs);
+        let Ok(state) = response.parse(b) else {
+            self.fail_stream(net, i, handler);
+            return false
+        };
+        let httparse::Status::Complete(head) = state else {
+            if !crlf_only(b) || b.len() > self.max_head_bytes {
+                self.fail_stream(net, i, handler);
+            }
+            return false
+        };
+        if !crlf_only(&b[..head]) || head > self.max_head_bytes {
+            self.fail_stream(net, i, handler);
+            return false
+        }
+        let status = response.code.unwrap_or(0);
+        let chunked = transfer_chunked(response.headers);
+        let content_length = response_content_length(response.headers);
+        if status == 101 ||
+            matches!(content_length, ContentLength::Invalid) ||
+            chunked.is_none() ||
+            (chunked == Some(true) && !matches!(content_length, ContentLength::Absent))
+        {
+            self.fail_stream(net, i, handler);
+            return false
+        }
+        // An informational head is not the response; keep reading.
+        if status < 200 {
+            self.conns[i].buf.drain(..head);
+            self.conns[i].dirty = !self.conns[i].buf.is_empty();
+            return false
+        }
+        let empty = matches!(status, 204 | 304);
+        let body = if empty {
+            StreamBody::Length(0)
+        } else if chunked == Some(true) {
+            StreamBody::Chunked
+        } else if let ContentLength::Present(length) = content_length {
+            StreamBody::Length(length)
+        } else {
+            StreamBody::Eof
+        };
+        handler(HttpEvent::ResponseHead { token, status, headers: response.headers });
+        self.conns[i].buf.drain(..head);
+        self.set_stream_body(i, body);
+        if empty {
+            self.end_stream(i, StreamEnd::Complete, handler);
+            return false
+        }
+        true
+    }
+    fn stream_body(&self, i: usize) -> Option<StreamBody> {
+        self.conns[i].stream.as_ref().and_then(|stream| stream.body)
+    }
+    fn set_stream_body(&mut self, i: usize, body: StreamBody) {
+        if let Some(stream) = self.conns[i].stream.as_mut() {
+            stream.body = Some(body);
+        }
+    }
+    /// Ends a stream and frees its connection for another request.
+    fn end_stream<F>(&mut self, i: usize, reason: StreamEnd, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let token = self.conns[i].token;
+        self.conns[i].stream = None;
+        // A stream owns its connection and nothing is pipelined behind it, so
+        // whatever trails the body, chunk trailers included, is unsolicited
+        // and would otherwise be parsed as the next response head.
+        self.conns[i].buf.clear();
+        self.conns[i].role.set_outbound_head(None);
+        self.conns[i].role.take_in_flight();
+        handler(HttpEvent::StreamEnd { token, reason });
+    }
+    /// Drops a malformed or oversized stream; the endpoint reconnects.
+    fn fail_stream<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let token = self.conns[i].token;
+        self.conns[i].buf.clear();
+        self.end_stream(i, StreamEnd::Disconnected, handler);
+        net.disconnect(token);
     }
     fn parse_outbound<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
     where
