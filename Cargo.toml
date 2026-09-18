@@ -11,6 +11,7 @@ members = [
   "crates/flux-profiler",
   "crates/flux-profiler-macros",
   "crates/flux-s3",
+  "crates/flux-sse",
   "crates/flux-timekeeper",
   "crates/flux-timing",
   "crates/flux-utils",

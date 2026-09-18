@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "flux-sse"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flux-network.workspace = true
+flux-timing.workspace = true
+
+[features]
+tls = ["flux-network/tls"]
+
+[lints]
+workspace = true

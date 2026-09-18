@@ -1609,6 +1609,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-sse"
+version = "0.3.2"
+dependencies = [
+ "flux-network",
+ "flux-timing",
+]
+
+[[package]]
 name = "flux-timekeeper"
 version = "0.3.2"
 dependencies = [
