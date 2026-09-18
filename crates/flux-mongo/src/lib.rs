@@ -2,14 +2,13 @@
 //! one poll with the tile's other traffic.
 //!
 //! Commands queue inside the client; [`Mongo::connect`] opens the pool,
-//! [`Mongo::on_event`], called from the network's event handler, tracks
-//! the pooled connections, and [`Mongo::drive`] sends queued commands on
-//! idle ones and delivers one outcome per id. A full queue refuses the new
-//! command instead of failing queued ones; queued commands wait out pool
-//! outages.
+//! [`Mongo::on_event`] tracks the pooled connections from the network's
+//! event handler, and [`Mongo::drive`] sends queued commands on idle ones
+//! and delivers one outcome per id. A full queue refuses the new command
+//! instead of failing queued ones; queued commands wait out pool outages.
 //!
-//! The wire protocol is `OP_MSG` only. Each connection first sends `{hello: 1}`
-//! against the `admin` database and, when credentials are configured,
+//! The wire protocol is `OP_MSG` only. Each connection first sends
+//! `{hello: 1}` against `admin` and, when credentials are configured,
 //! completes a SCRAM-SHA-256 exchange with `saslStart` / `saslContinue`
 //! against the auth-source database. A failed startup kills the connection
 //! without an outcome; the pool redials and queued commands wait.
@@ -45,20 +44,22 @@ pub struct CommandId(u64);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The server refused the command: numeric code, code name, and message.
-    Server { code: Option<i32>, code_name: Option<String>, message: String },
+    Server {
+        code: Option<i32>,
+        code_name: Option<String>,
+        message: String,
+    },
     /// Lost before a reply; the server may or may not have run the command.
     Disconnected,
-    /// The server's reply exceeded `max_output_bytes`.
     TooLarge,
-    /// A message arrived that fits no legal state.
     Protocol(&'static str),
 }
 
 type Outcome = (CommandId, Result<Document, Error>);
 
-struct Request {
+struct Queued {
     id: CommandId,
+    request_id: i32,
     bytes: Vec<u8>,
 }
 
@@ -120,7 +121,7 @@ pub struct Mongo {
     max_queued_bytes: usize,
     group: Option<TcpGroup>,
     conns: Vec<Conn>,
-    queue: VecDeque<Request>,
+    queue: VecDeque<Queued>,
     queued_bytes: usize,
     outcomes: Vec<Outcome>,
     next_id: u64,
@@ -187,8 +188,6 @@ impl Mongo {
         self.queue_body(&body)
     }
 
-    /// Queues an insert of `rows` into `db.coll`, or `None` when the queue
-    /// is full. Panics on an empty batch or an unencodable row.
     pub fn insert<T: Serialize>(&mut self, db: &str, coll: &str, rows: &[T]) -> Option<CommandId> {
         assert!(!rows.is_empty(), "insert needs at least one document");
         let documents: Vec<Bson> = rows
@@ -202,9 +201,8 @@ impl Mongo {
         })
     }
 
-    /// Queues a `find` of `filter` in `db.coll`, or `None` when the queue
-    /// is full. The outcome is the server's raw reply; page it with
-    /// `getMore` through [`Mongo::run_command`].
+    /// Queues a `find` of `filter` in `db.coll`. The outcome is the server's
+    /// raw reply; page it with `getMore` through [`Mongo::run_command`].
     pub fn find(&mut self, db: &str, coll: &str, filter: Document) -> Option<CommandId> {
         self.queue_body(&doc! {
             "find": coll,
@@ -219,14 +217,14 @@ impl Mongo {
         if self.full_for(bytes.len()) {
             return None;
         }
-        Some(self.enqueue(bytes))
+        Some(self.enqueue(request_id, bytes))
     }
 
-    fn enqueue(&mut self, bytes: Vec<u8>) -> CommandId {
+    fn enqueue(&mut self, request_id: i32, bytes: Vec<u8>) -> CommandId {
         let id = CommandId(self.next_id);
         self.next_id += 1;
         self.queued_bytes += bytes.len();
-        self.queue.push_back(Request { id, bytes });
+        self.queue.push_back(Queued { id, request_id, bytes });
         id
     }
 
@@ -234,40 +232,35 @@ impl Mongo {
         self.queued_bytes + len > self.max_queued_bytes
     }
 
-    fn pop_queued(&mut self) -> Option<Request> {
+    fn pop_queued(&mut self) -> Option<Queued> {
         let request = self.queue.pop_front()?;
         self.queued_bytes -= request.bytes.len();
         Some(request)
     }
 
     fn alloc_request_id(next: &mut i32) -> i32 {
-        loop {
-            let id = *next;
-            *next = next.wrapping_add(1);
-            if *next == 0 {
-                *next = 1;
-            }
-            if id != 0 {
-                return id;
-            }
+        let id = *next;
+        *next = next.wrapping_add(1);
+        if *next == 0 {
+            *next = 1;
         }
+        id
     }
 
     fn encode_msg(request_id: i32, body: &Document) -> Vec<u8> {
-        let payload = bson::to_vec(body).expect("command document encodes as BSON");
-        let mut out = Vec::with_capacity(HEADER_LEN + 5 + payload.len());
-        out.extend_from_slice(&((HEADER_LEN + 5 + payload.len()) as i32).to_le_bytes());
+        let mut out = Vec::new();
+        out.extend_from_slice(&0i32.to_le_bytes());
         out.extend_from_slice(&request_id.to_le_bytes());
         out.extend_from_slice(&0i32.to_le_bytes());
         out.extend_from_slice(&OP_MSG.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.push(0);
-        out.extend_from_slice(&payload);
+        body.to_writer(&mut out).expect("command document encodes as BSON");
+        let len = out.len() as i32;
+        out[0..4].copy_from_slice(&len.to_le_bytes());
         out
     }
 
-    /// Opens the pool; the builders must have run, and [`Mongo::drive`]
-    /// never opens anything itself.
     pub fn connect(&mut self, net: &mut TcpNetworkCore) {
         assert!(self.group.is_none(), "connect once");
         let group = net.add_group(TcpGroupConfig {
@@ -289,8 +282,6 @@ impl Mongo {
         }
     }
 
-    /// Sends queued commands on idle connections, then delivers each
-    /// finished command's outcome to `handler` exactly once.
     pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
     where
         F: FnMut(CommandId, Result<Document, Error>),
@@ -316,10 +307,8 @@ impl Mongo {
                 self.queue.push_front(request);
                 continue;
             }
-            self.conns[index].state = State::Busy(InFlight {
-                id: request.id,
-                request_id: Self::request_id_of(&request.bytes),
-            });
+            self.conns[index].state =
+                State::Busy(InFlight { id: request.id, request_id: request.request_id });
         }
         for (id, outcome) in self.outcomes.drain(..) {
             handler(id, outcome);
@@ -432,10 +421,6 @@ impl Mongo {
                 true
             }
         }
-    }
-
-    fn request_id_of(bytes: &[u8]) -> i32 {
-        i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
     }
 
     fn parse_reply(frame: &[u8]) -> Result<(i32, Document), Error> {
