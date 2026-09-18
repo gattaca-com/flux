@@ -35,7 +35,7 @@ pub fn insert_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<S
     if columns.is_empty() {
         return Err(unsupported("a row that is not a struct"))
     }
-    Ok(format!("INSERT INTO {table} ({}) FORMAT RowBinary", columns.join(", ")))
+    Ok(format!("INSERT INTO {table} ({}) VALUES", columns.join(", ")))
 }
 
 struct Encoder<'a> {
@@ -79,7 +79,7 @@ impl ser::Serializer for &mut Encoder<'_> {
     type SerializeTuple = Self;
     type SerializeTupleStruct = Self;
     type SerializeTupleVariant = ser::Impossible<(), Error>;
-    type SerializeMap = ser::Impossible<(), Error>;
+    type SerializeMap = Self;
     type SerializeStruct = Self;
     type SerializeStructVariant = ser::Impossible<(), Error>;
 
@@ -158,8 +158,9 @@ impl ser::Serializer for &mut Encoder<'_> {
     ) -> Result<Self::SerializeTupleVariant, Error> {
         Err(unsupported("an enum"))
     }
-    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Error> {
-        Err(unsupported("a map"))
+    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Error> {
+        self.count(len)?;
+        Ok(self)
     }
     fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
         self.depth += 1;
@@ -196,6 +197,20 @@ elements!(
     SerializeTuple::serialize_element,
     SerializeTupleStruct::serialize_field,
 );
+
+impl ser::SerializeMap for &mut Encoder<'_> {
+    type Ok = ();
+    type Error = Error;
+    fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
+        key.serialize(&mut **self)
+    }
+    fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), Error> {
+        Ok(())
+    }
+}
 
 impl ser::SerializeStruct for &mut Encoder<'_> {
     type Ok = ();

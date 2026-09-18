@@ -9,7 +9,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flux_clickhouse::ClickHouse;
 use flux_network::{
     Token,
-    http::{HttpEvent, HttpNetwork},
     tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork},
 };
 use flux_postgres::{Error, Output, Postgres, QueryId, copybinary};
@@ -528,17 +527,59 @@ fn scram_login_then_disconnect_recovers() {
     assert_eq!(result.as_ref().unwrap().tag, "SELECT 1");
 }
 
+/// Appends a `ClickHouse` varint-prefixed string.
+fn ch_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+}
+
+/// The server handshake: name, versions, revision, timezone, display name,
+/// and version patch.
+fn ch_hello() -> Vec<u8> {
+    let mut out = vec![0];
+    ch_string(&mut out, b"fake");
+    out.extend_from_slice(&[1, 1]);
+    out.extend_from_slice(&[0x9d, 0xa9, 0x03]);
+    ch_string(&mut out, b"UTC");
+    ch_string(&mut out, b"fake");
+    out.push(0);
+    out
+}
+
+/// The empty header block naming the columns of `Row`, which is what tells
+/// the client how to lay its insert data out.
+fn ch_header() -> Vec<u8> {
+    let mut out = vec![1, 0, 1, 0, 2, 255, 255, 255, 255, 0, 5, 0];
+    for (name, type_name) in [
+        ("a", "Int32"),
+        ("b", "String"),
+        ("c", "Nullable(UInt64)"),
+        ("d", "Bool"),
+        ("e", "Float64"),
+    ] {
+        ch_string(&mut out, name.as_bytes());
+        ch_string(&mut out, type_name.as_bytes());
+    }
+    out
+}
+
+/// The empty data block that ends the client's insert.
+const CH_INSERT_END: [u8; 12] = [2, 0, 1, 0, 2, 255, 255, 255, 255, 0, 0, 0];
+
 /// The acceptance case for the shared core: one poll loop carries a
-/// `Postgres` client, a `ClickHouse` client, and the fake HTTP server they
-/// answer to, each with its own network layer, and both clients report their
-/// own outcome.
+/// `Postgres` client, a `ClickHouse` client, and the fake servers they
+/// answer to, and both clients report their own outcome.
 #[test]
 fn one_poll_serves_postgres_and_clickhouse() {
     let (mut net, server_group, pg_addr) = setup();
-    let http_addr = free_addr();
-    let mut http = HttpNetwork::default();
-    http.listen(&mut net, http_addr).unwrap();
-    let mut ch = ClickHouse::new(http_addr, 1).with_database("telemetry");
+    let ch_addr = free_addr();
+    let ch_group = net.add_group(TcpGroupConfig {
+        name: "fake-clickhouse",
+        framing: Framing::Raw,
+        ..Default::default()
+    });
+    net.listen(ch_group, ch_addr).unwrap();
+    let mut ch = ClickHouse::new(ch_addr, 1).with_database("telemetry");
     ch.connect(&mut net);
     let mut pg = Postgres::new(pg_addr).with_database("telemetry");
     pg.connect(&mut net);
@@ -552,13 +593,33 @@ fn one_poll_serves_postgres_and_clickhouse() {
     let mut ch_outcome = None;
     let mut copied = Vec::new();
     let mut inserted = Vec::new();
+    let mut ch_replies = Vec::new();
+    let mut ch_query_end = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && (pg_outcome.is_none() || ch_outcome.is_none()) {
         net.poll_with(|event| {
-            if ch.on_event(&event) || http.on_event(&event) || pg.on_event(&event) {
+            if ch.on_event(&event) || pg.on_event(&event) {
                 return;
             }
             match event {
+                TcpEvent::Accepted { group, token, .. } if group == ch_group => {
+                    ch_replies.push((token, ch_hello()));
+                }
+                TcpEvent::Message { group, token, payload, .. } if group == ch_group => {
+                    inserted.extend_from_slice(payload);
+                    match ch_query_end {
+                        // The query packet ends with an empty block of its
+                        // own, so only a later one ends the insert data.
+                        Some(end) if inserted.len() > end && inserted.ends_with(&CH_INSERT_END) => {
+                            ch_replies.push((token, vec![5]));
+                        }
+                        None if inserted.windows(11).any(|w| w == b"INSERT INTO") => {
+                            ch_query_end = Some(inserted.len());
+                            ch_replies.push((token, ch_header()));
+                        }
+                        _ => {}
+                    }
+                }
                 TcpEvent::Accepted { group, token, .. } if group == server_group => {
                     server.conns.push(ServerConn {
                         token,
@@ -586,19 +647,12 @@ fn one_poll_serves_postgres_and_clickhouse() {
             }
         });
 
-        let mut requests = Vec::new();
         ch.drive(&mut net, |id, result| {
             assert_eq!(id, insert);
-            ch_outcome = Some(result.map(<[u8]>::to_vec).map_err(|_| ()));
+            ch_outcome = Some(result.map(|output| output.rows).map_err(|_| ()));
         });
-        http.drive(&mut net, |event| {
-            if let HttpEvent::Request { token, request } = event {
-                inserted.push(request.body.to_vec());
-                requests.push(token);
-            }
-        });
-        for token in requests {
-            http.respond(&mut net, token, 200, &[], b"");
+        for (token, reply) in std::mem::take(&mut ch_replies) {
+            net.send_with(token, |buf| buf.extend_from_slice(&reply));
         }
         pg.drive(&mut net, |id, result| {
             assert_eq!(id, copy);
@@ -613,6 +667,5 @@ fn one_poll_serves_postgres_and_clickhouse() {
     assert_eq!(pg_outcome, Some(Ok("COPY 1".to_owned())));
     assert_eq!(ch_outcome, Some(Ok(Vec::new())));
     assert_eq!(copied, binary_batch(&rows));
-    assert_eq!(inserted.len(), 1);
-    assert!(!inserted[0].is_empty());
+    assert!(inserted.windows(6).any(|w| w == b"shared"));
 }
