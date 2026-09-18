@@ -359,6 +359,7 @@ impl<T: Copy> InnerQueue<T> {
         self.count().saturating_sub(1)
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn version_at(&self, count: usize) -> u64 {
         ((count / self.len()) * 2 + 2) as u64
@@ -785,7 +786,9 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn set_pos(&mut self, count: usize) {
         self.pos = self.get_pos(count);
-        self.expected_version = self.queue.version_at(count);
+        // Queue lengths are powers of two. Keep the read off the producer's cache line.
+        let lap = count >> (self.mask + 1).trailing_zeros();
+        self.expected_version = (lap * 2 + 2) as u64;
     }
 
     #[inline]
