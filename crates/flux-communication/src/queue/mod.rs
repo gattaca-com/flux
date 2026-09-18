@@ -777,6 +777,25 @@ impl<T: Copy> ConsumerBare<T> {
         count
     }
 
+    /// If lapped: update count to continue from current position
+    /// within the current rotation instead of resetting to the head
+    /// of the queue. Returns the count resumed on, `None` if not lapped.
+    /// Broadcast only, useful when sampling from very busy queues.
+    #[inline]
+    pub fn resync(&mut self) -> Option<usize> {
+        // Unsubscribed: `pos` indexes nothing and the cursor may be null.
+        if self.pos == usize::MAX {
+            return None;
+        }
+        let version = self.queue.load(self.pos).version() & !1;
+        if version <= self.expected_version {
+            return None;
+        }
+        let count = self.queue.count_at(self.pos, version);
+        self.set_broadcast_pos(count);
+        Some(count)
+    }
+
     #[inline]
     fn set_pos(&mut self, count: usize) {
         self.pos = self.get_pos(count);
@@ -1092,6 +1111,12 @@ impl<T: 'static + Copy> Consumer<T> {
     #[inline]
     pub fn recover_after_error(&mut self) {
         self.bare.recover_after_error();
+    }
+
+    /// See [`ConsumerBare::resync`].
+    #[inline]
+    pub fn resync(&mut self) -> Option<usize> {
+        self.bare.resync()
     }
 
     #[inline]
