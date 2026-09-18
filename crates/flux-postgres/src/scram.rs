@@ -77,13 +77,18 @@ impl Exchange {
         if iterations == 0 {
             return Err("SCRAM iteration count is zero");
         }
-        let mut salted_input = Vec::with_capacity(salt.len() + 4);
-        salted_input.extend_from_slice(&salt);
-        salted_input.extend_from_slice(&1u32.to_be_bytes());
-        let mut salted = hmac(password.as_bytes(), &salted_input);
-        let mut prev = salted;
+        let mac = HmacSha256::new_from_slice(password.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        let mut prev: [u8; 32] = mac
+            .clone()
+            .chain_update(&salt)
+            .chain_update(1u32.to_be_bytes())
+            .finalize()
+            .into_bytes()
+            .into();
+        let mut salted = prev;
         for _ in 1..iterations {
-            prev = hmac(password.as_bytes(), &prev);
+            prev = mac.clone().chain_update(prev).finalize().into_bytes().into();
             for (acc, byte) in salted.iter_mut().zip(prev) {
                 *acc ^= byte;
             }

@@ -15,14 +15,14 @@ pub mod copybinary;
 pub mod copytext;
 mod scram;
 
-use std::{collections::VecDeque, net::SocketAddr};
+use std::{collections::VecDeque, fmt, net::SocketAddr};
 
 use flux_network::{
     Token,
     tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore},
 };
 use rand::Rng as _;
-use serde::Serialize;
+use serde::{Serialize, ser};
 use tracing::warn;
 
 const PROTOCOL_VERSION: i32 = 196_608;
@@ -75,8 +75,22 @@ pub enum Error {
 
 type Outcome = (QueryId, Result<Output, Error>);
 
-/// Bytes a COPY body opens and closes with; `COPY TEXT` has neither.
-type Frame = (fn(&mut Vec<u8>), fn(&mut Vec<u8>));
+#[derive(Debug)]
+pub struct EncodeError(pub(crate) String);
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+impl ser::Error for EncodeError {
+    fn custom<T: fmt::Display>(message: T) -> Self {
+        Self(message.to_string())
+    }
+}
 
 struct Request {
     id: QueryId,
@@ -95,19 +109,14 @@ struct ServerError {
     message: String,
 }
 
-struct QueryOut {
-    request: Request,
+struct InFlight {
+    id: QueryId,
+    copy: bool,
     columns: Vec<Column>,
     rows: Vec<Vec<Option<Vec<u8>>>>,
     tag: Option<String>,
     error: Option<ServerError>,
     bytes: usize,
-}
-
-struct CopyOut {
-    request: Request,
-    tag: Option<String>,
-    error: Option<ServerError>,
 }
 
 enum Startup {
@@ -120,8 +129,7 @@ enum State {
     Connecting,
     Startup(Startup),
     Ready,
-    Query(QueryOut),
-    Copy(CopyOut),
+    Busy(InFlight),
     Dead,
 }
 
@@ -139,38 +147,17 @@ impl Conn {
         self.outbox.clear();
     }
 
-    fn take_in_flight(&self) -> Option<QueryId> {
+    fn in_flight(&self) -> Option<QueryId> {
         match &self.state {
-            State::Query(query) => Some(query.request.id),
-            State::Copy(copy) => Some(copy.request.id),
+            State::Busy(flight) => Some(flight.id),
             _ => None,
         }
     }
 
     fn fatal(&mut self, error: Error) -> Option<Outcome> {
-        let id = self.take_in_flight();
+        let id = self.in_flight();
         self.state = State::Dead;
         id.map(|id| (id, Err(error)))
-    }
-
-    fn dispatch(
-        &mut self,
-        user: &str,
-        password: &str,
-        max_output: usize,
-        tag: u8,
-        body: &[u8],
-    ) -> Option<Outcome> {
-        if matches!(tag, b'A' | b'K' | b'N' | b'S') {
-            if matches!(self.state, State::Connecting) {
-                return self.fatal(Error::Protocol("message arrived before connect completed"));
-            }
-            return None;
-        }
-        match self.state.on_message(&mut self.outbox, user, password, max_output, tag, body) {
-            Ok(outcome) => outcome,
-            Err(error) => self.fatal(error),
-        }
     }
 }
 
@@ -276,7 +263,7 @@ impl Postgres {
     }
 
     pub fn with_connections(mut self, connections: usize) -> Self {
-        assert!(connections > 0 && self.conns.is_empty(), "nonzero, before connect");
+        assert!(connections > 0 && self.group.is_none(), "nonzero, before connect");
         self.connections = connections;
         self
     }
@@ -313,68 +300,30 @@ impl Postgres {
     }
 
     /// Encodes `rows` as `COPY BINARY` and queues them for `table`, naming
-    /// the columns after the row's fields. A full queue hands the encoded
-    /// body back for a later [`Postgres::copy`]. Panics on an empty batch,
-    /// an unencodable row, or rows whose columns differ.
+    /// the columns after the first row's fields. A full queue hands the encoded
+    /// body back for a later [`Postgres::copy`]. Panics on an empty batch or
+    /// an unencodable row; a row shaped unlike the first is refused by the
+    /// server.
     pub fn copy_rows<T: Serialize>(&mut self, table: &str, rows: &[T]) -> Result<QueryId, Vec<u8>> {
-        self.copy_batch(
-            table,
-            rows,
-            |table, row| copybinary::copy_statement(table, row).expect("COPY BINARY row"),
-            |out, row, columns| {
-                copybinary::encode_columns(out, row, columns).expect("COPY BINARY row");
-            },
-            (copybinary::header, copybinary::trailer),
-        )
+        let mut body = Vec::new();
+        let columns = copybinary::encode_batch(&mut body, rows).expect("COPY BINARY rows");
+        self.copy(&Self::copy_statement(table, &columns, "BINARY"), body)
     }
 
     /// Encodes `rows` as `COPY TEXT` and queues them for `table`, naming the
-    /// columns after the row's fields. Slower server-side than
+    /// columns after the first row's fields. Slower server-side than
     /// [`Postgres::copy_rows`], but it carries the types that only have a
-    /// text form, such as timestamps, numerics, and enum labels. Panics and
-    /// refuses like [`Postgres::copy_rows`].
+    /// text form, such as timestamps, numerics, and enum labels. Panics like
+    /// [`Postgres::copy_rows`]; a row shaped unlike the first is refused by the
+    /// server.
     pub fn copy_text_rows<T: Serialize>(
         &mut self,
         table: &str,
         rows: &[T],
     ) -> Result<QueryId, Vec<u8>> {
-        self.copy_batch(
-            table,
-            rows,
-            |table, row| copytext::copy_statement(table, row).expect("COPY TEXT row"),
-            |out, row, columns| {
-                copytext::encode_columns(out, row, columns).expect("COPY TEXT row");
-            },
-            (|_| {}, |_| {}),
-        )
-    }
-
-    /// Encodes one batch, holding every row to the first row's columns.
-    fn copy_batch<T: Serialize>(
-        &mut self,
-        table: &str,
-        rows: &[T],
-        statement: impl Fn(&str, &T) -> String,
-        encode: impl Fn(&mut Vec<u8>, &T, &mut Vec<&'static str>),
-        frame: Frame,
-    ) -> Result<QueryId, Vec<u8>> {
-        let sql = statement(table, &rows[0]);
         let mut body = Vec::new();
-        frame.0(&mut body);
-        let (mut columns, mut expected) = (Vec::new(), Vec::new());
-        for row in rows {
-            encode(&mut body, row, &mut columns);
-            if expected.is_empty() {
-                std::mem::swap(&mut expected, &mut columns);
-            } else {
-                assert_eq!(columns, expected, "COPY rows must share the same columns");
-            }
-        }
-        frame.1(&mut body);
-        if self.full_for(sql.len() + body.len()) {
-            return Err(body);
-        }
-        Ok(self.enqueue(sql, Some(body)))
+        let columns = copytext::encode_batch(&mut body, rows).expect("COPY TEXT rows");
+        self.copy(&Self::copy_statement(table, &columns, "TEXT"), body)
     }
 
     fn enqueue(&mut self, sql: String, data: Option<Vec<u8>>) -> QueryId {
@@ -394,6 +343,12 @@ impl Postgres {
         let request = self.queue.pop_front()?;
         self.queued_bytes -= request.queued_len();
         Some(request)
+    }
+
+    fn copy_statement(table: &str, columns: &[&str], format: &str) -> String {
+        let quoted: Vec<_> =
+            columns.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect();
+        format!("COPY {table} ({}) FROM STDIN (FORMAT {format})", quoted.join(", "))
     }
 
     fn startup_bytes(user: &str, database: &str, params: &[(String, String)]) -> Vec<u8> {
@@ -442,19 +397,6 @@ impl Postgres {
         }
     }
 
-    fn send_pending(&mut self, net: &mut TcpNetworkCore, index: usize) -> bool {
-        let outbox = &self.conns[index].outbox;
-        if outbox.is_empty() {
-            return true;
-        }
-        let token = self.conns[index].token;
-        if !net.send_with(token, |buf| buf.extend_from_slice(outbox)) {
-            return false;
-        }
-        self.conns[index].outbox.clear();
-        true
-    }
-
     /// Sends queued requests on idle connections, then delivers each finished
     /// request's outcome to `handler` exactly once.
     pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
@@ -462,18 +404,20 @@ impl Postgres {
         F: FnMut(QueryId, Result<Output, Error>),
     {
         assert!(self.group.is_some(), "connect before drive");
-        for index in 0..self.conns.len() {
-            if matches!(self.conns[index].state, State::Dead) {
-                net.disconnect(self.conns[index].token);
-            } else {
-                self.send_pending(net, index);
+        for conn in &mut self.conns {
+            if matches!(conn.state, State::Dead) {
+                net.disconnect(conn.token);
+            } else if !conn.outbox.is_empty() &&
+                net.send_with(conn.token, |buf| buf.extend_from_slice(&conn.outbox))
+            {
+                conn.outbox.clear();
             }
         }
         for index in 0..self.conns.len() {
             if !matches!(self.conns[index].state, State::Ready) {
                 continue;
             }
-            let Some(mut request) = self.pop_queued() else { break };
+            let Some(request) = self.pop_queued() else { break };
             let token = self.conns[index].token;
             let sent = net.send_with(token, |buf| {
                 buf.push(b'Q');
@@ -491,21 +435,17 @@ impl Postgres {
             if !sent {
                 self.queued_bytes += request.queued_len();
                 self.queue.push_front(request);
-                break;
+                continue;
             }
-            if request.data.is_some() {
-                request.data = None;
-                self.conns[index].state = State::Copy(CopyOut { request, tag: None, error: None });
-            } else {
-                self.conns[index].state = State::Query(QueryOut {
-                    request,
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    tag: None,
-                    error: None,
-                    bytes: 0,
-                });
-            }
+            self.conns[index].state = State::Busy(InFlight {
+                id: request.id,
+                copy: request.data.is_some(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                tag: None,
+                error: None,
+                bytes: 0,
+            });
         }
         for (id, outcome) in self.outcomes.drain(..) {
             handler(id, outcome);
@@ -532,25 +472,18 @@ impl Postgres {
     pub fn on_event(&mut self, event: &TcpEvent) -> bool {
         match *event {
             TcpEvent::Accepted { .. } => false,
-            TcpEvent::Connected { group, token, .. } => {
-                let Some(index) = self.conn_index(group, token) else { return false };
-                let Self { conns, outcomes, .. } = self;
-                let conn = &mut conns[index];
-                let stale = conn.take_in_flight();
-                conn.reset(State::Startup(Startup::AwaitAuth));
-                if let Some(id) = stale {
-                    outcomes.push((id, Err(Error::Disconnected)));
-                }
-                true
-            }
+            TcpEvent::Connected { group, token, .. } |
             TcpEvent::Disconnected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
                 let conn = &mut self.conns[index];
-                let in_flight = conn.take_in_flight();
-                conn.reset(State::Connecting);
-                if let Some(id) = in_flight {
+                if let Some(id) = conn.in_flight() {
                     self.outcomes.push((id, Err(Error::Disconnected)));
                 }
+                conn.reset(if matches!(event, TcpEvent::Connected { .. }) {
+                    State::Startup(Startup::AwaitAuth)
+                } else {
+                    State::Connecting
+                });
                 true
             }
             TcpEvent::Message { group, token, payload, .. } => {
@@ -589,7 +522,17 @@ impl Postgres {
                         let tag = rx[consumed];
                         let body = &rx[consumed + 5..consumed + 1 + len];
                         consumed += 1 + len;
-                        outcome = conn.dispatch(user, password, max_output_bytes, tag, body);
+                        outcome = conn
+                            .state
+                            .on_message(
+                                &mut conn.outbox,
+                                user,
+                                password,
+                                max_output_bytes,
+                                tag,
+                                body,
+                            )
+                            .unwrap_or_else(|error| conn.fatal(error));
                     }
                     if !matches!(conn.state, State::Dead) {
                         rx.drain(..consumed);
@@ -696,7 +639,7 @@ impl State {
             Self::Connecting => Err(Error::Protocol("message arrived before connect completed")),
             Self::Dead => Ok(None),
             Self::Ready => match tag {
-                b'Z' => Ok(None),
+                b'Z' | b'A' | b'K' | b'N' | b'S' => Ok(None),
                 b'E' => {
                     let error = Postgres::parse_error(body);
                     warn!(code = %error.code, message = %error.message, "postgres errored while idle");
@@ -710,17 +653,9 @@ impl State {
                 }
                 Ok(None)
             }
-            Self::Query(query) => match query.on_message(max_output, tag, body)? {
+            Self::Busy(flight) => match flight.on_message(max_output, tag, body)? {
                 Some(result) => {
-                    let id = query.request.id;
-                    *self = Self::Ready;
-                    Ok(Some((id, result)))
-                }
-                None => Ok(None),
-            },
-            Self::Copy(copy) => match copy.on_message(tag, body)? {
-                Some(result) => {
-                    let id = copy.request.id;
+                    let id = flight.id;
                     *self = Self::Ready;
                     Ok(Some((id, result)))
                 }
@@ -854,7 +789,7 @@ impl Startup {
     }
 }
 
-impl QueryOut {
+impl InFlight {
     fn on_message(
         &mut self,
         max_output: usize,
@@ -862,7 +797,7 @@ impl QueryOut {
         body: &[u8],
     ) -> Result<Option<Result<Output, Error>>, Error> {
         match tag {
-            b'T' => {
+            b'T' if !self.copy => {
                 let columns = Postgres::parse_columns(body)?;
                 self.bytes += body.len();
                 if self.bytes > max_output {
@@ -876,7 +811,7 @@ impl QueryOut {
                 self.columns = columns;
                 Ok(None)
             }
-            b'D' => {
+            b'D' if !self.copy => {
                 let row = Postgres::parse_row(body)?;
                 self.bytes += body.len();
                 if self.bytes > max_output {
@@ -885,14 +820,20 @@ impl QueryOut {
                 self.rows.push(row);
                 Ok(None)
             }
-            b'C' => {
-                self.tag = Some(Postgres::command_tag(body)?);
-                Ok(None)
-            }
-            b'I' => {
+            b'I' if !self.copy => {
                 if self.tag.is_none() {
                     self.tag = Some(String::new());
                 }
+                Ok(None)
+            }
+            b'G' if self.copy => {
+                if self.tag.is_some() || self.error.is_some() {
+                    return Err(Error::Protocol("second COPY FROM STDIN in one copy()"));
+                }
+                Ok(None)
+            }
+            b'C' => {
+                self.tag = Some(Postgres::command_tag(body)?);
                 Ok(None)
             }
             b'E' => {
@@ -912,41 +853,6 @@ impl QueryOut {
             }
             b'R' => Err(Error::Protocol("authentication message outside startup")),
             b'G' => Err(Error::Protocol("COPY FROM STDIN needs copy(), not query()")),
-            b'H' | b'W' | b'c' | b'd' => Err(Error::Protocol("COPY TO STDOUT is not supported")),
-            _ => Ok(None),
-        }
-    }
-}
-
-impl CopyOut {
-    fn on_message(&mut self, tag: u8, body: &[u8]) -> Result<Option<Result<Output, Error>>, Error> {
-        match tag {
-            b'G' => {
-                if self.tag.is_some() || self.error.is_some() {
-                    return Err(Error::Protocol("second COPY FROM STDIN in one copy()"));
-                }
-                Ok(None)
-            }
-            b'C' => {
-                self.tag = Some(Postgres::command_tag(body)?);
-                Ok(None)
-            }
-            b'E' => {
-                self.error = Some(Postgres::parse_error(body));
-                Ok(None)
-            }
-            b'Z' => {
-                let result = match self.error.take() {
-                    Some(error) => Err(Error::Server { code: error.code, message: error.message }),
-                    None => Ok(Output {
-                        tag: self.tag.take().unwrap_or_default(),
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                    }),
-                };
-                Ok(Some(result))
-            }
-            b'R' => Err(Error::Protocol("authentication message outside startup")),
             b'T' | b'D' | b'I' => Err(Error::Protocol("query results arrived in COPY")),
             b'H' | b'W' | b'c' | b'd' => Err(Error::Protocol("COPY TO STDOUT is not supported")),
             _ => Ok(None),

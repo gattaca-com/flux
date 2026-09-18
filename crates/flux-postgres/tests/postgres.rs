@@ -305,6 +305,7 @@ fn binary_batch(rows: &[Row]) -> Vec<u8> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn query_copy_and_error_byte_at_a_time() {
     let (mut net, server_group, addr) = setup();
     let mut pg = Postgres::new(addr).with_database("db").with_connections(2);
@@ -322,6 +323,10 @@ fn query_copy_and_error_byte_at_a_time() {
         d: false,
         e: 0.5,
     }];
+
+    let mut full = Postgres::new(addr).with_max_queued_bytes(1);
+    assert_eq!(full.copy_rows("t", &rows).unwrap_err(), binary_batch(&rows));
+    assert_eq!(full.query("SELECT 1"), None);
 
     let text_rows =
         [TextRow { name: "a\tb", amount: Some(-1) }, TextRow { name: "c", amount: None }];

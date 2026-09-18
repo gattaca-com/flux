@@ -1,7 +1,7 @@
 //! `COPY ... (FORMAT TEXT)` encoding of `serde::Serialize` rows.
 //!
-//! [`encode`] appends one row; [`copy_statement`] and [`encode_columns`]
-//! name the columns after the row's fields. Values are written in their
+//! [`encode`] appends one row; [`encode_batch`] names the columns
+//! after the first row's fields. Values are written in their
 //! text form, so types that serialize as strings reach `Postgres` as the
 //! literal it parses for the column: `chrono` timestamps, `BigDecimal`
 //! numerics, and unit enum variants all work here, unlike
@@ -12,22 +12,7 @@ use std::fmt::{self, Write as _};
 
 use serde::{Serialize, ser};
 
-#[derive(Debug)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl ser::Error for Error {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        Self(message.to_string())
-    }
-}
+use crate::EncodeError as Error;
 
 fn unsupported(what: &str) -> Error {
     Error(format!("{what} has no COPY TEXT encoding"))
@@ -37,14 +22,21 @@ pub fn encode<T: Serialize + ?Sized>(out: &mut Vec<u8>, row: &T) -> Result<(), E
     encode_inner(out, row, None)
 }
 
-/// Encodes one row and replaces `columns` with its column names.
-pub fn encode_columns<T: Serialize + ?Sized>(
+/// Encodes `rows` as one body and returns the first row's column names.
+pub fn encode_batch<T: Serialize>(
     out: &mut Vec<u8>,
-    row: &T,
-    columns: &mut Vec<&'static str>,
-) -> Result<(), Error> {
-    columns.clear();
-    encode_inner(out, row, Some(columns))
+    rows: &[T],
+) -> Result<Vec<&'static str>, Error> {
+    let Some((first, rest)) = rows.split_first() else { return Err(unsupported("an empty batch")) };
+    let mut columns = Vec::new();
+    encode_inner(out, first, Some(&mut columns))?;
+    if columns.is_empty() {
+        return Err(unsupported("a row that is not a struct"));
+    }
+    for row in rest {
+        encode_inner(out, row, None)?;
+    }
+    Ok(columns)
 }
 
 fn encode_inner<T: Serialize + ?Sized>(
@@ -58,20 +50,7 @@ fn encode_inner<T: Serialize + ?Sized>(
     Ok(())
 }
 
-pub fn copy_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<String, Error> {
-    let mut scratch = Vec::new();
-    let mut columns = Vec::new();
-    encode_columns(&mut scratch, row, &mut columns)?;
-    if columns.is_empty() {
-        return Err(unsupported("a row that is not a struct"))
-    }
-    let quoted = columns
-        .iter()
-        .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!("COPY {table} ({quoted}) FROM STDIN (FORMAT TEXT)"))
-}
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 struct Encoder<'a> {
     out: &'a mut Vec<u8>,
@@ -188,7 +167,7 @@ impl ser::Serializer for &mut Encoder<'_> {
     fn serialize_bytes(self, v: &[u8]) -> Result<(), Error> {
         self.out.extend_from_slice(b"\\\\x");
         for byte in v {
-            write!(self.out_writer(), "{byte:02x}").unwrap();
+            self.out.extend_from_slice(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]);
         }
         Ok(())
     }

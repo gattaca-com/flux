@@ -1,32 +1,15 @@
 //! `COPY ... (FORMAT BINARY)` encoding of `serde::Serialize` rows.
 //!
 //! [`encode`] appends one tuple to a body framed by [`header`] and
-//! [`trailer`]; [`copy_statement`] and [`encode_columns`] name the columns
-//! after the row's fields.
+//! [`trailer`]; [`encode_batch`] names the columns after the first
+//! row's fields.
 //! Integers are big-endian and widen to the smallest holding Postgres type
 //! (`u128`/`i128` to `numeric`); enums, `char`, maps, and sequences are
 //! rejected; wrap byte strings in [`crate::Bytea`].
 
-use std::fmt;
-
 use serde::{Serialize, ser};
 
-#[derive(Debug)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl ser::Error for Error {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        Self(message.to_string())
-    }
-}
+use crate::EncodeError as Error;
 
 fn unsupported(what: &str) -> Error {
     Error(format!("{what} has no COPY BINARY encoding"))
@@ -46,14 +29,23 @@ pub fn encode<T: Serialize + ?Sized>(out: &mut Vec<u8>, row: &T) -> Result<(), E
     encode_inner(out, row, None)
 }
 
-/// Encodes one tuple and replaces `columns` with its column names.
-pub fn encode_columns<T: Serialize + ?Sized>(
+/// Encodes `rows` as one framed body and returns the first row's column names.
+pub fn encode_batch<T: Serialize>(
     out: &mut Vec<u8>,
-    row: &T,
-    columns: &mut Vec<&'static str>,
-) -> Result<(), Error> {
-    columns.clear();
-    encode_inner(out, row, Some(columns))
+    rows: &[T],
+) -> Result<Vec<&'static str>, Error> {
+    let Some((first, rest)) = rows.split_first() else { return Err(unsupported("an empty batch")) };
+    header(out);
+    let mut columns = Vec::new();
+    encode_inner(out, first, Some(&mut columns))?;
+    if columns.is_empty() {
+        return Err(unsupported("a row that is not a struct"));
+    }
+    for row in rest {
+        encode_inner(out, row, None)?;
+    }
+    trailer(out);
+    Ok(columns)
 }
 
 fn encode_inner<T: Serialize + ?Sized>(
@@ -71,21 +63,6 @@ fn encode_inner<T: Serialize + ?Sized>(
     Ok(())
 }
 
-pub fn copy_statement<T: Serialize + ?Sized>(table: &str, row: &T) -> Result<String, Error> {
-    let mut scratch = Vec::new();
-    let mut columns = Vec::new();
-    encode_columns(&mut scratch, row, &mut columns)?;
-    if columns.is_empty() {
-        return Err(unsupported("a row that is not a struct"))
-    }
-    let quoted = columns
-        .iter()
-        .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!("COPY {table} ({quoted}) FROM STDIN (FORMAT BINARY)"))
-}
-
 struct Encoder<'a> {
     out: &'a mut Vec<u8>,
     columns: Option<&'a mut Vec<&'static str>>,
@@ -94,10 +71,13 @@ struct Encoder<'a> {
 }
 
 impl Encoder<'_> {
-    fn top_level(&mut self, len: usize) {
-        if self.depth == 0 {
-            self.fields = len;
+    fn container(&mut self, len: usize) -> Result<(), Error> {
+        if self.depth > 0 {
+            return Err(unsupported("a nested container"));
         }
+        self.fields = len;
+        self.depth += 1;
+        Ok(())
     }
     fn single(&mut self) {
         if self.depth == 0 && self.fields == 0 {
@@ -120,17 +100,12 @@ impl Encoder<'_> {
             len = 1;
         }
         let weight = len - 1;
-        let mut start = 0;
-        while len - start > 1 && digits[start] == 0 {
-            start += 1;
-        }
-        let kept = len - start;
-        self.out.extend_from_slice(&((8 + 2 * kept) as u32).to_be_bytes());
-        self.out.extend_from_slice(&(kept as u16).to_be_bytes());
+        self.out.extend_from_slice(&((8 + 2 * len) as u32).to_be_bytes());
+        self.out.extend_from_slice(&(len as u16).to_be_bytes());
         self.out.extend_from_slice(&(weight as u16).to_be_bytes());
         self.out.extend_from_slice(&(if negative { 0x4000u16 } else { 0 }).to_be_bytes());
         self.out.extend_from_slice(&0u16.to_be_bytes());
-        for digit in digits[start..len].iter().rev() {
+        for digit in digits[..len].iter().rev() {
             self.out.extend_from_slice(&digit.to_be_bytes());
         }
     }
@@ -268,11 +243,11 @@ impl ser::Serializer for &mut Encoder<'_> {
         Err(unsupported("a sequence"))
     }
     fn serialize_tuple(self, len: usize) -> Result<Self, Error> {
-        self.top_level(len);
+        self.container(len)?;
         Ok(self)
     }
     fn serialize_tuple_struct(self, _: &'static str, len: usize) -> Result<Self, Error> {
-        self.top_level(len);
+        self.container(len)?;
         Ok(self)
     }
     fn serialize_tuple_variant(
@@ -288,8 +263,7 @@ impl ser::Serializer for &mut Encoder<'_> {
         Err(unsupported("a map"))
     }
     fn serialize_struct(self, _: &'static str, len: usize) -> Result<Self, Error> {
-        self.top_level(len);
-        self.depth += 1;
+        self.container(len)?;
         Ok(self)
     }
     fn serialize_struct_variant(
@@ -312,6 +286,7 @@ macro_rules! elements {
                 v.serialize(&mut **self)
             }
             fn end(self) -> Result<(), Error> {
+                self.depth -= 1;
                 Ok(())
             }
         }
