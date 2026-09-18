@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod spsc;
+
 #[allow(clippy::significant_drop_tightening)]
 fn broadcast_id_for(label: &str, queue: &str) -> usize {
     static COUNTERS: OnceLock<Mutex<HashMap<(String, String), usize>>> = OnceLock::new();
