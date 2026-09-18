@@ -41,6 +41,49 @@ fn basic() {
     }
 }
 
+#[test]
+fn broadcast_epochs_survive_wrap_and_recovery() {
+    for typ in [QueueType::SPMC, QueueType::MPMC] {
+        for requested_len in [1, 3, 8, 32] {
+            let q = Queue::new(requested_len, typ);
+            let capacity = q.n_slots();
+            let mut producer = Producer::from(q);
+            let mut consumer = ConsumerBare::new_broadcast_test(q);
+            let mut message = 0;
+
+            for lap in 0..4 {
+                let messages = (lap * capacity)..((lap + 1) * capacity);
+                for value in messages.clone() {
+                    producer.produce(&value);
+                }
+                for value in messages {
+                    let (slot, epoch) = consumer.try_consume_with_epoch(&mut message).unwrap();
+                    assert_eq!(message, value);
+                    assert_eq!(consumer.slot_version(slot), epoch);
+                }
+                assert_eq!(consumer.try_consume(&mut message), Err(ReadError::Empty));
+            }
+
+            for value in 0..=capacity {
+                producer.produce(&value);
+            }
+            assert_eq!(consumer.try_consume(&mut message), Err(ReadError::SpedPast));
+            consumer.recover_after_error();
+            assert_eq!(consumer.try_consume(&mut message), Err(ReadError::Empty));
+
+            for value in 0..capacity {
+                producer.produce(&value);
+            }
+            for value in 0..capacity {
+                let (slot, epoch) = consumer.try_consume_with_epoch(&mut message).unwrap();
+                assert_eq!(message, value);
+                assert_eq!(consumer.slot_version(slot), epoch);
+            }
+            assert_eq!(consumer.try_consume(&mut message), Err(ReadError::Empty));
+        }
+    }
+}
+
 fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
     // Queue must hold all messages to prevent wrap-around: with a small ring, a
     // slow reader can overshoot the seqlock version across a lap boundary and
