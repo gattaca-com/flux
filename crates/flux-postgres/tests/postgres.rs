@@ -529,21 +529,23 @@ fn scram_login_then_disconnect_recovers() {
 }
 
 /// The acceptance case for the shared core: one poll loop carries a
-/// `Postgres` client and a `ClickHouse` client, and both report their own
-/// outcome.
+/// `Postgres` client, a `ClickHouse` client, and the fake HTTP server they
+/// answer to, each with its own network layer, and both clients report their
+/// own outcome.
 #[test]
 fn one_poll_serves_postgres_and_clickhouse() {
     let (mut net, server_group, pg_addr) = setup();
     let http_addr = free_addr();
     let mut http = HttpNetwork::default();
     http.listen(&mut net, http_addr).unwrap();
-    let ch = ClickHouse::new(&mut http, &mut net, http_addr, 1).with_database("telemetry");
+    let mut ch = ClickHouse::new(http_addr, 1).with_database("telemetry");
+    ch.connect(&mut net);
     let mut pg = Postgres::new(pg_addr).with_database("telemetry");
     pg.connect(&mut net);
 
     let rows = [Row { a: 7, b: "shared".to_owned(), c: Some(1), d: true, e: 2.5 }];
     let copy = pg.copy_rows("fills", &rows).unwrap();
-    let insert = ch.insert_rows(&mut http, "fills", &rows).unwrap();
+    let insert = ch.insert_rows("fills", &rows).unwrap();
 
     let mut server = FakeServer::paced(usize::MAX);
     let mut pg_outcome = None;
@@ -553,7 +555,7 @@ fn one_poll_serves_postgres_and_clickhouse() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && (pg_outcome.is_none() || ch_outcome.is_none()) {
         net.poll_with(|event| {
-            if http.on_event(&event) || pg.on_event(&event) {
+            if ch.on_event(&event) || http.on_event(&event) || pg.on_event(&event) {
                 return;
             }
             match event {
@@ -585,11 +587,12 @@ fn one_poll_serves_postgres_and_clickhouse() {
         });
 
         let mut requests = Vec::new();
+        ch.drive(&mut net, |id, result| {
+            assert_eq!(id, insert);
+            ch_outcome = Some(result.map(<[u8]>::to_vec).map_err(|_| ()));
+        });
         http.drive(&mut net, |event| {
-            if let Some((id, result)) = ch.outcome(&event) {
-                assert_eq!(id, insert);
-                ch_outcome = Some(result.map(<[u8]>::to_vec).map_err(|_| ()));
-            } else if let HttpEvent::Request { token, request } = event {
+            if let HttpEvent::Request { token, request } = event {
                 inserted.push(request.body.to_vec());
                 requests.push(token);
             }

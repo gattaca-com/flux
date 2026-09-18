@@ -18,17 +18,19 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    // One network is both the fake server and the client's pool.
+    // One poll carries the fake server and the client, each with its own
+    // HTTP layer.
     let mut net = TcpNetwork::default();
-    let mut http = HttpNetwork::default();
-    http.listen(&mut net, addr).unwrap();
-    let s3 = S3::new(&mut http, &mut net, addr, 2)
+    let mut server = HttpNetwork::default();
+    server.listen(&mut net, addr).unwrap();
+    let mut s3 = S3::new(addr, 2)
         .with_credentials("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
-    let put = s3.put_object(&mut http, "bucket", "some key+a/b", b"hello".to_vec()).unwrap();
-    let get = s3.get_object(&mut http, "bucket", "key").unwrap();
-    let missing = s3.get_object(&mut http, "bucket", "missing").unwrap();
-    let delete = s3.delete_object(&mut http, "bucket", "key").unwrap();
-    let list = s3.list_objects(&mut http, "bucket", Some("a/b"), Some("t/0")).unwrap();
+    s3.connect(&mut net);
+    let put = s3.put_object("bucket", "some key+a/b", b"hello".to_vec()).unwrap();
+    let get = s3.get_object("bucket", "key").unwrap();
+    let missing = s3.get_object("bucket", "missing").unwrap();
+    let delete = s3.delete_object("bucket", "key").unwrap();
+    let list = s3.list_objects("bucket", Some("a/b"), Some("t/0")).unwrap();
     let mut requests = Vec::new();
     let mut outcomes = Vec::new();
     let mut puts = 0;
@@ -36,18 +38,21 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
     while Instant::now() < deadline && outcomes.len() < 5 {
         let mut replies = Vec::new();
         net.poll_with(|event| {
-            http.on_event(&event);
+            if !s3.on_event(&event) {
+                server.on_event(&event);
+            }
         });
-        http.drive(&mut net, |event| {
-            if let Some((id, result)) = s3.outcome(&event) {
-                outcomes.push((id, match result {
-                    Ok(body) => Ok(body.to_vec()),
-                    Err(Error::Server { status, code, message }) => {
-                        Err((status, code.map(str::to_owned), message.to_vec()))
-                    }
-                    Err(err) => panic!("{err:?}"),
-                }));
-            } else if let HttpEvent::Request { token, request } = event {
+        s3.drive(&mut net, |id, result| {
+            outcomes.push((id, match result {
+                Ok(body) => Ok(body.to_vec()),
+                Err(Error::Server { status, code, message }) => {
+                    Err((status, code.map(str::to_owned), message.to_vec()))
+                }
+                Err(err) => panic!("{err:?}"),
+            }));
+        });
+        server.drive(&mut net, |event| {
+            if let HttpEvent::Request { token, request } = event {
                 if request.method == "PUT" {
                     puts += 1;
                 }
@@ -64,17 +69,17 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
         for (token, method, path, attempt) in replies {
             if method == "PUT" && attempt == 1 {
                 // The first attempt is cut off; the pool must resend it.
-                http.disconnect(&mut net, token);
+                server.disconnect(&mut net, token);
             } else if path == "/bucket/missing" {
-                http.respond(&mut net, token, 404, &[], NOT_FOUND);
+                server.respond(&mut net, token, 404, &[], NOT_FOUND);
             } else if method == "GET" && path == "/bucket/key" {
-                http.respond(&mut net, token, 200, &[], b"hello");
+                server.respond(&mut net, token, 200, &[], b"hello");
             } else if method == "DELETE" {
-                http.respond(&mut net, token, 204, &[], b"");
+                server.respond(&mut net, token, 204, &[], b"");
             } else if path.starts_with("/bucket?") {
-                http.respond(&mut net, token, 200, &[], LIST);
+                server.respond(&mut net, token, 200, &[], LIST);
             } else {
-                http.respond(&mut net, token, 200, &[], b"");
+                server.respond(&mut net, token, 200, &[], b"");
             }
         }
         thread::sleep(Duration::from_millis(1));

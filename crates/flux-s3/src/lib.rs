@@ -1,10 +1,11 @@
 //! `S3` over an [`HttpNetwork`] pool.
 //!
 //! [`S3::put_object`], [`S3::get_object`], [`S3::delete_object`], and
-//! [`S3::list_objects`] queue path-style requests on the network and return a
-//! [`RequestId`]; [`S3::outcome`] picks this client's results out of the
-//! network's events. Every request is SigV4-signed; all operations are
-//! idempotent, so one cut off by a lost connection is resent.
+//! [`S3::list_objects`] queue path-style requests and return a [`RequestId`];
+//! [`S3::connect`] opens the pool, [`S3::on_event`] claims this client's
+//! network events, and [`S3::drive`] sends what is queued and delivers each
+//! outcome. Every request is SigV4-signed; all operations are idempotent, so
+//! one cut off by a lost connection is resent.
 //!
 //! [`S3::new_tls`] speaks HTTPS to real endpoints; [`S3::new`] talks to
 //! plain-HTTP ones (`MinIO`, `LocalStack`, or an HTTP gateway).
@@ -15,8 +16,8 @@ use std::net::SocketAddr;
 
 pub use flux_network::http::RequestId;
 use flux_network::{
-    http::{Failure, HttpEvent, HttpNetwork, HttpPool, HttpResponse},
-    tcp::TcpNetworkCore,
+    http::{Failure, HttpNetwork, HttpPool, HttpResponse},
+    tcp::{TcpEvent, TcpNetworkCore},
 };
 
 const RETRIES: u8 = 3;
@@ -65,85 +66,111 @@ fn error_code(body: &[u8]) -> Option<&str> {
 }
 
 pub struct S3 {
-    pool: HttpPool,
+    addr: SocketAddr,
+    /// SNI and `Host` for a TLS endpoint; `None` leaves the wire plaintext.
+    server: Option<String>,
+    connections: usize,
     signer: sigv4::Signer,
+    http: HttpNetwork,
+    pool: Option<HttpPool>,
 }
 
 impl S3 {
-    /// Opens `connections` to `addr` on `http`.
-    pub fn new(
-        http: &mut HttpNetwork,
-        net: &mut TcpNetworkCore,
-        addr: SocketAddr,
-        connections: usize,
-    ) -> Self {
+    /// Prepares `connections` to a plaintext `addr`.
+    pub fn new(addr: SocketAddr, connections: usize) -> Self {
         Self {
-            pool: http.pool(net, addr, connections),
+            addr,
+            server: None,
+            connections,
             // Plain HTTP has no transport integrity, so the payload hash is
             // the only thing binding a body to its signature.
             signer: sigv4::Signer::new(&addr.to_string(), "", "", "us-east-1"),
+            http: HttpNetwork::default().with_name("s3"),
+            pool: None,
         }
     }
     /// Like [`Self::new`] but over TLS to `addr`, sending and signing
     /// SNI/`Host` `host` (path-style: one pool serves every bucket). Panics
     /// if `host` is not a valid DNS name or IP.
-    pub fn new_tls(
-        http: &mut HttpNetwork,
-        net: &mut TcpNetworkCore,
-        addr: SocketAddr,
-        host: &str,
-        connections: usize,
-    ) -> Self {
+    pub fn new_tls(addr: SocketAddr, host: &str, connections: usize) -> Self {
         Self {
-            pool: http.pool_tls(net, addr, host, connections),
+            server: Some(host.to_owned()),
             // TLS already protects the body, so it is not hashed twice.
             signer: sigv4::Signer::new(host, "", "", "us-east-1").unsigned_payloads(),
+            ..Self::new(addr, connections)
         }
     }
     pub fn with_credentials(mut self, access: &str, secret: &str) -> Self {
+        assert!(self.pool.is_none(), "configure before connect");
         self.signer.set_credentials(access, secret);
         self
     }
     pub fn with_region(mut self, region: &str) -> Self {
+        assert!(self.pool.is_none(), "configure before connect");
         self.signer.set_region(region);
         self
+    }
+    /// Configures the HTTP layer this client owns, through its own builders.
+    pub fn with_http(mut self, configure: impl FnOnce(HttpNetwork) -> HttpNetwork) -> Self {
+        assert!(self.pool.is_none(), "configure before connect");
+        self.http = configure(self.http);
+        self
+    }
+    /// Opens the pool; the builders must have run.
+    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+        assert!(self.pool.is_none(), "connect once");
+        let Self { http, server, addr, connections, .. } = self;
+        self.pool = Some(match server {
+            Some(host) => http.pool_tls(net, *addr, host, *connections),
+            None => http.pool(net, *addr, *connections),
+        });
+    }
+    /// Returns whether the event belonged to this client.
+    pub fn on_event(&mut self, event: &TcpEvent<'_>) -> bool {
+        self.http.on_event(event)
+    }
+    /// Sends queued requests and delivers each finished request's outcome to
+    /// `handler` exactly once.
+    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    where
+        F: for<'a> FnMut(RequestId, Result<&'a [u8], Error<'a>>),
+    {
+        let pool = self.pool.expect("connect before drive");
+        self.http.drive(net, |event| {
+            if let Some((id, result)) = event.outcome(pool) {
+                handler(id, result.map_err(Error::from).and_then(Error::check));
+            }
+        });
+    }
+    /// Removes every pooled endpoint; queued and in-flight requests are
+    /// dropped without outcomes.
+    pub fn close(self, net: &mut TcpNetworkCore) {
+        self.http.close(net);
     }
     /// Queues a PUT of `body` to `bucket/key`; returns it back when the
     /// network refuses it (full queue, or over `max_body_bytes`). S3 answers
     /// `503 SlowDown` under load; back off and resend on it.
     pub fn put_object(
-        &self,
-        http: &mut HttpNetwork,
+        &mut self,
         bucket: &str,
         key: &str,
         body: Vec<u8>,
     ) -> Result<RequestId, Vec<u8>> {
-        self.send(http, "PUT", &object_resource(bucket, key), "", body)
+        self.queue("PUT", &object_resource(bucket, key), "", body)
     }
     /// Queues a GET of `bucket/key`.
-    pub fn get_object(
-        &self,
-        http: &mut HttpNetwork,
-        bucket: &str,
-        key: &str,
-    ) -> Result<RequestId, Vec<u8>> {
-        self.send(http, "GET", &object_resource(bucket, key), "", Vec::new())
+    pub fn get_object(&mut self, bucket: &str, key: &str) -> Result<RequestId, Vec<u8>> {
+        self.queue("GET", &object_resource(bucket, key), "", Vec::new())
     }
     /// Queues a DELETE of `bucket/key`.
-    pub fn delete_object(
-        &self,
-        http: &mut HttpNetwork,
-        bucket: &str,
-        key: &str,
-    ) -> Result<RequestId, Vec<u8>> {
-        self.send(http, "DELETE", &object_resource(bucket, key), "", Vec::new())
+    pub fn delete_object(&mut self, bucket: &str, key: &str) -> Result<RequestId, Vec<u8>> {
+        self.queue("DELETE", &object_resource(bucket, key), "", Vec::new())
     }
     /// Queues a `ListObjectsV2` of `bucket`, returning the raw XML. A
     /// truncated listing carries a `NextContinuationToken`; pass it back as
     /// `continuation_token` for the next page.
     pub fn list_objects(
-        &self,
-        http: &mut HttpNetwork,
+        &mut self,
         bucket: &str,
         prefix: Option<&str>,
         continuation_token: Option<&str>,
@@ -151,20 +178,10 @@ impl S3 {
         let mut resource = String::from("/");
         resource.push_str(bucket);
         let query = list_query(prefix, continuation_token);
-        self.send(http, "GET", &resource, &query, Vec::new())
+        self.queue("GET", &resource, &query, Vec::new())
     }
-    /// This client's result in a network event, if the event was one of its
-    /// requests completing.
-    pub fn outcome<'a>(
-        &self,
-        event: &HttpEvent<'a>,
-    ) -> Option<(RequestId, Result<&'a [u8], Error<'a>>)> {
-        let (id, result) = event.outcome(self.pool)?;
-        Some((id, result.map_err(Error::from).and_then(Error::check)))
-    }
-    fn send(
-        &self,
-        http: &mut HttpNetwork,
+    fn queue(
+        &mut self,
         method: &str,
         resource: &str,
         query: &str,
@@ -177,13 +194,15 @@ impl S3 {
             path.push('?');
             path.push_str(query);
         }
+        let pool = self.pool.expect("connect before queueing requests");
+        let Self { http, signer, .. } = self;
         let headers = [
             ("X-Amz-Date", date.as_str()),
             ("Authorization", authorization.as_str()),
             ("X-Amz-Content-Sha256", payload.as_str()),
-            ("Host", self.signer.host()),
+            ("Host", signer.host()),
         ];
-        http.send(self.pool, method, &path, &headers, body, RETRIES)
+        http.send(pool, method, &path, &headers, body, RETRIES)
     }
 }
 

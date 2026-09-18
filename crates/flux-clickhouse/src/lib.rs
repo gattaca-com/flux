@@ -4,8 +4,8 @@ use std::{fmt::Write as _, net::SocketAddr};
 
 pub use flux_network::http::RequestId;
 use flux_network::{
-    http::{Failure, HttpEvent, HttpNetwork, HttpPool, HttpResponse},
-    tcp::TcpNetworkCore,
+    http::{Failure, HttpNetwork, HttpPool, HttpResponse},
+    tcp::{TcpEvent, TcpNetworkCore},
 };
 use serde::Serialize;
 
@@ -38,27 +38,29 @@ impl<'a> Error<'a> {
 }
 
 pub struct ClickHouse {
-    pool: HttpPool,
+    addr: SocketAddr,
+    connections: usize,
     user: String,
     key: String,
     settings: Vec<(String, String)>,
+    http: HttpNetwork,
+    pool: Option<HttpPool>,
 }
 
 impl ClickHouse {
-    pub fn new(
-        http: &mut HttpNetwork,
-        net: &mut TcpNetworkCore,
-        addr: SocketAddr,
-        connections: usize,
-    ) -> Self {
+    pub fn new(addr: SocketAddr, connections: usize) -> Self {
         Self {
-            pool: http.pool(net, addr, connections),
+            addr,
+            connections,
             user: "default".to_owned(),
             key: String::new(),
             settings: vec![("wait_end_of_query".to_owned(), "1".to_owned())],
+            http: HttpNetwork::default().with_name("clickhouse"),
+            pool: None,
         }
     }
     pub fn with_credentials(mut self, user: &str, key: &str) -> Self {
+        assert!(self.pool.is_none(), "configure before connect");
         user.clone_into(&mut self.user);
         key.clone_into(&mut self.key);
         self
@@ -67,26 +69,54 @@ impl ClickHouse {
         self.with_setting("database", database)
     }
     pub fn with_setting(mut self, name: &str, value: &str) -> Self {
+        assert!(self.pool.is_none(), "configure before connect");
         match self.settings.iter_mut().find(|(n, _)| n == name) {
             Some((_, v)) => value.clone_into(v),
             None => self.settings.push((name.to_owned(), value.to_owned())),
         }
         self
     }
-    pub fn query(&self, http: &mut HttpNetwork, sql: &str) -> Result<RequestId, Vec<u8>> {
-        http.send(self.pool, "POST", &self.path(None), &self.headers(), sql.as_bytes().to_vec(), 0)
+    /// Configures the HTTP layer this client owns, through its own builders.
+    pub fn with_http(mut self, configure: impl FnOnce(HttpNetwork) -> HttpNetwork) -> Self {
+        assert!(self.pool.is_none(), "configure before connect");
+        self.http = configure(self.http);
+        self
     }
-    pub fn insert(
-        &self,
-        http: &mut HttpNetwork,
-        sql: &str,
-        body: Vec<u8>,
-    ) -> Result<RequestId, Vec<u8>> {
-        http.send(self.pool, "POST", &self.path(Some(sql)), &self.headers(), body, 3)
+    /// Opens the pool; the builders must have run.
+    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+        assert!(self.pool.is_none(), "connect once");
+        self.pool = Some(self.http.pool(net, self.addr, self.connections));
+    }
+    /// Returns whether the event belonged to this client.
+    pub fn on_event(&mut self, event: &TcpEvent<'_>) -> bool {
+        self.http.on_event(event)
+    }
+    /// Sends queued requests and delivers each finished request's outcome to
+    /// `handler` exactly once.
+    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    where
+        F: for<'a> FnMut(RequestId, Result<&'a [u8], Error<'a>>),
+    {
+        let pool = self.pool.expect("connect before drive");
+        self.http.drive(net, |event| {
+            if let Some((id, result)) = event.outcome(pool) {
+                handler(id, result.map_err(Error::from).and_then(Error::check));
+            }
+        });
+    }
+    /// Removes every pooled endpoint; queued and in-flight requests are
+    /// dropped without outcomes.
+    pub fn close(self, net: &mut TcpNetworkCore) {
+        self.http.close(net);
+    }
+    pub fn query(&mut self, sql: &str) -> Result<RequestId, Vec<u8>> {
+        self.queue(&self.path(None), sql.as_bytes().to_vec(), 0)
+    }
+    pub fn insert(&mut self, sql: &str, body: Vec<u8>) -> Result<RequestId, Vec<u8>> {
+        self.queue(&self.path(Some(sql)), body, 3)
     }
     pub fn insert_rows<T: Serialize>(
-        &self,
-        http: &mut HttpNetwork,
+        &mut self,
         table: &str,
         rows: &[T],
     ) -> Result<RequestId, Vec<u8>> {
@@ -95,17 +125,13 @@ impl ClickHouse {
         for row in rows {
             rowbinary::encode(&mut body, row).expect("RowBinary row");
         }
-        self.insert(http, &sql, body)
+        self.insert(&sql, body)
     }
-    pub fn outcome<'a>(
-        &self,
-        event: &HttpEvent<'a>,
-    ) -> Option<(RequestId, Result<&'a [u8], Error<'a>>)> {
-        let (id, result) = event.outcome(self.pool)?;
-        Some((id, result.map_err(Error::from).and_then(Error::check)))
-    }
-    fn headers(&self) -> [(&str, &str); 2] {
-        [("X-ClickHouse-User", &self.user), ("X-ClickHouse-Key", &self.key)]
+    fn queue(&mut self, path: &str, body: Vec<u8>, retries: u8) -> Result<RequestId, Vec<u8>> {
+        let pool = self.pool.expect("connect before queueing requests");
+        let Self { http, user, key, .. } = self;
+        let headers = [("X-ClickHouse-User", user.as_str()), ("X-ClickHouse-Key", key.as_str())];
+        http.send(pool, "POST", path, &headers, body, retries)
     }
     fn path(&self, query: Option<&str>) -> String {
         let mut path = String::from("/?");
