@@ -99,6 +99,37 @@ fn collaborative_basic() {
 }
 
 #[test]
+fn collaborative_claims_survive_wrap() {
+    for typ in [QueueType::SPMC, QueueType::MPMC] {
+        for requested_len in [2, 3, 8] {
+            let q = Queue::new(requested_len, typ);
+            let capacity = q.n_slots();
+            let mut producer = Producer::from(q);
+            let mut consumers = [get_collaborative_consumer(&q), get_collaborative_consumer(&q)];
+
+            for lap in 0..4 {
+                let messages = (lap * capacity)..((lap + 1) * capacity);
+                for value in messages.clone() {
+                    producer.produce(&value);
+                }
+                consumers.reverse();
+                let mut received = Vec::new();
+                for _ in 0..(capacity / consumers.len()) {
+                    for consumer in &mut consumers {
+                        assert!(consumer.consume_collaborative(|value| received.push(*value)));
+                    }
+                }
+                received.sort_unstable();
+                assert_eq!(received, messages.collect::<Vec<_>>());
+                for consumer in &mut consumers {
+                    assert!(!consumer.consume_collaborative(|_| panic!("unexpected message")));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn collaborative_multiple_groups() {
     fn drain_sum(consumers: Vec<Consumer<usize>>) -> (usize, usize) {
         let handles: Vec<_> = consumers
