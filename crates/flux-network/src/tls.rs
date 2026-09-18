@@ -59,8 +59,10 @@ mod enabled {
         /// Whether the completed handshake has been reported once.
         announced: bool,
         cipher: Vec<u8>,
+        /// Plaintext that did not fit the caller's buffer, and how much of it
+        /// has been handed back.
         plain: Vec<u8>,
-        read: usize,
+        served: usize,
     }
 
     impl Session {
@@ -75,7 +77,7 @@ mod enabled {
                 announced: false,
                 cipher: Vec::new(),
                 plain: Vec::new(),
-                read: 0,
+                served: 0,
             }
         }
         /// Trusts `config` instead of the Mozilla roots.
@@ -96,7 +98,9 @@ mod enabled {
             self.started = Some(Instant::now());
             self.announced = false;
             self.plain.clear();
-            self.read = 0;
+            self.served = 0;
+            // Allocated once here rather than checked on every read.
+            self.cipher.resize(CIPHER_CHUNK, 0);
             self.take_pending(out);
         }
         pub fn is_handshaking(&self) -> bool {
@@ -147,49 +151,65 @@ mod enabled {
             buf: &mut [u8],
         ) -> io::Result<usize> {
             use std::io::Read as _;
-            loop {
-                if self.read < self.plain.len() {
-                    let taken = (&self.plain[self.read..]).read(buf)?;
-                    self.read += taken;
-                    if self.read == self.plain.len() {
-                        self.plain.clear();
-                        self.read = 0;
-                    }
-                    return Ok(taken)
+            // Whatever a previous read could not hand over comes first.
+            if self.served < self.plain.len() {
+                let taken = (&self.plain[self.served..]).read(buf)?;
+                self.served += taken;
+                if self.served == self.plain.len() {
+                    self.plain.clear();
+                    self.served = 0;
                 }
-                if self.fill(socket)? == 0 {
+                return Ok(taken)
+            }
+            self.fill(socket, buf)
+        }
+        /// Pulls socket reads through the session until it yields plaintext,
+        /// decrypting straight into `buf` and spilling only what will not fit.
+        fn fill<R: io::Read>(&mut self, socket: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+            use std::io::Read as _;
+            loop {
+                let Self { conn, cipher, plain, .. } = self;
+                let Some(conn) = conn.as_mut() else {
+                    return Err(io::Error::other("TLS bytes before the handshake started"))
+                };
+                // One syscall per fill: rustls reads at most 4KB per
+                // read_tls, so feeding it the socket directly would cost a
+                // syscall per record.
+                let read = socket.read(cipher)?;
+                if read == 0 {
                     return Ok(0)
                 }
-            }
-        }
-        /// Pulls one socket read through the session, appending whatever
-        /// plaintext it yields. Returns the ciphertext byte count.
-        fn fill<R: io::Read>(&mut self, socket: &mut R) -> io::Result<usize> {
-            use std::io::Read as _;
-            let Self { conn, cipher, plain, .. } = self;
-            let Some(conn) = conn.as_mut() else {
-                return Err(io::Error::other("TLS bytes before the handshake started"))
-            };
-            // One syscall per fill: rustls reads at most 4KB per read_tls, so
-            // feeding it the socket directly would cost a syscall per record.
-            cipher.resize(CIPHER_CHUNK, 0);
-            let read = socket.read(cipher)?;
-            if read == 0 {
-                return Ok(0)
-            }
-            // read_tls also refuses entry once ~16KB of plaintext is
-            // undrained, so process and drain after every slice read.
-            let mut pending = &cipher[..read];
-            while !pending.is_empty() {
-                conn.read_tls(&mut pending)?;
-                conn.process_new_packets().map_err(io::Error::other)?;
-                match conn.reader().read_to_end(plain) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error),
+                // read_tls also refuses entry once ~16KB of plaintext is
+                // undrained, so process and drain after every slice read.
+                let mut pending = &cipher[..read];
+                let mut filled = 0;
+                while !pending.is_empty() {
+                    conn.read_tls(&mut pending)?;
+                    conn.process_new_packets().map_err(io::Error::other)?;
+                    // Decrypt into the caller's buffer, which a whole fill
+                    // normally fits, so nothing is copied twice.
+                    while filled < buf.len() {
+                        match conn.reader().read(&mut buf[filled..]) {
+                            Ok(0) => break,
+                            Ok(taken) => filled += taken,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if filled == buf.len() {
+                        match conn.reader().read_to_end(plain) {
+                            Ok(_) => {}
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                // A read that carried only handshake records yields nothing
+                // to hand back; the next one may, or it blocks and says so.
+                if filled > 0 {
+                    return Ok(filled)
                 }
             }
-            Ok(read)
         }
     }
 }

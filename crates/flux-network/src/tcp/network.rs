@@ -304,19 +304,20 @@ struct Connection {
     close_when_drained: bool,
     timers: Option<NetworkTimers>,
     /// Client TLS for this endpoint; `None` leaves the wire in plaintext.
-    tls: Option<Session>,
+    /// Boxed so a plaintext connection carries a pointer, not a session.
+    tls: Option<Box<Session>>,
 }
 
 impl Connection {
     /// Whether a TLS connection is still negotiating and cannot carry
     /// application bytes yet.
     fn is_handshaking(&self) -> bool {
-        self.tls.as_ref().is_some_and(Session::is_handshaking)
+        self.tls.as_ref().is_some_and(|tls| tls.is_handshaking())
     }
     /// Whether this connection has been reported as established. Plaintext
     /// connections are announced as soon as the socket connects.
     fn announced(&self) -> bool {
-        self.tls.as_ref().is_none_or(Session::announced)
+        self.tls.as_ref().is_none_or(|tls| tls.announced())
     }
 }
 
@@ -411,7 +412,12 @@ impl NetworkState {
         Ok(())
     }
 
-    fn connect(&mut self, group: TcpGroup, peer_addr: SocketAddr, tls: Option<Session>) -> Token {
+    fn connect(
+        &mut self,
+        group: TcpGroup,
+        peer_addr: SocketAddr,
+        tls: Option<Box<Session>>,
+    ) -> Token {
         assert!(group.0 < self.groups.len(), "unknown TCP group");
         let token = self.next_token();
         let config = self.config(group);
@@ -742,7 +748,8 @@ impl NetworkState {
             self.disconnect_index(index, false);
         } else if self.connections[index].close_when_drained && queue_empty {
             self.disconnect_index(index, true);
-        } else if self.connections[index].tls.as_ref().is_some_and(Session::handshake_completed) {
+        } else if self.connections[index].tls.as_ref().is_some_and(|tls| tls.handshake_completed())
+        {
             // The encrypted connection is usable now; `on_connect_msg` goes
             // out through the normal send path so it is encrypted too.
             if let Some(message) = self.groups[group.0].config.on_connect_msg.clone() &&
@@ -1182,7 +1189,7 @@ impl TcpNetworkCore {
     /// every payload is encrypted; framing applies inside the session.
     #[must_use = "the token identifies the persistent outbound endpoint"]
     pub fn connect_tls(&mut self, group: TcpGroup, peer_addr: SocketAddr, tls: Session) -> Token {
-        self.state.connect(group, peer_addr, Some(tls))
+        self.state.connect(group, peer_addr, Some(Box::new(tls)))
     }
 
     /// Serializes and sends one payload to a connected token. Length-prefixed
@@ -1373,7 +1380,7 @@ impl TcpNetworkWithExternalPoll {
 /// Reads plaintext from `socket`, decrypting through `tls` when present.
 fn read_plaintext(
     socket: &mut mio::net::TcpStream,
-    tls: &mut Option<Session>,
+    tls: &mut Option<Box<Session>>,
     buf: &mut [u8],
 ) -> io::Result<usize> {
     match tls {
@@ -1543,7 +1550,7 @@ impl FramedStream {
         event: &Event,
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
-        tls: &mut Option<Session>,
+        tls: &mut Option<Box<Session>>,
         on_message: &mut F,
     ) -> StreamState
     where
@@ -1599,7 +1606,11 @@ impl FramedStream {
         StreamState::Alive
     }
 
-    fn read_frame(&mut self, max_frame_size: usize, tls: &mut Option<Session>) -> ReadOutcome<'_> {
+    fn read_frame(
+        &mut self,
+        max_frame_size: usize,
+        tls: &mut Option<Box<Session>>,
+    ) -> ReadOutcome<'_> {
         loop {
             match self.rx_state {
                 RxState::Header { mut bytes, mut have } => {

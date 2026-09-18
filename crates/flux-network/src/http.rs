@@ -318,7 +318,7 @@ impl HttpNetwork {
             {
                 let limit = self.buffer_limit();
                 if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
-                    !is_draining(&conn.role) &&
+                    !conn.role.is_draining() &&
                     !conn.over_limit
                 {
                     let available = limit.saturating_sub(conn.buf.len());
@@ -355,7 +355,7 @@ impl HttpNetwork {
         }
         self.parse_dirty(net, &mut handler);
         for conn in &mut self.conns {
-            if conn.over_limit && !is_draining(&conn.role) {
+            if conn.over_limit && !conn.role.is_draining() {
                 net.disconnect(conn.token);
                 conn.over_limit = false;
             }
@@ -382,10 +382,10 @@ impl HttpNetwork {
                 if in_flight.sent_at.elapsed() < timeout {
                     continue
                 }
-                if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) {
+                if let Some(in_flight) = self.conns[i].role.take_in_flight() {
                     self.failed.push((in_flight.queued.id, Failure::TimedOut));
                 }
-                set_outbound_head(&mut self.conns[i].role, None);
+                self.conns[i].role.set_outbound_head(None);
                 net.disconnect(self.conns[i].token);
             }
         }
@@ -412,8 +412,8 @@ impl HttpNetwork {
                         let answered = self.parse_eof_outbound(i, handler);
                         self.conns[i].buf.clear();
                         self.conns[i].dirty = false;
-                        set_outbound_head(&mut self.conns[i].role, None);
-                        if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) &&
+                        self.conns[i].role.set_outbound_head(None);
+                        if let Some(in_flight) = self.conns[i].role.take_in_flight() &&
                             !answered
                         {
                             self.requeue_or_fail(in_flight.queued);
@@ -558,7 +558,7 @@ impl HttpNetwork {
             return false
         }
         let Some(c) =
-            self.conns.iter_mut().find(|c| c.token == token && outbound_head(&c.role).is_none())
+            self.conns.iter_mut().find(|c| c.token == token && c.role.outbound_head().is_none())
         else {
             return false
         };
@@ -569,7 +569,7 @@ impl HttpNetwork {
             out.extend_from_slice(body);
         });
         if sent {
-            set_outbound_head(&mut c.role, Some(method.eq_ignore_ascii_case("HEAD")));
+            c.role.set_outbound_head(Some(method.eq_ignore_ascii_case("HEAD")));
         }
         sent
     }
@@ -613,7 +613,7 @@ impl HttpNetwork {
                 let Some(i) = self
                     .conns
                     .iter()
-                    .position(|c| c.token == token && outbound_head(&c.role).is_none())
+                    .position(|c| c.token == token && c.role.outbound_head().is_none())
                 else {
                     continue
                 };
@@ -627,7 +627,7 @@ impl HttpNetwork {
                 }
                 let queued = self.pools[p].queue.pop_front().unwrap();
                 self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
-                set_outbound_head(&mut self.conns[i].role, Some(queued.head_request));
+                self.conns[i].role.set_outbound_head(Some(queued.head_request));
                 if let Role::Outbound { in_flight, .. } = &mut self.conns[i].role {
                     *in_flight = Some(InFlight { queued, sent_at: Instant::now() });
                 }
@@ -647,7 +647,7 @@ impl HttpNetwork {
     fn fail_outbound(&mut self, net: &mut TcpNetworkCore, i: usize) {
         let token = self.conns[i].token;
         self.conns[i].buf.clear();
-        set_outbound_head(&mut self.conns[i].role, None);
+        self.conns[i].role.set_outbound_head(None);
         net.disconnect(token);
     }
     fn buffer_limit(&self) -> usize {
@@ -657,7 +657,7 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if !matches!(accepted_state_mut(&mut self.conns[i].role), State::Idle) {
+        if !matches!(self.conns[i].role.accepted_state_mut(), State::Idle) {
             return
         }
         let over_limit = self.conns[i].over_limit;
@@ -707,12 +707,12 @@ impl HttpNetwork {
                 return
             }
             if has_token(req.headers, "expect", b"100-continue") &&
-                !accepted_continued_mut(&self.conns[i].role)
+                !self.conns[i].role.accepted_continued()
             {
                 let token = self.conns[i].token;
                 if net.send_with(token, |out| write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap())
                 {
-                    set_accepted_continued(&mut self.conns[i].role, true);
+                    self.conns[i].role.set_accepted_continued(true);
                 }
             }
             return
@@ -731,14 +731,14 @@ impl HttpNetwork {
         handler(HttpEvent::Request { token, request });
         self.conns[i].buf.drain(..end);
         self.conns[i].dirty = !self.conns[i].buf.is_empty();
-        set_accepted_state(&mut self.conns[i].role, State::Pending);
-        set_accepted_close(&mut self.conns[i].role, close);
-        set_accepted_continued(&mut self.conns[i].role, false);
-        set_accepted_head_request(&mut self.conns[i].role, head_request);
+        self.conns[i].role.set_accepted_state(State::Pending);
+        self.conns[i].role.set_accepted_close(close);
+        self.conns[i].role.set_accepted_continued(false);
+        self.conns[i].role.set_accepted_head_request(head_request);
     }
     fn error(&mut self, net: &mut TcpNetworkCore, i: usize, status: u16) {
-        set_accepted_state(&mut self.conns[i].role, State::Pending);
-        set_accepted_close(&mut self.conns[i].role, true);
+        self.conns[i].role.set_accepted_state(State::Pending);
+        self.conns[i].role.set_accepted_close(true);
         let token = self.conns[i].token;
         let _ = self.respond(net, token, status, &[], &[]);
     }
@@ -758,7 +758,7 @@ impl HttpNetwork {
         let Some(i) = self
             .conns
             .iter()
-            .position(|c| c.token == token && matches!(accepted_state(&c.role), State::Pending))
+            .position(|c| c.token == token && matches!(c.role.accepted_state(), State::Pending))
         else {
             return false
         };
@@ -775,9 +775,9 @@ impl HttpNetwork {
         let caller_close = headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case("connection") && has_value_token(v.as_bytes(), b"close")
         });
-        let close = accepted_close(&self.conns[i].role) || caller_close;
+        let close = self.conns[i].role.accepted_close() || caller_close;
         let suppress_body =
-            accepted_head_request(&self.conns[i].role) || matches!(status, 100..=199 | 204 | 304);
+            self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
         let ok = net.send_with(token, |out| {
             write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
@@ -807,10 +807,11 @@ impl HttpNetwork {
         });
         if ok {
             self.conns[i].dirty = !close && !self.conns[i].buf.is_empty();
-            set_accepted_state(
-                &mut self.conns[i].role,
-                if close { State::Draining } else { State::Idle },
-            );
+            self.conns[i].role.set_accepted_state(if close {
+                State::Draining
+            } else {
+                State::Idle
+            });
             if close {
                 net.disconnect_when_drained(token);
             }
@@ -822,7 +823,7 @@ impl HttpNetwork {
         F: for<'a> FnMut(HttpEvent<'a>),
     {
         self.conns[i].dirty = false;
-        while outbound_head(&self.conns[i].role).is_some() {
+        while self.conns[i].role.outbound_head().is_some() {
             let b = &self.conns[i].buf;
             let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
             let mut response = httparse::Response::new(&mut hs);
@@ -843,7 +844,7 @@ impl HttpNetwork {
                 return
             }
             let status = response.code.unwrap_or(0);
-            let no_body = outbound_head(&self.conns[i].role) == Some(true) ||
+            let no_body = self.conns[i].role.outbound_head() == Some(true) ||
                 matches!(status, 100..=199 | 204 | 304);
             let chunked = transfer_chunked(response.headers);
             let content_length = response_content_length(response.headers);
@@ -892,7 +893,7 @@ impl HttpNetwork {
                 continue
             }
             let token = self.conns[i].token;
-            let id = in_flight_id(&self.conns[i].role);
+            let id = self.conns[i].role.in_flight_id();
             let close = response.version == Some(0) &&
                 !has_token(response.headers, "connection", b"keep-alive") ||
                 has_token(response.headers, "connection", b"close");
@@ -912,8 +913,8 @@ impl HttpNetwork {
             handler(HttpEvent::Response { token, id, response: response_event });
             self.conns[i].buf.drain(..consumed);
             self.conns[i].dirty = !self.conns[i].buf.is_empty();
-            set_outbound_head(&mut self.conns[i].role, None);
-            take_in_flight(&mut self.conns[i].role);
+            self.conns[i].role.set_outbound_head(None);
+            self.conns[i].role.take_in_flight();
             if close {
                 net.disconnect(token);
                 return
@@ -924,7 +925,7 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if outbound_head(&self.conns[i].role).is_none() {
+        if self.conns[i].role.outbound_head().is_none() {
             return false
         }
         let b = &self.conns[i].buf;
@@ -935,7 +936,7 @@ impl HttpNetwork {
             return false
         }
         let status = response.code.unwrap_or(0);
-        let no_body = outbound_head(&self.conns[i].role) == Some(true) ||
+        let no_body = self.conns[i].role.outbound_head() == Some(true) ||
             matches!(status, 100..=199 | 204 | 304);
         if no_body ||
             transfer_chunked(response.headers) != Some(false) ||
@@ -947,7 +948,7 @@ impl HttpNetwork {
         let token = self.conns[i].token;
         handler(HttpEvent::Response {
             token,
-            id: in_flight_id(&self.conns[i].role),
+            id: self.conns[i].role.in_flight_id(),
             response: HttpResponse {
                 version: response.version.unwrap_or(1),
                 status,
@@ -1089,69 +1090,71 @@ fn write_head(
     }
     write!(out, "Content-Length: {body_len}\r\n\r\n").unwrap();
 }
-fn in_flight_id(role: &Role) -> Option<RequestId> {
-    match role {
-        Role::Outbound { in_flight: Some(in_flight), .. } => Some(in_flight.queued.id),
-        _ => None,
+impl Role {
+    fn in_flight_id(&self) -> Option<RequestId> {
+        match self {
+            Self::Outbound { in_flight: Some(in_flight), .. } => Some(in_flight.queued.id),
+            _ => None,
+        }
     }
-}
-fn take_in_flight(role: &mut Role) -> Option<InFlight> {
-    match role {
-        Role::Outbound { in_flight, .. } => in_flight.take(),
-        Role::Accepted { .. } => None,
+    fn take_in_flight(&mut self) -> Option<InFlight> {
+        match self {
+            Self::Outbound { in_flight, .. } => in_flight.take(),
+            Self::Accepted { .. } => None,
+        }
     }
-}
-fn accepted_state(role: &Role) -> State {
-    match role {
-        Role::Accepted { state, .. } => *state,
-        Role::Outbound { .. } => State::Draining,
+    fn accepted_state(&self) -> State {
+        match self {
+            Self::Accepted { state, .. } => *state,
+            Self::Outbound { .. } => State::Draining,
+        }
     }
-}
-fn accepted_state_mut(role: &mut Role) -> &mut State {
-    match role {
-        Role::Accepted { state, .. } => state,
-        Role::Outbound { .. } => panic!("accepted role"),
+    fn accepted_state_mut(&mut self) -> &mut State {
+        match self {
+            Self::Accepted { state, .. } => state,
+            Self::Outbound { .. } => panic!("accepted role"),
+        }
     }
-}
-fn is_draining(role: &Role) -> bool {
-    matches!(role, Role::Accepted { state: State::Draining, .. })
-}
-fn set_accepted_state(role: &mut Role, state: State) {
-    *accepted_state_mut(role) = state;
-}
-fn accepted_close(role: &Role) -> bool {
-    matches!(role, Role::Accepted { close: true, .. })
-}
-fn set_accepted_close(role: &mut Role, close: bool) {
-    if let Role::Accepted { close: current, .. } = role {
-        *current = close;
+    fn is_draining(&self) -> bool {
+        matches!(self, Self::Accepted { state: State::Draining, .. })
     }
-}
-fn accepted_continued_mut(role: &Role) -> bool {
-    matches!(role, Role::Accepted { continued: true, .. })
-}
-fn set_accepted_continued(role: &mut Role, continued: bool) {
-    if let Role::Accepted { continued: current, .. } = role {
-        *current = continued;
+    fn set_accepted_state(&mut self, state: State) {
+        *self.accepted_state_mut() = state;
     }
-}
-fn accepted_head_request(role: &Role) -> bool {
-    matches!(role, Role::Accepted { head_request: true, .. })
-}
-fn set_accepted_head_request(role: &mut Role, head_request: bool) {
-    if let Role::Accepted { head_request: current, .. } = role {
-        *current = head_request;
+    fn accepted_close(&self) -> bool {
+        matches!(self, Self::Accepted { close: true, .. })
     }
-}
-fn outbound_head(role: &Role) -> Option<bool> {
-    match role {
-        Role::Outbound { in_flight_head, .. } => *in_flight_head,
-        Role::Accepted { .. } => None,
+    fn set_accepted_close(&mut self, close: bool) {
+        if let Self::Accepted { close: current, .. } = self {
+            *current = close;
+        }
     }
-}
-fn set_outbound_head(role: &mut Role, head_request: Option<bool>) {
-    if let Role::Outbound { in_flight_head: current, .. } = role {
-        *current = head_request;
+    fn accepted_continued(&self) -> bool {
+        matches!(self, Self::Accepted { continued: true, .. })
+    }
+    fn set_accepted_continued(&mut self, continued: bool) {
+        if let Self::Accepted { continued: current, .. } = self {
+            *current = continued;
+        }
+    }
+    fn accepted_head_request(&self) -> bool {
+        matches!(self, Self::Accepted { head_request: true, .. })
+    }
+    fn set_accepted_head_request(&mut self, head_request: bool) {
+        if let Self::Accepted { head_request: current, .. } = self {
+            *current = head_request;
+        }
+    }
+    fn outbound_head(&self) -> Option<bool> {
+        match self {
+            Self::Outbound { in_flight_head, .. } => *in_flight_head,
+            Self::Accepted { .. } => None,
+        }
+    }
+    fn set_outbound_head(&mut self, head_request: Option<bool>) {
+        if let Self::Outbound { in_flight_head: current, .. } = self {
+            *current = head_request;
+        }
     }
 }
 
