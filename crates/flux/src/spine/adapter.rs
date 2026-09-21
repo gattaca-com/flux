@@ -150,8 +150,10 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineSpscConsumer<T>>,
         F: FnMut(T, &mut S::Producers),
     {
-        while self.try_consume_one(&mut f)? {}
-        Ok(())
+        self.try_consume_maybe_track(|message, producers| {
+            f(message, producers);
+            true
+        })
     }
 
     /// Drain SPSC values, recording timings only when the callback returns
@@ -168,8 +170,9 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineSpscConsumer<T>>,
         F: FnMut(T, &mut S::Producers) -> bool,
     {
-        while self.try_consume_one_maybe_track(&mut f)? {}
-        Ok(())
+        self.try_consume_internal_message_maybe_track(|message, producers| {
+            f(message.into_data(), producers)
+        })
     }
 
     /// Consume at most one SPSC message, returning whether one was available.
@@ -236,7 +239,10 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: AsMut<SpineSpscConsumer<T>>,
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
     {
-        while self.try_consume_internal_message_one_maybe_track(&mut f)? {}
+        let mut consumer = self.consumers.as_mut().try_attached()?;
+        while consumer.consume_internal_message_maybe_track(&mut self.producers, &mut f) {
+            self.did_work = true;
+        }
         Ok(())
     }
 

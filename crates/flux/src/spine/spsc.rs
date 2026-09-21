@@ -166,6 +166,34 @@ pub struct SpineSpscConsumer<T: Copy> {
     timer: Timer,
 }
 
+/// Borrows an attached endpoint and timer for repeated consumption.
+pub(super) struct AttachedSpscConsumer<'a, T: Copy> {
+    inner: &'a mut spsc::Consumer<InternalMessage<T>>,
+    timer: &'a mut Timer,
+}
+
+impl<T: Copy> AttachedSpscConsumer<'_, T> {
+    #[inline]
+    pub(super) fn consume_internal_message_maybe_track<P, F>(
+        &mut self,
+        producers: &mut P,
+        mut f: F,
+    ) -> bool
+    where
+        P: SpineProducers,
+        F: FnMut(&mut InternalMessage<T>, &mut P) -> bool,
+    {
+        self.inner.consume(|message| {
+            *producers.timestamp_mut().ingestion_t_mut() = message.ingestion_time();
+            self.timer.start();
+            if f(message, producers) {
+                self.timer
+                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
+            }
+        })
+    }
+}
+
 impl<T: 'static + Copy> SpineSpscConsumer<T> {
     pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineSpscQueue<T>) -> Self
     where
@@ -194,6 +222,13 @@ impl<T: 'static + Copy> SpineSpscConsumer<T> {
             self.inner = Some(self.queue.inner.try_consumer()?);
         }
         Ok(())
+    }
+
+    /// Claim the role if needed, then borrow the endpoint and timer.
+    #[inline]
+    pub(super) fn try_attached(&mut self) -> Result<AttachedSpscConsumer<'_, T>, spsc::QueueError> {
+        self.try_attach()?;
+        Ok(AttachedSpscConsumer { inner: self.inner.as_mut().unwrap(), timer: &mut self.timer })
     }
 
     /// Consume one value with Spine ingestion/latency tracking. The message is
@@ -256,21 +291,13 @@ impl<T: 'static + Copy> SpineSpscConsumer<T> {
     pub fn try_consume_internal_message_maybe_track<P, F>(
         &mut self,
         producers: &mut P,
-        mut f: F,
+        f: F,
     ) -> Result<bool, spsc::QueueError>
     where
         P: SpineProducers,
         F: FnMut(&mut InternalMessage<T>, &mut P) -> bool,
     {
-        self.try_attach()?;
-        Ok(self.inner.as_mut().unwrap().consume(|message| {
-            *producers.timestamp_mut().ingestion_t_mut() = message.ingestion_time();
-            self.timer.start();
-            if f(message, producers) {
-                self.timer
-                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
-            }
-        }))
+        Ok(self.try_attached()?.consume_internal_message_maybe_track(producers, f))
     }
 }
 

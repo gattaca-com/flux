@@ -261,6 +261,113 @@ fn spsc_optional_tracking_preserves_consumer_attachment_errors() {
 }
 
 #[test]
+fn spsc_drain_panic_preserves_completed_work_and_releases_consumed_slots() {
+    for mode in 0..3 {
+        for completed in 0..2 {
+            for already_worked in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut spine = new_mixed_spine(tmp.path());
+                let mut producer = SpineAdapter::connect_tile(&LeftTile, &mut spine);
+                let mut consumer = SpineAdapter::connect_tile(&RightTile, &mut spine);
+                let queues = spsc_timing_queues(tmp.path());
+                let before = queues.map(|queue| queue.count());
+                let values = [11, 22];
+                for value in values {
+                    producer.try_produce(SpscMessage(value)).unwrap();
+                }
+                consumer.begin_loop(IngestionTime::now());
+                if already_worked {
+                    consumer.mark_work();
+                }
+                let mut received = Vec::new();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut handle = |message: SpscMessage, _: &mut MixedSpineProducers| {
+                        received.push(message.0);
+                        if received.len() > completed {
+                            producer.try_produce(SpscMessage(33)).expect("slot already released");
+                            panic!("intentional callback panic");
+                        }
+                        false
+                    };
+                    match mode {
+                        0 => consumer.try_consume(|message, producers| {
+                            handle(message, producers);
+                        }),
+                        1 => consumer.try_consume_maybe_track(handle),
+                        _ => consumer.try_consume_internal_message_maybe_track(
+                            |message: &mut InternalMessage<SpscMessage>, producers| {
+                                handle(message.into_data(), producers)
+                            },
+                        ),
+                    }
+                    .unwrap();
+                }));
+                assert!(result.is_err());
+                assert_eq!(received, values[..=completed]);
+                assert_eq!(consumer.did_work(), already_worked || completed > 0);
+                for (queue, before) in queues.into_iter().zip(before) {
+                    let tracked = if mode == 0 { completed } else { 0 };
+                    assert_eq!(queue.count() - before, tracked, "only completed callbacks record");
+                }
+                let mut remaining = Vec::new();
+                consumer
+                    .try_consume_maybe_track(|message: SpscMessage, _| {
+                        remaining.push(message.0);
+                        false
+                    })
+                    .unwrap();
+                let expected: Vec<_> =
+                    values[completed + 1..].iter().copied().chain([33]).collect();
+                assert_eq!(remaining, expected, "panicking callbacks do not redeliver messages");
+                drop(producer);
+                drop(consumer);
+                drop(spine);
+                cleanup_shmem(tmp.path());
+            }
+        }
+    }
+}
+
+#[test]
+fn spsc_drain_includes_messages_published_by_callbacks() {
+    for mode in 0..3 {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spine = new_mixed_spine(tmp.path());
+        let mut producer = SpineAdapter::connect_tile(&LeftTile, &mut spine);
+        let mut consumer = SpineAdapter::connect_tile(&RightTile, &mut spine);
+        for value in [11, 22] {
+            producer.try_produce(SpscMessage(value)).unwrap();
+        }
+        let mut received = Vec::new();
+        let mut handle = |message: SpscMessage, _: &mut MixedSpineProducers| {
+            received.push(message.0);
+            if received.len() == 1 {
+                producer.try_produce(SpscMessage(33)).expect("slot already released");
+            }
+            false
+        };
+        match mode {
+            0 => consumer.try_consume(|message, producers| {
+                handle(message, producers);
+            }),
+            1 => consumer.try_consume_maybe_track(handle),
+            _ => consumer.try_consume_internal_message_maybe_track(
+                |message: &mut InternalMessage<SpscMessage>, producers| {
+                    handle(message.into_data(), producers)
+                },
+            ),
+        }
+        .unwrap();
+        assert_eq!(received, [11, 22, 33], "drain continues until it observes an empty queue");
+        assert!(consumer.did_work());
+        drop(producer);
+        drop(consumer);
+        drop(spine);
+        cleanup_shmem(tmp.path());
+    }
+}
+
+#[test]
 fn mixed_spine_configures_spsc_capacity_and_shared_memory_path() {
     let tmp = tempfile::tempdir().expect("create temp directory");
     let config =
