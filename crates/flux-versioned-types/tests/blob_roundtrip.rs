@@ -8,10 +8,10 @@ use flux_utils::ArrayStr;
 use flux_versioned_types::{
     Blob, BlobCache, BlobHeader, ByteStable, DecodeError, HasVersionedLeaves, Scratch,
     TrackingTimestampWire, TrackingTimestampWireV1, Versioned, VersionedLeaves,
-    VisitorVersionedLeaf,
+    VersionedPersistable, VisitorVersionedLeaf,
     byte_stable::slice_as_bytes,
     raw::{FORMAT_VERSION, MAGIC},
-    versioned_enum, versioned_struct,
+    versioned_enum, versioned_struct, versioned_telemetry,
 };
 
 versioned_struct!(Leaf =>
@@ -43,6 +43,16 @@ versioned_struct!(Flag =>
     #[type_hash_lock(hash = 17693854425529480628)]
     FlagV1 { pub ok: bool }
 );
+
+versioned_telemetry!(Persisted, persist = "some.dir.name" =>
+    #[type_hash_lock(hash = 15368644949532225431)]
+    PersistedV1 { pub x: u64 }
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
+enum Stored {
+    P(Persisted),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 enum Sub {
@@ -386,6 +396,26 @@ fn family_blobs_decode_to_variants() {
     );
     let blob = a.load(&other).unwrap();
     assert!(Fam::decode_blob::<MetaV1>(blob, &mut b).is_none());
+}
+
+#[test]
+fn persist_dir_names_the_leaf() {
+    assert_eq!(<Persisted as Versioned>::NAME, "some.dir.name");
+    assert_eq!(<Persisted as VersionedPersistable>::PERSIST_DIR, "some.dir.name");
+    assert_eq!(Stored::LEAF_NAMES, &["some.dir.name"]);
+
+    let mut cache = BlobCache::new();
+    cache.push(&InternalMessage::new(stamp(1, 1), Stored::P(Persisted { x: 7 })));
+    let meta = MetaV1 { slot: 1, instance: ArrayStr::try_from("p").unwrap() };
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
+    assert_eq!(blobs.len(), 1);
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let blob = a.load(&blobs[0]).unwrap();
+    assert_eq!(blob.type_name(), "some.dir.name");
+    let (_, msgs) = Stored::decode_blob::<MetaV1>(blob, &mut b).unwrap().unwrap();
+    assert_eq!(msgs[0].data(), &Stored::P(Persisted { x: 7 }));
 }
 
 #[test]
