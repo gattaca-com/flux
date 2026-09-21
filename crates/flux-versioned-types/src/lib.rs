@@ -32,16 +32,15 @@ pub use byte_stable_derive::ByteStable;
 /// enum Fam { S(Sub), L(Leaf) }
 /// ```
 ///
-/// A name override on a variant that holds a sub-family does not build:
+/// Two variants holding the same leaf type do not build either; wrap one in
+/// its own leaf type instead:
 ///
 /// ```compile_fail
 /// use flux::type_hash_derive::type_hash_lock;
 /// use flux_versioned_types::{VersionedLeaves, versioned_struct};
 /// versioned_struct!(Leaf => #[type_hash_lock(hash = 10148638565996157175)] LeafV1 { pub v: u64 });
 /// #[derive(Clone, Copy, VersionedLeaves)]
-/// enum Sub { A(Leaf) }
-/// #[derive(Clone, Copy, VersionedLeaves)]
-/// enum Fam { #[leaves(name = "x")] S(Sub) }
+/// enum Fam { A(Leaf), B(Leaf) }
 /// ```
 pub use flux_versioned_types_macros::VersionedLeaves;
 pub use flux_versioned_types_macros::{
@@ -249,17 +248,18 @@ macro_rules! __versioned_enum_inner {
 ///
 /// Like [`versioned_struct`], but the latest version also derives
 /// [`TelemetrySchema`] so it is queryable. With `persist = "dir"` the type
-/// also gets a [`VersionedPersistable`] home under that directory.
+/// also gets a [`VersionedPersistable`] home under that directory, and
+/// `"dir"` is its wire name (`Versioned::NAME`).
 ///
 /// Schema-only field attributes (`#[telemetry_schema(..)]`) may be written
 /// on any version; they describe the final shape and are stripped from older
 /// versions' expansions.
 #[macro_export]
 macro_rules! versioned_telemetry {
-    ($name:ident, persist = $dir:expr => $($tokens:tt)*) => {
-        $crate::__versioned_telemetry_inner!($name => $($tokens)*);
+    ($name:ident, persist = $dir:literal => $($tokens:tt)*) => {
+        $crate::__versioned_telemetry_inner!(#[wire_name = $dir] $name => $($tokens)*);
         impl $crate::VersionedPersistable for $name {
-            const PERSIST_DIR: &'static str = $dir;
+            const PERSIST_DIR: &'static str = <$name as $crate::Versioned>::NAME;
         }
     };
     ($name:ident => $($tokens:tt)*) => {
@@ -270,8 +270,9 @@ macro_rules! versioned_telemetry {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __versioned_telemetry_inner {
-    ($name:ident => $($tokens:tt)*) => {
+    ($(#[$attr:meta])* $name:ident => $($tokens:tt)*) => {
         $crate::evolve_struct! {
+            $(#[$attr])*
             roll_into $name
             final_attrs {
                 #[derive($crate::TelemetrySchema)]

@@ -158,7 +158,7 @@ fn generate_versioned_impls(
                 &self,
                 visitor: &mut V,
             ) {
-                visitor.visit_leaf(#name_tokens, self);
+                visitor.visit_leaf(self);
             }
             fn decode_blob<U: ::flux_versioned_types::Versioned>(
                 blob: &::flux_versioned_types::Blob,
