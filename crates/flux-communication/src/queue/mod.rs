@@ -359,12 +359,6 @@ impl<T: Copy> InnerQueue<T> {
         self.count().saturating_sub(1)
     }
 
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn version_at(&self, count: usize) -> u64 {
-        ((count / self.len()) * 2 + 2) as u64
-    }
-
     #[inline]
     pub fn count_at(&self, pos: usize, version: u64) -> usize {
         ((version as usize - 2) / 2) * self.len() + (pos & self.header.mask)
