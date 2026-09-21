@@ -786,7 +786,6 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn set_pos(&mut self, count: usize) {
         self.pos = self.get_pos(count);
-        // Queue lengths are powers of two. Keep the read off the producer's cache line.
         let lap = count >> (self.mask + 1).trailing_zeros();
         self.expected_version = (lap * 2 + 2) as u64;
     }
