@@ -154,6 +154,24 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
+    /// Drain SPSC values, recording timings only when the callback returns
+    /// true. A false callback result still counts as work and does not stop
+    /// the drain. Ingestion times are propagated and the initial clock read
+    /// is retained.
+    #[inline]
+    pub fn try_consume_maybe_track<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(T, &mut S::Producers) -> bool,
+    {
+        while self.try_consume_one_maybe_track(&mut f)? {}
+        Ok(())
+    }
+
     /// Consume at most one SPSC message, returning whether one was available.
     #[inline]
     pub fn try_consume_one<T, F>(
@@ -170,6 +188,25 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(consumed)
     }
 
+    /// Consume at most one SPSC value, recording timings only when the callback
+    /// returns true. Returns whether a value was consumed; an untracked value
+    /// still counts as work and propagates ingestion time. The initial clock
+    /// read is retained.
+    #[inline]
+    pub fn try_consume_one_maybe_track<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(T, &mut S::Producers) -> bool,
+    {
+        let consumed = self.consumers.as_mut().try_consume_maybe_track(&mut self.producers, f)?;
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
     #[inline]
     pub fn try_consume_internal_message_one<T, F>(
         &mut self,
@@ -182,6 +219,45 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let consumed =
             self.consumers.as_mut().try_consume_internal_message(&mut self.producers, f)?;
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    /// Drain SPSC messages with their tracking metadata. A false callback
+    /// result skips timing records while still counting as work and continuing
+    /// the drain. Ingestion times and the initial clock read are retained.
+    #[inline]
+    pub fn try_consume_internal_message_maybe_track<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
+    {
+        while self.try_consume_internal_message_one_maybe_track(&mut f)? {}
+        Ok(())
+    }
+
+    /// Consume at most one SPSC message with its tracking metadata. The
+    /// callback selects whether to record timings; the result reports
+    /// consumption. An untracked message still counts as work and
+    /// propagates ingestion time. The initial clock read is retained.
+    #[inline]
+    pub fn try_consume_internal_message_one_maybe_track<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
+    {
+        let consumed = self
+            .consumers
+            .as_mut()
+            .try_consume_internal_message_maybe_track(&mut self.producers, f)?;
         self.did_work |= consumed;
         Ok(consumed)
     }

@@ -211,6 +211,26 @@ impl<T: 'static + Copy> SpineSpscConsumer<T> {
         self.try_consume_internal_message(producers, |message, p| f(message.into_data(), p))
     }
 
+    /// Consume one value, recording processing time and latency only when the
+    /// callback returns true. A false callback result still consumes the value
+    /// and propagates its ingestion time. The initial clock read is retained.
+    /// Returns whether a value was consumed, independently of the tracking
+    /// choice.
+    #[inline]
+    pub fn try_consume_maybe_track<P, F>(
+        &mut self,
+        producers: &mut P,
+        mut f: F,
+    ) -> Result<bool, spsc::QueueError>
+    where
+        P: SpineProducers,
+        F: FnMut(T, &mut P) -> bool,
+    {
+        self.try_consume_internal_message_maybe_track(producers, |message, p| {
+            f(message.into_data(), p)
+        })
+    }
+
     /// Consume one message, including its original tracking metadata.
     #[inline]
     pub fn try_consume_internal_message<P, F>(
@@ -222,12 +242,34 @@ impl<T: 'static + Copy> SpineSpscConsumer<T> {
         P: SpineProducers,
         F: FnMut(&mut InternalMessage<T>, &mut P),
     {
+        self.try_consume_internal_message_maybe_track(producers, |message, p| {
+            f(message, p);
+            true
+        })
+    }
+
+    /// Consume one message with its original tracking metadata. The callback's
+    /// return value controls timing records, not consumption or ingestion-time
+    /// propagation. The initial clock read is retained. The message is removed
+    /// before the callback, including if it panics.
+    #[inline]
+    pub fn try_consume_internal_message_maybe_track<P, F>(
+        &mut self,
+        producers: &mut P,
+        mut f: F,
+    ) -> Result<bool, spsc::QueueError>
+    where
+        P: SpineProducers,
+        F: FnMut(&mut InternalMessage<T>, &mut P) -> bool,
+    {
         self.try_attach()?;
         Ok(self.inner.as_mut().unwrap().consume(|message| {
             *producers.timestamp_mut().ingestion_t_mut() = message.ingestion_time();
             self.timer.start();
-            f(message, producers);
-            self.timer.record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
+            if f(message, producers) {
+                self.timer
+                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
+            }
         }))
     }
 }
