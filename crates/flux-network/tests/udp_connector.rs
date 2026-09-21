@@ -609,3 +609,70 @@ fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     assert_eq!(disconnected, Some(accepted));
     let _ = &client;
 }
+
+/// Unreliable mode under loss: every message that arrives is intact and
+/// unique, delivery keeps going past lost fragments, and the receiver only
+/// speaks when a heartbeat is due.
+#[test]
+fn udp_unreliable_keeps_streaming_through_loss() {
+    const N: u32 = 600;
+    let config = UdpConfig {
+        reliable: false,
+        send_window: 64,
+        recv_window: 64,
+        max_message_size: 4 * 1171,
+        ..UdpConfig::lan()
+    };
+    let server_addr = free_addr();
+    let relay = LossyRelay::start(server_addr, 5);
+
+    let mut server = udp(config);
+    let mut client = udp(config);
+    let (accepted, _) = connect_via(&mut server, &mut client, server_addr, relay.addr);
+
+    // Mostly two-fragment messages: losing either fragment loses the message.
+    let stride = config.max_datagram_size - 29;
+    let msgs: Vec<Vec<u8>> =
+        (0..N).map(|i| make_msg(i, 1 + (i as usize * 613) % (2 * stride))).collect();
+    let mut seen = vec![false; N as usize];
+    let mut received = 0usize;
+    let mut last = 0usize;
+    for m in &msgs {
+        server.write_or_enqueue_with(SendBehavior::Single(accepted), |b| b.extend_from_slice(m));
+        // Paced so the relay's socket buffer is not a second source of loss.
+        // Draining as we go still leaves bursts past a lost hole in the
+        // 64-datagram receive window, which is what slides it.
+        thread::sleep(Duration::from_micros(50));
+        client.poll_with(|e| {
+            if let PollEvent::Message { payload, .. } = e {
+                let id = msg_id(payload) as usize;
+                assert_eq!(checksum(payload), checksum(&msgs[id]), "message {id} corrupted");
+                assert!(!seen[id], "message {id} delivered twice");
+                seen[id] = true;
+                received += 1;
+                last = last.max(id);
+            }
+        });
+        server.poll_with(|_| {});
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        client.poll_with(|e| {
+            if let PollEvent::Message { payload, .. } = e {
+                let id = msg_id(payload) as usize;
+                assert!(!seen[id], "message {id} delivered twice");
+                seen[id] = true;
+                received += 1;
+                last = last.max(id);
+            }
+        });
+        server.poll_with(|_| {});
+        thread::sleep(Duration::from_micros(50));
+    }
+    let dropped = relay.dropped.load(Ordering::Relaxed);
+    assert!(dropped > 0, "relay dropped nothing");
+    assert!(received < N as usize, "loss must lose messages: {received}/{N}");
+    assert!(received > N as usize / 2, "too few delivered: {received}/{N}");
+    assert!(last > N as usize - 64, "delivery stalled at {last}");
+    assert_eq!(client.currently_disconnected().count(), 0, "client dropped its peer");
+}

@@ -7,6 +7,11 @@
 //! oldest unacked datagram, doubling the probe size per round. Messages are
 //! delivered as soon as all their fragments are in, so a lost datagram delays
 //! only its own message.
+//!
+//! With [`UdpConfig::reliable`] off the same wire format carries a fire-and-
+//! forget stream: the sender releases a datagram once the kernel takes it and
+//! never resends, the receiver acks only as a heartbeat and skips past holes.
+//! A lost fragment loses its message and nothing else.
 
 use flux_timing::Duration;
 
@@ -47,6 +52,11 @@ pub struct UdpConfig {
     /// other side can tell it is alive. Peer death is detected by the
     /// connector's user timeout.
     pub heartbeat_interval: Duration,
+    /// Off: no retransmits, no per-datagram acks; a datagram is done once the
+    /// kernel takes it and the receiver drops whatever a lost fragment leaves
+    /// incomplete. Acks still flow at `heartbeat_interval` for liveness. Both
+    /// ends of a link must agree.
+    pub reliable: bool,
 }
 
 impl Default for UdpConfig {
@@ -60,6 +70,7 @@ impl Default for UdpConfig {
             min_rto: Duration::from_micros(500),
             max_rto: Duration::from_secs(1),
             heartbeat_interval: Duration::from_millis(250),
+            reliable: true,
         }
     }
 }
