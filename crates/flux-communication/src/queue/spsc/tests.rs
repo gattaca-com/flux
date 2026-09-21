@@ -218,18 +218,22 @@ fn shared_mapping_outlives_queue_handles_and_enforces_roles_across_opens() {
         unsafe { Queue::<u32>::open_shared(&path) },
         Err(QueueError::IncompatibleLayout)
     ));
-    let producer = reopened.try_producer().unwrap();
+    let mut producer = reopened.try_producer().unwrap();
     let mut consumer = second_open.try_consumer().unwrap();
     assert!(matches!(second_open.try_producer(), Err(QueueError::ProducerAttached)));
     assert!(matches!(reopened.try_consumer(), Err(QueueError::ConsumerAttached)));
+    drop(second_open);
+    drop(reopened);
 
+    // Endpoints retain their mappings after every queue handle is dropped.
+    producer.produce(&47).unwrap();
     let mut value = 0;
     consumer.try_consume(&mut value).unwrap();
     assert_eq!(value, 31);
+    consumer.try_consume(&mut value).unwrap();
+    assert_eq!(value, 47);
     drop(consumer);
     drop(producer);
-    drop(second_open);
-    drop(reopened);
     cleanup_flink(&path).unwrap();
 }
 

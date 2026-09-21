@@ -133,14 +133,6 @@ impl<T> Storage<T> {
         unsafe { self.ptr.cast::<Header>().as_ref() }
     }
 
-    fn slot(&self, position: usize) -> *mut T {
-        // SAFETY: layout reserves capacity properly aligned slots. Masking keeps
-        // the index in bounds, including when the position counter wraps.
-        unsafe {
-            self.ptr.as_ptr().add(self.slots_offset).cast::<T>().add(position & (self.capacity - 1))
-        }
-    }
-
     fn initialize(&mut self) {
         let header = self.ptr.cast::<Header>().as_ptr();
         // SAFETY: only the mapping creator initializes these immutable fields.
@@ -162,6 +154,56 @@ impl<T> Drop for Storage<T> {
             // has dropped, so no endpoint can still access it.
             unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
         }
+    }
+}
+
+/// Process-local addresses retained by an endpoint. The owning Arc keeps every
+/// cached pointer valid even after queue handles are dropped or the endpoint
+/// moves.
+struct EndpointStorage<T> {
+    storage: Arc<Storage<T>>,
+    slots: *mut T,
+    mask: usize,
+    read: *const AtomicUsize,
+    write: *const AtomicUsize,
+}
+
+// SAFETY: these pointers address the allocation owned by storage. Slot access
+// follows the same exclusive-role and release/acquire rules as Storage, and
+// shared endpoint access cannot read or write payloads. Moving an endpoint does
+// not move its allocation. Storage also keeps the payload type invariant.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl<T: Send> Send for EndpointStorage<T> {}
+unsafe impl<T: Send> Sync for EndpointStorage<T> {}
+
+impl<T> EndpointStorage<T> {
+    fn new(storage: Arc<Storage<T>>) -> Self {
+        let header = storage.header();
+        // SAFETY: layout reserves capacity properly aligned slots, including
+        // an aligned one-past pointer for zero-sized payloads.
+        let slots = unsafe { storage.ptr.as_ptr().add(storage.slots_offset).cast::<T>() };
+        Self {
+            slots,
+            mask: storage.capacity - 1,
+            read: &raw const header.read.0,
+            write: &raw const header.write.0,
+            storage,
+        }
+    }
+
+    fn slot(&self, position: usize) -> *mut T {
+        // SAFETY: masking keeps the slot in bounds, including on counter wrap.
+        unsafe { self.slots.add(position & self.mask) }
+    }
+
+    fn read(&self) -> &AtomicUsize {
+        // SAFETY: storage owns the initialized header for this borrow.
+        unsafe { &*self.read }
+    }
+
+    fn write(&self) -> &AtomicUsize {
+        // SAFETY: storage owns the initialized header for this borrow.
+        unsafe { &*self.write }
     }
 }
 
@@ -312,7 +354,7 @@ impl<T: Copy> Queue<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| QueueError::ProducerAttached)?;
         Ok(Producer {
-            storage: Arc::clone(&self.storage),
+            storage: EndpointStorage::new(Arc::clone(&self.storage)),
             write: header.write.0.load(Ordering::Relaxed),
             cached_read: header.read.0.load(Ordering::Acquire),
         })
@@ -326,7 +368,7 @@ impl<T: Copy> Queue<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| QueueError::ConsumerAttached)?;
         Ok(Consumer {
-            storage: Arc::clone(&self.storage),
+            storage: EndpointStorage::new(Arc::clone(&self.storage)),
             read: header.read.0.load(Ordering::Relaxed),
             cached_write: header.write.0.load(Ordering::Acquire),
         })
@@ -352,7 +394,7 @@ impl<T: Copy> Queue<T> {
 /// std::thread::spawn(move || producer.produce(&std::ptr::null()));
 /// ```
 pub struct Producer<T: Copy> {
-    storage: Arc<Storage<T>>,
+    storage: EndpointStorage<T>,
     write: usize,
     cached_read: usize,
 }
@@ -362,9 +404,9 @@ impl<T: Copy> Producer<T> {
     /// A full queue is unchanged, and the caller retains `msg` for retry.
     #[inline]
     pub fn produce(&mut self, msg: &T) -> Result<usize, FullError> {
-        if self.write.wrapping_sub(self.cached_read) == self.storage.capacity {
-            self.cached_read = self.storage.header().read.0.load(Ordering::Acquire);
-            if self.write.wrapping_sub(self.cached_read) == self.storage.capacity {
+        if self.write.wrapping_sub(self.cached_read) == self.storage.mask + 1 {
+            self.cached_read = self.storage.read().load(Ordering::Acquire);
+            if self.write.wrapping_sub(self.cached_read) == self.storage.mask + 1 {
                 return Err(FullError);
             }
         }
@@ -373,21 +415,21 @@ impl<T: Copy> Producer<T> {
         // The consumer cannot read it until the following release publication.
         unsafe { self.storage.slot(position).write(*msg) };
         self.write = position.wrapping_add(1);
-        self.storage.header().write.0.store(self.write, Ordering::Release);
+        self.storage.write().store(self.write, Ordering::Release);
         Ok(position)
     }
 
     /// Available slots at the observed consumer position. The consumer may
     /// release more slots immediately afterwards.
     pub fn max_writable_msgs_without_speeding_past(&self) -> usize {
-        let read = self.storage.header().read.0.load(Ordering::Acquire);
-        self.storage.capacity - self.write.wrapping_sub(read)
+        let read = self.storage.read().load(Ordering::Acquire);
+        self.storage.mask + 1 - self.write.wrapping_sub(read)
     }
 }
 
 impl<T: Copy> Drop for Producer<T> {
     fn drop(&mut self) {
-        self.storage.header().producer_claimed.store(false, Ordering::Release);
+        self.storage.storage.header().producer_claimed.store(false, Ordering::Release);
     }
 }
 
@@ -402,7 +444,7 @@ impl<T: Copy> Drop for Producer<T> {
 /// let duplicate = consumer.clone();
 /// ```
 pub struct Consumer<T: Copy> {
-    storage: Arc<Storage<T>>,
+    storage: EndpointStorage<T>,
     read: usize,
     cached_write: usize,
 }
@@ -411,7 +453,7 @@ impl<T: Copy> Consumer<T> {
     #[inline]
     fn pop(&mut self) -> Option<T> {
         if self.read == self.cached_write {
-            self.cached_write = self.storage.header().write.0.load(Ordering::Acquire);
+            self.cached_write = self.storage.write().load(Ordering::Acquire);
             if self.read == self.cached_write {
                 return None;
             }
@@ -421,7 +463,7 @@ impl<T: Copy> Consumer<T> {
         // following release publication, which occurs after the copy completes.
         let value = unsafe { self.storage.slot(self.read).read() };
         self.read = self.read.wrapping_add(1);
-        self.storage.header().read.0.store(self.read, Ordering::Release);
+        self.storage.read().store(self.read, Ordering::Release);
         Some(value)
     }
 
@@ -443,13 +485,13 @@ impl<T: Copy> Consumer<T> {
 
     /// Unread messages at the observed producer position.
     pub fn queue_message_count(&self) -> usize {
-        self.storage.header().write.0.load(Ordering::Acquire).wrapping_sub(self.read)
+        self.storage.write().load(Ordering::Acquire).wrapping_sub(self.read)
     }
 }
 
 impl<T: Copy> Drop for Consumer<T> {
     fn drop(&mut self) {
-        self.storage.header().consumer_claimed.store(false, Ordering::Release);
+        self.storage.storage.header().consumer_claimed.store(false, Ordering::Release);
     }
 }
 
