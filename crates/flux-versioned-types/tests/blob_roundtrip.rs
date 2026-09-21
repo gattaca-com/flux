@@ -61,16 +61,24 @@ enum Sub {
     Ignored,
 }
 
+versioned_struct!(#[wire_name = "Tx.Included"] TxIncluded =>
+    #[type_hash_lock(hash = 13128693153787188024)]
+    TxIncludedV1 { pub inner: Flag }
+);
+
+versioned_struct!(#[wire_name = "Bundle.Included"] BundleIncluded =>
+    #[type_hash_lock(hash = 2220309847636450253)]
+    BundleIncludedV1 { pub inner: Flag }
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 enum Tx {
-    #[leaves(name = "Tx.Included")]
-    Included(Flag),
+    Included(TxIncluded),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 enum Bundle {
-    #[leaves(name = "Bundle.Included")]
-    Included(Flag),
+    Included(BundleIncluded),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
@@ -84,7 +92,7 @@ struct Counter {
 }
 
 impl VisitorVersionedLeaf for Counter {
-    fn visit_leaf<L: Versioned>(&mut self, _name: &'static str, _leaf: &L) {
+    fn visit_leaf<L: Versioned>(&mut self, _leaf: &L) {
         self.n += 1;
     }
 }
@@ -351,27 +359,26 @@ fn family_blobs_decode_to_variants() {
     }
     assert!(saw_leaf && saw_kind);
 
-    // The same leaf type at two positions with distinct names stays apart.
+    // The same payload under two names: one wrapper leaf per name.
+    let bundle = Telemetry::Bundle(Bundle::Included(BundleIncluded { inner: Flag { ok: true } }));
+    let tx = Telemetry::Tx(Tx::Included(TxIncluded { inner: Flag { ok: false } }));
     let mut cache = BlobCache::new();
-    cache.push(&InternalMessage::new(
-        stamp(4, 4),
-        Telemetry::Bundle(Bundle::Included(Flag { ok: true })),
-    ));
-    cache.push(&InternalMessage::new(stamp(5, 5), Telemetry::Tx(Tx::Included(Flag { ok: false }))));
+    cache.push(&InternalMessage::new(stamp(4, 4), bundle));
+    cache.push(&InternalMessage::new(stamp(5, 5), tx));
     let mut blobs: Vec<Vec<u8>> = Vec::new();
     cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
     assert_eq!(blobs.len(), 2);
     let mut decoded = Vec::new();
     for bytes in &blobs {
         let blob = a.load(bytes).unwrap();
-        assert!(blob.is::<Flag>());
+        assert!(!blob.is::<Flag>());
         let (_, msgs) = Telemetry::decode_blob::<MetaV1>(blob, &mut b).unwrap().unwrap();
         decoded.push((blob.type_name().to_owned(), *msgs[0].data()));
     }
     decoded.sort_by(|x, y| x.0.cmp(&y.0));
     assert_eq!(decoded, vec![
-        ("Bundle.Included".to_owned(), Telemetry::Bundle(Bundle::Included(Flag { ok: true }))),
-        ("Tx.Included".to_owned(), Telemetry::Tx(Tx::Included(Flag { ok: false }))),
+        ("Bundle.Included".to_owned(), bundle),
+        ("Tx.Included".to_owned(), tx),
     ]);
     assert_eq!(Telemetry::LEAF_NAMES, &["Bundle.Included", "Tx.Included"]);
 

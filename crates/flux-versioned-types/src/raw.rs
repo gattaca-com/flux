@@ -391,10 +391,10 @@ struct Push<'a> {
 }
 
 impl VisitorVersionedLeaf for Push<'_> {
-    fn visit_leaf<L: Versioned>(&mut self, name: &'static str, leaf: &L) {
+    fn visit_leaf<L: Versioned>(&mut self, leaf: &L) {
         const { assert!(align_of::<L>() <= ALIGN) };
         let timestamp = self.timestamp;
-        let buf = self.cache.buffers.entry(name).or_insert_with(|| TypedBuffer {
+        let buf = self.cache.buffers.entry(L::NAME).or_insert_with(|| TypedBuffer {
             type_hash: L::TYPE_HASH,
             n_messages: 0,
             publish_t_first: Nanos(0),

@@ -32,16 +32,15 @@ pub use byte_stable_derive::ByteStable;
 /// enum Fam { S(Sub), L(Leaf) }
 /// ```
 ///
-/// A name override on a variant that holds a sub-family does not build:
+/// Two variants holding the same leaf type do not build either; wrap one in
+/// its own leaf type instead:
 ///
 /// ```compile_fail
 /// use flux::type_hash_derive::type_hash_lock;
 /// use flux_versioned_types::{VersionedLeaves, versioned_struct};
 /// versioned_struct!(Leaf => #[type_hash_lock(hash = 10148638565996157175)] LeafV1 { pub v: u64 });
 /// #[derive(Clone, Copy, VersionedLeaves)]
-/// enum Sub { A(Leaf) }
-/// #[derive(Clone, Copy, VersionedLeaves)]
-/// enum Fam { #[leaves(name = "x")] S(Sub) }
+/// enum Fam { A(Leaf), B(Leaf) }
 /// ```
 pub use flux_versioned_types_macros::VersionedLeaves;
 pub use flux_versioned_types_macros::{
