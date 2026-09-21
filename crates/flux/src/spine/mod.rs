@@ -4,6 +4,10 @@
 //! one consumer across threads or processes. Use `try_produce` and
 //! `try_consume_one` (or `try_consume` to drain); `Full` leaves unread messages
 //! intact. Retain pending output and retry it before consuming more input.
+//! `try_consume_maybe_track` and `try_consume_one_maybe_track` let callbacks
+//! return false to skip processing-time and latency records for a message.
+//! Consumption and ingestion-time propagation still occur, as does the initial
+//! clock read. The ordinary consume methods record timings for every message.
 //!
 //! ```no_run
 //! # #![deny(unused_imports)]

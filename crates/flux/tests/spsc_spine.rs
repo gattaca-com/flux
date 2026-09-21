@@ -10,7 +10,11 @@ use std::{
 #[cfg(feature = "park")]
 use flux::tile::{TileConfig, tile_runner};
 use flux::{
-    communication::{ShmemData, cleanup_shmem, queue::spsc::QueueError},
+    communication::{
+        ShmemData, cleanup_shmem,
+        queue::{Queue, spsc::QueueError},
+        timer::TimingMessage,
+    },
     spine::{
         FluxSpine, QueueParams, SpineAdapter, SpineProducers, SpineQueue, SpineSpscQueue,
         SpscProduceError,
@@ -18,7 +22,10 @@ use flux::{
     tile::{Tile, TileInfo},
 };
 use flux_timing::{IngestionTime, InternalMessage, TrackingTimestamp};
-use flux_utils::directories::shmem_dir_with_base;
+use flux_utils::{
+    directories::{shmem_dir_queues_with_base, shmem_dir_with_base},
+    short_typename,
+};
 use spine_derive::from_spine;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +99,165 @@ fn new_bidirectional_spine(base_dir: &std::path::Path) -> BidirectionalSpine {
     // SAFETY: this test uses one architecture and one schema, passes only repr(C)
     // copy values, and does not inherit endpoints through fork.
     unsafe { BidirectionalSpine::new_with_base_dir(base_dir, None) }
+}
+
+fn spsc_timing_queues(base_dir: &std::path::Path) -> [Queue<TimingMessage>; 2] {
+    let dir = shmem_dir_queues_with_base(base_dir, MixedSpine::app_name());
+    let name = format!(
+        "{}-{}",
+        <RightTile as Tile<MixedSpine>>::name(&RightTile),
+        short_typename::<SpscMessage>()
+    );
+    ["timing", "latency"].map(|kind| Queue::open_shared(dir.join(format!("{kind}-{name}"))))
+}
+
+#[test]
+fn spsc_optional_tracking_drains_untracked_values_and_records_selected_messages() {
+    for internal in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spine = new_mixed_spine(tmp.path());
+        let mut producer = SpineAdapter::connect_tile(&LeftTile, &mut spine);
+        let mut consumer = SpineAdapter::connect_tile(&RightTile, &mut spine);
+        let queues = spsc_timing_queues(tmp.path());
+        let before = queues.map(|queue| queue.count());
+        let mut received = Vec::new();
+
+        for batch in 0..2 {
+            let ingestion = IngestionTime::now();
+            let timestamp = TrackingTimestamp::new(37).with_ingestion_t(ingestion);
+            for offset in 0..2 {
+                producer
+                    .producers
+                    .try_forward(&InternalMessage::new(timestamp, SpscMessage(batch * 2 + offset)))
+                    .unwrap();
+            }
+            consumer.begin_loop(IngestionTime::now());
+            if internal {
+                consumer
+                    .try_consume_internal_message_maybe_track(
+                        |message: &mut InternalMessage<SpscMessage>, p| {
+                            assert_eq!(message.tracking_timestamp(), timestamp);
+                            assert_eq!(p.timestamp().ingestion_t, ingestion);
+                            received.push(message.data().0);
+                            message.data().0 % 2 == 1
+                        },
+                    )
+                    .unwrap();
+            } else {
+                consumer
+                    .try_consume_maybe_track(|message: SpscMessage, p| {
+                        assert_eq!(p.timestamp().ingestion_t, ingestion);
+                        received.push(message.0);
+                        message.0 % 2 == 1
+                    })
+                    .unwrap();
+            }
+            assert!(consumer.did_work(), "consumption counts as work regardless of tracking");
+        }
+        assert_eq!(received, [0, 1, 2, 3], "false selects telemetry, not whether draining stops");
+        for (queue, before) in queues.into_iter().zip(before) {
+            assert_eq!(queue.count() - before, 2, "only selected messages emit each timing record");
+        }
+
+        consumer.begin_loop(IngestionTime::now());
+        consumer.try_consume_maybe_track(|_: SpscMessage, _| panic!("empty queue")).unwrap();
+        consumer
+            .try_consume_internal_message_maybe_track(|_: &mut InternalMessage<SpscMessage>, _| {
+                panic!("empty queue")
+            })
+            .unwrap();
+        assert!(!consumer.did_work(), "an empty drain does not count as work");
+
+        drop(producer);
+        drop(consumer);
+        drop(spine);
+        cleanup_shmem(tmp.path());
+    }
+}
+
+#[test]
+fn spsc_untracked_single_consumption_releases_capacity_before_callback() {
+    for internal in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spine = new_mixed_spine(tmp.path());
+        let mut producer = SpineAdapter::connect_tile(&LeftTile, &mut spine);
+        let mut consumer = SpineAdapter::connect_tile(&RightTile, &mut spine);
+        let queues = spsc_timing_queues(tmp.path());
+        let before = queues.map(|queue| queue.count());
+        let ingestion = IngestionTime::now();
+        for value in [11, 22] {
+            producer.producers.try_produce_with_ingestion(SpscMessage(value), ingestion).unwrap();
+        }
+        consumer.begin_loop(IngestionTime::now());
+        let mut handle = |message: SpscMessage, p: &mut MixedSpineProducers| {
+            assert_eq!(message, SpscMessage(11));
+            assert_eq!(p.timestamp().ingestion_t, ingestion);
+            producer.try_produce(SpscMessage(33)).expect("slot released before callback");
+            false
+        };
+        let delivered = if internal {
+            consumer.try_consume_internal_message_one_maybe_track(
+                |message: &mut InternalMessage<SpscMessage>, p| handle(message.into_data(), p),
+            )
+        } else {
+            consumer.try_consume_one_maybe_track(handle)
+        };
+        assert!(delivered.unwrap(), "untracked consumption still returns true");
+        assert!(consumer.did_work(), "untracked consumption counts as work");
+        assert_eq!(queues.map(|queue| queue.count()), before, "no timing records for false");
+
+        let mut remaining = Vec::new();
+        consumer.try_consume(|message: SpscMessage, _| remaining.push(message.0)).unwrap();
+        assert_eq!(remaining, [22, 33], "one-message consumption preserves the remaining FIFO");
+        for (queue, before) in queues.into_iter().zip(before) {
+            assert_eq!(
+                queue.count() - before,
+                2,
+                "ordinary consumption still records every message"
+            );
+        }
+        consumer.begin_loop(IngestionTime::now());
+        assert!(
+            !consumer.try_consume_one_maybe_track(|_: SpscMessage, _| panic!("empty")).unwrap()
+        );
+        assert!(
+            !consumer
+                .try_consume_internal_message_one_maybe_track(
+                    |_: &mut InternalMessage<SpscMessage>, _| panic!("empty"),
+                )
+                .unwrap()
+        );
+        assert!(!consumer.did_work());
+
+        drop(producer);
+        drop(consumer);
+        drop(spine);
+        cleanup_shmem(tmp.path());
+    }
+}
+
+#[test]
+fn spsc_optional_tracking_preserves_consumer_attachment_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spine = new_mixed_spine(tmp.path());
+    let mut owner = SpineAdapter::connect_tile(&LeftTile, &mut spine);
+    let mut other = SpineAdapter::connect_tile(&RightTile, &mut spine);
+    owner.consumers.spsc.try_attach().unwrap();
+    assert!(matches!(
+        other.try_consume_maybe_track(|_: SpscMessage, _| panic!("role already claimed")),
+        Err(QueueError::ConsumerAttached)
+    ));
+    assert!(matches!(
+        other.try_consume_internal_message_maybe_track(
+            |_: &mut InternalMessage<SpscMessage>, _| panic!("role already claimed"),
+        ),
+        Err(QueueError::ConsumerAttached)
+    ));
+    assert!(!other.did_work());
+    drop(owner);
+    drop(other);
+    drop(spine);
+    cleanup_shmem(tmp.path());
 }
 
 #[test]
