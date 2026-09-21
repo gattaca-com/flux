@@ -25,8 +25,10 @@ pub trait Versioned: type_hash::TypeHash + byte_stable::ByteStable {
 
     fn version_size(type_hash: u64) -> Option<usize>;
 
-    /// Casts `bytes` as the version `type_hash` names and migrates to `Self`.
-    fn decode_versions(type_hash: u64, bytes: &[u8]) -> Result<Vec<Self>, DecodeError>;
+    /// Casts `bytes` as `n` values of the version `type_hash` names and
+    /// migrates them to `Self`. Zero-sized versions have no bytes, so `n` is
+    /// the only source of the count.
+    fn decode_versions(type_hash: u64, bytes: &[u8], n: usize) -> Result<Vec<Self>, DecodeError>;
 }
 
 pub trait VisitorVersionedLeaf {

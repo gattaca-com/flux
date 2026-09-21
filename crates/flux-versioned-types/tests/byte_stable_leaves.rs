@@ -77,13 +77,13 @@ fn struct_versions_decode_and_migrate() {
     assert_eq!(Leaf::VERSION_HASHES, &[LeafV1::TYPE_HASH, LeafV2::TYPE_HASH]);
     let vals = [LeafV1 { slot: 1 }, LeafV1 { slot: 2 }, LeafV1 { slot: 3 }];
     let bytes = slice_as_bytes(vals.as_slice());
-    let out = Leaf::decode_versions(LeafV1::TYPE_HASH, bytes).unwrap();
+    let out = Leaf::decode_versions(LeafV1::TYPE_HASH, bytes, 3).unwrap();
     assert_eq!(out, vals.iter().map(|v| (*v).into()).collect::<Vec<Leaf>>());
     assert_eq!(out[0].extra, 0);
 
     let latest = [Leaf { slot: 9, extra: 1, flags: 2 }];
     let latest_bytes = slice_as_bytes(latest.as_slice());
-    let back = Leaf::decode_versions(LeafV2::TYPE_HASH, latest_bytes).unwrap();
+    let back = Leaf::decode_versions(LeafV2::TYPE_HASH, latest_bytes, 1).unwrap();
     assert_eq!(back, latest);
 }
 
@@ -92,19 +92,23 @@ fn struct_decode_rejects_bad_input() {
     let vals = [LeafV1 { slot: 7 }];
     let bytes = slice_as_bytes(vals.as_slice()).to_vec();
     assert!(matches!(
-        Leaf::decode_versions(0xDEAD_BEEF, &bytes),
+        Leaf::decode_versions(0xDEAD_BEEF, &bytes, 1),
         Err(DecodeError::UnknownTypeHash(0xDEAD_BEEF))
     ));
     assert!(matches!(
-        Leaf::decode_versions(LeafV1::TYPE_HASH, &bytes[..bytes.len() - 1]),
+        Leaf::decode_versions(LeafV1::TYPE_HASH, &bytes[..bytes.len() - 1], 1),
         Err(DecodeError::LengthMismatch { .. })
+    ));
+    assert!(matches!(
+        Leaf::decode_versions(LeafV1::TYPE_HASH, &bytes, 2),
+        Err(DecodeError::LengthMismatch { expected: 2, got: 1 })
     ));
     let mut backing = vec![0u64; 8];
     let wide = words_as_bytes_mut(backing.as_mut_slice());
     wide[1..=bytes.len()].copy_from_slice(&bytes);
     let misaligned = &wide[1..=bytes.len()];
     assert!(matches!(
-        Leaf::decode_versions(LeafV1::TYPE_HASH, misaligned),
+        Leaf::decode_versions(LeafV1::TYPE_HASH, misaligned, 1),
         Err(DecodeError::Unaligned)
     ));
 }
@@ -114,14 +118,14 @@ fn enum_versions_decode_and_validate() {
     assert_eq!(Kind::VERSION_HASHES, &[KindV1::TYPE_HASH, KindV2::TYPE_HASH]);
     let vals = [KindV1::A, KindV1::B, KindV1::A];
     let bytes = slice_as_bytes(vals.as_slice());
-    let out = Kind::decode_versions(KindV1::TYPE_HASH, bytes).unwrap();
+    let out = Kind::decode_versions(KindV1::TYPE_HASH, bytes, 3).unwrap();
     assert_eq!(out, vec![Kind::A, Kind::B, Kind::A]);
     assert!(matches!(
-        Kind::decode_versions(KindV2::TYPE_HASH, &[200]),
+        Kind::decode_versions(KindV2::TYPE_HASH, &[200], 1),
         Err(DecodeError::InvalidValue)
     ));
     assert!(matches!(
-        Kind::decode_versions(0xDEAD_BEEF, bytes),
+        Kind::decode_versions(0xDEAD_BEEF, bytes, 3),
         Err(DecodeError::UnknownTypeHash(0xDEAD_BEEF))
     ));
 }

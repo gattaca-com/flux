@@ -49,9 +49,15 @@ versioned_telemetry!(Persisted, persist = "some.dir.name" =>
     PersistedV1 { pub x: u64 }
 );
 
+versioned_telemetry!(Marker, persist = "app.marker" =>
+    #[type_hash_lock(hash = 11953884377883691210)]
+    MarkerV1 {}
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 enum Stored {
     P(Persisted),
+    M(Marker),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
@@ -409,7 +415,7 @@ fn family_blobs_decode_to_variants() {
 fn persist_dir_names_the_leaf() {
     assert_eq!(<Persisted as Versioned>::NAME, "some.dir.name");
     assert_eq!(<Persisted as VersionedPersistable>::PERSIST_DIR, "some.dir.name");
-    assert_eq!(Stored::LEAF_NAMES, &["some.dir.name"]);
+    assert_eq!(Stored::LEAF_NAMES, &["some.dir.name", "app.marker"]);
 
     let mut cache = BlobCache::new();
     cache.push(&InternalMessage::new(stamp(1, 1), Stored::P(Persisted { x: 7 })));
@@ -423,6 +429,31 @@ fn persist_dir_names_the_leaf() {
     assert_eq!(blob.type_name(), "some.dir.name");
     let (_, msgs) = Stored::decode_blob::<MetaV1>(blob, &mut b).unwrap().unwrap();
     assert_eq!(msgs[0].data(), &Stored::P(Persisted { x: 7 }));
+}
+
+#[test]
+fn zero_sized_leaf_round_trips_by_message_count() {
+    assert_eq!(size_of::<Marker>(), 0);
+    let stamps = [stamp(1, 1), stamp(2, 2), stamp(3, 3)];
+    let mut cache = BlobCache::new();
+    for s in &stamps {
+        cache.push(&InternalMessage::new(*s, Stored::M(Marker {})));
+    }
+    let meta = MetaV1 { slot: 1, instance: ArrayStr::try_from("z").unwrap() };
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
+    assert_eq!(blobs.len(), 1);
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let blob = a.load(&blobs[0]).unwrap();
+    assert_eq!(blob.header.n_messages, 3);
+    let (_, msgs) = Stored::decode_blob::<MetaV1>(blob, &mut b).unwrap().unwrap();
+    assert_eq!(msgs.len(), 3);
+    for (got, want) in msgs.iter().zip(&stamps) {
+        assert_eq!(got.data(), &Stored::M(Marker {}));
+        assert_eq!(got.ingestion_time().real(), want.ingestion_t.real());
+        assert_eq!(got.tile_id(), want.publish_delta.tile_id());
+    }
 }
 
 #[test]
