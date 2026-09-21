@@ -20,7 +20,7 @@ pub struct TileConfig {
     thread_niceness: Option<ThreadNiceness>,
     min_loop_duration: Option<Duration>,
     metrics: bool,
-    idle_backoff: u32,
+    idle_backoff: u8,
     #[cfg_attr(not(feature = "park"), allow(dead_code))]
     park: bool,
 }
@@ -70,7 +70,7 @@ impl TileConfig {
     /// latency for new work after idle period; the delay depends on the CPU.
     /// Report work outside adapter operations with [`SpineAdapter::mark_work`].
     /// Parking takes precedence when enabled and eligible.
-    pub fn with_idle_backoff(mut self, pauses: u32) -> Self {
+    pub fn with_idle_backoff(mut self, pauses: u8) -> Self {
         self.idle_backoff = pauses;
         self
     }
