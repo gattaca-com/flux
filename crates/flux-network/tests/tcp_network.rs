@@ -51,6 +51,114 @@ fn encoded_frame(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn listener_buffers_apply_to_handshakes_and_reconnects() {
+    use std::{io::Read, net::Ipv6Addr, os::fd::AsRawFd, ptr};
+
+    for grouped in [false, true] {
+        for ip in [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()] {
+            for socket_buf_size in [None, Some(4096)] {
+                let probe = std::net::TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
+                let addr = probe.local_addr().unwrap();
+                drop(probe);
+                let mut legacy = NetworkDriver::default();
+                let mut network = TcpNetwork::default();
+                let group = network
+                    .add_group(TcpGroupConfig { socket_buf_size, ..TcpGroupConfig::default() });
+                if grouped {
+                    network.listen(group, addr).unwrap();
+                } else {
+                    if let Some(size) = socket_buf_size {
+                        legacy = legacy.with_socket_buf_size(size);
+                    }
+                    legacy.listen_at(addr).unwrap();
+                }
+
+                for reconnect in [false, true] {
+                    let mut client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+                            .unwrap();
+                    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    // Observe the negotiated peer window before Flux can accept the socket.
+                    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+                    let mut len = size_of::<libc::tcp_info>() as libc::socklen_t;
+                    assert_eq!(
+                        unsafe {
+                            libc::getsockopt(
+                                client.as_raw_fd(),
+                                libc::IPPROTO_TCP,
+                                libc::TCP_INFO,
+                                ptr::from_mut(&mut info).cast(),
+                                ptr::from_mut(&mut len),
+                            )
+                        },
+                        0
+                    );
+                    if socket_buf_size.is_some() {
+                        let send_scale = if cfg!(target_endian = "little") {
+                            info.tcpi_snd_rcv_wscale & 0xf
+                        } else {
+                            info.tcpi_snd_rcv_wscale >> 4
+                        };
+                        assert_eq!(send_scale, 0, "small listener buffer must not need scaling");
+                    }
+                    // Reconnecting senders may send before the receiver polls accept().
+                    if reconnect {
+                        client.write_all(&encoded_frame(REQUEST)).unwrap();
+                    }
+                    let mut accepted = None;
+                    let mut received = false;
+                    let mut sent = reconnect;
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < deadline && !received {
+                        if grouped {
+                            network.poll_with(|event| match event {
+                                TcpEvent::Accepted { token, .. } => accepted = Some(token),
+                                TcpEvent::Message { token, payload, .. } => {
+                                    assert_eq!(Some(token), accepted);
+                                    assert_eq!(payload, REQUEST);
+                                    received = true;
+                                }
+                                _ => {}
+                            });
+                        } else {
+                            legacy.poll_with(|event| match event {
+                                PollEvent::Accept { stream, .. } => accepted = Some(stream),
+                                PollEvent::Message { token, payload, .. } => {
+                                    assert_eq!(Some(token), accepted);
+                                    assert_eq!(payload, REQUEST);
+                                    received = true;
+                                }
+                                _ => {}
+                            });
+                        }
+                        if !sent && accepted.is_some() {
+                            client.write_all(&encoded_frame(REQUEST)).unwrap();
+                            sent = true;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(received, "grouped={grouped}, addr={addr}, reconnect={reconnect}");
+                    let token = accepted.unwrap();
+                    if grouped {
+                        assert!(network.send_with(token, |buf| buf.extend_from_slice(RESPONSE)));
+                    } else {
+                        legacy.write_or_enqueue_with(SendBehavior::Single(token), |buf| {
+                            buf.extend_from_slice(RESPONSE);
+                        });
+                    }
+                    let mut reply = vec![0; 12 + RESPONSE.len()];
+                    client.read_exact(&mut reply).unwrap();
+                    assert_eq!(&reply[..4], &(RESPONSE.len() as u32).to_le_bytes());
+                    assert_eq!(&reply[12..], RESPONSE);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn groups_route_events_and_messages() {
     let addr = unused_addr();

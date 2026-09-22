@@ -1,7 +1,12 @@
 //! TCP side of [`crate::NetworkDriver`]: mio streams and listeners with framed
 //! messages, reconnect of outbound streams, and per-stream send backlogs.
 
-use std::net::SocketAddr;
+use std::{
+    io,
+    net::SocketAddr,
+    os::fd::{AsRawFd, FromRawFd},
+    ptr,
+};
 
 use flux::spine::{SpineProducerWithDCache, SpineProducers};
 use flux_timing::{Duration, Instant, Nanos, Repeater};
@@ -335,7 +340,7 @@ impl TcpManager {
     // communicated to the handling function so the handler can know what
     // endpoint it is receiving a connection for.
     pub(crate) fn listen_at(&mut self, addr: SocketAddr) -> Option<Token> {
-        let mut listener = mio::net::TcpListener::bind(addr)
+        let mut listener = Self::bind_listener(addr, self.config.socket_buf_size)
             .inspect_err(|e| warn!("couldn't start listening at {addr:?}: {e}"))
             .ok()?;
         let token = Token(self.next_token);
@@ -346,6 +351,68 @@ impl TcpManager {
         self.conns.push((token, Variant::Listener(listener)));
         self.next_token += 1;
         Some(token)
+    }
+
+    pub(crate) fn bind_listener(
+        addr: SocketAddr,
+        socket_buf_size: Option<usize>,
+    ) -> io::Result<TcpListener> {
+        let Some(size) = socket_buf_size else { return TcpListener::bind(addr) };
+        let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        let fd = unsafe {
+            libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+        };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+        let reuse: libc::c_int = 1;
+        if unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                ptr::from_ref(&reuse).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // Accepted sockets inherit the receive window negotiated before accept().
+        set_socket_buf_size(&listener, size);
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let len = match addr {
+            SocketAddr::V4(addr) => {
+                let address = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: addr.port().to_be(),
+                    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(addr.ip().octets()) },
+                    sin_zero: [0; 8],
+                };
+                unsafe { ptr::write(ptr::from_mut(&mut storage).cast(), address) };
+                size_of::<libc::sockaddr_in>()
+            }
+            SocketAddr::V6(addr) => {
+                let address = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: addr.port().to_be(),
+                    sin6_flowinfo: addr.flowinfo(),
+                    sin6_addr: libc::in6_addr { s6_addr: addr.ip().octets() },
+                    sin6_scope_id: addr.scope_id(),
+                };
+                unsafe { ptr::write(ptr::from_mut(&mut storage).cast(), address) };
+                size_of::<libc::sockaddr_in6>()
+            }
+        };
+        if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len as libc::socklen_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Match mio's kernel-capped listener backlog on Linux.
+        if unsafe { libc::listen(fd, -1) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(TcpListener::from_std(listener))
     }
 
     fn maybe_reconnect(&mut self) {

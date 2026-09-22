@@ -203,8 +203,9 @@ impl NetworkDriver {
         self
     }
 
-    /// Sets kernel `SO_SNDBUF` and `SO_RCVBUF` on all sockets (outbound and
-    /// accepted).
+    /// Sets kernel `SO_SNDBUF` and `SO_RCVBUF` on outbound, listening and
+    /// accepted sockets. Configure this before [`Self::listen_at`] so TCP
+    /// handshakes use the requested receive buffer.
     pub fn with_socket_buf_size(mut self, size: usize) -> Self {
         self.inner.config_mut().socket_buf_size = Some(size);
         self

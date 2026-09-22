@@ -10,7 +10,7 @@ use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::TcpListene
 use tracing::{debug, error, info, warn};
 
 use super::{
-    TcpTelemetry, set_socket_buf_size,
+    TcpManager, TcpTelemetry, set_socket_buf_size,
     stream::{
         DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, frame_payload_len, set_keepalive,
         set_user_timeout, write_frame_header, write_frame_len, write_frame_ts,
@@ -405,7 +405,7 @@ impl NetworkState {
         if group.0 >= self.groups.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown TCP group"));
         }
-        let mut socket = TcpListener::bind(addr)?;
+        let mut socket = TcpManager::bind_listener(addr, self.config(group).socket_buf_size)?;
         let token = self.next_token();
         self.registry.register(&mut socket, token, Interest::READABLE)?;
         self.listeners.push(Listener { token, group, socket });
