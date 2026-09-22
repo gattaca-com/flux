@@ -55,7 +55,8 @@ pub struct UdpConfig {
     /// Off: no retransmits, no per-datagram acks; a datagram is done once the
     /// kernel takes it and the receiver drops whatever a lost fragment leaves
     /// incomplete. Acks still flow at `heartbeat_interval` for liveness. Both
-    /// ends of a link must agree.
+    /// ends of a link must agree. Nothing throttles a burst, so the receiver's
+    /// socket buffer must hold the largest one or its overflow is loss too.
     pub reliable: bool,
 }
 
