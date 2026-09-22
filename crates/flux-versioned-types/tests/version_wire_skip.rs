@@ -36,7 +36,7 @@ fn skipped_versions_are_bincode_only() {
     assert_eq!(Foo::VERSION_HASHES, [FooV2::TYPE_HASH]);
     assert_eq!(Bar::VERSION_HASHES, [BarV2::TYPE_HASH]);
     assert!(matches!(
-        Foo::decode_versions(FooV1::TYPE_HASH, &[]),
+        Foo::decode_versions(FooV1::TYPE_HASH, &[], 0),
         Err(DecodeError::UnknownTypeHash(_))
     ));
     let bytes = bincode::serialize(&vec![FooV1 { a: 3, b: 4 }]).unwrap();

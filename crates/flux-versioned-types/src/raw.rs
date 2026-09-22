@@ -216,10 +216,8 @@ impl Blob {
                 got: self.header.metadata_len as usize,
             });
         }
-        let out = U::decode_versions(self.header.metadata_type_hash, self.user_metadata_bytes())?;
-        if out.len() != 1 {
-            return Err(DecodeError::LengthMismatch { expected: 1, got: out.len() });
-        }
+        let out =
+            U::decode_versions(self.header.metadata_type_hash, self.user_metadata_bytes(), 1)?;
         Ok(out[0])
     }
 
@@ -253,10 +251,7 @@ impl Blob {
         let bytes = scratch.as_bytes();
         let (ts_bytes, leaf_bytes) = bytes.split_at(ts_len as usize);
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
-        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes)?;
-        if leaves.len() != n as usize {
-            return Err(DecodeError::LengthMismatch { expected: n as usize, got: leaves.len() });
-        }
+        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes, n as usize)?;
         Ok((
             meta,
             stamps
