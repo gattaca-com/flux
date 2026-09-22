@@ -87,4 +87,3 @@ fn end_to_end_send_receive_and_exit() {
 
     assert_eq!(got.load(Ordering::Relaxed), want);
 }
-
