@@ -360,11 +360,6 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     #[inline]
-    pub(crate) fn version_at(&self, count: usize) -> u64 {
-        ((count / self.len()) * 2 + 2) as u64
-    }
-
-    #[inline]
     pub fn count_at(&self, pos: usize, version: u64) -> usize {
         ((version as usize - 2) / 2) * self.len() + (pos & self.header.mask)
     }
@@ -785,7 +780,8 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn set_pos(&mut self, count: usize) {
         self.pos = self.get_pos(count);
-        self.expected_version = self.queue.version_at(count);
+        let lap = count >> (self.mask + 1).trailing_zeros();
+        self.expected_version = (lap * 2 + 2) as u64;
     }
 
     #[inline]
