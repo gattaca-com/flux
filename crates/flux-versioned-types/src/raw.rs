@@ -222,10 +222,8 @@ impl Blob {
                 got: self.header.metadata_len as usize,
             });
         }
-        let out = U::decode_versions(self.header.metadata_type_hash, self.user_metadata_bytes())?;
-        if out.len() != 1 {
-            return Err(DecodeError::LengthMismatch { expected: 1, got: out.len() });
-        }
+        let out =
+            U::decode_versions(self.header.metadata_type_hash, self.user_metadata_bytes(), 1)?;
         Ok(out[0])
     }
 
@@ -263,10 +261,7 @@ impl Blob {
         let (ts_bytes, rest) = bytes.split_at(ts_len as usize);
         let leaf_bytes = &rest[leaf_off as usize - ts_len as usize..];
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
-        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes)?;
-        if leaves.len() != n as usize {
-            return Err(DecodeError::LengthMismatch { expected: n as usize, got: leaves.len() });
-        }
+        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes, n as usize)?;
         Ok((
             meta,
             stamps
@@ -404,10 +399,10 @@ struct Push<'a> {
 }
 
 impl VisitorVersionedLeaf for Push<'_> {
-    fn visit_leaf<L: Versioned>(&mut self, name: &'static str, leaf: &L) {
+    fn visit_leaf<L: Versioned>(&mut self, leaf: &L) {
         const { assert!(align_of::<L>() <= LEAF_ALIGN_MAX) };
         let timestamp = self.timestamp;
-        let buf = self.cache.buffers.entry(name).or_insert_with(|| TypedBuffer {
+        let buf = self.cache.buffers.entry(L::NAME).or_insert_with(|| TypedBuffer {
             type_hash: L::TYPE_HASH,
             align: align_of::<L>() as u32,
             n_messages: 0,

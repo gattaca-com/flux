@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as Tokens;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, LitStr, parse_macro_input};
+use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 pub fn derive_versioned_leaves(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -14,7 +14,6 @@ pub fn derive_versioned_leaves(input: TokenStream) -> TokenStream {
 struct Kept<'a> {
     variant: &'a syn::Ident,
     ty: &'a syn::Type,
-    name: Option<LitStr>,
 }
 
 type Skipped<'a> = (&'a syn::Ident, &'a Fields);
@@ -23,51 +22,23 @@ impl Kept<'_> {
     /// The wire names this variant contributes.
     fn names(&self) -> Tokens {
         let ty = self.ty;
-        self.name.as_ref().map_or_else(
-            || quote! { <#ty as ::flux_versioned_types::HasVersionedLeaves>::LEAF_NAMES },
-            |n| quote! { &[#n] },
-        )
-    }
-
-    fn names_len(&self) -> Tokens {
-        let ty = self.ty;
-        self.name.as_ref().map_or_else(
-            || quote! { <#ty as ::flux_versioned_types::HasVersionedLeaves>::LEAF_NAMES.len() },
-            |_| quote! { 1 },
-        )
+        quote! { <#ty as ::flux_versioned_types::HasVersionedLeaves>::LEAF_NAMES }
     }
 
     fn visit_arm(&self) -> Tokens {
-        let (v, ty) = (self.variant, self.ty);
-        // Calling the visitor directly needs `ty: Versioned`, so a name
-        // override on a sub-family variant is a type error.
-        self.name.as_ref().map_or_else(
-            || quote! { Self::#v(x) => x.visit_leaf(visitor) },
-            |n| quote! { Self::#v(x) => visitor.visit_leaf::<#ty>(#n, x) },
-        )
+        let v = self.variant;
+        quote! { Self::#v(x) => x.visit_leaf(visitor) }
     }
 
     fn decode_step(&self) -> Tokens {
         let (v, ty) = (self.variant, self.ty);
-        let wrap = quote! {
-            |(meta, msgs): (U, Vec<_>)| (meta, msgs.into_iter().map(|m| m.map(Self::#v)).collect())
-        };
-        self.name.as_ref().map_or_else(
-            || {
-                quote! {
-                    if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob::<U>(blob, scratch) {
-                        return Some(found.map(#wrap));
-                    }
-                }
-            },
-            |n| {
-                quote! {
-                    if blob.type_name() == #n && blob.is::<#ty>() {
-                        return Some(blob.decode::<U, #ty>(scratch).map(#wrap));
-                    }
-                }
-            },
-        )
+        quote! {
+            if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob::<U>(blob, scratch) {
+                return Some(found.map(|(meta, msgs): (U, Vec<_>)| {
+                    (meta, msgs.into_iter().map(|m| m.map(Self::#v)).collect())
+                }));
+            }
+        }
     }
 }
 
@@ -76,17 +47,14 @@ fn parse_variants(data: &syn::DataEnum) -> syn::Result<(Vec<Kept<'_>>, Vec<Skipp
     let mut skipped = Vec::new();
     for variant in &data.variants {
         let mut skip = false;
-        let mut name = None;
         for attr in variant.attrs.iter().filter(|a| a.path().is_ident("leaves")) {
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("skip") {
                     skip = true;
-                } else if meta.path.is_ident("name") {
-                    name = Some(meta.value()?.parse::<LitStr>()?);
+                    Ok(())
                 } else {
-                    return Err(meta.error("expected `skip` or `name = \"..\"`"));
+                    Err(meta.error("expected `skip`"))
                 }
-                Ok(())
             })?;
         }
         if skip {
@@ -102,7 +70,7 @@ fn parse_variants(data: &syn::DataEnum) -> syn::Result<(Vec<Kept<'_>>, Vec<Skipp
                 ));
             }
         };
-        kept.push(Kept { variant: &variant.ident, ty, name });
+        kept.push(Kept { variant: &variant.ident, ty });
     }
     Ok((kept, skipped))
 }
@@ -111,20 +79,14 @@ fn checks(family: &str, kept: &[Kept<'_>]) -> Tokens {
     let pairs = kept.iter().enumerate().flat_map(|(i, a)| {
         kept.iter().skip(i + 1).map(move |b| {
             let msg = format!(
-                "family `{family}`: variants `{}` and `{}` reach the same wire name; set #[leaves(name = \"..\")] on one",
+                "family `{family}`: variants `{}` and `{}` hold leaves with the same name; wrap one in its own leaf type",
                 a.variant, b.variant
             );
             let (na, nb) = (a.names(), b.names());
             quote! { assert!(::flux_versioned_types::leaves::names_disjoint(#na, #nb), #msg); }
         })
     });
-    let fits = kept.iter().filter_map(|k| {
-        let n = k.name.as_ref()?;
-        let msg =
-            format!("family `{family}`: wire name of `{}` is longer than TYPE_NAME_LEN", k.variant);
-        Some(quote! { assert!(::flux_versioned_types::leaves::name_fits(#n), #msg); })
-    });
-    quote! { #(#pairs)* #(#fits)* }
+    quote! { #(#pairs)* }
 }
 
 fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
@@ -145,7 +107,10 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
         Fields::Unit => quote! { Self::#v => {} },
     });
     let leaf_names = kept.iter().map(Kept::names);
-    let leaf_names_len = kept.iter().map(Kept::names_len);
+    let leaf_names_len = kept.iter().map(|k| {
+        let names = k.names();
+        quote! { #names.len() }
+    });
     let decode_steps = kept.iter().map(Kept::decode_step);
     // `From` only for field types that appear once; a repeated type has no
     // single variant to map to.

@@ -97,6 +97,12 @@ fn generate_versioned_impls(
         quote! {
             <#version as flux::type_hash::TypeHash>::TYPE_HASH => {
                 match ::flux_versioned_types::byte_stable::cast_slice::<#version>(bytes) {
+                    Ok(slice) if slice.len() != n => {
+                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                            expected: n,
+                            got: slice.len(),
+                        })
+                    }
                     Ok(slice) => #migrate,
                     Err(::flux_versioned_types::byte_stable::CastError::Unaligned) => {
                         Err(::flux_versioned_types::DecodeError::Unaligned)
@@ -115,10 +121,12 @@ fn generate_versioned_impls(
                         Err(::flux_versioned_types::DecodeError::InvalidValue)
                     }
                     Err(::flux_versioned_types::byte_stable::CastError::ZeroSized) => {
-                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
-                            expected: 0,
-                            got: bytes.len(),
-                        })
+                        // SAFETY: `cast_slice` returns `ZeroSized` only when
+                        // `#version` has no bytes, so the all-zero value is its
+                        // sole inhabitant.
+                        Ok((0..n)
+                            .map(|_| unsafe { ::core::mem::zeroed::<#version>() }.into())
+                            .collect())
                     }
                 }
             }
@@ -139,6 +147,7 @@ fn generate_versioned_impls(
             fn decode_versions(
                 type_hash: u64,
                 bytes: &[u8],
+                n: usize,
             ) -> Result<Vec<Self>, ::flux_versioned_types::DecodeError> {
                 match type_hash {
                     #(#decode_arms,)*
@@ -158,7 +167,7 @@ fn generate_versioned_impls(
                 &self,
                 visitor: &mut V,
             ) {
-                visitor.visit_leaf(#name_tokens, self);
+                visitor.visit_leaf(self);
             }
             fn decode_blob<U: ::flux_versioned_types::Versioned>(
                 blob: &::flux_versioned_types::Blob,

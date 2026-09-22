@@ -6,10 +6,9 @@
 //!
 //! A blob is identified by two things: its wire name, which says which
 //! message this is, and its type hash, which says how to decode it. The name
-//! defaults to the leaf's [`Versioned::NAME`]; a family variant overrides it
-//! with `#[leaves(name = "..")]`, so one leaf type can sit at several
-//! positions. Names must be unique across a family tree; the derive checks
-//! that at compile time.
+//! is the leaf's [`Versioned::NAME`]; to reuse a payload under a second name,
+//! wrap it in its own leaf type. Names must be unique across a family tree;
+//! the derive checks that at compile time.
 
 use flux_timing::InternalMessage;
 
@@ -26,12 +25,14 @@ pub trait Versioned: type_hash::TypeHash + byte_stable::ByteStable {
 
     fn version_size(type_hash: u64) -> Option<usize>;
 
-    /// Casts `bytes` as the version `type_hash` names and migrates to `Self`.
-    fn decode_versions(type_hash: u64, bytes: &[u8]) -> Result<Vec<Self>, DecodeError>;
+    /// Casts `bytes` as `n` values of the version `type_hash` names and
+    /// migrates them to `Self`. Zero-sized versions have no bytes, so `n` is
+    /// the only source of the count.
+    fn decode_versions(type_hash: u64, bytes: &[u8], n: usize) -> Result<Vec<Self>, DecodeError>;
 }
 
 pub trait VisitorVersionedLeaf {
-    fn visit_leaf<L: Versioned>(&mut self, name: &'static str, leaf: &L);
+    fn visit_leaf<L: Versioned>(&mut self, leaf: &L);
 }
 
 pub trait HasVersionedLeaves: Copy {
