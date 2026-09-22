@@ -9,7 +9,7 @@ use rand::Rng;
 
 use crate::{
     ReadError,
-    queue::{Consumer, InnerQueue, Producer, Queue, QueueType},
+    queue::{Consumer, ConsumerBare, InnerQueue, Producer, Queue, QueueType},
 };
 
 fn get_collaborative_consumer<T: Copy + 'static>(q: &Queue<T>) -> Consumer<T> {
@@ -20,13 +20,15 @@ fn get_collaborative_consumer<T: Copy + 'static>(q: &Queue<T>) -> Consumer<T> {
 fn collaborative_consume_race_with_write() {
     let q: Queue<usize> = Queue::new(16, QueueType::MPMC);
     let inner: &InnerQueue<usize> = &q;
+    // Subscribe before reserving the slot so the probe reads that same slot.
+    let mut probe = ConsumerBare::new_broadcast_test(q);
     // Advance count without writing the seqlock — mirrors the gap between
     // `next_count()` (increments count) and `lock.write()` inside `produce()`.
     inner.header.count.fetch_add(1, Ordering::Release);
 
     let mut val = 0;
     assert_eq!(
-        inner.load(0).read_with_version(&mut val, inner.version_at(0)),
+        probe.try_consume(&mut val),
         Err(ReadError::Empty),
         "unwritten slot must appear empty (write in-flight)"
     );
