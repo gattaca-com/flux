@@ -366,6 +366,25 @@ impl Type {
         }
     }
 
+    // Native format puts every nested dictionary version before the column data.
+    fn read_prefix(&self, cursor: &mut Cursor<'_>) -> Option<()> {
+        match self {
+            Self::LowCardinality(_) => {
+                if cursor.u64()? != LOW_CARDINALITY_VERSION {
+                    return cursor.fail("unknown low cardinality version")
+                }
+            }
+            Self::Nullable(inner) | Self::Array(inner) => inner.read_prefix(cursor)?,
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.read_prefix(cursor)?;
+                }
+            }
+            Self::Fixed(_) | Self::Str => {}
+        }
+        Some(())
+    }
+
     /// Reads a whole column, returning each row's value in `RowBinary` form.
     fn read_column(&self, cursor: &mut Cursor<'_>, rows: usize) -> Option<Vec<Vec<u8>>> {
         match self {
@@ -437,9 +456,6 @@ impl Type {
     fn read_dictionary(cursor: &mut Cursor<'_>, inner: &Self, rows: usize) -> Option<Vec<Vec<u8>>> {
         if rows == 0 {
             return Some(Vec::new())
-        }
-        if cursor.u64()? != LOW_CARDINALITY_VERSION {
-            return cursor.fail("unknown low cardinality version")
         }
         let flags = cursor.u64()?;
         if flags & NEEDS_GLOBAL_DICTIONARY != 0 {
@@ -567,6 +583,21 @@ impl ColumnBuf {
         }
     }
 
+    fn write_prefix(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Dictionary { .. } => {
+                out.extend_from_slice(&LOW_CARDINALITY_VERSION.to_le_bytes());
+            }
+            Self::Nullable { values, .. } | Self::Array { values, .. } => values.write_prefix(out),
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.write_prefix(out);
+                }
+            }
+            Self::Leaf(_) => {}
+        }
+    }
+
     fn write(self, out: &mut Vec<u8>) {
         match self {
             Self::Leaf(values) => out.extend_from_slice(&values),
@@ -593,7 +624,6 @@ impl ColumnBuf {
                     0x1_0000..=0xffff_ffff => (2, 4),
                     _ => (3, 8),
                 };
-                out.extend_from_slice(&LOW_CARDINALITY_VERSION.to_le_bytes());
                 let flags = key_type | HAS_ADDITIONAL_KEYS | NEEDS_DICTIONARY_UPDATE;
                 out.extend_from_slice(&flags.to_le_bytes());
                 out.extend_from_slice(&entries.to_le_bytes());
@@ -644,7 +674,10 @@ impl Output {
         for (column, buf) in columns.iter().zip(bufs) {
             put_string(out, column.name.as_bytes());
             put_string(out, column.type_name.as_bytes());
-            buf.write(out);
+            if rows != 0 {
+                buf.write_prefix(out);
+                buf.write(out);
+            }
         }
         Ok(())
     }
@@ -670,6 +703,9 @@ impl Output {
             let Some(ty) = Type::parse(&type_name) else {
                 return cursor.fail("server sent a column type this client cannot decode")
             };
+            if state.row_count != 0 {
+                ty.read_prefix(cursor)?;
+            }
             for (row, value) in state.rows.iter_mut().zip(ty.read_column(cursor, state.row_count)?)
             {
                 row.push(ty.cell(value));
@@ -689,5 +725,56 @@ impl Output {
         put_uvarint(out, 2);
         out.extend_from_slice(&(-1i32).to_le_bytes());
         put_uvarint(out, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_low_cardinality_prefixes() {
+        let columns = vec![Column {
+            name: "x".into(),
+            type_name: "Tuple(Array(LowCardinality(String)), Array(LowCardinality(Nullable(String))), Array(LowCardinality(String)))".into(),
+        }];
+        let rows =
+            [(vec!["", ""], vec![None, Some("")], Vec::<&str>::new()), (vec![], vec![], vec![])];
+        let mut body = Vec::new();
+        let mut cells = Vec::new();
+        for row in &rows {
+            let start = body.len();
+            crate::rowbinary::encode(&mut body, row).unwrap();
+            cells.push(vec![Some(body[start..].to_vec())]);
+        }
+
+        // ClickHouse Native layout: all dictionary versions precede tuple data,
+        // including the dictionary of the array with no elements.
+        let mut expected = Vec::new();
+        Output::write_info(&mut expected);
+        expected.extend_from_slice(&[1, 2]);
+        put_string(&mut expected, columns[0].name.as_bytes());
+        put_string(&mut expected, columns[0].type_name.as_bytes());
+        for word in [1u64, 1, 1, 2, 2, 0x600, 1] {
+            expected.extend_from_slice(&word.to_le_bytes());
+        }
+        expected.push(0);
+        expected.extend_from_slice(&2u64.to_le_bytes());
+        expected.extend_from_slice(&[0, 0]);
+        for word in [2u64, 2, 0x600, 2] {
+            expected.extend_from_slice(&word.to_le_bytes());
+        }
+        expected.extend_from_slice(&[0, 0]);
+        expected.extend_from_slice(&2u64.to_le_bytes());
+        expected.extend_from_slice(&[0, 1]);
+        expected.extend_from_slice(&[0; 16]);
+
+        let mut encoded = Vec::new();
+        Output::write_rowbinary(&columns, &body, &mut encoded).unwrap();
+        assert_eq!(encoded, expected);
+        let mut cursor = Cursor::new(&expected);
+        let decoded = Output::read_resume(&mut cursor, &mut None).unwrap();
+        assert_eq!(decoded, Output { columns, rows: cells });
+        assert_eq!(cursor.remaining(), 0);
     }
 }
