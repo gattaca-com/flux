@@ -40,6 +40,31 @@ impl Kept<'_> {
             }
         }
     }
+
+    fn owned_decode_iter_step(&self) -> Tokens {
+        let (v, ty) = (self.variant, self.ty);
+        quote! {
+            if <#ty as ::flux_versioned_types::HasVersionedLeaves>::LEAF_NAMES.contains(&blob.type_name()) {
+                return <#ty as ::flux_versioned_types::HasVersionedLeaves>::into_decode_iter::<U>(blob)
+                    .map(|found| found.map(|(meta, msgs)| {
+                        let mapped = ::flux_versioned_types::leaves::FamilyIter::new(msgs, Self::#v);
+                        (meta, Box::new(mapped) as Box<dyn ExactSizeIterator<Item = _>>)
+                    }));
+            }
+        }
+    }
+
+    fn decode_iter_step(&self) -> Tokens {
+        let (v, ty) = (self.variant, self.ty);
+        quote! {
+            if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_iter::<U>(blob) {
+                return Some(found.map(|(meta, msgs)| {
+                    let mapped = ::flux_versioned_types::leaves::FamilyIter::new(msgs, Self::#v);
+                    (meta, Box::new(mapped) as Box<dyn ExactSizeIterator<Item = _> + '_>)
+                }));
+            }
+        }
+    }
 }
 
 fn parse_variants(data: &syn::DataEnum) -> syn::Result<(Vec<Kept<'_>>, Vec<Skipped<'_>>)> {
@@ -112,6 +137,8 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
         quote! { #names.len() }
     });
     let decode_steps = kept.iter().map(Kept::decode_step);
+    let decode_iter_steps = kept.iter().map(Kept::decode_iter_step);
+    let into_decode_iter_steps = kept.iter().map(Kept::owned_decode_iter_step);
     // `From` only for field types that appear once; a repeated type has no
     // single variant to map to.
     let type_key = |ty: &syn::Type| quote! { #ty }.to_string();
@@ -152,6 +179,21 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
                 scratch: &mut ::flux_versioned_types::Scratch,
             ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
                 #(#decode_steps)*
+                None
+            }
+            fn into_decode_iter<U: ::flux_versioned_types::Versioned>(
+                blob: ::flux_versioned_types::DecompressedBlob,
+            ) -> Option<::flux_versioned_types::OwnedDecodedIter<U, Self>>
+            where
+                Self: 'static,
+            {
+                #(#into_decode_iter_steps)*
+                None
+            }
+            fn decode_iter<U: ::flux_versioned_types::Versioned>(
+                blob: &::flux_versioned_types::DecompressedBlob,
+            ) -> Option<::flux_versioned_types::DecodedIter<'_, U, Self>> {
+                #(#decode_iter_steps)*
                 None
             }
         }

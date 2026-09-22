@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use flux_timing::InternalMessage;
-use flux_versioned_types::{Blob, DecodeError, HasVersionedLeaves, Scratch, Versioned};
+use flux_versioned_types::{
+    Blob, DecodeError, DecompressedBlob, HasVersionedLeaves, Scratch, Versioned,
+};
 
 #[derive(Debug)]
 pub enum ReadError {
@@ -44,6 +46,19 @@ impl BlobReader {
                 return Err(ReadError::ForeignType { type_name: blob.type_name().to_owned() });
             };
             out.push(decoded.map_err(ReadError::Decode)?);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Decompress every blob in `path` into owned stores. Each
+    /// [`DecompressedBlob`] outlives the read: the file buffer may be reused
+    /// or dropped while iteration is paused or in flight.
+    pub fn read_decompressed(&mut self, path: &Path) -> Result<Vec<DecompressedBlob>, ReadError> {
+        load_file(&mut self.file, path)?;
+        let mut out = Vec::new();
+        visit_blobs(self.file.as_bytes(), |blob| {
+            out.push(blob.decompress().map_err(ReadError::Decode)?);
             Ok(())
         })?;
         Ok(out)

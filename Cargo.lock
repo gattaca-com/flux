@@ -1575,6 +1575,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "type-hash-derive",
+ "zstd",
 ]
 
 [[package]]

@@ -10,7 +10,8 @@ pub mod shipper;
 pub mod writer;
 
 pub use flux_versioned_types::{
-    Blob, BlobCache, DecodeError, HasVersionedLeaves, Scratch, Versioned,
+    Blob, BlobCache, DecodeError, DecodedIter, DecompressedBlob, HasVersionedLeaves, MessageIter,
+    OwnedDecodedIter, OwnedMessageIter, Scratch, Versioned,
 };
 pub use mio::Token;
 pub use queues::GatherQueues;

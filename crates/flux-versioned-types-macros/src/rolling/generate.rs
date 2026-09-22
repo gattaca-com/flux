@@ -69,6 +69,61 @@ pub(crate) fn generate_roll_chain(
     output
 }
 
+fn cast_error_arms() -> TokenStream2 {
+    quote! {
+        Err(::flux_versioned_types::byte_stable::CastError::Unaligned) => {
+            Err(::flux_versioned_types::DecodeError::Unaligned)
+        }
+        Err(::flux_versioned_types::byte_stable::CastError::Length { got, size }) => {
+            Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                expected: if size == 0 {
+                    0
+                } else {
+                    size.saturating_mul(got / size + 1)
+                },
+                got,
+            })
+        }
+        Err(::flux_versioned_types::byte_stable::CastError::Invalid { .. }) => {
+            Err(::flux_versioned_types::DecodeError::InvalidValue)
+        }
+        Err(::flux_versioned_types::byte_stable::CastError::ZeroSized) => {
+            Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                expected: 0,
+                got: bytes.len(),
+            })
+        }
+    }
+}
+
+fn decode_one_arms(wired: &[&Ident], last: &Ident) -> Vec<TokenStream2> {
+    let cast_errors = cast_error_arms();
+    wired
+        .iter()
+        .map(|version| {
+            let single = if *version == last {
+                quote! { Ok(one) }
+            } else {
+                quote! { Ok(one.into()) }
+            };
+            quote! {
+                <#version as flux::type_hash::TypeHash>::TYPE_HASH => {
+                    if bytes.len() != ::core::mem::size_of::<#version>() {
+                        return Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                            expected: ::core::mem::size_of::<#version>(),
+                            got: bytes.len(),
+                        });
+                    }
+                    match <#version as ::flux_versioned_types::ByteStable>::read(bytes) {
+                        Ok(one) => #single,
+                        #cast_errors
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
 fn generate_versioned_impls(
     alias: &Ident,
     versions: &[&Ident],
@@ -88,6 +143,7 @@ fn generate_versioned_impls(
         .filter(|(_, skipped)| !**skipped)
         .map(|(version, _)| *version)
         .collect();
+    let cast_errors = cast_error_arms();
     let decode_arms = wired.iter().map(|version| {
         let migrate = if *version == last {
             quote! { Ok(slice.to_vec()) }
@@ -98,32 +154,12 @@ fn generate_versioned_impls(
             <#version as flux::type_hash::TypeHash>::TYPE_HASH => {
                 match ::flux_versioned_types::byte_stable::cast_slice::<#version>(bytes) {
                     Ok(slice) => #migrate,
-                    Err(::flux_versioned_types::byte_stable::CastError::Unaligned) => {
-                        Err(::flux_versioned_types::DecodeError::Unaligned)
-                    }
-                    Err(::flux_versioned_types::byte_stable::CastError::Length { got, size }) => {
-                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
-                            expected: if size == 0 {
-                                0
-                            } else {
-                                size.saturating_mul(got / size + 1)
-                            },
-                            got,
-                        })
-                    }
-                    Err(::flux_versioned_types::byte_stable::CastError::Invalid { .. }) => {
-                        Err(::flux_versioned_types::DecodeError::InvalidValue)
-                    }
-                    Err(::flux_versioned_types::byte_stable::CastError::ZeroSized) => {
-                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
-                            expected: 0,
-                            got: bytes.len(),
-                        })
-                    }
+                    #cast_errors
                 }
             }
         }
     });
+    let one_arms = decode_one_arms(&wired, last);
     quote! {
         impl ::flux_versioned_types::Versioned for #last {
             const NAME: &'static str = #name_tokens;
@@ -142,6 +178,15 @@ fn generate_versioned_impls(
             ) -> Result<Vec<Self>, ::flux_versioned_types::DecodeError> {
                 match type_hash {
                     #(#decode_arms,)*
+                    _ => Err(::flux_versioned_types::DecodeError::UnknownTypeHash(type_hash)),
+                }
+            }
+            fn decode_one(
+                type_hash: u64,
+                bytes: &[u8],
+            ) -> Result<Self, ::flux_versioned_types::DecodeError> {
+                match type_hash {
+                    #(#one_arms,)*
                     _ => Err(::flux_versioned_types::DecodeError::UnknownTypeHash(type_hash)),
                 }
             }
@@ -164,11 +209,26 @@ fn generate_versioned_impls(
                 blob: &::flux_versioned_types::Blob,
                 scratch: &mut ::flux_versioned_types::Scratch,
             ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
-                if blob.type_name() == #name_tokens && blob.is::<Self>() {
-                    Some(blob.decode::<U, Self>(scratch))
-                } else {
-                    None
-                }
+                (blob.type_name() == #name_tokens && blob.is::<Self>())
+                    .then(|| blob.decode::<U, Self>(scratch))
+            }
+            fn into_decode_iter<U: ::flux_versioned_types::Versioned>(
+                blob: ::flux_versioned_types::DecompressedBlob,
+            ) -> Option<::flux_versioned_types::OwnedDecodedIter<U, Self>> {
+                (blob.type_name() == #name_tokens && blob.is::<Self>()).then(|| {
+                    blob.into_messages::<U, Self>().map(|(meta, msgs)| {
+                        (meta, Box::new(msgs) as Box<dyn ExactSizeIterator<Item = _>>)
+                    })
+                })
+            }
+            fn decode_iter<U: ::flux_versioned_types::Versioned>(
+                blob: &::flux_versioned_types::DecompressedBlob,
+            ) -> Option<::flux_versioned_types::DecodedIter<'_, U, Self>> {
+                (blob.type_name() == #name_tokens && blob.is::<Self>()).then(|| {
+                    blob.messages::<U, Self>().map(|(meta, msgs)| {
+                        (meta, Box::new(msgs) as Box<dyn ExactSizeIterator<Item = _> + '_>)
+                    })
+                })
             }
         }
     }

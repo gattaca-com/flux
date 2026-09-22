@@ -12,9 +12,63 @@
 
 use flux_timing::InternalMessage;
 
-use crate::raw::{Blob, DecodeError, Scratch, TYPE_NAME_LEN};
+use crate::raw::{Blob, DecodeError, DecompressedBlob, Scratch, TYPE_NAME_LEN};
 
 pub type Decoded<U, T> = Result<(U, Vec<InternalMessage<T>>), DecodeError>;
+
+/// Lazy counterpart to [`Decoded`].
+///
+/// The user metadata plus an iterator that decodes and migrates one message
+/// per `next`, backed by the blob's owned decompressed bytes. Generated
+/// dispatch boxes once for the leaf and once per matched family nesting
+/// level, never per message. `nth` skips positionally without decoding.
+pub type DecodedIter<'a, U, T> = Result<
+    (U, Box<dyn ExactSizeIterator<Item = Result<InternalMessage<T>, DecodeError>> + 'a>),
+    DecodeError,
+>;
+
+/// Owning family iterator; consumes the backing without decompressing again.
+pub type OwnedDecodedIter<U, T> = DecodedIter<'static, U, T>;
+
+/// Generated family wrapping that preserves positional `nth` skipping.
+#[doc(hidden)]
+pub struct FamilyIter<I, F> {
+    inner: I,
+    wrap: F,
+}
+
+impl<I, F> FamilyIter<I, F> {
+    pub fn new(inner: I, wrap: F) -> Self {
+        Self { inner, wrap }
+    }
+}
+
+impl<I, F, T, U> Iterator for FamilyIter<I, F>
+where
+    I: Iterator<Item = Result<InternalMessage<T>, DecodeError>>,
+    F: Fn(T) -> U,
+{
+    type Item = Result<InternalMessage<U>, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|msg| msg.map(|m| m.map(&self.wrap)))
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|msg| msg.map(|m| m.map(&self.wrap)))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<I, F, T, U> ExactSizeIterator for FamilyIter<I, F>
+where
+    I: ExactSizeIterator<Item = Result<InternalMessage<T>, DecodeError>>,
+    F: Fn(T) -> U,
+{
+}
 
 pub trait Versioned: type_hash::TypeHash + byte_stable::ByteStable {
     /// Alias name unless overridden with `#[wire_name = ".."]`.
@@ -27,6 +81,12 @@ pub trait Versioned: type_hash::TypeHash + byte_stable::ByteStable {
 
     /// Casts `bytes` as the version `type_hash` names and migrates to `Self`.
     fn decode_versions(type_hash: u64, bytes: &[u8]) -> Result<Vec<Self>, DecodeError>;
+
+    /// Casts exactly one `version_size(type_hash)` record and migrates it to
+    /// `Self`. Same per-record semantics as
+    /// [`decode_versions`](Self::decode_versions) without building a `Vec`;
+    /// the lazy iterators call this once per message.
+    fn decode_one(type_hash: u64, bytes: &[u8]) -> Result<Self, DecodeError>;
 }
 
 pub trait VisitorVersionedLeaf {
@@ -41,6 +101,17 @@ pub trait HasVersionedLeaves: Copy {
 
     /// `None` when `blob`'s name and type match none of this type's positions.
     fn decode_blob<U: Versioned>(blob: &Blob, scratch: &mut Scratch) -> Option<Decoded<U, Self>>;
+
+    /// Lazy counterpart to [`decode_blob`](Self::decode_blob): `None` under
+    /// the same conditions, otherwise the user metadata plus an iterator that
+    /// migrates one message per `next` without building a `Vec`.
+    fn decode_iter<U: Versioned>(blob: &DecompressedBlob) -> Option<DecodedIter<'_, U, Self>>;
+
+    /// Owning counterpart to [`decode_iter`](Self::decode_iter), suitable for
+    /// a paused pending run after its source and reader have been dropped.
+    fn into_decode_iter<U: Versioned>(blob: DecompressedBlob) -> Option<OwnedDecodedIter<U, Self>>
+    where
+        Self: 'static;
 }
 
 pub const fn concat_names<const N: usize>(parts: &[&'static [&'static str]]) -> [&'static str; N] {

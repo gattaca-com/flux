@@ -10,7 +10,7 @@
 //! XOR). `version` pins the header, timestamp record, and zstd; bump it when
 //! any of them change.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Read, marker::PhantomData};
 
 use byte_stable::ByteStable;
 use flux_timing::{InternalMessage, Nanos};
@@ -216,11 +216,7 @@ impl Blob {
                 got: self.header.metadata_len as usize,
             });
         }
-        let out = U::decode_versions(self.header.metadata_type_hash, self.user_metadata_bytes())?;
-        if out.len() != 1 {
-            return Err(DecodeError::LengthMismatch { expected: 1, got: out.len() });
-        }
-        Ok(out[0])
+        U::decode_one(self.header.metadata_type_hash, self.user_metadata_bytes())
     }
 
     /// Rebuilt `publish_t` carries sub-millisecond clock noise across hosts;
@@ -253,7 +249,11 @@ impl Blob {
         let bytes = scratch.as_bytes();
         let (ts_bytes, leaf_bytes) = bytes.split_at(ts_len as usize);
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
-        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes)?;
+        let leaves = if leaf_size == 0 {
+            vec![T::decode_one(self.header.type_hash, leaf_bytes)?; n as usize]
+        } else {
+            T::decode_versions(self.header.type_hash, leaf_bytes)?
+        };
         if leaves.len() != n as usize {
             return Err(DecodeError::LengthMismatch { expected: n as usize, got: leaves.len() });
         }
@@ -266,7 +266,293 @@ impl Blob {
                 .collect(),
         ))
     }
+
+    /// Decompress the payload into a fresh owned, 8-aligned store.
+    ///
+    /// `Blob` is a borrowed DST; the returned [`DecompressedBlob`] owns its
+    /// bytes independently of the wire borrow and can be consumed by
+    /// [`DecompressedBlob::into_messages`] or
+    /// [`HasVersionedLeaves::into_decode_iter`]. Storage grows with actual
+    /// decompressor output, never a claimed length. Zstd's streaming
+    /// decoder also enforces its default maximum window. The output length
+    /// and timestamp prefix are checked here; leaf hash and stride are
+    /// checked when opening an iterator, and values on each yield.
+    pub fn decompress(&self) -> Result<DecompressedBlob, DecodeError> {
+        let n = self.header.n_messages as usize;
+        let ts_len = n * size_of::<TrackingTimestampWire>();
+        let total = self.header.decompressed_len as usize;
+        if total < ts_len {
+            return Err(DecodeError::LengthMismatch { expected: ts_len, got: total });
+        }
+        let mut plain = Scratch::new();
+        let mut decoder = zstd::stream::read::Decoder::with_buffer(self.compressed())
+            .map_err(DecodeError::Zstd)?;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = decoder.read(&mut chunk).map_err(DecodeError::Zstd)?;
+            if read == 0 {
+                break;
+            }
+            let start = plain.as_bytes().len();
+            let end = start.checked_add(read).filter(|&end| end <= total).ok_or_else(|| {
+                DecodeError::LengthMismatch { expected: total, got: start.saturating_add(read) }
+            })?;
+            plain.resize(end);
+            plain.as_mut_bytes()[start..end].copy_from_slice(&chunk[..read]);
+        }
+        let written = plain.as_bytes().len();
+        if written != total {
+            return Err(DecodeError::LengthMismatch { expected: total, got: written });
+        }
+        let (ts_bytes, _) = plain.as_bytes().split_at(ts_len);
+        ref_timestamps(ts_bytes, n)?;
+        let mut meta = Scratch::new();
+        meta.resize(self.user_metadata_bytes().len());
+        meta.as_mut_bytes().copy_from_slice(self.user_metadata_bytes());
+        Ok(DecompressedBlob {
+            type_hash: self.header.type_hash,
+            metadata_type_hash: self.header.metadata_type_hash,
+            meta,
+            n_messages: self.header.n_messages,
+            type_name: self.header.type_name,
+            publish_t_first: self.header.publish_t_first,
+            publish_t_last: self.header.publish_t_last,
+            plain,
+        })
+    }
 }
+
+/// A blob whose zstd payload has been decompressed into owned, 8-aligned
+/// backing bytes holding `[TrackingTimestampWire x n][stored leaf x n]`.
+///
+/// Produced once per wire blob by [`Blob::decompress`]; with no path back to
+/// wire bytes, decompressed state can never masquerade as shippable or
+/// persistable wire data. The owner is freely movable across queues and
+/// pauses; [`messages`](Self::messages) borrows it while
+/// [`into_messages`](Self::into_messages) takes it.
+pub struct DecompressedBlob {
+    type_hash: u64,
+    metadata_type_hash: u64,
+    /// The single user-metadata value's bytes; decoded on demand, never a `Vec`
+    /// of records.
+    meta: Scratch,
+    n_messages: u32,
+    type_name: ArrayStr<TYPE_NAME_LEN>,
+    publish_t_first: Nanos,
+    publish_t_last: Nanos,
+    plain: Scratch,
+}
+
+impl DecompressedBlob {
+    /// The plain `TYPE_HASH` of the version that wrote the blob.
+    pub fn type_hash(&self) -> u64 {
+        self.type_hash
+    }
+
+    pub fn type_name(&self) -> &str {
+        self.type_name.as_str()
+    }
+
+    pub fn n_messages(&self) -> u32 {
+        self.n_messages
+    }
+
+    /// Advisory min publish time from the wire header.
+    pub fn publish_t_first(&self) -> Nanos {
+        self.publish_t_first
+    }
+
+    /// Advisory max publish time from the wire header.
+    pub fn publish_t_last(&self) -> Nanos {
+        self.publish_t_last
+    }
+
+    pub fn is<T: Versioned>(&self) -> bool {
+        T::VERSION_HASHES.contains(&self.type_hash)
+    }
+
+    /// Decode the single user-metadata value with no `Vec` at any stage.
+    pub fn user_metadata<U: Versioned>(&self) -> Result<U, DecodeError> {
+        U::decode_one(self.metadata_type_hash, self.meta.as_bytes())
+    }
+
+    /// Borrowed portable timestamps in message order, straight from the
+    /// backing bytes: one pass, no allocation. Enough to drive merge ordering
+    /// and positional skips without decoding any leaf.
+    pub fn stamps(&self) -> Result<&[TrackingTimestampWire], DecodeError> {
+        self.split().map(|(stamps, _)| stamps)
+    }
+
+    /// Borrowed lazy messages: checks the stored hash against `T`, decodes
+    /// the user metadata once, then migrates one leaf per `next` with no
+    /// `Vec<leaf>` or `Vec<message>` anywhere in the path.
+    pub fn messages<U: Versioned, T: Versioned>(
+        &self,
+    ) -> Result<(U, MessageIter<'_, T>), DecodeError> {
+        let meta = self.user_metadata::<U>()?;
+        let (stride, stamps, leaves) = self.prepare::<T>()?;
+        Ok((meta, MessageIter {
+            stamps,
+            leaves,
+            stride,
+            type_hash: self.type_hash,
+            pos: 0,
+            marker: PhantomData,
+        }))
+    }
+
+    /// Owning lazy messages: the same validation, then an iterator that owns
+    /// the backing bytes, so it survives moves and outlives any wire borrow.
+    pub fn into_messages<U: Versioned, T: Versioned>(
+        self,
+    ) -> Result<(U, OwnedMessageIter<T>), DecodeError> {
+        let meta = self.user_metadata::<U>()?;
+        let stride = self.stride_for::<T>()?;
+        Ok((meta, OwnedMessageIter { blob: self, stride, pos: 0, marker: PhantomData }))
+    }
+
+    fn split(&self) -> Result<(&[TrackingTimestampWire], &[u8]), DecodeError> {
+        let n = self.n_messages as usize;
+        let ts_len = n * size_of::<TrackingTimestampWire>();
+        let bytes = self.plain.as_bytes();
+        let ts_bytes = bytes
+            .get(..ts_len)
+            .ok_or(DecodeError::LengthMismatch { expected: ts_len, got: bytes.len() })?;
+        Ok((ref_timestamps(ts_bytes, n)?, &bytes[ts_len..]))
+    }
+
+    /// Stored-version record width plus shape validation; the leaf bytes are
+    /// left to per-item [`Versioned::decode_one`] calls.
+    fn stride_for<T: Versioned>(&self) -> Result<usize, DecodeError> {
+        if !self.is::<T>() {
+            return Err(DecodeError::UnknownTypeHash(self.type_hash));
+        }
+        let stride =
+            T::version_size(self.type_hash).ok_or(DecodeError::UnknownTypeHash(self.type_hash))?;
+        let n = self.n_messages as usize;
+        let (_, leaves) = self.split()?;
+        let want = n
+            .checked_mul(stride)
+            .ok_or(DecodeError::LengthMismatch { expected: usize::MAX, got: leaves.len() })?;
+        if leaves.len() != want {
+            return Err(DecodeError::LengthMismatch { expected: want, got: leaves.len() });
+        }
+        Ok(stride)
+    }
+
+    fn prepare<T: Versioned>(
+        &self,
+    ) -> Result<(usize, &[TrackingTimestampWire], &[u8]), DecodeError> {
+        let stride = self.stride_for::<T>()?;
+        let (stamps, leaves) = self.split()?;
+        Ok((stride, stamps, leaves))
+    }
+}
+
+/// Borrowing lazy message iterator over a [`DecompressedBlob`].
+///
+/// Yields one migrated [`InternalMessage`] per `next`; record contents are
+/// validated on yield, so corruption surfaces as that item's error rather
+/// than a panic. [`advance`](Self::advance) skips a prefix positionally
+/// without decoding it.
+pub struct MessageIter<'a, T: Versioned> {
+    stamps: &'a [TrackingTimestampWire],
+    leaves: &'a [u8],
+    stride: usize,
+    type_hash: u64,
+    pos: usize,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: Versioned> MessageIter<'_, T> {
+    /// Skip `n` records without decoding them.
+    pub fn advance(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n).min(self.stamps.len());
+    }
+}
+
+impl<T: Versioned> Iterator for MessageIter<'_, T> {
+    type Item = Result<InternalMessage<T>, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.stamps.len() {
+            return None;
+        }
+        // Bounds follow from `prepare`: `stamps.len() == n` and
+        // `leaves.len() == n * stride`.
+        let stamp = self.stamps[self.pos];
+        let base = self.pos * self.stride;
+        let leaf = T::decode_one(self.type_hash, &self.leaves[base..base + self.stride]);
+        self.pos += 1;
+        Some(leaf.map(|leaf| InternalMessage::new(stamp.to_tracking_timestamp(), leaf)))
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.advance(n);
+        self.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rest = self.stamps.len() - self.pos;
+        (rest, Some(rest))
+    }
+}
+
+impl<T: Versioned> ExactSizeIterator for MessageIter<'_, T> {}
+
+/// Owning lazy message iterator: the same one-record-at-a-time semantics as
+/// [`MessageIter`] while holding the backing bytes itself.
+pub struct OwnedMessageIter<T: Versioned> {
+    blob: DecompressedBlob,
+    stride: usize,
+    pos: usize,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: Versioned> OwnedMessageIter<T> {
+    /// Skip `n` records without decoding them.
+    pub fn advance(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n).min(self.blob.n_messages as usize);
+    }
+}
+
+impl<T: Versioned> Iterator for OwnedMessageIter<T> {
+    type Item = Result<InternalMessage<T>, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let n = self.blob.n_messages as usize;
+        if self.pos >= n {
+            return None;
+        }
+        // Bounds follow from `stride_for`, mirroring `MessageIter`.
+        let item = (|| {
+            let bytes = self.blob.plain.as_bytes();
+            let ts_len = n * size_of::<TrackingTimestampWire>();
+            let stamp = ref_timestamps(
+                &bytes[self.pos * size_of::<TrackingTimestampWire>()..
+                    (self.pos + 1) * size_of::<TrackingTimestampWire>()],
+                1,
+            )?[0];
+            let base = ts_len + self.pos * self.stride;
+            let leaf = T::decode_one(self.blob.type_hash, &bytes[base..base + self.stride])?;
+            Ok(InternalMessage::new(stamp.to_tracking_timestamp(), leaf))
+        })();
+        self.pos += 1;
+        Some(item)
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.advance(n);
+        self.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rest = self.blob.n_messages as usize - self.pos;
+        (rest, Some(rest))
+    }
+}
+
+impl<T: Versioned> ExactSizeIterator for OwnedMessageIter<T> {}
 
 fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[TrackingTimestampWire], DecodeError> {
     let stamps = byte_stable::cast_slice::<TrackingTimestampWire>(bytes).map_err(|e| match e {

@@ -19,6 +19,22 @@ pub unsafe trait ByteStable: Copy + 'static {
 
     fn is_valid(bytes: &[u8]) -> bool;
 
+    /// Read exactly one aligned, validated value, including a zero-sized one.
+    fn read(bytes: &[u8]) -> Result<Self, CastError> {
+        let () = Self::LAYOUT_PROOF;
+        if bytes.len() != mem::size_of::<Self>() {
+            return Err(CastError::Length { got: bytes.len(), size: mem::size_of::<Self>() });
+        }
+        if !(bytes.as_ptr() as usize).is_multiple_of(mem::align_of::<Self>()) {
+            return Err(CastError::Unaligned);
+        }
+        if !Self::is_valid(bytes) {
+            return Err(CastError::Invalid { index: 0 });
+        }
+        // Safety: exact size, aligned, initialized and validated, including ZSTs.
+        Ok(unsafe { bytes.as_ptr().cast::<Self>().read() })
+    }
+
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         slice_as_bytes(slice::from_ref(self))

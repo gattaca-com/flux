@@ -46,8 +46,13 @@ pub use flux_versioned_types_macros::VersionedLeaves;
 pub use flux_versioned_types_macros::{
     TelemetrySchema, evolve_enum, evolve_struct, roll_chain_into,
 };
-pub use leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf};
-pub use raw::{Blob, BlobCache, BlobHeader, DecodeError, Scratch};
+pub use leaves::{
+    Decoded, DecodedIter, HasVersionedLeaves, OwnedDecodedIter, Versioned, VisitorVersionedLeaf,
+};
+pub use raw::{
+    Blob, BlobCache, BlobHeader, DecodeError, DecompressedBlob, MessageIter, OwnedMessageIter,
+    Scratch,
+};
 pub use schema::TelemetrySchema;
 pub use wire::{
     DEFAULT_TELEMETRY_WIRE_ZSTD_LEVEL, TelemetryWire, TelemetryWirePayloadEncoding, TelemetryWireV2,
