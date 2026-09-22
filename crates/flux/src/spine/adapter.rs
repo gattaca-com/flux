@@ -276,6 +276,27 @@ impl<S: FluxSpine> SpineAdapter<S> {
 
     #[inline]
     /// Consumes at most one message, passing it to `handle`. Returns whether
+    /// `handle` ran. Single-shot `consume_with_dcache` for callers that
+    /// interleave other work between messages instead of draining.
+    pub fn consume_with_dcache_one<T, R, F, G>(&mut self, mut read: F, mut handle: G) -> bool
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineDCacheConsumer<T>>,
+        S::Producers: SpineProducers,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
+    {
+        let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
+        let Some(result) = c.consume(&mut self.producers, &mut read) else {
+            return false;
+        };
+        self.did_work |= !matches!(result, DCacheRead::SpedPast);
+        handle(result, &mut self.producers);
+        true
+    }
+
+    #[inline]
+    /// Consumes at most one message, passing it to `handle`. Returns whether
     /// `handle` ran.
     pub fn consume_with_dcache_collaborative<T, R, F, G>(
         &mut self,
