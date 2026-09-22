@@ -72,6 +72,14 @@ pub fn words_as_bytes_mut(words: &mut [u64]) -> &mut [u8] {
     unsafe { slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), mem::size_of_val(words)) }
 }
 
+/// Only `u128`: every byte pattern is a valid `u128`, so arbitrary writes
+/// are fine. Backs 16-aligned scratch buffers.
+#[inline]
+pub fn u128s_as_bytes_mut(words: &mut [u128]) -> &mut [u8] {
+    // Safety: padding-free, any pattern valid, exclusive borrow carried over.
+    unsafe { slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), mem::size_of_val(words)) }
+}
+
 macro_rules! impl_any_pattern {
     ($($t:ty),* $(,)?) => {$(
         // Safety: padding-free, every bit pattern valid.

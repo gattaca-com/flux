@@ -24,8 +24,12 @@ use crate::{
 pub const MAGIC: [u8; 8] = *b"FLUXBLOB";
 pub const FORMAT_VERSION: u32 = 1;
 pub const TYPE_NAME_LEN: usize = 64;
-/// Leaves must not need more.
+/// Sections and the blob itself pack to this. Leaves may need up to
+/// `LEAF_ALIGN_MAX`; their region pads accordingly.
 pub const ALIGN: usize = 8;
+/// Max leaf alignment (`u128`); the leaf region pads to the header-carried
+/// alignment so 8-aligned types keep byte-identical blobs.
+pub const LEAF_ALIGN_MAX: usize = 16;
 
 // The header is read by native reinterpretation; x86_64 layout is the format.
 const _: () = assert!(cfg!(target_endian = "little") && size_of::<usize>() == 8);
@@ -42,11 +46,13 @@ pub struct BlobHeader {
     pub version: u32,
     pub metadata_len: u32,
     pub n_messages: u32,
-    _reserved: u32,
+    /// `align_of` the leaf type; 0 in pre-alignment blobs means 8.
+    leaf_align: u32,
     pub type_hash: u64,
     pub metadata_type_hash: u64,
     pub compressed_len: u64,
-    /// `n_messages * (24 + size_of leaf)` for the version that wrote the blob.
+    /// Timestamps plus pad-to-`leaf_align` plus packed leaves, for the
+    /// version that wrote the blob.
     pub decompressed_len: u64,
     /// Min/max publish time in the batch. Advisory, not validated.
     pub publish_t_first: Nanos,
@@ -84,10 +90,10 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// 8-byte aligned byte buffer.
+/// 16-byte aligned byte buffer so decoded leaves cast directly.
 #[derive(Default)]
 pub struct Scratch {
-    words: Vec<u64>,
+    words: Vec<u128>,
     len: usize,
 }
 
@@ -97,7 +103,7 @@ impl Scratch {
     }
 
     pub fn resize(&mut self, len: usize) {
-        let words = len.div_ceil(ALIGN);
+        let words = len.div_ceil(LEAF_ALIGN_MAX);
         if words > self.words.len() {
             self.words.resize(words, 0);
         }
@@ -113,7 +119,7 @@ impl Scratch {
     }
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
-        &mut byte_stable::words_as_bytes_mut(&mut self.words)[..self.len]
+        &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..self.len]
     }
 
     /// For buffers that are not 8-aligned, such as `DiskIo` reads.
@@ -234,7 +240,10 @@ impl Blob {
             .ok_or(DecodeError::UnknownTypeHash(self.header.type_hash))?
             as u64;
         let ts_len = n * size_of::<TrackingTimestampWire>() as u64;
-        let expected = ts_len + n * leaf_size;
+        // Pre-alignment blobs carry 0; their leaves are 8-aligned.
+        let align = u64::from(self.header.leaf_align).max(ALIGN as u64);
+        let leaf_off = ts_len.next_multiple_of(align);
+        let expected = leaf_off + n * leaf_size;
         if self.header.decompressed_len != expected {
             return Err(DecodeError::LengthMismatch {
                 expected: usize::try_from(expected).unwrap_or(usize::MAX),
@@ -249,7 +258,8 @@ impl Blob {
             return Err(DecodeError::LengthMismatch { expected: expected_len, got: written });
         }
         let bytes = scratch.as_bytes();
-        let (ts_bytes, leaf_bytes) = bytes.split_at(ts_len as usize);
+        let (ts_bytes, rest) = bytes.split_at(ts_len as usize);
+        let leaf_bytes = &rest[leaf_off as usize - ts_len as usize..];
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
         let leaves = T::decode_versions(self.header.type_hash, leaf_bytes, n as usize)?;
         Ok((
@@ -285,6 +295,7 @@ fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[TrackingTimestampWire], De
 
 struct TypedBuffer {
     type_hash: u64,
+    align: u32,
     n_messages: u32,
     publish_t_first: Nanos,
     publish_t_last: Nanos,
@@ -344,8 +355,10 @@ impl BlobCache {
             let buf = &buffers[name];
             let meta_bytes = ByteStable::as_bytes(user_meta);
             let meta_pad = meta_bytes.len().next_multiple_of(ALIGN);
-            let mut plain = Vec::with_capacity(buf.timestamps.len() + buf.leaves.len());
+            let leaf_off = buf.timestamps.len().next_multiple_of(buf.align as usize);
+            let mut plain = Vec::with_capacity(leaf_off + buf.leaves.len());
             plain.extend_from_slice(&buf.timestamps);
+            plain.resize(leaf_off, 0);
             plain.extend_from_slice(&buf.leaves);
             let comp =
                 zstd::bulk::compress(&plain, zstd_level).expect("zstd bulk compression failed");
@@ -355,7 +368,7 @@ impl BlobCache {
                 version: FORMAT_VERSION,
                 metadata_len: meta_bytes.len() as u32,
                 n_messages: buf.n_messages,
-                _reserved: 0,
+                leaf_align: buf.align,
                 type_hash: buf.type_hash,
                 metadata_type_hash: U::TYPE_HASH,
                 compressed_len: comp.len() as u64,
@@ -387,10 +400,11 @@ struct Push<'a> {
 
 impl VisitorVersionedLeaf for Push<'_> {
     fn visit_leaf<L: Versioned>(&mut self, leaf: &L) {
-        const { assert!(align_of::<L>() <= ALIGN) };
+        const { assert!(align_of::<L>() <= LEAF_ALIGN_MAX) };
         let timestamp = self.timestamp;
         let buf = self.cache.buffers.entry(L::NAME).or_insert_with(|| TypedBuffer {
             type_hash: L::TYPE_HASH,
+            align: align_of::<L>() as u32,
             n_messages: 0,
             publish_t_first: Nanos(0),
             publish_t_last: Nanos(0),
