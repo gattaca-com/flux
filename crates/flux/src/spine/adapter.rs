@@ -210,6 +210,117 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(consumed)
     }
 
+    /// Drain SPSC payloads by reference, with consumption telemetry.
+    /// Each slot stays occupied through its callback and timing records,
+    /// and is released on return or unwind.
+    ///
+    /// Only SPSC accessors satisfy this method's bound. An MPMC queue is
+    /// rejected at compile time:
+    ///
+    /// ```compile_fail,E0277
+    /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
+    /// use spine_derive::from_spine;
+    /// #[from_spine("borrow-example")]
+    /// struct App {
+    ///     tile_info: ShmemData<TileInfo>,
+    ///     #[queue(flavour("mpmc"))]
+    ///     messages: flux::spine::SpineQueue<u64>,
+    /// }
+    /// fn borrow(adapter: &mut SpineAdapter<App>) {
+    ///     adapter.consume_ref(|_: &u64, _| {}).unwrap();
+    /// }
+    /// ```
+    #[inline]
+    pub fn consume_ref<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(&T, &mut S::Producers),
+    {
+        self.consume_ref_maybe_track(|message, producers| {
+            f(message, producers);
+            true
+        })
+    }
+
+    /// Drain borrowed SPSC payloads, recording timings when the callback
+    /// returns true. Untracked values still count as work, propagate ingestion
+    /// times, and take the initial clock read. Each slot stays occupied through
+    /// its callback and selected records, then releases on return or unwind.
+    ///
+    /// Selective tracking also requires an SPSC queue:
+    ///
+    /// ```compile_fail,E0277
+    /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
+    /// use spine_derive::from_spine;
+    /// #[from_spine("borrow-example")]
+    /// struct App {
+    ///     tile_info: ShmemData<TileInfo>,
+    ///     #[queue(flavour("spmc"))]
+    ///     messages: flux::spine::SpineQueue<u64>,
+    /// }
+    /// fn borrow(adapter: &mut SpineAdapter<App>) {
+    ///     adapter.consume_ref_maybe_track(|_: &u64, _| false).unwrap();
+    /// }
+    /// ```
+    #[inline]
+    pub fn consume_ref_maybe_track<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(&T, &mut S::Producers) -> bool,
+    {
+        let mut consumer = self.consumers.as_mut().try_attached()?;
+        while consumer.consume_ref_maybe_track(&mut self.producers, &mut f) {
+            self.did_work = true;
+        }
+        Ok(())
+    }
+
+    /// Borrow at most one SPSC payload, with consumption telemetry.
+    /// The slot stays occupied through the callback and timing records,
+    /// and is released on return or unwind. Returns false when empty.
+    #[inline]
+    pub fn consume_ref_one<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(&T, &mut S::Producers),
+    {
+        let consumed = self.consumers.as_mut().consume_ref(&mut self.producers, f)?;
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    /// Borrow at most one SPSC payload, recording timings when the callback
+    /// returns true. An untracked payload still counts as work, propagates its
+    /// ingestion time, and takes the initial clock read. The slot stays
+    /// occupied through the callback and selected records, then releases on
+    /// return or unwind. Returns whether a payload was consumed.
+    #[inline]
+    pub fn consume_ref_one_maybe_track<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        F: FnMut(&T, &mut S::Producers) -> bool,
+    {
+        let consumed = self.consumers.as_mut().consume_ref_maybe_track(&mut self.producers, f)?;
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
     #[inline]
     pub fn try_consume_internal_message_one<T, F>(
         &mut self,

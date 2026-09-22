@@ -19,7 +19,11 @@ fn sequence_rollover_preserves_slot_ownership() {
         assert_eq!(consumer.queue_message_count(), queue.capacity());
         for i in 0..queue.capacity() {
             let mut value = 0;
-            consumer.try_consume(&mut value).unwrap();
+            if i % 2 == 0 {
+                consumer.try_consume(&mut value).unwrap();
+            } else {
+                assert!(consumer.consume_ref(|message| value = *message));
+            }
             assert_eq!(value, (batch * queue.capacity() + i) as u64);
             if i == 1 {
                 drop(consumer);
@@ -44,14 +48,22 @@ fn aligned_and_zero_sized_payloads() {
     #[derive(Clone, Copy)]
     #[repr(C, align(4096))]
     struct Aligned(u64);
+    #[derive(Clone, Copy)]
+    #[repr(align(4096))]
+    struct AlignedZero;
 
     let queue = Queue::new(2);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
     producer.produce(&Aligned(17)).unwrap();
+    producer.produce(&Aligned(18)).unwrap();
     let mut value = Aligned(0);
     consumer.try_consume(&mut value).unwrap();
     assert_eq!(value.0, 17);
+    assert!(consumer.consume_ref(|message| {
+        assert_eq!(std::ptr::from_ref(message).addr() % align_of::<Aligned>(), 0);
+        assert_eq!(message.0, 18);
+    }));
 
     let queue = Queue::new(1);
     let mut producer = queue.try_producer().unwrap();
@@ -60,6 +72,18 @@ fn aligned_and_zero_sized_payloads() {
     assert_eq!(producer.produce(&()), Err(FullError));
     consumer.try_consume(&mut ()).unwrap();
     assert_eq!(consumer.try_consume(&mut ()), Err(EmptyError::Empty));
+
+    let queue = Queue::new(2);
+    let mut producer = queue.try_producer().unwrap();
+    let mut consumer = queue.try_consumer().unwrap();
+    producer.produce(&AlignedZero).unwrap();
+    producer.produce(&AlignedZero).unwrap();
+    assert_eq!(producer.produce(&AlignedZero), Err(FullError));
+    consumer.try_consume(&mut AlignedZero).unwrap();
+    assert!(consumer.consume_ref(|message| {
+        assert_eq!(std::ptr::from_ref(message).addr() % align_of::<AlignedZero>(), 0);
+    }));
+    assert_eq!(consumer.try_consume(&mut AlignedZero), Err(EmptyError::Empty));
 }
 
 #[cfg(not(miri))]

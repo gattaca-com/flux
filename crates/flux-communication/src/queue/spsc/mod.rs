@@ -433,9 +433,9 @@ impl<T: Copy> Drop for Producer<T> {
     }
 }
 
-/// Exclusive consumer. Values are copied out before slots are released, so
-/// callbacks never borrow shared storage. Dropping permits a replacement
-/// reader.
+/// Exclusive consumer. Copying operations release slots before invoking
+/// callbacks; [`Consumer::consume_ref`] borrows a slot until its callback
+/// finishes. Dropping permits a replacement reader.
 ///
 /// ```compile_fail
 /// use flux_communication::queue::spsc::Queue;
@@ -447,6 +447,20 @@ pub struct Consumer<T: Copy> {
     storage: EndpointStorage<T>,
     read: usize,
     cached_write: usize,
+}
+
+struct SlotRelease<'a> {
+    position: &'a mut usize,
+    read: &'a AtomicUsize,
+}
+
+impl Drop for SlotRelease<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        *self.position = self.position.wrapping_add(1);
+        // Publishing the read cursor returns this slot to the producer.
+        self.read.store(*self.position, Ordering::Release);
+    }
 }
 
 impl<T: Copy> Consumer<T> {
@@ -480,6 +494,40 @@ impl<T: Copy> Consumer<T> {
     pub fn consume(&mut self, mut f: impl FnMut(&mut T)) -> bool {
         let Some(mut value) = self.pop() else { return false };
         f(&mut value);
+        true
+    }
+
+    /// Borrow the next message in its queue slot without copying it.
+    ///
+    /// Returns false without calling `f` when empty. The slot remains occupied
+    /// throughout `f` and is released when it returns or unwinds. A callback
+    /// must not wait for producer progress that requires this slot to be free.
+    /// Use [`Self::consume`] to release the slot before running a callback.
+    ///
+    /// The callback cannot retain the slot's reference:
+    ///
+    /// ```compile_fail,E0521
+    /// use flux_communication::queue::spsc::Queue;
+    /// let queue = Queue::<u64>::new(1);
+    /// let mut consumer = queue.try_consumer().unwrap();
+    /// let mut saved = None;
+    /// consumer.consume_ref(|message| saved = Some(message));
+    /// ```
+    #[inline]
+    pub fn consume_ref(&mut self, f: impl FnOnce(&T)) -> bool {
+        if self.read == self.cached_write {
+            self.cached_write = self.storage.write().load(Ordering::Acquire);
+            if self.read == self.cached_write {
+                return false;
+            }
+        }
+        let slot = self.storage.slot(self.read);
+        let release = SlotRelease { position: &mut self.read, read: self.storage.read() };
+        // SAFETY: the acquired write cursor proves this slot is initialized.
+        // The producer cannot reuse it until the guard publishes read, after this
+        // callback's borrow ends, including during unwinding.
+        f(unsafe { &*slot });
+        drop(release);
         true
     }
 

@@ -135,6 +135,57 @@ fn nonzero_values_and_callbacks_are_copied_out() {
     assert_eq!(value.get(), 13);
 }
 
+#[test]
+fn borrowed_slot_is_held_until_callback_returns_or_unwinds() {
+    let queue = Queue::new(1);
+    let mut producer = queue.try_producer().unwrap();
+    let mut consumer = queue.try_consumer().unwrap();
+    producer.produce(&41).unwrap();
+
+    // Moving this capture out also exercises an FnOnce-only callback.
+    let owned = String::from("callback state");
+    assert!(consumer.consume_ref(|message| {
+        drop(owned);
+        assert_eq!(*message, 41);
+        assert_eq!(producer.max_writable_msgs_without_speeding_past(), 0);
+        assert!(producer.produce(&99).is_err());
+        assert_eq!(*message, 41);
+    }));
+    assert_eq!(producer.max_writable_msgs_without_speeding_past(), 1);
+    producer.produce(&42).unwrap();
+
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            consumer.consume_ref(|message| {
+                assert_eq!(*message, 42);
+                assert!(producer.produce(&99).is_err());
+                panic!("callback panic is intentional");
+            });
+        }))
+        .is_err()
+    );
+    assert_eq!(producer.max_writable_msgs_without_speeding_past(), 1);
+    drop(consumer);
+    let mut consumer = queue.try_consumer().unwrap();
+    assert_eq!(consumer.queue_message_count(), 0);
+    assert!(!consumer.consume_ref(|_| panic!("must not replay after unwind")));
+    producer.produce(&43).unwrap();
+    assert!(consumer.consume_ref(|message| assert_eq!(*message, 43)));
+}
+
+#[test]
+fn copying_callback_releases_capacity_before_running() {
+    let queue = Queue::new(1);
+    let mut producer = queue.try_producer().unwrap();
+    let mut consumer = queue.try_consumer().unwrap();
+    producer.produce(&1).unwrap();
+    assert!(consumer.consume(|message| {
+        producer.produce(&2).expect("copied consumption releases before callback");
+        assert_eq!(*message, 1);
+    }));
+    assert!(consumer.consume_ref(|message| assert_eq!(*message, 2)));
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PatternedMessage {
     sequence: u64,
@@ -189,6 +240,56 @@ fn threaded_transfer_keeps_multiword_messages_intact() {
 
     producer_thread.join().unwrap();
     consumer_thread.join().unwrap();
+}
+
+#[test]
+fn progress_queries_remain_bounded_during_transfer() {
+    // While either endpoint queries, only its peer can change availability.
+    // A positive observation must allow an immediate operation.
+    for capacity in [1, 2, 8, 64] {
+        let queue = Queue::new(capacity);
+        let mut producer = queue.try_producer().unwrap();
+        let mut consumer = queue.try_consumer().unwrap();
+        let messages = if cfg!(miri) { 128 } else { 20_000 };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                for sequence in 0..messages {
+                    loop {
+                        let available = producer.max_writable_msgs_without_speeding_past();
+                        assert!(available <= capacity);
+                        if producer.produce(&sequence).is_ok() {
+                            break;
+                        }
+                        assert_eq!(available, 0, "reported space must remain writable");
+                        assert!(Instant::now() < deadline);
+                        thread::yield_now();
+                    }
+                }
+            });
+            scope.spawn(move || {
+                for expected in 0..messages {
+                    let mut value = usize::MAX;
+                    loop {
+                        let unread = consumer.queue_message_count();
+                        assert!(unread <= capacity);
+                        let received = if expected % 2 == 0 {
+                            consumer.consume_ref(|message| value = *message)
+                        } else {
+                            consumer.try_consume(&mut value).is_ok()
+                        };
+                        if received {
+                            assert_eq!(value, expected);
+                            break;
+                        }
+                        assert_eq!(unread, 0, "reported values must remain readable");
+                        assert!(Instant::now() < deadline);
+                        thread::yield_now();
+                    }
+                }
+            });
+        });
+    }
 }
 
 #[cfg(not(miri))]
@@ -291,12 +392,12 @@ fn concurrent_process_transfer_keeps_multiword_messages_intact() {
     let mut child = shared_child("stream", &path).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     for sequence in 0..10_000 {
-        let mut message = PatternedMessage::new(u64::MAX);
-        while consumer.try_consume(&mut message).is_err() {
+        while !consumer.consume_ref(|message| {
+            assert_eq!(*message, PatternedMessage::new(sequence));
+        }) {
             assert!(Instant::now() < deadline, "child producer stopped making progress");
             thread::yield_now();
         }
-        assert_eq!(message, PatternedMessage::new(sequence));
     }
     assert!(child.wait().unwrap().success());
     drop(consumer);
