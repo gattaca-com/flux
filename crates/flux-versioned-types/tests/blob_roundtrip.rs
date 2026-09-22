@@ -44,6 +44,11 @@ versioned_struct!(Flag =>
     FlagV1 { pub ok: bool }
 );
 
+versioned_struct!(Big =>
+    #[type_hash_lock(hash = 229356978702323145)]
+    BigV1 { pub amount: u128 }
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, VersionedLeaves)]
 enum Sub {
     A(Leaf),
@@ -618,4 +623,32 @@ fn foreign_leaf_fields_round_trip() {
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0].data(), &first);
     assert_eq!(msgs[1].data(), &second);
+}
+
+#[test]
+fn u128_leaf_roundtrips_with_pad() {
+    // Odd n: 3 x 24-byte stamps = 72 bytes, pads to 80 for 16-aligned leaves.
+    let msgs = [
+        InternalMessage::new(stamp(1, 1), Big { amount: 1 }),
+        InternalMessage::new(stamp(2, 2), Big { amount: u128::MAX }),
+        InternalMessage::new(stamp(3, 3), Big { amount: 1 << 100 }),
+    ];
+    let mut cache = BlobCache::new();
+    for msg in &msgs {
+        cache.push(msg);
+    }
+    let meta = MetaV1 { slot: 9, instance: ArrayStr::try_from("big").unwrap() };
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
+    assert_eq!(blobs.len(), 1);
+
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let blob = a.load(&blobs[0]).unwrap();
+    assert_eq!(blob.header.decompressed_len, 80 + 3 * 16);
+    let (_, decoded): (Meta, Vec<InternalMessage<Big>>) = blob.decode(&mut b).unwrap();
+    assert_eq!(decoded.len(), 3);
+    for (got, want) in decoded.iter().zip(msgs.iter()) {
+        assert_eq!(got.data(), want.data());
+    }
 }
