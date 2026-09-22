@@ -8,6 +8,13 @@
 //! return false to skip processing-time and latency records for a message.
 //! Consumption and ingestion-time propagation still occur, as does the initial
 //! clock read. The ordinary consume methods record timings for every message.
+//! For SPSC queues, `consume_ref` and `consume_ref_one` pass `&T` directly
+//! from the slot, keeping it occupied through the callback and timing records.
+//! Their `maybe_track` variants select telemetry in the same way. The slot
+//! releases on return or unwind, and the callback cannot retain its reference.
+//! A borrowed callback must not wait for output that needs its occupied slot
+//! to become free; see
+//! [`crate::communication::queue::spsc::Consumer::consume_ref`].
 //!
 //! ```no_run
 //! # #![deny(unused_imports)]
@@ -37,6 +44,16 @@
 //!             Err(SpscProduceError::Attach(error)) => panic!("producer role: {error}"),
 //!         }
 //!     }
+//! }
+//!
+//! fn read_in_place(adapter: &mut SpineAdapter<Readings>, total: &mut u64) {
+//!     adapter.consume_ref(|reading: &Reading, _producers| {
+//!         *total += reading.0;
+//!     }).unwrap();
+//!     adapter.consume_ref_maybe_track(|reading: &Reading, _producers| {
+//!         *total += reading.0;
+//!         reading.0 != 0
+//!     }).unwrap();
 //! }
 //!
 //! // SAFETY: participants use this exact schema and process-independent values,

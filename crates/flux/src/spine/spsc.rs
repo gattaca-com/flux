@@ -174,6 +174,22 @@ pub(super) struct AttachedSpscConsumer<'a, T: Copy> {
 
 impl<T: Copy> AttachedSpscConsumer<'_, T> {
     #[inline]
+    pub(super) fn consume_ref_maybe_track<P, F>(&mut self, producers: &mut P, mut f: F) -> bool
+    where
+        P: SpineProducers,
+        F: FnMut(&T, &mut P) -> bool,
+    {
+        self.inner.consume_ref(|message| {
+            *producers.timestamp_mut().ingestion_t_mut() = message.ingestion_time();
+            self.timer.start();
+            if f(message.data(), producers) {
+                self.timer
+                    .record_processing_and_latency_from(producers.timestamp().ingestion_t.into());
+            }
+        })
+    }
+
+    #[inline]
     pub(super) fn consume_internal_message_maybe_track<P, F>(
         &mut self,
         producers: &mut P,
@@ -264,6 +280,43 @@ impl<T: 'static + Copy> SpineSpscConsumer<T> {
         self.try_consume_internal_message_maybe_track(producers, |message, p| {
             f(message.into_data(), p)
         })
+    }
+
+    /// Borrow one payload in its queue slot, with consumption telemetry.
+    /// The slot stays occupied through the callback and timing records, and
+    /// is released on return or unwind. Returns false when empty.
+    #[inline]
+    pub fn consume_ref<P, F>(
+        &mut self,
+        producers: &mut P,
+        mut f: F,
+    ) -> Result<bool, spsc::QueueError>
+    where
+        P: SpineProducers,
+        F: FnMut(&T, &mut P),
+    {
+        self.consume_ref_maybe_track(producers, |message, p| {
+            f(message, p);
+            true
+        })
+    }
+
+    /// Borrow one payload, recording timings only when the callback returns
+    /// true. A false result still consumes it and propagates its ingestion
+    /// time. The initial clock read is retained. The slot stays occupied
+    /// through the callback and selected records, then releases on return or
+    /// unwind. Returns whether a payload was consumed.
+    #[inline]
+    pub fn consume_ref_maybe_track<P, F>(
+        &mut self,
+        producers: &mut P,
+        f: F,
+    ) -> Result<bool, spsc::QueueError>
+    where
+        P: SpineProducers,
+        F: FnMut(&T, &mut P) -> bool,
+    {
+        Ok(self.try_attached()?.consume_ref_maybe_track(producers, f))
     }
 
     /// Consume one message, including its original tracking metadata.
