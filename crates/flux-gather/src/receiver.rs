@@ -27,12 +27,23 @@ pub trait BlobHandler<S: FluxSpine, U>: Tile<S> {
 pub struct BlobReceiver {
     listen: SocketAddr,
     socket_buf_size: usize,
+    transport: Transport,
     driver: Option<NetworkDriver>,
 }
 
 impl BlobReceiver {
     pub fn new(listen: SocketAddr) -> Self {
-        Self { listen, socket_buf_size: 64 * 1024 * 1024, driver: None }
+        Self {
+            listen,
+            socket_buf_size: 64 * 1024 * 1024,
+            transport: Transport::Tcp(TcpConfig::default()),
+            driver: None,
+        }
+    }
+
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 
     pub fn with_socket_buf_size(mut self, bytes: usize) -> Self {
@@ -49,7 +60,7 @@ where
     fn try_init(&mut self, adapter: &mut SpineAdapter<S>) -> bool {
         let producers: &SpineProducerWithDCache<IncomingBlob> = adapter.producers.as_ref();
         let mut driver = NetworkDriver::default()
-            .with_transport(Transport::Tcp(TcpConfig::default()))
+            .with_transport(self.transport)
             .with_socket_buf_size(self.socket_buf_size)
             .with_dcache(producers.dcache_ptr());
         driver.listen_at(self.listen).expect("gather receiver couldn't listen");

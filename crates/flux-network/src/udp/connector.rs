@@ -261,6 +261,17 @@ impl UdpManager {
         let _ = self.registry.deregister(&mut entry.socket);
     }
 
+    pub(crate) fn clear_backlog(&mut self, token: Token) -> usize {
+        let Some(i) = self.peers.iter().position(|p| p.token == token) else { return 0 };
+        let (count, assigned) = self.peers[i].clear_backlog(&mut self.store);
+        // Even a locally disconnected peer may have an observed Hello: reusing
+        // that session would leave the receiver waiting on discarded sequences.
+        if assigned {
+            self.drop_peer(i, Instant::now());
+        }
+        count
+    }
+
     pub(crate) fn disconnect_outbound(&mut self) {
         let now = Instant::now();
         for i in 0..self.peers.len() {
@@ -274,6 +285,20 @@ impl UdpManager {
     /// peer, then flushes the sockets touched. `payload` comes back as a
     /// recycled buffer for the caller's next message.
     pub(crate) fn write(&mut self, where_to: SendBehavior, payload: &mut Vec<u8>) {
+        assert!(
+            self.udp.max_pending_bytes == 0 || payload.len() <= self.udp.max_message_size,
+            "udp message exceeds max_message_size"
+        );
+        for peer in &self.peers {
+            if matches!(where_to, SendBehavior::Single(token) if token != peer.token) ||
+                (peer.is_outbound() &&
+                    !peer.is_connected() &&
+                    self.config.drop_outbound_backlog_on_disconnect)
+            {
+                continue;
+            }
+            peer.validate_send(payload.len());
+        }
         let now = Instant::now();
         let ts = Nanos::now();
         let slot = self.store.insert(payload);
@@ -510,6 +535,9 @@ impl UdpManager {
                 ) == SendOutcome::WouldBlock
                 {
                     arm_writable(&self.registry, entry);
+                }
+                if header.kind == Kind::Ack && !peer.unsent().is_empty() {
+                    self.flush_socket(k, now);
                 }
             }
         }

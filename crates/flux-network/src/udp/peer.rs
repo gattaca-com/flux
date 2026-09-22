@@ -585,8 +585,8 @@ impl TxWindow {
     }
 }
 
-/// A multi-fragment message being reassembled in owned memory (a dcache
-/// reservation could be lapped while fragments are in flight). Recycled
+/// A message reassembled or waiting for ordered delivery in owned memory (a
+/// dcache reservation could be lapped while waiting). Recycled
 /// whole; stale bytes are overwritten before delivery so nothing is zeroed.
 struct Partial {
     first_seq: u64,
@@ -598,10 +598,11 @@ struct Partial {
 }
 
 /// Receive side: sequence tracking above the ack point plus in-progress
-/// multi-fragment messages. A partial always straddles the ack point (its
-/// missing fragment is unacked), so the window bounds how many can exist.
+/// messages, including completed messages waiting for ordered delivery. A
+/// missing fragment pins the ack point, bounding reassembly by the window.
 struct RxWindow {
     ack_next: u64,
+    deliver_next: u64,
     /// Highest sequence accepted; the ack bitmap runs from `ack_next + 1` to
     /// here.
     highest: u64,
@@ -618,6 +619,7 @@ impl RxWindow {
     fn new(capacity: usize, max_bits: u64) -> Self {
         Self {
             ack_next: 0,
+            deliver_next: 0,
             highest: 0,
             bits: vec![0; capacity.div_ceil(u64::BITS as usize)],
             mask: capacity as u64 - 1,
@@ -630,6 +632,7 @@ impl RxWindow {
 
     fn reset(&mut self, first_seq: u64) {
         self.ack_next = first_seq;
+        self.deliver_next = first_seq;
         self.highest = first_seq;
         self.bits.fill(0);
         self.spare.append(&mut self.partials);
@@ -709,6 +712,8 @@ pub(crate) struct UdpPeer {
     local_session: u32,
     remote_session: Option<u32>,
     tx: TxWindow,
+    pending: VecDeque<(u32, Nanos)>,
+    pending_bytes: usize,
     rx: RxWindow,
     rto: Rto,
     last_recv: Instant,
@@ -748,6 +753,8 @@ impl UdpPeer {
             local_session,
             remote_session: None,
             tx: TxWindow::new(config.send_window),
+            pending: VecDeque::new(),
+            pending_bytes: 0,
             ctrl: vec![0; HEADER_SIZE + rx.max_bits.div_ceil(64) as usize * 8],
             rx,
             rto: Rto::new(&config),
@@ -798,6 +805,19 @@ impl UdpPeer {
     /// Releases every store reference before the peer is dropped.
     pub(crate) fn release_all(&mut self, store: &mut MsgStore) {
         self.tx.release_all(store);
+        for (slot, _) in self.pending.drain(..) {
+            store.release(slot);
+        }
+        self.pending_bytes = 0;
+    }
+
+    /// Clears queued messages and reports whether assigned sequences were lost.
+    pub(crate) fn clear_backlog(&mut self, store: &mut MsgStore) -> (usize, bool) {
+        let assigned = !self.tx.messages.is_empty();
+        let count = self.tx.messages.len() + self.pending.len();
+        self.release_all(store);
+        self.tx.clear(store);
+        (count, assigned)
     }
 
     /// Drops the session and adopts `new_session` so the remote sees a fresh
@@ -813,7 +833,7 @@ impl UdpPeer {
         self.remote_session = None;
         self.local_session = new_session;
         if drop_backlog {
-            self.tx.clear(store);
+            self.clear_backlog(store);
         } else {
             self.tx.rewind(new_session);
         }
@@ -880,6 +900,21 @@ impl UdpPeer {
         send_datagram(socket, self.addr, &self.ctrl[..HEADER_SIZE + n])
     }
 
+    pub(crate) fn validate_send(&self, len: usize) {
+        if self.config.max_pending_bytes == 0 {
+            return;
+        }
+        assert!(len <= self.config.max_message_size, "udp message exceeds max_message_size");
+        if !self.pending.is_empty() ||
+            fragment_count(len, self.config.stride()) as u64 > self.tx.free()
+        {
+            assert!(
+                len <= self.config.max_pending_bytes.saturating_sub(self.pending_bytes),
+                "udp pending send queue exceeds max_pending_bytes"
+            );
+        }
+    }
+
     /// Stages the message in store `slot`.
     pub(crate) fn push_message(
         &mut self,
@@ -889,11 +924,20 @@ impl UdpPeer {
         now: Instant,
     ) -> PushOutcome {
         let len = store.bytes(slot).len();
+        self.validate_send(len);
         if len > self.config.max_message_size {
             warn!(%self.addr, len, max = self.config.max_message_size, "udp message too large");
             return PushOutcome::TooLarge;
         }
-        if self.tx.push(self.local_session, self.config.stride(), store, slot, ts) {
+        if self.pending.is_empty() &&
+            self.tx.push(self.local_session, self.config.stride(), store, slot, ts)
+        {
+            return PushOutcome::Queued;
+        }
+        if self.config.max_pending_bytes != 0 {
+            store.add_ref(slot);
+            self.pending.push_back((slot, ts));
+            self.pending_bytes += len;
             return PushOutcome::Queued;
         }
         self.dropped_full += 1;
@@ -998,13 +1042,29 @@ impl UdpPeer {
             warn!(%self.addr, len, "udp message exceeds dcache capacity, not acked");
             return;
         }
+        let first_seq = header.seq - index as u64;
+        let Some(end_seq) = first_seq.checked_add(total as u64) else { return };
+        // ACKing inconsistent ranges can advance the window indefinitely while
+        // ordered delivery remains stuck on an incomplete message.
+        if self.config.ordered &&
+            header.seq >= self.rx.ack_next &&
+            (first_seq < self.rx.deliver_next ||
+                self.rx.partials.iter().any(|p| {
+                    let end = p.first_seq + fragment_count(p.len, self.config.stride()) as u64;
+                    first_seq < end &&
+                        p.first_seq < end_seq &&
+                        (p.first_seq != first_seq || p.len != len)
+                }))
+        {
+            return;
+        }
         self.ack_due = true;
         if !self.rx.accept(header.seq) {
             return;
         }
         let send_ts = Nanos(header.send_ts);
 
-        if total == 1 {
+        if total == 1 && !self.config.ordered {
             match dcache {
                 None => self.deliver(RxPayload::Raw(payload), send_ts, deliver),
                 Some(dc) => match dc.write(len, |buf| buf.copy_from_slice(payload)) {
@@ -1015,7 +1075,6 @@ impl UdpPeer {
             return;
         }
 
-        let first_seq = header.seq - index as u64;
         let pos = self.partial_index(first_seq, len, total, header.send_ts);
         let partial = &mut self.rx.partials[pos];
         if partial.len != len {
@@ -1026,21 +1085,41 @@ impl UdpPeer {
         // and a fragment index maps to exactly one sequence of its message.
         partial.remaining -= 1;
         partial.buf[offset..offset + payload.len()].copy_from_slice(payload);
-        if partial.remaining != 0 {
+        if partial.remaining != 0 || (self.config.ordered && first_seq != self.rx.deliver_next) {
             return;
         }
 
-        let done = self.rx.partials.swap_remove(pos);
-        let send_ts = Nanos(done.send_ts);
-        let bytes = &done.buf[..len];
-        match dcache {
-            None => self.deliver(RxPayload::Raw(bytes), send_ts, deliver),
-            Some(dc) => match dc.write(len, |buf| buf.copy_from_slice(bytes)) {
-                Ok(dref) => self.deliver(RxPayload::DCache(dref), send_ts, deliver),
-                Err(e) => warn!("dcache write failed: {e}"),
-            },
+        loop {
+            let pos = if self.config.ordered {
+                let Some(pos) = self
+                    .rx
+                    .partials
+                    .iter()
+                    .position(|p| p.first_seq == self.rx.deliver_next && p.remaining == 0)
+                else {
+                    break;
+                };
+                pos
+            } else {
+                pos
+            };
+            let done = self.rx.partials.swap_remove(pos);
+            self.rx.deliver_next =
+                done.first_seq + fragment_count(done.len, self.config.stride()) as u64;
+            let send_ts = Nanos(done.send_ts);
+            let bytes = &done.buf[..done.len];
+            match dcache {
+                None => self.deliver(RxPayload::Raw(bytes), send_ts, deliver),
+                Some(dc) => match dc.write(done.len, |buf| buf.copy_from_slice(bytes)) {
+                    Ok(dref) => self.deliver(RxPayload::DCache(dref), send_ts, deliver),
+                    Err(e) => warn!("dcache write failed: {e}"),
+                },
+            }
+            self.rx.spare.push(done);
+            if !self.config.ordered {
+                break;
+            }
         }
-        self.rx.spare.push(done);
     }
 
     /// Finds or creates the partial for `first_seq`.
@@ -1105,6 +1184,14 @@ impl UdpPeer {
         );
         if let Some(rtt) = acked.rtt {
             self.rto.sample(rtt);
+        }
+        while let Some(&(slot, ts)) = self.pending.front() {
+            if !self.tx.push(self.local_session, self.config.stride(), store, slot, ts) {
+                break;
+            }
+            self.pending.pop_front();
+            self.pending_bytes -= store.bytes(slot).len();
+            store.release(slot);
         }
         if acked.blocked { SendOutcome::WouldBlock } else { SendOutcome::Done }
     }

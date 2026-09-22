@@ -129,8 +129,9 @@ impl Inner {
 /// into the dcache and must be drained with [`poll_with_produce`].
 ///
 /// ## UDP
-/// Messages are delivered as soon as they are complete, in any order. On
-/// reconnect everything still queued is resent under the new session unless
+/// Messages are delivered as soon as they are complete, in any order, unless
+/// [`UdpConfig::ordered`] is enabled. On reconnect everything still queued is
+/// resent under the new session unless
 /// [`with_drop_outbound_backlog_on_disconnect`] is set.
 pub struct NetworkDriver {
     /// Scratch the caller serialises into; managers get it as a slice.
@@ -289,6 +290,11 @@ impl NetworkDriver {
     /// [`SendBehavior::Broadcast`] to send to all active connections or
     /// [`SendBehavior::Single`] to target one token. Empty payloads are not
     /// sent.
+    ///
+    /// # Panics
+    /// With UDP `max_pending_bytes` enabled, panics before enqueueing if the
+    /// message exceeds `max_message_size` or any target's pending queue is
+    /// full.
     #[inline]
     pub fn write_or_enqueue_with<F>(&mut self, where_to: SendBehavior, serialise: F)
     where
@@ -327,12 +333,14 @@ impl NetworkDriver {
         }
     }
 
-    /// Drops the frames queued for `token`, returning how many. A partially
-    /// written frame is kept. TCP only.
+    /// Drops the messages queued for `token`, returning how many. TCP keeps a
+    /// partially written frame. UDP clears whole unacked and pending messages;
+    /// discarding assigned sequences reconnects an outbound peer or drops an
+    /// accepted peer so no receive session is left with a sequence hole.
     pub fn clear_backlog(&mut self, token: Token) -> usize {
         match &mut self.inner {
             Inner::Tcp(m) => m.clear_backlog(token),
-            Inner::Udp(_) => 0,
+            Inner::Udp(m) => m.clear_backlog(token),
         }
     }
 

@@ -22,6 +22,7 @@ use flux_gather::{
     Blob, BlobCache, BlobConsumer, BlobHandler, BlobReader, BlobReceiver, BlobShipper, BlobWriter,
     GatherQueues, IncomingBlob, ReadError, Token,
 };
+use flux_network::{Transport, UdpConfig};
 use flux_timing::{Duration, InternalMessage, Nanos};
 use flux_utils::ArrayStr;
 use flux_versioned_types::{
@@ -276,6 +277,7 @@ fn spawn_receiver(
     base: PathBuf,
     disk: PathBuf,
     addr: SocketAddr,
+    transport: Transport,
     seen: Arc<Mutex<Vec<Seen>>>,
     replica: Arc<Mutex<Vec<InternalMessage<Telemetry>>>>,
     stop: Arc<AtomicBool>,
@@ -287,7 +289,7 @@ fn spawn_receiver(
     std::thread::spawn(move || {
         let spine = RecvSpine::new_with_base_dir(&base, None);
         spine.start(None, None, |scoped| {
-            attach_tile(BlobReceiver::new(addr), scoped, background());
+            attach_tile(BlobReceiver::new(addr).with_transport(transport), scoped, background());
             attach_tile(
                 BlobConsumer::new(RecordingHandler {
                     writer: BlobWriter::new(),
@@ -387,6 +389,15 @@ impl Tile<GatherTestSpine> for ProducerTile {
 
 #[test]
 fn gather_end_to_end_sender_to_receiver() {
+    gather_end_to_end(Transport::default());
+}
+
+#[test]
+fn gather_end_to_end_sender_to_receiver_ordered_udp() {
+    gather_end_to_end(Transport::Udp(UdpConfig { ordered: true, ..UdpConfig::wan() }));
+}
+
+fn gather_end_to_end(transport: Transport) {
     let _port = PORT_LOCK.lock().unwrap();
     let send_base = tempfile::tempdir().expect("send base");
     let recv_base = tempfile::tempdir().expect("recv base");
@@ -410,6 +421,7 @@ fn gather_end_to_end_sender_to_receiver() {
         recv_base.path().to_path_buf(),
         recv_disk.clone(),
         addr,
+        transport,
         seen.clone(),
         replica.clone(),
         stop,
@@ -442,7 +454,7 @@ fn gather_end_to_end_sender_to_receiver() {
             Gatherer {
                 ready: ready.clone(),
                 cache: BlobCache::new(),
-                shipper: BlobShipper::new(vec![addr]),
+                shipper: BlobShipper::new(vec![addr]).with_transport(transport),
                 writer: BlobWriter::new(),
                 base: send_disk.clone(),
                 last_slot: 0,
@@ -653,6 +665,7 @@ fn non_blob_peer_is_disconnected() {
         recv_base.path().to_path_buf(),
         recv_disk,
         addr,
+        Transport::default(),
         seen.clone(),
         replica,
         stop.clone(),

@@ -1,8 +1,8 @@
-//! Gather versioned leaves into blobs, ship them over TCP, and persist them to
-//! disk.
+//! Gather versioned leaves into blobs, ship them over TCP or UDP, and persist
+//! them to disk.
 //!
-//! One blob is one TCP frame is one file: frame payloads and file contents are
-//! `blob.as_bytes()`. See `tests/e2e.rs` for the complete usage example.
+//! One blob is one transport message is one file: payloads and file contents
+//! are `blob.as_bytes()`. See `tests/e2e.rs` for the complete usage example.
 pub mod queues;
 pub mod reader;
 pub mod receiver;

@@ -91,6 +91,12 @@ impl BlobShipper {
         Self { driver, endpoints, retry: Repeater::every(Duration::from_secs(2)) }
     }
 
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        let driver = std::mem::take(&mut self.driver);
+        self.driver = driver.with_transport(transport);
+        self
+    }
+
     pub fn with_max_backlog(mut self, frames: usize, timeout: Duration) -> Self {
         let driver = std::mem::take(&mut self.driver);
         self.driver = driver.with_max_backlog(frames, timeout);

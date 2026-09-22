@@ -1,12 +1,12 @@
-//! Reliable, unordered UDP transport for [`crate::NetworkDriver`].
+//! Reliable UDP transport for [`crate::NetworkDriver`].
 //!
 //! Each message is fragmented into datagrams that carry consecutive sequence
 //! numbers. The receiver acks with a cumulative point plus a selective bitmap
 //! covering everything it holds above it. The sender resends holes below the
 //! highest acked sequence at once, and after an RTO of ack silence probes the
 //! oldest unacked datagram, doubling the probe size per round. Messages are
-//! delivered as soon as all their fragments are in, so a lost datagram delays
-//! only its own message.
+//! delivered as soon as all their fragments are in by default; ordered receive
+//! completion can be enabled with [`UdpConfig::ordered`].
 
 use flux_timing::Duration;
 
@@ -26,15 +26,26 @@ pub(crate) use connector::UdpManager;
 /// `max_datagram_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
+    /// Deliver messages in send order within each session. Completed later
+    /// messages wait in the receive window until earlier messages are complete.
+    /// Receive-side only; does not change the wire format. Defaults to false.
+    pub ordered: bool,
     /// Datagram size including the 29-byte header. 1200 stays under the
     /// 1280-byte IPv6 minimum MTU.
     pub max_datagram_size: usize,
     /// Datagrams a sender may have in flight per peer, counted from the oldest
     /// message not yet fully acked. Power of two, at least 64. A message that
-    /// does not fit disconnects the peer, like an exceeded backlog. There is
-    /// no flow control, so the receiver's socket buffer should hold a full
-    /// window.
+    /// does not fit disconnects the peer unless `max_pending_bytes` is enabled.
+    /// There is no flow control, so the receiver's socket buffer should hold a
+    /// full window.
     pub send_window: usize,
+    /// Payload bytes queued per peer behind a full send window. Zero preserves
+    /// the default disconnect-on-overflow policy. With a nonzero limit, sends
+    /// panic rather than silently dropping oversized messages or exceeding this
+    /// queue bound. Pending messages obey
+    /// `drop_outbound_backlog_on_disconnect`; `with_max_backlog` continues
+    /// to count only in-flight datagrams.
+    pub max_pending_bytes: usize,
     /// Datagrams a receiver tracks above its ack point. Power of two, at least
     /// 64. Should be at least the peer's `send_window`.
     pub recv_window: usize,
@@ -52,8 +63,10 @@ pub struct UdpConfig {
 impl Default for UdpConfig {
     fn default() -> Self {
         Self {
+            ordered: false,
             max_datagram_size: 1200,
             send_window: 16 * 1024,
+            max_pending_bytes: 0,
             recv_window: 16 * 1024,
             max_message_size: 16 * 1024 * 1024,
             initial_rto: Duration::from_millis(20),
