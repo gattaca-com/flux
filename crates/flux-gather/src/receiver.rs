@@ -8,7 +8,7 @@ use flux::{
     tile::{Tile, TileName},
 };
 use flux_network::{NetworkDriver, PollEvent, TcpConfig, Transport};
-use flux_versioned_types::{Blob, DecodeError, Scratch, Versioned};
+use flux_versioned_types::{Blob, DecodeError, Versioned};
 use mio::Token;
 use tracing::warn;
 
@@ -19,8 +19,9 @@ pub struct IncomingBlob {
 }
 
 pub trait BlobHandler<S: FluxSpine, U>: Tile<S> {
-    /// `blob` is valid until the next frame.
-    fn on_blob(&mut self, meta: &U, blob: &Blob, adapter: &mut SpineAdapter<S>);
+    /// `blob` borrows the gather mapping and is valid only for the call.
+    /// Copy out whatever must outlive it; header-only work needs no copy.
+    fn on_blob(&mut self, meta: &U, blob: &Blob, producers: &mut S::Producers);
 }
 
 pub struct BlobReceiver {
@@ -68,17 +69,17 @@ where
     }
 }
 
-/// Copies each frame out of the dcache before the epoch check so a torn slot
-/// never reaches the handler.
+/// Hands each frame to the handler borrowed from the dcache mapping, so a
+/// torn slot never reaches it. The handler copies out whatever must outlive
+/// the call; header-only work needs no copy.
 pub struct BlobConsumer<U: Versioned, H> {
     handler: H,
-    scratch: Scratch,
     meta: PhantomData<fn() -> U>,
 }
 
 impl<U: Versioned, H> BlobConsumer<U, H> {
     pub fn new(handler: H) -> Self {
-        Self { handler, scratch: Scratch::new(), meta: PhantomData }
+        Self { handler, meta: PhantomData }
     }
 
     /// `Err`: the peer is not sending our blobs.
@@ -98,7 +99,7 @@ impl<U: Versioned, H> BlobConsumer<U, H> {
             });
         }
         let meta = blob.user_metadata::<U>()?;
-        self.handler.on_blob(&meta, blob, adapter);
+        self.handler.on_blob(&meta, blob, &mut adapter.producers);
         Ok(())
     }
 
@@ -126,11 +127,9 @@ where
 
     fn loop_body(&mut self, adapter: &mut SpineAdapter<S>) {
         loop {
-            let mut pending: Option<U> = None;
-            let scratch = &mut self.scratch;
             let more = adapter
-                .consume_with_dcache_collaborative::<IncomingBlob, Result<U, DecodeError>, _, _>(
-                    |_, payload| {
+                .consume_with_dcache_collaborative::<IncomingBlob, Result<(), DecodeError>, _, _>(
+                    |_, payload, producers| {
                         let blob = Blob::from_bytes(payload)?;
                         if blob.as_bytes().len() != payload.len() {
                             return Err(DecodeError::LengthMismatch {
@@ -139,11 +138,11 @@ where
                             });
                         }
                         let meta = blob.user_metadata::<U>()?;
-                        scratch.load(blob.as_bytes())?;
-                        Ok(meta)
+                        self.handler.on_blob(&meta, blob, producers);
+                        Ok(())
                     },
                     |result, producers| match result {
-                        DCacheRead::Ok((_, Ok(meta))) => pending = Some(meta),
+                        DCacheRead::Ok((_, Ok(()))) | DCacheRead::SpedPast => {}
                         DCacheRead::Ok((msg, Err(error))) => {
                             warn!(?error, token = ?msg.token, "gather peer sent a non-blob frame");
                             producers.produce(msg.token);
@@ -154,14 +153,8 @@ where
                         DCacheRead::Lost(_) => {
                             warn!("gather frame lost to receiver-side overrun");
                         }
-                        DCacheRead::SpedPast => {}
                     },
                 );
-            if let Some(meta) = pending {
-                let blob = Blob::from_bytes(self.scratch.as_bytes())
-                    .expect("copied from a validated blob");
-                self.handler.on_blob(&meta, blob, adapter);
-            }
             if !more {
                 break;
             }

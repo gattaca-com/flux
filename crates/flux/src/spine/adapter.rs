@@ -286,11 +286,13 @@ impl<S: FluxSpine> SpineAdapter<S> {
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
-        F: FnMut(T, &[u8]) -> R,
+        F: FnMut(T, &[u8], &mut S::Producers) -> R,
         G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let Some(result) = c.consume_collaborative(&mut self.producers, &mut read) else {
+        let Some(result) =
+            c.consume_collaborative(&mut self.producers, |msg, payload, p| read(msg, payload, p))
+        else {
             return false;
         };
         self.did_work |= !matches!(result, DCacheRead::SpedPast);
@@ -334,11 +336,14 @@ impl<S: FluxSpine> SpineAdapter<S> {
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
-        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
+        F: FnMut(&InternalMessage<T>, &[u8], &mut S::Producers) -> R,
         G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        let Some(result) = c.consume_collaborative_internal_message(&mut self.producers, &mut read)
+        let Some(result) = c
+            .consume_collaborative_internal_message(&mut self.producers, |msg, payload, p| {
+                read(msg, payload, p)
+            })
         else {
             return false;
         };

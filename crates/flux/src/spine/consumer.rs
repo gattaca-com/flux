@@ -293,15 +293,17 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
     ) -> Option<DCacheRead<T, R>>
     where
         P: SpineProducers,
-        F: FnMut(T, &[u8]) -> R,
+        F: FnMut(T, &[u8], &mut P) -> R,
     {
-        self.consume_collaborative_internal_message(producers, |msg, payload| read(**msg, payload))
-            .map(|res| match res {
-                DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
-                DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
-                DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
-                DCacheRead::SpedPast => DCacheRead::SpedPast,
-            })
+        self.consume_collaborative_internal_message(producers, |msg, payload, p| {
+            read(**msg, payload, p)
+        })
+        .map(|res| match res {
+            DCacheRead::Ok((msg, r)) => DCacheRead::Ok((msg.into_data(), r)),
+            DCacheRead::Lost(msg) => DCacheRead::Lost(msg.into_data()),
+            DCacheRead::NoRef(msg) => DCacheRead::NoRef(msg.into_data()),
+            DCacheRead::SpedPast => DCacheRead::SpedPast,
+        })
     }
 
     #[inline]
@@ -312,7 +314,7 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
     ) -> Option<DCacheRead<InternalMessage<T>, R>>
     where
         P: SpineProducers,
-        F: FnMut(&InternalMessage<T>, &[u8]) -> R,
+        F: FnMut(&InternalMessage<T>, &[u8], &mut P) -> R,
     {
         Some(match self.inner.try_consume_with_epoch_collaborative() {
             Ok((&msg, slot_pos, slot_ver)) => {
@@ -324,7 +326,8 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
                 }
                 let user_msg = msg.with_data(msg.data().data);
                 self.timer.start();
-                let Ok(extracted) = self.dcache.map(dref, |payload| read(&user_msg, payload))
+                let Ok(extracted) =
+                    self.dcache.map(dref, |payload| read(&user_msg, payload, &mut *producers))
                 else {
                     return Some(DCacheRead::Lost(user_msg));
                 };

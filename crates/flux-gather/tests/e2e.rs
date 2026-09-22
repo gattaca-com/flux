@@ -181,7 +181,12 @@ impl Tile<RecvSpine> for RecordingHandler {
 }
 
 impl BlobHandler<RecvSpine, TestMeta> for RecordingHandler {
-    fn on_blob(&mut self, meta: &TestMeta, blob: &Blob, adapter: &mut SpineAdapter<RecvSpine>) {
+    fn on_blob(
+        &mut self,
+        meta: &TestMeta,
+        blob: &Blob,
+        producers: &mut <RecvSpine as flux::spine::FluxSpine>::Producers,
+    ) {
         self.writer.write(blob, &meta.path(&self.base, blob.type_name()));
         {
             let mut seen = self.seen.lock().unwrap();
@@ -197,7 +202,7 @@ impl BlobHandler<RecvSpine, TestMeta> for RecordingHandler {
         let decoded = Telemetry::decode_blob::<TestMeta>(blob, &mut self.scratch)
             .expect("gathered blobs hold Telemetry leaves")
             .expect("blob decodes");
-        let replica: &SpineProducer<Telemetry> = adapter.producers.as_ref();
+        let replica: &SpineProducer<Telemetry> = producers.as_ref();
         for msg in &decoded.1 {
             replica.produce_without_first(msg);
         }
