@@ -71,6 +71,7 @@ pub(crate) struct TcpManager {
     reconnected_to: Vec<Token>,
     // Connections dropped outside event handling, drained in poll_with before reconnects.
     pending_disconnects: Vec<Token>,
+    broadcast_paused: Vec<Token>,
     next_token: usize,
     /// Header of the frame currently being written; the payload is the
     /// caller's and identical for every recipient of a broadcast.
@@ -93,6 +94,7 @@ impl TcpManager {
             to_be_reconnected: Vec::with_capacity(10),
             reconnected_to: Vec::with_capacity(10),
             pending_disconnects: Vec::with_capacity(10),
+            broadcast_paused: Vec::new(),
             next_token: 0,
             header: [0; FRAME_HEADER_SIZE],
         }
@@ -100,6 +102,20 @@ impl TcpManager {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.conns.is_empty() && self.to_be_reconnected.is_empty()
+    }
+
+    pub(crate) fn pause_broadcast(&mut self, token: Token) {
+        if !self.broadcast_paused.contains(&token) {
+            self.broadcast_paused.push(token);
+        }
+    }
+
+    pub(crate) fn resume_broadcast(&mut self, token: Token) {
+        self.broadcast_paused.retain(|t| *t != token);
+    }
+
+    pub(crate) fn is_broadcast_paused(&self, token: Token) -> bool {
+        self.broadcast_paused.contains(&token)
     }
 
     pub(crate) fn disconnect_outbound(&mut self) {
@@ -124,9 +140,11 @@ impl TcpManager {
             }
             Variant::Inbound(mut tcp_connection) => {
                 tcp_connection.close(&self.registry);
+                self.broadcast_paused.retain(|t| *t != token);
             }
             Variant::Listener(mut tcp_listener) => {
                 let _ = self.registry.deregister(&mut tcp_listener);
+                self.broadcast_paused.retain(|t| *t != token);
             }
         }
     }
@@ -162,8 +180,12 @@ impl TcpManager {
     #[inline]
     fn broadcast(&mut self, payload: &[u8]) {
         let max_backlog = self.config.max_backlog;
+        let paused = &self.broadcast_paused;
         if !self.config.drop_outbound_backlog_on_disconnect {
-            for (_, c) in &mut self.to_be_reconnected {
+            for (token, c) in &mut self.to_be_reconnected {
+                if paused.contains(token) {
+                    continue;
+                }
                 let Variant::Outbound(tcp) = c else {
                     unreachable!("only outbound should be auto reconnected");
                 };
@@ -174,6 +196,9 @@ impl TcpManager {
         let mut i = self.conns.len();
         while i != 0 {
             i -= 1;
+            if self.broadcast_paused.contains(&self.conns[i].0) {
+                continue;
+            }
             match &mut self.conns[i].1 {
                 Variant::Outbound(tcp_connection) | Variant::Inbound(tcp_connection) => {
                     let state = tcp_connection.write_or_enqueue_shared(

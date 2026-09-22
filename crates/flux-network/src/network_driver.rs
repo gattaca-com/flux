@@ -328,6 +328,31 @@ impl NetworkDriver {
         }
     }
 
+    /// Excludes `token` from [`SendBehavior::Broadcast`] until
+    /// [`Self::resume_broadcast`]. [`SendBehavior::Single`] writes to it are
+    /// unaffected, and so is everything it receives.
+    pub fn pause_broadcast(&mut self, token: Token) {
+        match &mut self.inner {
+            Inner::Tcp(m) => m.pause_broadcast(token),
+            Inner::Udp(m) => m.pause_broadcast(token),
+        }
+    }
+
+    /// Puts `token` back in the broadcast set. No-op if it was not paused.
+    pub fn resume_broadcast(&mut self, token: Token) {
+        match &mut self.inner {
+            Inner::Tcp(m) => m.resume_broadcast(token),
+            Inner::Udp(m) => m.resume_broadcast(token),
+        }
+    }
+
+    pub fn is_broadcast_paused(&self, token: Token) -> bool {
+        match &self.inner {
+            Inner::Tcp(m) => m.is_broadcast_paused(token),
+            Inner::Udp(m) => m.is_broadcast_paused(token),
+        }
+    }
+
     /// Drops the frames queued for `token`, returning how many. A partially
     /// written frame is kept. TCP only.
     pub fn clear_backlog(&mut self, token: Token) -> usize {

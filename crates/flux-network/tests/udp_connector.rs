@@ -676,3 +676,90 @@ fn udp_unreliable_keeps_streaming_through_loss() {
     assert!(last > N as usize - 64, "delivery stalled at {last}");
     assert_eq!(client.currently_disconnected().count(), 0, "client dropped its peer");
 }
+
+fn drain(
+    server: &mut NetworkDriver,
+    a: &mut NetworkDriver,
+    got_a: &mut Vec<Vec<u8>>,
+    b: &mut NetworkDriver,
+    got_b: &mut Vec<Vec<u8>>,
+) {
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        server.poll_with(|_| {});
+        a.poll_with(|e| {
+            if let PollEvent::Message { payload, .. } = e {
+                got_a.push(payload.to_vec());
+            }
+        });
+        b.poll_with(|e| {
+            if let PollEvent::Message { payload, .. } = e {
+                got_b.push(payload.to_vec());
+            }
+        });
+    }
+}
+
+#[test]
+fn udp_paused_peer_sits_out_broadcasts() {
+    let addr = free_addr();
+    let mut server = udp(UdpConfig::lan());
+    server.listen_at(addr).unwrap();
+    let mut a = udp(UdpConfig::lan());
+    let mut b = udp(UdpConfig::lan());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut accepted: Vec<Token> = Vec::new();
+    a.connect(addr).unwrap();
+    while accepted.is_empty() {
+        assert!(Instant::now() < deadline, "accept a");
+        server.poll_with(|e| {
+            if let PollEvent::Accept { stream, .. } = e {
+                accepted.push(stream);
+            }
+        });
+        a.poll_with(|_| {});
+    }
+    b.connect(addr).unwrap();
+    while accepted.len() < 2 {
+        assert!(Instant::now() < deadline, "accept b");
+        server.poll_with(|e| {
+            if let PollEvent::Accept { stream, .. } = e {
+                accepted.push(stream);
+            }
+        });
+        a.poll_with(|_| {});
+        b.poll_with(|_| {});
+    }
+    let (token_a, token_b) = (accepted[0], accepted[1]);
+
+    let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+    server.write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(b"live-1"));
+    drain(&mut server, &mut a, &mut got_a, &mut b, &mut got_b);
+    assert_eq!(got_a, vec![b"live-1".to_vec()]);
+    assert_eq!(got_b, vec![b"live-1".to_vec()]);
+
+    server.pause_broadcast(token_b);
+    assert!(server.is_broadcast_paused(token_b));
+    assert!(!server.is_broadcast_paused(token_a));
+
+    server.write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(b"live-2"));
+    server.write_or_enqueue_with(SendBehavior::Single(token_b), |buf| {
+        buf.extend_from_slice(b"direct");
+    });
+    got_a.clear();
+    got_b.clear();
+    drain(&mut server, &mut a, &mut got_a, &mut b, &mut got_b);
+    assert_eq!(got_a, vec![b"live-2".to_vec()]);
+    assert_eq!(got_b, vec![b"direct".to_vec()]);
+
+    server.resume_broadcast(token_b);
+    assert!(!server.is_broadcast_paused(token_b));
+
+    server.write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(b"live-3"));
+    got_a.clear();
+    got_b.clear();
+    drain(&mut server, &mut a, &mut got_a, &mut b, &mut got_b);
+    assert_eq!(got_a, vec![b"live-3".to_vec()]);
+    assert_eq!(got_b, vec![b"live-3".to_vec()]);
+}
