@@ -27,6 +27,7 @@ fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
     let first = std::array::from_fn(|i| (i as u64).wrapping_mul(31));
     let second = std::array::from_fn(|i| !(i as u64));
     let mut calls = 0;
+    assert_eq!(producer.next_sequence(), start);
     assert_eq!(
         producer.produce_with(|| {
             calls += 1;
@@ -35,6 +36,7 @@ fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
         }),
         Ok(start)
     );
+    assert_eq!(producer.next_sequence(), usize::MAX);
     let owned = String::from("FnOnce factory");
     assert_eq!(
         producer.produce_with(|| {
@@ -43,6 +45,7 @@ fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
         }),
         Ok(usize::MAX)
     );
+    assert_eq!(producer.next_sequence(), 0, "sequence wraps after usize::MAX");
     assert_eq!(
         producer.produce_with(|| {
             calls += 1;
@@ -50,6 +53,7 @@ fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
         }),
         Err(super::FullError)
     );
+    assert_eq!(producer.next_sequence(), 0, "Full must not advance the sequence");
     assert_eq!(calls, 1, "a full queue must not invoke the factory");
     assert!(consumer.consume_ref(|value| assert_eq!(*value, first)));
 
@@ -59,11 +63,14 @@ fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
         }))
         .is_err()
     );
+    assert_eq!(producer.next_sequence(), 0, "panic must not advance the sequence");
     assert!(consumer.consume_ref(|value| assert_eq!(*value, second)));
     assert!(!consumer.consume_ref(|_| panic!("panicked factory must not publish")));
 
     assert_eq!(producer.produce_with(|| first), Ok(0), "panic must not advance the sequence");
+    assert_eq!(producer.next_sequence(), 1);
     assert_eq!(producer.produce(&second), Ok(1));
+    assert_eq!(producer.next_sequence(), 2);
     assert!(consumer.consume_ref(|value| assert_eq!(*value, first)));
     assert!(consumer.consume_ref(|value| assert_eq!(*value, second)));
     assert!(!consumer.consume_ref(|_| unreachable!()));
@@ -151,10 +158,13 @@ fn cloned_handles_cannot_duplicate_roles_and_dropped_endpoints_handoff_state() {
     assert!(matches!(clone.try_producer(), Err(QueueError::ProducerAttached)));
     assert!(matches!(queue.try_consumer(), Err(QueueError::ConsumerAttached)));
 
-    producer.produce(&10).unwrap();
+    assert_eq!(producer.next_sequence(), 0);
+    assert_eq!(producer.produce(&10), Ok(0));
+    let next = producer.next_sequence();
     drop(producer);
     let mut replacement_producer = clone.try_producer().unwrap();
-    replacement_producer.produce(&20).unwrap();
+    assert_eq!(replacement_producer.next_sequence(), next);
+    assert_eq!(replacement_producer.produce(&20), Ok(next));
 
     let mut value = 0;
     consumer.try_consume(&mut value).unwrap();

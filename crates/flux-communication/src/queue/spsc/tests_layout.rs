@@ -13,9 +13,13 @@ fn sequence_rollover_preserves_slot_ownership() {
     for batch in 0..3 {
         for i in 0..queue.capacity() {
             let value = batch * queue.capacity() + i;
-            assert_eq!(producer.produce(&(value as u64)), Ok(start.wrapping_add(value)));
+            let next = producer.next_sequence();
+            assert_eq!(next, start.wrapping_add(value));
+            assert_eq!(producer.produce(&(value as u64)), Ok(next));
         }
+        let next = producer.next_sequence();
         assert_eq!(producer.produce(&99), Err(FullError));
+        assert_eq!(producer.next_sequence(), next);
         assert_eq!(consumer.queue_message_count(), queue.capacity());
         for i in 0..queue.capacity() {
             let mut value = 0;
@@ -33,6 +37,7 @@ fn sequence_rollover_preserves_slot_ownership() {
         assert_eq!(producer.max_writable_msgs_without_speeding_past(), queue.capacity());
         drop(producer);
         producer = queue.try_producer().unwrap();
+        assert_eq!(producer.next_sequence(), next);
     }
 }
 

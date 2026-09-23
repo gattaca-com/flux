@@ -506,7 +506,7 @@ fn dcache_producer_handoff_and_shared_reopen_preserve_unread_fifo() {
         ));
         assert!(!called, "failed role acquisition must skip the payload writer");
         drop(first);
-        drop(idle); // An unattached bundle must not overwrite the saved index.
+        drop(idle); // An unattached bundle must not interfere with role handoff.
         contender
             .try_produce_with_dcache(
                 Frame(3),
@@ -514,7 +514,7 @@ fn dcache_producer_handoff_and_shared_reopen_preserve_unread_fifo() {
                     bytes.copy_from_slice(b"three");
                 })),
             )
-            .expect("replacement resumes the saved payload region index");
+            .expect("replacement resumes at the metadata queue's next sequence");
         drop(contender);
         drop(spine);
     }
@@ -553,7 +553,7 @@ fn dcache_child_producer_continues_shared_slot() {
 }
 
 #[test]
-fn dcache_new_process_producer_resumes_saved_slot_with_unread_backlog() {
+fn dcache_new_process_producer_resumes_sequence_with_unread_backlog() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let mut spine = new_spine(tmp.path());
