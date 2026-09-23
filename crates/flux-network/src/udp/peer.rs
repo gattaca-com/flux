@@ -590,6 +590,7 @@ impl TxWindow {
 /// whole; stale bytes are overwritten before delivery so nothing is zeroed.
 struct Partial {
     first_seq: u64,
+    last_seq: u64,
     len: usize,
     /// Kept at its largest past length; the message is `buf[..len]`.
     buf: Vec<u8>,
@@ -610,12 +611,15 @@ struct RxWindow {
     capacity: u64,
     /// Most bits one ack can carry.
     max_bits: u64,
+    /// Unreliable mode: the window follows the highest sequence instead of
+    /// waiting at a hole that no retransmit will ever fill.
+    slide: bool,
     partials: Vec<Partial>,
     spare: Vec<Partial>,
 }
 
 impl RxWindow {
-    fn new(capacity: usize, max_bits: u64) -> Self {
+    fn new(capacity: usize, max_bits: u64, slide: bool) -> Self {
         Self {
             ack_next: 0,
             highest: 0,
@@ -623,6 +627,7 @@ impl RxWindow {
             mask: capacity as u64 - 1,
             capacity: capacity as u64,
             max_bits: max_bits.min(capacity as u64 - 1),
+            slide,
             partials: Vec::new(),
             spare: Vec::new(),
         }
@@ -655,7 +660,16 @@ impl RxWindow {
 
     /// Records `seq`; `false` for duplicates and out-of-window sequences.
     fn accept(&mut self, seq: u64) -> bool {
-        if seq < self.ack_next || seq >= self.ack_next + self.capacity || self.bit(seq) {
+        if seq < self.ack_next {
+            return false;
+        }
+        if seq >= self.ack_next + self.capacity {
+            if !self.slide {
+                return false;
+            }
+            self.slide_to(seq + 1 - self.capacity);
+        }
+        if self.bit(seq) {
             return false;
         }
         self.set_bit(seq, true);
@@ -665,6 +679,29 @@ impl RxWindow {
             self.ack_next += 1;
         }
         true
+    }
+
+    /// Moves the ack point past holes. Everything below it is lost for good,
+    /// so partials that still needed one of those sequences are recycled;
+    /// this bounds partials to the window in unreliable mode.
+    fn slide_to(&mut self, ack_next: u64) {
+        if ack_next - self.ack_next >= self.capacity {
+            self.bits.fill(0);
+        } else {
+            for seq in self.ack_next..ack_next {
+                self.set_bit(seq, false);
+            }
+        }
+        self.ack_next = ack_next;
+        let mut i = 0;
+        while i < self.partials.len() {
+            if self.partials[i].last_seq < ack_next {
+                let dead = self.partials.swap_remove(i);
+                self.spare.push(dead);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Bits an ack should carry: one per sequence in `ack_next + 1 ..=
@@ -736,7 +773,7 @@ impl UdpPeer {
         let now = Instant::now();
         // Whole 64-bit words of bitmap that fit in one datagram.
         let max_bits = (config.stride() / 8 * 64) as u64;
-        let rx = RxWindow::new(config.recv_window, max_bits);
+        let rx = RxWindow::new(config.recv_window, max_bits, !config.reliable);
         Self {
             addr,
             token,
@@ -789,10 +826,16 @@ impl UdpPeer {
         self.tx.stage(seq, store, &self.native_addr, batch);
     }
 
+    /// Unreliable: handed to the kernel is as good as acked, so the window
+    /// never holds anything to resend and `retransmit_due` has nothing to do.
     #[inline]
-    pub(crate) fn mark_sent(&mut self, seq: u64, now: Instant) {
+    pub(crate) fn mark_sent(&mut self, seq: u64, store: &mut MsgStore, now: Instant) {
         self.tx.mark_sent(seq, false, now);
         self.last_send = now;
+        if !self.config.reliable {
+            self.tx.base = self.tx.next_send;
+            self.tx.release_messages(store);
+        }
     }
 
     /// Releases every store reference before the peer is dropped.
@@ -998,7 +1041,9 @@ impl UdpPeer {
             warn!(%self.addr, len, "udp message exceeds dcache capacity, not acked");
             return;
         }
-        self.ack_due = true;
+        if self.config.reliable {
+            self.ack_due = true;
+        }
         if !self.rx.accept(header.seq) {
             return;
         }
@@ -1050,6 +1095,7 @@ impl UdpPeer {
         }
         let mut partial = self.rx.spare.pop().unwrap_or(Partial {
             first_seq: 0,
+            last_seq: 0,
             len: 0,
             buf: Vec::new(),
             remaining: 0,
@@ -1059,6 +1105,7 @@ impl UdpPeer {
             partial.buf.resize(len, 0);
         }
         partial.first_seq = first_seq;
+        partial.last_seq = first_seq + total as u64 - 1;
         partial.len = len;
         partial.remaining = total;
         partial.send_ts = send_ts;
@@ -1078,6 +1125,8 @@ impl UdpPeer {
     }
 
     /// Ingests an ack; reports whether the socket blocked while resending.
+    /// Unreliable: the ack is a liveness signal only, its contents are not
+    /// trusted to drive any send.
     pub(crate) fn on_ack(
         &mut self,
         header: &Header,
@@ -1091,6 +1140,9 @@ impl UdpPeer {
             return SendOutcome::Done;
         }
         self.last_recv = now;
+        if !self.config.reliable {
+            return SendOutcome::Done;
+        }
         let acked = self.tx.on_ack(
             header.seq,
             u64::from(header.len),
@@ -1275,8 +1327,87 @@ mod tests {
     }
 
     #[test]
+    fn rx_window_slides_past_holes_and_drops_dead_partials() {
+        let mut rx = RxWindow::new(64, 64, true);
+        rx.reset(0);
+        // Seq 0 is lost; 1..64 arrive, filling the window.
+        for seq in 1..64 {
+            assert!(rx.accept(seq));
+        }
+        assert_eq!(rx.ack_next, 0);
+        for &(first, last) in &[(0, 1), (2, 3), (60, 65)] {
+            rx.partials.push(Partial {
+                first_seq: first,
+                last_seq: last,
+                len: 0,
+                buf: Vec::new(),
+                remaining: 1,
+                send_ts: 0,
+            });
+        }
+        // 70 is 7 past the window: ack point moves to 7 and the partials
+        // fully below it are recycled. 7..64 stay contiguous, so the ack
+        // point runs on to 64.
+        assert!(rx.accept(70));
+        assert_eq!(rx.ack_next, 64);
+        assert_eq!(rx.partials.len(), 1);
+        assert_eq!(rx.partials[0].first_seq, 60);
+        assert_eq!(rx.spare.len(), 2);
+        assert!(!rx.accept(5), "below the ack point");
+        assert!(rx.accept(64) && !rx.accept(70));
+        // A jump of more than a window clears every bit.
+        assert!(rx.accept(64 + 1000));
+        assert_eq!(rx.ack_next, 64 + 1000 + 1 - 64);
+        assert_eq!(rx.ack_bits(), 63);
+        assert!(rx.partials.is_empty());
+
+        let mut fixed = RxWindow::new(64, 64, false);
+        fixed.reset(0);
+        assert!(fixed.accept(1) && !fixed.accept(64));
+        assert_eq!(fixed.ack_next, 0);
+    }
+
+    #[test]
+    fn unreliable_sender_releases_on_send_and_ignores_acks() {
+        let config = UdpConfig { reliable: false, ..cfg() };
+        let (s, _) = sock();
+        let mut store = MsgStore::new();
+        let mut peer = UdpPeer::new(s.local_addr().unwrap(), Token(0), Token(0), 1, config, None);
+        let mut batch = SendBatch::new();
+        let now = Instant::now();
+        let slot = store.insert(&mut vec![0; config.stride() * 3]);
+        assert_eq!(peer.push_message(&mut store, slot, Nanos(1), now), PushOutcome::Queued);
+        store.release(slot);
+        assert_eq!(store.free.len(), 0);
+        for seq in 0..3 {
+            peer.mark_sent(seq, &mut store, now);
+        }
+        assert_eq!((peer.tx.base, peer.tx.next_send, peer.tx.next), (3, 3, 3));
+        assert_eq!(store.free.len(), 1, "released without an ack");
+        assert!(peer.tx.messages.is_empty());
+        // A hostile ack naming everything as a hole triggers no resend.
+        peer.connected = true;
+        peer.remote_session = Some(7);
+        let hdr = Header { kind: Kind::Ack, session: 7, seq: 0, len: 64, index: 0, send_ts: 0 };
+        let zero = [0u8; 8];
+        assert_eq!(peer.on_ack(&hdr, &zero, &mut store, &s, &mut batch, now), SendOutcome::Done);
+        assert_eq!(peer.tx.base, 3);
+        let (resent, _) = peer.tx.retransmit_due(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            &store,
+            s.as_raw_fd(),
+            &peer.native_addr,
+            &mut batch,
+            now,
+        );
+        assert_eq!(resent, 0);
+    }
+
+    #[test]
     fn rx_window_accepts_once_and_reports_bitmap() {
-        let mut rx = RxWindow::new(64, 64);
+        let mut rx = RxWindow::new(64, 64, false);
         rx.reset(10);
         assert_eq!(rx.ack_bits(), 0);
         assert!(rx.accept(11));
@@ -1296,7 +1427,7 @@ mod tests {
 
     #[test]
     fn bitmap_spans_ring_words() {
-        let mut rx = RxWindow::new(256, 1024);
+        let mut rx = RxWindow::new(256, 1024, false);
         rx.reset(100);
         for seq in (101..250).step_by(3) {
             assert!(rx.accept(seq));

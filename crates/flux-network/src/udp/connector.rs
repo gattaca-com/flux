@@ -344,7 +344,15 @@ impl UdpManager {
                 self.staged[n] = Staged { peer: i, seq };
                 n += 1;
                 if n == BATCH {
-                    if !Self::dispatch(&mut self.batch, &self.staged, &mut self.peers, fd, n, now) {
+                    if !Self::dispatch(
+                        &mut self.batch,
+                        &self.staged,
+                        &mut self.peers,
+                        &mut self.store,
+                        fd,
+                        n,
+                        now,
+                    ) {
                         arm_writable(&self.registry, entry);
                         return;
                     }
@@ -352,7 +360,17 @@ impl UdpManager {
                 }
             }
         }
-        if n != 0 && !Self::dispatch(&mut self.batch, &self.staged, &mut self.peers, fd, n, now) {
+        if n != 0 &&
+            !Self::dispatch(
+                &mut self.batch,
+                &self.staged,
+                &mut self.peers,
+                &mut self.store,
+                fd,
+                n,
+                now,
+            )
+        {
             arm_writable(&self.registry, entry);
         }
     }
@@ -363,13 +381,14 @@ impl UdpManager {
         batch: &mut SendBatch,
         staged: &[Staged; BATCH],
         peers: &mut [UdpPeer],
+        store: &mut MsgStore,
         fd: i32,
         n: usize,
         now: Instant,
     ) -> bool {
         let accepted = send_batch(batch, fd, n);
         for s in &staged[..accepted] {
-            peers[s.peer].mark_sent(s.seq, now);
+            peers[s.peer].mark_sent(s.seq, store, now);
         }
         accepted == n
     }
