@@ -6,9 +6,9 @@
 //! publication orders payload bytes. Neither a region nor a borrowed slice may
 //! outlive the corresponding slot ownership.
 //!
-//! The producer's region index advances once per successful publication,
-//! including messages without a payload. Its offset from the core queue's
-//! slot index stays constant across endpoint handoffs; it need not be zero.
+//! Each region uses the metadata slot's index, derived from the core producer's
+//! next sequence number. The core cursor also governs endpoint replacement,
+//! messages without payloads, and sequence rollover.
 
 use std::{
     alloc::Layout,
@@ -18,7 +18,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -27,7 +27,7 @@ use shared_memory::{Shmem, ShmemConf, ShmemError};
 use thiserror::Error;
 
 const CACHELINE: usize = 64;
-const MAGIC: u64 = u64::from_le_bytes(*b"FXSDCH01");
+const MAGIC: u64 = u64::from_le_bytes(*b"FXSDCH02");
 
 #[derive(Debug, Error)]
 pub(super) enum StorageError {
@@ -46,7 +46,6 @@ struct Header {
     ready: AtomicU64,
     capacity: usize,
     mtu: usize,
-    next_slot: AtomicUsize,
 }
 
 struct Shape {
@@ -79,24 +78,23 @@ fn shape(capacity: usize, mtu: usize) -> Result<Shape, StorageError> {
 }
 
 enum Backing {
-    Heap { _cache: Arc<DCache>, next_slot: AtomicUsize },
-    Shared { _mapping: Shmem, header: NonNull<Header> },
+    Heap { _cache: Arc<DCache> },
+    Shared { _mapping: Shmem },
 }
 
 struct Inner {
     cache: DCachePtr,
-    backing: Backing,
+    _backing: Backing,
     capacity: usize,
     mtu: usize,
     stride: usize,
 }
 
 // SAFETY: the cached DCache pointer addresses the allocation retained by
-// `backing`. Only an attached producer may write a region and only a consumer
+// `_backing`. Only an attached producer may write a region and only a consumer
 // holding the matching metadata slot may read it. The core queue's cursor
-// publication orders these accesses. The producer role's Release/Acquire
-// handoff also orders relaxed accesses to next_slot. Shmem may be unmapped on
-// any thread after the last Arc handle is dropped.
+// publication orders these accesses. Shmem may be unmapped on any thread
+// after the last Arc handle is dropped.
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Inner {}
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -116,7 +114,7 @@ impl Storage {
         let ptr = unsafe { DCachePtr::from_raw(Arc::as_ptr(&cache)) };
         Self(Arc::new(Inner {
             cache: ptr,
-            backing: Backing::Heap { _cache: cache, next_slot: AtomicUsize::new(0) },
+            _backing: Backing::Heap { _cache: cache },
             capacity,
             mtu,
             stride: shape.stride,
@@ -153,7 +151,6 @@ impl Storage {
                 unsafe {
                     (&raw mut (*header.as_ptr()).capacity).write(capacity);
                     (&raw mut (*header.as_ptr()).mtu).write(mtu);
-                    (&raw mut (*header.as_ptr()).next_slot).write(AtomicUsize::new(0));
                 }
                 // SAFETY: the checked layout reserves the full aligned DCache
                 // prefix and data region, and the mapping remains owned below.
@@ -166,7 +163,7 @@ impl Storage {
                 mapping.set_owner(false);
                 Ok(Self(Arc::new(Inner {
                     cache,
-                    backing: Backing::Shared { _mapping: mapping, header },
+                    _backing: Backing::Shared { _mapping: mapping },
                     capacity,
                     mtu,
                     stride: shape.stride,
@@ -207,8 +204,7 @@ impl Storage {
         if stored.capacity != capacity ||
             stored.mtu != mtu ||
             mapping.len() != shape.layout.size() ||
-            !(ptr.as_ptr() as usize).is_multiple_of(shape.layout.align()) ||
-            stored.next_slot.load(Ordering::Relaxed) >= capacity
+            !(ptr.as_ptr() as usize).is_multiple_of(shape.layout.align())
         {
             return Err(StorageError::IncompatibleLayout);
         }
@@ -219,7 +215,7 @@ impl Storage {
         let cache = unsafe { DCachePtr::from_raw(raw_cache) };
         Ok(Self(Arc::new(Inner {
             cache,
-            backing: Backing::Shared { _mapping: mapping, header },
+            _backing: Backing::Shared { _mapping: mapping },
             capacity,
             mtu,
             stride: shape.stride,
@@ -232,28 +228,6 @@ impl Storage {
 
     pub(super) fn capacity(&self) -> usize {
         self.0.capacity
-    }
-
-    fn next_slot_atomic(&self) -> &AtomicUsize {
-        match &self.0.backing {
-            Backing::Heap { next_slot, .. } => next_slot,
-            Backing::Shared { header, .. } => {
-                // SAFETY: the Arc retains the mapping and construction
-                // initializes and validates its header.
-                unsafe { &header.as_ref().next_slot }
-            }
-        }
-    }
-
-    /// The caller has acquired the core producer role before loading this.
-    pub(super) fn next_slot(&self) -> usize {
-        self.next_slot_atomic().load(Ordering::Relaxed)
-    }
-
-    /// The caller releases the core producer role after storing this.
-    pub(super) fn set_next_slot(&self, slot: usize) {
-        assert!(slot < self.capacity(), "SPSC DCache slot out of range");
-        self.next_slot_atomic().store(slot, Ordering::Relaxed);
     }
 
     pub(super) fn validate_len(&self, len: usize) -> Result<(), DCacheError> {
@@ -328,19 +302,17 @@ mod tests {
     }
 
     #[test]
-    fn shared_reopen_preserves_payload_and_cursor() {
+    fn shared_reopen_preserves_payload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("arena");
         // SAFETY: this test exclusively owns the matching arena and slot.
         let created = unsafe { Storage::create_or_open_shared(&path, 4, 65) }.unwrap();
         let (dref, ()) =
             unsafe { created.write(2, 5, |bytes| bytes.copy_from_slice(b"hello")) }.unwrap();
-        created.set_next_slot(3);
         drop(created);
 
         // SAFETY: this test retains exclusive ownership of the same slot.
         let opened = unsafe { Storage::create_or_open_shared(&path, 4, 65) }.unwrap();
-        assert_eq!(opened.next_slot(), 3);
         assert_eq!(unsafe { opened.read(dref, <[u8]>::to_vec) }.unwrap(), b"hello");
         assert!(matches!(
             unsafe { Storage::create_or_open_shared(&path, 4, 64) },
@@ -352,6 +324,32 @@ mod tests {
         ));
         drop(opened);
         crate::communication::cleanup_flink(&path).unwrap();
+    }
+
+    #[test]
+    fn persisted_index_arena_format_is_rejected_without_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arena");
+        let capacity = 4;
+        let mtu = 65;
+        let layout = shape(capacity, mtu).unwrap();
+        let mapping = ShmemConf::new().flink(&path).size(layout.layout.size()).create().unwrap();
+        let header = NonNull::new(mapping.as_ptr()).unwrap().cast::<Header>().as_ptr();
+        let old_magic = u64::from_le_bytes(*b"FXSDCH01");
+        // Model the former format's header prefix in otherwise valid storage.
+        // Its header was also 64 bytes, so size checks alone cannot reject it.
+        // SAFETY: this test exclusively owns the aligned, zero-filled mapping;
+        // no endpoints exist and only header validation will access it.
+        unsafe {
+            (&raw mut (*header).capacity).write(capacity);
+            (&raw mut (*header).mtu).write(mtu);
+            (*header).ready.store(old_magic, Ordering::Release);
+            assert!(matches!(
+                Storage::create_or_open_shared(&path, capacity, mtu),
+                Err(StorageError::IncompatibleLayout)
+            ));
+            assert_eq!((*header).ready.load(Ordering::Acquire), old_magic);
+        }
     }
 
     #[test]

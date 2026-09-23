@@ -149,12 +149,11 @@ impl<T: Copy> fmt::Debug for SpineSpscDCacheQueue<T> {
 pub struct SpineSpscProducerWithDCache<T: Copy> {
     inner: SpineSpscProducer<DCacheMsg<T>>,
     storage: Storage,
-    next_slot: usize,
 }
 
 impl<T: Copy> SpineSpscProducerWithDCache<T> {
     pub fn new(queue: SpineSpscDCacheQueue<T>) -> Self {
-        Self { inner: SpineSpscProducer::new(queue.inner), storage: queue.storage, next_slot: 0 }
+        Self { inner: SpineSpscProducer::new(queue.inner), storage: queue.storage }
     }
 
     pub fn is_attached(&self) -> bool {
@@ -162,13 +161,7 @@ impl<T: Copy> SpineSpscProducerWithDCache<T> {
     }
 
     pub fn try_attach(&mut self) -> Result<(), spsc::QueueError> {
-        if !self.inner.is_attached() {
-            self.inner.try_attach()?;
-            // The preceding role acquire observes the previous producer's
-            // saved region index, which was stored before releasing its role.
-            self.next_slot = self.storage.next_slot();
-        }
-        Ok(())
+        self.inner.try_attach()
     }
 
     /// Fill a payload and construct its metadata only after a slot is free.
@@ -187,12 +180,12 @@ impl<T: Copy> SpineSpscProducerWithDCache<T> {
         }
         self.try_attach()?;
         let storage = &self.storage;
-        let slot = self.next_slot;
+        let slot = self.inner.inner.as_ref().unwrap().next_sequence() & (storage.capacity() - 1);
         self.inner.try_produce_with(|| {
             let (message, dref) = if let Some(len) = len {
                 // SAFETY: the core factory runs only with a free metadata
-                // slot. Region indices advance exactly once per publication,
-                // so this region cannot belong to an unread or borrowed slot.
+                // slot. The region is indexed by that publication's sequence,
+                // so it cannot belong to an unread or borrowed slot.
                 let (dref, message) =
                     unsafe { storage.write(slot, len, |bytes| make(Some(bytes))) }
                         .expect("validated SPSC payload region");
@@ -202,18 +195,7 @@ impl<T: Copy> SpineSpscProducerWithDCache<T> {
             };
             message.with_data(DCacheMsg::new(message.into_data(), dref))
         })?;
-        self.next_slot = self.next_slot.wrapping_add(1) & (self.storage.capacity() - 1);
         Ok(())
-    }
-}
-
-impl<T: Copy> Drop for SpineSpscProducerWithDCache<T> {
-    fn drop(&mut self) {
-        if self.inner.is_attached() {
-            // The inner producer's field destructor releases its role AFTER
-            // this store. Crashed/forgotten producers never release the role.
-            self.storage.set_next_slot(self.next_slot);
-        }
     }
 }
 

@@ -400,6 +400,15 @@ pub struct Producer<T: Copy> {
 }
 
 impl<T: Copy> Producer<T> {
+    /// Sequence number returned by the next successful publication, wrapping
+    /// at `usize::MAX`. A full queue or a panicking factory leaves it
+    /// unchanged. This reads the producer's local cursor; it neither checks
+    /// nor reserves capacity.
+    #[inline]
+    pub fn next_sequence(&self) -> usize {
+        self.write
+    }
+
     /// Publish one message, returning its wrapping, zero-based sequence number.
     /// A full queue is unchanged, and the caller retains `msg` for retry.
     #[inline]
