@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use super::{
     TcpManager, TcpTelemetry, set_socket_buf_size,
     stream::{
-        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, frame_payload_len, set_keepalive,
-        set_user_timeout, write_frame_header, write_frame_len, write_frame_ts,
+        DEFAULT_TCP_USER_TIMEOUT_MS, FRAME_HEADER_SIZE, frame_payload_len, frame_send_ts,
+        set_keepalive, set_user_timeout, write_frame_header, write_frame_len, write_frame_ts,
     },
 };
 use crate::tls::Session;
@@ -583,7 +583,8 @@ impl NetworkState {
             return false;
         }
 
-        let mut stream = FramedStream::new(socket, token, peer_addr, config.max_frame_size);
+        let mut stream =
+            FramedStream::new(socket, token, peer_addr, config.framing, config.max_frame_size);
         // TLS sends its opening flight here; `on_connect_msg` waits for the
         // finished handshake so it travels encrypted.
         let first = if is_tls { Some(&handshake[..]) } else { config.on_connect_msg.as_deref() };
@@ -661,7 +662,13 @@ impl NetworkState {
                     peer_addr,
                     config.framing,
                 );
-                let mut stream = FramedStream::new(socket, token, peer_addr, config.max_frame_size);
+                let mut stream = FramedStream::new(
+                    socket,
+                    token,
+                    peer_addr,
+                    config.framing,
+                    config.max_frame_size,
+                );
                 if let Some(message) = config.on_connect_msg.as_deref() {
                     let header = (config.framing == Framing::LengthPrefixed).then(|| {
                         let mut header = [0; FRAME_HEADER_SIZE];
@@ -1401,15 +1408,81 @@ enum ReadOutcome<'a> {
     Disconnected,
 }
 
-#[derive(Clone, Copy)]
-enum RxState {
-    Header { bytes: [u8; FRAME_HEADER_SIZE], have: usize },
-    Payload { length: usize, have: usize, send_ts: Nanos },
+/// Bytes read from one connection. Length-prefixed framing keeps unparsed
+/// read-ahead in `bytes[head..tail]` across `poll_with` calls, so it must stay
+/// per connection; raw framing uses `bytes` as scratch.
+struct RxBuffer {
+    bytes: Vec<u8>,
+    head: usize,
+    tail: usize,
 }
 
-impl Default for RxState {
-    fn default() -> Self {
-        Self::Header { bytes: [0; FRAME_HEADER_SIZE], have: 0 }
+/// Result of [`RxBuffer::next_frame`].
+enum NextFrame {
+    /// A whole frame was buffered and consumed; its payload is at
+    /// `bytes[start..start + length]`.
+    Ready { start: usize, length: usize, send_ts: Nanos },
+    /// The frame at `head` is not all buffered. `frame_len` is its length, or
+    /// the header's while that is incomplete.
+    Incomplete { frame_len: usize },
+    /// The header names a payload past `max_frame_size`.
+    PayloadTooLarge(usize),
+}
+
+impl RxBuffer {
+    fn pending(&self) -> usize {
+        self.tail - self.head
+    }
+
+    /// Consumes the frame at the cursor if it is all here. Keepalives are
+    /// skipped.
+    fn next_frame(&mut self, max_frame_size: usize) -> NextFrame {
+        loop {
+            if self.pending() < FRAME_HEADER_SIZE {
+                return NextFrame::Incomplete { frame_len: FRAME_HEADER_SIZE };
+            }
+            let at = self.head;
+            let header = &self.bytes[at..at + FRAME_HEADER_SIZE];
+            let length = frame_payload_len(header);
+            let send_ts = frame_send_ts(header);
+
+            // Checked before the length sizes any allocation.
+            if max_frame_size < length {
+                return NextFrame::PayloadTooLarge(length);
+            }
+            if length == 0 {
+                self.head = at + FRAME_HEADER_SIZE;
+                continue;
+            }
+            let frame_len = FRAME_HEADER_SIZE + length;
+            if frame_len <= self.pending() {
+                let start = at + FRAME_HEADER_SIZE;
+                self.head = start + length;
+                return NextFrame::Ready { start, length, send_ts };
+            }
+            return NextFrame::Incomplete { frame_len };
+        }
+    }
+
+    /// Makes room for a `frame_len`-byte frame from `head`, and for at least
+    /// one byte to read into: an empty read buffer returns `Ok(0)`, which
+    /// reads as a closed peer.
+    fn make_room(&mut self, frame_len: usize) {
+        if self.head == self.tail {
+            self.head = 0;
+            self.tail = 0;
+        }
+        if frame_len <= self.bytes.len() - self.head && self.tail < self.bytes.len() {
+            return;
+        }
+        if self.head != 0 {
+            self.bytes.copy_within(self.head..self.tail, 0);
+            self.tail -= self.head;
+            self.head = 0;
+        }
+        if self.bytes.len() < frame_len || self.tail == self.bytes.len() {
+            self.bytes.resize(frame_len.max(INITIAL_RX_BUFFER_SIZE).max(self.tail + 1), 0);
+        }
     }
 }
 
@@ -1520,8 +1593,7 @@ struct FramedStream {
     socket: mio::net::TcpStream,
     token: Token,
     peer_addr: SocketAddr,
-    rx_state: RxState,
-    rx_buffer: Vec<u8>,
+    rx_buffer: RxBuffer,
     send_queue: ByteQueue,
     writable_armed: bool,
 }
@@ -1531,14 +1603,20 @@ impl FramedStream {
         socket: mio::net::TcpStream,
         token: Token,
         peer_addr: SocketAddr,
+        framing: Framing,
         max_frame_size: usize,
     ) -> Self {
+        // Allocated here so the read path only allocates for an oversized
+        // frame. Raw reads at most `max_frame_size` at a time.
+        let rx_len = match framing {
+            Framing::Raw => INITIAL_RX_BUFFER_SIZE.min(max_frame_size),
+            Framing::LengthPrefixed => INITIAL_RX_BUFFER_SIZE,
+        };
         Self {
             socket,
             token,
             peer_addr,
-            rx_state: RxState::default(),
-            rx_buffer: vec![0; INITIAL_RX_BUFFER_SIZE.min(max_frame_size)],
+            rx_buffer: RxBuffer { bytes: vec![0; rx_len], head: 0, tail: 0 },
             send_queue: ByteQueue::default(),
             writable_armed: false,
         }
@@ -1559,9 +1637,9 @@ impl FramedStream {
         if event.is_readable() {
             if config.framing == Framing::Raw {
                 loop {
-                    match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer) {
+                    match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
                         Ok(0) => return StreamState::Disconnected,
-                        Ok(read) => on_message(&self.rx_buffer[..read], Nanos::now()),
+                        Ok(read) => on_message(&self.rx_buffer.bytes[..read], Nanos::now()),
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                         Err(err) => {
                             debug!(?err, %self.peer_addr, "tcp raw read failed");
@@ -1606,84 +1684,45 @@ impl FramedStream {
         StreamState::Alive
     }
 
+    /// Returns the next buffered frame, reading from the socket only when none
+    /// is buffered. `WouldBlock` therefore means nothing is left in either,
+    /// which edge-triggered readiness requires.
     fn read_frame(
         &mut self,
         max_frame_size: usize,
         tls: &mut Option<Box<Session>>,
     ) -> ReadOutcome<'_> {
         loop {
-            match self.rx_state {
-                RxState::Header { mut bytes, mut have } => {
-                    while have < FRAME_HEADER_SIZE {
-                        match read_plaintext(&mut self.socket, tls, &mut bytes[have..]) {
-                            Ok(0) => return ReadOutcome::Disconnected,
-                            Ok(read) => {
-                                have += read;
-                                if have != FRAME_HEADER_SIZE {
-                                    continue;
-                                }
-                                let length =
-                                    u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-                                let send_ts = Nanos(u64::from_le_bytes(
-                                    bytes[4..FRAME_HEADER_SIZE].try_into().unwrap(),
-                                ));
-                                if length == 0 {
-                                    self.rx_state = RxState::default();
-                                    break;
-                                }
-                                if length > max_frame_size {
-                                    warn!(
-                                        %self.peer_addr,
-                                        payload_len = length,
-                                        max_frame_size,
-                                        "tcp frame exceeds configured maximum"
-                                    );
-                                    return ReadOutcome::Disconnected;
-                                }
-                                if self.rx_buffer.len() < length {
-                                    self.rx_buffer.resize(length, 0);
-                                }
-                                self.rx_state = RxState::Payload { length, have: 0, send_ts };
-                            }
-                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                                self.rx_state = RxState::Header { bytes, have };
-                                return ReadOutcome::WouldBlock;
-                            }
-                            Err(err) => {
-                                debug!(?err, %self.peer_addr, "tcp header read failed");
-                                return ReadOutcome::Disconnected;
-                            }
-                        }
-                    }
+            let frame_len = match self.rx_buffer.next_frame(max_frame_size) {
+                NextFrame::Ready { start, length, send_ts } => {
+                    return ReadOutcome::Message {
+                        payload: &self.rx_buffer.bytes[start..start + length],
+                        send_ts,
+                    };
                 }
-                RxState::Payload { length, mut have, send_ts } => {
-                    while have < length {
-                        match read_plaintext(
-                            &mut self.socket,
-                            tls,
-                            &mut self.rx_buffer[have..length],
-                        ) {
-                            Ok(0) => return ReadOutcome::Disconnected,
-                            Ok(read) => {
-                                have += read;
-                                if have == length {
-                                    self.rx_state = RxState::default();
-                                    return ReadOutcome::Message {
-                                        payload: &self.rx_buffer[..length],
-                                        send_ts,
-                                    };
-                                }
-                            }
-                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                                self.rx_state = RxState::Payload { length, have, send_ts };
-                                return ReadOutcome::WouldBlock;
-                            }
-                            Err(err) => {
-                                debug!(?err, %self.peer_addr, "tcp payload read failed");
-                                return ReadOutcome::Disconnected;
-                            }
-                        }
-                    }
+                NextFrame::PayloadTooLarge(length) => {
+                    warn!(
+                        %self.peer_addr,
+                        payload_len = length,
+                        max_frame_size,
+                        "tcp frame exceeds configured maximum"
+                    );
+                    return ReadOutcome::Disconnected;
+                }
+                NextFrame::Incomplete { frame_len } => frame_len,
+            };
+
+            self.rx_buffer.make_room(frame_len);
+            let tail = self.rx_buffer.tail;
+            match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes[tail..]) {
+                Ok(0) => return ReadOutcome::Disconnected,
+                Ok(read) => self.rx_buffer.tail += read,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    return ReadOutcome::WouldBlock;
+                }
+                Err(err) => {
+                    debug!(?err, %self.peer_addr, "tcp frame read failed");
+                    return ReadOutcome::Disconnected;
                 }
             }
         }
@@ -1828,8 +1867,8 @@ mod tests {
     use mio::{Poll, Token};
 
     use super::{
-        ByteQueue, FRAME_HEADER_SIZE, FramedStream, PayloadBuf, StreamState, TcpGroupConfig,
-        set_socket_buf_size, write_frame_header,
+        ByteQueue, FRAME_HEADER_SIZE, FramedStream, Framing, PayloadBuf, StreamState,
+        TcpGroupConfig, set_socket_buf_size, write_frame_header,
     };
 
     #[test]
@@ -1899,7 +1938,8 @@ mod tests {
 
         let socket = mio::net::TcpStream::from_std(client);
         set_socket_buf_size(&socket, 1024);
-        let mut stream = FramedStream::new(socket, Token(0), peer_addr, 1024);
+        let mut stream =
+            FramedStream::new(socket, Token(0), peer_addr, Framing::LengthPrefixed, 1024);
         let fill = [0; 4096];
         loop {
             match stream.socket.write(&fill) {

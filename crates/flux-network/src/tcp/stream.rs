@@ -100,6 +100,12 @@ pub(crate) fn frame_payload_len(header: &[u8]) -> usize {
     u32::from_le_bytes(header[..LEN_HEADER_SIZE].try_into().unwrap()) as usize
 }
 
+/// Read the send timestamp from a frame header.
+#[inline]
+pub(crate) fn frame_send_ts(header: &[u8]) -> Nanos {
+    Nanos(u64::from_le_bytes(header[LEN_HEADER_SIZE..FRAME_HEADER_SIZE].try_into().unwrap()))
+}
+
 /// Allocate a contiguous `header + payload` frame for the send backlog.
 ///
 /// Only hit when a socket blocks; the happy path writes `header` and `payload`
