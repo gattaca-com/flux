@@ -19,6 +19,7 @@ flux-utils.workspace = true
 libc.workspace = true
 mio = { workspace = true, optional = true }
 serde.workspace = true
+shared_memory.workspace = true
 signal-hook.workspace = true
 spine-derive.workspace = true
 thiserror.workspace = true
@@ -30,7 +31,6 @@ wincode-derive = { workspace = true, optional = true }
 zstd.workspace = true
 
 [dev-dependencies]
-shared_memory.workspace = true
 tempfile.workspace = true
 
 [features]

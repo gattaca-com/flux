@@ -9,12 +9,18 @@
 //! The tile runner does not park a tile with a claimed SPSC endpoint: the
 //! process-local parking signal cannot wake peers in other processes.
 
+mod dcache;
+
 use std::{
     fmt,
     path::Path,
     time::{Duration, Instant},
 };
 
+pub use dcache::{
+    SpineSpscDCacheConsumer, SpineSpscDCacheQueue, SpineSpscProducerWithDCache,
+    SpscDCacheProduceError,
+};
 use flux_timing::InternalMessage;
 use flux_utils::{directories::shmem_dir_with_base, short_typename};
 
@@ -33,8 +39,9 @@ pub enum SpscProduceError {
 ///
 /// `#[queue(flavour("spsc"))]` rewrites a `SpineQueue<T>` field to this type.
 /// Such spines use unsafe shared-memory constructors and non-cloneable endpoint
-/// bundles. Broadcast, collaborative consumers, dcache and gather are
-/// unavailable.
+/// bundles. Broadcast, collaborative consumers and gather are unavailable.
+/// Adding `mtu(...)` selects [`SpineSpscDCacheQueue`] for managed side
+/// payloads.
 #[derive(Clone)]
 pub struct SpineSpscQueue<T: Copy> {
     inner: spsc::Queue<InternalMessage<T>>,

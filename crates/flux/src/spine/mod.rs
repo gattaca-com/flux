@@ -69,7 +69,16 @@
 //! process-local. A crashed owner leaves its role claimed; reset storage only
 //! after all peers have detached. SPSC mappings live under
 //! `app/shmem/spsc/<field>` and are not included in broadcast queue discovery.
-//! `mtu` and `gather` are unsupported.
+//! With `mtu(...)`, use `try_produce_with_dcache` and
+//! `try_consume_with_dcache` (or its `_one` variant). Capacity is checked
+//! before the payload writer runs. `None` publishes a metadata-only message
+//! received as `DCacheRead::NoRef`. The payload reader holds the slot; the
+//! handler runs after release. The `_maybe_track` variants let the handler
+//! select telemetry for the reader and handler together, including
+//! metadata-only messages. Managed payload storage lives at `<field>.dcache`;
+//! remove it together with its metadata mapping only after all peers detach.
+//! Raw `DCache` pointers, independently published references, and `gather` are
+//! unsupported for SPSC.
 //!
 //! Constructing shared SPSC storage requires acknowledging the payload
 //! contract:
@@ -113,7 +122,10 @@ pub use consumer::{DCacheRead, SpineConsumer, SpineDCacheConsumer};
 use flux_timing::{IngestionTime, InternalMessage, Nanos, TrackingTimestamp};
 use flux_utils::{DCacheError, DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
-pub use spsc::{SpineSpscConsumer, SpineSpscProducer, SpineSpscQueue, SpscProduceError};
+pub use spsc::{
+    SpineSpscConsumer, SpineSpscDCacheConsumer, SpineSpscDCacheQueue, SpineSpscProducer,
+    SpineSpscProducerWithDCache, SpineSpscQueue, SpscDCacheProduceError, SpscProduceError,
+};
 pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
 use crate::{
@@ -190,6 +202,58 @@ pub trait SpineProducers {
     {
         let timestamp = self.timestamp().with_new_publish_delta();
         self.as_mut().try_produce_with(|| InternalMessage::new(timestamp, data))
+    }
+
+    /// Construct a message only once an SPSC slot is available. Errors never
+    /// invoke `make`; a panic publishes nothing and leaves the slot free.
+    fn try_produce_with<T: Copy>(
+        &mut self,
+        make: impl FnOnce() -> T,
+    ) -> Result<(), SpscProduceError>
+    where
+        Self: AsMut<SpineSpscProducer<T>>,
+    {
+        let timestamp = self.timestamp().with_new_publish_delta();
+        self.as_mut().try_produce_with(|| InternalMessage::new(timestamp, make()))
+    }
+
+    /// Publish metadata and a managed SPSC payload. `Full` never invokes the
+    /// writer or changes unread payload bytes. `None` publishes without a
+    /// payload; explicit lengths must be nonzero and at most the queue's MTU.
+    fn try_produce_with_dcache<T: Copy, F: FnOnce(&mut [u8])>(
+        &mut self,
+        data: T,
+        payload: Option<(usize, F)>,
+    ) -> Result<(), SpscDCacheProduceError>
+    where
+        Self: AsMut<SpineSpscProducerWithDCache<T>>,
+    {
+        let timestamp = self.timestamp().with_new_publish_delta();
+        self.as_mut().try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
+            if let Some((_, fill)) = payload {
+                fill(bytes.expect("requested SPSC payload"));
+            }
+            InternalMessage::new(timestamp, data)
+        })
+    }
+
+    /// Managed SPSC publication with an explicit ingestion timestamp.
+    fn try_produce_with_dcache_and_ingestion<T: Copy, F: FnOnce(&mut [u8])>(
+        &mut self,
+        data: T,
+        payload: Option<(usize, F)>,
+        ingestion_t: IngestionTime,
+    ) -> Result<(), SpscDCacheProduceError>
+    where
+        Self: AsMut<SpineSpscProducerWithDCache<T>>,
+    {
+        let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
+        self.as_mut().try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
+            if let Some((_, fill)) = payload {
+                fill(bytes.expect("requested SPSC payload"));
+            }
+            InternalMessage::new(timestamp, data)
+        })
     }
 
     fn try_produce_with_ingestion<T: Copy>(

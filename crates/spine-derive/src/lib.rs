@@ -152,9 +152,6 @@ fn get_queue_config(attrs: &[Attribute]) -> Result<QueueConfig> {
         if config.is_gather {
             return Err(syn::Error::new(span, "SPSC queues cannot use `gather`"));
         }
-        if config.mtu_expr.is_some() {
-            return Err(syn::Error::new(span, "SPSC queues cannot use `mtu(...)`"));
-        }
     }
 
     Ok(config)
@@ -199,9 +196,10 @@ fn spine_queue_inner_ty(ty: &Type) -> Option<&Type> {
 ///
 /// SPSC queues return `Full` through `SpineAdapter::try_produce`; the caller
 /// keeps pending output and retries. Their endpoints are claimed on first use
-/// and cannot be cloned. They do not support `mtu` or `gather`. Spines
-/// containing SPSC queues have unsafe shared-memory constructors; see
-/// `SpineSpscQueue`.
+/// and cannot be cloned. SPSC queues with `mtu` use a Spine-managed `DCache`.
+/// SPSC queues do not support `gather`. Spines containing SPSC queues have
+/// unsafe shared-memory constructors; see `SpineSpscQueue` and
+/// `SpineSpscDCacheQueue`.
 #[allow(clippy::too_many_lines)]
 #[proc_macro_attribute]
 pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -263,37 +261,51 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 has_spsc = true;
                 spsc_fields.push(field_ident.clone());
 
+                let (consumer_ty, producer_ty, queue_ty) = if mtu_expr.is_some() {
+                    (
+                        quote! { ::flux::spine::SpineSpscDCacheConsumer<#inner_ty> },
+                        quote! { ::flux::spine::SpineSpscProducerWithDCache<#inner_ty> },
+                        quote! { ::flux::spine::SpineSpscDCacheQueue<#inner_ty> },
+                    )
+                } else {
+                    (
+                        quote! { ::flux::spine::SpineSpscConsumer<#inner_ty> },
+                        quote! { ::flux::spine::SpineSpscProducer<#inner_ty> },
+                        quote! { ::flux::spine::SpineSpscQueue<#inner_ty> },
+                    )
+                };
+
                 consumer_fields.push(quote! {
-                    pub #field_ident : ::flux::spine::SpineSpscConsumer<#inner_ty>
+                    pub #field_ident : #consumer_ty
                 });
                 producer_fields.push(quote! {
-                    pub #field_ident : ::flux::spine::SpineSpscProducer<#inner_ty>
+                    pub #field_ident : #producer_ty
                 });
 
                 consumer_init.push(quote! {
-                    #field_ident : ::flux::spine::SpineSpscConsumer::attach::<_, #struct_ident, _>(
+                    #field_ident : <#consumer_ty>::attach::<_, #struct_ident, _>(
                         &spine.base_dir, tile, spine.#field_ident.clone())
                 });
                 producer_init.push(quote! {
-                    #field_ident : ::flux::spine::SpineSpscProducer::new(spine.#field_ident.clone())
+                    #field_ident : <#producer_ty>::new(spine.#field_ident.clone())
                 });
 
                 as_mut_impls.push(quote! {
-                    impl AsMut<::flux::spine::SpineSpscConsumer<#inner_ty>> for #consumers_ident {
-                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineSpscConsumer<#inner_ty> {
+                    impl AsMut<#consumer_ty> for #consumers_ident {
+                        fn as_mut(&mut self) -> &mut #consumer_ty {
                             &mut self.#field_ident
                         }
                     }
-                    impl AsMut<::flux::spine::SpineSpscProducer<#inner_ty>> for #producers_ident {
-                        fn as_mut(&mut self) -> &mut ::flux::spine::SpineSpscProducer<#inner_ty> {
+                    impl AsMut<#producer_ty> for #producers_ident {
+                        fn as_mut(&mut self) -> &mut #producer_ty {
                             &mut self.#field_ident
                         }
                     }
                 });
 
                 spine_as_ref_impls.push(quote! {
-                    impl AsRef<::flux::spine::SpineSpscQueue<#inner_ty>> for #struct_ident {
-                        fn as_ref(&self) -> &::flux::spine::SpineSpscQueue<#inner_ty> {
+                    impl AsRef<#queue_ty> for #struct_ident {
+                        fn as_ref(&self) -> &#queue_ty {
                             &self.#field_ident
                         }
                     }
@@ -492,22 +504,42 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 QueueFlavour::Spsc => quote! {},
             };
             if queue_config.flavour == QueueFlavour::Spsc {
-                config_fields.push(quote! {
-                    pub #field_ident: ::flux::spine::QueueParams
-                });
-                config_defaults.push(quote! {
-                    #field_ident: ::flux::spine::QueueParams { size: #size_arg }
-                });
-                new_let_stmts.push(quote! {
-                    let #field_ident = unsafe {
-                        ::flux::spine::SpineSpscQueue::<#inner_ty>::create_or_open_shared_with_base_dir(
-                            &base_dir,
-                            &format!("{}{}", #app_name_tokens, path_suffix),
-                            stringify!(#field_ident),
-                            config.#field_ident.size,
-                        )
-                    };
-                });
+                if let Some(mtu_expr) = queue_config.mtu_expr.as_ref() {
+                    config_fields.push(quote! {
+                        pub #field_ident: ::flux::spine::DCacheQueueParams
+                    });
+                    config_defaults.push(quote! {
+                        #field_ident: ::flux::spine::DCacheQueueParams { size: #size_arg, mtu: #mtu_expr }
+                    });
+                    new_let_stmts.push(quote! {
+                        let #field_ident = unsafe {
+                            ::flux::spine::SpineSpscDCacheQueue::<#inner_ty>::create_or_open_shared_with_base_dir(
+                                &base_dir,
+                                &format!("{}{}", #app_name_tokens, path_suffix),
+                                stringify!(#field_ident),
+                                config.#field_ident.size,
+                                config.#field_ident.mtu,
+                            )
+                        };
+                    });
+                } else {
+                    config_fields.push(quote! {
+                        pub #field_ident: ::flux::spine::QueueParams
+                    });
+                    config_defaults.push(quote! {
+                        #field_ident: ::flux::spine::QueueParams { size: #size_arg }
+                    });
+                    new_let_stmts.push(quote! {
+                        let #field_ident = unsafe {
+                            ::flux::spine::SpineSpscQueue::<#inner_ty>::create_or_open_shared_with_base_dir(
+                                &base_dir,
+                                &format!("{}{}", #app_name_tokens, path_suffix),
+                                stringify!(#field_ident),
+                                config.#field_ident.size,
+                            )
+                        };
+                    });
+                }
                 new_struct_field_names.push(quote! { #field_ident });
             } else if let Some(mtu_expr) = queue_config.mtu_expr.as_ref() {
                 let dcache_ident = format_ident!("{}_dcache", field_ident);
@@ -561,7 +593,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc = "All participants must use the same payload types, layout, architecture, and application schema."]
         #[doc = "Values must be valid in every process, without process-local pointers or references."]
         #[doc = "All mapping access must use the SPSC queue implementation. Endpoints inherited across `fork` must not be used or dropped in the child."]
-        #[doc = "See `flux::spine::SpineSpscQueue::create_or_open_shared_with_base_dir`."]
+        #[doc = "See the SPSC queue type's `create_or_open_shared_with_base_dir` safety contract."]
     });
     let call_constructor = |call| {
         if has_spsc {
@@ -631,8 +663,8 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Reconstruct the input struct without #[queue] attributes on its fields.
-    // For SpineQueue fields with `mtu`, also inject a `{field}_dcache: DCachePtr`
-    // field.
+    // For non-SPSC SpineQueue fields with `mtu`, also inject a
+    // `{field}_dcache: DCachePtr` field.
     let input_attrs = &input.attrs;
     let vis = &input.vis;
     let struct_ident = &input.ident;
@@ -655,8 +687,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                         Err(error) => return error.into_compile_error().into(),
                     };
                     if queue_config.flavour == QueueFlavour::Spsc {
-                        let new_ty = quote! {
-                            ::flux::spine::SpineSpscQueue<#inner_ty>
+                        let new_ty = if queue_config.mtu_expr.is_some() {
+                            quote! { ::flux::spine::SpineSpscDCacheQueue<#inner_ty> }
+                        } else {
+                            quote! { ::flux::spine::SpineSpscQueue<#inner_ty> }
                         };
                         all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #new_ty });
                     } else if queue_config.mtu_expr.is_some() {
@@ -812,7 +846,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueFlavour, get_queue_config};
+    use super::{QueueFlavour, get_queue_config, spine_queue_inner_ty};
 
     #[test]
     fn parses_supported_queue_flavours() {
@@ -832,11 +866,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_spsc_with_gather_or_mtu() {
+    fn rejects_spsc_with_gather() {
         let gather = syn::parse_quote!(#[queue(flavour("spsc"), gather)]);
-        assert!(get_queue_config(&[gather]).is_err());
+        let error = get_queue_config(&[gather]).err().unwrap();
+        assert!(error.to_string().contains("SPSC queues cannot use `gather`"));
+    }
 
+    #[test]
+    fn accepts_spsc_with_mtu() {
         let mtu = syn::parse_quote!(#[queue(flavour("spsc"), mtu(1500))]);
-        assert!(get_queue_config(&[mtu]).is_err());
+        let config = get_queue_config(&[mtu]).unwrap();
+        assert_eq!(config.flavour, QueueFlavour::Spsc);
+        assert!(config.mtu_expr.is_some());
+    }
+
+    #[test]
+    fn recognizes_qualified_spine_queue_with_spsc_mtu() {
+        let input: syn::ItemStruct = syn::parse_quote! {
+            struct Example {
+                #[queue(flavour("spsc"), mtu(1500))]
+                frames: ::flux::spine::SpineQueue<u64>
+            }
+        };
+        let field = input.fields.iter().next().unwrap();
+        let inner_ty = spine_queue_inner_ty(&field.ty).unwrap();
+        assert!(matches!(inner_ty, syn::Type::Path(path) if path.path.is_ident("u64")));
+        let config = get_queue_config(&field.attrs).unwrap();
+        assert_eq!(config.flavour, QueueFlavour::Spsc);
+        assert!(config.mtu_expr.is_some());
     }
 }
