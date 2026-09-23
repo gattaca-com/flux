@@ -125,7 +125,8 @@ fn a_paused_connection_is_left_out_of_the_reconnect_backlog() {
                 disconnected = true;
             }
         });
-        sender.write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(b"probe"));
+        sender
+            .write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(b"probe"));
         thread::sleep(Duration::from_millis(1));
     }
     assert!(disconnected, "sender never noticed the peer going away");
