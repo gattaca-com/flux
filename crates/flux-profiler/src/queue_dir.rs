@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::OnceLock};
 
 use flux_communication::{
-    cleanup::{cleanup_flink, is_pid_alive},
+    cleanup::{cleanup_flink, cleanup_shmem, is_pid_alive},
     queue::{Queue, QueueType},
 };
 use flux_utils::directories::{local_share_dir, shmem_dir_queues};
@@ -121,6 +121,25 @@ pub fn enable_profiler(app_name: &str) {
     });
     dir.publish_perf_schema();
     dir.write_pid();
+}
+
+const IN_PROCESS_APP_PREFIX: &str = "local-profiler-";
+
+/// In-process mark ids are addresses in the producing process, so each process
+/// needs its own app: a shared one lets a reader dereference foreign ids. Apps
+/// of dead pids are reaped here, as nothing else unlinks their shmem.
+pub(super) fn in_process_app() -> String {
+    for entry in std::fs::read_dir(local_share_dir()).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(IN_PROCESS_APP_PREFIX))
+            .and_then(|pid| pid.parse().ok());
+        if pid.is_some_and(|pid| !is_pid_alive(pid)) {
+            cleanup_shmem(&entry.path());
+        }
+    }
+    format!("{IN_PROCESS_APP_PREFIX}{}", std::process::id())
 }
 
 /// Every app under `local_share_dir()` whose queue dir names a live pid.
