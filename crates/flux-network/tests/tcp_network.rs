@@ -740,3 +740,128 @@ fn owned_poll_assigns_tokens_from_zero() {
     let second = network.connect(group, unused_addr());
     assert_eq!(second, mio::Token(2), "the listener consumed token 1 from the same counter");
 }
+
+/// Polls until `want` messages arrive, returning `(token, payload)` in order.
+fn collect_messages(network: &mut TcpNetwork, want: usize) -> Vec<(mio::Token, Vec<u8>)> {
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && messages.len() < want {
+        network.poll_with(|event| {
+            if let TcpEvent::Message { token, payload, .. } = event {
+                messages.push((token, payload.to_vec()));
+            }
+        });
+        thread::sleep(Duration::from_micros(200));
+    }
+    messages
+}
+
+fn server(max_frame_size: usize) -> (TcpNetwork, flux_network::tcp::TcpGroup, SocketAddr) {
+    let addr = unused_addr();
+    let mut network = TcpNetwork::default();
+    let group =
+        network.add_group(TcpGroupConfig { name: "server", max_frame_size, ..Default::default() });
+    network.listen(group, addr).unwrap();
+    (network, group, addr)
+}
+
+#[test]
+fn burst_of_frames_is_delivered_in_order() {
+    let (mut network, group, addr) = server(64 * 1024);
+    let mut peer = std::net::TcpStream::connect(addr).unwrap();
+    let _ = wait_for_accept(&mut network, group);
+
+    // Varied sizes, so frames straddle read boundaries.
+    let expected: Vec<Vec<u8>> =
+        (0..500).map(|i| format!("frame-{i}-{}", "x".repeat(i % 97)).into_bytes()).collect();
+    let stream: Vec<u8> = expected.iter().flat_map(|payload| encoded_frame(payload)).collect();
+    let writer = thread::spawn(move || peer.write_all(&stream).unwrap());
+
+    let messages = collect_messages(&mut network, expected.len());
+    writer.join().unwrap();
+    assert!(messages.iter().map(|(_, payload)| payload).eq(expected.iter()));
+}
+
+#[test]
+fn keepalive_frames_are_not_delivered() {
+    let (mut network, group, addr) = server(64 * 1024);
+    let mut peer = std::net::TcpStream::connect(addr).unwrap();
+    let _ = wait_for_accept(&mut network, group);
+
+    let stream = [&b""[..], REQUEST, b"", b"", RESPONSE]
+        .into_iter()
+        .flat_map(encoded_frame)
+        .collect::<Vec<_>>();
+    peer.write_all(&stream).unwrap();
+
+    let messages = collect_messages(&mut network, 2);
+    assert!(messages.iter().map(|(_, payload)| payload.as_slice()).eq([REQUEST, RESPONSE]));
+}
+
+#[test]
+fn frame_larger_than_initial_read_buffer_is_delivered() {
+    let (mut network, group, addr) = server(4 * 1024 * 1024);
+    let mut peer = std::net::TcpStream::connect(addr).unwrap();
+    let _ = wait_for_accept(&mut network, group);
+
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let frame = encoded_frame(&big);
+    let writer = thread::spawn(move || peer.write_all(&frame).unwrap());
+
+    let messages = collect_messages(&mut network, 1);
+    writer.join().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].1, big);
+}
+
+/// Each connection buffers its own read-ahead: two peers interleaved mid-frame
+/// must not corrupt each other.
+#[test]
+fn connections_do_not_share_read_ahead() {
+    let (mut network, group, addr) = server(64 * 1024);
+    let mut left = std::net::TcpStream::connect(addr).unwrap();
+    let left_token = wait_for_accept(&mut network, group);
+    let mut right = std::net::TcpStream::connect(addr).unwrap();
+    let right_token = wait_for_accept(&mut network, group);
+
+    let (mut expected_left, mut expected_right) = (Vec::new(), Vec::new());
+    let mut messages = Vec::new();
+    for round in 0..40 {
+        let l = format!("left-{round}-{}", "L".repeat(round % 31)).into_bytes();
+        let r = format!("right-{round}-{}", "R".repeat((round * 7) % 53)).into_bytes();
+        let (lf, rf) = (encoded_frame(&l), encoded_frame(&r));
+        expected_left.push(l);
+        expected_right.push(r);
+
+        // Poll while the left peer holds a partial frame.
+        left.write_all(&lf[..lf.len() / 2]).unwrap();
+        right.write_all(&rf).unwrap();
+        messages.extend(collect_messages(&mut network, 1));
+        left.write_all(&lf[lf.len() / 2..]).unwrap();
+        messages.extend(collect_messages(&mut network, 1));
+    }
+
+    let from = |token| -> Vec<Vec<u8>> {
+        messages.iter().filter(|(t, _)| *t == token).map(|(_, p)| p.clone()).collect()
+    };
+    assert_eq!(from(left_token), expected_left);
+    assert_eq!(from(right_token), expected_right);
+}
+
+#[test]
+fn burst_costs_far_fewer_reads_than_frames() {
+    let (mut network, group, addr) = server(64 * 1024);
+    let mut peer = std::net::TcpStream::connect(addr).unwrap();
+    let _ = wait_for_accept(&mut network, group);
+
+    let frames = 2_000;
+    let stream: Vec<u8> =
+        (0..frames).flat_map(|i| encoded_frame(format!("frame-{i}").as_bytes())).collect();
+    let before = network.read_syscalls();
+    let writer = thread::spawn(move || peer.write_all(&stream).unwrap());
+    assert_eq!(collect_messages(&mut network, frames).len(), frames);
+    writer.join().unwrap();
+
+    let per_frame = (network.read_syscalls() - before) as f64 / frames as f64;
+    assert!(per_frame < 0.25, "{per_frame} reads per frame");
+}
