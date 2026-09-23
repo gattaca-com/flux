@@ -10,7 +10,7 @@ use std::{
 use super::{
     drainer::EventsDrainer,
     perf::Schema,
-    queue_dir::{QUEUE_DIR, QueueDir, enable_profiler},
+    queue_dir::{QUEUE_DIR, QueueDir, enable_profiler, in_process_app},
     symbols::{CrossProcessSymbolsResolver, InProcessSymbolsResolver},
 };
 
@@ -64,7 +64,7 @@ pub struct InProcessReader {
 
 impl InProcessReader {
     pub fn start() -> Self {
-        enable_profiler("local-profiler");
+        enable_profiler(&in_process_app());
         let dir = QUEUE_DIR.get().expect("enable_profiler locked it").clone();
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
