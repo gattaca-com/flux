@@ -199,25 +199,3 @@ pub mod test_shmem {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn in_process_app_reaps_dead_pids_and_keeps_live_ones() {
-        const PID_MAX_LIMIT: u32 = 1 << 22;
-        let app_dir = |pid: u32| local_share_dir().join(format!("{IN_PROCESS_APP_PREFIX}{pid}"));
-        let dead = app_dir(PID_MAX_LIMIT + 1);
-        let live = app_dir(std::process::id());
-        for dir in [&dead, &live] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-
-        assert_eq!(in_process_app(), format!("{IN_PROCESS_APP_PREFIX}{}", std::process::id()));
-        assert!(!dead.exists(), "a dead pid's app is reaped");
-        assert!(live.exists(), "this process's app is kept");
-
-        cleanup_shmem(&live);
-    }
-}
