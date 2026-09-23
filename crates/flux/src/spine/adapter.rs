@@ -10,8 +10,8 @@ use signal_hook::consts::SIGINT;
 use crate::{
     spine::{
         DCacheRead, FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer,
-        SpineProducerWithDCache, SpineProducers, SpineSpscConsumer, SpineSpscProducer,
-        SpscProduceError,
+        SpineProducerWithDCache, SpineProducers, SpineSpscConsumer, SpineSpscDCacheConsumer,
+        SpineSpscProducer, SpineSpscProducerWithDCache, SpscDCacheProduceError, SpscProduceError,
     },
     tile::Tile,
 };
@@ -136,6 +136,151 @@ impl<S: FluxSpine> SpineAdapter<S> {
         self.producers.try_produce(data)?;
         self.did_work = true;
         Ok(())
+    }
+
+    /// Construct and publish an SPSC message only if a slot is available.
+    /// An error never invokes `make` or counts as work.
+    #[inline]
+    pub fn try_produce_with<T: Copy>(
+        &mut self,
+        make: impl FnOnce() -> T,
+    ) -> Result<(), SpscProduceError>
+    where
+        S::Producers: AsMut<SpineSpscProducer<T>>,
+    {
+        self.producers.try_produce_with(make)?;
+        self.did_work = true;
+        Ok(())
+    }
+
+    /// Publish a managed SPSC payload after checking queue capacity. A full
+    /// queue does not invoke the writer. `None` is received as
+    /// `DCacheRead::NoRef`.
+    #[inline]
+    pub fn try_produce_with_dcache<T: Copy, F: FnOnce(&mut [u8])>(
+        &mut self,
+        data: T,
+        payload: Option<(usize, F)>,
+    ) -> Result<(), SpscDCacheProduceError>
+    where
+        S::Producers: AsMut<SpineSpscProducerWithDCache<T>>,
+    {
+        self.producers.try_produce_with_dcache(data, payload)?;
+        self.did_work = true;
+        Ok(())
+    }
+
+    /// Drain managed SPSC messages. The reader borrows payload bytes while
+    /// the slot is held; the handler receives its owned result after release.
+    /// `None` payloads skip the reader and reach the handler as `NoRef`.
+    /// Timings cover both callbacks, including metadata-only messages.
+    /// Returns whether any message was consumed.
+    /// The reader must not wait for a publication that needs its held slot;
+    /// retain pending output and retry after the slot releases instead.
+    ///
+    /// The extracted result cannot retain a payload reference after release:
+    ///
+    /// ```compile_fail
+    /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
+    /// use spine_derive::from_spine;
+    /// #[from_spine("payload-borrow-example")]
+    /// struct App {
+    ///     tile_info: ShmemData<TileInfo>,
+    ///     #[queue(flavour("spsc"), mtu(256))]
+    ///     messages: flux::spine::SpineQueue<u64>,
+    /// }
+    /// fn borrow(adapter: &mut SpineAdapter<App>) {
+    ///     adapter.try_consume_with_dcache(|_: u64, bytes| bytes, |_, _| {}).unwrap();
+    /// }
+    /// ```
+    #[inline]
+    pub fn try_consume_with_dcache<T, R, F, G>(
+        &mut self,
+        read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
+    {
+        self.try_consume_with_dcache_maybe_track(read, |result, producers| {
+            handle(result, producers);
+            true
+        })
+    }
+
+    /// Drain managed SPSC messages, recording reader and handler timings only
+    /// when the handler returns true. Untracked messages still count as work
+    /// and propagate ingestion time. The initial clock read is retained.
+    /// SPSC ownership prevents `Lost` and `SpedPast` outcomes.
+    #[inline]
+    pub fn try_consume_with_dcache_maybe_track<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
+    {
+        let mut consumer = self.consumers.as_mut().try_attached()?;
+        let mut handled = false;
+        while consumer.consume_maybe_track(
+            &mut self.producers,
+            &mut self.did_work,
+            &mut read,
+            &mut handle,
+        ) {
+            handled = true;
+        }
+        Ok(handled)
+    }
+
+    /// Consume at most one managed SPSC message, with reader and handler
+    /// telemetry. The slot releases before the handler, or if the reader
+    /// unwinds.
+    #[inline]
+    pub fn try_consume_with_dcache_one<T, R, F, G>(
+        &mut self,
+        read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
+    {
+        self.try_consume_with_dcache_one_maybe_track(read, |result, producers| {
+            handle(result, producers);
+            true
+        })
+    }
+
+    /// Consume at most one managed SPSC message; the handler selects whether
+    /// to record reader and handler timings, independently of consumption.
+    #[inline]
+    pub fn try_consume_with_dcache_one_maybe_track<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
+    {
+        Ok(self.consumers.as_mut().try_attached()?.consume_maybe_track(
+            &mut self.producers,
+            &mut self.did_work,
+            &mut read,
+            &mut handle,
+        ))
     }
 
     /// Consume all available SPSC messages. An empty queue is successful; a
