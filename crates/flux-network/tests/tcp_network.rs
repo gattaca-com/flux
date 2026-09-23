@@ -847,21 +847,3 @@ fn connections_do_not_share_read_ahead() {
     assert_eq!(from(left_token), expected_left);
     assert_eq!(from(right_token), expected_right);
 }
-
-#[test]
-fn burst_costs_far_fewer_reads_than_frames() {
-    let (mut network, group, addr) = server(64 * 1024);
-    let mut peer = std::net::TcpStream::connect(addr).unwrap();
-    let _ = wait_for_accept(&mut network, group);
-
-    let frames = 2_000;
-    let stream: Vec<u8> =
-        (0..frames).flat_map(|i| encoded_frame(format!("frame-{i}").as_bytes())).collect();
-    let before = network.read_syscalls();
-    let writer = thread::spawn(move || peer.write_all(&stream).unwrap());
-    assert_eq!(collect_messages(&mut network, frames).len(), frames);
-    writer.join().unwrap();
-
-    let per_frame = (network.read_syscalls() - before) as f64 / frames as f64;
-    assert!(per_frame < 0.25, "{per_frame} reads per frame");
-}

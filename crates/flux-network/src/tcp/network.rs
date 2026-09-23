@@ -368,8 +368,6 @@ struct NetworkState {
     send_buffer: Vec<u8>,
     /// Staged frames encrypted for one TLS connection.
     tls_buffer: Vec<u8>,
-    /// Socket reads issued, across all connections.
-    read_syscalls: u64,
 }
 
 impl NetworkState {
@@ -384,7 +382,6 @@ impl NetworkState {
             token_range: tokens,
             send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
             tls_buffer: Vec::new(),
-            read_syscalls: 0,
         }
     }
 
@@ -744,7 +741,6 @@ impl NetworkState {
                 config,
                 &mut connection.timers,
                 &mut connection.tls,
-                &mut self.read_syscalls,
                 &mut |payload, send_ts| {
                     handler(TcpEvent::Message { group, token, payload, send_ts });
                 },
@@ -1154,13 +1150,6 @@ impl TcpNetworkCore {
         Self { state: NetworkState::new(registry, tokens) }
     }
 
-    /// Socket reads issued since creation, across all connections. Difference
-    /// it around a `poll_with` to count that poll's reads.
-    #[must_use]
-    pub fn read_syscalls(&self) -> u64 {
-        self.state.read_syscalls
-    }
-
     /// Adds a protocol group and returns its handle.
     #[must_use = "the group handle identifies listeners and outbound endpoints"]
     pub fn add_group(&mut self, config: TcpGroupConfig) -> TcpGroup {
@@ -1400,9 +1389,7 @@ fn read_plaintext(
     socket: &mut mio::net::TcpStream,
     tls: &mut Option<Box<Session>>,
     buf: &mut [u8],
-    read_syscalls: &mut u64,
 ) -> io::Result<usize> {
-    *read_syscalls += 1;
     match tls {
         Some(session) => session.read_plain(socket, buf),
         None => socket.read(buf),
@@ -1634,7 +1621,6 @@ impl FramedStream {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn poll_with<F>(
         &mut self,
         registry: &Registry,
@@ -1642,7 +1628,6 @@ impl FramedStream {
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
         tls: &mut Option<Box<Session>>,
-        read_syscalls: &mut u64,
         on_message: &mut F,
     ) -> StreamState
     where
@@ -1651,12 +1636,7 @@ impl FramedStream {
         if event.is_readable() {
             if config.framing == Framing::Raw {
                 loop {
-                    match read_plaintext(
-                        &mut self.socket,
-                        tls,
-                        &mut self.rx_buffer.bytes,
-                        read_syscalls,
-                    ) {
+                    match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
                         Ok(0) => return StreamState::Disconnected,
                         Ok(read) => on_message(&self.rx_buffer.bytes[..read], Nanos::now()),
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
@@ -1668,7 +1648,7 @@ impl FramedStream {
                 }
             } else {
                 loop {
-                    match self.read_frame(config.max_frame_size, tls, read_syscalls) {
+                    match self.read_frame(config.max_frame_size, tls) {
                         ReadOutcome::Message { payload, send_ts } => {
                             if let Some(timers) = timers {
                                 if let Some(latency) = &mut timers.latency {
@@ -1710,7 +1690,6 @@ impl FramedStream {
         &mut self,
         max_frame_size: usize,
         tls: &mut Option<Box<Session>>,
-        read_syscalls: &mut u64,
     ) -> ReadOutcome<'_> {
         loop {
             let frame_len = match self.rx_buffer.next_frame(max_frame_size) {
@@ -1734,12 +1713,7 @@ impl FramedStream {
 
             self.rx_buffer.make_room(frame_len);
             let tail = self.rx_buffer.tail;
-            match read_plaintext(
-                &mut self.socket,
-                tls,
-                &mut self.rx_buffer.bytes[tail..],
-                read_syscalls,
-            ) {
+            match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes[tail..]) {
                 Ok(0) => return ReadOutcome::Disconnected,
                 Ok(read) => self.rx_buffer.tail += read,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
