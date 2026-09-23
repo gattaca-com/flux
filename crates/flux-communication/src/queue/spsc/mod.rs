@@ -404,6 +404,16 @@ impl<T: Copy> Producer<T> {
     /// A full queue is unchanged, and the caller retains `msg` for retry.
     #[inline]
     pub fn produce(&mut self, msg: &T) -> Result<usize, FullError> {
+        self.produce_with(|| *msg)
+    }
+
+    /// Construct and publish one message if capacity is available, returning
+    /// its sequence number.
+    ///
+    /// The factory is not called when the queue is full. If it panics, no
+    /// message is published and the producer's write position is unchanged.
+    #[inline]
+    pub fn produce_with(&mut self, message: impl FnOnce() -> T) -> Result<usize, FullError> {
         if self.write.wrapping_sub(self.cached_read) == self.storage.mask + 1 {
             self.cached_read = self.storage.read().load(Ordering::Acquire);
             if self.write.wrapping_sub(self.cached_read) == self.storage.mask + 1 {
@@ -413,7 +423,7 @@ impl<T: Copy> Producer<T> {
         let position = self.write;
         // SAFETY: the acquired read cursor grants ownership of this free slot.
         // The consumer cannot read it until the following release publication.
-        unsafe { self.storage.slot(position).write(*msg) };
+        unsafe { self.storage.slot(position).write(message()) };
         self.write = position.wrapping_add(1);
         self.storage.write().store(self.write, Ordering::Release);
         Ok(position)

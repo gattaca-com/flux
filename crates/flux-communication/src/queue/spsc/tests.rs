@@ -13,6 +13,63 @@ use super::{Queue, QueueError};
 use crate::{EmptyError, cleanup_flink};
 
 #[test]
+fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
+    use std::sync::atomic::Ordering;
+
+    let queue = Queue::<[u64; 19]>::new(2);
+    let start = usize::MAX - 1;
+    // Seed an empty queue near counter wrap; reaching it through the public
+    // API would require usize::MAX successful transfers.
+    queue.storage.header().write.0.store(start, Ordering::Relaxed);
+    queue.storage.header().read.0.store(start, Ordering::Relaxed);
+    let mut producer = queue.try_producer().unwrap();
+    let mut consumer = queue.try_consumer().unwrap();
+    let first = std::array::from_fn(|i| (i as u64).wrapping_mul(31));
+    let second = std::array::from_fn(|i| !(i as u64));
+    let mut calls = 0;
+    assert_eq!(
+        producer.produce_with(|| {
+            calls += 1;
+            assert!(!consumer.consume_ref(|_| panic!("factory has not returned a message")));
+            first
+        }),
+        Ok(start)
+    );
+    let owned = String::from("FnOnce factory");
+    assert_eq!(
+        producer.produce_with(|| {
+            drop(owned);
+            second
+        }),
+        Ok(usize::MAX)
+    );
+    assert_eq!(
+        producer.produce_with(|| {
+            calls += 1;
+            first
+        }),
+        Err(super::FullError)
+    );
+    assert_eq!(calls, 1, "a full queue must not invoke the factory");
+    assert!(consumer.consume_ref(|value| assert_eq!(*value, first)));
+
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            producer.produce_with(|| panic!("factory panic is intentional")).unwrap();
+        }))
+        .is_err()
+    );
+    assert!(consumer.consume_ref(|value| assert_eq!(*value, second)));
+    assert!(!consumer.consume_ref(|_| panic!("panicked factory must not publish")));
+
+    assert_eq!(producer.produce_with(|| first), Ok(0), "panic must not advance the sequence");
+    assert_eq!(producer.produce(&second), Ok(1));
+    assert!(consumer.consume_ref(|value| assert_eq!(*value, first)));
+    assert!(consumer.consume_ref(|value| assert_eq!(*value, second)));
+    assert!(!consumer.consume_ref(|_| unreachable!()));
+}
+
+#[test]
 fn borrowed_payloads_remain_usable_within_their_lifetime() {
     let value = String::from("borrowed payload");
     let queue = Queue::new(1);
