@@ -1606,10 +1606,11 @@ impl FramedStream {
         framing: Framing,
         max_frame_size: usize,
     ) -> Self {
-        // Raw reads straight into `bytes`; length-prefixed sizes it on demand.
+        // Allocated here so the read path only allocates for an oversized
+        // frame. Raw reads at most `max_frame_size` at a time.
         let rx_len = match framing {
             Framing::Raw => INITIAL_RX_BUFFER_SIZE.min(max_frame_size),
-            Framing::LengthPrefixed => 0,
+            Framing::LengthPrefixed => INITIAL_RX_BUFFER_SIZE,
         };
         Self {
             socket,
