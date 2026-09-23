@@ -188,8 +188,8 @@ pub trait SpineProducers {
     where
         Self: AsMut<SpineSpscProducer<T>>,
     {
-        let message = InternalMessage::new(self.timestamp().with_new_publish_delta(), data);
-        self.as_mut().try_produce(&message)
+        let timestamp = self.timestamp().with_new_publish_delta();
+        self.as_mut().try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
     fn try_produce_with_ingestion<T: Copy>(
@@ -200,8 +200,8 @@ pub trait SpineProducers {
     where
         Self: AsMut<SpineSpscProducer<T>>,
     {
-        let message = InternalMessage::new(self.timestamp().with_ingestion_t(ingestion_t), data);
-        self.as_mut().try_produce(&message)
+        let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
+        self.as_mut().try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
     /// Forward a message to an SPSC queue without changing its tracking

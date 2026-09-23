@@ -148,6 +148,16 @@ impl<T: Copy> SpineSpscProducer<T> {
         self.inner.as_mut().unwrap().produce(message).map_err(|_| SpscProduceError::Full)?;
         Ok(())
     }
+
+    #[inline]
+    pub(crate) fn try_produce_with(
+        &mut self,
+        message: impl FnOnce() -> InternalMessage<T>,
+    ) -> Result<(), SpscProduceError> {
+        self.try_attach()?;
+        self.inner.as_mut().unwrap().produce_with(message).map_err(|_| SpscProduceError::Full)?;
+        Ok(())
+    }
 }
 
 impl<T: Copy> fmt::Debug for SpineSpscProducer<T> {
