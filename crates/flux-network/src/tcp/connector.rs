@@ -111,7 +111,9 @@ impl TcpManager {
     }
 
     pub(crate) fn resume_broadcast(&mut self, token: Token) {
-        self.broadcast_paused.retain(|t| *t != token);
+        if let Some(i) = self.broadcast_paused.iter().position(|t| *t == token) {
+            self.broadcast_paused.swap_remove(i);
+        }
     }
 
     pub(crate) fn is_broadcast_paused(&self, token: Token) -> bool {
@@ -140,11 +142,11 @@ impl TcpManager {
             }
             Variant::Inbound(mut tcp_connection) => {
                 tcp_connection.close(&self.registry);
-                self.broadcast_paused.retain(|t| *t != token);
+                self.resume_broadcast(token);
             }
             Variant::Listener(mut tcp_listener) => {
                 let _ = self.registry.deregister(&mut tcp_listener);
-                self.broadcast_paused.retain(|t| *t != token);
+                self.resume_broadcast(token);
             }
         }
     }

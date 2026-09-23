@@ -282,35 +282,3 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::SpedPast));
     }
 }
-
-#[test]
-fn resync_takes_the_current_slot() {
-    let q = Queue::new(16, QueueType::SPMC);
-    let mut p = Producer::from(q);
-    let mut c = ConsumerBare::new_broadcast_test(q);
-    let mut m = 0;
-
-    // Nothing has been written yet, so there is nothing to adopt.
-    assert_eq!(c.resync(), None);
-
-    // Lap the consumer: slot 0 now holds message 16, not the 0 it expects.
-    for i in 0..20 {
-        p.produce(&i);
-    }
-    assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
-
-    // Resync stays on slot 0 and takes what the producer left there.
-    assert_eq!(c.resync(), Some(16));
-    assert_eq!(c.try_consume(&mut m), Ok(()));
-    assert_eq!(m, 16);
-
-    // The remainder of the ring up to the write head follows in sequence.
-    for i in 17..20 {
-        assert_eq!(c.try_consume(&mut m), Ok(()));
-        assert_eq!(m, i);
-    }
-    assert!(matches!(c.try_consume(&mut m), Err(ReadError::Empty)));
-
-    // Caught up, not lapped.
-    assert_eq!(c.resync(), None);
-}

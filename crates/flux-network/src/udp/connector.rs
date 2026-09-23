@@ -225,7 +225,7 @@ impl UdpManager {
     fn remove_peer(&mut self, index: usize) -> Token {
         let mut peer = self.peers.swap_remove(index);
         peer.release_all(&mut self.store);
-        self.broadcast_paused.retain(|t| *t != peer.token);
+        self.resume_broadcast(peer.token);
         peer.token
     }
 
@@ -236,7 +236,9 @@ impl UdpManager {
     }
 
     pub(crate) fn resume_broadcast(&mut self, token: Token) {
-        self.broadcast_paused.retain(|t| *t != token);
+        if let Some(i) = self.broadcast_paused.iter().position(|t| *t == token) {
+            self.broadcast_paused.swap_remove(i);
+        }
     }
 
     pub(crate) fn is_broadcast_paused(&self, token: Token) -> bool {
