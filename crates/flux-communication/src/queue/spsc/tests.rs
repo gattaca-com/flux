@@ -273,7 +273,7 @@ impl PatternedMessage {
 #[test]
 fn threaded_transfer_keeps_multiword_messages_intact() {
     let messages = if cfg!(miri) { 128 } else { 50_000 };
-    let deadline = Instant::now() + Duration::from_secs(if cfg!(miri) { 20 } else { 5 });
+    let progress_timeout = Duration::from_secs(if cfg!(miri) { 20 } else { 5 });
     let queue = Queue::new(64);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
@@ -281,6 +281,7 @@ fn threaded_transfer_keeps_multiword_messages_intact() {
 
     let producer_thread = thread::spawn(move || {
         for sequence in 0..messages {
+            let deadline = Instant::now() + progress_timeout;
             let message = PatternedMessage::new(sequence as u64);
             loop {
                 if producer.produce(&message).is_ok() {
@@ -293,6 +294,7 @@ fn threaded_transfer_keeps_multiword_messages_intact() {
     });
     let consumer_thread = thread::spawn(move || {
         for sequence in 0..messages {
+            let deadline = Instant::now() + progress_timeout;
             let mut message = PatternedMessage::new(u64::MAX);
             loop {
                 if consumer.try_consume(&mut message).is_ok() {
@@ -317,11 +319,12 @@ fn progress_queries_remain_bounded_during_transfer() {
         let queue = Queue::new(capacity);
         let mut producer = queue.try_producer().unwrap();
         let mut consumer = queue.try_consumer().unwrap();
-        let messages = if cfg!(miri) { 128 } else { 20_000 };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Exercise repeated slot reuse without requiring a particular transfer rate.
+        let messages = capacity * 8;
         thread::scope(|scope| {
             scope.spawn(move || {
                 for sequence in 0..messages {
+                    let deadline = Instant::now() + Duration::from_secs(10);
                     loop {
                         let available = producer.max_writable_msgs_without_speeding_past();
                         assert!(available <= capacity);
@@ -329,13 +332,17 @@ fn progress_queries_remain_bounded_during_transfer() {
                             break;
                         }
                         assert_eq!(available, 0, "reported space must remain writable");
-                        assert!(Instant::now() < deadline);
+                        assert!(
+                            Instant::now() < deadline,
+                            "producer remained full: capacity={capacity}, sequence={sequence}"
+                        );
                         thread::yield_now();
                     }
                 }
             });
             scope.spawn(move || {
                 for expected in 0..messages {
+                    let deadline = Instant::now() + Duration::from_secs(10);
                     let mut value = usize::MAX;
                     loop {
                         let unread = consumer.queue_message_count();
@@ -350,7 +357,10 @@ fn progress_queries_remain_bounded_during_transfer() {
                             break;
                         }
                         assert_eq!(unread, 0, "reported values must remain readable");
-                        assert!(Instant::now() < deadline);
+                        assert!(
+                            Instant::now() < deadline,
+                            "consumer remained empty: capacity={capacity}, sequence={expected}"
+                        );
                         thread::yield_now();
                     }
                 }
@@ -457,8 +467,8 @@ fn concurrent_process_transfer_keeps_multiword_messages_intact() {
     let queue = unsafe { Queue::<PatternedMessage>::create_or_open_shared(&path, 4) }.unwrap();
     let mut consumer = queue.try_consumer().unwrap();
     let mut child = shared_child("stream", &path).spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
     for sequence in 0..10_000 {
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !consumer.consume_ref(|message| {
             assert_eq!(*message, PatternedMessage::new(sequence));
         }) {
@@ -480,8 +490,8 @@ fn shared_process_child() {
     if std::env::var("FLUX_SPSC_CHILD_MODE").as_deref() == Ok("stream") {
         let queue = unsafe { Queue::<PatternedMessage>::open_shared(path) }.unwrap();
         let mut producer = queue.try_producer().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
         for sequence in 0..10_000 {
+            let deadline = Instant::now() + Duration::from_secs(10);
             while producer.produce(&PatternedMessage::new(sequence)).is_err() {
                 assert!(Instant::now() < deadline, "parent consumer stopped making progress");
                 thread::yield_now();
