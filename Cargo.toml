@@ -89,6 +89,7 @@ quote = "1"
 rand = "0.9.0"
 ratatui = "0.29.0"
 rcgen = "0.14"
+rtrb = "0.4.0"
 rustc-hash = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { features = ["derive"], version = "1.0" }
