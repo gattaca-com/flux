@@ -6,6 +6,7 @@ use std::{
 
 use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos, Repeater};
+use flux_utils::{DCachePtr, DCacheRef};
 use mio::{Events, Interest, Poll, Registry, Token, event::Event, net::TcpListener};
 use tracing::{debug, error, info, warn};
 
@@ -1270,6 +1271,37 @@ impl TcpNetworkCore {
     pub fn remove(&mut self, token: Token) -> bool {
         self.state.remove(token)
     }
+
+    /// Reads the next `dref.len - filled` bytes of a raw connection straight
+    /// from the socket into `dcache` at `dref[filled..]` instead of emitting
+    /// them as messages; reading goes back to messages once `dref` is full.
+    /// Progress is reported by [`Self::dcache_read_filled`]. Returns `false`
+    /// for unknown, disconnected or length-prefixed connections.
+    pub fn read_into_dcache(
+        &mut self,
+        token: Token,
+        dcache: DCachePtr,
+        dref: DCacheRef,
+        filled: usize,
+    ) -> bool {
+        let Some(connection) = self.state.connections.iter_mut().find(|c| c.token == token) else {
+            return false;
+        };
+        let ConnectionState::Connected(stream) = &mut connection.state else { return false };
+        if self.state.groups[connection.group.0].config.framing != Framing::Raw {
+            return false;
+        }
+        stream.dcache_read = Some(DCacheRead { dcache, dref, filled });
+        true
+    }
+
+    /// Bytes written so far by the last [`Self::read_into_dcache`] on `token`.
+    pub fn dcache_read_filled(&self, token: Token) -> Option<usize> {
+        self.state.connections.iter().find(|c| c.token == token).and_then(|c| match &c.state {
+            ConnectionState::Connected(stream) => stream.dcache_read.map(|read| read.filled),
+            _ => None,
+        })
+    }
 }
 
 /// A TCP network whose sockets are registered with a poll owned by the caller.
@@ -1589,6 +1621,13 @@ impl ByteQueue {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DCacheRead {
+    dcache: DCachePtr,
+    dref: DCacheRef,
+    filled: usize,
+}
+
 struct FramedStream {
     socket: mio::net::TcpStream,
     token: Token,
@@ -1596,6 +1635,7 @@ struct FramedStream {
     rx_buffer: RxBuffer,
     send_queue: ByteQueue,
     writable_armed: bool,
+    dcache_read: Option<DCacheRead>,
 }
 
 impl FramedStream {
@@ -1619,6 +1659,7 @@ impl FramedStream {
             rx_buffer: RxBuffer { bytes: vec![0; rx_len], head: 0, tail: 0 },
             send_queue: ByteQueue::default(),
             writable_armed: false,
+            dcache_read: None,
         }
     }
 
@@ -1637,9 +1678,25 @@ impl FramedStream {
         if event.is_readable() {
             if config.framing == Framing::Raw {
                 loop {
-                    match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
-                        Ok(0) => return StreamState::Disconnected,
-                        Ok(read) => on_message(&self.rx_buffer.bytes[..read], Nanos::now()),
+                    let read = match self.dcache_read.as_mut().filter(|r| r.filled < r.dref.len) {
+                        Some(r) => r
+                            .dcache
+                            .write_into(r.dref, r.filled, |buf| {
+                                read_plaintext(&mut self.socket, tls, buf)
+                            })
+                            .map_err(io::Error::other)
+                            .flatten()
+                            .inspect(|read| r.filled += read)
+                            .map(|read| (read, false)),
+                        None => read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes)
+                            .map(|read| (read, true)),
+                    };
+                    match read {
+                        Ok((0, _)) => return StreamState::Disconnected,
+                        Ok((_, false)) => {}
+                        Ok((read, true)) => {
+                            on_message(&self.rx_buffer.bytes[..read], Nanos::now());
+                        }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                         Err(err) => {
                             debug!(?err, %self.peer_addr, "tcp raw read failed");
