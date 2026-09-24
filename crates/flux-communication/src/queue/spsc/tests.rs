@@ -79,7 +79,7 @@ fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
 #[test]
 fn borrowed_payloads_remain_usable_within_their_lifetime() {
     let value = String::from("borrowed payload");
-    let queue = Queue::new(1);
+    let queue = Queue::<_>::new(1);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
     producer.produce(&value.as_str()).unwrap();
@@ -88,7 +88,7 @@ fn borrowed_payloads_remain_usable_within_their_lifetime() {
 
 #[test]
 fn fifo_capacity_one_never_overwrites_unread_message() {
-    let queue = Queue::new(1);
+    let queue = Queue::<_>::new(1);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
 
@@ -111,7 +111,7 @@ fn capacity_rounds_to_the_next_power_of_two() {
 
 #[test]
 fn full_and_empty_leave_caller_values_unchanged() {
-    let queue = Queue::new(2);
+    let queue = Queue::<_>::new(2);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
 
@@ -130,7 +130,7 @@ fn full_and_empty_leave_caller_values_unchanged() {
 
 #[test]
 fn drain_and_refill_preserve_fifo_order_across_wraps() {
-    let queue = Queue::new(3);
+    let queue = Queue::<_>::new(3);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
 
@@ -150,7 +150,7 @@ fn drain_and_refill_preserve_fifo_order_across_wraps() {
 
 #[test]
 fn cloned_handles_cannot_duplicate_roles_and_dropped_endpoints_handoff_state() {
-    let queue = Queue::new(4);
+    let queue = Queue::<_>::new(4);
     let clone = queue.clone();
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = clone.try_consumer().unwrap();
@@ -177,7 +177,7 @@ fn cloned_handles_cannot_duplicate_roles_and_dropped_endpoints_handoff_state() {
 
 #[test]
 fn nonzero_values_and_callbacks_are_copied_out() {
-    let queue = Queue::new(1);
+    let queue = Queue::<_>::new(1);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
 
@@ -204,7 +204,7 @@ fn nonzero_values_and_callbacks_are_copied_out() {
 
 #[test]
 fn borrowed_slot_is_held_until_callback_returns_or_unwinds() {
-    let queue = Queue::new(1);
+    let queue = Queue::<_>::new(1);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
     producer.produce(&41).unwrap();
@@ -242,7 +242,7 @@ fn borrowed_slot_is_held_until_callback_returns_or_unwinds() {
 
 #[test]
 fn copying_callback_releases_capacity_before_running() {
-    let queue = Queue::new(1);
+    let queue = Queue::<_>::new(1);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
     producer.produce(&1).unwrap();
@@ -274,7 +274,7 @@ impl PatternedMessage {
 fn threaded_transfer_keeps_multiword_messages_intact() {
     let messages = if cfg!(miri) { 128 } else { 50_000 };
     let progress_timeout = Duration::from_secs(if cfg!(miri) { 20 } else { 5 });
-    let queue = Queue::new(64);
+    let queue = Queue::<_>::new(64);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
     drop(queue);
@@ -316,7 +316,7 @@ fn progress_queries_remain_bounded_during_transfer() {
     // While either endpoint queries, only its peer can change availability.
     // A positive observation must allow an immediate operation.
     for capacity in [1, 2, 8, 64] {
-        let queue = Queue::new(capacity);
+        let queue = Queue::<_>::new(capacity);
         let mut producer = queue.try_producer().unwrap();
         let mut consumer = queue.try_consumer().unwrap();
         // Exercise repeated slot reuse without requiring a particular transfer rate.
