@@ -32,7 +32,7 @@ license = "Apache-2.0 AND MIT"
 publish = false
 repository = "https://github.com/gattaca-com/flux"
 rust-version = "1.91.0"
-version = "0.4.0"
+version = "0.5.0"
 
 
 [workspace.dependencies]
@@ -106,8 +106,8 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
 webpki-roots = "1"
-wincode = "0.5"
-wincode-derive = "0.4"
+wincode = "0.6"
+wincode-derive = "0.5"
 zstd = "0.13.2"
 
 [workspace.lints.clippy]
