@@ -191,10 +191,10 @@ pub(super) struct AttachedSpscConsumer<'a, T: Copy> {
 
 impl<T: Copy> AttachedSpscConsumer<'_, T> {
     #[inline]
-    pub(super) fn consume_ref_maybe_track<P, F>(&mut self, producers: &mut P, mut f: F) -> bool
+    pub(super) fn consume_ref_maybe_track<P, F>(&mut self, producers: &mut P, f: F) -> bool
     where
         P: SpineProducers,
-        F: FnMut(&T, &mut P) -> bool,
+        F: FnOnce(&T, &mut P) -> bool,
     {
         self.inner.consume_ref(|message| {
             *producers.timestamp_mut().ingestion_t_mut() = message.ingestion_time();
@@ -303,14 +303,10 @@ impl<T: 'static + Copy> SpineSpscConsumer<T> {
     /// The slot stays occupied through the callback and timing records, and
     /// is released on return or unwind. Returns false when empty.
     #[inline]
-    pub fn consume_ref<P, F>(
-        &mut self,
-        producers: &mut P,
-        mut f: F,
-    ) -> Result<bool, spsc::QueueError>
+    pub fn consume_ref<P, F>(&mut self, producers: &mut P, f: F) -> Result<bool, spsc::QueueError>
     where
         P: SpineProducers,
-        F: FnMut(&T, &mut P),
+        F: FnOnce(&T, &mut P),
     {
         self.consume_ref_maybe_track(producers, |message, p| {
             f(message, p);
@@ -331,7 +327,7 @@ impl<T: 'static + Copy> SpineSpscConsumer<T> {
     ) -> Result<bool, spsc::QueueError>
     where
         P: SpineProducers,
-        F: FnMut(&T, &mut P) -> bool,
+        F: FnOnce(&T, &mut P) -> bool,
     {
         Ok(self.try_attached()?.consume_ref_maybe_track(producers, f))
     }
