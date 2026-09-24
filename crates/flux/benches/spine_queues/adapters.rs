@@ -11,14 +11,15 @@ use flux::{
     },
     spine::{
         FluxSpine, SpineAdapter, SpineConsumer, SpineProducer, SpineProducers, SpineQueue,
-        SpineSpscConsumer, SpineSpscProducer, SpineSpscQueue,
+        SpineSpscConsumer, SpineSpscProducer, SpineSpscQueue, SpscConsumerAccess,
+        SpscProducerAccess,
     },
     tile::{Tile, TileName},
-    timing::{IngestionTime, TrackingTimestamp},
+    timing::{IngestionTime, InternalMessage, TrackingTimestamp},
     utils::{directories::shmem_dir_queues_with_base, short_typename},
 };
 
-use crate::support::{CAPACITY, Case, Message, Rx, Tx};
+use crate::support::{CAPACITY, Case, Message, Rx, SlotGeometry, Tx};
 
 const APP: &str = "spine-queue-benchmark";
 
@@ -55,6 +56,24 @@ impl<P> AsMut<P> for Producers<P> {
     }
 }
 
+impl<const B: usize, Slot> SpscProducerAccess<Message<B>>
+    for Producers<SpineSpscProducer<Message<B>, Slot>>
+{
+    type Slot = Slot;
+    fn spsc_producer(&mut self) -> &mut SpineSpscProducer<Message<B>, Slot> {
+        &mut self.message
+    }
+}
+
+impl<const B: usize, Slot> SpscConsumerAccess<Message<B>>
+    for Consumers<SpineSpscConsumer<Message<B>, Slot>>
+{
+    type Slot = Slot;
+    fn spsc_consumer(&mut self) -> &mut SpineSpscConsumer<Message<B>, Slot> {
+        &mut self.message
+    }
+}
+
 impl<P> SpineProducers for Producers<P> {
     fn timestamp(&self) -> &TrackingTimestamp {
         &self.timestamp
@@ -65,7 +84,7 @@ impl<P> SpineProducers for Producers<P> {
 }
 
 type BroadcastSpine<const B: usize> = BenchSpine<SpineQueue<Message<B>>>;
-type SpscSpine<const B: usize> = BenchSpine<SpineSpscQueue<Message<B>>>;
+type SpscSpine<const B: usize, Slot> = BenchSpine<SpineSpscQueue<Message<B>, Slot>>;
 
 impl<const B: usize> FluxSpine for BroadcastSpine<B> {
     type Consumers = Consumers<SpineConsumer<Message<B>>>;
@@ -100,9 +119,9 @@ impl<const B: usize> FluxSpine for BroadcastSpine<B> {
     }
 }
 
-impl<const B: usize> FluxSpine for SpscSpine<B> {
-    type Consumers = Consumers<SpineSpscConsumer<Message<B>>>;
-    type Producers = Producers<SpineSpscProducer<Message<B>>>;
+impl<const B: usize, Slot> FluxSpine for SpscSpine<B, Slot> {
+    type Consumers = Consumers<SpineSpscConsumer<Message<B>, Slot>>;
+    type Producers = Producers<SpineSpscProducer<Message<B>, Slot>>;
 
     fn attach_consumers<T: Tile<Self>>(&mut self, tile: &T) -> Self::Consumers {
         Consumers {
@@ -165,7 +184,7 @@ impl<const B: usize> Tx<B> for Sender<BroadcastSpine<B>> {
     }
 }
 
-impl<const B: usize> Tx<B> for Sender<SpscSpine<B>> {
+impl<const B: usize, Slot> Tx<B> for Sender<SpscSpine<B, Slot>> {
     #[inline]
     fn begin_batch(&mut self) {
         self.0.begin_loop(IngestionTime::now());
@@ -191,7 +210,7 @@ impl<const B: usize, const TRACK: bool> Rx<B> for Receiver<BroadcastSpine<B>, TR
     }
 }
 
-impl<const B: usize, const TRACK: bool> Rx<B> for Receiver<SpscSpine<B>, TRACK> {
+impl<const B: usize, Slot, const TRACK: bool> Rx<B> for Receiver<SpscSpine<B, Slot>, TRACK> {
     #[inline]
     fn drain(&mut self, mut callback: impl FnMut(&Message<B>)) {
         self.0.begin_loop(IngestionTime::now());
@@ -205,6 +224,15 @@ impl<const B: usize, const TRACK: bool> Rx<B> for Receiver<SpscSpine<B>, TRACK> 
                 })
                 .unwrap();
         }
+    }
+    fn slot_geometry(&self) -> Option<SlotGeometry> {
+        let wire = InternalMessage::new(TrackingTimestamp::new(0), Message([0; B]));
+        let offset = std::ptr::from_ref(wire.data()).addr() - std::ptr::from_ref(&wire).addr();
+        Some(SlotGeometry {
+            size: size_of::<Slot>(),
+            alignment: align_of::<Slot>(),
+            payload_offset: offset,
+        })
     }
 }
 
@@ -223,13 +251,13 @@ fn check_telemetry<const B: usize, const TRACK: bool>(base: &Path) -> impl FnMut
     }
 }
 
-pub fn run<const B: usize, const TRACK: bool>(queue: &str, case: &mut Case<B>, run: usize) {
+pub fn run<const B: usize, Slot, const TRACK: bool>(queue: &str, case: &mut Case<B>, run: usize) {
     let directory = tempfile::Builder::new().prefix("flux-spine-bench-").tempdir().unwrap();
     // An abort deliberately retains this unique directory for diagnosis.
     eprintln!("Spine telemetry directory: {}", directory.path().display());
     if queue == "SPSC" {
         // SAFETY: this benchmark's constructor uses only local heap queue storage.
-        let mut spine = unsafe { SpscSpine::<B>::new_in_base_dir(directory.path()) };
+        let mut spine = unsafe { SpscSpine::<B, Slot>::new_in_base_dir(directory.path()) };
         let mut sender = SpineAdapter::connect_tile(&Publisher, &mut spine);
         let mut receiver = SpineAdapter::connect_tile(&Subscriber, &mut spine);
         sender.producers.message.try_attach().unwrap();
