@@ -2,13 +2,14 @@
 #![allow(improper_ctypes)]
 
 use std::{
+    collections::HashMap,
     fs,
     io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -19,8 +20,8 @@ use flux::{
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
 use flux_gather::{
-    Blob, BlobCache, BlobConsumer, BlobHandler, BlobReader, BlobReceiver, BlobShipper, BlobWriter,
-    GatherQueues, IncomingBlob, ReadError, Token,
+    Blob, BlobCache, BlobConsumer, BlobEvent, BlobHandler, BlobIo, BlobReader, BlobReceiver,
+    BlobShipper, FileToken, GatherQueues, IncomingBlob, ReadError, Token,
 };
 use flux_timing::{Duration, InternalMessage, Nanos};
 use flux_utils::ArrayStr;
@@ -92,7 +93,7 @@ struct Gatherer {
     ready: Arc<AtomicBool>,
     cache: BlobCache,
     shipper: BlobShipper,
-    writer: BlobWriter,
+    writer: BlobIo,
     base: PathBuf,
     last_slot: u64,
 }
@@ -103,7 +104,9 @@ impl Gatherer {
         self.cache.flush(&meta, 1, |blob| {
             self.shipper.ship(blob);
             if blob.type_name() != Fill::NAME {
-                self.writer.write(blob, &meta.path(&self.base, blob.type_name()));
+                self.writer
+                    .write(blob, &meta.path(&self.base, blob.type_name()))
+                    .expect("queue write");
             }
         });
         self.last_slot = slot;
@@ -160,23 +163,81 @@ struct Seen {
     n_messages: u32,
 }
 
+/// Every file the receiver writes is loaded back once its write is reported
+/// and compared with the bytes that were written.
+#[derive(Default)]
+struct RoundTrips {
+    ok: AtomicUsize,
+    problems: Mutex<Vec<String>>,
+}
+
+impl RoundTrips {
+    fn problem(&self, problem: String) {
+        self.problems.lock().unwrap().push(problem);
+    }
+}
+
 struct RecordingHandler {
-    writer: BlobWriter,
+    io: BlobIo,
     base: PathBuf,
     seen: Arc<Mutex<Vec<Seen>>>,
     done: Arc<AtomicBool>,
     scratch: Scratch,
+    writing: HashMap<FileToken, (PathBuf, Vec<u8>)>,
+    loading: HashMap<FileToken, Vec<u8>>,
+    round_trips: Arc<RoundTrips>,
+}
+
+impl RecordingHandler {
+    fn pump(&mut self) -> bool {
+        let mut written = Vec::new();
+        let loading = &mut self.loading;
+        let round_trips = &self.round_trips;
+        let reaped = self.io.poll_with(|event| match event {
+            BlobEvent::Written { file } => written.push(file),
+            BlobEvent::Loaded { file, bytes } => match loading.remove(&file) {
+                Some(expected) if expected == bytes => {
+                    round_trips.ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(_) => round_trips.problem(format!("{file:?}: loaded bytes differ")),
+                None => round_trips.problem(format!("{file:?}: load never requested")),
+            },
+            BlobEvent::Failed { file, error } => round_trips.problem(format!("{file:?}: {error}")),
+        });
+        for file in written {
+            let Some((path, bytes)) = self.writing.remove(&file) else {
+                self.round_trips.problem(format!("{file:?}: write never requested"));
+                continue;
+            };
+            match self.io.load(&path) {
+                Ok(token) => {
+                    self.loading.insert(token, bytes);
+                }
+                Err(error) => self.round_trips.problem(format!("{}: {error}", path.display())),
+            }
+        }
+        reaped
+    }
 }
 
 impl Tile<RecvSpine> for RecordingHandler {
     fn loop_body(&mut self, adapter: &mut SpineAdapter<RecvSpine>) {
-        if self.writer.poll() {
+        if self.pump() {
             adapter.mark_work();
         }
     }
 
     fn teardown(mut self, _adapter: &mut SpineAdapter<RecvSpine>) {
-        self.writer.drain();
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        while !(self.writing.is_empty() && self.loading.is_empty()) && Instant::now() < deadline {
+            self.pump();
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+        let outstanding = self.writing.len() + self.loading.len();
+        if outstanding > 0 {
+            self.round_trips.problem(format!("{outstanding} round trips outstanding at teardown"));
+        }
+        self.io.drain();
     }
 }
 
@@ -187,7 +248,9 @@ impl BlobHandler<RecvSpine, TestMeta> for RecordingHandler {
         blob: &Blob,
         producers: &mut <RecvSpine as flux::spine::FluxSpine>::Producers,
     ) {
-        self.writer.write(blob, &meta.path(&self.base, blob.type_name()));
+        let path = meta.path(&self.base, blob.type_name());
+        let file = self.io.write(blob, &path).expect("queue write");
+        self.writing.insert(file, (path, blob.as_bytes().to_vec()));
         {
             let mut seen = self.seen.lock().unwrap();
             seen.push(Seen {
@@ -281,6 +344,7 @@ fn spawn_receiver(
     stop: Arc<AtomicBool>,
     receiver_done: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    round_trips: Arc<RoundTrips>,
     want_replica: usize,
     deadline: Instant,
 ) -> std::thread::JoinHandle<()> {
@@ -290,11 +354,14 @@ fn spawn_receiver(
             attach_tile(BlobReceiver::new(addr), scoped, background());
             attach_tile(
                 BlobConsumer::new(RecordingHandler {
-                    writer: BlobWriter::new(),
+                    io: BlobIo::new(),
                     base: disk,
                     seen,
                     done,
                     scratch: Scratch::new(),
+                    writing: HashMap::new(),
+                    loading: HashMap::new(),
+                    round_trips,
                 }),
                 scoped,
                 background(),
@@ -403,6 +470,7 @@ fn gather_end_to_end_sender_to_receiver() {
     let stop = Arc::new(AtomicBool::new(false));
     let receiver_done = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
+    let round_trips = Arc::new(RoundTrips::default());
     let deadline = Instant::now() + DEADLINE;
     let ready = Arc::new(AtomicBool::new(false));
 
@@ -415,6 +483,7 @@ fn gather_end_to_end_sender_to_receiver() {
         stop,
         receiver_done.clone(),
         done.clone(),
+        round_trips.clone(),
         EXPECTED_REPLICA_MSGS,
         Instant::now() + RECEIVER_DEADLINE,
     );
@@ -443,7 +512,7 @@ fn gather_end_to_end_sender_to_receiver() {
                 ready: ready.clone(),
                 cache: BlobCache::new(),
                 shipper: BlobShipper::new(vec![addr]),
-                writer: BlobWriter::new(),
+                writer: BlobIo::new(),
                 base: send_disk.clone(),
                 last_slot: 0,
             },
@@ -457,6 +526,7 @@ fn gather_end_to_end_sender_to_receiver() {
     let seen: Vec<Seen> = seen.lock().unwrap().clone();
     assert_hook_records(&seen);
     assert_disk_identity(&send_disk, &recv_disk);
+    assert_round_trips(&round_trips);
     assert_decoded_content(&send_disk, &recv_disk);
     assert_single_blob_replay(&recv_disk);
     let replica: Vec<InternalMessage<Telemetry>> = replica.lock().unwrap().clone();
@@ -484,6 +554,12 @@ fn assert_hook_records(seen: &[Seen]) {
     assert_eq!(tail[0].type_name, Price::NAME);
     assert_eq!(tail[0].meta.n_blobs, 1);
     assert_eq!(tail[0].n_messages, 2);
+}
+
+fn assert_round_trips(round_trips: &RoundTrips) {
+    let problems = round_trips.problems.lock().unwrap().clone();
+    assert!(problems.is_empty(), "round trips: {problems:?}");
+    assert_eq!(round_trips.ok.load(Ordering::Relaxed), EXPECTED_BLOBS, "files loaded back");
 }
 
 fn assert_disk_identity(send_disk: &Path, recv_disk: &Path) {
@@ -658,6 +734,7 @@ fn non_blob_peer_is_disconnected() {
         stop.clone(),
         receiver_done,
         done,
+        Arc::new(RoundTrips::default()),
         usize::MAX,
         deadline,
     );
