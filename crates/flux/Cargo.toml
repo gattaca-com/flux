@@ -33,6 +33,10 @@ zstd.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[[bench]]
+name = "spine_queues"
+harness = false
+
 [features]
 default = []
 park = ["dep:mio", "flux-communication/park"]
