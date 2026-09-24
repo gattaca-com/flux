@@ -110,6 +110,7 @@ pub(crate) struct UdpManager {
     /// Taken out while datagrams are dispatched so peers can be borrowed.
     recv: Option<RecvBatch>,
     pending_disconnects: Vec<Token>,
+    broadcast_paused: Vec<Token>,
     next_token: usize,
     /// Peer maintenance runs at most this often; half the minimum RTO keeps
     /// recovery timing within tolerance while idle polls stay cheap.
@@ -136,6 +137,7 @@ impl UdpManager {
             staged: [Staged { peer: 0, seq: 0 }; BATCH],
             recv: Some(RecvBatch::new(udp.max_datagram_size)),
             pending_disconnects: Vec::new(),
+            broadcast_paused: Vec::new(),
             next_token: 0,
             tick_interval: udp.min_rto / 2_u32,
             next_tick: Instant::ZERO,
@@ -223,7 +225,24 @@ impl UdpManager {
     fn remove_peer(&mut self, index: usize) -> Token {
         let mut peer = self.peers.swap_remove(index);
         peer.release_all(&mut self.store);
+        self.resume_broadcast(peer.token);
         peer.token
+    }
+
+    pub(crate) fn pause_broadcast(&mut self, token: Token) {
+        if !self.broadcast_paused.contains(&token) {
+            self.broadcast_paused.push(token);
+        }
+    }
+
+    pub(crate) fn resume_broadcast(&mut self, token: Token) {
+        if let Some(i) = self.broadcast_paused.iter().position(|t| *t == token) {
+            self.broadcast_paused.swap_remove(i);
+        }
+    }
+
+    pub(crate) fn is_broadcast_paused(&self, token: Token) -> bool {
+        self.broadcast_paused.contains(&token)
     }
 
     /// Outbound peers renegotiate; accepted peers are dropped.
@@ -282,6 +301,9 @@ impl UdpManager {
                 let mut i = self.peers.len();
                 while i != 0 {
                     i -= 1;
+                    if self.broadcast_paused.contains(&self.peers[i].token) {
+                        continue;
+                    }
                     if !self.stage_message(i, slot, ts, now) {
                         self.drop_peer_pending(i, now);
                     }

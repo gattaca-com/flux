@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use flux_network::{NetworkDriver, SendBehavior, TcpConfig, Transport};
+use flux_network::{NetworkDriver, PollEvent, SendBehavior, TcpConfig, Transport};
 use flux_timing::{Duration, Instant, Repeater};
 use flux_versioned_types::Blob;
 use mio::Token;
@@ -20,10 +20,13 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    fn dial(&mut self, driver: &mut NetworkDriver) {
-        if self.token.is_none() {
-            self.token = driver.connect(self.addr);
+    /// The token when this call dialled the endpoint.
+    fn dial(&mut self, driver: &mut NetworkDriver) -> Option<Token> {
+        if self.token.is_some() {
+            return None;
         }
+        self.token = driver.connect(self.addr);
+        self.token
     }
 
     fn shed(&mut self, driver: &mut NetworkDriver, disconnected: &[Token], now: Instant) {
@@ -110,15 +113,52 @@ impl BlobShipper {
             .write_or_enqueue_with(SendBehavior::Broadcast, |buf| buf.extend_from_slice(bytes));
     }
 
+    /// One endpoint only, by token. A broadcast pause does not apply.
+    pub fn ship_to(&mut self, token: Token, blob: &Blob) {
+        let bytes = blob.as_bytes();
+        self.driver
+            .write_or_enqueue_with(SendBehavior::Single(token), |buf| buf.extend_from_slice(bytes));
+    }
+
+    /// Takes an endpoint out of [`Self::ship`] until resumed; [`Self::ship_to`]
+    /// still reaches it.
+    pub fn pause_broadcast(&mut self, token: Token) {
+        self.driver.pause_broadcast(token);
+    }
+
+    pub fn resume_broadcast(&mut self, token: Token) {
+        self.driver.resume_broadcast(token);
+    }
+
+    pub fn is_broadcast_paused(&self, token: Token) -> bool {
+        self.driver.is_broadcast_paused(token)
+    }
+
+    /// Which endpoint, in construction order, `token` belongs to.
+    pub fn endpoint_of(&self, token: Token) -> Option<usize> {
+        self.endpoints.iter().position(|ep| ep.token == Some(token))
+    }
+
     pub fn drive(&mut self) -> bool {
+        self.drive_with(|_| {})
+    }
+
+    /// [`Self::drive`] that hands the caller every connection event. A fresh
+    /// dial is reported as `Reconnect`, so a caller that owes a peer something
+    /// on connection sees the first dial and every reconnection alike.
+    pub fn drive_with(&mut self, mut on_event: impl for<'a> FnMut(PollEvent<&'a [u8]>)) -> bool {
+        let mut worked = false;
         if self.retry.fired() {
             let now = Instant::now();
             let disconnected: Vec<Token> = self.driver.currently_disconnected().collect();
             for ep in &mut self.endpoints {
-                ep.dial(&mut self.driver);
+                if let Some(token) = ep.dial(&mut self.driver) {
+                    on_event(PollEvent::Reconnect { token });
+                    worked = true;
+                }
                 ep.shed(&mut self.driver, &disconnected, now);
             }
         }
-        self.driver.poll_with(|_| {})
+        self.driver.poll_with(&mut on_event) || worked
     }
 }
