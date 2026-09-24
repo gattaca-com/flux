@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use flux::{
     TimingMessage,
-    communication::{cleanup_shmem, queue::Queue},
+    communication::{
+        cleanup_shmem,
+        queue::{Queue, QueueType},
+    },
     spine::{
         FluxSpine, SpineAdapter, SpineConsumer, SpineProducer, SpineProducers, SpineQueue,
         SpineSpscConsumer, SpineSpscProducer, SpineSpscQueue,
@@ -15,7 +18,7 @@ use flux::{
     utils::{directories::shmem_dir_queues_with_base, short_typename},
 };
 
-use crate::support::{CAPACITY, Measurement, Message, Rx, Settings, Tx, transfer};
+use crate::support::{CAPACITY, Case, Message, Rx, Tx};
 
 const APP: &str = "spine-queue-benchmark";
 
@@ -61,10 +64,10 @@ impl<P> SpineProducers for Producers<P> {
     }
 }
 
-type MpmcSpine<const B: usize> = BenchSpine<SpineQueue<Message<B>>>;
+type BroadcastSpine<const B: usize> = BenchSpine<SpineQueue<Message<B>>>;
 type SpscSpine<const B: usize> = BenchSpine<SpineSpscQueue<Message<B>>>;
 
-impl<const B: usize> FluxSpine for MpmcSpine<B> {
+impl<const B: usize> FluxSpine for BroadcastSpine<B> {
     type Consumers = Consumers<SpineConsumer<Message<B>>>;
     type Producers = Producers<SpineProducer<Message<B>>>;
 
@@ -80,7 +83,7 @@ impl<const B: usize> FluxSpine for MpmcSpine<B> {
     unsafe fn new_in_base_dir(base: impl AsRef<Path>) -> Self {
         Self {
             base_dir: base.as_ref().to_owned(),
-            queue: Queue::new(CAPACITY, flux::communication::queue::QueueType::MPMC),
+            queue: Queue::new(CAPACITY, QueueType::MPMC),
             next_tile: 0,
         }
     }
@@ -151,7 +154,7 @@ impl<S: FluxSpine> Tile<S> for Subscriber {
 struct Sender<S: FluxSpine>(SpineAdapter<S>);
 struct Receiver<S: FluxSpine, const TRACK: bool>(SpineAdapter<S>);
 
-impl<const B: usize> Tx<B> for Sender<MpmcSpine<B>> {
+impl<const B: usize> Tx<B> for Sender<BroadcastSpine<B>> {
     #[inline]
     fn begin_batch(&mut self) {
         self.0.begin_loop(IngestionTime::now());
@@ -173,7 +176,7 @@ impl<const B: usize> Tx<B> for Sender<SpscSpine<B>> {
     }
 }
 
-impl<const B: usize, const TRACK: bool> Rx<B> for Receiver<MpmcSpine<B>, TRACK> {
+impl<const B: usize, const TRACK: bool> Rx<B> for Receiver<BroadcastSpine<B>, TRACK> {
     #[inline]
     fn drain(&mut self, mut callback: impl FnMut(&Message<B>)) {
         self.0.begin_loop(IngestionTime::now());
@@ -220,43 +223,32 @@ fn check_telemetry<const B: usize, const TRACK: bool>(base: &Path) -> impl FnMut
     }
 }
 
-pub fn run<const B: usize, const TRACK: bool>(
-    spsc: bool,
-    settings: &Settings,
-    seed: u32,
-) -> Option<Measurement> {
+pub fn run<const B: usize, const TRACK: bool>(queue: &str, case: &mut Case<B>, run: usize) {
     let directory = tempfile::Builder::new().prefix("flux-spine-bench-").tempdir().unwrap();
     // An abort deliberately retains this unique directory for diagnosis.
     eprintln!("Spine telemetry directory: {}", directory.path().display());
-    let result = if spsc {
+    if queue == "SPSC" {
         // SAFETY: this benchmark's constructor uses only local heap queue storage.
         let mut spine = unsafe { SpscSpine::<B>::new_in_base_dir(directory.path()) };
         let mut sender = SpineAdapter::connect_tile(&Publisher, &mut spine);
         let mut receiver = SpineAdapter::connect_tile(&Subscriber, &mut spine);
         sender.producers.message.try_attach().unwrap();
         receiver.consumers.message.try_attach().unwrap();
-        transfer(
-            Sender(sender),
-            Receiver::<_, TRACK>(receiver),
-            settings,
-            seed,
-            check_telemetry::<B, TRACK>(directory.path()),
-        )
+        let check = check_telemetry::<B, TRACK>(directory.path());
+        case.run(run, Sender(sender), Receiver::<_, TRACK>(receiver), check);
     } else {
-        // SAFETY: this benchmark's constructor uses only local heap queue storage.
-        let mut spine = unsafe { MpmcSpine::<B>::new_in_base_dir(directory.path()) };
+        let kind = if queue == "SPMC" { QueueType::SPMC } else { QueueType::MPMC };
+        let mut spine = BroadcastSpine::<B> {
+            base_dir: directory.path().to_owned(),
+            queue: Queue::new(CAPACITY, kind),
+            next_tile: 0,
+        };
         let sender = SpineAdapter::connect_tile(&Publisher, &mut spine);
         let mut receiver = SpineAdapter::connect_tile(&Subscriber, &mut spine);
         receiver.subscribe_broadcast::<Message<B>>();
-        transfer(
-            Sender(sender),
-            Receiver::<_, TRACK>(receiver),
-            settings,
-            seed,
-            check_telemetry::<B, TRACK>(directory.path()),
-        )
-    };
+        let check = check_telemetry::<B, TRACK>(directory.path());
+        case.run(run, Sender(sender), Receiver::<_, TRACK>(receiver), check);
+    }
     // All adapters and the Spine have dropped; clean only this owned directory.
     cleanup_shmem(directory.path());
-    result
 }
