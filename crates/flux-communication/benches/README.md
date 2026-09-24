@@ -41,4 +41,4 @@ Throughput has no artificial pauses or per-message timestamps. The separate late
 
 CSV lines beginning with `run` contain throughput in millions of messages per second and p50/p95 latency in nanoseconds. `summary` lines contain the arithmetic mean and sample standard deviation of all throughput runs, plus p50/p95 pooled over their latency samples. Nothing is trimmed or discarded. With one run, SD is `NaN`. These measurements describe a small callback and cache-hot repeated payloads; they do not predict every application workload.
 
-The queue adapters are near the top of `spsc.rs`; `produce`, `consume` and `phase` contain the shared measurement loop. Workload constants are at the top, and the payload-size dispatch is in `main`.
+The queue adapters are near the top of `spsc.rs`. The workspace's `benches/queue_support.rs` contains the workload constants, measurement loop, CPU selection and summary statistics shared with the [Spine benchmark](../../flux/benches/README.md). The payload-size dispatch is in `main`.
