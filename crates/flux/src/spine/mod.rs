@@ -16,6 +16,20 @@
 //! to become free; see
 //! [`crate::communication::queue::spsc::Consumer::consume_ref`].
 //!
+//! Add `slot(LayoutType)` to an SPSC field to set its storage stride and
+//! alignment. The type describes the complete stored message, including
+//! `InternalMessage` tracking metadata. It must be large and aligned enough
+//! for `InternalMessage<T>` (or `InternalMessage<DCacheMsg<T>>` with `mtu`),
+//! but need not implement `Copy`, `Clone`, `Send`, or `Sync`. Its values are
+//! never constructed. Without `slot`, the stored message is the slot type.
+//! All participants opening a shared mapping must use the same slot layout.
+//! Incompatible mappings are rejected; recreate them only after all
+//! participants detach. Managed `DCache` side payloads have a separate layout.
+//! Generated bundles select the slot through [`SpscProducerAccess`],
+//! [`SpscConsumerAccess`], [`SpscDCacheProducerAccess`] and
+//! [`SpscDCacheConsumerAccess`]. Hand-written bundles used through the adapter
+//! implement the corresponding traits too.
+//!
 //! ```no_run
 //! # #![deny(unused_imports)]
 //! use flux::{
@@ -124,7 +138,8 @@ use flux_utils::{DCacheError, DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
 pub use spsc::{
     SpineSpscConsumer, SpineSpscDCacheConsumer, SpineSpscDCacheQueue, SpineSpscProducer,
-    SpineSpscProducerWithDCache, SpineSpscQueue, SpscDCacheProduceError, SpscProduceError,
+    SpineSpscProducerWithDCache, SpineSpscQueue, SpscConsumerAccess, SpscDCacheConsumerAccess,
+    SpscDCacheProduceError, SpscDCacheProducerAccess, SpscProduceError, SpscProducerAccess,
 };
 pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
@@ -198,10 +213,10 @@ pub trait SpineProducers {
     /// when forwarding from a consume callback; consumption is not rolled back.
     fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
     where
-        Self: AsMut<SpineSpscProducer<T>>,
+        Self: SpscProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_new_publish_delta();
-        self.as_mut().try_produce_with(|| InternalMessage::new(timestamp, data))
+        self.spsc_producer().try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
     /// Construct a message only once an SPSC slot is available. Errors never
@@ -211,10 +226,10 @@ pub trait SpineProducers {
         make: impl FnOnce() -> T,
     ) -> Result<(), SpscProduceError>
     where
-        Self: AsMut<SpineSpscProducer<T>>,
+        Self: SpscProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_new_publish_delta();
-        self.as_mut().try_produce_with(|| InternalMessage::new(timestamp, make()))
+        self.spsc_producer().try_produce_with(|| InternalMessage::new(timestamp, make()))
     }
 
     /// Publish metadata and a managed SPSC payload. `Full` never invokes the
@@ -226,15 +241,18 @@ pub trait SpineProducers {
         payload: Option<(usize, F)>,
     ) -> Result<(), SpscDCacheProduceError>
     where
-        Self: AsMut<SpineSpscProducerWithDCache<T>>,
+        Self: SpscDCacheProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_new_publish_delta();
-        self.as_mut().try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
-            if let Some((_, fill)) = payload {
-                fill(bytes.expect("requested SPSC payload"));
-            }
-            InternalMessage::new(timestamp, data)
-        })
+        self.spsc_dcache_producer().try_produce_with(
+            payload.as_ref().map(|(len, _)| *len),
+            |bytes| {
+                if let Some((_, fill)) = payload {
+                    fill(bytes.expect("requested SPSC payload"));
+                }
+                InternalMessage::new(timestamp, data)
+            },
+        )
     }
 
     /// Managed SPSC publication with an explicit ingestion timestamp.
@@ -245,15 +263,18 @@ pub trait SpineProducers {
         ingestion_t: IngestionTime,
     ) -> Result<(), SpscDCacheProduceError>
     where
-        Self: AsMut<SpineSpscProducerWithDCache<T>>,
+        Self: SpscDCacheProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
-        self.as_mut().try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
-            if let Some((_, fill)) = payload {
-                fill(bytes.expect("requested SPSC payload"));
-            }
-            InternalMessage::new(timestamp, data)
-        })
+        self.spsc_dcache_producer().try_produce_with(
+            payload.as_ref().map(|(len, _)| *len),
+            |bytes| {
+                if let Some((_, fill)) = payload {
+                    fill(bytes.expect("requested SPSC payload"));
+                }
+                InternalMessage::new(timestamp, data)
+            },
+        )
     }
 
     fn try_produce_with_ingestion<T: Copy>(
@@ -262,19 +283,19 @@ pub trait SpineProducers {
         ingestion_t: IngestionTime,
     ) -> Result<(), SpscProduceError>
     where
-        Self: AsMut<SpineSpscProducer<T>>,
+        Self: SpscProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
-        self.as_mut().try_produce_with(|| InternalMessage::new(timestamp, data))
+        self.spsc_producer().try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
     /// Forward a message to an SPSC queue without changing its tracking
     /// metadata.
     fn try_forward<T: Copy>(&mut self, message: &InternalMessage<T>) -> Result<(), SpscProduceError>
     where
-        Self: AsMut<SpineSpscProducer<T>>,
+        Self: SpscProducerAccess<T>,
     {
-        self.as_mut().try_produce(message)
+        self.spsc_producer().try_produce(message)
     }
 
     fn produce<T: Copy>(&self, d: T)
