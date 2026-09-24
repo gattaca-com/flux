@@ -10,8 +10,8 @@ use signal_hook::consts::SIGINT;
 use crate::{
     spine::{
         DCacheRead, FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer,
-        SpineProducerWithDCache, SpineProducers, SpineSpscConsumer, SpineSpscDCacheConsumer,
-        SpineSpscProducer, SpineSpscProducerWithDCache, SpscDCacheProduceError, SpscProduceError,
+        SpineProducerWithDCache, SpineProducers, SpscConsumerAccess, SpscDCacheConsumerAccess,
+        SpscDCacheProduceError, SpscDCacheProducerAccess, SpscProduceError, SpscProducerAccess,
     },
     tile::Tile,
 };
@@ -131,7 +131,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     #[inline]
     pub fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
     where
-        S::Producers: AsMut<SpineSpscProducer<T>>,
+        S::Producers: SpscProducerAccess<T>,
     {
         self.producers.try_produce(data)?;
         self.did_work = true;
@@ -146,7 +146,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         make: impl FnOnce() -> T,
     ) -> Result<(), SpscProduceError>
     where
-        S::Producers: AsMut<SpineSpscProducer<T>>,
+        S::Producers: SpscProducerAccess<T>,
     {
         self.producers.try_produce_with(make)?;
         self.did_work = true;
@@ -163,7 +163,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         payload: Option<(usize, F)>,
     ) -> Result<(), SpscDCacheProduceError>
     where
-        S::Producers: AsMut<SpineSpscProducerWithDCache<T>>,
+        S::Producers: SpscDCacheProducerAccess<T>,
     {
         self.producers.try_produce_with_dcache(data, payload)?;
         self.did_work = true;
@@ -201,7 +201,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
         F: FnMut(T, &[u8]) -> R,
         G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
@@ -223,11 +223,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
         F: FnMut(T, &[u8]) -> R,
         G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
     {
-        let mut consumer = self.consumers.as_mut().try_attached()?;
+        let mut consumer = self.consumers.spsc_dcache_consumer().try_attached()?;
         let mut handled = false;
         while consumer.consume_maybe_track(
             &mut self.producers,
@@ -251,7 +251,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
         F: FnMut(T, &[u8]) -> R,
         G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
@@ -271,11 +271,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscDCacheConsumer<T>>,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
         F: FnMut(T, &[u8]) -> R,
         G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
     {
-        Ok(self.consumers.as_mut().try_attached()?.consume_maybe_track(
+        Ok(self.consumers.spsc_dcache_consumer().try_attached()?.consume_maybe_track(
             &mut self.producers,
             &mut self.did_work,
             &mut read,
@@ -292,7 +292,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<(), crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(T, &mut S::Producers),
     {
         self.try_consume_maybe_track(|message, producers| {
@@ -312,7 +312,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<(), crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(T, &mut S::Producers) -> bool,
     {
         self.try_consume_internal_message_maybe_track(|message, producers| {
@@ -328,10 +328,10 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(T, &mut S::Producers),
     {
-        let consumed = self.consumers.as_mut().try_consume(&mut self.producers, f)?;
+        let consumed = self.consumers.spsc_consumer().try_consume(&mut self.producers, f)?;
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -347,10 +347,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(T, &mut S::Producers) -> bool,
     {
-        let consumed = self.consumers.as_mut().try_consume_maybe_track(&mut self.producers, f)?;
+        let consumed =
+            self.consumers.spsc_consumer().try_consume_maybe_track(&mut self.producers, f)?;
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -382,7 +383,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<(), crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&T, &mut S::Producers),
     {
         self.consume_ref_maybe_track(|message, producers| {
@@ -418,10 +419,10 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<(), crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&T, &mut S::Producers) -> bool,
     {
-        let mut consumer = self.consumers.as_mut().try_attached()?;
+        let mut consumer = self.consumers.spsc_consumer().try_attached()?;
         while consumer.consume_ref_maybe_track(&mut self.producers, &mut f) {
             self.did_work = true;
         }
@@ -438,10 +439,10 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnOnce(&T, &mut S::Producers),
     {
-        let consumed = self.consumers.as_mut().consume_ref(&mut self.producers, f)?;
+        let consumed = self.consumers.spsc_consumer().consume_ref(&mut self.producers, f)?;
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -458,10 +459,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnOnce(&T, &mut S::Producers) -> bool,
     {
-        let consumed = self.consumers.as_mut().consume_ref_maybe_track(&mut self.producers, f)?;
+        let consumed =
+            self.consumers.spsc_consumer().consume_ref_maybe_track(&mut self.producers, f)?;
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -473,11 +475,11 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers),
     {
         let consumed =
-            self.consumers.as_mut().try_consume_internal_message(&mut self.producers, f)?;
+            self.consumers.spsc_consumer().try_consume_internal_message(&mut self.producers, f)?;
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -492,10 +494,10 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<(), crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
     {
-        let mut consumer = self.consumers.as_mut().try_attached()?;
+        let mut consumer = self.consumers.spsc_consumer().try_attached()?;
         while consumer.consume_internal_message_maybe_track(&mut self.producers, &mut f) {
             self.did_work = true;
         }
@@ -513,12 +515,12 @@ impl<S: FluxSpine> SpineAdapter<S> {
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
-        S::Consumers: AsMut<SpineSpscConsumer<T>>,
+        S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
     {
         let consumed = self
             .consumers
-            .as_mut()
+            .spsc_consumer()
             .try_consume_internal_message_maybe_track(&mut self.producers, f)?;
         self.did_work |= consumed;
         Ok(consumed)

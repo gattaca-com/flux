@@ -47,13 +47,21 @@ impl From<SpscProduceError> for SpscDCacheProduceError {
 /// reference can be used to bypass the queue's capacity check.
 /// Storage reserves `capacity * round_up(mtu, 64)` bytes, rounded to a power
 /// of two, plus headers. All endpoints retain both allocations.
-#[derive(Clone)]
-pub struct SpineSpscDCacheQueue<T: Copy> {
-    inner: SpineSpscQueue<DCacheMsg<T>>,
+///
+/// With an inferred payload, write `SpineSpscDCacheQueue::<_>::new(...)` to
+/// select the default metadata slot layout.
+pub struct SpineSpscDCacheQueue<T: Copy, Slot = InternalMessage<DCacheMsg<T>>> {
+    inner: SpineSpscQueue<DCacheMsg<T>, Slot>,
     storage: Storage,
 }
 
-impl<T: Copy> SpineSpscDCacheQueue<T> {
+impl<T: Copy, Slot> Clone for SpineSpscDCacheQueue<T, Slot> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone(), storage: self.storage.clone() }
+    }
+}
+
+impl<T: Copy, Slot> SpineSpscDCacheQueue<T, Slot> {
     pub fn new(len: usize, mtu: usize) -> Self {
         let inner = SpineSpscQueue::new(len);
         let storage = Storage::new(inner.capacity(), mtu);
@@ -128,7 +136,7 @@ impl<T: Copy> SpineSpscDCacheQueue<T> {
     }
 }
 
-impl<T: Copy> fmt::Debug for SpineSpscDCacheQueue<T> {
+impl<T: Copy, Slot> fmt::Debug for SpineSpscDCacheQueue<T, Slot> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpineSpscDCacheQueue")
             .field("capacity", &self.capacity())
@@ -146,13 +154,13 @@ impl<T: Copy> fmt::Debug for SpineSpscDCacheQueue<T> {
 /// let producer = SpineSpscProducerWithDCache::new(SpineSpscDCacheQueue::<u64>::new(8, 256));
 /// let raw_cache = producer.dcache_ptr();
 /// ```
-pub struct SpineSpscProducerWithDCache<T: Copy> {
-    inner: SpineSpscProducer<DCacheMsg<T>>,
+pub struct SpineSpscProducerWithDCache<T: Copy, Slot = InternalMessage<DCacheMsg<T>>> {
+    inner: SpineSpscProducer<DCacheMsg<T>, Slot>,
     storage: Storage,
 }
 
-impl<T: Copy> SpineSpscProducerWithDCache<T> {
-    pub fn new(queue: SpineSpscDCacheQueue<T>) -> Self {
+impl<T: Copy, Slot> SpineSpscProducerWithDCache<T, Slot> {
+    pub fn new(queue: SpineSpscDCacheQueue<T, Slot>) -> Self {
         Self { inner: SpineSpscProducer::new(queue.inner), storage: queue.storage }
     }
 
@@ -199,7 +207,7 @@ impl<T: Copy> SpineSpscProducerWithDCache<T> {
     }
 }
 
-impl<T: Copy> fmt::Debug for SpineSpscProducerWithDCache<T> {
+impl<T: Copy, Slot> fmt::Debug for SpineSpscProducerWithDCache<T, Slot> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpineSpscProducerWithDCache")
             .field("attached", &self.is_attached())
@@ -208,13 +216,13 @@ impl<T: Copy> fmt::Debug for SpineSpscProducerWithDCache<T> {
 }
 
 /// Exclusive consumer of metadata and its callback-scoped payload bytes.
-pub struct SpineSpscDCacheConsumer<T: Copy> {
-    inner: SpineSpscConsumer<DCacheMsg<T>>,
+pub struct SpineSpscDCacheConsumer<T: Copy, Slot = InternalMessage<DCacheMsg<T>>> {
+    inner: SpineSpscConsumer<DCacheMsg<T>, Slot>,
     storage: Storage,
 }
 
-impl<T: 'static + Copy> SpineSpscDCacheConsumer<T> {
-    pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineSpscDCacheQueue<T>) -> Self
+impl<T: 'static + Copy, Slot> SpineSpscDCacheConsumer<T, Slot> {
+    pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineSpscDCacheQueue<T, Slot>) -> Self
     where
         D: AsRef<Path>,
         S: FluxSpine,
@@ -245,7 +253,7 @@ impl<T: 'static + Copy> SpineSpscDCacheConsumer<T> {
 
     pub(crate) fn try_attached(
         &mut self,
-    ) -> Result<AttachedDCacheConsumer<'_, T>, spsc::QueueError> {
+    ) -> Result<AttachedDCacheConsumer<'_, T, Slot>, spsc::QueueError> {
         self.try_attach()?;
         Ok(AttachedDCacheConsumer {
             inner: self.inner.inner.as_mut().unwrap(),
@@ -255,7 +263,7 @@ impl<T: 'static + Copy> SpineSpscDCacheConsumer<T> {
     }
 }
 
-impl<T: Copy> fmt::Debug for SpineSpscDCacheConsumer<T> {
+impl<T: Copy, Slot> fmt::Debug for SpineSpscDCacheConsumer<T, Slot> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpineSpscDCacheConsumer")
             .field("attached", &self.inner.inner.is_some())
@@ -263,13 +271,13 @@ impl<T: Copy> fmt::Debug for SpineSpscDCacheConsumer<T> {
     }
 }
 
-pub(crate) struct AttachedDCacheConsumer<'a, T: Copy> {
-    inner: &'a mut spsc::Consumer<InternalMessage<DCacheMsg<T>>>,
+pub(crate) struct AttachedDCacheConsumer<'a, T: Copy, Slot> {
+    inner: &'a mut spsc::Consumer<InternalMessage<DCacheMsg<T>>, Slot>,
     timer: &'a mut Timer,
     storage: &'a Storage,
 }
 
-impl<T: Copy> AttachedDCacheConsumer<'_, T> {
+impl<T: Copy, Slot> AttachedDCacheConsumer<'_, T, Slot> {
     /// Extract while the core slot is held; return owned results after release.
     pub(crate) fn extract<P, R>(
         &mut self,

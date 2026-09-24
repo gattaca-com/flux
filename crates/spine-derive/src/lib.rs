@@ -82,6 +82,7 @@ struct QueueConfig {
     size_expr: Option<Expr>,
     flavour: QueueFlavour,
     mtu_expr: Option<Expr>,
+    slot_ty: Option<Type>,
     gather_with_args: bool,
     spsc_span: Option<proc_macro2::Span>,
 }
@@ -92,6 +93,7 @@ fn get_queue_config(attrs: &[Attribute]) -> Result<QueueConfig> {
         size_expr: None,
         flavour: QueueFlavour::Mpmc,
         mtu_expr: None,
+        slot_ty: None,
         gather_with_args: false,
         spsc_span: None,
     };
@@ -142,6 +144,18 @@ fn get_queue_config(attrs: &[Attribute]) -> Result<QueueConfig> {
                     config.mtu_expr = Some(lit);
                     return Ok(());
                 }
+                if meta.path.is_ident("slot") {
+                    let content;
+                    parenthesized!(content in meta.input);
+                    let ty: Type = content.parse()?;
+                    if !content.is_empty() {
+                        return Err(content.error("expected one slot type"));
+                    }
+                    if config.slot_ty.replace(ty).is_some() {
+                        return Err(meta.error("duplicate `slot` argument"));
+                    }
+                    return Ok(());
+                }
                 Err(meta.error("unrecognized queue argument"))
             })?;
         }
@@ -152,6 +166,12 @@ fn get_queue_config(attrs: &[Attribute]) -> Result<QueueConfig> {
         if config.is_gather {
             return Err(syn::Error::new(span, "SPSC queues cannot use `gather`"));
         }
+    }
+    if config.slot_ty.is_some() && config.flavour != QueueFlavour::Spsc {
+        return Err(syn::Error::new_spanned(
+            config.slot_ty.as_ref().unwrap(),
+            "`slot` requires `flavour(\"spsc\")`",
+        ));
     }
 
     Ok(config)
@@ -187,6 +207,8 @@ fn spine_queue_inner_ty(ty: &Type) -> Option<&Type> {
 /// - `size(..)`: queue capacity (default `2usize.pow(15)`).
 /// - `flavour("mpmc")`, `flavour("spmc")`, or `flavour("spsc")`: queue flavour.
 /// - `mtu(..)`: dcache-backed queue with the given max frame size.
+/// - `slot(Type)`: complete stored SPSC message layout, including tracking
+///   metadata.
 /// - `gather`: drain this queue into a `BlobCache` via the generated
 ///   `GatherQueues` impl; every gathered type must implement
 ///   `HasVersionedLeaves` and the crate needs a direct `flux-gather`
@@ -260,18 +282,29 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             if queue_config.flavour == QueueFlavour::Spsc {
                 has_spsc = true;
                 spsc_fields.push(field_ident.clone());
+                let slot_ty = queue_config.slot_ty.as_ref().map_or_else(
+                    || {
+                        if mtu_expr.is_some() {
+                            quote! { ::flux::timing::InternalMessage<::flux::spine::DCacheMsg<#inner_ty>> }
+                        } else {
+                            quote! { ::flux::timing::InternalMessage<#inner_ty> }
+                        }
+                    },
+                    |ty| quote! { #ty },
+                );
+                let slot_arg = queue_config.slot_ty.as_ref().map(|ty| quote! { , #ty });
 
                 let (consumer_ty, producer_ty, queue_ty) = if mtu_expr.is_some() {
                     (
-                        quote! { ::flux::spine::SpineSpscDCacheConsumer<#inner_ty> },
-                        quote! { ::flux::spine::SpineSpscProducerWithDCache<#inner_ty> },
-                        quote! { ::flux::spine::SpineSpscDCacheQueue<#inner_ty> },
+                        quote! { ::flux::spine::SpineSpscDCacheConsumer<#inner_ty #slot_arg> },
+                        quote! { ::flux::spine::SpineSpscProducerWithDCache<#inner_ty #slot_arg> },
+                        quote! { ::flux::spine::SpineSpscDCacheQueue<#inner_ty #slot_arg> },
                     )
                 } else {
                     (
-                        quote! { ::flux::spine::SpineSpscConsumer<#inner_ty> },
-                        quote! { ::flux::spine::SpineSpscProducer<#inner_ty> },
-                        quote! { ::flux::spine::SpineSpscQueue<#inner_ty> },
+                        quote! { ::flux::spine::SpineSpscConsumer<#inner_ty #slot_arg> },
+                        quote! { ::flux::spine::SpineSpscProducer<#inner_ty #slot_arg> },
+                        quote! { ::flux::spine::SpineSpscQueue<#inner_ty #slot_arg> },
                     )
                 };
 
@@ -299,6 +332,30 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     impl AsMut<#producer_ty> for #producers_ident {
                         fn as_mut(&mut self) -> &mut #producer_ty {
                             &mut self.#field_ident
+                        }
+                    }
+                });
+
+                as_mut_impls.push(if mtu_expr.is_some() {
+                    quote! {
+                        impl ::flux::spine::SpscDCacheConsumerAccess<#inner_ty> for #consumers_ident {
+                            type Slot = #slot_ty;
+                            fn spsc_dcache_consumer(&mut self) -> &mut #consumer_ty { &mut self.#field_ident }
+                        }
+                        impl ::flux::spine::SpscDCacheProducerAccess<#inner_ty> for #producers_ident {
+                            type Slot = #slot_ty;
+                            fn spsc_dcache_producer(&mut self) -> &mut #producer_ty { &mut self.#field_ident }
+                        }
+                    }
+                } else {
+                    quote! {
+                        impl ::flux::spine::SpscConsumerAccess<#inner_ty> for #consumers_ident {
+                            type Slot = #slot_ty;
+                            fn spsc_consumer(&mut self) -> &mut #consumer_ty { &mut self.#field_ident }
+                        }
+                        impl ::flux::spine::SpscProducerAccess<#inner_ty> for #producers_ident {
+                            type Slot = #slot_ty;
+                            fn spsc_producer(&mut self) -> &mut #producer_ty { &mut self.#field_ident }
                         }
                     }
                 });
@@ -504,6 +561,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 QueueFlavour::Spsc => quote! {},
             };
             if queue_config.flavour == QueueFlavour::Spsc {
+                let slot_arg = queue_config.slot_ty.as_ref().map(|ty| quote! { , #ty });
                 if let Some(mtu_expr) = queue_config.mtu_expr.as_ref() {
                     config_fields.push(quote! {
                         pub #field_ident: ::flux::spine::DCacheQueueParams
@@ -513,7 +571,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     });
                     new_let_stmts.push(quote! {
                         let #field_ident = unsafe {
-                            ::flux::spine::SpineSpscDCacheQueue::<#inner_ty>::create_or_open_shared_with_base_dir(
+                            ::flux::spine::SpineSpscDCacheQueue::<#inner_ty #slot_arg>::create_or_open_shared_with_base_dir(
                                 &base_dir,
                                 &format!("{}{}", #app_name_tokens, path_suffix),
                                 stringify!(#field_ident),
@@ -531,7 +589,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     });
                     new_let_stmts.push(quote! {
                         let #field_ident = unsafe {
-                            ::flux::spine::SpineSpscQueue::<#inner_ty>::create_or_open_shared_with_base_dir(
+                            ::flux::spine::SpineSpscQueue::<#inner_ty #slot_arg>::create_or_open_shared_with_base_dir(
                                 &base_dir,
                                 &format!("{}{}", #app_name_tokens, path_suffix),
                                 stringify!(#field_ident),
@@ -687,10 +745,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                         Err(error) => return error.into_compile_error().into(),
                     };
                     if queue_config.flavour == QueueFlavour::Spsc {
+                        let slot_arg = queue_config.slot_ty.as_ref().map(|ty| quote! { , #ty });
                         let new_ty = if queue_config.mtu_expr.is_some() {
-                            quote! { ::flux::spine::SpineSpscDCacheQueue<#inner_ty> }
+                            quote! { ::flux::spine::SpineSpscDCacheQueue<#inner_ty #slot_arg> }
                         } else {
-                            quote! { ::flux::spine::SpineSpscQueue<#inner_ty> }
+                            quote! { ::flux::spine::SpineSpscQueue<#inner_ty #slot_arg> }
                         };
                         all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #new_ty });
                     } else if queue_config.mtu_expr.is_some() {
@@ -856,6 +915,23 @@ mod tests {
             (syn::parse_quote!(#[queue(flavour("spsc"))]), QueueFlavour::Spsc),
         ] {
             assert_eq!(get_queue_config(&[attribute]).unwrap().flavour, flavour);
+        }
+    }
+
+    #[test]
+    fn parses_spsc_slot_type_and_rejects_other_flavours() {
+        let attribute = syn::parse_quote!(#[queue(flavour("spsc"), slot(crate::Layout<64>))]);
+        let config = get_queue_config(&[attribute]).unwrap();
+        let ty = config.slot_ty.unwrap();
+        assert_eq!(quote::quote!(#ty).to_string(), "crate :: Layout < 64 >");
+
+        for attribute in [
+            syn::parse_quote!(#[queue(slot(Layout))]),
+            syn::parse_quote!(#[queue(flavour("mpmc"), slot(Layout))]),
+            syn::parse_quote!(#[queue(flavour("spmc"), slot(Layout))]),
+        ] {
+            let error = get_queue_config(&[attribute]).err().unwrap();
+            assert!(error.to_string().contains("requires `flavour(\"spsc\")`"));
         }
     }
 
