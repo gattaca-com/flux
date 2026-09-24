@@ -1,63 +1,57 @@
-//! MPMC/SPSC through Spine, with consumption telemetry disabled and enabled.
-//! See `benches/README.md` for CPU selection, build flags and methodology.
+//! MPMC/SPMC/SPSC through Spine, with consumption telemetry disabled and
+//! enabled. See `README.md` beside this file for how to run it and what it
+//! measures.
 
 #[path = "spine_queues/adapters.rs"]
 mod adapters;
 #[path = "../../../benches/queue_support.rs"]
 mod support;
 
-use support::{Measurement, Settings, abort_on_panic, print_header, quantile, summarize};
+use support::{Case, Settings, abort_on_panic};
 
-const CASES: [&str; 4] = ["MPMC-none", "SPSC-none", "MPMC-all", "SPSC-all"];
+// `<queue>-<telemetry records>`
+const CASES: [&str; 6] =
+    ["MPMC-none", "SPMC-none", "SPSC-none", "MPMC-all", "SPMC-all", "SPSC-all"];
 
 fn compare<const B: usize>(settings: &Settings, telemetry: Option<&str>) {
-    let mut results: [Vec<Measurement>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut cases = CASES.map(|name| Case::<B>::new(name, settings));
     // Reverse and rotate the order so each case runs in different positions.
-    let orders = [[0, 1, 2, 3], [3, 2, 1, 0], [1, 0, 3, 2], [2, 3, 0, 1]];
-    for run in 0..settings.runs {
-        let seed = 0x9e37_79b9 ^ (run as u32 + 1);
-        for index in orders[run % orders.len()] {
-            let case = CASES[index];
-            let (queue, records) = case.split_once('-').unwrap();
+    let orders = [
+        [0, 1, 5, 2, 4, 3],
+        [1, 2, 0, 3, 5, 4],
+        [2, 3, 1, 4, 0, 5],
+        [3, 4, 2, 5, 1, 0],
+        [4, 5, 3, 0, 2, 1],
+        [5, 0, 4, 1, 3, 2],
+    ];
+    for run in 1..=settings.runs {
+        for index in orders[(run - 1) % orders.len()] {
+            let (queue, records) = CASES[index].split_once('-').unwrap();
             if settings.queue.as_deref().is_some_and(|q| q != queue) ||
                 telemetry.is_some_and(|t| t != records)
             {
                 continue;
             }
-            let result = if index >= 2 {
-                adapters::run::<B, true>(index % 2 == 1, settings, seed)
+            let case = &mut cases[index];
+            if records == "all" {
+                adapters::run::<B, true>(queue, case, run);
             } else {
-                adapters::run::<B, false>(index % 2 == 1, settings, seed)
-            };
-            if let Some(mut result) = result {
-                result.latencies.sort_unstable();
-                println!(
-                    "run,{case},{B},{},{:.6},{},{}",
-                    run + 1,
-                    result.mmsg_s,
-                    quantile(&result.latencies, 50),
-                    quantile(&result.latencies, 95)
-                );
-                results[index].push(result);
-            } else {
-                println!("verified,{case},{B}");
+                adapters::run::<B, false>(queue, case, run);
             }
         }
     }
-    for (case, results) in CASES.into_iter().zip(results) {
-        summarize(case, B, results);
-    }
+    cases.iter().for_each(Case::summarize);
 }
 
 fn main() {
     abort_on_panic();
-    let settings = Settings::read(&["MPMC", "SPSC"]);
+    let settings = Settings::read(&["MPMC", "SPMC", "SPSC"]);
     let telemetry = std::env::var("FLUX_BENCH_TELEMETRY").ok();
     assert!(
         telemetry.as_deref().is_none_or(|t| ["none", "all"].contains(&t)),
         "choose telemetry none or all"
     );
-    print_header(&settings);
+    settings.print_header();
     macro_rules! sizes {
         ($($size:literal),*) => { $(if settings.size.is_none_or(|b| b == $size) {
             compare::<$size>(&settings, telemetry.as_deref());
