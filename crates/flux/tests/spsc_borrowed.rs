@@ -163,6 +163,45 @@ fn borrowed_and_copying_consumption_preserve_fifo_across_single_and_drain_calls(
 }
 
 #[test]
+fn borrowed_single_message_callbacks_can_move_captured_storage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spine = new_spine(tmp.path());
+    let mut producer = SpineAdapter::connect_tile(&Sender, &mut spine);
+    let mut consumer = SpineAdapter::connect_tile(&Receiver, &mut spine);
+    for sequence in [1, 2] {
+        producer.try_produce(Payload::new(sequence)).unwrap();
+    }
+
+    let mut batch = Vec::new();
+    let mut received = None;
+    assert!(
+        consumer
+            .consume_ref_one(|message: &Payload, _| {
+                batch.push(message.sequence);
+                received = Some(batch);
+            })
+            .unwrap()
+    );
+
+    let mut batch = received.take().unwrap();
+    assert!(
+        consumer
+            .consume_ref_one_maybe_track(|message: &Payload, _| {
+                batch.push(message.sequence);
+                received = Some(batch);
+                false
+            })
+            .unwrap()
+    );
+    assert_eq!(received.unwrap(), [1, 2]);
+
+    drop(producer);
+    drop(consumer);
+    drop(spine);
+    cleanup_shmem(tmp.path());
+}
+
+#[test]
 fn borrowed_selective_tracking_propagates_ingestion_and_marks_work() {
     let tmp = tempfile::tempdir().unwrap();
     let mut spine = new_spine(tmp.path());

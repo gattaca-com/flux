@@ -439,7 +439,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineSpscConsumer<T>>,
-        F: FnMut(&T, &mut S::Producers),
+        F: FnOnce(&T, &mut S::Producers),
     {
         let consumed = self.consumers.as_mut().consume_ref(&mut self.producers, f)?;
         self.did_work |= consumed;
@@ -459,7 +459,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineSpscConsumer<T>>,
-        F: FnMut(&T, &mut S::Producers) -> bool,
+        F: FnOnce(&T, &mut S::Producers) -> bool,
     {
         let consumed = self.consumers.as_mut().consume_ref_maybe_track(&mut self.producers, f)?;
         self.did_work |= consumed;
