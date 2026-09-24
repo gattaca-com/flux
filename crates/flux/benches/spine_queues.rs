@@ -7,13 +7,15 @@ mod adapters;
 #[path = "../../../benches/queue_support.rs"]
 mod support;
 
-use support::{Case, Settings, abort_on_panic};
+use support::{Case, Message, Settings, abort_on_panic, dispatch_layout};
+
+type Wire<const B: usize> = flux::timing::InternalMessage<Message<B>>;
 
 // `<queue>-<telemetry records>`
 const CASES: [&str; 6] =
     ["MPMC-none", "SPMC-none", "SPSC-none", "MPMC-all", "SPMC-all", "SPSC-all"];
 
-fn compare<const B: usize>(settings: &Settings, telemetry: Option<&str>) {
+fn compare<const B: usize, Slot>(settings: &Settings, telemetry: Option<&str>) {
     let mut cases = CASES.map(|name| Case::<B>::new(name, settings));
     // Reverse and rotate the order so each case runs in different positions.
     let orders = [
@@ -34,9 +36,9 @@ fn compare<const B: usize>(settings: &Settings, telemetry: Option<&str>) {
             }
             let case = &mut cases[index];
             if records == "all" {
-                adapters::run::<B, true>(queue, case, run);
+                adapters::run::<B, Slot, true>(queue, case, run);
             } else {
-                adapters::run::<B, false>(queue, case, run);
+                adapters::run::<B, Slot, false>(queue, case, run);
             }
         }
     }
@@ -52,10 +54,5 @@ fn main() {
         "choose telemetry none or all"
     );
     settings.print_header();
-    macro_rules! sizes {
-        ($($size:literal),*) => { $(if settings.size.is_none_or(|b| b == $size) {
-            compare::<$size>(&settings, telemetry.as_deref());
-        })* };
-    }
-    sizes!(8, 32, 64, 128, 192, 256, 512, 1024);
+    dispatch_layout!(settings, compare, Wire, telemetry.as_deref());
 }

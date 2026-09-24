@@ -25,3 +25,11 @@ Setup uses a fresh temporary directory, printed to stderr. Successful cases remo
 This measures queues through their adapters, including telemetry when enabled, without a tile runner, parking, DCaches or a telemetry-draining thread. It is representative of a very small callback, not a prediction for every application. Compiler, machine and code layout changes can alter results; raw-versus-Spine differences are not a controlled subtraction of adapter overhead.
 
 `spine_queues.rs` selects the cases; `spine_queues/adapters.rs` contains the single-queue Spine bundles, API calls and telemetry checks. Explicit bundles allow one const-generic definition for all payload sizes.
+
+## SPSC slot layouts
+
+Set `FLUX_BENCH_QUEUE=SPSC FLUX_BENCH_SLOT=64`, `128` or `256` to select the exact slot size and alignment. The default, `natural`, retains the stored message layout. Only the message is copied; padding is unused. The same selection works with throughput, latency and verify modes.
+
+Supported application sizes are 8/32 B for 64 B slots, 8/32/64 B for 128 B slots, and 8/32/64/128/192 B for 256 B slots. These combinations also accommodate Spine tracking metadata. Without a size filter, only supported sizes run. Natural slots support all eight sizes.
+
+Full-payload validation checks borrowed slot addresses for the selected stride and alignment, accounting for Spine metadata before the application payload. Geometry checks are outside measured loops. Keep the printed slot geometry with CSV results.

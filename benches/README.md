@@ -8,6 +8,7 @@ The [raw queue](../crates/flux-communication/benches/README.md) and [Spine](../c
 | `FLUX_BENCH_MODE` | `throughput` | `throughput`, `latency`, or `verify` (validation only, one repetition). |
 | `FLUX_BENCH_SIZE` | all sizes | One of 8, 32, 64, 128, 192, 256, 512 and 1024 bytes. |
 | `FLUX_BENCH_QUEUE` | all queues | One queue name; see each benchmark's README. |
+| `FLUX_BENCH_SLOT` | `natural` | SPSC slot size and alignment: `natural`, `64`, `128`, or `256`. Padding requires `FLUX_BENCH_QUEUE=SPSC`; see the supported payload sizes in each benchmark's README. |
 | `FLUX_BENCH_RUNS` | `5` | Repetitions per case. |
 | `FLUX_BENCH_MESSAGES` | throughput `16777216`, latency `1048576` | Measured messages per repetition. |
 | `FLUX_BENCH_WINDOWS` | `summary` | Throughput windows: `samples` also prints each window; `off` disables collection. |

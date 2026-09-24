@@ -45,6 +45,7 @@ mod workers {
                 runs: 1,
                 size: None,
                 queue: None,
+                slot: super::super::SlotLayout::Natural,
                 windows: true,
                 window_samples: false,
                 pauses: [0, 1],

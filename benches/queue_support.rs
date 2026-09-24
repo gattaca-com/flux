@@ -35,6 +35,50 @@ const WARMUP: usize = 32768;
 #[repr(C)]
 pub struct Message<const B: usize>(pub [u8; B]);
 
+#[repr(C, align(64))]
+pub struct Slot64([u8; 64]);
+#[repr(C, align(128))]
+pub struct Slot128([u8; 128]);
+#[repr(C, align(256))]
+pub struct Slot256([u8; 256]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotLayout {
+    Natural,
+    Bytes64,
+    Bytes128,
+    Bytes256,
+}
+
+impl SlotLayout {
+    pub fn sizes(self) -> &'static [usize] {
+        match self {
+            Self::Natural => &SIZES,
+            Self::Bytes64 => &[8, 32],
+            Self::Bytes128 => &[8, 32, 64],
+            Self::Bytes256 => &[8, 32, 64, 128, 192],
+        }
+    }
+}
+
+pub struct SlotGeometry {
+    pub size: usize,
+    pub alignment: usize,
+    pub payload_offset: usize,
+}
+
+impl SlotGeometry {
+    fn check(&self, payload_addresses: [usize; 2]) {
+        let first = payload_addresses[0] - self.payload_offset;
+        assert!(first.is_multiple_of(self.alignment), "slot alignment");
+        assert_eq!(payload_addresses[1] - payload_addresses[0], self.size, "slot stride");
+        println!(
+            "# SPSC slot_bytes={} slot_align={} ring_base={first:#x} payload_offset={}",
+            self.size, self.alignment, self.payload_offset
+        );
+    }
+}
+
 pub trait Tx<const B: usize>: Send {
     fn begin_batch(&mut self) {}
     fn send(&mut self, message: &Message<B>);
@@ -43,6 +87,9 @@ pub trait Tx<const B: usize>: Send {
 pub trait Rx<const B: usize>: Send {
     // Drain ready messages and return after the first empty read.
     fn drain(&mut self, callback: impl FnMut(&Message<B>));
+    fn slot_geometry(&self) -> Option<SlotGeometry> {
+        None
+    }
 }
 
 fn payload<const B: usize>(id: usize) -> Message<B> {
@@ -112,16 +159,24 @@ fn produce<const B: usize, S: Tx<B>>(
 }
 
 fn validate<const B: usize>(rx: &mut impl Rx<B>, expected: &[Message<B>], credit: &Credit) {
+    let geometry = rx.slot_geometry();
+    let mut payload_addresses = [0; 2];
     let mut received = 0;
     while received < expected.len() {
         let before = received;
         rx.drain(|message| {
             assert_eq!(*black_box(message), expected[received], "FIFO/full payload at {received}");
+            if geometry.is_some() && received < payload_addresses.len() {
+                payload_addresses[received] = std::ptr::from_ref(message).addr();
+            }
             received += 1;
         });
         if received != before {
             credit.release(received);
         }
+    }
+    if let Some(geometry) = geometry {
+        geometry.check(payload_addresses);
     }
 }
 
@@ -301,6 +356,7 @@ pub struct Settings {
     pub runs: usize,
     pub size: Option<usize>,
     pub queue: Option<String>,
+    pub slot: SlotLayout,
     windows: bool,
     window_samples: bool,
     pauses: [u32; 2],
@@ -371,10 +427,25 @@ impl Settings {
         assert!(size.is_none_or(|b| SIZES.contains(&b)), "unsupported payload size");
         let queue = env::var("FLUX_BENCH_QUEUE").ok();
         assert!(queue.as_deref().is_none_or(|q| queues.contains(&q)), "unsupported queue");
+        let slot = match env::var("FLUX_BENCH_SLOT").as_deref().unwrap_or("natural") {
+            "natural" => SlotLayout::Natural,
+            "64" => SlotLayout::Bytes64,
+            "128" => SlotLayout::Bytes128,
+            "256" => SlotLayout::Bytes256,
+            _ => panic!("choose slot natural, 64, 128 or 256"),
+        };
+        assert!(
+            slot == SlotLayout::Natural || queue.as_deref() == Some("SPSC"),
+            "set FLUX_BENCH_QUEUE=SPSC when selecting a padded slot"
+        );
+        assert!(
+            size.is_none_or(|b| slot.sizes().contains(&b)),
+            "unsupported payload/slot combination"
+        );
         let pauses = [number("FLUX_BENCH_PAUSE_MIN", 25), number("FLUX_BENCH_PAUSE_MAX", 150)]
             .map(|n| u32::try_from(n).expect("pause count fits u32"));
         assert!(pauses[0] <= pauses[1], "minimum pause exceeds maximum");
-        Self { cpus, mode, messages, runs, size, queue, windows, window_samples, pauses }
+        Self { cpus, mode, messages, runs, size, queue, slot, windows, window_samples, pauses }
     }
 
     pub fn print_header(&self) {
@@ -382,6 +453,7 @@ impl Settings {
             "# capacity={CAPACITY} pool={POOL} credit={WINDOW} batch={BATCH} validation={VALIDATION} warmup={WARMUP} messages={} cpus={:?}",
             self.messages, self.cpus
         );
+        println!("# SPSC slot={:?}; padded variants have equal size and alignment", self.slot);
         match self.mode {
             Mode::Verify => println!("# mode=verify\n# verified,queue,bytes"),
             Mode::Throughput => throughput::print_header(self),
@@ -389,6 +461,38 @@ impl Settings {
         }
     }
 }
+
+// Only instantiate supported combinations: a run-time guard cannot prevent an
+// invalid Slot type's compile-time layout assertion from being evaluated.
+macro_rules! dispatch_layout {
+    ($settings:ident, $run:ident, $natural:ident $(, $extra:expr)*) => {
+        for &size in $settings.slot.sizes() {
+            if $settings.size.is_some_and(|selected| selected != size) { continue; }
+            match ($settings.slot, size) {
+                ($crate::support::SlotLayout::Natural, 8) => $run::<8, $natural<8>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 32) => $run::<32, $natural<32>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 64) => $run::<64, $natural<64>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 128) => $run::<128, $natural<128>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 192) => $run::<192, $natural<192>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 256) => $run::<256, $natural<256>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 512) => $run::<512, $natural<512>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 1024) => $run::<1024, $natural<1024>>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes64, 8) => $run::<8, $crate::support::Slot64>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes64, 32) => $run::<32, $crate::support::Slot64>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes128, 8) => $run::<8, $crate::support::Slot128>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes128, 32) => $run::<32, $crate::support::Slot128>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes128, 64) => $run::<64, $crate::support::Slot128>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 8) => $run::<8, $crate::support::Slot256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 32) => $run::<32, $crate::support::Slot256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 64) => $run::<64, $crate::support::Slot256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 128) => $run::<128, $crate::support::Slot256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 192) => $run::<192, $crate::support::Slot256>(&$settings $(, $extra)*),
+                _ => unreachable!("validated layout and size"),
+            }
+        }
+    };
+}
+pub(crate) use dispatch_layout;
 
 pub fn abort_on_panic() {
     // A failed worker must stop its peer, which may be waiting for credits.
