@@ -722,7 +722,8 @@ pub struct ConsumerBare<T> {
     mask: usize,                // 16
     expected_version: u64,      // 24
     is_running: u8,             // 25
-    _pad: [u8; 7],              // 32
+    exclusive_cursor: bool,     // 26: cursor written only by this consumer (broadcast)
+    _pad: [u8; 6],              // 32
     cursor: *const AtomicUsize, // 40
     label: &'static str,        // 56 (ptr + len)
     queue: Queue<T>,            // 64 fat ptr: (usize, pointer)
@@ -737,7 +738,8 @@ impl<T: Copy> ConsumerBare<T> {
             mask: queue.header.mask,
             expected_version: 0,
             is_running: 1,
-            _pad: [0; 7],
+            exclusive_cursor: false,
+            _pad: [0; 6],
             cursor: std::ptr::null(),
             label,
             queue,
@@ -770,6 +772,7 @@ impl<T: Copy> ConsumerBare<T> {
 
     pub fn set_collaborative_cursor(&mut self, cursor: *const AtomicUsize) {
         self.cursor = cursor;
+        self.exclusive_cursor = false;
     }
 
     #[inline]
@@ -813,8 +816,18 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline]
     fn acquire_specific_slot(&mut self, delta: usize) {
-        let cursor = unsafe { &*self.cursor }.fetch_add(delta, Ordering::Relaxed);
-        self.set_pos(cursor + delta - 1);
+        let cursor = unsafe { &*self.cursor };
+        let prev = if self.exclusive_cursor {
+            // Only this consumer writes a broadcast cursor, so a plain load + store
+            // is enough and avoids the `lock xadd` (a full barrier on x86) that
+            // `fetch_add` compiles to.
+            let prev = cursor.load(Ordering::Relaxed);
+            cursor.store(prev + delta, Ordering::Relaxed);
+            prev
+        } else {
+            cursor.fetch_add(delta, Ordering::Relaxed)
+        };
+        self.set_pos(prev + delta - 1);
     }
 
     #[inline]
@@ -861,6 +874,7 @@ impl<T: Copy> ConsumerBare<T> {
             self.label,
             id
         ));
+        self.exclusive_cursor = true;
 
         // Always set current producer position without restoring value from cursor
         self.set_broadcast_pos(self.queue.count());
@@ -942,6 +956,7 @@ impl<T: Copy> ConsumerBare<T> {
             (*consumer_ptr).expected_version = 0;
             (*consumer_ptr).mask = queue.header.mask;
             (*consumer_ptr).cursor = std::ptr::null();
+            (*consumer_ptr).exclusive_cursor = false;
             (*consumer_ptr).label = label;
             (*consumer_ptr).queue = queue;
         }

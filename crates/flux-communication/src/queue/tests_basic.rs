@@ -282,3 +282,23 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::SpedPast));
     }
 }
+
+#[test]
+fn broadcast_cursor_advances_without_rmw() {
+    let q = Queue::new(16, QueueType::SPMC);
+    let mut p = Producer::from(q);
+    let mut c = ConsumerBare::new_broadcast_test(q);
+    assert!(c.exclusive_cursor);
+    let start = unsafe { &*c.cursor }.load(Ordering::Relaxed);
+
+    let mut m = 0;
+    for i in 0..40 {
+        p.produce(&i);
+        c.try_consume(&mut m).unwrap();
+        assert_eq!(m, i);
+    }
+    assert_eq!(unsafe { &*c.cursor }.load(Ordering::Relaxed), start + 40);
+
+    let collab = ConsumerBare::new_collaborative_test(q, "broadcast_cursor_advances_without_rmw");
+    assert!(!collab.exclusive_cursor);
+}
