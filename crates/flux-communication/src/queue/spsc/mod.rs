@@ -34,7 +34,7 @@ use std::{
     alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error},
     cell::UnsafeCell,
     marker::PhantomData,
-    mem::{MaybeUninit, align_of, size_of},
+    mem::{align_of, size_of},
     path::Path,
     ptr::NonNull,
     sync::{
@@ -88,19 +88,38 @@ struct Header {
     read: Cursor,
 }
 
-fn layout<T, Slot>(capacity: usize) -> Result<(Layout, usize), QueueError> {
+const fn slot_size<T, const SLOT_SIZE: usize>() -> usize {
     const {
-        assert!(size_of::<Slot>() >= size_of::<T>(), "SPSC slot is smaller than its payload");
-        assert!(
-            align_of::<Slot>() >= align_of::<T>(),
-            "SPSC slot is less aligned than its payload"
-        );
+        let size = if SLOT_SIZE == 0 { size_of::<T>() } else { SLOT_SIZE };
+        assert!(size >= size_of::<T>(), "SPSC slot is smaller than its payload");
+        size
     }
+}
+
+const fn slot_align<T, const SLOT_SIZE: usize>() -> usize {
+    const {
+        let align = if SLOT_SIZE == 0 {
+            align_of::<T>()
+        } else {
+            // A valid nonzero stride is divisible by T's power-of-two alignment.
+            1usize << slot_size::<T, SLOT_SIZE>().trailing_zeros()
+        };
+        assert!(
+            align.is_multiple_of(align_of::<T>()),
+            "SPSC slot alignment is not a multiple of payload alignment"
+        );
+        align
+    }
+}
+
+fn layout<T, const SLOT_SIZE: usize>(capacity: usize) -> Result<(Layout, usize), QueueError> {
+    let stride = slot_size::<T, SLOT_SIZE>();
     if !capacity.is_power_of_two() || capacity > isize::MAX as usize {
         return Err(QueueError::InvalidCapacity);
     }
-    let slots =
-        Layout::array::<MaybeUninit<Slot>>(capacity).map_err(|_| QueueError::InvalidCapacity)?;
+    let bytes = stride.checked_mul(capacity).ok_or(QueueError::InvalidCapacity)?;
+    let slots = Layout::from_size_align(bytes, slot_align::<T, SLOT_SIZE>())
+        .map_err(|_| QueueError::InvalidCapacity)?;
     let (layout, offset) =
         Layout::new::<Header>().extend(slots).map_err(|_| QueueError::InvalidCapacity)?;
     Ok((layout.pad_to_align(), offset))
@@ -113,7 +132,7 @@ fn rounded_capacity(len: usize) -> Result<usize, QueueError> {
     len.checked_next_power_of_two().ok_or(QueueError::InvalidCapacity)
 }
 
-struct Storage<T, Slot = T> {
+struct Storage<T, const SLOT_SIZE: usize> {
     ptr: NonNull<u8>,
     layout: Layout,
     slots_offset: usize,
@@ -124,8 +143,6 @@ struct Storage<T, Slot = T> {
     // Shared queue handles can create writers. Invariance prevents shortening
     // payload lifetimes through one alias and reading them through another.
     _value: PhantomData<UnsafeCell<T>>,
-    // Slot describes geometry; it does not represent an owned value.
-    _slot: PhantomData<fn() -> Slot>,
 }
 
 // SAFETY: each slot is exclusively accessed by its owning endpoint. Release /
@@ -133,12 +150,11 @@ struct Storage<T, Slot = T> {
 // concurrent endpoints of the same kind. No references to slots escape.
 // Shmem's pointer is used under the same rules; its configuration is immutable
 // after construction and its mapping can be unmapped on any thread.
-// Slot values never exist, so their Send/Sync properties are irrelevant.
 #[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T: Send, Slot> Send for Storage<T, Slot> {}
-unsafe impl<T: Send, Slot> Sync for Storage<T, Slot> {}
+unsafe impl<T: Send, const SLOT_SIZE: usize> Send for Storage<T, SLOT_SIZE> {}
+unsafe impl<T: Send, const SLOT_SIZE: usize> Sync for Storage<T, SLOT_SIZE> {}
 
-impl<T, Slot> Storage<T, Slot> {
+impl<T, const SLOT_SIZE: usize> Storage<T, SLOT_SIZE> {
     fn header(&self) -> &Header {
         // SAFETY: construction initializes or validates the complete header,
         // and the allocation remains alive through this borrow.
@@ -152,8 +168,8 @@ impl<T, Slot> Storage<T, Slot> {
         // whole Header: the link can already be visible to an opening process.
         unsafe {
             (&raw mut (*header).capacity).write(self.capacity);
-            (&raw mut (*header).element_size).write(size_of::<Slot>());
-            (&raw mut (*header).element_align).write(align_of::<Slot>());
+            (&raw mut (*header).element_size).write(slot_size::<T, SLOT_SIZE>());
+            (&raw mut (*header).element_align).write(slot_align::<T, SLOT_SIZE>());
             (&raw mut (*header).payload_size).write(size_of::<T>());
             (&raw mut (*header).payload_align).write(align_of::<T>());
         }
@@ -161,7 +177,7 @@ impl<T, Slot> Storage<T, Slot> {
     }
 }
 
-impl<T, Slot> Drop for Storage<T, Slot> {
+impl<T, const SLOT_SIZE: usize> Drop for Storage<T, SLOT_SIZE> {
     fn drop(&mut self) {
         if self.shared.is_none() {
             // SAFETY: this allocation used this exact layout and the last Arc
@@ -174,9 +190,9 @@ impl<T, Slot> Drop for Storage<T, Slot> {
 /// Process-local addresses retained by an endpoint. The owning Arc keeps every
 /// cached pointer valid even after queue handles are dropped or the endpoint
 /// moves.
-struct EndpointStorage<T, Slot> {
-    storage: Arc<Storage<T, Slot>>,
-    slots: *mut MaybeUninit<Slot>,
+struct EndpointStorage<T, const SLOT_SIZE: usize> {
+    storage: Arc<Storage<T, SLOT_SIZE>>,
+    slots: *mut u8,
     mask: usize,
     read: *const AtomicUsize,
     write: *const AtomicUsize,
@@ -187,16 +203,15 @@ struct EndpointStorage<T, Slot> {
 // shared endpoint access cannot read or write payloads. Moving an endpoint does
 // not move its allocation. Storage also keeps the payload type invariant.
 #[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T: Send, Slot> Send for EndpointStorage<T, Slot> {}
-unsafe impl<T: Send, Slot> Sync for EndpointStorage<T, Slot> {}
+unsafe impl<T: Send, const SLOT_SIZE: usize> Send for EndpointStorage<T, SLOT_SIZE> {}
+unsafe impl<T: Send, const SLOT_SIZE: usize> Sync for EndpointStorage<T, SLOT_SIZE> {}
 
-impl<T, Slot> EndpointStorage<T, Slot> {
-    fn new(storage: Arc<Storage<T, Slot>>) -> Self {
+impl<T, const SLOT_SIZE: usize> EndpointStorage<T, SLOT_SIZE> {
+    fn new(storage: Arc<Storage<T, SLOT_SIZE>>) -> Self {
         let header = storage.header();
         // SAFETY: layout reserves capacity properly aligned slots, including
         // an aligned one-past pointer for zero-sized slots.
-        let slots =
-            unsafe { storage.ptr.as_ptr().add(storage.slots_offset).cast::<MaybeUninit<Slot>>() };
+        let slots = unsafe { storage.ptr.as_ptr().add(storage.slots_offset) };
         Self {
             slots,
             mask: storage.capacity - 1,
@@ -208,9 +223,9 @@ impl<T, Slot> EndpointStorage<T, Slot> {
 
     fn slot(&self, position: usize) -> *mut T {
         // SAFETY: masking keeps the slot in bounds, including on counter wrap.
-        // layout checks that every slot can hold an aligned T. No Slot value
-        // is read or created through the MaybeUninit pointer.
-        unsafe { self.slots.add(position & self.mask).cast::<T>() }
+        // layout checks that every slot can hold an aligned T and that the
+        // complete ring fits in isize, so this byte offset cannot overflow.
+        unsafe { self.slots.add((position & self.mask) * slot_size::<T, SLOT_SIZE>()).cast::<T>() }
     }
 
     fn read(&self) -> &AtomicUsize {
@@ -226,34 +241,39 @@ impl<T, Slot> EndpointStorage<T, Slot> {
 
 /// A queue handle that can claim one producer and one consumer.
 ///
-/// `Slot` controls the size and alignment of each ring slot and defaults to
-/// `T`. Only `T` is stored, copied or borrowed; no `Slot` value is constructed
-/// or dropped. A slot must be at least as large and aligned as `T`.
+/// `SLOT_SIZE` is the byte stride between ring slots. Its default, zero,
+/// selects `size_of::<T>()`. Only `T` is stored, copied or borrowed; extra
+/// slot bytes are unused. An explicit nonzero size requests alignment equal
+/// to its largest power-of-two divisor: 256 selects 256-byte alignment,
+/// while 48 selects 16-byte alignment. Zero retains `T`'s alignment.
+/// The ring base is aligned to at least 128 bytes and to the slot alignment,
+/// so a 64-byte stride places each slot on a separate 64-byte cache line.
 ///
 /// ```
 /// use flux_communication::queue::spsc::Queue;
-/// #[repr(C, align(64))]
-/// struct CacheLine([u8; 64]);
-/// let queue = Queue::<u64, CacheLine>::new(16);
+/// let queue = Queue::<u64, 64>::new(16);
 /// queue.try_producer().unwrap().produce(&42).unwrap();
 /// queue.try_consumer().unwrap().consume_ref(|value| assert_eq!(*value, 42));
+/// // Non-power-of-two strides are valid too.
+/// let _ = Queue::<u64, 24>::new(4);
 /// ```
 ///
-/// Invalid slot layouts fail when a constructor is instantiated during a
-/// build. A check-only compilation may not evaluate these assertions.
+/// The effective stride must be at least `size_of::<T>()` and a multiple of
+/// `align_of::<T>()`. Invalid strides fail when a constructor is instantiated
+/// during a build. A check-only compilation may not evaluate these assertions.
 ///
 /// ```compile_fail,E0080
 /// use flux_communication::queue::spsc::Queue;
-/// let _ = Queue::<[u64; 2], u64>::new(4);
+/// let _ = Queue::<u64, 4>::new(4);
 /// ```
 ///
 /// ```compile_fail,E0080
 /// use flux_communication::queue::spsc::Queue;
-/// let _ = Queue::<u64, [u8; 64]>::new(4);
+/// let _ = Queue::<u64, 12>::new(4);
 /// ```
 ///
 /// With an inferred payload, write `Queue::<_>::new(...)` to select the default
-/// slot type.
+/// slot size.
 ///
 /// Cloning this handle does not clone either endpoint. Dropping it does not
 /// invalidate endpoints, which keep the backing allocation or mapping alive.
@@ -272,36 +292,37 @@ impl<T, Slot> EndpointStorage<T, Slot> {
 /// }
 /// queue.try_consumer().unwrap().consume(|value| println!("{value}"));
 /// ```
-pub struct Queue<T: Copy, Slot = T> {
-    storage: Arc<Storage<T, Slot>>,
+pub struct Queue<T: Copy, const SLOT_SIZE: usize = 0> {
+    storage: Arc<Storage<T, SLOT_SIZE>>,
 }
 
-impl<T: Copy, Slot> Clone for Queue<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> Clone for Queue<T, SLOT_SIZE> {
     fn clone(&self) -> Self {
         Self { storage: Arc::clone(&self.storage) }
     }
 }
 
-impl<T: Copy, Slot> Queue<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> Queue<T, SLOT_SIZE> {
+    /// Effective byte stride, resolving zero to the natural payload size.
+    pub const SLOT_SIZE: usize = slot_size::<T, SLOT_SIZE>();
+
+    /// Slot alignment requested by the size; zero selects the payload
+    /// alignment.
+    pub const SLOT_ALIGN: usize = slot_align::<T, SLOT_SIZE>();
+
     /// Allocate a queue, rounding `len` up to a power of two.
     ///
     /// # Panics
     /// Panics if `len` is zero or the allocation size overflows.
     pub fn new(len: usize) -> Self {
         let capacity = rounded_capacity(len).expect("invalid SPSC capacity");
-        let (layout, slots_offset) = layout::<T, Slot>(capacity).expect("invalid SPSC allocation");
+        let (layout, slots_offset) =
+            layout::<T, SLOT_SIZE>(capacity).expect("invalid SPSC allocation");
         // SAFETY: the checked layout has nonzero size and the required alignment.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
             .unwrap_or_else(|| handle_alloc_error(layout));
-        let mut storage = Storage {
-            ptr,
-            layout,
-            slots_offset,
-            capacity,
-            shared: None,
-            _value: PhantomData,
-            _slot: PhantomData,
-        };
+        let mut storage =
+            Storage { ptr, layout, slots_offset, capacity, shared: None, _value: PhantomData };
         storage.initialize();
         Self { storage: Arc::new(storage) }
     }
@@ -312,21 +333,24 @@ impl<T: Copy, Slot> Queue<T, Slot> {
     /// An existing mapping is never reset or replaced. A concurrent creator may
     /// still be publishing the file link or initializing the header; callers
     /// can retry an open failure or [`QueueError::Uninitialized`].
+    /// The mapping address must satisfy the slot alignment; otherwise this
+    /// returns [`QueueError::IncompatibleLayout`]. Alignments above the system
+    /// page size may not be satisfied by the shared-memory mapper.
     ///
     /// # Safety
     /// All participants must use this queue implementation with the same `T`,
-    /// slot size/alignment, architecture and application schema. Values must be
-    /// valid in every participating process (in particular, no
-    /// process-local pointers or references). No participant may modify the
-    /// mapping outside this interface, or use or drop inherited endpoints
-    /// in a child after `fork`. Size/alignment validation cannot establish
-    /// this contract for the caller.
+    /// effective slot size and alignment, architecture and application schema.
+    /// Values must be valid in every participating process (in particular,
+    /// no process-local pointers or references). No participant may modify
+    /// the mapping outside this interface, or use or drop inherited
+    /// endpoints in a child after `fork`. Size/alignment validation cannot
+    /// establish this contract for the caller.
     pub unsafe fn create_or_open_shared(
         path: impl AsRef<Path>,
         len: usize,
     ) -> Result<Self, QueueError> {
         let capacity = rounded_capacity(len)?;
-        let (layout, slots_offset) = layout::<T, Slot>(capacity)?;
+        let (layout, slots_offset) = layout::<T, SLOT_SIZE>(capacity)?;
         match ShmemConf::new().size(layout.size()).flink(path.as_ref()).create() {
             Ok(shared) => {
                 let ptr = NonNull::new(shared.as_ptr()).ok_or(QueueError::IncompatibleLayout)?;
@@ -340,7 +364,6 @@ impl<T: Copy, Slot> Queue<T, Slot> {
                     capacity,
                     shared: Some(shared),
                     _value: PhantomData,
-                    _slot: PhantomData,
                 };
                 storage.initialize();
                 storage.shared.as_mut().unwrap().set_owner(false);
@@ -382,15 +405,15 @@ impl<T: Copy, Slot> Queue<T, Slot> {
         // SAFETY: acquiring MAGIC observes completed initialization. The caller
         // ensures participants obey the shared-memory contract thereafter.
         let header = unsafe { &*header_ptr };
-        if header.element_size != size_of::<Slot>() ||
-            header.element_align != align_of::<Slot>() ||
+        if header.element_size != slot_size::<T, SLOT_SIZE>() ||
+            header.element_align != slot_align::<T, SLOT_SIZE>() ||
             header.payload_size != size_of::<T>() ||
             header.payload_align != align_of::<T>()
         {
             return Err(QueueError::IncompatibleLayout);
         }
         let capacity = header.capacity;
-        let (layout, slots_offset) = layout::<T, Slot>(capacity)?;
+        let (layout, slots_offset) = layout::<T, SLOT_SIZE>(capacity)?;
         if shared.len() < layout.size() || !(ptr.as_ptr() as usize).is_multiple_of(layout.align()) {
             return Err(QueueError::IncompatibleLayout);
         }
@@ -402,7 +425,6 @@ impl<T: Copy, Slot> Queue<T, Slot> {
                 capacity,
                 shared: Some(shared),
                 _value: PhantomData,
-                _slot: PhantomData,
             }),
         })
     }
@@ -412,7 +434,7 @@ impl<T: Copy, Slot> Queue<T, Slot> {
     }
 
     /// Claim the producer role, resuming at the last published position.
-    pub fn try_producer(&self) -> Result<Producer<T, Slot>, QueueError> {
+    pub fn try_producer(&self) -> Result<Producer<T, SLOT_SIZE>, QueueError> {
         let header = self.storage.header();
         header
             .producer_claimed
@@ -426,7 +448,7 @@ impl<T: Copy, Slot> Queue<T, Slot> {
     }
 
     /// Claim the consumer role, continuing with the oldest unread message.
-    pub fn try_consumer(&self) -> Result<Consumer<T, Slot>, QueueError> {
+    pub fn try_consumer(&self) -> Result<Consumer<T, SLOT_SIZE>, QueueError> {
         let header = self.storage.header();
         header
             .consumer_claimed
@@ -458,13 +480,13 @@ impl<T: Copy, Slot> Queue<T, Slot> {
 /// let mut producer = queue.try_producer().unwrap();
 /// std::thread::spawn(move || producer.produce(&std::ptr::null()));
 /// ```
-pub struct Producer<T: Copy, Slot = T> {
-    storage: EndpointStorage<T, Slot>,
+pub struct Producer<T: Copy, const SLOT_SIZE: usize = 0> {
+    storage: EndpointStorage<T, SLOT_SIZE>,
     write: usize,
     cached_read: usize,
 }
 
-impl<T: Copy, Slot> Producer<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> Producer<T, SLOT_SIZE> {
     /// Sequence number returned by the next successful publication, wrapping
     /// at `usize::MAX`. A full queue or a panicking factory leaves it
     /// unchanged. This reads the producer's local cursor; it neither checks
@@ -511,7 +533,7 @@ impl<T: Copy, Slot> Producer<T, Slot> {
     }
 }
 
-impl<T: Copy, Slot> Drop for Producer<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> Drop for Producer<T, SLOT_SIZE> {
     fn drop(&mut self) {
         self.storage.storage.header().producer_claimed.store(false, Ordering::Release);
     }
@@ -527,8 +549,8 @@ impl<T: Copy, Slot> Drop for Producer<T, Slot> {
 /// let consumer = queue.try_consumer().unwrap();
 /// let duplicate = consumer.clone();
 /// ```
-pub struct Consumer<T: Copy, Slot = T> {
-    storage: EndpointStorage<T, Slot>,
+pub struct Consumer<T: Copy, const SLOT_SIZE: usize = 0> {
+    storage: EndpointStorage<T, SLOT_SIZE>,
     read: usize,
     cached_write: usize,
 }
@@ -547,7 +569,7 @@ impl Drop for SlotRelease<'_> {
     }
 }
 
-impl<T: Copy, Slot> Consumer<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> Consumer<T, SLOT_SIZE> {
     #[inline]
     fn pop(&mut self) -> Option<T> {
         if self.read == self.cached_write {
@@ -621,7 +643,7 @@ impl<T: Copy, Slot> Consumer<T, Slot> {
     }
 }
 
-impl<T: Copy, Slot> Drop for Consumer<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> Drop for Consumer<T, SLOT_SIZE> {
     fn drop(&mut self) {
         self.storage.storage.header().consumer_claimed.store(false, Ordering::Release);
     }
