@@ -16,19 +16,35 @@
 //! to become free; see
 //! [`crate::communication::queue::spsc::Consumer::consume_ref`].
 //!
-//! Add `slot(LayoutType)` to an SPSC field to set its storage stride and
-//! alignment. The type describes the complete stored message, including
-//! `InternalMessage` tracking metadata. It must be large and aligned enough
-//! for `InternalMessage<T>` (or `InternalMessage<DCacheMsg<T>>` with `mtu`),
-//! but need not implement `Copy`, `Clone`, `Send`, or `Sync`. Its values are
-//! never constructed. Without `slot`, the stored message is the slot type.
-//! All participants opening a shared mapping must use the same slot layout.
+//! Add `slot(bytes)` to an SPSC field to set its byte stride. The stride must
+//! accommodate the complete `InternalMessage<T>` (or
+//! `InternalMessage<DCacheMsg<T>>` with `mtu`) and be a multiple of that
+//! message's alignment. An explicit nonzero size selects alignment equal to
+//! its largest power-of-two divisor: `slot(256)` aligns slots to 256 bytes,
+//! while `slot(48)` aligns them to 16 bytes. Omit `slot` or use `slot(0)` for
+//! the natural stored message size and alignment. All participants opening
+//! a shared mapping must use the same effective stride and slot alignment.
 //! Incompatible mappings are rejected; recreate them only after all
 //! participants detach. Managed `DCache` side payloads have a separate layout.
-//! Generated bundles select the slot through [`SpscProducerAccess`],
+//! Generated bundles select the queue through [`SpscProducerAccess`],
 //! [`SpscConsumerAccess`], [`SpscDCacheProducerAccess`] and
 //! [`SpscDCacheConsumerAccess`]. Hand-written bundles used through the adapter
 //! implement the corresponding traits too.
+//!
+//! A stride smaller than the complete stored message is rejected when the
+//! queue constructor is instantiated:
+//!
+//! ```compile_fail,E0080
+//! use flux::{communication::ShmemData, tile::TileInfo};
+//! use spine_derive::from_spine;
+//! #[from_spine("invalid-slot")]
+//! struct App {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(flavour("spsc"), slot(1))]
+//!     messages: flux::spine::SpineQueue<u64>,
+//! }
+//! let _ = unsafe { App::new(None) };
+//! ```
 //!
 //! ```no_run
 //! # #![deny(unused_imports)]
@@ -138,8 +154,9 @@ use flux_utils::{DCacheError, DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
 pub use spsc::{
     SpineSpscConsumer, SpineSpscDCacheConsumer, SpineSpscDCacheQueue, SpineSpscProducer,
-    SpineSpscProducerWithDCache, SpineSpscQueue, SpscConsumerAccess, SpscDCacheConsumerAccess,
-    SpscDCacheProduceError, SpscDCacheProducerAccess, SpscProduceError, SpscProducerAccess,
+    SpineSpscProducerWithDCache, SpineSpscQueue, SpscAttachedConsumer, SpscAttachedDCacheConsumer,
+    SpscConsumerAccess, SpscDCacheConsumerAccess, SpscDCacheProduceError, SpscDCacheProducerAccess,
+    SpscProduceError, SpscProducerAccess,
 };
 pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
@@ -216,7 +233,7 @@ pub trait SpineProducers {
         Self: SpscProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_new_publish_delta();
-        self.spsc_producer().try_produce_with(|| InternalMessage::new(timestamp, data))
+        self.spsc_try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
     /// Construct a message only once an SPSC slot is available. Errors never
@@ -229,7 +246,7 @@ pub trait SpineProducers {
         Self: SpscProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_new_publish_delta();
-        self.spsc_producer().try_produce_with(|| InternalMessage::new(timestamp, make()))
+        self.spsc_try_produce_with(|| InternalMessage::new(timestamp, make()))
     }
 
     /// Publish metadata and a managed SPSC payload. `Full` never invokes the
@@ -244,15 +261,12 @@ pub trait SpineProducers {
         Self: SpscDCacheProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_new_publish_delta();
-        self.spsc_dcache_producer().try_produce_with(
-            payload.as_ref().map(|(len, _)| *len),
-            |bytes| {
-                if let Some((_, fill)) = payload {
-                    fill(bytes.expect("requested SPSC payload"));
-                }
-                InternalMessage::new(timestamp, data)
-            },
-        )
+        self.spsc_dcache_try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
+            if let Some((_, fill)) = payload {
+                fill(bytes.expect("requested SPSC payload"));
+            }
+            InternalMessage::new(timestamp, data)
+        })
     }
 
     /// Managed SPSC publication with an explicit ingestion timestamp.
@@ -266,15 +280,12 @@ pub trait SpineProducers {
         Self: SpscDCacheProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
-        self.spsc_dcache_producer().try_produce_with(
-            payload.as_ref().map(|(len, _)| *len),
-            |bytes| {
-                if let Some((_, fill)) = payload {
-                    fill(bytes.expect("requested SPSC payload"));
-                }
-                InternalMessage::new(timestamp, data)
-            },
-        )
+        self.spsc_dcache_try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
+            if let Some((_, fill)) = payload {
+                fill(bytes.expect("requested SPSC payload"));
+            }
+            InternalMessage::new(timestamp, data)
+        })
     }
 
     fn try_produce_with_ingestion<T: Copy>(
@@ -286,7 +297,7 @@ pub trait SpineProducers {
         Self: SpscProducerAccess<T>,
     {
         let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
-        self.spsc_producer().try_produce_with(|| InternalMessage::new(timestamp, data))
+        self.spsc_try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
     /// Forward a message to an SPSC queue without changing its tracking
@@ -295,7 +306,7 @@ pub trait SpineProducers {
     where
         Self: SpscProducerAccess<T>,
     {
-        self.spsc_producer().try_produce(message)
+        self.spsc_try_produce_with(|| *message)
     }
 
     fn produce<T: Copy>(&self, d: T)

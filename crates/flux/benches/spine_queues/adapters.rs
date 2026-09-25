@@ -7,12 +7,12 @@ use flux::{
     TimingMessage,
     communication::{
         cleanup_shmem,
-        queue::{Queue, QueueType},
+        queue::{Queue, QueueType, spsc},
     },
     spine::{
         FluxSpine, SpineAdapter, SpineConsumer, SpineProducer, SpineProducers, SpineQueue,
-        SpineSpscConsumer, SpineSpscProducer, SpineSpscQueue, SpscConsumerAccess,
-        SpscProducerAccess,
+        SpineSpscConsumer, SpineSpscProducer, SpineSpscQueue, SpscAttachedConsumer,
+        SpscConsumerAccess, SpscProduceError, SpscProducerAccess,
     },
     tile::{Tile, TileName},
     timing::{IngestionTime, InternalMessage, TrackingTimestamp},
@@ -56,21 +56,26 @@ impl<P> AsMut<P> for Producers<P> {
     }
 }
 
-impl<const B: usize, Slot> SpscProducerAccess<Message<B>>
-    for Producers<SpineSpscProducer<Message<B>, Slot>>
+impl<const B: usize, const SLOT_SIZE: usize> SpscProducerAccess<Message<B>>
+    for Producers<SpineSpscProducer<Message<B>, SLOT_SIZE>>
 {
-    type Slot = Slot;
-    fn spsc_producer(&mut self) -> &mut SpineSpscProducer<Message<B>, Slot> {
-        &mut self.message
+    #[inline]
+    fn spsc_try_produce_with(
+        &mut self,
+        make: impl FnOnce() -> InternalMessage<Message<B>>,
+    ) -> Result<(), SpscProduceError> {
+        self.message.try_produce_with(make)
     }
 }
 
-impl<const B: usize, Slot> SpscConsumerAccess<Message<B>>
-    for Consumers<SpineSpscConsumer<Message<B>, Slot>>
+impl<const B: usize, const SLOT_SIZE: usize> SpscConsumerAccess<Message<B>>
+    for Consumers<SpineSpscConsumer<Message<B>, SLOT_SIZE>>
 {
-    type Slot = Slot;
-    fn spsc_consumer(&mut self) -> &mut SpineSpscConsumer<Message<B>, Slot> {
-        &mut self.message
+    #[inline]
+    fn spsc_try_attached(
+        &mut self,
+    ) -> Result<impl SpscAttachedConsumer<Message<B>> + '_, spsc::QueueError> {
+        self.message.try_attached()
     }
 }
 
@@ -84,7 +89,8 @@ impl<P> SpineProducers for Producers<P> {
 }
 
 type BroadcastSpine<const B: usize> = BenchSpine<SpineQueue<Message<B>>>;
-type SpscSpine<const B: usize, Slot> = BenchSpine<SpineSpscQueue<Message<B>, Slot>>;
+type SpscSpine<const B: usize, const SLOT_SIZE: usize> =
+    BenchSpine<SpineSpscQueue<Message<B>, SLOT_SIZE>>;
 
 impl<const B: usize> FluxSpine for BroadcastSpine<B> {
     type Consumers = Consumers<SpineConsumer<Message<B>>>;
@@ -119,9 +125,9 @@ impl<const B: usize> FluxSpine for BroadcastSpine<B> {
     }
 }
 
-impl<const B: usize, Slot> FluxSpine for SpscSpine<B, Slot> {
-    type Consumers = Consumers<SpineSpscConsumer<Message<B>, Slot>>;
-    type Producers = Producers<SpineSpscProducer<Message<B>, Slot>>;
+impl<const B: usize, const SLOT_SIZE: usize> FluxSpine for SpscSpine<B, SLOT_SIZE> {
+    type Consumers = Consumers<SpineSpscConsumer<Message<B>, SLOT_SIZE>>;
+    type Producers = Producers<SpineSpscProducer<Message<B>, SLOT_SIZE>>;
 
     fn attach_consumers<T: Tile<Self>>(&mut self, tile: &T) -> Self::Consumers {
         Consumers {
@@ -184,7 +190,7 @@ impl<const B: usize> Tx<B> for Sender<BroadcastSpine<B>> {
     }
 }
 
-impl<const B: usize, Slot> Tx<B> for Sender<SpscSpine<B, Slot>> {
+impl<const B: usize, const SLOT_SIZE: usize> Tx<B> for Sender<SpscSpine<B, SLOT_SIZE>> {
     #[inline]
     fn begin_batch(&mut self) {
         self.0.begin_loop(IngestionTime::now());
@@ -210,7 +216,9 @@ impl<const B: usize, const TRACK: bool> Rx<B> for Receiver<BroadcastSpine<B>, TR
     }
 }
 
-impl<const B: usize, Slot, const TRACK: bool> Rx<B> for Receiver<SpscSpine<B, Slot>, TRACK> {
+impl<const B: usize, const SLOT_SIZE: usize, const TRACK: bool> Rx<B>
+    for Receiver<SpscSpine<B, SLOT_SIZE>, TRACK>
+{
     #[inline]
     fn drain(&mut self, mut callback: impl FnMut(&Message<B>)) {
         self.0.begin_loop(IngestionTime::now());
@@ -229,8 +237,8 @@ impl<const B: usize, Slot, const TRACK: bool> Rx<B> for Receiver<SpscSpine<B, Sl
         let wire = InternalMessage::new(TrackingTimestamp::new(0), Message([0; B]));
         let offset = std::ptr::from_ref(wire.data()).addr() - std::ptr::from_ref(&wire).addr();
         Some(SlotGeometry {
-            size: size_of::<Slot>(),
-            alignment: align_of::<Slot>(),
+            size: spsc::Queue::<InternalMessage<Message<B>>, SLOT_SIZE>::SLOT_SIZE,
+            alignment: spsc::Queue::<InternalMessage<Message<B>>, SLOT_SIZE>::SLOT_ALIGN,
             payload_offset: offset,
         })
     }
@@ -251,13 +259,17 @@ fn check_telemetry<const B: usize, const TRACK: bool>(base: &Path) -> impl FnMut
     }
 }
 
-pub fn run<const B: usize, Slot, const TRACK: bool>(queue: &str, case: &mut Case<B>, run: usize) {
+pub fn run<const B: usize, const SLOT_SIZE: usize, const TRACK: bool>(
+    queue: &str,
+    case: &mut Case<B>,
+    run: usize,
+) {
     let directory = tempfile::Builder::new().prefix("flux-spine-bench-").tempdir().unwrap();
     // An abort deliberately retains this unique directory for diagnosis.
     eprintln!("Spine telemetry directory: {}", directory.path().display());
     if queue == "SPSC" {
         // SAFETY: this benchmark's constructor uses only local heap queue storage.
-        let mut spine = unsafe { SpscSpine::<B, Slot>::new_in_base_dir(directory.path()) };
+        let mut spine = unsafe { SpscSpine::<B, SLOT_SIZE>::new_in_base_dir(directory.path()) };
         let mut sender = SpineAdapter::connect_tile(&Publisher, &mut spine);
         let mut receiver = SpineAdapter::connect_tile(&Subscriber, &mut spine);
         sender.producers.message.try_attach().unwrap();

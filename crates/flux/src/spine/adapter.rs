@@ -10,8 +10,9 @@ use signal_hook::consts::SIGINT;
 use crate::{
     spine::{
         DCacheRead, FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer,
-        SpineProducerWithDCache, SpineProducers, SpscConsumerAccess, SpscDCacheConsumerAccess,
-        SpscDCacheProduceError, SpscDCacheProducerAccess, SpscProduceError, SpscProducerAccess,
+        SpineProducerWithDCache, SpineProducers, SpscAttachedConsumer, SpscAttachedDCacheConsumer,
+        SpscConsumerAccess, SpscDCacheConsumerAccess, SpscDCacheProduceError,
+        SpscDCacheProducerAccess, SpscProduceError, SpscProducerAccess,
     },
     tile::Tile,
 };
@@ -227,7 +228,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         F: FnMut(T, &[u8]) -> R,
         G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
     {
-        let mut consumer = self.consumers.spsc_dcache_consumer().try_attached()?;
+        let mut consumer = self.consumers.spsc_dcache_try_attached()?;
         let mut handled = false;
         while consumer.consume_maybe_track(
             &mut self.producers,
@@ -275,7 +276,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         F: FnMut(T, &[u8]) -> R,
         G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
     {
-        Ok(self.consumers.spsc_dcache_consumer().try_attached()?.consume_maybe_track(
+        Ok(self.consumers.spsc_dcache_try_attached()?.consume_maybe_track(
             &mut self.producers,
             &mut self.did_work,
             &mut read,
@@ -324,14 +325,20 @@ impl<S: FluxSpine> SpineAdapter<S> {
     #[inline]
     pub fn try_consume_one<T, F>(
         &mut self,
-        f: F,
+        mut f: F,
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
         S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(T, &mut S::Producers),
     {
-        let consumed = self.consumers.spsc_consumer().try_consume(&mut self.producers, f)?;
+        let consumed = self.consumers.spsc_try_attached()?.consume_internal_message_maybe_track(
+            &mut self.producers,
+            |message, producers| {
+                f(message.into_data(), producers);
+                true
+            },
+        );
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -343,15 +350,19 @@ impl<S: FluxSpine> SpineAdapter<S> {
     #[inline]
     pub fn try_consume_one_maybe_track<T, F>(
         &mut self,
-        f: F,
+        mut f: F,
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
         S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(T, &mut S::Producers) -> bool,
     {
-        let consumed =
-            self.consumers.spsc_consumer().try_consume_maybe_track(&mut self.producers, f)?;
+        let consumed = self
+            .consumers
+            .spsc_try_attached()?
+            .consume_internal_message_maybe_track(&mut self.producers, |message, producers| {
+                f(message.into_data(), producers)
+            });
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -422,7 +433,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&T, &mut S::Producers) -> bool,
     {
-        let mut consumer = self.consumers.spsc_consumer().try_attached()?;
+        let mut consumer = self.consumers.spsc_try_attached()?;
         while consumer.consume_ref_maybe_track(&mut self.producers, &mut f) {
             self.did_work = true;
         }
@@ -442,7 +453,13 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: SpscConsumerAccess<T>,
         F: FnOnce(&T, &mut S::Producers),
     {
-        let consumed = self.consumers.spsc_consumer().consume_ref(&mut self.producers, f)?;
+        let consumed = self.consumers.spsc_try_attached()?.consume_ref_maybe_track(
+            &mut self.producers,
+            |message, producers| {
+                f(message, producers);
+                true
+            },
+        );
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -463,7 +480,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         F: FnOnce(&T, &mut S::Producers) -> bool,
     {
         let consumed =
-            self.consumers.spsc_consumer().consume_ref_maybe_track(&mut self.producers, f)?;
+            self.consumers.spsc_try_attached()?.consume_ref_maybe_track(&mut self.producers, f);
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -471,15 +488,20 @@ impl<S: FluxSpine> SpineAdapter<S> {
     #[inline]
     pub fn try_consume_internal_message_one<T, F>(
         &mut self,
-        f: F,
+        mut f: F,
     ) -> Result<bool, crate::communication::queue::spsc::QueueError>
     where
         T: 'static + Copy,
         S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers),
     {
-        let consumed =
-            self.consumers.spsc_consumer().try_consume_internal_message(&mut self.producers, f)?;
+        let consumed = self.consumers.spsc_try_attached()?.consume_internal_message_maybe_track(
+            &mut self.producers,
+            |message, producers| {
+                f(message, producers);
+                true
+            },
+        );
         self.did_work |= consumed;
         Ok(consumed)
     }
@@ -497,7 +519,7 @@ impl<S: FluxSpine> SpineAdapter<S> {
         S::Consumers: SpscConsumerAccess<T>,
         F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
     {
-        let mut consumer = self.consumers.spsc_consumer().try_attached()?;
+        let mut consumer = self.consumers.spsc_try_attached()?;
         while consumer.consume_internal_message_maybe_track(&mut self.producers, &mut f) {
             self.did_work = true;
         }
@@ -520,8 +542,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let consumed = self
             .consumers
-            .spsc_consumer()
-            .try_consume_internal_message_maybe_track(&mut self.producers, f)?;
+            .spsc_try_attached()?
+            .consume_internal_message_maybe_track(&mut self.producers, f);
         self.did_work |= consumed;
         Ok(consumed)
     }
