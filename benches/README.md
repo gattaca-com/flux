@@ -6,7 +6,7 @@ The [raw queue](../crates/flux-communication/benches/README.md) and [Spine](../c
 |---|---|---|
 | `FLUX_BENCH_CPUS` | required | Producer and consumer CPUs, for example `13,12`. |
 | `FLUX_BENCH_MODE` | `throughput` | `throughput`, `latency`, or `verify` (validation only, one repetition). |
-| `FLUX_BENCH_SIZE` | all sizes | One of 8, 32, 64, 128, 192, 256, 512 and 1024 bytes. |
+| `FLUX_BENCH_SIZE` | 8–1024 B | One of 8, 32, 64, 128, 192, 256, 512 and 1024 bytes. Explicitly select 1, 2 or 4 bytes for throughput or verify mode only, with natural or 64 B SPSC slots. |
 | `FLUX_BENCH_QUEUE` | all queues | One queue name; see each benchmark's README. |
 | `FLUX_BENCH_SLOT` | `natural` | SPSC slot stride: `natural`, `64`, `128`, `192`, or `256`. Alignment matches the stride except for 192 B slots, which use 64 B alignment. Padding requires `FLUX_BENCH_QUEUE=SPSC`; see the supported payload sizes in each benchmark's README. |
 | `FLUX_BENCH_RUNS` | `5` | Repetitions per case. |
@@ -21,7 +21,7 @@ On Linux, choose two otherwise idle physical cores, preferably sharing L3, and k
 
 The ring holds 1024 messages; the source pool holds 4096. Messages are published individually; SPSC and rtrb also release each slot individually. At most 512 messages are outstanding, so MPMC and SPMC cannot overwrite unread data; the producer checks this per 64-message group, inside the timing. Both workers pass message references through `black_box`.
 
-Each repetition creates a fresh queue and two pinned workers that own their endpoints. They check 32768 unique messages for full payload and FIFO order, then warm up with 32768 messages and measure `FLUX_BENCH_MESSAGES` using the selected mode's loops. Verify mode stops after the payload checks. The same workers handle all rounds; the main thread coordinates them.
+Each repetition creates a fresh queue and two pinned workers that own their endpoints. They check 32768 messages against the expected payload sequence, then warm up with 32768 messages and measure `FLUX_BENCH_MESSAGES` using the selected mode's loops. Tiny payloads cannot uniquely encode every sequence position; their values are mixed before truncation to avoid a repeating ring-lap pattern, but collisions remain possible. Verify mode stops after the payload checks. The same workers handle all rounds; the main thread coordinates them.
 
 All three threads meet at a barrier before and after every round. The producer waits for the consumer to leave the start barrier before starting its clock. Between rounds, the controller checks the completed round and resets credits before the next round can start. Recording storage is preallocated and reused. Every round checks its message count; throughput also checks the sum of bytes read, and latency checks timestamp sums and one histogram entry per message. Repetitions vary the case order; latency cases in the same repetition share a pause sequence.
 

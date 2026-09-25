@@ -20,7 +20,7 @@ mod throughput;
 #[path = "window_stats.rs"]
 mod window_stats;
 
-pub const SIZES: [usize; 8] = [8, 32, 64, 128, 192, 256, 512, 1024];
+pub const SIZES: [usize; 11] = [1, 2, 4, 8, 32, 64, 128, 192, 256, 512, 1024];
 pub const CAPACITY: usize = 1024;
 const WINDOW: usize = 512;
 const BATCH: usize = 64;
@@ -45,7 +45,7 @@ impl SlotLayout {
     pub fn sizes(self) -> &'static [usize] {
         match self {
             Self::Natural => &SIZES,
-            Self::Bytes64 => &[8, 32],
+            Self::Bytes64 => &[1, 2, 4, 8, 32],
             Self::Bytes128 => &[8, 32, 64],
             Self::Bytes192 => &[8, 32, 64, 128],
             Self::Bytes256 => &[8, 32, 64, 128, 192],
@@ -85,15 +85,22 @@ pub trait Rx<const B: usize>: Send {
 
 fn payload<const B: usize>(id: usize) -> Message<B> {
     let mut bytes = [0; B];
-    for (i, chunk) in bytes[8..].chunks_mut(8).enumerate() {
+    let prefix = B.min(8);
+    for (i, chunk) in bytes[prefix..].chunks_mut(8).enumerate() {
         let mut z = (id as u64).wrapping_add((i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^= z >> 31;
         chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
     }
-    let word = (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6a09_e667_f3bc_c909;
-    bytes[..8].copy_from_slice(&word.to_le_bytes());
+    let mut word = (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6a09_e667_f3bc_c909;
+    if B < 8 {
+        // Mix high bits before truncation to avoid repeating ring-lap patterns.
+        word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        word ^= word >> 31;
+    }
+    bytes[..prefix].copy_from_slice(&word.to_le_bytes()[..prefix]);
     Message(bytes)
 }
 
@@ -402,6 +409,10 @@ impl Settings {
         assert!(runs > 0);
         let size = env::var("FLUX_BENCH_SIZE").ok().map(|s| s.parse().expect("payload size"));
         assert!(size.is_none_or(|b| SIZES.contains(&b)), "unsupported payload size");
+        assert!(
+            mode != Mode::Latency || size.is_none_or(|b| b >= 8),
+            "latency requires at least 8 payload bytes for its timestamp"
+        );
         let queue = env::var("FLUX_BENCH_QUEUE").ok();
         assert!(queue.as_deref().is_none_or(|q| queues.contains(&q)), "unsupported queue");
         let slot = match env::var("FLUX_BENCH_SLOT").as_deref().unwrap_or("natural") {
@@ -448,8 +459,12 @@ impl Settings {
 macro_rules! dispatch_layout {
     ($settings:ident, $run:ident $(, $extra:expr)*) => {
         for &size in $settings.slot.sizes() {
+            if size < 8 && $settings.size.is_none() { continue; }
             if $settings.size.is_some_and(|selected| selected != size) { continue; }
             match ($settings.slot, size) {
+                ($crate::support::SlotLayout::Natural, 1) => $run::<1, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 2) => $run::<2, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 4) => $run::<4, 0>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Natural, 8) => $run::<8, 0>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Natural, 32) => $run::<32, 0>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Natural, 64) => $run::<64, 0>(&$settings $(, $extra)*),
@@ -458,6 +473,9 @@ macro_rules! dispatch_layout {
                 ($crate::support::SlotLayout::Natural, 256) => $run::<256, 0>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Natural, 512) => $run::<512, 0>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Natural, 1024) => $run::<1024, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes64, 1) => $run::<1, 64>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes64, 2) => $run::<2, 64>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes64, 4) => $run::<4, 64>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes64, 8) => $run::<8, 64>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes64, 32) => $run::<32, 64>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes128, 8) => $run::<8, 128>(&$settings $(, $extra)*),

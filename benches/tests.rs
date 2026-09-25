@@ -1,5 +1,46 @@
 #![allow(dead_code, unused_imports, clippy::float_cmp)]
 
+mod tiny_payloads {
+    use std::{panic::AssertUnwindSafe, sync::atomic::AtomicUsize};
+
+    use super::super::{CAPACITY, Credit, Message, Rx, payload, validate};
+
+    struct Replay<const B: usize>(Vec<Message<B>>);
+
+    impl<const B: usize> Rx<B> for Replay<B> {
+        fn drain(&mut self, mut callback: impl FnMut(&Message<B>)) {
+            for message in self.0.drain(..) {
+                callback(&message);
+            }
+        }
+    }
+
+    fn check<const B: usize>() {
+        let expected: Vec<_> = (CAPACITY..2 * CAPACITY).map(payload::<B>).collect();
+        let credit = Credit(AtomicUsize::new(0));
+        validate(&mut Replay(expected.clone()), &expected, &credit);
+
+        let mut corrupted = expected.clone();
+        corrupted[0].0[B / 2] ^= 1;
+        let stale = (0..CAPACITY).map(payload::<B>).collect();
+        for messages in [corrupted, stale] {
+            assert!(
+                std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    validate(&mut Replay(messages), &expected, &credit);
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn detects_corruption_and_replayed_ring_lap() {
+        check::<1>();
+        check::<2>();
+        check::<4>();
+    }
+}
+
 mod workers {
     use std::sync::{
         Arc,
