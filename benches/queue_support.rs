@@ -40,6 +40,7 @@ pub enum SlotLayout {
     Natural,
     Bytes64,
     Bytes128,
+    Bytes192,
     Bytes256,
 }
 
@@ -49,6 +50,7 @@ impl SlotLayout {
             Self::Natural => &SIZES,
             Self::Bytes64 => &[8, 32],
             Self::Bytes128 => &[8, 32, 64],
+            Self::Bytes192 => &[8, 32, 64, 128],
             Self::Bytes256 => &[8, 32, 64, 128, 192],
         }
     }
@@ -424,8 +426,9 @@ impl Settings {
             "natural" => SlotLayout::Natural,
             "64" => SlotLayout::Bytes64,
             "128" => SlotLayout::Bytes128,
+            "192" => SlotLayout::Bytes192,
             "256" => SlotLayout::Bytes256,
-            _ => panic!("choose slot natural, 64, 128 or 256"),
+            _ => panic!("choose slot natural, 64, 128, 192 or 256"),
         };
         assert!(
             slot == SlotLayout::Natural || queue.as_deref() == Some("SPSC"),
@@ -478,6 +481,10 @@ macro_rules! dispatch_layout {
                 ($crate::support::SlotLayout::Bytes128, 8) => $run::<8, 128>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes128, 32) => $run::<32, 128>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes128, 64) => $run::<64, 128>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes192, 8) => $run::<8, 192>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes192, 32) => $run::<32, 192>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes192, 64) => $run::<64, 192>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes192, 128) => $run::<128, 192>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes256, 8) => $run::<8, 256>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes256, 32) => $run::<32, 256>(&$settings $(, $extra)*),
                 ($crate::support::SlotLayout::Bytes256, 64) => $run::<64, 256>(&$settings $(, $extra)*),

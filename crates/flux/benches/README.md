@@ -28,8 +28,10 @@ This measures queues through their adapters, including telemetry when enabled, w
 
 ## SPSC slot layouts
 
-Set `FLUX_BENCH_QUEUE=SPSC FLUX_BENCH_SLOT=64`, `128` or `256` to select the exact slot stride and alignment. The default, `natural`, retains the stored message layout. Only the message is copied; padding is unused. The same selection works with throughput, latency and verify modes.
+Set `FLUX_BENCH_QUEUE=SPSC FLUX_BENCH_SLOT=64`, `128`, `192` or `256` to select the exact slot stride. Alignment matches the stride except for 192 B slots, which use 64 B alignment. The default, `natural`, retains the stored message layout. Only the message is copied; padding is unused. The same selection works with throughput, latency and verify modes.
 
-Supported application sizes are 8/32 B for 64 B slots, 8/32/64 B for 128 B slots, and 8/32/64/128/192 B for 256 B slots. These combinations also accommodate Spine tracking metadata. Without a size filter, only supported sizes run. Natural slots support all eight sizes.
+Supported application sizes are 8/32 B for 64 B slots, 8/32/64 B for 128 B slots, 8/32/64/128 B for 192 B slots, and 8/32/64/128/192 B for 256 B slots. These combinations also accommodate Spine tracking metadata. Without a size filter, only supported sizes run. Natural slots support all eight sizes.
+
+For a 192 B payload in a 256 B slot, set `FLUX_BENCH_QUEUE=SPSC FLUX_BENCH_SIZE=192 FLUX_BENCH_SLOT=256`.
 
 Full-payload validation checks borrowed slot addresses for the selected stride and alignment, accounting for Spine metadata before the application payload. Geometry checks are outside measured loops. Keep the printed slot geometry with CSV results.
