@@ -412,7 +412,7 @@ impl<T: Copy, const SLOT_SIZE: usize> Producer<T, SLOT_SIZE> {
     }
 
     /// Closure `f` blocks the write cursor.
-    #[inline]
+    #[inline(always)]
     pub fn produce_with(&mut self, f: impl FnOnce() -> T) -> Result<usize, FullError> {
         if self.write.wrapping_sub(self.cached_read) == self.storage.mask + 1 {
             self.cached_read = self.storage.read().load(Ordering::Acquire);
@@ -459,7 +459,7 @@ impl Drop for SlotRelease<'_> {
 }
 
 impl<T: Copy, const SLOT_SIZE: usize> Consumer<T, SLOT_SIZE> {
-    #[inline]
+    #[inline(always)]
     fn pop(&mut self) -> Option<T> {
         if self.read == self.cached_write {
             self.cached_write = self.storage.write().load(Ordering::Acquire);
@@ -487,7 +487,7 @@ impl<T: Copy, const SLOT_SIZE: usize> Consumer<T, SLOT_SIZE> {
     }
 
     /// Closure `f` blocks the read cursor.
-    #[inline]
+    #[inline(always)]
     pub fn consume_ref(&mut self, f: impl FnOnce(&T)) -> bool {
         if self.read == self.cached_write {
             self.cached_write = self.storage.write().load(Ordering::Acquire);
