@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, mem, ptr, rc::Rc};
+use std::{io::Result, ptr};
 
 use flux::{
     communication::{
@@ -24,23 +24,15 @@ struct Frame(u64);
 #[repr(C)]
 struct DefaultReading(u64);
 
-// The slot is only a layout marker. Neither its bytes nor its Rc are
-// constructed.
-#[repr(C, align(128))]
-struct Slot256 {
-    bytes: [u8; 256],
-    no_send: PhantomData<Rc<()>>,
-}
-
 #[from_spine("spsc-slot-layout")]
 #[derive(Debug)]
 struct LayoutSpine {
     tile_info: ShmemData<TileInfo>,
-    #[queue(size(2), flavour("spsc"), slot(Slot256))]
+    #[queue(size(2), flavour("spsc"), slot(8 * 6))]
     readings: flux::spine::SpineQueue<Reading>,
     #[queue(size(2), flavour("spsc"))]
     defaults: flux::spine::SpineQueue<DefaultReading>,
-    #[queue(size(2), flavour("spsc"), mtu(16), slot(Slot256))]
+    #[queue(size(2), flavour("spsc"), mtu(16), slot(256))]
     frames: flux::spine::SpineQueue<Frame>,
 }
 
@@ -56,26 +48,28 @@ impl<S: FluxSpine> Tile<S> for Receiver {
     fn loop_body(&mut self, _: &mut SpineAdapter<S>) {}
 }
 
-fn new_spine(base: &std::path::Path) -> LayoutSpine {
+// Callers may use their own Result alias beside a generated Spine.
+#[allow(clippy::unnecessary_wraps)]
+fn new_spine(base: &std::path::Path) -> Result<LayoutSpine> {
     // SAFETY: all endpoints use the same schema on one architecture and the
     // payloads contain no process-local pointers.
-    unsafe { LayoutSpine::new_with_base_dir(base, None) }
+    Ok(unsafe { LayoutSpine::new_with_base_dir(base, None) })
 }
 
 #[test]
-fn slot_marker_does_not_constrain_endpoint_traits() {
+fn numeric_stride_preserves_endpoint_traits() {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>() {}
-    assert_send_sync::<flux::spine::SpineSpscQueue<Reading, Slot256>>();
-    assert_send::<flux::spine::SpineSpscProducer<Reading, Slot256>>();
-    assert_send::<flux::spine::SpineSpscConsumer<Reading, Slot256>>();
-    assert_send_sync::<flux::spine::SpineSpscDCacheQueue<Frame, Slot256>>();
+    assert_send_sync::<flux::spine::SpineSpscQueue<Reading, 48>>();
+    assert_send::<flux::spine::SpineSpscProducer<Reading, 48>>();
+    assert_send::<flux::spine::SpineSpscConsumer<Reading, 48>>();
+    assert_send_sync::<flux::spine::SpineSpscDCacheQueue<Frame, 256>>();
 }
 
 #[test]
 fn padded_slots_preserve_addresses_values_and_factory_capacity() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut spine = new_spine(tmp.path());
+    let mut spine = new_spine(tmp.path()).unwrap();
     let mut producer = SpineAdapter::connect_tile(&Sender, &mut spine);
     let mut consumer = SpineAdapter::connect_tile(&Receiver, &mut spine);
 
@@ -103,10 +97,10 @@ fn padded_slots_preserve_addresses_values_and_factory_capacity() {
                 .unwrap()
         );
     }
-    assert_eq!(addresses[1] - addresses[0], mem::size_of::<Slot256>());
+    assert_eq!(addresses[1] - addresses[0], 48);
     let sample = InternalMessage::new(TrackingTimestamp::new(1), Reading(0));
     let data_offset = ptr::from_ref(sample.data()) as usize - ptr::from_ref(&sample) as usize;
-    assert_eq!((addresses[0] - data_offset) % mem::align_of::<Slot256>(), 0);
+    assert_eq!((addresses[0] - data_offset) % 16, 0, "48-byte slots request 16-byte alignment");
     assert!(
         consumer
             .try_consume_one::<DefaultReading, _>(|value, _| assert_eq!(value, DefaultReading(9)))
@@ -133,14 +127,14 @@ fn padded_slots_preserve_addresses_values_and_factory_capacity() {
 #[test]
 fn padded_slot_forwards_tracking_and_managed_payloads_reuse() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut spine = new_spine(tmp.path());
+    let mut spine = new_spine(tmp.path()).unwrap();
     // The managed consumer exposes payload bytes, not metadata slot addresses.
     // Reopen its metadata queue to check that the macro applied the slot layout.
     let path = shmem_dir_with_base(tmp.path(), "spsc-slot-layout").join("spsc/frames");
     // SAFETY: the exact stored payload/schema, no endpoints or fork; the
     // mismatched default slot is rejected before accessing any payload.
     unsafe {
-        drop(Queue::<InternalMessage<DCacheMsg<Frame>>, Slot256>::open_shared(&path).unwrap());
+        drop(Queue::<InternalMessage<DCacheMsg<Frame>>, 256>::open_shared(&path).unwrap());
         assert!(matches!(
             Queue::<InternalMessage<DCacheMsg<Frame>>>::open_shared(&path),
             Err(QueueError::IncompatibleLayout)

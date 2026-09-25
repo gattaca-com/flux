@@ -27,30 +27,73 @@ use flux_utils::{directories::shmem_dir_with_base, short_typename};
 use super::{FluxSpine, SpineProducers};
 use crate::{Timer, communication::queue::spsc, tile::Tile};
 
-/// Selects a queue's compile-time slot layout from a producer bundle.
+mod sealed {
+    pub trait Attached {}
+}
+
+/// Publishes through a statically selected SPSC producer in a bundle.
+/// Hand-written bundles delegate to [`SpineSpscProducer::try_produce_with`].
 pub trait SpscProducerAccess<T: Copy> {
-    type Slot;
-    fn spsc_producer(&mut self) -> &mut SpineSpscProducer<T, Self::Slot>;
+    fn spsc_try_produce_with(
+        &mut self,
+        make: impl FnOnce() -> InternalMessage<T>,
+    ) -> Result<(), SpscProduceError>;
 }
 
-/// Selects a queue's compile-time slot layout from a consumer bundle.
+/// Operations available while a consumer role is attached.
+/// Obtain this borrowed view from [`SpineSpscConsumer::try_attached`].
+/// This trait is sealed: only SPSC consumers implement these operations.
+pub trait SpscAttachedConsumer<T: Copy>: sealed::Attached {
+    fn consume_ref_maybe_track<P, F>(&mut self, producers: &mut P, f: F) -> bool
+    where
+        P: SpineProducers,
+        F: FnOnce(&T, &mut P) -> bool;
+
+    fn consume_internal_message_maybe_track<P, F>(&mut self, producers: &mut P, f: F) -> bool
+    where
+        P: SpineProducers,
+        F: FnMut(&mut InternalMessage<T>, &mut P) -> bool;
+}
+
+/// Attaches a statically selected SPSC consumer in a bundle.
+/// Hand-written bundles delegate to [`SpineSpscConsumer::try_attached`].
 pub trait SpscConsumerAccess<T: Copy> {
-    type Slot;
-    fn spsc_consumer(&mut self) -> &mut SpineSpscConsumer<T, Self::Slot>;
+    fn spsc_try_attached(&mut self) -> Result<impl SpscAttachedConsumer<T> + '_, spsc::QueueError>;
 }
 
-/// Selects a managed payload queue's metadata slot layout from a producer
-/// bundle.
+/// Publishes through a statically selected managed payload producer.
+/// Hand-written bundles delegate to
+/// [`SpineSpscProducerWithDCache::try_produce_with`].
 pub trait SpscDCacheProducerAccess<T: Copy> {
-    type Slot;
-    fn spsc_dcache_producer(&mut self) -> &mut SpineSpscProducerWithDCache<T, Self::Slot>;
+    fn spsc_dcache_try_produce_with(
+        &mut self,
+        len: Option<usize>,
+        make: impl FnOnce(Option<&mut [u8]>) -> InternalMessage<T>,
+    ) -> Result<(), SpscDCacheProduceError>;
 }
 
-/// Selects a managed payload queue's metadata slot layout from a consumer
-/// bundle.
+/// Operations available while a managed payload consumer is attached.
+///
+/// Obtain this borrowed view from [`SpineSpscDCacheConsumer::try_attached`].
+/// This trait is sealed: only SPSC consumers implement these operations.
+pub trait SpscAttachedDCacheConsumer<T: Copy>: sealed::Attached {
+    fn consume_maybe_track<P, R>(
+        &mut self,
+        producers: &mut P,
+        did_work: &mut bool,
+        read: &mut impl FnMut(T, &[u8]) -> R,
+        handle: &mut impl FnMut(super::DCacheRead<T, R>, &mut P) -> bool,
+    ) -> bool
+    where
+        P: SpineProducers;
+}
+
+/// Attaches a statically selected managed payload consumer.
+/// Hand-written bundles delegate to [`SpineSpscDCacheConsumer::try_attached`].
 pub trait SpscDCacheConsumerAccess<T: Copy> {
-    type Slot;
-    fn spsc_dcache_consumer(&mut self) -> &mut SpineSpscDCacheConsumer<T, Self::Slot>;
+    fn spsc_dcache_try_attached(
+        &mut self,
+    ) -> Result<impl SpscAttachedDCacheConsumer<T> + '_, spsc::QueueError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,18 +113,24 @@ pub enum SpscProduceError {
 /// payloads.
 ///
 /// With an inferred payload, write `SpineSpscQueue::<_>::new(...)` to select
-/// the default slot layout.
-pub struct SpineSpscQueue<T: Copy, Slot = InternalMessage<T>> {
-    inner: spsc::Queue<InternalMessage<T>, Slot>,
+/// the natural slot size.
+/// A positive slot size must accommodate the complete stored message and be a
+/// multiple of its alignment:
+///
+/// ```compile_fail,E0080
+/// let _ = flux::spine::SpineSpscQueue::<u64, 1>::new(2);
+/// ```
+pub struct SpineSpscQueue<T: Copy, const SLOT_SIZE: usize = 0> {
+    inner: spsc::Queue<InternalMessage<T>, SLOT_SIZE>,
 }
 
-impl<T: Copy, Slot> Clone for SpineSpscQueue<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> Clone for SpineSpscQueue<T, SLOT_SIZE> {
     fn clone(&self) -> Self {
         Self { inner: self.inner.clone() }
     }
 }
 
-impl<T: Copy, Slot> SpineSpscQueue<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> SpineSpscQueue<T, SLOT_SIZE> {
     pub fn new(len: usize) -> Self {
         Self { inner: spsc::Queue::new(len) }
     }
@@ -126,7 +175,7 @@ impl<T: Copy, Slot> SpineSpscQueue<T, Slot> {
                     let existing_capacity = if matches!(error, spsc::QueueError::IncompatibleLayout)
                     {
                         // SAFETY: same payload/access contract as the constructor.
-                        unsafe { spsc::Queue::<InternalMessage<T>, Slot>::open_shared(&path) }
+                        unsafe { spsc::Queue::<InternalMessage<T>, SLOT_SIZE>::open_shared(&path) }
                             .ok()
                             .map(|queue| queue.capacity())
                     } else {
@@ -152,20 +201,20 @@ impl<T: Copy, Slot> SpineSpscQueue<T, Slot> {
     }
 }
 
-impl<T: Copy, Slot> fmt::Debug for SpineSpscQueue<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> fmt::Debug for SpineSpscQueue<T, SLOT_SIZE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpineSpscQueue").field("capacity", &self.capacity()).finish_non_exhaustive()
     }
 }
 
 /// A tile's lazily claimed SPSC producer. It cannot be cloned or copied.
-pub struct SpineSpscProducer<T: Copy, Slot = InternalMessage<T>> {
-    queue: SpineSpscQueue<T, Slot>,
-    inner: Option<spsc::Producer<InternalMessage<T>, Slot>>,
+pub struct SpineSpscProducer<T: Copy, const SLOT_SIZE: usize = 0> {
+    queue: SpineSpscQueue<T, SLOT_SIZE>,
+    inner: Option<spsc::Producer<InternalMessage<T>, SLOT_SIZE>>,
 }
 
-impl<T: Copy, Slot> SpineSpscProducer<T, Slot> {
-    pub fn new(queue: SpineSpscQueue<T, Slot>) -> Self {
+impl<T: Copy, const SLOT_SIZE: usize> SpineSpscProducer<T, SLOT_SIZE> {
+    pub fn new(queue: SpineSpscQueue<T, SLOT_SIZE>) -> Self {
         Self { queue, inner: None }
     }
 
@@ -190,8 +239,11 @@ impl<T: Copy, Slot> SpineSpscProducer<T, Slot> {
         Ok(())
     }
 
+    /// Construct and publish after attaching the producer and checking
+    /// capacity. An attachment error or full queue never invokes the
+    /// factory.
     #[inline]
-    pub(crate) fn try_produce_with(
+    pub fn try_produce_with(
         &mut self,
         message: impl FnOnce() -> InternalMessage<T>,
     ) -> Result<(), SpscProduceError> {
@@ -201,7 +253,7 @@ impl<T: Copy, Slot> SpineSpscProducer<T, Slot> {
     }
 }
 
-impl<T: Copy, Slot> fmt::Debug for SpineSpscProducer<T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> fmt::Debug for SpineSpscProducer<T, SLOT_SIZE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpineSpscProducer")
             .field("queue", &self.queue)
@@ -211,21 +263,25 @@ impl<T: Copy, Slot> fmt::Debug for SpineSpscProducer<T, Slot> {
 }
 
 /// A tile's lazily claimed SPSC consumer. Empty reads still claim the role.
-pub struct SpineSpscConsumer<T: Copy, Slot = InternalMessage<T>> {
-    queue: SpineSpscQueue<T, Slot>,
-    inner: Option<spsc::Consumer<InternalMessage<T>, Slot>>,
+pub struct SpineSpscConsumer<T: Copy, const SLOT_SIZE: usize = 0> {
+    queue: SpineSpscQueue<T, SLOT_SIZE>,
+    inner: Option<spsc::Consumer<InternalMessage<T>, SLOT_SIZE>>,
     timer: Timer,
 }
 
 /// Borrows an attached endpoint and timer for repeated consumption.
-pub(super) struct AttachedSpscConsumer<'a, T: Copy, Slot> {
-    inner: &'a mut spsc::Consumer<InternalMessage<T>, Slot>,
+struct AttachedSpscConsumer<'a, T: Copy, const SLOT_SIZE: usize> {
+    inner: &'a mut spsc::Consumer<InternalMessage<T>, SLOT_SIZE>,
     timer: &'a mut Timer,
 }
 
-impl<T: Copy, Slot> AttachedSpscConsumer<'_, T, Slot> {
+impl<T: Copy, const SLOT_SIZE: usize> sealed::Attached for AttachedSpscConsumer<'_, T, SLOT_SIZE> {}
+
+impl<T: Copy, const SLOT_SIZE: usize> SpscAttachedConsumer<T>
+    for AttachedSpscConsumer<'_, T, SLOT_SIZE>
+{
     #[inline]
-    pub(super) fn consume_ref_maybe_track<P, F>(&mut self, producers: &mut P, f: F) -> bool
+    fn consume_ref_maybe_track<P, F>(&mut self, producers: &mut P, f: F) -> bool
     where
         P: SpineProducers,
         F: FnOnce(&T, &mut P) -> bool,
@@ -241,11 +297,7 @@ impl<T: Copy, Slot> AttachedSpscConsumer<'_, T, Slot> {
     }
 
     #[inline]
-    pub(super) fn consume_internal_message_maybe_track<P, F>(
-        &mut self,
-        producers: &mut P,
-        mut f: F,
-    ) -> bool
+    fn consume_internal_message_maybe_track<P, F>(&mut self, producers: &mut P, mut f: F) -> bool
     where
         P: SpineProducers,
         F: FnMut(&mut InternalMessage<T>, &mut P) -> bool,
@@ -261,8 +313,8 @@ impl<T: Copy, Slot> AttachedSpscConsumer<'_, T, Slot> {
     }
 }
 
-impl<T: 'static + Copy, Slot> SpineSpscConsumer<T, Slot> {
-    pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineSpscQueue<T, Slot>) -> Self
+impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> {
+    pub fn attach<D, S, Tl>(base_dir: D, tile: &Tl, queue: SpineSpscQueue<T, SLOT_SIZE>) -> Self
     where
         D: AsRef<Path>,
         S: FluxSpine,
@@ -293,9 +345,7 @@ impl<T: 'static + Copy, Slot> SpineSpscConsumer<T, Slot> {
 
     /// Claim the role if needed, then borrow the endpoint and timer.
     #[inline]
-    pub(super) fn try_attached(
-        &mut self,
-    ) -> Result<AttachedSpscConsumer<'_, T, Slot>, spsc::QueueError> {
+    pub fn try_attached(&mut self) -> Result<impl SpscAttachedConsumer<T> + '_, spsc::QueueError> {
         self.try_attach()?;
         Ok(AttachedSpscConsumer { inner: self.inner.as_mut().unwrap(), timer: &mut self.timer })
     }
@@ -403,7 +453,7 @@ impl<T: 'static + Copy, Slot> SpineSpscConsumer<T, Slot> {
     }
 }
 
-impl<T: 'static + Copy, Slot> fmt::Debug for SpineSpscConsumer<T, Slot> {
+impl<T: 'static + Copy, const SLOT_SIZE: usize> fmt::Debug for SpineSpscConsumer<T, SLOT_SIZE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpineSpscConsumer")
             .field("queue", &self.queue)

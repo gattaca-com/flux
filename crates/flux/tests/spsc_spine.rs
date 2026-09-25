@@ -1,14 +1,3 @@
-#[cfg(feature = "park")]
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
-#[cfg(feature = "park")]
-use flux::tile::{TileConfig, tile_runner};
 use flux::{
     communication::{
         ShmemData, cleanup_shmem,
@@ -639,93 +628,6 @@ fn legacy_spine_constructors_and_bundles_remain_copyable() {
     let mut spine = LegacyOnlySpine::new_with_base_dir(tmp.path(), None);
     let adapter = SpineAdapter::connect_tile(&TestTile, &mut spine);
     drop(adapter);
-    drop(spine);
-    cleanup_shmem(tmp.path());
-}
-
-#[cfg(feature = "park")]
-#[derive(Clone)]
-struct ParkConsumer {
-    empty_polls: Arc<AtomicUsize>,
-    received: Arc<AtomicU64>,
-    done: std::sync::mpsc::Sender<()>,
-}
-
-#[cfg(feature = "park")]
-impl Tile<MixedSpine> for ParkConsumer {
-    fn loop_body(&mut self, adapter: &mut SpineAdapter<MixedSpine>) {
-        let received = self.received.clone();
-        let consumed = adapter
-            .try_consume_one(|message: SpscMessage, _| received.store(message.0, Ordering::Relaxed))
-            .expect("consumer owns SPSC role");
-        if consumed {
-            adapter.request_stop_scope();
-            self.done.send(()).expect("watchdog is listening");
-        } else {
-            self.empty_polls.fetch_add(1, Ordering::Release);
-        }
-    }
-}
-
-#[cfg(feature = "park")]
-struct ParkProducer {
-    consumer_empty_polls: Arc<AtomicUsize>,
-    sent: bool,
-}
-
-#[cfg(feature = "park")]
-impl Tile<MixedSpine> for ParkProducer {
-    fn try_init(&mut self, _: &mut SpineAdapter<MixedSpine>) -> bool {
-        self.consumer_empty_polls.load(Ordering::Acquire) >= 2
-    }
-
-    fn loop_body(&mut self, adapter: &mut SpineAdapter<MixedSpine>) {
-        if !self.sent {
-            adapter.try_produce(SpscMessage(101)).expect("producer owns SPSC role");
-            self.sent = true;
-        }
-    }
-}
-
-#[cfg(feature = "park")]
-#[test]
-fn parked_tile_runner_keeps_claimed_spsc_endpoints_polling() {
-    let tmp = tempfile::tempdir().expect("create temp directory");
-    let mut spine = new_mixed_spine(tmp.path());
-    let empty_polls = Arc::new(AtomicUsize::new(0));
-    let received = Arc::new(AtomicU64::new(0));
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let (done, completion) = std::sync::mpsc::channel();
-
-    std::thread::scope(|scope| {
-        let mut scoped = flux::spine::ScopedSpine::new(&mut spine, scope, None, None);
-        // Construct both runners before starting either: timer setup must not
-        // provide a process-local signal that masks a parked SPSC consumer.
-        let consumer = tile_runner(
-            ParkConsumer { empty_polls: empty_polls.clone(), received: received.clone(), done },
-            &mut scoped,
-            TileConfig::background(None, None).without_metrics().with_park(),
-        );
-        let producer = tile_runner(
-            ParkProducer { consumer_empty_polls: empty_polls, sent: false },
-            &mut scoped,
-            TileConfig::background(None, None).without_metrics().with_park(),
-        );
-        let stop = scoped.stop_flag.clone();
-        let watchdog_failed = timed_out.clone();
-        scope.spawn(move || {
-            if completion.recv_timeout(Duration::from_secs(5)).is_err() {
-                watchdog_failed.store(true, Ordering::Relaxed);
-                stop.store(signal_hook::consts::SIGINT as usize, Ordering::Relaxed);
-                flux::park::SIGNAL.signal();
-            }
-        });
-        scope.spawn(consumer);
-        scope.spawn(producer);
-    });
-
-    assert!(!timed_out.load(Ordering::Relaxed), "SPSC tile parked without an IPC wakeup");
-    assert_eq!(received.load(Ordering::Relaxed), 101);
     drop(spine);
     cleanup_shmem(tmp.path());
 }

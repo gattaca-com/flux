@@ -7,15 +7,13 @@ mod adapters;
 #[path = "../../../benches/queue_support.rs"]
 mod support;
 
-use support::{Case, Message, Settings, abort_on_panic, dispatch_layout};
-
-type Wire<const B: usize> = flux::timing::InternalMessage<Message<B>>;
+use support::{Case, Settings, abort_on_panic, dispatch_layout};
 
 // `<queue>-<telemetry records>`
 const CASES: [&str; 6] =
     ["MPMC-none", "SPMC-none", "SPSC-none", "MPMC-all", "SPMC-all", "SPSC-all"];
 
-fn compare<const B: usize, Slot>(settings: &Settings, telemetry: Option<&str>) {
+fn compare<const B: usize, const SLOT_SIZE: usize>(settings: &Settings, telemetry: Option<&str>) {
     let mut cases = CASES.map(|name| Case::<B>::new(name, settings));
     // Reverse and rotate the order so each case runs in different positions.
     let orders = [
@@ -36,9 +34,9 @@ fn compare<const B: usize, Slot>(settings: &Settings, telemetry: Option<&str>) {
             }
             let case = &mut cases[index];
             if records == "all" {
-                adapters::run::<B, Slot, true>(queue, case, run);
+                adapters::run::<B, SLOT_SIZE, true>(queue, case, run);
             } else {
-                adapters::run::<B, Slot, false>(queue, case, run);
+                adapters::run::<B, SLOT_SIZE, false>(queue, case, run);
             }
         }
     }
@@ -54,5 +52,5 @@ fn main() {
         "choose telemetry none or all"
     );
     settings.print_header();
-    dispatch_layout!(settings, compare, Wire, telemetry.as_deref());
+    dispatch_layout!(settings, compare, telemetry.as_deref());
 }
