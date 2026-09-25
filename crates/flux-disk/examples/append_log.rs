@@ -39,7 +39,11 @@ fn main() {
                 done = true;
             }
             DiskEvent::Failed { op, error, .. } => panic!("write phase failed: {op:?}: {error}"),
-            DiskEvent::Read { .. } | DiskEvent::Truncated { .. } | DiskEvent::Renamed { .. } => {
+            DiskEvent::Read { .. } |
+            DiskEvent::Truncated { .. } |
+            DiskEvent::Renamed { .. } |
+            DiskEvent::Linked { .. } |
+            DiskEvent::Unlinked { .. } => {
                 unreachable!("no reads or structural changes issued in the write phase")
             }
         });
@@ -63,7 +67,9 @@ fn main() {
             DiskEvent::Written { .. } |
             DiskEvent::Synced { .. } |
             DiskEvent::Truncated { .. } |
-            DiskEvent::Renamed { .. } => {
+            DiskEvent::Renamed { .. } |
+            DiskEvent::Linked { .. } |
+            DiskEvent::Unlinked { .. } => {
                 unreachable!("no writes or syncs issued in the read phase")
             }
         });

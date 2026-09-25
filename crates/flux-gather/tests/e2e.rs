@@ -531,6 +531,7 @@ fn gather_end_to_end_sender_to_receiver() {
     assert_single_blob_replay(&recv_disk);
     let replica: Vec<InternalMessage<Telemetry>> = replica.lock().unwrap().clone();
     assert_replica_round_trip(&replica, t0, t1);
+    assert_rewrite_replaces(&recv_disk);
 
     cleanup_shmem(send_base.path());
 }
@@ -560,6 +561,37 @@ fn assert_round_trips(round_trips: &RoundTrips) {
     let problems = round_trips.problems.lock().unwrap().clone();
     assert!(problems.is_empty(), "round trips: {problems:?}");
     assert_eq!(round_trips.ok.load(Ordering::Relaxed), EXPECTED_BLOBS, "files loaded back");
+}
+
+/// A rewrite goes through unlink and link and leaves nothing else in the
+/// directory.
+fn assert_rewrite_replaces(recv_disk: &Path) {
+    let path = test_meta(1, 3).path(recv_disk, Price::NAME);
+    let replacement = fs::read(test_meta(2, 3).path(recv_disk, Price::NAME)).expect("read slot 2");
+    assert_ne!(fs::read(&path).expect("read slot 1"), replacement);
+    let dir = path.parent().expect("slot dir");
+    let entries = fs::read_dir(dir).expect("read dir").count();
+
+    let mut scratch = Scratch::new();
+    let blob = scratch.load(&replacement).expect("blob");
+    let mut io = BlobIo::new();
+    let token = io.write(blob, &path).expect("queue rewrite");
+    let mut events = Vec::new();
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while events.is_empty() {
+        assert!(Instant::now() < deadline, "rewrite never reported");
+        io.poll_with(|event| {
+            events.push(match event {
+                BlobEvent::Written { file } => (file, true),
+                BlobEvent::Loaded { file, .. } | BlobEvent::Failed { file, .. } => (file, false),
+            });
+        });
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    io.drain();
+    assert_eq!(events, vec![(token, true)]);
+    assert_eq!(fs::read(&path).expect("read rewritten"), replacement);
+    assert_eq!(fs::read_dir(dir).expect("read dir").count(), entries);
 }
 
 fn assert_disk_identity(send_disk: &Path, recv_disk: &Path) {
