@@ -1,5 +1,5 @@
-// Expected startup panics run in a separate test process from tile runners:
-// ScopedSpine's global panic hook stops runners even for a caught panic.
+// Separate process: ScopedSpine's panic hook stops runners even for caught
+// panics.
 use flux::{
     communication::{cleanup_shmem, queue::spsc::Queue},
     spine::{SpineSpscProducer, SpineSpscQueue},
@@ -23,10 +23,9 @@ fn spine_startup_waits_for_shared_queue_initialization() {
         .unwrap()
     };
     let mapping = shared_memory::ShmemConf::new().flink(&path).open().unwrap();
-    // Initialization fault injection needs the private layout's first word:
-    // its atomic publication marker. The public constructor cannot pause at
-    // this boundary. No endpoint accesses the fixture while it is unpublished;
-    // all other header fields and slots retain their initialized layout.
+    // The public constructor cannot pause before publication.
+    // The first header word is the publication marker. No endpoint accesses
+    // the fixture while unpublished; the remaining layout stays initialized.
     let ptr = std::ptr::NonNull::new(mapping.as_ptr()).unwrap();
     assert!(mapping.len() >= std::mem::size_of::<AtomicU64>());
     assert!((ptr.as_ptr() as usize).is_multiple_of(std::mem::align_of::<AtomicU64>()));
@@ -38,7 +37,7 @@ fn spine_startup_waits_for_shared_queue_initialization() {
             std::thread::sleep(std::time::Duration::from_millis(50));
             ready.store(magic, Ordering::Release);
         });
-        // SAFETY: the fixture models only a delayed creator's publication.
+        // SAFETY: only the publication marker changes; layout and schema match.
         let opened = unsafe {
             SpineSpscQueue::<u64>::create_or_open_shared_with_base_dir(
                 tmp.path(),
@@ -106,7 +105,7 @@ fn incompatible_startup_names_the_queue_and_preserves_unread_messages() {
 fn stale_queue_link_reports_explicit_cleanup_without_replacing_storage() {
     let tmp = tempfile::tempdir().unwrap();
     let path = shmem_dir_with_base(tmp.path(), "stale").join("spsc/messages");
-    // SAFETY: this fixture has one schema and no other participants.
+    // SAFETY: one schema, no other participants.
     let queue = unsafe {
         SpineSpscQueue::<u64>::create_or_open_shared_with_base_dir(
             tmp.path(),

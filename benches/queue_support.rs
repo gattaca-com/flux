@@ -1,6 +1,3 @@
-// Shared workload, CPU placement and worker lifecycle for the raw and Spine
-// queue benchmarks; see README.md beside this file. The throughput and latency
-// modules own their measured loops and reports.
 use std::{
     collections::HashSet,
     env,
@@ -80,7 +77,6 @@ pub trait Tx<const B: usize>: Send {
 }
 
 pub trait Rx<const B: usize>: Send {
-    // Drain ready messages and return after the first empty read.
     fn drain(&mut self, callback: impl FnMut(&Message<B>));
     fn slot_geometry(&self) -> Option<SlotGeometry> {
         None
@@ -111,7 +107,6 @@ fn source_pool<const B: usize>() -> Vec<Message<B>> {
 struct Credit(AtomicUsize);
 
 impl Credit {
-    // Spins until `end` messages fit in the window; returns the failed checks.
     #[inline(always)]
     fn reserve(&self, end: usize, cached: &mut usize) -> u64 {
         let mut waits = 0;
@@ -131,8 +126,6 @@ impl Credit {
     }
 }
 
-// Sends `count` messages in credited batches; `send` publishes message `index`.
-// Returns the failed credit checks.
 #[inline(always)]
 fn produce<const B: usize, S: Tx<B>>(
     sender: &mut S,
@@ -209,10 +202,6 @@ impl Rounds {
     }
 }
 
-// Validates the endpoints on one pinned producer/consumer pair, then passes
-// them to `producer` and `consumer` on the same threads. Each must call
-// `Rounds::run` once per entry of `counts`. `check` runs on this thread after
-// validation and after every round, with that round's message count.
 fn workers<const B: usize, S: Tx<B>, R: Rx<B>, P: Send, C: Send>(
     sender: S,
     receiver: R,
@@ -229,8 +218,6 @@ fn workers<const B: usize, S: Tx<B>, R: Rx<B>, P: Send, C: Send>(
         consumer_ready: AtomicBool::new(false),
     };
     thread::scope(|scope| {
-        // Each worker owns its endpoint so private cursor state need not share
-        // a cache line with the other endpoint.
         let producer = scope.spawn(move || {
             pin(settings.cpus[0]);
             let mut sender = sender;
@@ -263,8 +250,6 @@ enum Results {
     Latency(latency::Summary),
 }
 
-// One queue/size combination: each repetition validates a fresh queue and
-// measures it in the selected mode; the summary follows the last repetition.
 pub struct Case<'a, const B: usize> {
     name: &'a str,
     settings: &'a Settings,
@@ -281,8 +266,6 @@ impl<'a, const B: usize> Case<'a, B> {
         Self { name, settings, results }
     }
 
-    // `check` runs between rounds, while both workers wait, with the count of
-    // messages the finished round consumed.
     pub fn run(
         &mut self,
         run: usize,
@@ -301,7 +284,6 @@ impl<'a, const B: usize> Case<'a, B> {
                 summary.add(name, B, run, throughput::run(sender, receiver, settings, check));
             }
             Results::Latency(summary) => {
-                // Every case in a repetition uses the same pause sequence.
                 let seed = 0x9e37_79b9 ^ run as u32;
                 let latencies = latency::run(sender, receiver, settings, seed, check);
                 summary.add(name, B, run, &latencies);

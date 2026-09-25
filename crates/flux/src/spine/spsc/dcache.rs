@@ -1,5 +1,3 @@
-//! Managed side payloads whose lifetime follows the SPSC metadata slot.
-
 mod storage;
 
 use std::{
@@ -42,17 +40,7 @@ impl From<SpscProduceError> for SpscDCacheProduceError {
     }
 }
 
-/// A bounded SPSC queue with managed payloads of at most `mtu` bytes.
-///
-/// Each metadata slot owns one payload region. Payload reads hold the metadata
-/// slot, so neither unread nor borrowed bytes can be overwritten. Only managed
-/// writes are supported; no raw `DCache` pointer or independently allocated
-/// reference can be used to bypass the queue's capacity check.
-/// Storage reserves `capacity * round_up(mtu, 64)` bytes, rounded to a power
-/// of two, plus headers. All endpoints retain both allocations.
-///
-/// With an inferred payload, write `SpineSpscDCacheQueue::<_>::new(...)` to
-/// select the natural metadata slot size.
+/// Each metadata slot owns a payload region; a held slot prevents its reuse.
 pub struct SpineSpscDCacheQueue<T: Copy, const SLOT_SIZE: usize = 0> {
     inner: SpineSpscQueue<DCacheMsg<T>, SLOT_SIZE>,
     storage: Storage,
@@ -71,17 +59,10 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscDCacheQueue<T, SLOT_SIZE> {
         Self { inner, storage }
     }
 
-    /// Open persistent metadata and payload storage under `app/shmem/spsc`.
-    /// The payload file link is named `<field_name>.dcache`.
-    /// Both mappings must be removed together, only after every peer detaches.
-    /// Existing mappings are never reset or replaced.
-    ///
     /// # Safety
-    /// All participants must use this queue implementation with matching
-    /// payload types, application schema, architecture, capacity and MTU.
-    /// Metadata must be valid in every process, without process-local pointers.
-    /// No other interface may access either mapping. Inherited endpoints must
-    /// not be used or dropped in a child after `fork`.
+    /// The shared-memory contract of
+    /// [`SpineSpscQueue::create_or_open_shared_with_base_dir`] applies to
+    /// both mappings. Participants must also agree on capacity and MTU.
     pub unsafe fn create_or_open_shared_with_base_dir(
         base_dir: impl AsRef<Path>,
         app: impl AsRef<Path>,
@@ -105,7 +86,6 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscDCacheQueue<T, SLOT_SIZE> {
             len.checked_next_power_of_two().filter(|_| len != 0).expect("invalid SPSC capacity");
         let started = Instant::now();
         let storage = loop {
-            // SAFETY: the caller supplies the shared payload/access contract.
             match unsafe { Storage::create_or_open_shared(&payload_path, capacity, mtu) } {
                 Ok(storage) => break storage,
                 Err(StorageError::Uninitialized) if started.elapsed() < Duration::from_secs(1) => {
@@ -117,8 +97,6 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscDCacheQueue<T, SLOT_SIZE> {
                 ),
             }
         };
-        // The side arena is ready before the metadata queue becomes visible.
-        // SAFETY: the caller supplies the metadata and shared-storage contract.
         let inner = unsafe {
             SpineSpscQueue::create_or_open_shared_with_base_dir(base_dir, app, field_name, len)
         };
@@ -148,10 +126,6 @@ impl<T: Copy, const SLOT_SIZE: usize> fmt::Debug for SpineSpscDCacheQueue<T, SLO
     }
 }
 
-/// Exclusive producer of metadata and managed side payloads.
-///
-/// Payloads cannot be written independently of the queue's capacity gate:
-///
 /// ```compile_fail,E0599
 /// use flux::spine::{SpineSpscDCacheQueue, SpineSpscProducerWithDCache};
 /// let producer = SpineSpscProducerWithDCache::new(SpineSpscDCacheQueue::<u64>::new(8, 256));
@@ -175,12 +149,7 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscProducerWithDCache<T, SLOT_SIZE> 
         self.inner.try_attach()
     }
 
-    /// Fill a payload and construct its metadata only after a slot is free.
-    /// `None` publishes metadata without a payload. Explicit lengths must be
-    /// nonzero and at most the configured MTU. Invalid lengths, attachment
-    /// errors and Full never invoke `make`. A panic publishes nothing.
-    /// The callback must initialize every byte it intends the consumer to use;
-    /// unwritten bytes retain their previous contents.
+    /// Unwritten payload bytes retain previous contents.
     pub fn try_produce_with(
         &mut self,
         len: Option<usize>,
@@ -194,9 +163,8 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscProducerWithDCache<T, SLOT_SIZE> 
         let slot = self.inner.inner.as_ref().unwrap().next_sequence() & (storage.capacity() - 1);
         self.inner.try_produce_with(|| {
             let (message, dref) = if let Some(len) = len {
-                // SAFETY: the core factory runs only with a free metadata
-                // slot. The region is indexed by that publication's sequence,
-                // so it cannot belong to an unread or borrowed slot.
+                // SAFETY: the core factory holds this sequence's free slot;
+                // unread and borrowed slots cannot share its region.
                 let (dref, message) =
                     unsafe { storage.write(slot, len, |bytes| make(Some(bytes))) }
                         .expect("validated SPSC payload region");
@@ -218,7 +186,6 @@ impl<T: Copy, const SLOT_SIZE: usize> fmt::Debug for SpineSpscProducerWithDCache
     }
 }
 
-/// Exclusive consumer of metadata and its callback-scoped payload bytes.
 pub struct SpineSpscDCacheConsumer<T: Copy, const SLOT_SIZE: usize = 0> {
     inner: SpineSpscConsumer<DCacheMsg<T>, SLOT_SIZE>,
     storage: Storage,
@@ -239,7 +206,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscDCacheConsumer<T, SLOT_
             inner: SpineSpscConsumer {
                 queue: queue.inner,
                 inner: None,
-                // Label telemetry with the application type, not DCacheMsg<T>.
                 timer: Timer::new_with_base_dir(
                     base_dir,
                     S::app_name(),
@@ -258,8 +224,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscDCacheConsumer<T, SLOT_
         self.inner.try_attach()
     }
 
-    /// Claim the role if needed, then borrow the endpoint, timer and payload
-    /// storage.
     pub fn try_attached(
         &mut self,
     ) -> Result<impl SpscAttachedDCacheConsumer<T> + '_, spsc::QueueError> {
@@ -292,7 +256,6 @@ impl<T: Copy, const SLOT_SIZE: usize> super::sealed::Attached
 }
 
 impl<T: Copy, const SLOT_SIZE: usize> AttachedDCacheConsumer<'_, T, SLOT_SIZE> {
-    /// Extract while the core slot is held; return owned results after release.
     pub(crate) fn extract<P, R>(
         &mut self,
         producers: &mut P,
@@ -311,8 +274,7 @@ impl<T: Copy, const SLOT_SIZE: usize> AttachedDCacheConsumer<'_, T, SLOT_SIZE> {
             result = Some(if dref.is_none() {
                 DCacheRead::NoRef(user_message)
             } else {
-                // SAFETY: consume_ref retains the metadata slot throughout
-                // read, preventing the sole producer from reusing its region.
+                // SAFETY: consume_ref holds the slot, preventing region reuse.
                 let extracted = unsafe { storage.read(dref, |bytes| read(&user_message, bytes)) }
                     .expect("published SPSC payload descriptor");
                 DCacheRead::Ok((user_message, extracted))

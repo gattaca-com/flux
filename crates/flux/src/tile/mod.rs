@@ -57,8 +57,8 @@ impl TileConfig {
     }
 
     /// Parked tiles wake only on spine producer signals; never for tiles that
-    /// poll sockets or disk. A tile that claims an SPSC endpoint keeps polling,
-    /// since its peer can live outside the process-local signal's reach.
+    /// poll sockets or disk. Claimed SPSC endpoints force polling: peers may be
+    /// in other processes.
     pub fn with_park(mut self) -> Self {
         self.park = true;
         self

@@ -1,7 +1,3 @@
-//! MPMC/SPMC/SPSC through Spine, with consumption telemetry disabled and
-//! enabled. See `README.md` beside this file for how to run it and what it
-//! measures.
-
 #[path = "spine_queues/adapters.rs"]
 mod adapters;
 #[path = "../../../benches/queue_support.rs"]
@@ -9,13 +5,11 @@ mod support;
 
 use support::{Case, Settings, abort_on_panic, dispatch_layout};
 
-// `<queue>-<telemetry records>`
 const CASES: [&str; 6] =
     ["MPMC-none", "SPMC-none", "SPSC-none", "MPMC-all", "SPMC-all", "SPSC-all"];
 
 fn compare<const B: usize, const SLOT_SIZE: usize>(settings: &Settings, telemetry: Option<&str>) {
     let mut cases = CASES.map(|name| Case::<B>::new(name, settings));
-    // Reverse and rotate the order so each case runs in different positions.
     let orders = [
         [0, 1, 5, 2, 4, 3],
         [1, 2, 0, 3, 5, 4],

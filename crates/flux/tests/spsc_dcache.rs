@@ -76,7 +76,6 @@ fn plain_spsc_factory_runs_only_for_free_slots_and_panic_does_not_publish() {
     let mut receiver = SpineAdapter::connect_tile(&Receiver, &mut spine);
     sender.try_produce_with(|| PlainFrame(1)).unwrap();
 
-    // A panicking factory cannot skip a slot or replace the unread sentinel.
     for _ in 0..5 {
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -193,7 +192,6 @@ fn dcache_read_holds_slot_and_handler_runs_after_release() {
         .unwrap();
     let sender = RefCell::new(sender);
 
-    // A payload read borrows its slot; the later handler can publish again.
     assert!(
         receiver
             .try_consume_with_dcache_one(
@@ -255,7 +253,6 @@ fn dcache_panic_does_not_publish_or_advance_and_consumed_slot_is_released() {
         .unwrap();
     sender.begin_loop(IngestionTime::now());
 
-    // Failed factories must not advance into the still-unread first region.
     for _ in 0..5 {
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -567,7 +564,6 @@ fn dcache_new_process_producer_resumes_sequence_with_unread_backlog() {
         sender.try_produce_with_dcache(Frame(2), None::<(usize, fn(&mut [u8]))>).unwrap();
     }
 
-    // An exec'd producer has no process-local slot index from the first owner.
     let output = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("dcache_child_producer_continues_shared_slot")
@@ -709,7 +705,6 @@ fn dcache_configuration_mismatch_and_missing_arena_are_rejected() {
         .is_err()
     );
 
-    // A rejected opener leaves the original queue and its payload intact.
     spine = new_spine(tmp.path());
     let mut receiver = SpineAdapter::connect_tile(&Receiver, &mut spine);
     assert!(

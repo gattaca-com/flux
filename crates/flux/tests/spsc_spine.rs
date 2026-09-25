@@ -79,14 +79,14 @@ impl<S: FluxSpine> Tile<S> for RightTile {
 }
 
 fn new_mixed_spine(base_dir: &std::path::Path) -> MixedSpine {
-    // SAFETY: this test uses one architecture and one schema, passes only repr(C)
-    // copy values, and does not inherit endpoints through fork.
+    // SAFETY: one architecture/schema, repr(C) Copy payloads, no inherited
+    // endpoints.
     unsafe { MixedSpine::new_with_base_dir(base_dir, None) }
 }
 
 fn new_bidirectional_spine(base_dir: &std::path::Path) -> BidirectionalSpine {
-    // SAFETY: this test uses one architecture and one schema, passes only repr(C)
-    // copy values, and does not inherit endpoints through fork.
+    // SAFETY: one architecture/schema, repr(C) Copy payloads, no inherited
+    // endpoints.
     unsafe { BidirectionalSpine::new_with_base_dir(base_dir, None) }
 }
 
@@ -361,8 +361,8 @@ fn mixed_spine_configures_spsc_capacity_and_shared_memory_path() {
     let tmp = tempfile::tempdir().expect("create temp directory");
     let config =
         MixedSpineConfig { legacy: QueueParams { size: 8 }, spsc: QueueParams { size: 3 } };
-    // SAFETY: this test uses one architecture and one schema, passes only repr(C)
-    // copy values, and does not inherit endpoints through fork.
+    // SAFETY: one architecture/schema, repr(C) Copy payloads, no inherited
+    // endpoints.
     let spine =
         unsafe { MixedSpine::new_with_base_dir_and_config(tmp.path(), Some("-custom"), config) };
 

@@ -1,6 +1,3 @@
-//! Raw MPMC, SPMC, SPSC and rtrb: saturated throughput or paced latency.
-//! See `README.md` beside this file for how to run it and what it measures.
-
 #[path = "../../../benches/queue_support.rs"]
 mod support;
 use flux_communication::{

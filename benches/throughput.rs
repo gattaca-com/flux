@@ -1,5 +1,3 @@
-// Saturated throughput: the producer sends as fast as credits allow, and the
-// consumer reads the middle byte of each message.
 use std::{hint::black_box, time::Instant};
 
 use super::{
@@ -45,7 +43,6 @@ fn receive<const B: usize, const WINDOWS: bool>(
     sum
 }
 
-// Returns millions of messages per second.
 pub fn run<const B: usize>(
     sender: impl Tx<B>,
     receiver: impl Rx<B>,
@@ -70,7 +67,6 @@ pub fn run<const B: usize>(
             })
         },
         |receiver, rounds| {
-            // Allocated before timing; each round restarts the same storage.
             let mut windows = WindowSamples::new(WARMUP.max(settings.messages));
             let ends = counts.map(|count| {
                 rounds.run(Role::Consumer, |credit| {
@@ -97,7 +93,6 @@ pub fn run<const B: usize>(
     settings.messages as f64 / end.duration_since(start).as_secs_f64() / 1e6
 }
 
-// Run-to-run throughput moments of one case.
 #[derive(Default)]
 pub struct Summary(Moments);
 

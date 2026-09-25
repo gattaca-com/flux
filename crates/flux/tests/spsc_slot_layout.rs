@@ -48,7 +48,6 @@ impl<S: FluxSpine> Tile<S> for Receiver {
     fn loop_body(&mut self, _: &mut SpineAdapter<S>) {}
 }
 
-// Callers may use their own Result alias beside a generated Spine.
 #[allow(clippy::unnecessary_wraps)]
 fn new_spine(base: &std::path::Path) -> Result<LayoutSpine> {
     // SAFETY: all endpoints use the same schema on one architecture and the
@@ -128,8 +127,6 @@ fn padded_slots_preserve_addresses_values_and_factory_capacity() {
 fn padded_slot_forwards_tracking_and_managed_payloads_reuse() {
     let tmp = tempfile::tempdir().unwrap();
     let mut spine = new_spine(tmp.path()).unwrap();
-    // The managed consumer exposes payload bytes, not metadata slot addresses.
-    // Reopen its metadata queue to check that the macro applied the slot layout.
     let path = shmem_dir_with_base(tmp.path(), "spsc-slot-layout").join("spsc/frames");
     // SAFETY: the exact stored payload/schema, no endpoints or fork; the
     // mismatched default slot is rejected before accessing any payload.

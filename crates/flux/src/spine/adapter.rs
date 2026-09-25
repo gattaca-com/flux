@@ -90,8 +90,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         self.did_work
     }
 
-    /// SPSC peers can be in another process, outside the parking signal's
-    /// reach.
     pub fn requires_polling(&self) -> bool {
         S::requires_polling(&self.consumers, &self.producers)
     }
@@ -127,8 +125,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         self.did_work = true;
     }
 
-    /// Try to publish to an SPSC queue. Only a successful publication counts as
-    /// work. Keep pending output in the tile and retry `Full` on a later loop.
     #[inline]
     pub fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
     where
@@ -139,8 +135,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Construct and publish an SPSC message only if a slot is available.
-    /// An error never invokes `make` or counts as work.
     #[inline]
     pub fn try_produce_with<T: Copy>(
         &mut self,
@@ -154,9 +148,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Publish a managed SPSC payload after checking queue capacity. A full
-    /// queue does not invoke the writer. `None` is received as
-    /// `DCacheRead::NoRef`.
     #[inline]
     pub fn try_produce_with_dcache<T: Copy, F: FnOnce(&mut [u8])>(
         &mut self,
@@ -171,16 +162,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Drain managed SPSC messages. The reader borrows payload bytes while
-    /// the slot is held; the handler receives its owned result after release.
-    /// `None` payloads skip the reader and reach the handler as `NoRef`.
-    /// Timings cover both callbacks, including metadata-only messages.
-    /// Returns whether any message was consumed.
-    /// The reader must not wait for a publication that needs its held slot;
-    /// retain pending output and retry after the slot releases instead.
-    ///
-    /// The extracted result cannot retain a payload reference after release:
-    ///
     /// ```compile_fail
     /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
     /// use spine_derive::from_spine;
@@ -212,10 +193,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         })
     }
 
-    /// Drain managed SPSC messages, recording reader and handler timings only
-    /// when the handler returns true. Untracked messages still count as work
-    /// and propagate ingestion time. The initial clock read is retained.
-    /// SPSC ownership prevents `Lost` and `SpedPast` outcomes.
     #[inline]
     pub fn try_consume_with_dcache_maybe_track<T, R, F, G>(
         &mut self,
@@ -241,9 +218,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(handled)
     }
 
-    /// Consume at most one managed SPSC message, with reader and handler
-    /// telemetry. The slot releases before the handler, or if the reader
-    /// unwinds.
     #[inline]
     pub fn try_consume_with_dcache_one<T, R, F, G>(
         &mut self,
@@ -262,8 +236,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         })
     }
 
-    /// Consume at most one managed SPSC message; the handler selects whether
-    /// to record reader and handler timings, independently of consumption.
     #[inline]
     pub fn try_consume_with_dcache_one_maybe_track<T, R, F, G>(
         &mut self,
@@ -284,8 +256,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         ))
     }
 
-    /// Consume all available SPSC messages. An empty queue is successful; a
-    /// second consumer receives an attachment error.
     #[inline]
     pub fn try_consume<T, F>(
         &mut self,
@@ -302,10 +272,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         })
     }
 
-    /// Drain SPSC values, recording timings only when the callback returns
-    /// true. A false callback result still counts as work and does not stop
-    /// the drain. Ingestion times are propagated and the initial clock read
-    /// is retained.
     #[inline]
     pub fn try_consume_maybe_track<T, F>(
         &mut self,
@@ -321,7 +287,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         })
     }
 
-    /// Consume at most one SPSC message, returning whether one was available.
     #[inline]
     pub fn try_consume_one<T, F>(
         &mut self,
@@ -343,10 +308,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(consumed)
     }
 
-    /// Consume at most one SPSC value, recording timings only when the callback
-    /// returns true. Returns whether a value was consumed; an untracked value
-    /// still counts as work and propagates ingestion time. The initial clock
-    /// read is retained.
     #[inline]
     pub fn try_consume_one_maybe_track<T, F>(
         &mut self,
@@ -367,13 +328,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(consumed)
     }
 
-    /// Drain SPSC payloads by reference, with consumption telemetry.
-    /// Each slot stays occupied through its callback and timing records,
-    /// and is released on return or unwind.
-    ///
-    /// Only SPSC accessors satisfy this method's bound. An MPMC queue is
-    /// rejected at compile time:
-    ///
     /// ```compile_fail,E0277
     /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
     /// use spine_derive::from_spine;
@@ -403,13 +357,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         })
     }
 
-    /// Drain borrowed SPSC payloads, recording timings when the callback
-    /// returns true. Untracked values still count as work, propagate ingestion
-    /// times, and take the initial clock read. Each slot stays occupied through
-    /// its callback and selected records, then releases on return or unwind.
-    ///
-    /// Selective tracking also requires an SPSC queue:
-    ///
     /// ```compile_fail,E0277
     /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
     /// use spine_derive::from_spine;
@@ -440,9 +387,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Borrow at most one SPSC payload, with consumption telemetry.
-    /// The slot stays occupied through the callback and timing records,
-    /// and is released on return or unwind. Returns false when empty.
     #[inline]
     pub fn consume_ref_one<T, F>(
         &mut self,
@@ -464,11 +408,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(consumed)
     }
 
-    /// Borrow at most one SPSC payload, recording timings when the callback
-    /// returns true. An untracked payload still counts as work, propagates its
-    /// ingestion time, and takes the initial clock read. The slot stays
-    /// occupied through the callback and selected records, then releases on
-    /// return or unwind. Returns whether a payload was consumed.
     #[inline]
     pub fn consume_ref_one_maybe_track<T, F>(
         &mut self,
@@ -506,9 +445,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(consumed)
     }
 
-    /// Drain SPSC messages with their tracking metadata. A false callback
-    /// result skips timing records while still counting as work and continuing
-    /// the drain. Ingestion times and the initial clock read are retained.
     #[inline]
     pub fn try_consume_internal_message_maybe_track<T, F>(
         &mut self,
@@ -526,10 +462,6 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Consume at most one SPSC message with its tracking metadata. The
-    /// callback selects whether to record timings; the result reports
-    /// consumption. An untracked message still counts as work and
-    /// propagates ingestion time. The initial clock read is retained.
     #[inline]
     pub fn try_consume_internal_message_one_maybe_track<T, F>(
         &mut self,

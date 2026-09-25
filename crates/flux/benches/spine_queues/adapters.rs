@@ -1,6 +1,3 @@
-//! Heap-backed, single-queue Spines. Explicit bundles allow const-generic
-//! payload sizes without repeating a generated Spine for each size.
-
 use std::path::{Path, PathBuf};
 
 use flux::{
@@ -265,7 +262,6 @@ pub fn run<const B: usize, const SLOT_SIZE: usize, const TRACK: bool>(
     run: usize,
 ) {
     let directory = tempfile::Builder::new().prefix("flux-spine-bench-").tempdir().unwrap();
-    // An abort deliberately retains this unique directory for diagnosis.
     eprintln!("Spine telemetry directory: {}", directory.path().display());
     if queue == "SPSC" {
         // SAFETY: this benchmark's constructor uses only local heap queue storage.
@@ -289,6 +285,5 @@ pub fn run<const B: usize, const SLOT_SIZE: usize, const TRACK: bool>(
         let check = check_telemetry::<B, TRACK>(directory.path());
         case.run(run, Sender(sender), Receiver::<_, TRACK>(receiver), check);
     }
-    // All adapters and the Spine have dropped; clean only this owned directory.
     cleanup_shmem(directory.path());
 }

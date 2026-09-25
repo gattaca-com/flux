@@ -18,8 +18,6 @@ fn factory_preserves_full_panic_publication_and_wrapping_fifo() {
 
     let queue = Queue::<[u64; 19]>::new(2);
     let start = usize::MAX - 1;
-    // Seed an empty queue near counter wrap; reaching it through the public
-    // API would require usize::MAX successful transfers.
     queue.storage.header().write.0.store(start, Ordering::Relaxed);
     queue.storage.header().read.0.store(start, Ordering::Relaxed);
     let mut producer = queue.try_producer().unwrap();
@@ -209,7 +207,6 @@ fn borrowed_slot_is_held_until_callback_returns_or_unwinds() {
     let mut consumer = queue.try_consumer().unwrap();
     producer.produce(&41).unwrap();
 
-    // Moving this capture out also exercises an FnOnce-only callback.
     let owned = String::from("callback state");
     assert!(consumer.consume_ref(|message| {
         drop(owned);
@@ -313,13 +310,10 @@ fn threaded_transfer_keeps_multiword_messages_intact() {
 
 #[test]
 fn progress_queries_remain_bounded_during_transfer() {
-    // While either endpoint queries, only its peer can change availability.
-    // A positive observation must allow an immediate operation.
     for capacity in [1, 2, 8, 64] {
         let queue = Queue::<_>::new(capacity);
         let mut producer = queue.try_producer().unwrap();
         let mut consumer = queue.try_consumer().unwrap();
-        // Exercise repeated slot reuse without requiring a particular transfer rate.
         let messages = capacity * 8;
         thread::scope(|scope| {
             scope.spawn(move || {
@@ -403,7 +397,6 @@ fn shared_mapping_outlives_queue_handles_and_enforces_roles_across_opens() {
     drop(second_open);
     drop(reopened);
 
-    // Endpoints retain their mappings after every queue handle is dropped.
     producer.produce(&47).unwrap();
     let mut value = 0;
     consumer.try_consume(&mut value).unwrap();

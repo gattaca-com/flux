@@ -73,8 +73,6 @@ fn zero_sized_payloads_can_use_nonzero_slots() {
 #[test]
 fn sequence_rollover_preserves_slot_ownership() {
     let queue = Queue::<u64>::new(4);
-    // Counter wrap is part of the sequence contract. Seed an empty queue near
-    // wrap, with no endpoints attached, instead of performing usize::MAX writes.
     let start = usize::MAX - 1;
     queue.storage.header().write.0.store(start, Ordering::Relaxed);
     queue.storage.header().read.0.store(start, Ordering::Relaxed);
@@ -116,7 +114,6 @@ fn invalid_capacities_are_rejected_before_allocation() {
     for capacity in [0, usize::MAX, 1 << (usize::BITS - 1)] {
         assert!(std::panic::catch_unwind(|| Queue::<u64>::new(capacity)).is_err());
     }
-    // Both strides meet the payload contract but cannot form this allocation.
     assert!(std::panic::catch_unwind(|| Queue::<u8, { usize::MAX }>::new(2)).is_err());
     assert!(std::panic::catch_unwind(|| Queue::<u8, { isize::MAX as usize }>::new(1)).is_err());
 }
@@ -172,8 +169,8 @@ mod shared_layout {
     fn padded_shared_slots_validate_both_layouts_and_preserve_unread_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("padded");
-        // SAFETY: every successful participant uses the same u64 payload and
-        // matching slot geometry; no endpoint accesses the mismatch fixtures.
+        // SAFETY: successful participants share u64 and slot geometry;
+        // mismatch fixtures have no endpoints.
         let queue = unsafe { Queue::<u64, 256>::create_or_open_shared(&path, 2) }.unwrap();
         let mut producer = queue.try_producer().unwrap();
         producer.produce(&11).unwrap();
@@ -256,15 +253,12 @@ mod shared_layout {
         crate::cleanup_flink(&path).unwrap();
     }
 
-    // These fixtures model incomplete/incompatible mappings, with no live
-    // endpoints. The public open operation must reject them before slot access.
     fn check_header(mut change: impl FnMut(*mut Header), expected_uninitialized: bool) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spsc");
         let shared = ShmemConf::new().flink(&path).size(size_of::<Header>()).create().unwrap();
         let ptr = NonNull::new(shared.as_ptr()).unwrap().cast::<Header>().as_ptr();
-        // SAFETY: a fresh, aligned mapping holds a Header; no other references
-        // exist. Fields not assigned here have valid zero representations.
+        // SAFETY: exclusive, aligned Header storage; remaining fields accept zero.
         unsafe {
             (&raw mut (*ptr).capacity).write(1);
             (&raw mut (*ptr).element_size).write(size_of::<u64>());
@@ -274,8 +268,7 @@ mod shared_layout {
             (*ptr).ready.store(MAGIC, Ordering::Release);
         }
         change(ptr);
-        // SAFETY: fixture fields are initialized, no process accesses slots,
-        // and the malformed layout must be rejected before a queue is returned.
+        // SAFETY: initialized header, no slot access; malformed layout is rejected.
         let result = unsafe { Queue::<u64>::open_shared(&path) };
         if expected_uninitialized {
             assert!(matches!(result, Err(QueueError::Uninitialized)));
@@ -305,7 +298,6 @@ mod shared_layout {
         for capacity in [0, 3, usize::MAX, 1 << (usize::BITS - 1)] {
             check_header(|ptr| unsafe { (*ptr).capacity = capacity }, false);
         }
-        // A plausible header without enough room for even one slot.
         check_header(|_| {}, false);
 
         let dir = tempfile::tempdir().unwrap();

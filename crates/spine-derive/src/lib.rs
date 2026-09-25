@@ -207,22 +207,14 @@ fn spine_queue_inner_ty(ty: &Type) -> Option<&Type> {
 /// - `size(..)`: queue capacity (default `2usize.pow(15)`).
 /// - `flavour("mpmc")`, `flavour("spmc")`, or `flavour("spsc")`: queue flavour.
 /// - `mtu(..)`: dcache-backed queue with the given max frame size.
-/// - `slot(bytes)`: SPSC byte stride including tracking metadata. Nonzero sizes
-///   select alignment equal to their largest power-of-two divisor. Zero selects
-///   the natural stored message size and alignment.
+/// - `slot(bytes)`: SPSC stride including tracking metadata; zero selects the
+///   stored type's layout. See `flux::communication::queue::spsc::Queue`.
 /// - `gather`: drain this queue into a `BlobCache` via the generated
 ///   `GatherQueues` impl; every gathered type must implement
 ///   `HasVersionedLeaves` and the crate needs a direct `flux-gather`
 ///   dependency. A boundary orders only its own producer thread's messages and
 ///   rings are independent, so drain once more after a boundary before
 ///   flushing.
-///
-/// SPSC queues return `Full` through `SpineAdapter::try_produce`; the caller
-/// keeps pending output and retries. Their endpoints are claimed on first use
-/// and cannot be cloned. SPSC queues with `mtu` use a Spine-managed `DCache`.
-/// SPSC queues do not support `gather`. Spines containing SPSC queues have
-/// unsafe shared-memory constructors; see `SpineSpscQueue` and
-/// `SpineSpscDCacheQueue`.
 #[allow(clippy::too_many_lines)]
 #[proc_macro_attribute]
 pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -660,10 +652,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let constructor_docs = has_spsc.then(|| quote! {
         #[doc = "# Safety"]
         #[doc = ""]
-        #[doc = "All participants must use the same payload types, layout, architecture, and application schema."]
-        #[doc = "Values must be valid in every process, without process-local pointers or references."]
-        #[doc = "All mapping access must use the SPSC queue implementation. Endpoints inherited across `fork` must not be used or dropped in the child."]
-        #[doc = "See the SPSC queue type's `create_or_open_shared_with_base_dir` safety contract."]
+        #[doc = "SPSC fields require [SpineSpscQueue's shared-memory contract](::flux::spine::SpineSpscQueue::create_or_open_shared_with_base_dir)."]
     });
     let call_constructor = |call| {
         if has_spsc {
@@ -732,9 +721,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { Self::new_with_base_dir(base_dir, None) }
     };
 
-    // Reconstruct the input struct without #[queue] attributes on its fields.
-    // For non-SPSC SpineQueue fields with `mtu`, also inject a
-    // `{field}_dcache: DCachePtr` field.
     let input_attrs = &input.attrs;
     let vis = &input.vis;
     let struct_ident = &input.ident;
@@ -750,7 +736,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let colon_token = &f.colon_token;
                 let ty = &f.ty;
 
-                // Dcache and SPSC queues use storage types different from the input marker.
                 if let Some(inner_ty) = spine_queue_inner_ty(ty) {
                     let queue_config = match get_queue_config(&f.attrs) {
                         Ok(config) => config,

@@ -1,4 +1,3 @@
-// Benchmark correctness and numerical tests; no performance assertions.
 #![allow(dead_code, unused_imports, clippy::float_cmp)]
 
 mod workers {
@@ -16,7 +15,6 @@ mod workers {
         }
     }
 
-    // Counts drained messages, so a check can see whether its round finished.
     struct Counted<const B: usize>(mpsc::Receiver<Message<B>>, Arc<AtomicUsize>);
 
     impl<const B: usize> Rx<B> for Counted<B> {
@@ -28,8 +26,6 @@ mod workers {
         }
     }
 
-    // Both workers share one CPU here; this checks the round protocol, not
-    // performance.
     #[test]
     fn checks_follow_each_completed_round() {
         let cpu = core_affinity::get_core_ids().unwrap()[0].id;
@@ -63,7 +59,6 @@ mod workers {
                 Mode::Verify => &[VALIDATION],
                 _ => &[VALIDATION, WARMUP, settings.messages],
             };
-            // Each check sees every message of its round and none of the next.
             let expected: Vec<_> = rounds
                 .iter()
                 .scan(0, |total, &count| {
@@ -206,9 +201,7 @@ mod windows {
         assert!(moments(&[1.]).sample_sd().is_nan());
     }
 
-    // Synthetic clock boundaries exercise coverage without wall-clock noise.
     fn samples(counts: &[usize]) -> WindowSamples {
-        // Room for one mark per count, even where counts repeat a threshold.
         let mut samples = WindowSamples::new(counts.len() * WINDOW_MESSAGES);
         samples.start();
         let start = Instant::now();
@@ -238,7 +231,6 @@ mod windows {
             assert_eq!(m.n, counts.len());
             assert_eq!(m.mean, 3.);
             assert_eq!(m.m2, 0.);
-            // Settling marks cannot survive a new round.
             samples.start();
             let start = Instant::now();
             samples.finish(1, start, start + std::time::Duration::from_nanos(9));

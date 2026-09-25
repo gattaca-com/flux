@@ -38,7 +38,6 @@ pub struct WindowSamples {
 
 impl WindowSamples {
     pub fn new(max_messages: usize) -> Self {
-        // Initialize every entry before the worker starts measuring.
         Self {
             marks: vec![(0, Instant::now()); max_messages.div_ceil(WINDOW_MESSAGES) + 1],
             used: 0,
@@ -46,7 +45,6 @@ impl WindowSamples {
     }
 
     pub fn start(&mut self) {
-        // Reserve the first mark for the producer's start, filled in after join.
         self.used = 1;
     }
 

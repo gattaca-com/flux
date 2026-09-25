@@ -13,8 +13,6 @@ use flux_timing::IngestionTime;
 use flux_utils::{directories::shmem_dir_queues_with_base, short_typename};
 use spine_derive::from_spine;
 
-/// Large enough to exercise a real shared-memory payload path without carrying
-/// process-local state that would make a Spine mapping invalid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 struct Payload {
@@ -57,8 +55,8 @@ impl<S: FluxSpine> Tile<S> for Receiver {
 }
 
 fn new_spine(base_dir: &std::path::Path) -> BorrowedSpine {
-    // SAFETY: this test uses one architecture and schema, passes repr(C) Copy
-    // values without pointers, and does not inherit endpoints through fork.
+    // SAFETY: one architecture/schema, repr(C) Copy payloads without pointers,
+    // no inherited endpoints.
     unsafe { BorrowedSpine::new_with_base_dir(base_dir, None) }
 }
 

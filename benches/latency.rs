@@ -1,6 +1,3 @@
-// Paced one-way latency: the producer pauses, then stamps each message with an
-// ordered counter read; the consumer records every difference in its own
-// histogram.
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{Ordering, compiler_fence};
 use std::{
@@ -48,8 +45,6 @@ pub fn read_timestamp(message: &[u8]) -> Instant {
 }
 
 pub struct Latencies {
-    // Store ticks; conversion to nanoseconds happens when reporting, not on
-    // the consumer's critical path. Three significant digits bound bin width.
     histogram: Histogram<u64>,
     previous_end: u64,
     pub overlapping_sends: u64,
@@ -67,13 +62,11 @@ impl Latencies {
             assert!(__cpuid(0x8000_0001).edx & (1 << 27) != 0, "RDTSCP required");
             assert!(__cpuid(0x8000_0007).edx & (1 << 8) != 0, "invariant TSC required");
         }
-        // Initialize the shared clock and conversion before timing.
         let highest = Duration::from_secs(60).0;
         let _ = Instant::now();
         let _ = Duration(1).as_nanos();
         let mut histogram = Histogram::new_with_bounds(1, highest, 3).unwrap();
         histogram.auto(false);
-        // Touch all histogram storage before timing; reset keeps it allocated.
         histogram.record(highest).unwrap();
         histogram.reset();
         Self { histogram, previous_end: 0, overlapping_sends: 0 }
@@ -105,7 +98,6 @@ impl Latencies {
     }
 
     pub fn mean_and_stdev_ns(&self) -> (f64, f64) {
-        // Scale fractional tick statistics without rounding to whole nanoseconds.
         (self.histogram.mean() * ns_per_tick(), self.histogram.stdev() * ns_per_tick())
     }
 
@@ -126,8 +118,6 @@ fn random(state: &mut u32) -> u32 {
     *state
 }
 
-// Pauses for a random count within `pauses`, then stamps and sends each
-// message. Returns the sum of sent timestamps and the failed credit checks.
 #[inline(never)]
 fn send<const B: usize>(
     tx: &mut impl Tx<B>,
@@ -154,7 +144,6 @@ fn send<const B: usize>(
     (stamps, waits)
 }
 
-// Returns the sum of received timestamps.
 #[inline(never)]
 fn receive<const B: usize>(
     rx: &mut impl Rx<B>,
@@ -193,7 +182,6 @@ pub fn run<const B: usize>(
     seed: u32,
     check: impl FnMut(usize),
 ) -> Latencies {
-    // Stamp the source pool in place rather than preparing a separate message.
     let mut pool = source_pool::<B>();
     let counts = [WARMUP, settings.messages];
     let (produced, (consumed, latencies)) = workers(
@@ -236,7 +224,6 @@ pub fn run<const B: usize>(
     latencies
 }
 
-// Pooled message latencies of one case.
 #[derive(Default)]
 pub struct Summary {
     runs: usize,

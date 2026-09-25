@@ -1,14 +1,4 @@
-//! Fixed payload regions owned by SPSC metadata slots.
-//!
-//! The core queue's producer and consumer cursors govern access to these
-//! regions. A producer may write a region only while its metadata slot is free;
-//! a consumer may read it only while it holds that slot. Its release/acquire
-//! publication orders payload bytes. Neither a region nor a borrowed slice may
-//! outlive the corresponding slot ownership.
-//!
-//! Each region uses the metadata slot's index, derived from the core producer's
-//! next sequence number. The core cursor also governs endpoint replacement,
-//! messages without payloads, and sequence rollover.
+//! Fixed payload regions indexed by SPSC metadata slots.
 
 use std::{
     alloc::Layout,
@@ -90,11 +80,9 @@ struct Inner {
     stride: usize,
 }
 
-// SAFETY: the cached DCache pointer addresses the allocation retained by
-// `_backing`. Only an attached producer may write a region and only a consumer
-// holding the matching metadata slot may read it. The core queue's cursor
-// publication orders these accesses. Shmem may be unmapped on any thread
-// after the last Arc handle is dropped.
+// SAFETY: `_backing` retains the DCache allocation. The core cursor orders
+// writes by the sole producer and reads under the matching held slot. Shmem
+// may unmap on any thread after the last Arc drops.
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Inner {}
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -104,13 +92,9 @@ unsafe impl Sync for Inner {}
 pub(super) struct Storage(Arc<Inner>);
 
 impl Storage {
-    /// Allocate one fixed payload region per metadata queue slot.
-    ///
-    /// `capacity` is the already rounded core queue capacity.
     pub(super) fn new(capacity: usize, mtu: usize) -> Self {
         let shape = shape(capacity, mtu).expect("invalid SPSC DCache configuration");
         let cache = DCache::new(shape.data_capacity);
-        // SAFETY: the Arc retains the allocation for every clone of Storage.
         let ptr = unsafe { DCachePtr::from_raw(Arc::as_ptr(&cache)) };
         Self(Arc::new(Inner {
             cache: ptr,
@@ -121,14 +105,10 @@ impl Storage {
         }))
     }
 
-    /// Create or open persistent storage without changing an existing arena.
-    /// The parent directory must already exist. A concurrent creator may leave
-    /// an opening process observing `Uninitialized` until it publishes MAGIC.
-    ///
     /// # Safety
-    /// All participants must agree on the architecture and application schema
-    /// and access payloads solely under the matching core SPSC queue's slot
-    /// ownership protocol. Inherited handles must not be used after `fork`.
+    /// All participants must agree on architecture, layout and schema. Access
+    /// payloads only under the matching queue's slot ownership. Do not use
+    /// inherited handles after `fork`.
     pub(super) unsafe fn create_or_open_shared(
         path: impl AsRef<Path>,
         capacity: usize,
@@ -143,22 +123,15 @@ impl Storage {
                 {
                     return Err(StorageError::IncompatibleLayout);
                 }
-                // A new shared-memory object is zero-filled by the OS. Leave
-                // ready at zero while initializing the immutable header fields.
+                // New mappings are zero-filled; ready stays 0 until published.
                 let header = ptr.cast::<Header>();
-                // SAFETY: only the creator writes these fields, and openers
-                // read them after the ready flag's Release/Acquire handshake.
                 unsafe {
                     (&raw mut (*header.as_ptr()).capacity).write(capacity);
                     (&raw mut (*header.as_ptr()).mtu).write(mtu);
                 }
-                // SAFETY: the checked layout reserves the full aligned DCache
-                // prefix and data region, and the mapping remains owned below.
                 let cache_ptr = unsafe { ptr.as_ptr().add(shape.dcache_offset) };
                 let raw_cache = DCache::from_ptr(cache_ptr, shape.data_capacity);
-                // SAFETY: the pointer remains valid through mapping ownership.
                 let cache = unsafe { DCachePtr::from_raw(raw_cache) };
-                // SAFETY: Header is aligned and initialized above.
                 unsafe { header.as_ref().ready.store(MAGIC, Ordering::Release) };
                 mapping.set_owner(false);
                 Ok(Self(Arc::new(Inner {
@@ -169,10 +142,9 @@ impl Storage {
                     stride: shape.stride,
                 })))
             }
-            Err(ShmemError::LinkExists) => {
-                // SAFETY: inherited from this function's shared-memory contract.
-                unsafe { Self::open_shared(path, capacity, mtu, &shape) }
-            }
+            Err(ShmemError::LinkExists) => unsafe {
+                Self::open_shared(path, capacity, mtu, &shape)
+            },
             Err(error) => Err(error.into()),
         }
     }
@@ -191,15 +163,13 @@ impl Storage {
             return Err(StorageError::IncompatibleLayout);
         }
         let header = ptr.cast::<Header>();
-        // SAFETY: bounds and alignment permit borrowing ready alone. The
-        // creator may still be writing the other, non-atomic header fields.
+        // SAFETY: bounds/alignment checked; only ready may be read before publication.
         let ready = unsafe { &(*header.as_ptr()).ready };
         match ready.load(Ordering::Acquire) {
             0 => return Err(StorageError::Uninitialized),
             MAGIC => {}
             _ => return Err(StorageError::IncompatibleLayout),
         }
-        // SAFETY: acquiring MAGIC observes the creator's header writes.
         let stored = unsafe { header.as_ref() };
         if stored.capacity != capacity ||
             stored.mtu != mtu ||
@@ -208,10 +178,8 @@ impl Storage {
         {
             return Err(StorageError::IncompatibleLayout);
         }
-        // SAFETY: the validated mapping spans the DCache prefix and data.
         let cache_ptr = unsafe { ptr.as_ptr().add(shape.dcache_offset) };
         let raw_cache = DCache::from_ptr(cache_ptr, shape.data_capacity);
-        // SAFETY: the pointer remains valid through mapping ownership.
         let cache = unsafe { DCachePtr::from_raw(raw_cache) };
         Ok(Self(Arc::new(Inner {
             cache,
@@ -240,12 +208,9 @@ impl Storage {
         }
     }
 
-    /// Write a free metadata slot's fixed payload region.
-    ///
     /// # Safety
-    /// The caller must own the sole producer role and a free metadata slot
-    /// corresponding to `slot`. It must publish that slot only after this
-    /// function returns, and must not concurrently write the same region.
+    /// The caller must own the producer role and the free metadata slot `slot`,
+    /// publish only after this returns, and prevent concurrent region writes.
     pub(super) unsafe fn write<R>(
         &self,
         slot: usize,
@@ -261,11 +226,9 @@ impl Storage {
         Ok((dref, result))
     }
 
-    /// Read a payload while its metadata queue slot remains held.
-    ///
     /// # Safety
-    /// The caller must hold the corresponding metadata slot for the entire
-    /// callback, and no producer may reuse its region during that callback.
+    /// The caller must hold the matching slot throughout the callback and
+    /// prevent its region from being reused.
     pub(super) unsafe fn read<R>(
         &self,
         dref: DCacheRef,
@@ -336,8 +299,6 @@ mod tests {
         let mapping = ShmemConf::new().flink(&path).size(layout.layout.size()).create().unwrap();
         let header = NonNull::new(mapping.as_ptr()).unwrap().cast::<Header>().as_ptr();
         let old_magic = u64::from_le_bytes(*b"FXSDCH01");
-        // Model the former format's header prefix in otherwise valid storage.
-        // Its header was also 64 bytes, so size checks alone cannot reject it.
         // SAFETY: this test exclusively owns the aligned, zero-filled mapping;
         // no endpoints exist and only header validation will access it.
         unsafe {

@@ -1,14 +1,3 @@
-//! SPSC endpoints used by generated Spine bundles.
-//!
-//! Endpoints are claimed on first use, so attaching a tile does not reserve
-//! queues it never uses. Call `try_attach` during `Tile::on_attach` to reserve
-//! a role before workers start. A second owner receives an error. Dropping the
-//! bundle releases its roles; unread messages remain available to replacements.
-//!
-//! SPSC operations require polling, including after `Full` or an empty read.
-//! The tile runner does not park a tile with a claimed SPSC endpoint: the
-//! process-local parking signal cannot wake peers in other processes.
-
 mod dcache;
 
 use std::{
@@ -31,8 +20,6 @@ mod sealed {
     pub trait Attached {}
 }
 
-/// Publishes through a statically selected SPSC producer in a bundle.
-/// Hand-written bundles delegate to [`SpineSpscProducer::try_produce_with`].
 pub trait SpscProducerAccess<T: Copy> {
     fn spsc_try_produce_with(
         &mut self,
@@ -40,9 +27,6 @@ pub trait SpscProducerAccess<T: Copy> {
     ) -> Result<(), SpscProduceError>;
 }
 
-/// Operations available while a consumer role is attached.
-/// Obtain this borrowed view from [`SpineSpscConsumer::try_attached`].
-/// This trait is sealed: only SPSC consumers implement these operations.
 pub trait SpscAttachedConsumer<T: Copy>: sealed::Attached {
     fn consume_ref_maybe_track<P, F>(&mut self, producers: &mut P, f: F) -> bool
     where
@@ -55,15 +39,10 @@ pub trait SpscAttachedConsumer<T: Copy>: sealed::Attached {
         F: FnMut(&mut InternalMessage<T>, &mut P) -> bool;
 }
 
-/// Attaches a statically selected SPSC consumer in a bundle.
-/// Hand-written bundles delegate to [`SpineSpscConsumer::try_attached`].
 pub trait SpscConsumerAccess<T: Copy> {
     fn spsc_try_attached(&mut self) -> Result<impl SpscAttachedConsumer<T> + '_, spsc::QueueError>;
 }
 
-/// Publishes through a statically selected managed payload producer.
-/// Hand-written bundles delegate to
-/// [`SpineSpscProducerWithDCache::try_produce_with`].
 pub trait SpscDCacheProducerAccess<T: Copy> {
     fn spsc_dcache_try_produce_with(
         &mut self,
@@ -72,10 +51,6 @@ pub trait SpscDCacheProducerAccess<T: Copy> {
     ) -> Result<(), SpscDCacheProduceError>;
 }
 
-/// Operations available while a managed payload consumer is attached.
-///
-/// Obtain this borrowed view from [`SpineSpscDCacheConsumer::try_attached`].
-/// This trait is sealed: only SPSC consumers implement these operations.
 pub trait SpscAttachedDCacheConsumer<T: Copy>: sealed::Attached {
     fn consume_maybe_track<P, R>(
         &mut self,
@@ -88,8 +63,6 @@ pub trait SpscAttachedDCacheConsumer<T: Copy>: sealed::Attached {
         P: SpineProducers;
 }
 
-/// Attaches a statically selected managed payload consumer.
-/// Hand-written bundles delegate to [`SpineSpscDCacheConsumer::try_attached`].
 pub trait SpscDCacheConsumerAccess<T: Copy> {
     fn spsc_dcache_try_attached(
         &mut self,
@@ -104,19 +77,6 @@ pub enum SpscProduceError {
     Attach(#[from] spsc::QueueError),
 }
 
-/// A Spine queue with one producer and one consumer across all processes.
-///
-/// `#[queue(flavour("spsc"))]` rewrites a `SpineQueue<T>` field to this type.
-/// Such spines use unsafe shared-memory constructors and non-cloneable endpoint
-/// bundles. Broadcast, collaborative consumers and gather are unavailable.
-/// Adding `mtu(...)` selects [`SpineSpscDCacheQueue`] for managed side
-/// payloads.
-///
-/// With an inferred payload, write `SpineSpscQueue::<_>::new(...)` to select
-/// the natural slot size.
-/// A positive slot size must accommodate the complete stored message and be a
-/// multiple of its alignment:
-///
 /// ```compile_fail,E0080
 /// let _ = flux::spine::SpineSpscQueue::<u64, 1>::new(2);
 /// ```
@@ -135,19 +95,9 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscQueue<T, SLOT_SIZE> {
         Self { inner: spsc::Queue::new(len) }
     }
 
-    /// Create or open an SPSC mapping under `app/shmem/spsc/field_name`.
-    /// This directory keeps the distinct layout away from broadcast discovery.
-    /// An initializing creator is retried for up to one second. Existing
-    /// mappings and file links are never reset, including stale links left
-    /// after a reboot. Once all participants have stopped, remove stale storage
-    /// with [`crate::communication::cleanup_flink`] before restarting them.
-    ///
     /// # Safety
-    /// All participants must use the same payload type, layout, architecture
-    /// and application schema. Values must be valid in every process, with no
-    /// process-local pointers or references. All access must use this queue
-    /// implementation. Inherited endpoints must not be used or dropped in a
-    /// child after `fork`. See [`spsc::Queue::create_or_open_shared`].
+    /// The shared-memory contract of [`spsc::Queue::create_or_open_shared`]
+    /// applies.
     pub unsafe fn create_or_open_shared_with_base_dir(
         base_dir: impl AsRef<Path>,
         app: impl AsRef<Path>,
@@ -161,7 +111,6 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscQueue<T, SLOT_SIZE> {
         let path = directory.join(field_name);
         let started = Instant::now();
         loop {
-            // SAFETY: the caller supplies the shared-memory payload/access contract.
             match unsafe { spsc::Queue::create_or_open_shared(&path, len) } {
                 Ok(inner) => return Self { inner },
                 Err(spsc::QueueError::Uninitialized)
@@ -170,11 +119,8 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscQueue<T, SLOT_SIZE> {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => {
-                    // An otherwise compatible mapping can explain a capacity
-                    // mismatch without accessing the core queue's private header.
                     let existing_capacity = if matches!(error, spsc::QueueError::IncompatibleLayout)
                     {
-                        // SAFETY: same payload/access contract as the constructor.
                         unsafe { spsc::Queue::<InternalMessage<T>, SLOT_SIZE>::open_shared(&path) }
                             .ok()
                             .map(|queue| queue.capacity())
@@ -207,7 +153,6 @@ impl<T: Copy, const SLOT_SIZE: usize> fmt::Debug for SpineSpscQueue<T, SLOT_SIZE
     }
 }
 
-/// A tile's lazily claimed SPSC producer. It cannot be cloned or copied.
 pub struct SpineSpscProducer<T: Copy, const SLOT_SIZE: usize = 0> {
     queue: SpineSpscQueue<T, SLOT_SIZE>,
     inner: Option<spsc::Producer<InternalMessage<T>, SLOT_SIZE>>,
@@ -222,7 +167,6 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscProducer<T, SLOT_SIZE> {
         self.inner.is_some()
     }
 
-    /// Reserve the producer role. Repeated calls on this handle are no-ops.
     pub fn try_attach(&mut self) -> Result<(), spsc::QueueError> {
         if self.inner.is_none() {
             self.inner = Some(self.queue.inner.try_producer()?);
@@ -230,8 +174,6 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscProducer<T, SLOT_SIZE> {
         Ok(())
     }
 
-    /// Publish a message, preserving its tracking metadata. A full queue is
-    /// unchanged; the caller retains the message for retry.
     #[inline]
     pub fn try_produce(&mut self, message: &InternalMessage<T>) -> Result<(), SpscProduceError> {
         self.try_attach()?;
@@ -239,9 +181,6 @@ impl<T: Copy, const SLOT_SIZE: usize> SpineSpscProducer<T, SLOT_SIZE> {
         Ok(())
     }
 
-    /// Construct and publish after attaching the producer and checking
-    /// capacity. An attachment error or full queue never invokes the
-    /// factory.
     #[inline]
     pub fn try_produce_with(
         &mut self,
@@ -262,14 +201,12 @@ impl<T: Copy, const SLOT_SIZE: usize> fmt::Debug for SpineSpscProducer<T, SLOT_S
     }
 }
 
-/// A tile's lazily claimed SPSC consumer. Empty reads still claim the role.
 pub struct SpineSpscConsumer<T: Copy, const SLOT_SIZE: usize = 0> {
     queue: SpineSpscQueue<T, SLOT_SIZE>,
     inner: Option<spsc::Consumer<InternalMessage<T>, SLOT_SIZE>>,
     timer: Timer,
 }
 
-/// Borrows an attached endpoint and timer for repeated consumption.
 struct AttachedSpscConsumer<'a, T: Copy, const SLOT_SIZE: usize> {
     inner: &'a mut spsc::Consumer<InternalMessage<T>, SLOT_SIZE>,
     timer: &'a mut Timer,
@@ -335,7 +272,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> 
         self.inner.is_some()
     }
 
-    /// Reserve the consumer role. Repeated calls on this handle are no-ops.
     pub fn try_attach(&mut self) -> Result<(), spsc::QueueError> {
         if self.inner.is_none() {
             self.inner = Some(self.queue.inner.try_consumer()?);
@@ -343,15 +279,12 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> 
         Ok(())
     }
 
-    /// Claim the role if needed, then borrow the endpoint and timer.
     #[inline]
     pub fn try_attached(&mut self) -> Result<impl SpscAttachedConsumer<T> + '_, spsc::QueueError> {
         self.try_attach()?;
         Ok(AttachedSpscConsumer { inner: self.inner.as_mut().unwrap(), timer: &mut self.timer })
     }
 
-    /// Consume one value with Spine ingestion/latency tracking. The message is
-    /// removed before the callback, including if the callback panics.
     #[inline]
     pub fn try_consume<P, F>(
         &mut self,
@@ -365,11 +298,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> 
         self.try_consume_internal_message(producers, |message, p| f(message.into_data(), p))
     }
 
-    /// Consume one value, recording processing time and latency only when the
-    /// callback returns true. A false callback result still consumes the value
-    /// and propagates its ingestion time. The initial clock read is retained.
-    /// Returns whether a value was consumed, independently of the tracking
-    /// choice.
     #[inline]
     pub fn try_consume_maybe_track<P, F>(
         &mut self,
@@ -385,9 +313,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> 
         })
     }
 
-    /// Borrow one payload in its queue slot, with consumption telemetry.
-    /// The slot stays occupied through the callback and timing records, and
-    /// is released on return or unwind. Returns false when empty.
     #[inline]
     pub fn consume_ref<P, F>(&mut self, producers: &mut P, f: F) -> Result<bool, spsc::QueueError>
     where
@@ -400,11 +325,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> 
         })
     }
 
-    /// Borrow one payload, recording timings only when the callback returns
-    /// true. A false result still consumes it and propagates its ingestion
-    /// time. The initial clock read is retained. The slot stays occupied
-    /// through the callback and selected records, then releases on return or
-    /// unwind. Returns whether a payload was consumed.
     #[inline]
     pub fn consume_ref_maybe_track<P, F>(
         &mut self,
@@ -418,7 +338,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> 
         Ok(self.try_attached()?.consume_ref_maybe_track(producers, f))
     }
 
-    /// Consume one message, including its original tracking metadata.
     #[inline]
     pub fn try_consume_internal_message<P, F>(
         &mut self,
@@ -435,10 +354,6 @@ impl<T: 'static + Copy, const SLOT_SIZE: usize> SpineSpscConsumer<T, SLOT_SIZE> 
         })
     }
 
-    /// Consume one message with its original tracking metadata. The callback's
-    /// return value controls timing records, not consumption or ingestion-time
-    /// propagation. The initial clock read is retained. The message is removed
-    /// before the callback, including if it panics.
     #[inline]
     pub fn try_consume_internal_message_maybe_track<P, F>(
         &mut self,

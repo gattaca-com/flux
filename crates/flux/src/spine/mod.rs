@@ -1,38 +1,12 @@
 //! Typed queues connecting tiles.
 //!
-//! Select `#[queue(flavour("spsc"))]` for a bounded queue with one producer and
-//! one consumer across threads or processes. Use `try_produce` and
-//! `try_consume_one` (or `try_consume` to drain); `Full` leaves unread messages
-//! intact. Retain pending output and retry it before consuming more input.
-//! `try_consume_maybe_track` and `try_consume_one_maybe_track` let callbacks
-//! return false to skip processing-time and latency records for a message.
-//! Consumption and ingestion-time propagation still occur, as does the initial
-//! clock read. The ordinary consume methods record timings for every message.
-//! For SPSC queues, `consume_ref` and `consume_ref_one` pass `&T` directly
-//! from the slot, keeping it occupied through the callback and timing records.
-//! Their `maybe_track` variants select telemetry in the same way. The slot
-//! releases on return or unwind, and the callback cannot retain its reference.
-//! A borrowed callback must not wait for output that needs its occupied slot
-//! to become free; see
-//! [`crate::communication::queue::spsc::Consumer::consume_ref`].
+//! `#[queue(flavour("spsc"))]` uses one producer and consumer. On `Full`,
+//! retain pending output for retry: consuming input is not rolled back. A
+//! borrowed callback holds its slot and must not wait for output that needs it.
 //!
-//! Add `slot(bytes)` to an SPSC field to set its byte stride. The stride must
-//! accommodate the complete `InternalMessage<T>` (or
-//! `InternalMessage<DCacheMsg<T>>` with `mtu`) and be a multiple of that
-//! message's alignment. An explicit nonzero size selects alignment equal to
-//! its largest power-of-two divisor: `slot(256)` aligns slots to 256 bytes,
-//! while `slot(48)` aligns them to 16 bytes. Omit `slot` or use `slot(0)` for
-//! the natural stored message size and alignment. All participants opening
-//! a shared mapping must use the same effective stride and slot alignment.
-//! Incompatible mappings are rejected; recreate them only after all
-//! participants detach. Managed `DCache` side payloads have a separate layout.
-//! Generated bundles select the queue through [`SpscProducerAccess`],
-//! [`SpscConsumerAccess`], [`SpscDCacheProducerAccess`] and
-//! [`SpscDCacheConsumerAccess`]. Hand-written bundles used through the adapter
-//! implement the corresponding traits too.
-//!
-//! A stride smaller than the complete stored message is rejected when the
-//! queue constructor is instantiated:
+//! Shared participants must agree on the effective `slot(bytes)` stride and
+//! alignment. Zero/omission uses the stored type's layout; a nonzero stride
+//! must fit the entire stored message.
 //!
 //! ```compile_fail,E0080
 //! use flux::{communication::ShmemData, tile::TileInfo};
@@ -91,27 +65,11 @@
 //! let spine = unsafe { Readings::new(None) };
 //! ```
 //!
-//! SPSC endpoints are claimed lazily, or explicitly with the generated field's
-//! `try_attach` in `Tile::on_attach`. Dropping a bundle releases its roles; an
-//! additional producer or consumer gets an attachment error. Endpoint bundles
-//! in SPSC-enabled spines cannot be cloned. Claimed roles keep their tile
-//! polling even with `TileConfig::with_park()`, since parking signals are
-//! process-local. A crashed owner leaves its role claimed; reset storage only
-//! after all peers have detached. SPSC mappings live under
-//! `app/shmem/spsc/<field>` and are not included in broadcast queue discovery.
-//! With `mtu(...)`, use `try_produce_with_dcache` and
-//! `try_consume_with_dcache` (or its `_one` variant). Capacity is checked
-//! before the payload writer runs. `None` publishes a metadata-only message
-//! received as `DCacheRead::NoRef`. The payload reader holds the slot; the
-//! handler runs after release. The `_maybe_track` variants let the handler
-//! select telemetry for the reader and handler together, including
-//! metadata-only messages. Managed payload storage lives at `<field>.dcache`;
-//! remove it together with its metadata mapping only after all peers detach.
-//! Raw `DCache` pointers, independently published references, and `gather` are
-//! unsupported for SPSC.
+//! SPSC roles are claimed on first use; a crashed owner leaves its role
+//! claimed. Remove shared storage only after all peers detach. Claimed roles
+//! require polling because parking signals are process-local.
 //!
-//! Constructing shared SPSC storage requires acknowledging the payload
-//! contract:
+//! With `mtu(...)`, remove metadata and payload mappings together.
 //!
 //! ```compile_fail,E0133
 //! use flux::{communication::ShmemData, tile::TileInfo};
@@ -124,8 +82,6 @@
 //! }
 //! let app = App::new(None);
 //! ```
-//!
-//! Owning a producer bundle does not allow duplicating its SPSC role:
 //!
 //! ```compile_fail,E0599
 //! use flux::{communication::ShmemData, tile::TileInfo};
@@ -225,9 +181,6 @@ pub trait SpineProducers {
     fn timestamp(&self) -> &TrackingTimestamp;
     fn timestamp_mut(&mut self) -> &mut TrackingTimestamp;
 
-    /// Publish to an SPSC queue, returning `Full` for caller-managed retry.
-    /// No message is published on error. Retain pending output in the tile
-    /// when forwarding from a consume callback; consumption is not rolled back.
     fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
     where
         Self: SpscProducerAccess<T>,
@@ -236,8 +189,6 @@ pub trait SpineProducers {
         self.spsc_try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
-    /// Construct a message only once an SPSC slot is available. Errors never
-    /// invoke `make`; a panic publishes nothing and leaves the slot free.
     fn try_produce_with<T: Copy>(
         &mut self,
         make: impl FnOnce() -> T,
@@ -249,9 +200,6 @@ pub trait SpineProducers {
         self.spsc_try_produce_with(|| InternalMessage::new(timestamp, make()))
     }
 
-    /// Publish metadata and a managed SPSC payload. `Full` never invokes the
-    /// writer or changes unread payload bytes. `None` publishes without a
-    /// payload; explicit lengths must be nonzero and at most the queue's MTU.
     fn try_produce_with_dcache<T: Copy, F: FnOnce(&mut [u8])>(
         &mut self,
         data: T,
@@ -269,7 +217,6 @@ pub trait SpineProducers {
         })
     }
 
-    /// Managed SPSC publication with an explicit ingestion timestamp.
     fn try_produce_with_dcache_and_ingestion<T: Copy, F: FnOnce(&mut [u8])>(
         &mut self,
         data: T,
@@ -300,8 +247,6 @@ pub trait SpineProducers {
         self.spsc_try_produce_with(|| InternalMessage::new(timestamp, data))
     }
 
-    /// Forward a message to an SPSC queue without changing its tracking
-    /// metadata.
     fn try_forward<T: Copy>(&mut self, message: &InternalMessage<T>) -> Result<(), SpscProduceError>
     where
         Self: SpscProducerAccess<T>,
@@ -382,21 +327,13 @@ pub trait FluxSpine: Sized + Send {
 
     fn attach_consumers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Consumers;
     fn attach_producers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Producers;
-    /// Construct a spine with shared-memory queues.
-    ///
     /// # Safety
-    /// For SPSC fields, all processes must agree on payload types, layout and
-    /// architecture, use process-independent values and access the mapping only
-    /// through the queue interface. Inherited endpoints must not be used or
-    /// dropped after `fork`. See
-    /// [`SpineSpscQueue::create_or_open_shared_with_base_dir`].
-    /// Broadcast-only generated spines also provide safe inherent constructors.
+    /// SPSC fields require
+    /// [`SpineSpscQueue::create_or_open_shared_with_base_dir`]'s
+    /// shared-memory contract.
     unsafe fn new_in_base_dir(base_dir: impl AsRef<Path>) -> Self;
 
-    /// Whether a tile has an endpoint whose progress requires polling.
-    /// Generated spines report claimed SPSC roles, including those used
-    /// directly through producer/consumer fields or from a consume
-    /// callback.
+    /// Whether a tile has a claimed endpoint that requires polling.
     fn requires_polling(_consumers: &Self::Consumers, _producers: &Self::Producers) -> bool {
         false
     }
