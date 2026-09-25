@@ -1,67 +1,62 @@
 use super::*;
 
-#[repr(C, align(64))]
-struct Slot64 {
-    _bytes: [u8; 64],
-    _not_send: PhantomData<std::rc::Rc<()>>,
-}
-
-impl Drop for Slot64 {
-    fn drop(&mut self) {
-        panic!("a slot layout marker must never be dropped");
-    }
-}
-
 #[test]
 fn padded_slots_preserve_addresses_fifo_and_endpoint_handoff() {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>() {}
-    assert_send_sync::<Queue<u64, Slot64>>();
-    assert_send::<Producer<u64, Slot64>>();
-    assert_send::<Consumer<u64, Slot64>>();
-
-    let queue = Queue::<u64, Slot64>::new(4);
-    let alias = queue.clone();
-    let mut producer = queue.try_producer().unwrap();
-    let mut consumer = queue.try_consumer().unwrap();
-    let mut addresses = Vec::new();
-    for batch in 0..3 {
-        for i in 0..queue.capacity() {
-            producer.produce(&((batch * queue.capacity() + i) as u64)).unwrap();
+    fn check<const N: usize>(alignment: usize) {
+        let queue = Queue::<u64, N>::new(4);
+        let alias = queue.clone();
+        let mut producer = queue.try_producer().unwrap();
+        let mut consumer = queue.try_consumer().unwrap();
+        let mut addresses = Vec::new();
+        for batch in 0..3 {
+            for i in 0..queue.capacity() {
+                producer.produce(&((batch * queue.capacity() + i) as u64)).unwrap();
+            }
+            assert_eq!(producer.produce(&99), Err(FullError));
+            for i in 0..queue.capacity() {
+                assert!(consumer.consume_ref(|value| {
+                    assert_eq!(*value, (batch * queue.capacity() + i) as u64);
+                    let address = std::ptr::from_ref(value).addr();
+                    assert_eq!(address % alignment, 0, "slot alignment");
+                    if batch == 0 {
+                        addresses.push(address);
+                    } else {
+                        assert_eq!(address, addresses[i], "ring reuse retains its slot geometry");
+                    }
+                    if i == 0 {
+                        assert_eq!(producer.produce(&99), Err(FullError), "borrow holds the slot");
+                    }
+                }));
+            }
+            drop(producer);
+            producer = alias.try_producer().unwrap();
+            drop(consumer);
+            consumer = alias.try_consumer().unwrap();
         }
-        assert_eq!(producer.produce(&99), Err(FullError));
-        for i in 0..queue.capacity() {
-            assert!(consumer.consume_ref(|value| {
-                assert_eq!(*value, (batch * queue.capacity() + i) as u64);
-                let address = std::ptr::from_ref(value).addr();
-                assert_eq!(address % align_of::<Slot64>(), 0);
-                if batch == 0 {
-                    addresses.push(address);
-                } else {
-                    assert_eq!(address, addresses[i], "ring reuse retains its slot geometry");
-                }
-                if i == 0 {
-                    assert_eq!(producer.produce(&99), Err(FullError), "borrow holds the slot");
-                }
-            }));
+        assert_eq!(addresses[0] % 128, 0, "ring base alignment");
+        for pair in addresses.windows(2) {
+            assert_eq!(pair[1] - pair[0], N);
         }
-        drop(producer);
-        producer = alias.try_producer().unwrap();
+        drop(queue);
+        drop(alias);
         drop(consumer);
-        consumer = alias.try_consumer().unwrap();
+        std::thread::spawn(move || drop(producer)).join().unwrap();
     }
-    for pair in addresses.windows(2) {
-        assert_eq!(pair[1] - pair[0], size_of::<Slot64>());
-    }
-    drop(queue);
-    drop(alias);
-    drop(consumer);
-    std::thread::spawn(move || drop(producer)).join().unwrap();
+    assert_send_sync::<Queue<u64, 64>>();
+    assert_send::<Producer<u64, 64>>();
+    assert_send::<Consumer<u64, 64>>();
+    check::<24>(8);
+    check::<48>(16);
+    check::<64>(64);
+    check::<256>(256);
+    check::<768>(256);
 }
 
 #[test]
 fn zero_sized_payloads_can_use_nonzero_slots() {
-    let queue = Queue::<(), Slot64>::new(2);
+    let queue = Queue::<(), 64>::new(2);
     let mut producer = queue.try_producer().unwrap();
     let mut consumer = queue.try_consumer().unwrap();
     producer.produce(&()).unwrap();
@@ -71,8 +66,7 @@ fn zero_sized_payloads_can_use_nonzero_slots() {
     for _ in 0..queue.capacity() {
         assert!(consumer.consume_ref(|value| addresses.push(std::ptr::from_ref(value).addr())));
     }
-    assert_eq!(addresses[0] % align_of::<Slot64>(), 0);
-    assert_eq!(addresses[1] - addresses[0], size_of::<Slot64>());
+    assert_eq!(addresses[1] - addresses[0], 64);
     assert!(!consumer.consume_ref(|()| panic!("queue is empty")));
 }
 
@@ -122,6 +116,9 @@ fn invalid_capacities_are_rejected_before_allocation() {
     for capacity in [0, usize::MAX, 1 << (usize::BITS - 1)] {
         assert!(std::panic::catch_unwind(|| Queue::<u64>::new(capacity)).is_err());
     }
+    // Both strides meet the payload contract but cannot form this allocation.
+    assert!(std::panic::catch_unwind(|| Queue::<u8, { usize::MAX }>::new(2)).is_err());
+    assert!(std::panic::catch_unwind(|| Queue::<u8, { isize::MAX as usize }>::new(1)).is_err());
 }
 
 #[test]
@@ -173,43 +170,32 @@ mod shared_layout {
 
     #[test]
     fn padded_shared_slots_validate_both_layouts_and_preserve_unread_data() {
-        #[repr(C, align(64))]
-        struct EquivalentSlot([u64; 8]);
-        #[repr(C, align(128))]
-        struct LargerSlot([u8; 128]);
-        #[repr(C, align(32))]
-        struct DifferentAlignment([u8; 64]);
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("padded");
         // SAFETY: every successful participant uses the same u64 payload and
         // matching slot geometry; no endpoint accesses the mismatch fixtures.
-        let queue = unsafe { Queue::<u64, Slot64>::create_or_open_shared(&path, 2) }.unwrap();
+        let queue = unsafe { Queue::<u64, 256>::create_or_open_shared(&path, 2) }.unwrap();
         let mut producer = queue.try_producer().unwrap();
         producer.produce(&11).unwrap();
         producer.produce(&22).unwrap();
         drop(producer);
         drop(queue);
-        // SAFETY: the layout marker's identity is immaterial; its geometry matches.
-        let reopened = unsafe { Queue::<u64, EquivalentSlot>::open_shared(&path) }.unwrap();
+        // SAFETY: the payload and numeric stride match the creator.
+        let reopened = unsafe { Queue::<u64, 256>::open_shared(&path) }.unwrap();
         assert!(matches!(
             unsafe { Queue::<u64>::open_shared(&path) },
             Err(QueueError::IncompatibleLayout)
         ));
         assert!(matches!(
-            unsafe { Queue::<u64, LargerSlot>::open_shared(&path) },
+            unsafe { Queue::<u64, 128>::open_shared(&path) },
             Err(QueueError::IncompatibleLayout)
         ));
         assert!(matches!(
-            unsafe { Queue::<u64, DifferentAlignment>::open_shared(&path) },
+            unsafe { Queue::<[u64; 2], 256>::open_shared(&path) },
             Err(QueueError::IncompatibleLayout)
         ));
         assert!(matches!(
-            unsafe { Queue::<[u64; 2], Slot64>::open_shared(&path) },
-            Err(QueueError::IncompatibleLayout)
-        ));
-        assert!(matches!(
-            unsafe { Queue::<[u8; 8], Slot64>::open_shared(&path) },
+            unsafe { Queue::<[u8; 8], 256>::open_shared(&path) },
             Err(QueueError::IncompatibleLayout)
         ));
 
@@ -221,10 +207,52 @@ mod shared_layout {
                 addresses.push(std::ptr::from_ref(value).addr());
             }));
         }
-        assert_eq!(addresses[0] % align_of::<EquivalentSlot>(), 0);
-        assert_eq!(addresses[1] - addresses[0], size_of::<EquivalentSlot>());
+        assert_eq!(addresses[0] % 256, 0);
+        assert_eq!(addresses[1] - addresses[0], 256);
         drop(consumer);
         drop(reopened);
+        crate::cleanup_flink(&path).unwrap();
+    }
+
+    #[test]
+    fn natural_and_explicit_sizes_share_a_mapping_when_alignment_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("natural");
+        assert_eq!(Queue::<u64>::SLOT_SIZE, size_of::<u64>());
+        assert_eq!(Queue::<u64, { size_of::<u64>() }>::SLOT_SIZE, size_of::<u64>());
+        // SAFETY: the same payload and effective stride, with one writer and reader.
+        let queue = unsafe { Queue::<u64>::create_or_open_shared(&path, 2) }.unwrap();
+        let explicit =
+            unsafe { Queue::<u64, { size_of::<u64>() }>::create_or_open_shared(&path, 2) }.unwrap();
+        let mut producer = queue.try_producer().unwrap();
+        let mut consumer = explicit.try_consumer().unwrap();
+        producer.produce(&73).unwrap();
+        assert!(consumer.consume_ref(|value| assert_eq!(*value, 73)));
+        drop(producer);
+        drop(consumer);
+        drop(queue);
+        drop(explicit);
+        crate::cleanup_flink(&path).unwrap();
+    }
+
+    #[test]
+    fn equal_strides_with_different_alignment_cannot_share_a_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("natural");
+        // SAFETY: a single creator and no live endpoints during mismatch checks.
+        let queue = unsafe { Queue::<[u64; 2]>::create_or_open_shared(&path, 2) }.unwrap();
+        assert!(matches!(
+            unsafe { Queue::<[u64; 2], 16>::open_shared(&path) },
+            Err(QueueError::IncompatibleLayout)
+        ));
+        drop(queue);
+        crate::cleanup_flink(&path).unwrap();
+        let queue = unsafe { Queue::<[u64; 2], 16>::create_or_open_shared(&path, 2) }.unwrap();
+        assert!(matches!(
+            unsafe { Queue::<[u64; 2]>::open_shared(&path) },
+            Err(QueueError::IncompatibleLayout)
+        ));
+        drop(queue);
         crate::cleanup_flink(&path).unwrap();
     }
 

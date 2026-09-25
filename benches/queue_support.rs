@@ -35,13 +35,6 @@ const WARMUP: usize = 32768;
 #[repr(C)]
 pub struct Message<const B: usize>(pub [u8; B]);
 
-#[repr(C, align(64))]
-pub struct Slot64([u8; 64]);
-#[repr(C, align(128))]
-pub struct Slot128([u8; 128]);
-#[repr(C, align(256))]
-pub struct Slot256([u8; 256]);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotLayout {
     Natural,
@@ -453,7 +446,10 @@ impl Settings {
             "# capacity={CAPACITY} pool={POOL} credit={WINDOW} batch={BATCH} validation={VALIDATION} warmup={WARMUP} messages={} cpus={:?}",
             self.messages, self.cpus
         );
-        println!("# SPSC slot={:?}; padded variants have equal size and alignment", self.slot);
+        println!(
+            "# SPSC slot={:?}; explicit sizes select stride and alignment in bytes",
+            self.slot
+        );
         match self.mode {
             Mode::Verify => println!("# mode=verify\n# verified,queue,bytes"),
             Mode::Throughput => throughput::print_header(self),
@@ -463,30 +459,30 @@ impl Settings {
 }
 
 // Only instantiate supported combinations: a run-time guard cannot prevent an
-// invalid Slot type's compile-time layout assertion from being evaluated.
+// invalid stride's compile-time layout assertion from being evaluated.
 macro_rules! dispatch_layout {
-    ($settings:ident, $run:ident, $natural:ident $(, $extra:expr)*) => {
+    ($settings:ident, $run:ident $(, $extra:expr)*) => {
         for &size in $settings.slot.sizes() {
             if $settings.size.is_some_and(|selected| selected != size) { continue; }
             match ($settings.slot, size) {
-                ($crate::support::SlotLayout::Natural, 8) => $run::<8, $natural<8>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Natural, 32) => $run::<32, $natural<32>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Natural, 64) => $run::<64, $natural<64>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Natural, 128) => $run::<128, $natural<128>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Natural, 192) => $run::<192, $natural<192>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Natural, 256) => $run::<256, $natural<256>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Natural, 512) => $run::<512, $natural<512>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Natural, 1024) => $run::<1024, $natural<1024>>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes64, 8) => $run::<8, $crate::support::Slot64>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes64, 32) => $run::<32, $crate::support::Slot64>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes128, 8) => $run::<8, $crate::support::Slot128>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes128, 32) => $run::<32, $crate::support::Slot128>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes128, 64) => $run::<64, $crate::support::Slot128>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes256, 8) => $run::<8, $crate::support::Slot256>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes256, 32) => $run::<32, $crate::support::Slot256>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes256, 64) => $run::<64, $crate::support::Slot256>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes256, 128) => $run::<128, $crate::support::Slot256>(&$settings $(, $extra)*),
-                ($crate::support::SlotLayout::Bytes256, 192) => $run::<192, $crate::support::Slot256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 8) => $run::<8, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 32) => $run::<32, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 64) => $run::<64, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 128) => $run::<128, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 192) => $run::<192, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 256) => $run::<256, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 512) => $run::<512, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Natural, 1024) => $run::<1024, 0>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes64, 8) => $run::<8, 64>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes64, 32) => $run::<32, 64>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes128, 8) => $run::<8, 128>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes128, 32) => $run::<32, 128>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes128, 64) => $run::<64, 128>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 8) => $run::<8, 256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 32) => $run::<32, 256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 64) => $run::<64, 256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 128) => $run::<128, 256>(&$settings $(, $extra)*),
+                ($crate::support::SlotLayout::Bytes256, 192) => $run::<192, 256>(&$settings $(, $extra)*),
                 _ => unreachable!("validated layout and size"),
             }
         }
