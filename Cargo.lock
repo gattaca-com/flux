@@ -1488,6 +1488,7 @@ dependencies = [
  "flux-communication",
  "flux-timing",
  "flux-utils",
+ "hdrhistogram",
  "libc",
  "mio",
  "serde",
@@ -1495,6 +1496,7 @@ dependencies = [
  "signal-hook",
  "spine-derive",
  "tempfile",
+ "thiserror 1.0.69",
  "tracing",
  "type-hash",
  "type-hash-derive",
@@ -1517,13 +1519,17 @@ dependencies = [
 name = "flux-communication"
 version = "0.5.0"
 dependencies = [
+ "core_affinity",
  "directories",
  "flux-timing",
  "flux-utils",
+ "hdrhistogram",
  "libc",
  "mio",
  "rand 0.9.2",
+ "rtrb",
  "shared_memory",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -2010,6 +2016,16 @@ dependencies = [
  "foldhash 0.2.0",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "byteorder",
+ "num-traits",
 ]
 
 [[package]]
@@ -3110,6 +3126,12 @@ dependencies = [
  "bytes",
  "rustc-hex",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9278fb35b3e730abe136e9b395b5b81b96d06b9f5478a50f0c8430a2237b22de"
 
 [[package]]
 name = "ruint"

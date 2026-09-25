@@ -19,6 +19,16 @@ shared_memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+core_affinity.workspace = true
+hdrhistogram.workspace = true
+rtrb.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "spsc"
+harness = false
+
 [lints]
 workspace = true
 

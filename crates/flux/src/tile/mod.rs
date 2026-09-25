@@ -57,7 +57,8 @@ impl TileConfig {
     }
 
     /// Parked tiles wake only on spine producer signals; never for tiles that
-    /// poll sockets or disk.
+    /// poll sockets or disk. Claimed SPSC endpoints force polling: peers may be
+    /// in other processes.
     pub fn with_park(mut self) -> Self {
         self.park = true;
         self
@@ -179,7 +180,11 @@ where
 
             #[cfg(feature = "park")]
             {
-                if config.park && !worked && !adapter.waker_registered() {
+                if config.park &&
+                    !worked &&
+                    !adapter.waker_registered() &&
+                    !adapter.requires_polling()
+                {
                     crate::park::SIGNAL.park(expected);
                 }
                 expected = crate::park::SIGNAL.read_counter();

@@ -19,8 +19,10 @@ flux-utils.workspace = true
 libc.workspace = true
 mio = { workspace = true, optional = true }
 serde.workspace = true
+shared_memory.workspace = true
 signal-hook.workspace = true
 spine-derive.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 type-hash.workspace = true
 type-hash-derive.workspace = true
@@ -29,8 +31,12 @@ wincode-derive = { workspace = true, optional = true }
 zstd.workspace = true
 
 [dev-dependencies]
-shared_memory.workspace = true
+hdrhistogram.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "spine_queues"
+harness = false
 
 [features]
 default = []
