@@ -195,12 +195,12 @@ impl RecordingHandler {
         let round_trips = &self.round_trips;
         let reaped = self.io.poll_with(|event| match event {
             BlobEvent::Written { file } => written.push(file),
-            BlobEvent::Loaded { file, bytes } => match loading.remove(&file) {
+            BlobEvent::Read { file, bytes } => match loading.remove(&file) {
                 Some(expected) if expected == bytes => {
                     round_trips.ok.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(_) => round_trips.problem(format!("{file:?}: loaded bytes differ")),
-                None => round_trips.problem(format!("{file:?}: load never requested")),
+                None => round_trips.problem(format!("{file:?}: read never requested")),
             },
             BlobEvent::Failed { file, error } => round_trips.problem(format!("{file:?}: {error}")),
         });
@@ -209,7 +209,7 @@ impl RecordingHandler {
                 self.round_trips.problem(format!("{file:?}: write never requested"));
                 continue;
             };
-            match self.io.load(&path) {
+            match self.io.read(&path) {
                 Ok(token) => {
                     self.loading.insert(token, bytes);
                 }
@@ -583,7 +583,7 @@ fn assert_rewrite_replaces(recv_disk: &Path) {
         io.poll_with(|event| {
             events.push(match event {
                 BlobEvent::Written { file } => (file, true),
-                BlobEvent::Loaded { file, .. } | BlobEvent::Failed { file, .. } => (file, false),
+                BlobEvent::Read { file, .. } | BlobEvent::Failed { file, .. } => (file, false),
             });
         });
         std::thread::sleep(StdDuration::from_millis(1));

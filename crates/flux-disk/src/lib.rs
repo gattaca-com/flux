@@ -1296,7 +1296,7 @@ impl Drop for DiskIo {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs, io,
+        fs,
         os::fd::IntoRawFd,
         time::{Duration as StdDuration, Instant as StdInstant},
     };

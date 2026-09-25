@@ -10,12 +10,12 @@ use tracing::error;
 
 #[derive(Debug)]
 pub enum BlobEvent<'a> {
-    /// The file is in place; a `load` of its path from here on sees the whole
+    /// The file is in place; a `read` of its path from here on sees the whole
     /// of it.
     Written { file: FileToken },
     /// The whole file. Valid for the callback only; the caller copies it.
-    Loaded { file: FileToken, bytes: &'a [u8] },
-    /// The write or load failed.
+    Read { file: FileToken, bytes: &'a [u8] },
+    /// The write or read failed.
     Failed { file: FileToken, error: io::Error },
 }
 
@@ -27,7 +27,7 @@ struct Staged {
     relinked: bool,
 }
 
-/// Asynchronous blob file io. Every token `write` or `load` returns gets
+/// Asynchronous blob file io. Every token `write` or `read` returns gets
 /// exactly one `BlobEvent`; the caller keeps the token-to-file mapping.
 #[derive(Default)]
 pub struct BlobIo {
@@ -64,7 +64,7 @@ impl BlobIo {
 
     /// Reads the whole of `path`. `Err` only when the open fails
     /// synchronously; a missing file surfaces as `Failed`.
-    pub fn load(&mut self, path: &Path) -> io::Result<FileToken> {
+    pub fn read(&mut self, path: &Path) -> io::Result<FileToken> {
         let file = self.disk.open(path, OpenOptions::new().read(true))?;
         // `read_to_end` reports once, with the whole file.
         self.disk.read_to_end(file, 0);
@@ -96,7 +96,7 @@ impl BlobIo {
                     (file, BlobEvent::Written { file })
                 }
                 DiskEvent::Read { file, payload, .. } => {
-                    (file, BlobEvent::Loaded { file, bytes: payload })
+                    (file, BlobEvent::Read { file, bytes: payload })
                 }
                 DiskEvent::Failed { file, op, error, .. } => {
                     let i = staged.iter().position(|s| s.file == file);
