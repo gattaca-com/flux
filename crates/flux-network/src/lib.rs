@@ -1,10 +1,17 @@
+//! TCP and reliable, unordered UDP groups sharing one poll.
+//!
+//! Use [`Network`] for an owned poll or [`NetworkWithExternalPoll`] for an
+//! existing one.
+
 pub mod http;
-pub mod network_driver;
-pub mod tcp;
+pub mod network;
+mod tcp;
 pub mod tls;
 pub mod udp;
 
 pub use mio::Token;
-pub use network_driver::{NetworkDriver, PollEvent, SendBehavior, Transport};
-pub use tcp::TcpConfig;
+pub use network::{
+    Event, Framing, Group, GroupConfig, Network, NetworkCore, NetworkEvent, NetworkTelemetry,
+    NetworkWithExternalPoll, PayloadBuf, ReplayPolicy, TcpGroupConfig, UdpGroupConfig,
+};
 pub use udp::UdpConfig;

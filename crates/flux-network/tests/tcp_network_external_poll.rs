@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::tcp::{TcpEvent, TcpGroupConfig, TcpNetworkWithExternalPoll};
+use flux_network::{NetworkEvent, NetworkWithExternalPoll, TcpGroupConfig};
 use mio::{Events, Poll, Token};
 
 const SERVER_TOKENS: Range<usize> = 100..200;
@@ -82,9 +82,9 @@ fn one_poll_drives_two_networks_with_disjoint_ranges() {
     let mut events = Events::with_capacity(128);
 
     let mut server =
-        TcpNetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), SERVER_TOKENS);
+        NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), SERVER_TOKENS);
     let mut client =
-        TcpNetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), CLIENT_TOKENS);
+        NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), CLIENT_TOKENS);
 
     let server_group = server.add_group(TcpGroupConfig {
         name: "server",
@@ -115,21 +115,21 @@ fn one_poll_drives_two_networks_with_disjoint_ranges() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done && Instant::now() < deadline {
         {
-            let mut on_server = |event: TcpEvent<'_>| {
+            let mut on_server = |event: NetworkEvent<'_>| {
                 let ev = match event {
-                    TcpEvent::Accepted { group, token, .. } => {
+                    NetworkEvent::Accepted { group, token, .. } => {
                         assert_eq!(group, server_group);
                         Ev::Accepted(token)
                     }
-                    TcpEvent::Message { group, token, payload, .. } => {
+                    NetworkEvent::Message { group, token, payload, .. } => {
                         assert_eq!(group, server_group);
                         Ev::Message(token, payload.to_vec())
                     }
-                    TcpEvent::Disconnected { group, token, .. } => {
+                    NetworkEvent::Disconnected { group, token, .. } => {
                         assert_eq!(group, server_group);
                         Ev::Disconnected(token)
                     }
-                    TcpEvent::Connected { .. } => {
+                    NetworkEvent::Connected { .. } => {
                         panic!("server network has no outbound endpoints")
                     }
                 };
@@ -145,24 +145,24 @@ fn one_poll_drives_two_networks_with_disjoint_ranges() {
                 );
                 server_log.push(Record { phase: phase.get(), event: ev });
             };
-            let mut on_client = |event: TcpEvent<'_>| {
+            let mut on_client = |event: NetworkEvent<'_>| {
                 let ev = match event {
-                    TcpEvent::Connected { group, token, .. } => {
+                    NetworkEvent::Connected { group, token, .. } => {
                         assert_eq!(group, client_group);
                         assert_eq!(token, client_token, "reconnect must keep the endpoint token");
                         Ev::Connected(token)
                     }
-                    TcpEvent::Message { group, token, payload, .. } => {
+                    NetworkEvent::Message { group, token, payload, .. } => {
                         assert_eq!(group, client_group);
                         assert_eq!(token, client_token);
                         Ev::Message(token, payload.to_vec())
                     }
-                    TcpEvent::Disconnected { group, token, .. } => {
+                    NetworkEvent::Disconnected { group, token, .. } => {
                         assert_eq!(group, client_group);
                         assert_eq!(token, client_token);
                         Ev::Disconnected(token)
                     }
-                    TcpEvent::Accepted { .. } => panic!("client network has no listeners"),
+                    NetworkEvent::Accepted { .. } => panic!("client network has no listeners"),
                 };
                 client_log.push(Record { phase: phase.get(), event: ev });
             };
@@ -222,11 +222,11 @@ fn one_poll_drives_two_networks_with_disjoint_ranges() {
     assert!(has_message(&server_log, REQUEST));
     assert!(has_message(&client_log, RESPONSE));
 
-    // The reconnect uses the next server-side token and preserves the client
+    // The reconnect uses a fresh server-side token and preserves the client
     // token, which is checked in the handler.
     let accepted = accepts(&server_log);
     assert_eq!(accepted.len(), 2);
-    assert_eq!(accepted[1].0, accepted[0].0 + 1);
+    assert_ne!(accepted[1], accepted[0]);
     assert_eq!(message_token(&server_log, AFTER_RECONNECT), Some(accepted[1]));
 
     // A requested disconnect is reported by the next pre_poll; the peer close
@@ -236,16 +236,15 @@ fn one_poll_drives_two_networks_with_disjoint_ranges() {
 }
 
 #[test]
-#[should_panic(expected = "tcp token range 100..102 exhausted")]
+#[should_panic(expected = "network token range 100..102 exhausted")]
 fn exhausted_token_range_panics_naming_the_range() {
     let poll = Poll::new().unwrap();
-    let mut network =
-        TcpNetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 100..102);
+    let mut network = NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 100..102);
     let group = network.add_group(TcpGroupConfig::default());
 
     network.listen(group, unused_addr()).unwrap();
     let second = network.connect(group, unused_addr());
-    assert_eq!(second, Token(101), "tokens are assigned in ascending order from the range start");
+    assert!((100..102).contains(&second.0));
 
     let _ = network.connect(group, unused_addr());
 }
@@ -254,8 +253,7 @@ fn exhausted_token_range_panics_naming_the_range() {
 #[cfg_attr(debug_assertions, should_panic(expected = "lies outside this network's token range"))]
 fn foreign_token_trips_the_containment_assert() {
     let mut poll = Poll::new().unwrap();
-    let mut network =
-        TcpNetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 100..200);
+    let mut network = NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 100..200);
 
     // Register a readiness source outside the network's token range.
     let mut listener = mio::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -270,6 +268,6 @@ fn foreign_token_trips_the_containment_assert() {
     let event = events.iter().next().expect("listener readiness did not arrive");
     assert_eq!(event.token(), Token(7));
 
-    // Debug builds reject the token; release builds emit no TcpEvent for it.
-    network.handle_event(event, &mut |_| panic!("no TcpEvent expected for a foreign token"));
+    // Debug builds reject the token; release builds emit no NetworkEvent for it.
+    network.handle_event(event, &mut |_| panic!("no NetworkEvent expected for a foreign token"));
 }

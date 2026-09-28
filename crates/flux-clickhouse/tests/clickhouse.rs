@@ -5,10 +5,7 @@ use std::{
 };
 
 use flux_clickhouse::{ClickHouse, Error, Output, QueryId};
-use flux_network::{
-    Token,
-    tcp::{Framing, TcpEvent, TcpGroupConfig, TcpNetwork},
-};
+use flux_network::{Framing, Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token};
 fn uvarint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         out.push(value as u8 | 0x80);
@@ -328,11 +325,11 @@ impl FakeServer {
     }
 }
 
-fn listen() -> (TcpNetwork, std::net::SocketAddr) {
+fn listen() -> (Network, std::net::SocketAddr) {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    (TcpNetwork::default(), addr)
+    (Network::default(), addr)
 }
 
 #[test]
@@ -341,6 +338,7 @@ fn timeouts_budgets_and_recovery() {
     let server_group = net.add_group(TcpGroupConfig {
         name: "fake-clickhouse",
         framing: Framing::Raw,
+        replay: ReplayPolicy::Drop,
         ..Default::default()
     });
     net.listen(server_group, addr).unwrap();
@@ -372,7 +370,7 @@ fn timeouts_budgets_and_recovery() {
                 return;
             }
             match event {
-                TcpEvent::Accepted { group, token, .. } if group == server_group => {
+                NetworkEvent::Accepted { group, token, .. } if group == server_group => {
                     server.conns.push(ServerConn {
                         token,
                         input: Vec::new(),
@@ -380,7 +378,7 @@ fn timeouts_budgets_and_recovery() {
                         compressed: false,
                     });
                 }
-                TcpEvent::Message { group, token, payload, .. } if group == server_group => {
+                NetworkEvent::Message { group, token, payload, .. } if group == server_group => {
                     for msg in server.push(token, payload) {
                         let reply = match &msg {
                             ClientMsg::Hello { .. } => server_hello(),

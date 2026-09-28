@@ -2,7 +2,7 @@
 //! append_log`.
 //!
 //! Shows the poll-driven pattern `DiskIo` shares with `flux-network`'s
-//! `TcpNetwork`: `open`/`write_with`/`sync_all`/`close` queue work and return
+//! `Network`: `open`/`write_with`/`sync_all`/`close` queue work and return
 //! immediately — operations submitted before a file finishes opening are
 //! simply queued — and `poll_with` delivers completions as they arrive from
 //! `io_uring`, never blocking.

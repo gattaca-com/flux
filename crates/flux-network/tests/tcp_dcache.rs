@@ -13,7 +13,9 @@ use flux::{
     spine::{DCacheRead, ScopedSpine, SpineAdapter, SpineProducerWithDCache},
     tile::{Tile, TileConfig, TileInfo, attach_tile},
 };
-use flux_network::{NetworkDriver, PollEvent, SendBehavior, Transport, UdpConfig};
+use flux_network::{
+    Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, UdpConfig, UdpGroupConfig,
+};
 use spine_derive::from_spine;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -29,8 +31,8 @@ struct TcpDcacheSpine {
 }
 
 struct NetworkTile {
-    conn: Option<NetworkDriver>,
-    transport: Transport,
+    conn: Option<Network>,
+    transport: flux_network::GroupConfig,
     ready: Arc<AtomicBool>,
     bind_addr: SocketAddr,
     deadline: Instant,
@@ -39,9 +41,9 @@ struct NetworkTile {
 impl Tile<TcpDcacheSpine> for NetworkTile {
     fn try_init(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) -> bool {
         let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
-        let mut conn =
-            NetworkDriver::default().with_transport(self.transport).with_dcache(sp.dcache_ptr());
-        conn.listen_at(self.bind_addr).unwrap();
+        let mut conn = Network::default().with_dcache(sp.dcache_ptr());
+        let conn_group = conn.add_group(self.transport.clone());
+        conn.listen(conn_group, self.bind_addr).unwrap();
         self.conn = Some(conn);
         self.ready.store(true, Ordering::Release);
         true
@@ -54,7 +56,7 @@ impl Tile<TcpDcacheSpine> for NetworkTile {
         }
         let Some(conn) = &mut self.conn else { return };
         conn.poll_with_produce(&mut adapter.producers, |ev| {
-            let PollEvent::Message { payload: bytes, .. } = ev else { return None };
+            let NetworkEvent::Message { payload: bytes, .. } = ev else { return None };
             bytes.try_into().ok().map(Payload)
         });
     }
@@ -88,18 +90,25 @@ impl Tile<TcpDcacheSpine> for ReaderTile {
 
 #[test]
 fn dcache_multi_stream_tcp() {
-    dcache_multi_stream(Transport::default());
+    dcache_multi_stream(
+        TcpGroupConfig {
+            aligned_payloads: true,
+            replay: ReplayPolicy::Replay,
+            ..Default::default()
+        }
+        .into(),
+    );
 }
 
 #[test]
 fn dcache_multi_stream_udp() {
-    dcache_multi_stream(Transport::Udp(UdpConfig::lan()));
+    dcache_multi_stream(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() }.into());
 }
 
 /// Two streams into the same dcache-backed spine queue.
 /// Verifies dcache bytes match the queue message (same shmem region).
 #[allow(clippy::significant_drop_tightening)]
-fn dcache_multi_stream(transport: Transport) {
+fn dcache_multi_stream(transport: flux_network::GroupConfig) {
     const MSG_A: &[u8; 8] = b"stream-a";
     const MSG_B: &[u8; 8] = b"stream-b";
 
@@ -115,15 +124,17 @@ fn dcache_multi_stream(transport: Transport) {
     let received: Arc<Mutex<Vec<Payload>>> = Arc::new(Mutex::new(Vec::new()));
 
     let ready_c = ready.clone();
+    let client_config = transport.clone();
     let client = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready_c.load(Ordering::Acquire) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
         for msg in [MSG_A, MSG_B] {
-            let mut conn = NetworkDriver::default().with_transport(transport);
-            let tok = conn.connect(bind_addr).unwrap();
-            conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
+            let mut conn = Network::default();
+            let conn_group = conn.add_group(client_config.clone());
+            let tok = conn.connect(conn_group, bind_addr);
+            conn.send_with(tok, |buf| {
                 buf.extend_from_slice(msg);
             });
             let flush = Instant::now() + Duration::from_millis(100);

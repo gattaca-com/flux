@@ -1,4 +1,4 @@
-//! TCP vs reliable UDP through `NetworkDriver`, on loopback.
+//! TCP vs reliable UDP through `Network`, on loopback.
 //!
 //! `rtt`: one message to the server and its echo back, both connectors polled
 //! from this thread. `throughput`: a burst of messages one way, timed until
@@ -17,7 +17,10 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use flux_network::{NetworkDriver, PollEvent, SendBehavior, Transport, UdpConfig};
+use flux_network::{
+    Group, GroupConfig, Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, UdpConfig,
+    UdpGroupConfig,
+};
 use mio::Token;
 
 const SIZES: [(&str, usize); 3] = [("2k", 2 * 1024), ("64k", 64 * 1024), ("2m", 2 * 1024 * 1024)];
@@ -25,13 +28,19 @@ const BURST: usize = 256;
 const LOSS_ONE_IN: usize = 100;
 
 fn free_addr() -> SocketAddr {
-    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap()
+    loop {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        if UdpSocket::bind(addr).is_ok() {
+            return addr;
+        }
+    }
 }
 
 /// A connected pair. The server echoes everything back on `Single(accepted)`.
 struct Pair {
-    server: NetworkDriver,
-    client: NetworkDriver,
+    server: Network,
+    client: Network,
     accepted: Token,
     client_token: Token,
 }
@@ -42,21 +51,23 @@ fn udp_config() -> UdpConfig {
     UdpConfig { max_message_size: 4 * 1024 * 1024, ..UdpConfig::lan() }
 }
 
-fn connector(transport: Transport) -> NetworkDriver {
-    NetworkDriver::default().with_transport(transport).with_socket_buf_size(16 * 1024 * 1024)
+fn connector(config: GroupConfig) -> (Network, Group) {
+    let mut network = Network::default();
+    let group = network.add_group(config.with_socket_buf_size(16 * 1024 * 1024));
+    (network, group)
 }
 
-fn pair(transport: Transport, listen: SocketAddr, dial: SocketAddr) -> Pair {
-    let mut server = connector(transport);
-    let mut client = connector(transport);
-    server.listen_at(listen).unwrap();
-    let client_token = client.connect(dial).unwrap();
+fn pair(transport: GroupConfig, listen: SocketAddr, dial: SocketAddr) -> Pair {
+    let (mut server, server_group) = connector(transport.clone());
+    let (mut client, client_group) = connector(transport);
+    server.listen(server_group, listen).unwrap();
+    let client_token = client.connect(client_group, dial);
     let mut accepted = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while accepted.is_none() || client.currently_disconnected().count() != 0 {
         assert!(Instant::now() < deadline, "handshake");
         server.poll_with(|e| {
-            if let PollEvent::Accept { stream, .. } = e {
+            if let NetworkEvent::Accepted { token: stream, .. } = e {
                 accepted = Some(stream);
             }
         });
@@ -69,22 +80,22 @@ impl Pair {
     /// Sends `msg` and spins until the echo is back.
     fn round_trip(&mut self, msg: &[u8]) {
         let Self { server, client, accepted, client_token } = self;
-        client.write_or_enqueue_with(SendBehavior::Single(*client_token), |b| {
+        client.send_with(*client_token, |b| {
             b.extend_from_slice(msg);
         });
         let mut got = false;
         while !got {
             client.poll_with(|_| {});
-            server.poll_with(|e| got |= matches!(e, PollEvent::Message { .. }));
+            server.poll_with(|e| got |= matches!(e, NetworkEvent::Message { .. }));
         }
-        server.write_or_enqueue_with(SendBehavior::Single(*accepted), |b| {
+        server.send_with(*accepted, |b| {
             b.extend_from_slice(msg);
         });
         got = false;
         while !got {
             server.poll_with(|_| {});
             client.poll_with(|e| {
-                if let PollEvent::Message { payload, .. } = e {
+                if let NetworkEvent::Message { payload, .. } = e {
                     assert_eq!(payload.len(), msg.len());
                     got = true;
                 }
@@ -100,14 +111,14 @@ impl Pair {
         let mut got = 0;
         while got < count {
             while sent < count && sent - got < window {
-                self.client.write_or_enqueue_with(SendBehavior::Single(self.client_token), |b| {
+                self.client.send_with(self.client_token, |b| {
                     b.extend_from_slice(msg);
                 });
                 sent += 1;
             }
             self.client.poll_with(|_| {});
             self.server.poll_with(|e| {
-                if let PollEvent::Message { .. } = e {
+                if let NetworkEvent::Message { .. } = e {
                     got += 1;
                 }
             });
@@ -178,8 +189,19 @@ impl Drop for LossyRelay {
     }
 }
 
-fn transports() -> [(&'static str, Transport); 2] {
-    [("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))]
+fn transports() -> [(&'static str, GroupConfig); 2] {
+    [
+        (
+            "tcp",
+            TcpGroupConfig {
+                aligned_payloads: true,
+                replay: ReplayPolicy::Replay,
+                ..Default::default()
+            }
+            .into(),
+        ),
+        ("udp", UdpGroupConfig { udp: udp_config(), ..Default::default() }.into()),
+    ]
 }
 
 fn bench_rtt(c: &mut Criterion) {
@@ -226,7 +248,11 @@ fn bench_rtt_loss(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(2 * size as u64));
         let server_addr = free_addr();
         let relay = LossyRelay::start(server_addr, LOSS_ONE_IN);
-        let mut pair = pair(Transport::Udp(udp_config()), server_addr, relay.addr);
+        let mut pair = pair(
+            UdpGroupConfig { udp: udp_config(), ..Default::default() }.into(),
+            server_addr,
+            relay.addr,
+        );
         group.bench_function(BenchmarkId::new("udp", size_name), |b| {
             b.iter(|| pair.round_trip(&msg));
         });

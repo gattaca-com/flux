@@ -23,8 +23,7 @@ use std::{collections::VecDeque, net::SocketAddr};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bson::{Bson, Document, doc};
 use flux_network::{
-    Token,
-    tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore},
+    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token,
 };
 use rand::Rng as _;
 use serde::Serialize;
@@ -119,7 +118,7 @@ pub struct Mongo {
     connections: usize,
     max_output_bytes: usize,
     max_queued_bytes: usize,
-    group: Option<TcpGroup>,
+    group: Option<Group>,
     conns: Vec<Conn>,
     queue: VecDeque<Queued>,
     queued_bytes: usize,
@@ -261,11 +260,12 @@ impl Mongo {
         out
     }
 
-    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+    pub fn connect(&mut self, net: &mut NetworkCore) {
         assert!(self.group.is_none(), "connect once");
         let group = net.add_group(TcpGroupConfig {
             name: "mongo",
             framing: Framing::Raw,
+            replay: ReplayPolicy::Drop,
             max_frame_size: usize::MAX,
             ..Default::default()
         });
@@ -282,7 +282,7 @@ impl Mongo {
         }
     }
 
-    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    pub fn drive<F>(&mut self, net: &mut NetworkCore, mut handler: F)
     where
         F: FnMut(CommandId, Result<Document, Error>),
     {
@@ -317,13 +317,13 @@ impl Mongo {
 
     /// Removes every pooled endpoint; queued and in-flight commands are
     /// dropped without outcomes.
-    pub fn close(self, net: &mut TcpNetworkCore) {
+    pub fn close(self, net: &mut NetworkCore) {
         for conn in &self.conns {
             net.remove(conn.token);
         }
     }
 
-    fn conn_index(&self, group: TcpGroup, token: Token) -> Option<usize> {
+    fn conn_index(&self, group: Group, token: Token) -> Option<usize> {
         if self.group != Some(group) {
             return None;
         }
@@ -332,16 +332,16 @@ impl Mongo {
 
     /// Returns whether the event belonged to this client. Outcomes queue
     /// inside and are delivered by [`Mongo::drive`].
-    pub fn on_event(&mut self, event: &TcpEvent) -> bool {
+    pub fn on_event(&mut self, event: &NetworkEvent) -> bool {
         match *event {
-            TcpEvent::Accepted { .. } => false,
-            TcpEvent::Connected { group, token, .. } |
-            TcpEvent::Disconnected { group, token, .. } => {
+            NetworkEvent::Accepted { .. } => false,
+            NetworkEvent::Connected { group, token, .. } |
+            NetworkEvent::Disconnected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
                 if let Some(id) = self.conns[index].in_flight() {
                     self.outcomes.push((id, Err(Error::Disconnected)));
                 }
-                if matches!(event, TcpEvent::Connected { .. }) {
+                if matches!(event, NetworkEvent::Connected { .. }) {
                     let request_id = Self::alloc_request_id(&mut self.next_request_id);
                     let hello = doc! { "hello": 1, "$db": "admin" };
                     let conn = &mut self.conns[index];
@@ -352,7 +352,7 @@ impl Mongo {
                 }
                 true
             }
-            TcpEvent::Message { group, token, payload, .. } => {
+            NetworkEvent::Message { group, token, payload, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
                 let Self {
                     conns,

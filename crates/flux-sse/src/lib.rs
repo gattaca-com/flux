@@ -30,9 +30,8 @@
 use std::{fmt::Write as _, net::SocketAddr};
 
 use flux_network::{
-    Token,
+    NetworkCore, NetworkEvent, Token,
     http::{HttpEvent, HttpNetwork},
-    tcp::{TcpEvent, TcpNetworkCore},
 };
 use flux_timing::Duration;
 
@@ -117,23 +116,23 @@ impl Sse {
         self
     }
     /// Opens the endpoint; the subscription is issued once it connects.
-    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+    pub fn connect(&mut self, net: &mut NetworkCore) {
         assert!(self.token.is_none(), "connect once");
         self.token = Some(self.http.connect(net, self.addr));
     }
     /// Like [`Self::connect`] but over TLS, sending and verifying `host`.
     #[cfg(feature = "tls")]
-    pub fn connect_tls(&mut self, net: &mut TcpNetworkCore, host: &str) {
+    pub fn connect_tls(&mut self, net: &mut NetworkCore, host: &str) {
         assert!(self.token.is_none(), "connect once");
         self.token = Some(self.http.connect_tls(net, self.addr, host));
     }
     /// Returns whether the event belonged to this client.
-    pub fn on_event(&mut self, event: &TcpEvent<'_>) -> bool {
+    pub fn on_event(&mut self, event: &NetworkEvent<'_>) -> bool {
         self.http.on_event(event)
     }
     /// Issues the subscription when the endpoint connects, then delivers the
     /// events parsed since the last call.
-    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    pub fn drive<F>(&mut self, net: &mut NetworkCore, mut handler: F)
     where
         F: for<'a> FnMut(SseEvent<'a>),
     {
@@ -183,7 +182,7 @@ impl Sse {
         }
     }
     /// Removes the endpoint; a running stream ends without a [`SseEvent::Gap`].
-    pub fn close(self, net: &mut TcpNetworkCore) {
+    pub fn close(self, net: &mut NetworkCore) {
         self.http.close(net);
     }
 }

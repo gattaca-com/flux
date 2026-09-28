@@ -7,7 +7,7 @@ use flux::{
     },
     tile::{Tile, TileName},
 };
-use flux_network::{NetworkDriver, PollEvent, TcpConfig, Transport};
+use flux_network::{Network, NetworkEvent, TcpGroupConfig};
 use flux_versioned_types::{Blob, DecodeError, Versioned};
 use mio::Token;
 use tracing::warn;
@@ -27,7 +27,7 @@ pub trait BlobHandler<S: FluxSpine, U>: Tile<S> {
 pub struct BlobReceiver {
     listen: SocketAddr,
     socket_buf_size: usize,
-    driver: Option<NetworkDriver>,
+    driver: Option<Network>,
 }
 
 impl BlobReceiver {
@@ -48,20 +48,24 @@ where
 {
     fn try_init(&mut self, adapter: &mut SpineAdapter<S>) -> bool {
         let producers: &SpineProducerWithDCache<IncomingBlob> = adapter.producers.as_ref();
-        let mut driver = NetworkDriver::default()
-            .with_transport(Transport::Tcp(TcpConfig::default()))
-            .with_socket_buf_size(self.socket_buf_size)
-            .with_dcache(producers.dcache_ptr());
-        driver.listen_at(self.listen).expect("gather receiver couldn't listen");
+        let mut driver = Network::default().with_dcache(producers.dcache_ptr());
+        let group = driver.add_group(TcpGroupConfig {
+            socket_buf_size: Some(self.socket_buf_size),
+            max_frame_size: u32::MAX as usize,
+            ..Default::default()
+        });
+        driver.listen(group, self.listen).expect("gather receiver couldn't listen");
         self.driver = Some(driver);
         true
     }
 
     fn loop_body(&mut self, adapter: &mut SpineAdapter<S>) {
         let Some(driver) = self.driver.as_mut() else { return };
-        adapter.consume(|token: Token, _| driver.disconnect(token));
+        adapter.consume(|token: Token, _| {
+            driver.disconnect(token);
+        });
         if driver.poll_with_produce(&mut adapter.producers, |event| match event {
-            PollEvent::Message { token, .. } => Some(IncomingBlob { token }),
+            NetworkEvent::Message { token, .. } => Some(IncomingBlob { token }),
             _ => None,
         }) {
             adapter.mark_work();

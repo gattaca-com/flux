@@ -18,4 +18,4 @@ pub use mio::Token;
 pub use queues::GatherQueues;
 pub use reader::{BlobReader, ReadError};
 pub use receiver::{BlobConsumer, BlobHandler, BlobReceiver, IncomingBlob};
-pub use shipper::BlobShipper;
+pub use shipper::{BlobShipper, BlobShipperBuilder};

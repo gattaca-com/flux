@@ -16,8 +16,8 @@ use std::net::SocketAddr;
 
 pub use flux_network::http::RequestId;
 use flux_network::{
+    NetworkCore, NetworkEvent,
     http::{Failure, HttpNetwork, HttpPool, HttpResponse},
-    tcp::{TcpEvent, TcpNetworkCore},
 };
 
 const RETRIES: u8 = 3;
@@ -117,7 +117,7 @@ impl S3 {
         self
     }
     /// Opens the pool; the builders must have run.
-    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+    pub fn connect(&mut self, net: &mut NetworkCore) {
         assert!(self.pool.is_none(), "connect once");
         let Self { http, server, addr, connections, .. } = self;
         self.pool = Some(match server {
@@ -126,12 +126,12 @@ impl S3 {
         });
     }
     /// Returns whether the event belonged to this client.
-    pub fn on_event(&mut self, event: &TcpEvent<'_>) -> bool {
+    pub fn on_event(&mut self, event: &NetworkEvent<'_>) -> bool {
         self.http.on_event(event)
     }
     /// Sends queued requests and delivers each finished request's outcome to
     /// `handler` exactly once.
-    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    pub fn drive<F>(&mut self, net: &mut NetworkCore, mut handler: F)
     where
         F: for<'a> FnMut(RequestId, Result<&'a [u8], Error<'a>>),
     {
@@ -144,7 +144,7 @@ impl S3 {
     }
     /// Removes every pooled endpoint; queued and in-flight requests are
     /// dropped without outcomes.
-    pub fn close(self, net: &mut TcpNetworkCore) {
+    pub fn close(self, net: &mut NetworkCore) {
         self.http.close(net);
     }
     /// Queues a PUT of `body` to `bucket/key`; returns it back when the

@@ -9,8 +9,8 @@ use std::{
 };
 
 use flux_network::{
+    Network,
     http::{HttpEvent, HttpNetwork},
-    tcp::TcpNetwork,
     tls::rustls::{
         self, ClientConfig, RootCertStore, ServerConfig, ServerConnection,
         pki_types::PrivatePkcs8KeyDer,
@@ -69,7 +69,7 @@ fn tls_pool_round_trips_big_bodies() {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut http =
         HttpNetwork::default().with_max_body_bytes(64 * 1024).with_tls_config(client_config);
     let pool = http.pool_tls(&mut net, addr, "localhost", 1);

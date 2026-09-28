@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::tcp::TcpNetwork;
+use flux_network::Network;
 use flux_s3::{Error, RequestId, S3};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,7 +28,7 @@ fn var(name: &str) -> String {
 }
 
 /// Drives the network until `id` completes, returning its body.
-fn settle(net: &mut TcpNetwork, s3: &mut S3, id: RequestId) -> Result<Vec<u8>, String> {
+fn settle(net: &mut Network, s3: &mut S3, id: RequestId) -> Result<Vec<u8>, String> {
     let mut outcome = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && outcome.is_none() {
@@ -50,7 +50,7 @@ fn settle(net: &mut TcpNetwork, s3: &mut S3, id: RequestId) -> Result<Vec<u8>, S
     outcome.expect("the request never completed")
 }
 
-fn ok(net: &mut TcpNetwork, s3: &mut S3, id: RequestId) -> Vec<u8> {
+fn ok(net: &mut Network, s3: &mut S3, id: RequestId) -> Vec<u8> {
     settle(net, s3, id).unwrap_or_else(|error| panic!("{error}"))
 }
 
@@ -67,7 +67,7 @@ fn signed_round_trip() {
         .find(SocketAddr::is_ipv4)
         .expect("S3_ENDPOINT resolved to no IPv4 address");
 
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut s3 = if tls {
         let host = endpoint.rsplit_once(':').map_or(endpoint.as_str(), |(host, _)| host);
         S3::new_tls(addr, host, 1)

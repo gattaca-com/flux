@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::tcp::TcpNetwork;
+use flux_network::Network;
 use flux_sse::{Sse, SseEvent};
 
 #[test]
@@ -28,7 +28,7 @@ fn delivers_one_event() {
         thread::sleep(Duration::from_secs(10));
     });
 
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut sse = Sse::new(addr, "/eth/v1/events").with_query(&[("topics", "head")]);
     sse.connect(&mut net);
     let mut seen = Vec::new();

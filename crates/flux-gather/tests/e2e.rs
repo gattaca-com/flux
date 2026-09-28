@@ -511,7 +511,7 @@ fn gather_end_to_end_sender_to_receiver() {
             Gatherer {
                 ready: ready.clone(),
                 cache: BlobCache::new(),
-                shipper: BlobShipper::new(vec![addr]),
+                shipper: BlobShipper::builder(vec![addr]).connect(),
                 writer: BlobIo::new(),
                 base: send_disk.clone(),
                 last_slot: 0,

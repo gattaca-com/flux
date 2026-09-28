@@ -7,10 +7,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flux_clickhouse::ClickHouse;
-use flux_network::{
-    Token,
-    tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetwork},
-};
+use flux_network::{Framing, Group, Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token};
 use flux_postgres::{Error, Output, Postgres, QueryId, copybinary};
 use hmac::{Hmac, Mac};
 use serde::Serialize;
@@ -188,9 +185,9 @@ impl FakeServer {
 }
 
 fn tick(
-    net: &mut TcpNetwork,
+    net: &mut Network,
     pg: &mut Postgres,
-    server_group: TcpGroup,
+    server_group: Group,
     server: &mut FakeServer,
     outcomes: &mut Vec<(QueryId, Result<Output, Error>)>,
     seen: &mut Vec<ClientMsg>,
@@ -202,7 +199,7 @@ fn tick(
             return;
         }
         match event {
-            TcpEvent::Accepted { group, token, .. } if group == server_group => {
+            NetworkEvent::Accepted { group, token, .. } if group == server_group => {
                 server.conns.push(ServerConn {
                     token,
                     input: Vec::new(),
@@ -210,7 +207,7 @@ fn tick(
                     outbox: VecDeque::new(),
                 });
             }
-            TcpEvent::Message { group, token, payload, .. } if group == server_group => {
+            NetworkEvent::Message { group, token, payload, .. } if group == server_group => {
                 for msg in server.push(token, payload) {
                     seen.push(msg.clone());
                     if on_msg(server, token, msg) {
@@ -237,12 +234,13 @@ fn free_addr() -> std::net::SocketAddr {
     addr
 }
 
-fn setup() -> (TcpNetwork, TcpGroup, std::net::SocketAddr) {
+fn setup() -> (Network, Group, std::net::SocketAddr) {
     let addr = free_addr();
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let group = net.add_group(TcpGroupConfig {
         name: "fake-pg",
         framing: Framing::Raw,
+        replay: ReplayPolicy::Drop,
         ..Default::default()
     });
     net.listen(group, addr).unwrap();
@@ -576,6 +574,7 @@ fn one_poll_serves_postgres_and_clickhouse() {
     let ch_group = net.add_group(TcpGroupConfig {
         name: "fake-clickhouse",
         framing: Framing::Raw,
+        replay: ReplayPolicy::Drop,
         ..Default::default()
     });
     net.listen(ch_group, ch_addr).unwrap();
@@ -602,10 +601,10 @@ fn one_poll_serves_postgres_and_clickhouse() {
                 return;
             }
             match event {
-                TcpEvent::Accepted { group, token, .. } if group == ch_group => {
+                NetworkEvent::Accepted { group, token, .. } if group == ch_group => {
                     ch_replies.push((token, ch_hello()));
                 }
-                TcpEvent::Message { group, token, payload, .. } if group == ch_group => {
+                NetworkEvent::Message { group, token, payload, .. } if group == ch_group => {
                     inserted.extend_from_slice(payload);
                     match ch_query_end {
                         // The query packet ends with an empty block of its
@@ -620,7 +619,7 @@ fn one_poll_serves_postgres_and_clickhouse() {
                         _ => {}
                     }
                 }
-                TcpEvent::Accepted { group, token, .. } if group == server_group => {
+                NetworkEvent::Accepted { group, token, .. } if group == server_group => {
                     server.conns.push(ServerConn {
                         token,
                         input: Vec::new(),
@@ -628,7 +627,7 @@ fn one_poll_serves_postgres_and_clickhouse() {
                         outbox: VecDeque::new(),
                     });
                 }
-                TcpEvent::Message { group, token, payload, .. } if group == server_group => {
+                NetworkEvent::Message { group, token, payload, .. } if group == server_group => {
                     for msg in server.push(token, payload) {
                         match msg {
                             ClientMsg::Startup(_) => server.reply(token, &hello()),
