@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use flux_timing::{IngestionTime, InternalMessage, PublishDelta, TrackingTimestamp};
+use flux_timing::{Duration, IngestionTime, InternalMessage, PublishDelta, TrackingTimestamp};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use type_hash::TypeHash;
 
@@ -365,15 +365,14 @@ impl TrackingTimestampWire {
     /// Reconstruct a local `TrackingTimestamp` from portable wall-clock values.
     pub fn to_tracking_timestamp(self) -> TrackingTimestamp {
         let ingestion = IngestionTime::from(self.ingestion_t_real);
-        let publish = IngestionTime::from(self.publish_t_real);
-
-        // Needed when ingestion and publish the same, but conversion to RDTSC might
-        // give some noise to have negative delta
-        let publish_internal = std::cmp::max(ingestion.internal(), publish.internal());
+        // The delta comes from the two exact wall-clock values. Projecting
+        // publish onto the TSC on its own re-reads both clocks, and their
+        // jitter between the two projections would land in the delta.
+        let delta = Duration::from(self.publish_t_real.saturating_sub(self.ingestion_t_real));
         TrackingTimestamp {
             ingestion_t: ingestion,
             publish_delta: PublishDelta::new(self.tile_id)
-                .from_ingestion_and_publish_t(ingestion.internal(), publish_internal),
+                .from_ingestion_and_publish_t(ingestion.internal(), ingestion.internal() + delta),
         }
     }
 }

@@ -241,9 +241,9 @@ fn end_to_end_cache_flush_decode() {
         assert_eq!(got.data(), want.data());
         assert_eq!(got.ingestion_time().real(), want.ingestion_time().real());
         assert_eq!(got.tile_id(), want.tile_id());
-        // Rebuilding the timestamp re-reads the live clock.
+        // Only the nanos -> ticks -> nanos rounding of the publish delta is lost.
         let drift = got.publish_t().0 as i64 - want.publish_t().0 as i64;
-        assert!(drift.abs() <= 1_000_000, "publish_t drifted by {drift}ns");
+        assert!(drift.abs() <= 2, "publish_t drifted by {drift}ns");
     }
 }
 
