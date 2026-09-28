@@ -26,7 +26,7 @@ fn groups(network: &mut NetworkCore) -> [Group; 2] {
     ]
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Log {
     accepted: Vec<(Group, Token)>,
     connected: Vec<(Group, Token)>,
@@ -63,7 +63,10 @@ fn until(
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !done(server_log, client_log) {
-        assert!(Instant::now() < deadline, "mixed exchange timed out");
+        assert!(
+            Instant::now() < deadline,
+            "mixed exchange timed out: server={server_log:?}, client={client_log:?}"
+        );
         server.poll_with(|event| server_log.record(&event));
         client.poll_with(|event| client_log.record(&event));
     }
@@ -185,10 +188,20 @@ fn token_operations_do_not_distinguish_transports() {
     let outbound =
         std::array::from_fn::<_, 2, _>(|i| client.connect(client_groups[i], addresses[i]));
     let (mut server_log, mut client_log) = (Log::default(), Log::default());
-    until(&mut server, &mut client, &mut server_log, &mut client_log, |s, c| {
-        s.accepted.len() == 2 && c.connected.len() == 2
-    });
-    let accepted: Vec<Token> = server_log.accepted.iter().map(|(_, token)| *token).collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server_log.accepted.len() < 2 {
+        assert!(Instant::now() < deadline, "accept timed out");
+        server.poll_with(|event| server_log.record(&event));
+    }
+    // Retry before consuming the handshake reply, leaving a duplicate UDP
+    // hello queued at the server when we close the accepted sessions below.
+    client.force_reconnect();
+    while client_log.connected.len() < 2 {
+        assert!(Instant::now() < deadline, "connect timed out");
+        client.poll_with(|event| client_log.record(&event));
+    }
+    let accepted =
+        server_groups.map(|group| server_log.accepted.iter().find(|(g, _)| *g == group).unwrap().1);
 
     for &token in accepted.iter().chain(&outbound) {
         assert_eq!(server.clear_backlog(token).max(client.clear_backlog(token)), 0);
@@ -212,7 +225,10 @@ fn token_operations_do_not_distinguish_transports() {
         assert!(!server.send_with(token, |buf| buf.extend_from_slice(b"refused")));
     }
     until(&mut server, &mut client, &mut server_log, &mut client_log, |s, c| {
-        s.disconnected.len() == 2 && c.disconnected.len() == 2
+        (0..2).all(|i| {
+            s.disconnected.contains(&(server_groups[i], accepted[i])) &&
+                c.disconnected.contains(&(client_groups[i], outbound[i]))
+        })
     });
     for i in 0..2 {
         assert!(server_log.disconnected.contains(&(server_groups[i], accepted[i])));

@@ -672,26 +672,22 @@ impl UdpManager {
                 }
                 self.accept(k, dgram, tokens, deliver);
             }
-            Kind::HelloAck => {
+            Kind::HelloAck | Kind::Reset => {
                 let Some(i) = peer_index else { return };
                 let peer = &mut self.peers[i];
                 if !peer.is_outbound() {
                     return;
                 }
-                let Some(_) = peer.on_hello_ack(header, now) else { return };
                 let token = peer.token;
-                debug!(addr = %from, "udp connected");
-                deliver(Event::Connected { group: self.group, token, peer_addr: from });
-                self.flush_socket(k, now);
-            }
-            Kind::Reset => {
-                let Some(i) = peer_index else { return };
-                let peer = &self.peers[i];
-                if peer.is_outbound() && peer.on_reset(header) {
-                    warn!(addr = %from, "udp peer reset us, reconnecting");
-                    let token = peer.token;
+                if peer.needs_reset(header) {
+                    warn!(addr = %from, "udp peer lost our session, reconnecting");
                     deliver(Event::Disconnected { group: self.group, token, peer_addr: from });
                     self.drop_peer(i, now);
+                } else if header.kind == Kind::HelloAck && peer.on_hello_ack(header, now).is_some()
+                {
+                    debug!(addr = %from, "udp connected");
+                    deliver(Event::Connected { group: self.group, token, peer_addr: from });
+                    self.flush_socket(k, now);
                 }
             }
             Kind::Data | Kind::Ack => {

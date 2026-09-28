@@ -920,11 +920,15 @@ impl UdpPeer {
         send_datagram(socket, addr, &buf);
     }
 
-    /// A reset naming our current session means the remote holds no peer for
-    /// this connection: renegotiate. Resets for earlier sessions are stale.
+    /// A reset, or a hello ack with a different remote session, means the
+    /// listener lost our peer. Only replies naming our current session count.
     #[inline]
-    pub(crate) fn on_reset(&self, header: &Header) -> bool {
-        self.connected && header.len == self.local_session
+    pub(crate) fn needs_reset(&self, header: &Header) -> bool {
+        self.connected &&
+            header.len == self.local_session &&
+            (header.kind == Kind::Reset ||
+                (header.kind == Kind::HelloAck &&
+                    self.remote_session != Some(header.session)))
     }
 
     /// `len` carries the echoed remote session in a hello ack.
@@ -1434,6 +1438,42 @@ mod tests {
         fixed.reset(0);
         assert!(fixed.accept(1) && !fixed.accept(64));
         assert_eq!(fixed.ack_next, 0);
+    }
+
+    #[test]
+    fn control_replies_reset_only_the_current_session() {
+        let mut peer =
+            UdpPeer::new("127.0.0.1:1".parse().unwrap(), Token(0), Token(0), 1, cfg(), None);
+        let now = Instant::now();
+        let mut header =
+            Header { kind: Kind::HelloAck, session: 2, seq: 0, len: 1, index: 0, send_ts: 0 };
+        assert!(!peer.needs_reset(&header), "initial handshake");
+        assert_eq!(peer.on_hello_ack(&header, now), Some(false));
+        assert!(!peer.needs_reset(&header), "duplicate reply from the same peer");
+        assert_eq!(peer.on_hello_ack(&header, now), None);
+
+        header.session = 3;
+        assert!(peer.needs_reset(&header), "listener accepted a retry after losing our peer");
+        header.len = 0;
+        assert!(!peer.needs_reset(&header), "reply to an earlier attempt");
+        header.kind = Kind::Reset;
+        assert!(!peer.needs_reset(&header), "stale reset");
+        header.len = 1;
+        assert!(peer.needs_reset(&header), "reset naming our session");
+
+        peer.mark_disconnected(false, 4, &mut MsgStore::new());
+        assert!(!peer.needs_reset(&header), "already reconnecting");
+        header.kind = Kind::HelloAck;
+        assert_eq!(
+            peer.on_hello_ack(&header, now),
+            None,
+            "old reply cannot complete a new attempt"
+        );
+        header.len = 4;
+        assert_eq!(peer.on_hello_ack(&header, now), Some(true));
+        header.len = 1;
+        header.kind = Kind::Reset;
+        assert!(!peer.needs_reset(&header), "old reset cannot drop the new session");
     }
 
     #[test]
