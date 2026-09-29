@@ -7,7 +7,7 @@ use flux::{
     communication::{ShmemData, cleanup_shmem},
     persistence::Persistable,
     spine::{SpineAdapter, SpineQueue},
-    tile::{Tile, TileConfig, TileInfo, attach_tile},
+    tile::{Tile, TileConfig, TileInfo, TileName, attach_tile},
 };
 use flux_timing::Duration;
 use flux_utils::directories::{shmem_dir_data_with_base, shmem_dir_queues_with_base};
@@ -38,6 +38,13 @@ struct TestSpine {
     pub qa: SpineQueue<MsgA>,
     #[queue(size(2usize.pow(14)))]
     pub qb: SpineQueue<MsgB>,
+}
+
+#[from_spine("spine-pair-timer-test", per_producer_consumer_timers)]
+#[derive(Debug)]
+struct PairTimerSpine {
+    pub tile_info: ShmemData<TileInfo>,
+    pub qa: SpineQueue<MsgA>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -84,6 +91,63 @@ fn all_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+#[derive(Clone, Copy, Default)]
+struct PairProducerA;
+
+impl Tile<PairTimerSpine> for PairProducerA {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<PairTimerSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_producer_a")
+    }
+}
+
+impl Tile<TestSpine> for PairProducerA {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<TestSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_producer_a")
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PairProducerB;
+
+impl Tile<PairTimerSpine> for PairProducerB {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<PairTimerSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_producer_b")
+    }
+}
+
+impl Tile<TestSpine> for PairProducerB {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<TestSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_producer_b")
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PairConsumer;
+
+impl Tile<PairTimerSpine> for PairConsumer {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<PairTimerSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_consumer")
+    }
+}
+
+impl Tile<TestSpine> for PairConsumer {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<TestSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_consumer")
+    }
+}
+
 /// Creates a spine with a custom temp `base_dir`, attaches two tiles
 /// (writer + reader), runs until the reader receives a message, then
 /// asserts that every shared-memory file was created inside the
@@ -101,14 +165,14 @@ fn all_shmem_files_reside_in_base_dir() {
         let mut scoped = flux::spine::ScopedSpine::new(&mut spine, scope, None, None);
 
         attach_tile(
-            Writer,
-            &mut scoped,
-            TileConfig::background(None, Some(Duration::from_millis(10))),
-        );
-        attach_tile(
             Reader { received: got.clone() },
             &mut scoped,
             TileConfig::background(None, None),
+        );
+        attach_tile(
+            Writer,
+            &mut scoped,
+            TileConfig::background(None, Some(Duration::from_millis(10))),
         );
     });
 
@@ -164,6 +228,80 @@ fn all_shmem_files_reside_in_base_dir() {
             "shmem file {} is NOT inside base_dir {}",
             f.display(),
             base.display()
+        );
+    }
+
+    cleanup_shmem(base);
+}
+
+#[test]
+fn per_producer_consumer_timer_files_are_created() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let base = tmp.path();
+
+    let mut spine = PairTimerSpine::new_with_base_dir(base, None);
+    let mut producer_a = SpineAdapter::connect_tile(&PairProducerA, &mut spine);
+    let mut producer_b = SpineAdapter::connect_tile(&PairProducerB, &mut spine);
+    let mut consumer = SpineAdapter::connect_tile(&PairConsumer, &mut spine);
+
+    consumer.subscribe_broadcast::<MsgA>();
+
+    let mut sum = 0;
+    producer_a.produce(MsgA(1));
+    producer_b.produce(MsgA(2));
+    consumer.consume(|msg: MsgA, _| {
+        sum += msg.0;
+    });
+
+    assert_eq!(sum, 3);
+
+    let files = all_files_under(base);
+    for expected in [
+        "timing-pair_consumer-pair_producer_a-MsgA",
+        "latency-pair_consumer-pair_producer_a-MsgA",
+        "timing-pair_consumer-pair_producer_b-MsgA",
+        "latency-pair_consumer-pair_producer_b-MsgA",
+    ] {
+        assert!(
+            files.iter().any(|path| path.file_name().is_some_and(|name| name == expected)),
+            "expected {expected}, found {files:?}",
+        );
+    }
+
+    cleanup_shmem(base);
+}
+
+#[test]
+fn ad_hoc_consume_with_producer_timers_creates_pair_timer_files() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let base = tmp.path();
+
+    let mut spine = TestSpine::new_with_base_dir(base, None);
+    let mut producer_a = SpineAdapter::connect_tile(&PairProducerA, &mut spine);
+    let mut producer_b = SpineAdapter::connect_tile(&PairProducerB, &mut spine);
+    let mut consumer = SpineAdapter::connect_tile(&PairConsumer, &mut spine);
+
+    consumer.subscribe_broadcast::<MsgA>();
+
+    let mut sum = 0;
+    producer_a.produce(MsgA(1));
+    producer_b.produce(MsgA(2));
+    consumer.consume_with_producer_timers(|msg: MsgA, _| {
+        sum += msg.0;
+    });
+
+    assert_eq!(sum, 3);
+
+    let files = all_files_under(base);
+    for expected in [
+        "timing-pair_consumer-pair_producer_a-MsgA",
+        "latency-pair_consumer-pair_producer_a-MsgA",
+        "timing-pair_consumer-pair_producer_b-MsgA",
+        "latency-pair_consumer-pair_producer_b-MsgA",
+    ] {
+        assert!(
+            files.iter().any(|path| path.file_name().is_some_and(|name| name == expected)),
+            "expected {expected}, found {files:?}",
         );
     }
 

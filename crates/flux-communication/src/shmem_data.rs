@@ -86,6 +86,12 @@ impl<T> ShmemData<T> {
     }
 }
 
+impl<T> Clone for ShmemData<T> {
+    fn clone(&self) -> Self {
+        self.copy_ptr()
+    }
+}
+
 impl<T: std::fmt::Debug> std::fmt::Debug for ShmemData<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.inner)
