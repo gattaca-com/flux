@@ -33,21 +33,4 @@ so those changes still require an intentionally incompatible version bump.
 
 ### Release process
 
-1. Change only `workspace.package.version` in the root `Cargo.toml`.
-2. Run `cargo check --workspace --all-features` to refresh `Cargo.lock`.
-3. Run `cargo test --workspace --all-features --locked`.
-4. Open a pull request containing the version bump and the updated `Cargo.lock`.
-
-The release checks validate the version shape, confirm every crate inherits the
-workspace package metadata, and check public API compatibility. Once the change
-is merged to `main`, create the version tag from a machine whose public IP is in
-the GitHub organization allow list:
-
-1. Check out `main` with a clean worktree.
-2. Run `just release`.
-
-The command fetches `origin` and all tags, requires local `main` to exactly match
-`origin/main`, repeats the workspace/version validation, creates an annotated
-`vMAJOR.MINOR.PATCH` tag, and pushes only that tag. It never moves or recreates
-an existing version tag. It does not create a GitHub Release or build release
-artifacts.
+Follow [creating a version tag](README.md#creating-a-version-tag) in the README.

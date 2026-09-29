@@ -2,6 +2,9 @@
 # Clippy pulls default toolchain from the rust-toolchain.toml file.
 TOOLCHAIN_FMT := "nightly-2025-10-01"
 
+_default:
+  @just --list
+
 fmt:
   rustup toolchain install {{TOOLCHAIN_FMT}} --component rustfmt > /dev/null 2>&1 && \
   cargo +{{TOOLCHAIN_FMT}} fmt
@@ -11,13 +14,12 @@ fmt-check:
   cargo +{{TOOLCHAIN_FMT}} fmt --check
 
 clippy:
-	cargo clippy --locked --all-features --no-deps --all-targets -- -D warnings
+  cargo clippy --locked --all-features --no-deps --all-targets -- -D warnings
 
 clippy-fix:
-	cargo clippy --fix --locked --all-features --no-deps --all-targets -- -D warnings
+  cargo clippy --fix --locked --all-features --no-deps --all-targets -- -D warnings
 
-# cargo machete finds deps a crate declares but never uses; check_workspace_deps.sh
-# finds the reverse, [workspace.dependencies] entries no crate consumes.
+# Find unused deps: in crates (cargo machete) and in [workspace.dependencies].
 machete:
   cargo install cargo-machete --locked && \
   cargo machete && \
