@@ -1692,8 +1692,6 @@ impl FramedStream {
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
     ) -> StreamState {
-        // A non-empty queue means the socket last reported full; the armed
-        // WRITABLE event drains it, so writing now would only hit WouldBlock.
         if !self.send_queue.is_empty() {
             return self.enqueue_remainder(registry, header, payload, 0, config, timers);
         }
