@@ -26,6 +26,7 @@ ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shared_memory.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 ctrlc.workspace = true
