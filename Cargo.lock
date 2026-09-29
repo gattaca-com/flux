@@ -1545,6 +1545,7 @@ dependencies = [
  "shared_memory",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

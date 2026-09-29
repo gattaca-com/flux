@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::{fs::File, io::IsTerminal, path::PathBuf, sync::Mutex};
 
 use clap::{Parser, Subcommand};
 use flux_ctl::{discovery, tui};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "flux-ctl", about = "Manage and observe flux shared memory")]
@@ -66,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let base_dir = cli.base_dir.unwrap_or_else(flux_utils::directories::local_share_dir);
 
+    let tui = !cli.clean && matches!(cli.command, None | Some(Commands::Watch { .. }));
+    init_logging(tui)?;
     if cli.clean {
         return discovery::clean(&base_dir, None, true);
     }
@@ -85,4 +88,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Clean { force, app } => discovery::clean(&base_dir, app.as_deref(), force),
         Commands::Stats { app, verbose } => discovery::stats(&base_dir, app.as_deref(), verbose),
     }
+}
+
+/// Sends the `tracing` events of flux-ctl and the flux crates to stderr, or,
+/// for the TUI, which draws on the terminal, to
+/// `$XDG_STATE_HOME/flux-ctl/flux-ctl.log` (`~/.local/state` without it).
+/// `RUST_LOG` overrides the default filter, `warn,flux_ctl=info`.
+fn init_logging(tui: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,flux_ctl=info".into());
+    let logs = tracing_subscriber::fmt().with_env_filter(filter);
+    if tui {
+        let state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        });
+        let dir = state.ok_or("neither XDG_STATE_HOME nor HOME is set")?.join("flux-ctl");
+        std::fs::create_dir_all(&dir)?;
+        let file = File::options().create(true).append(true).open(dir.join("flux-ctl.log"))?;
+        logs.with_writer(Mutex::new(file)).with_ansi(false).init();
+    } else {
+        logs.with_writer(std::io::stderr).with_ansi(std::io::stderr().is_terminal()).init();
+    }
+    Ok(())
 }
