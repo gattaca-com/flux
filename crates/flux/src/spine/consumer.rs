@@ -144,10 +144,12 @@ impl ConsumerTimers {
         }
     }
 
-    fn start_for(&mut self, tile_id: u16) -> ConsumerTimerKey {
+    fn start_for<T>(&mut self, msg: &InternalMessage<T>) -> ConsumerTimerKey {
         let key = match self {
             Self::Single(_) => ConsumerTimerKey::Single,
-            Self::PerProducer { .. } => ConsumerTimerKey::Producer(Self::producer_slot(tile_id)),
+            Self::PerProducer { .. } => {
+                ConsumerTimerKey::Producer(Self::producer_slot(msg.tile_id()))
+            }
         };
         self.timer_mut(key).start();
         key
@@ -272,7 +274,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             f(m.into_data(), producers);
             self.timers.record_processing_and_latency_from(
                 timer,
@@ -288,12 +290,15 @@ impl<T: 'static + Copy> SpineConsumer<T> {
         F: FnMut(T, &mut P),
     {
         let Self { timers, producer_timer_config, ad_hoc_producer_timers, inner } = self;
-        let timers =
-            Self::producer_timers_or_init(timers, producer_timer_config.as_ref(), ad_hoc_producer_timers);
+        let timers = Self::producer_timers_or_init(
+            timers,
+            producer_timer_config.as_ref(),
+            ad_hoc_producer_timers,
+        );
 
         inner.consume(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = timers.start_for(m.tile_id());
+            let timer = timers.start_for(m);
             f(m.into_data(), producers);
             timers.record_processing_and_latency_from(
                 timer,
@@ -310,7 +315,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             if f(m.into_data(), producers) {
                 self.timers.record_processing_and_latency_from(
                     timer,
@@ -337,7 +342,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
                 return;
             }
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             f(m.into_data(), producers);
             self.timers.record_processing_and_latency_from(
                 timer,
@@ -354,7 +359,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume_collaborative(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             f(m.into_data(), producers);
             self.timers.record_processing_and_latency_from(
                 timer,
@@ -371,7 +376,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume_last(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             f(m.into_data(), producers);
             self.timers.record_processing_and_latency_from(
                 timer,
@@ -388,7 +393,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             f(m, producers);
             self.timers.record_processing_and_latency_from(
                 timer,
@@ -409,7 +414,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             if f(m, producers) {
                 self.timers.record_processing_and_latency_from(
                     timer,
@@ -436,7 +441,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
                 return;
             }
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             f(m, producers);
             self.timers.record_processing_and_latency_from(
                 timer,
@@ -453,7 +458,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume_last(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             f(m, producers);
             self.timers.record_processing_and_latency_from(
                 timer,
@@ -474,7 +479,7 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         self.inner.consume_last(|m| {
             *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
-            let timer = self.timers.start_for(m.tile_id());
+            let timer = self.timers.start_for(m);
             if f(m, producers) {
                 self.timers.record_processing_and_latency_from(
                     timer,
@@ -611,7 +616,7 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
                     return Some(DCacheRead::NoRef(msg.with_data(msg.data().data)));
                 }
                 let user_msg = msg.with_data(msg.data().data);
-                let timer = self.timers.start_for(msg.tile_id());
+                let timer = self.timers.start_for(&msg);
                 let Ok(extracted) =
                     self.dcache.map(dref, |payload| read(&user_msg, payload, &mut *producers))
                 else {
@@ -650,7 +655,7 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
                     return Some(DCacheRead::NoRef(msg.with_data(msg.data().data)));
                 }
                 let user_msg = msg.with_data(msg.data().data);
-                let timer = self.timers.start_for(msg.tile_id());
+                let timer = self.timers.start_for(&msg);
                 let Ok(extracted) = self.dcache.map(dref, |payload| read(&user_msg, payload))
                 else {
                     return Some(DCacheRead::Lost(user_msg));
