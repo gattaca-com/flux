@@ -1693,12 +1693,7 @@ impl FramedStream {
         timers: &mut Option<NetworkTimers>,
     ) -> StreamState {
         if !self.send_queue.is_empty() {
-            if self.drain_queue(registry, config) == StreamState::Disconnected {
-                return StreamState::Disconnected;
-            }
-            if !self.send_queue.is_empty() {
-                return self.enqueue_remainder(registry, header, payload, 0, config, timers);
-            }
+            return self.enqueue_remainder(registry, header, payload, 0, config, timers);
         }
 
         let result = if let Some(header) = header {
