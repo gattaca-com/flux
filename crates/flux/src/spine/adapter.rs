@@ -10,7 +10,9 @@ use signal_hook::consts::SIGINT;
 use crate::{
     spine::{
         DCacheRead, FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer,
-        SpineProducerWithDCache, SpineProducers,
+        SpineProducerWithDCache, SpineProducers, SpscAttachedConsumer, SpscAttachedDCacheConsumer,
+        SpscConsumerAccess, SpscDCacheConsumerAccess, SpscDCacheProduceError,
+        SpscDCacheProducerAccess, SpscProduceError, SpscProducerAccess,
     },
     tile::Tile,
 };
@@ -88,6 +90,10 @@ impl<S: FluxSpine> SpineAdapter<S> {
         self.did_work
     }
 
+    pub fn requires_polling(&self) -> bool {
+        S::requires_polling(&self.consumers, &self.producers)
+    }
+
     /// Manually mark work as done. Use for non-consume/produce work like
     /// business logic ticks.
     #[inline]
@@ -117,6 +123,361 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         self.producers.produce(d);
         self.did_work = true;
+    }
+
+    #[inline]
+    pub fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
+    where
+        S::Producers: SpscProducerAccess<T>,
+    {
+        self.producers.try_produce(data)?;
+        self.did_work = true;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn try_produce_with<T: Copy>(
+        &mut self,
+        make: impl FnOnce() -> T,
+    ) -> Result<(), SpscProduceError>
+    where
+        S::Producers: SpscProducerAccess<T>,
+    {
+        self.producers.try_produce_with(make)?;
+        self.did_work = true;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn try_produce_with_dcache<T: Copy, F: FnOnce(&mut [u8])>(
+        &mut self,
+        data: T,
+        payload: Option<(usize, F)>,
+    ) -> Result<(), SpscDCacheProduceError>
+    where
+        S::Producers: SpscDCacheProducerAccess<T>,
+    {
+        self.producers.try_produce_with_dcache(data, payload)?;
+        self.did_work = true;
+        Ok(())
+    }
+
+    /// ```compile_fail
+    /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
+    /// use spine_derive::from_spine;
+    /// #[from_spine("payload-borrow-example")]
+    /// struct App {
+    ///     tile_info: ShmemData<TileInfo>,
+    ///     #[queue(flavour("spsc"), mtu(256))]
+    ///     messages: flux::spine::SpineQueue<u64>,
+    /// }
+    /// fn borrow(adapter: &mut SpineAdapter<App>) {
+    ///     adapter.try_consume_with_dcache(|_: u64, bytes| bytes, |_, _| {}).unwrap();
+    /// }
+    /// ```
+    #[inline]
+    pub fn try_consume_with_dcache<T, R, F, G>(
+        &mut self,
+        read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
+    {
+        self.try_consume_with_dcache_maybe_track(read, |result, producers| {
+            handle(result, producers);
+            true
+        })
+    }
+
+    #[inline]
+    pub fn try_consume_with_dcache_maybe_track<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
+    {
+        let mut consumer = self.consumers.spsc_dcache_try_attached()?;
+        let mut handled = false;
+        while consumer.consume_maybe_track(
+            &mut self.producers,
+            &mut self.did_work,
+            &mut read,
+            &mut handle,
+        ) {
+            handled = true;
+        }
+        Ok(handled)
+    }
+
+    #[inline]
+    pub fn try_consume_with_dcache_one<T, R, F, G>(
+        &mut self,
+        read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
+    {
+        self.try_consume_with_dcache_one_maybe_track(read, |result, producers| {
+            handle(result, producers);
+            true
+        })
+    }
+
+    #[inline]
+    pub fn try_consume_with_dcache_one_maybe_track<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscDCacheConsumerAccess<T>,
+        F: FnMut(T, &[u8]) -> R,
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers) -> bool,
+    {
+        Ok(self.consumers.spsc_dcache_try_attached()?.consume_maybe_track(
+            &mut self.producers,
+            &mut self.did_work,
+            &mut read,
+            &mut handle,
+        ))
+    }
+
+    #[inline]
+    pub fn try_consume<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(T, &mut S::Producers),
+    {
+        self.try_consume_maybe_track(|message, producers| {
+            f(message, producers);
+            true
+        })
+    }
+
+    #[inline]
+    pub fn try_consume_maybe_track<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(T, &mut S::Producers) -> bool,
+    {
+        self.try_consume_internal_message_maybe_track(|message, producers| {
+            f(message.into_data(), producers)
+        })
+    }
+
+    #[inline]
+    pub fn try_consume_one<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(T, &mut S::Producers),
+    {
+        let consumed = self.consumers.spsc_try_attached()?.consume_internal_message_maybe_track(
+            &mut self.producers,
+            |message, producers| {
+                f(message.into_data(), producers);
+                true
+            },
+        );
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    #[inline]
+    pub fn try_consume_one_maybe_track<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(T, &mut S::Producers) -> bool,
+    {
+        let consumed = self
+            .consumers
+            .spsc_try_attached()?
+            .consume_internal_message_maybe_track(&mut self.producers, |message, producers| {
+                f(message.into_data(), producers)
+            });
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    /// ```compile_fail,E0277
+    /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
+    /// use spine_derive::from_spine;
+    /// #[from_spine("borrow-example")]
+    /// struct App {
+    ///     tile_info: ShmemData<TileInfo>,
+    ///     #[queue(flavour("mpmc"))]
+    ///     messages: flux::spine::SpineQueue<u64>,
+    /// }
+    /// fn borrow(adapter: &mut SpineAdapter<App>) {
+    ///     adapter.consume_ref(|_: &u64, _| {}).unwrap();
+    /// }
+    /// ```
+    #[inline]
+    pub fn consume_ref<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(&T, &mut S::Producers),
+    {
+        self.consume_ref_maybe_track(|message, producers| {
+            f(message, producers);
+            true
+        })
+    }
+
+    /// ```compile_fail,E0277
+    /// use flux::{communication::ShmemData, spine::SpineAdapter, tile::TileInfo};
+    /// use spine_derive::from_spine;
+    /// #[from_spine("borrow-example")]
+    /// struct App {
+    ///     tile_info: ShmemData<TileInfo>,
+    ///     #[queue(flavour("spmc"))]
+    ///     messages: flux::spine::SpineQueue<u64>,
+    /// }
+    /// fn borrow(adapter: &mut SpineAdapter<App>) {
+    ///     adapter.consume_ref_maybe_track(|_: &u64, _| false).unwrap();
+    /// }
+    /// ```
+    #[inline]
+    pub fn consume_ref_maybe_track<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(&T, &mut S::Producers) -> bool,
+    {
+        let mut consumer = self.consumers.spsc_try_attached()?;
+        while consumer.consume_ref_maybe_track(&mut self.producers, &mut f) {
+            self.did_work = true;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn consume_ref_one<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnOnce(&T, &mut S::Producers),
+    {
+        let consumed = self.consumers.spsc_try_attached()?.consume_ref_maybe_track(
+            &mut self.producers,
+            |message, producers| {
+                f(message, producers);
+                true
+            },
+        );
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    #[inline]
+    pub fn consume_ref_one_maybe_track<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnOnce(&T, &mut S::Producers) -> bool,
+    {
+        let consumed =
+            self.consumers.spsc_try_attached()?.consume_ref_maybe_track(&mut self.producers, f);
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    #[inline]
+    pub fn try_consume_internal_message_one<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(&mut InternalMessage<T>, &mut S::Producers),
+    {
+        let consumed = self.consumers.spsc_try_attached()?.consume_internal_message_maybe_track(
+            &mut self.producers,
+            |message, producers| {
+                f(message, producers);
+                true
+            },
+        );
+        self.did_work |= consumed;
+        Ok(consumed)
+    }
+
+    #[inline]
+    pub fn try_consume_internal_message_maybe_track<T, F>(
+        &mut self,
+        mut f: F,
+    ) -> Result<(), crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
+    {
+        let mut consumer = self.consumers.spsc_try_attached()?;
+        while consumer.consume_internal_message_maybe_track(&mut self.producers, &mut f) {
+            self.did_work = true;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn try_consume_internal_message_one_maybe_track<T, F>(
+        &mut self,
+        f: F,
+    ) -> Result<bool, crate::communication::queue::spsc::QueueError>
+    where
+        T: 'static + Copy,
+        S::Consumers: SpscConsumerAccess<T>,
+        F: FnMut(&mut InternalMessage<T>, &mut S::Producers) -> bool,
+    {
+        let consumed = self
+            .consumers
+            .spsc_try_attached()?
+            .consume_internal_message_maybe_track(&mut self.producers, f);
+        self.did_work |= consumed;
+        Ok(consumed)
     }
 
     #[inline]

@@ -1,6 +1,104 @@
+//! Typed queues connecting tiles.
+//!
+//! `#[queue(flavour("spsc"))]` uses one producer and consumer. On `Full`,
+//! retain pending output for retry: consuming input is not rolled back. A
+//! borrowed callback holds its slot and must not wait for output that needs it.
+//!
+//! Shared participants must agree on the effective `slot(bytes)` stride and
+//! alignment. Zero/omission uses the stored type's layout; a nonzero stride
+//! must fit the entire stored message.
+//!
+//! ```compile_fail,E0080
+//! use flux::{communication::ShmemData, tile::TileInfo};
+//! use spine_derive::from_spine;
+//! #[from_spine("invalid-slot")]
+//! struct App {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(flavour("spsc"), slot(1))]
+//!     messages: flux::spine::SpineQueue<u64>,
+//! }
+//! let _ = unsafe { App::new(None) };
+//! ```
+//!
+//! ```no_run
+//! # #![deny(unused_imports)]
+//! use flux::{
+//!     communication::ShmemData,
+//!     spine::{SpineAdapter, SpscProduceError},
+//!     tile::TileInfo,
+//! };
+//! use spine_derive::from_spine;
+//!
+//! #[derive(Clone, Copy, Debug)]
+//! #[repr(C)]
+//! struct Reading(u64);
+//!
+//! #[from_spine("readings")]
+//! struct Readings {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(size(1024), flavour("spsc"))]
+//!     readings: flux::spine::SpineQueue<Reading>,
+//! }
+//!
+//! fn publish_pending(adapter: &mut SpineAdapter<Readings>, pending: &mut Option<Reading>) {
+//!     if let Some(message) = *pending {
+//!         match adapter.try_produce(message) {
+//!             Ok(()) => *pending = None,
+//!             Err(SpscProduceError::Full) => {}, // retry on a later loop
+//!             Err(SpscProduceError::Attach(error)) => panic!("producer role: {error}"),
+//!         }
+//!     }
+//! }
+//!
+//! fn read_in_place(adapter: &mut SpineAdapter<Readings>, total: &mut u64) {
+//!     adapter.consume_ref(|reading: &Reading, _producers| {
+//!         *total += reading.0;
+//!     }).unwrap();
+//!     adapter.consume_ref_maybe_track(|reading: &Reading, _producers| {
+//!         *total += reading.0;
+//!         reading.0 != 0
+//!     }).unwrap();
+//! }
+//!
+//! // SAFETY: participants use this exact schema and process-independent values,
+//! // only access the mapping through Flux, and do not inherit endpoints via fork.
+//! let spine = unsafe { Readings::new(None) };
+//! ```
+//!
+//! SPSC roles are claimed on first use; a crashed owner leaves its role
+//! claimed. Remove shared storage only after all peers detach. Claimed roles
+//! require polling because parking signals are process-local.
+//!
+//! With `mtu(...)`, remove metadata and payload mappings together.
+//!
+//! ```compile_fail,E0133
+//! use flux::{communication::ShmemData, tile::TileInfo};
+//! use spine_derive::from_spine;
+//! #[from_spine("example")]
+//! struct App {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(flavour("spsc"))]
+//!     messages: flux::spine::SpineQueue<u64>,
+//! }
+//! let app = App::new(None);
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use flux::{communication::ShmemData, tile::TileInfo};
+//! use spine_derive::from_spine;
+//! #[from_spine("example")]
+//! struct App {
+//!     tile_info: ShmemData<TileInfo>,
+//!     #[queue(flavour("spsc"))]
+//!     messages: flux::spine::SpineQueue<u64>,
+//! }
+//! fn duplicate(producers: AppProducers) { let copy = producers.clone(); }
+//! ```
+
 mod adapter;
 mod consumer;
 mod scoped;
+mod spsc;
 mod standalone_producer;
 
 use std::path::Path;
@@ -10,6 +108,12 @@ pub use consumer::{DCacheRead, SpineConsumer, SpineDCacheConsumer};
 use flux_timing::{IngestionTime, InternalMessage, Nanos, TrackingTimestamp};
 use flux_utils::{DCacheError, DCachePtr, DCacheRef, directories::shmem_dir};
 pub use scoped::ScopedSpine;
+pub use spsc::{
+    SpineSpscConsumer, SpineSpscDCacheConsumer, SpineSpscDCacheQueue, SpineSpscProducer,
+    SpineSpscProducerWithDCache, SpineSpscQueue, SpscAttachedConsumer, SpscAttachedDCacheConsumer,
+    SpscConsumerAccess, SpscDCacheConsumerAccess, SpscDCacheProduceError, SpscDCacheProducerAccess,
+    SpscProduceError, SpscProducerAccess,
+};
 pub use standalone_producer::{StandaloneDCacheProducer, StandaloneProducer};
 
 use crate::{
@@ -76,6 +180,79 @@ pub trait HasDCacheQueue<T: 'static + Copy> {
 pub trait SpineProducers {
     fn timestamp(&self) -> &TrackingTimestamp;
     fn timestamp_mut(&mut self) -> &mut TrackingTimestamp;
+
+    fn try_produce<T: Copy>(&mut self, data: T) -> Result<(), SpscProduceError>
+    where
+        Self: SpscProducerAccess<T>,
+    {
+        let timestamp = self.timestamp().with_new_publish_delta();
+        self.spsc_try_produce_with(|| InternalMessage::new(timestamp, data))
+    }
+
+    fn try_produce_with<T: Copy>(
+        &mut self,
+        make: impl FnOnce() -> T,
+    ) -> Result<(), SpscProduceError>
+    where
+        Self: SpscProducerAccess<T>,
+    {
+        let timestamp = self.timestamp().with_new_publish_delta();
+        self.spsc_try_produce_with(|| InternalMessage::new(timestamp, make()))
+    }
+
+    fn try_produce_with_dcache<T: Copy, F: FnOnce(&mut [u8])>(
+        &mut self,
+        data: T,
+        payload: Option<(usize, F)>,
+    ) -> Result<(), SpscDCacheProduceError>
+    where
+        Self: SpscDCacheProducerAccess<T>,
+    {
+        let timestamp = self.timestamp().with_new_publish_delta();
+        self.spsc_dcache_try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
+            if let Some((_, fill)) = payload {
+                fill(bytes.expect("requested SPSC payload"));
+            }
+            InternalMessage::new(timestamp, data)
+        })
+    }
+
+    fn try_produce_with_dcache_and_ingestion<T: Copy, F: FnOnce(&mut [u8])>(
+        &mut self,
+        data: T,
+        payload: Option<(usize, F)>,
+        ingestion_t: IngestionTime,
+    ) -> Result<(), SpscDCacheProduceError>
+    where
+        Self: SpscDCacheProducerAccess<T>,
+    {
+        let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
+        self.spsc_dcache_try_produce_with(payload.as_ref().map(|(len, _)| *len), |bytes| {
+            if let Some((_, fill)) = payload {
+                fill(bytes.expect("requested SPSC payload"));
+            }
+            InternalMessage::new(timestamp, data)
+        })
+    }
+
+    fn try_produce_with_ingestion<T: Copy>(
+        &mut self,
+        data: T,
+        ingestion_t: IngestionTime,
+    ) -> Result<(), SpscProduceError>
+    where
+        Self: SpscProducerAccess<T>,
+    {
+        let timestamp = self.timestamp().with_ingestion_t(ingestion_t);
+        self.spsc_try_produce_with(|| InternalMessage::new(timestamp, data))
+    }
+
+    fn try_forward<T: Copy>(&mut self, message: &InternalMessage<T>) -> Result<(), SpscProduceError>
+    where
+        Self: SpscProducerAccess<T>,
+    {
+        self.spsc_try_produce_with(|| *message)
+    }
 
     fn produce<T: Copy>(&self, d: T)
     where
@@ -145,12 +322,21 @@ pub trait SpineProducers {
 }
 
 pub trait FluxSpine: Sized + Send {
-    type Consumers: Clone + Send;
-    type Producers: SpineProducers + Clone + Send;
+    type Consumers: Send;
+    type Producers: SpineProducers + Send;
 
     fn attach_consumers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Consumers;
     fn attach_producers<Tl: Tile<Self>>(&mut self, tile: &Tl) -> Self::Producers;
-    fn new_in_base_dir(base_dir: impl AsRef<Path>) -> Self;
+    /// # Safety
+    /// SPSC fields require
+    /// [`SpineSpscQueue::create_or_open_shared_with_base_dir`]'s
+    /// shared-memory contract.
+    unsafe fn new_in_base_dir(base_dir: impl AsRef<Path>) -> Self;
+
+    /// Whether a tile has a claimed endpoint that requires polling.
+    fn requires_polling(_consumers: &Self::Consumers, _producers: &Self::Producers) -> bool {
+        false
+    }
 
     fn register_tile(&mut self, name: TileName) -> u16;
     fn app_name() -> &'static str;

@@ -74,6 +74,7 @@ crossterm = "0.28.1"
 ctrlc = "3"
 directories = "5.0.1"
 governor = "0.6.3"
+hdrhistogram = { version = "7.5.4", default-features = false }
 hmac = "0.12"
 httparse = "1"
 humantime = "2.1"
@@ -89,6 +90,7 @@ quote = "1"
 rand = "0.9.0"
 ratatui = "0.29.0"
 rcgen = "0.14"
+rtrb = "0.4.0"
 rustc-hash = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { features = ["derive"], version = "1.0" }
