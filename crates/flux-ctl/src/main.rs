@@ -12,6 +12,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use flux_ctl::{discovery, record, tui};
 use flux_timing::Nanos;
+use flux_utils::{ThreadNiceness, thread_boot, try_thread_boot};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -84,6 +85,13 @@ enum Commands {
         /// Only queues whose name contains this
         #[arg(long = "match")]
         filter: Option<String>,
+        /// Pin the recorder to these cores, e.g. `3` or `3,4`, off the app's
+        #[arg(long, value_delimiter = ',')]
+        cores: Vec<usize>,
+        /// Niceness, -20 to 19, an error if it cannot be set (default: 10,
+        /// which yields to the app on a shared core, and only warns)
+        #[arg(long, allow_negative_numbers = true, value_parser = clap::value_parser!(i32).range(-20..=19))]
+        nice: Option<i32>,
     },
     /// Per-queue statistics of a `record` directory, as JSON
     Summarize {
@@ -136,7 +144,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Commands::Record { app, out, duration, rotate_secs, max_mb, filter } => {
+        Commands::Record { app, out, duration, rotate_secs, max_mb, filter, cores, nice } => {
+            // A recorder left on the app's cores would disturb what it measures.
+            try_thread_boot(&cores, nice.map(ThreadNiceness::Custom))
+                .map_err(|e| format!("placing the recorder (--cores, --nice): {e}"))?;
+            if nice.is_none() {
+                // Only a yield, so a recorder already nicer, or off Linux, goes on.
+                thread_boot(&[], Some(ThreadNiceness::Custom(10)));
+            }
+            // Before attach, so a signal from then on still lets `run` finish
+            // the files; after `try_thread_boot`, so its thread is placed too.
+            let stop = Arc::new(AtomicBool::new(false));
+            let on_signal = Arc::clone(&stop);
+            ctrlc::set_handler(move || on_signal.store(true, Ordering::Relaxed))?;
             let secs = |s| (s > 0).then(|| Duration::from_secs(s));
             let out = out.unwrap_or_else(|| {
                 PathBuf::from(format!("{app}-{}", Nanos::now().with_fmt_utc("%Y%m%dT%H%M%SZ")))
@@ -148,10 +168,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 secs(rotate_secs),
                 filter.as_deref(),
             )?;
-            let stop = Arc::new(AtomicBool::new(false));
-            let on_signal = Arc::clone(&stop);
-            ctrlc::set_handler(move || on_signal.store(true, Ordering::Relaxed))?;
-
             let until = record::Until {
                 duration: secs(duration),
                 bytes: (max_mb > 0).then(|| max_mb * 1_000_000),
