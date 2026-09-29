@@ -97,10 +97,10 @@ impl Parse for FromSpineArgs {
                 let value: LitStr = input.parse()?;
                 match value.value().as_str() {
                     "consumer" => per_producer_consumer_timers = false,
-                    "per_producer"
-                    | "producer_consumer"
-                    | "per_producer_consumer"
-                    | "per_producer_consumer_pair" => per_producer_consumer_timers = true,
+                    "per_producer" |
+                    "producer_consumer" |
+                    "per_producer_consumer" |
+                    "per_producer_consumer_pair" => per_producer_consumer_timers = true,
                     _ => {
                         return Err(syn::Error::new_spanned(
                             value,
@@ -217,10 +217,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         let field_ident = field.ident.as_ref().expect("named field required");
 
         // recognise Queue<T>
-        if let Type::Path(tp) = &field.ty
-            && tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue")
-            && let PathArguments::AngleBracketed(args) = &tp.path.segments[0].arguments
-            && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+        if let Type::Path(tp) = &field.ty &&
+            tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") &&
+            let PathArguments::AngleBracketed(args) = &tp.path.segments[0].arguments &&
+            let Some(GenericArgument::Type(inner_ty)) = args.args.first()
         {
             message_types.push(quote! {
                 ::flux::utils::short_typename::<#inner_ty>().to_string()
@@ -379,10 +379,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 });
             }
-        } else if let Type::Path(tp) = &field.ty
-            && let Some(last_seg) = tp.path.segments.last()
-            && let PathArguments::AngleBracketed(args) = &last_seg.arguments
-            && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+        } else if let Type::Path(tp) = &field.ty &&
+            let Some(last_seg) = tp.path.segments.last() &&
+            let PathArguments::AngleBracketed(args) = &last_seg.arguments &&
+            let Some(GenericArgument::Type(inner_ty)) = args.args.first()
         {
             let check_fn = format_ident!("_ffi_check_{}_{}", struct_ident, field_ident);
             let inner_ty_span = inner_ty.span();
@@ -551,11 +551,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 // For dcache queue fields, rewrite SpineQueue<T> → SpineQueue<DCacheMsg<T>>
                 // and inject the private dcache handle field immediately after.
-                if let Type::Path(tp) = ty
-                    && tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue")
-                    && let PathArguments::AngleBracketed(ref targs) =
-                        tp.path.segments.last().unwrap().arguments
-                    && let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
+                if let Type::Path(tp) = ty &&
+                    tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") &&
+                    let PathArguments::AngleBracketed(ref targs) =
+                        tp.path.segments.last().unwrap().arguments &&
+                    let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
                 {
                     let (_, _, _, mtu_opt, _) = get_queue_config(&f.attrs);
                     if mtu_opt.is_some() {

@@ -8,8 +8,7 @@ use flux_utils::{DCachePtr, ShortTypename, short_typename};
 
 use crate::{
     Timer,
-    communication::ShmemData,
-    communication::{ReadError, queue},
+    communication::{ReadError, ShmemData, queue},
     spine::{DCacheMsg, FluxSpine, SpineProducers, SpineQueue},
     tile::{Tile, TileInfo, TileName},
 };
@@ -32,7 +31,7 @@ enum ConsumerTimers {
         consumer_name: TileName,
         message_name: ShortTypename,
         tile_info: ShmemData<TileInfo>,
-        timers: Box<[Option<Timer>; PRODUCER_TIMER_SLOTS]>,
+        timers: Box<[Option<Timer>]>,
     },
 }
 
@@ -61,7 +60,7 @@ impl ConsumerTimers {
             consumer_name,
             message_name,
             tile_info,
-            timers: Box::new([None; PRODUCER_TIMER_SLOTS]),
+            timers: vec![None; PRODUCER_TIMER_SLOTS].into_boxed_slice(),
         }
     }
 
@@ -75,11 +74,10 @@ impl ConsumerTimers {
     where
         D: AsRef<Path>,
     {
-        let name = if let Some(producer_name) = producer_name {
-            format!("{consumer_name}-{producer_name}-{message_name}")
-        } else {
-            format!("{consumer_name}-{message_name}")
-        };
+        let name = producer_name.map_or_else(
+            || format!("{consumer_name}-{message_name}"),
+            |producer_name| format!("{consumer_name}-{producer_name}-{message_name}"),
+        );
         Timer::new_with_base_dir(base_dir, app_name, name)
     }
 
