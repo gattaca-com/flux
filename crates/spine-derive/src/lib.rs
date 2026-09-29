@@ -16,6 +16,11 @@ enum FromSpineArg {
     Named(LitStr),
 }
 
+struct FromSpineArgs {
+    app_name: FromSpineArg,
+    per_producer_consumer_timers: bool,
+}
+
 impl Parse for FromSpineArg {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         if input.is_empty() {
@@ -67,6 +72,52 @@ impl FromSpineArg {
             Self::Str(s) | Self::Named(s) => quote! { #s },
             Self::Path(p) => quote! { stringify!(#p) },
         }
+    }
+}
+
+impl Parse for FromSpineArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let app_name: FromSpineArg = input.parse()?;
+        let mut per_producer_consumer_timers = false;
+
+        while input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+
+            let ident: Ident = input.parse()?;
+            if ident == "per_producer_consumer_timers" {
+                per_producer_consumer_timers = true;
+                continue;
+            }
+
+            if ident == "consumer_timers" {
+                input.parse::<Token![=]>()?;
+                let value: LitStr = input.parse()?;
+                match value.value().as_str() {
+                    "consumer" => per_producer_consumer_timers = false,
+                    "per_producer"
+                    | "producer_consumer"
+                    | "per_producer_consumer"
+                    | "per_producer_consumer_pair" => per_producer_consumer_timers = true,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            r#"expected "consumer" or "per_producer_consumer""#,
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            return Err(syn::Error::new_spanned(
+                ident,
+                "expected `per_producer_consumer_timers` or `consumer_timers = \"...\"`",
+            ));
+        }
+
+        Ok(Self { app_name, per_producer_consumer_timers })
     }
 }
 
@@ -122,6 +173,11 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 /// Generate a spine struct plus consumers/producers, config, and the
 /// `FluxSpine` impl.
 ///
+/// Macro options:
+/// - `#[from_spine("app")]`: default consumer timers are per consumer/message.
+/// - `#[from_spine("app", per_producer_consumer_timers)]`: consumer timers are
+///   split by producer tile, consumer tile, and message type.
+///
 /// Queue attributes (`#[queue(..)]` on `SpineQueue<T>` fields):
 /// - `size(..)`: queue capacity (default `2usize.pow(15)`).
 /// - `flavour("spmc")`: SPMC queue instead of MPMC.
@@ -135,8 +191,9 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 #[allow(clippy::too_many_lines)]
 #[proc_macro_attribute]
 pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as FromSpineArg);
-    let app_name_tokens = args.as_tokens();
+    let args = parse_macro_input!(attr as FromSpineArgs);
+    let app_name_tokens = args.app_name.as_tokens();
+    let per_producer_consumer_timers = args.per_producer_consumer_timers;
     // ─── 1. parse the annotated struct ────────────────────────────────────
     let input: ItemStruct = parse_macro_input!(item);
     let struct_ident = &input.ident;
@@ -160,10 +217,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         let field_ident = field.ident.as_ref().expect("named field required");
 
         // recognise Queue<T>
-        if let Type::Path(tp) = &field.ty &&
-            tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") &&
-            let PathArguments::AngleBracketed(args) = &tp.path.segments[0].arguments &&
-            let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+        if let Type::Path(tp) = &field.ty
+            && tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue")
+            && let PathArguments::AngleBracketed(args) = &tp.path.segments[0].arguments
+            && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
         {
             message_types.push(quote! {
                 ::flux::utils::short_typename::<#inner_ty>().to_string()
@@ -197,10 +254,22 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     pub #field_ident : ::flux::spine::SpineProducerWithDCache<#inner_ty>
                 });
 
-                consumer_init.push(quote! {
-                    #field_ident : ::flux::spine::SpineDCacheConsumer::attach::<_, #struct_ident, _>(
-                        &spine.base_dir, tile, spine.#field_ident, spine.#dcache_ident)
-                });
+                if per_producer_consumer_timers {
+                    consumer_init.push(quote! {
+                        #field_ident : ::flux::spine::SpineDCacheConsumer::attach_with_producer_timers::<_, #struct_ident, _>(
+                            &spine.base_dir,
+                            tile,
+                            spine.#field_ident,
+                            spine.#dcache_ident,
+                            spine.tile_info.clone(),
+                        )
+                    });
+                } else {
+                    consumer_init.push(quote! {
+                        #field_ident : ::flux::spine::SpineDCacheConsumer::attach::<_, #struct_ident, _>(
+                            &spine.base_dir, tile, spine.#field_ident, spine.#dcache_ident)
+                    });
+                }
                 producer_init.push(quote! {
                     #field_ident : ::flux::spine::SpineProducerWithDCache::new(
                         spine.#field_ident, spine.#dcache_ident)
@@ -266,10 +335,21 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 producer_fields
                     .push(quote! { pub #field_ident : ::flux::spine::SpineProducer<#inner_ty> });
 
-                consumer_init.push(quote! {
-                    #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(
-                        &spine.base_dir, tile, spine.#field_ident)
-                });
+                if per_producer_consumer_timers {
+                    consumer_init.push(quote! {
+                        #field_ident : ::flux::spine::SpineConsumer::attach_with_producer_timers::<_, #struct_ident, _>(
+                            &spine.base_dir,
+                            tile,
+                            spine.#field_ident,
+                            spine.tile_info.clone(),
+                        )
+                    });
+                } else {
+                    consumer_init.push(quote! {
+                        #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(
+                            &spine.base_dir, tile, spine.#field_ident)
+                    });
+                }
                 producer_init.push(quote! {
                     #field_ident : ::flux::communication::queue::Producer::from(spine.#field_ident)
                 });
@@ -299,10 +379,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 });
             }
-        } else if let Type::Path(tp) = &field.ty &&
-            let Some(last_seg) = tp.path.segments.last() &&
-            let PathArguments::AngleBracketed(args) = &last_seg.arguments &&
-            let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+        } else if let Type::Path(tp) = &field.ty
+            && let Some(last_seg) = tp.path.segments.last()
+            && let PathArguments::AngleBracketed(args) = &last_seg.arguments
+            && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
         {
             let check_fn = format_ident!("_ffi_check_{}_{}", struct_ident, field_ident);
             let inner_ty_span = inner_ty.span();
@@ -471,11 +551,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 // For dcache queue fields, rewrite SpineQueue<T> → SpineQueue<DCacheMsg<T>>
                 // and inject the private dcache handle field immediately after.
-                if let Type::Path(tp) = ty &&
-                    tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") &&
-                    let PathArguments::AngleBracketed(ref targs) =
-                        tp.path.segments.last().unwrap().arguments &&
-                    let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
+                if let Type::Path(tp) = ty
+                    && tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue")
+                    && let PathArguments::AngleBracketed(ref targs) =
+                        tp.path.segments.last().unwrap().arguments
+                    && let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
                 {
                     let (_, _, _, mtu_opt, _) = get_queue_config(&f.attrs);
                     if mtu_opt.is_some() {
@@ -529,7 +609,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         // generated Consumers / Producers structs
-        #[derive(Clone, Copy, Debug)]
+        #[derive(Clone, Debug)]
         #vis struct #consumers_ident { #consumer_fields }
         impl #consumers_ident {
             pub fn attach<Tl: ::flux::tile::Tile<#struct_ident>>(tile: &Tl, spine: &mut #struct_ident) -> Self {
