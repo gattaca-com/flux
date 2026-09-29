@@ -74,6 +74,7 @@ crossterm = "0.28.1"
 ctrlc = "3"
 directories = "5.0.1"
 governor = "0.6.3"
+hdrhistogram = { version = "7.5", default-features = false }
 hmac = "0.12"
 httparse = "1"
 humantime = "2.1"
@@ -82,6 +83,7 @@ io-uring = "0.7.14"
 libc = "0.2.177"
 lz4_flex = "0.14"
 mio = { version = "1.1.1", features = ["net", "os-poll"] }
+parquet = { version = "60.0.0", default-features = false, features = ["zstd"] }
 proc-macro-crate = "3"
 proc-macro2 = "1"
 quanta = "0.12.3"
