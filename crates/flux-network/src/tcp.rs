@@ -503,14 +503,7 @@ impl TcpManager {
             return false;
         }
 
-        let mut stream = FramedStream::new(
-            socket,
-            token,
-            peer_addr,
-            config.framing,
-            config.max_frame_size,
-            dcache.is_some() || config.aligned_payloads,
-        );
+        let mut stream = FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
         if is_tls {
             stream.send_queue.framed = false;
         }
@@ -633,14 +626,8 @@ impl TcpManager {
                     peer_addr,
                     config.framing,
                 );
-                let mut stream = FramedStream::new(
-                    socket,
-                    token,
-                    peer_addr,
-                    config.framing,
-                    config.max_frame_size,
-                    dcache.is_some() || config.aligned_payloads,
-                );
+                let mut stream =
+                    FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
                 if let Some(message) = config.on_connect_msg.as_deref() {
                     let header = (config.framing == Framing::LengthPrefixed).then(|| {
                         let mut header = [0; FRAME_HEADER_SIZE];
@@ -1470,14 +1457,14 @@ impl FramedStream {
         socket: mio::net::TcpStream,
         token: Token,
         peer_addr: SocketAddr,
-        framing: Framing,
-        max_frame_size: usize,
-        direct: bool,
+        config: &TcpGroupConfig,
+        dcache: bool,
     ) -> Self {
         // Allocated here so the read path only allocates for an oversized
         // frame. Raw reads at most `max_frame_size` at a time.
-        let rx_len = match framing {
-            Framing::Raw => INITIAL_RX_BUFFER_SIZE.min(max_frame_size),
+        let direct = dcache || config.aligned_payloads;
+        let rx_len = match config.framing {
+            Framing::Raw => INITIAL_RX_BUFFER_SIZE.min(config.max_frame_size),
             Framing::LengthPrefixed => INITIAL_RX_BUFFER_SIZE,
         };
         Self {
@@ -1490,11 +1477,18 @@ impl FramedStream {
                 tail: 0,
             },
             send_queue: ByteQueue {
-                framed: framing == Framing::LengthPrefixed,
+                framed: config.framing == Framing::LengthPrefixed,
                 ..ByteQueue::default()
             },
             writable_armed: false,
-            direct_rx: direct.then(DirectRx::default),
+            direct_rx: direct.then(|| DirectRx {
+                words: if dcache {
+                    Vec::new()
+                } else {
+                    vec![0; INITIAL_RX_BUFFER_SIZE.min(config.max_frame_size).div_ceil(8)]
+                },
+                ..DirectRx::default()
+            }),
         }
     }
 
@@ -1834,7 +1828,7 @@ mod tests {
     use mio::{Poll, Token};
 
     use super::{
-        ByteQueue, FRAME_HEADER_SIZE, FramedStream, Framing, StreamState, TcpGroupConfig,
+        ByteQueue, FRAME_HEADER_SIZE, FramedStream, StreamState, TcpGroupConfig,
         set_socket_buf_size, write_frame_header,
     };
 
@@ -1944,8 +1938,13 @@ mod tests {
 
         let socket = mio::net::TcpStream::from_std(client);
         set_socket_buf_size(&socket, 1024);
-        let mut stream =
-            FramedStream::new(socket, Token(0), peer_addr, Framing::LengthPrefixed, 1024, false);
+        let config = TcpGroupConfig {
+            backlog_warn_bytes: None,
+            max_backlog_bytes: Some(16),
+            max_frame_size: 1024,
+            ..Default::default()
+        };
+        let mut stream = FramedStream::new(socket, Token(0), peer_addr, &config, false);
         let fill = [0; 4096];
         loop {
             match stream.socket.write(&fill) {
@@ -1956,11 +1955,6 @@ mod tests {
         }
         stream.send_queue.bytes.extend_from_slice(&[1; 8]);
 
-        let config = TcpGroupConfig {
-            backlog_warn_bytes: None,
-            max_backlog_bytes: Some(16),
-            ..Default::default()
-        };
         let mut header = [0; FRAME_HEADER_SIZE];
         let payload = [2; 8];
         write_frame_header(&mut header, payload.len(), Nanos::now());
