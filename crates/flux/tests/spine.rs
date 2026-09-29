@@ -102,6 +102,14 @@ impl Tile<PairTimerSpine> for PairProducerA {
     }
 }
 
+impl Tile<TestSpine> for PairProducerA {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<TestSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_producer_a")
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct PairProducerB;
 
@@ -113,11 +121,27 @@ impl Tile<PairTimerSpine> for PairProducerB {
     }
 }
 
+impl Tile<TestSpine> for PairProducerB {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<TestSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_producer_b")
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct PairConsumer;
 
 impl Tile<PairTimerSpine> for PairConsumer {
     fn loop_body(&mut self, _adapter: &mut SpineAdapter<PairTimerSpine>) {}
+
+    fn name(&self) -> TileName {
+        TileName::from_str_truncate("pair_consumer")
+    }
+}
+
+impl Tile<TestSpine> for PairConsumer {
+    fn loop_body(&mut self, _adapter: &mut SpineAdapter<TestSpine>) {}
 
     fn name(&self) -> TileName {
         TileName::from_str_truncate("pair_consumer")
@@ -226,6 +250,43 @@ fn per_producer_consumer_timer_files_are_created() {
     producer_a.produce(MsgA(1));
     producer_b.produce(MsgA(2));
     consumer.consume(|msg: MsgA, _| {
+        sum += msg.0;
+    });
+
+    assert_eq!(sum, 3);
+
+    let files = all_files_under(base);
+    for expected in [
+        "timing-pair_consumer-pair_producer_a-MsgA",
+        "latency-pair_consumer-pair_producer_a-MsgA",
+        "timing-pair_consumer-pair_producer_b-MsgA",
+        "latency-pair_consumer-pair_producer_b-MsgA",
+    ] {
+        assert!(
+            files.iter().any(|path| path.file_name().is_some_and(|name| name == expected)),
+            "expected {expected}, found {files:?}",
+        );
+    }
+
+    cleanup_shmem(base);
+}
+
+#[test]
+fn ad_hoc_consume_with_producer_timers_creates_pair_timer_files() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let base = tmp.path();
+
+    let mut spine = TestSpine::new_with_base_dir(base, None);
+    let mut producer_a = SpineAdapter::connect_tile(&PairProducerA, &mut spine);
+    let mut producer_b = SpineAdapter::connect_tile(&PairProducerB, &mut spine);
+    let mut consumer = SpineAdapter::connect_tile(&PairConsumer, &mut spine);
+
+    consumer.subscribe_broadcast::<MsgA>();
+
+    let mut sum = 0;
+    producer_a.produce(MsgA(1));
+    producer_b.produce(MsgA(2));
+    consumer.consume_with_producer_timers(|msg: MsgA, _| {
         sum += msg.0;
     });
 

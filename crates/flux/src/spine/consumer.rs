@@ -23,16 +23,61 @@ enum ConsumerTimerKey {
 }
 
 #[derive(Clone, Debug)]
-enum ConsumerTimers {
-    Single(Timer),
-    PerProducer {
-        base_dir: PathBuf,
-        app_name: &'static str,
+struct ProducerTimerConfig {
+    base_dir: PathBuf,
+    app_name: &'static str,
+    consumer_name: TileName,
+    message_name: ShortTypename,
+    tile_info: ShmemData<TileInfo>,
+}
+
+impl ProducerTimerConfig {
+    fn new<D, S>(
+        base_dir: D,
         consumer_name: TileName,
         message_name: ShortTypename,
         tile_info: ShmemData<TileInfo>,
-        timers: Box<[Option<Timer>]>,
-    },
+    ) -> Self
+    where
+        D: AsRef<Path>,
+        S: FluxSpine,
+    {
+        Self {
+            base_dir: base_dir.as_ref().to_path_buf(),
+            app_name: S::app_name(),
+            consumer_name,
+            message_name,
+            tile_info,
+        }
+    }
+
+    fn single_timer(&self) -> Timer {
+        self.new_timer(None)
+    }
+
+    fn new_timer(&self, producer_name: Option<String>) -> Timer {
+        let name = producer_name.map_or_else(
+            || format!("{}-{}", self.consumer_name, self.message_name),
+            |producer_name| {
+                format!("{}-{}-{}", self.consumer_name, producer_name, self.message_name)
+            },
+        );
+        Timer::new_with_base_dir(&self.base_dir, self.app_name, name)
+    }
+
+    fn producer_name(&self, slot: usize) -> String {
+        self.tile_info
+            .tiles
+            .get(slot)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| format!("producer-{slot}"), ToString::to_string)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ConsumerTimers {
+    Single(Timer),
+    PerProducer { config: ProducerTimerConfig, timers: Box<[Option<Timer>]> },
 }
 
 impl ConsumerTimers {
@@ -41,7 +86,15 @@ impl ConsumerTimers {
         D: AsRef<Path>,
         S: FluxSpine,
     {
-        Self::Single(Self::new_timer(base_dir, S::app_name(), consumer_name, None, message_name))
+        Self::Single(Timer::new_with_base_dir(
+            base_dir,
+            S::app_name(),
+            format!("{consumer_name}-{message_name}"),
+        ))
+    }
+
+    fn single_from_config(config: &ProducerTimerConfig) -> Self {
+        Self::Single(config.single_timer())
     }
 
     fn per_producer<D, S>(
@@ -54,31 +107,16 @@ impl ConsumerTimers {
         D: AsRef<Path>,
         S: FluxSpine,
     {
-        Self::PerProducer {
-            base_dir: base_dir.as_ref().to_path_buf(),
-            app_name: S::app_name(),
+        Self::per_producer_from_config(ProducerTimerConfig::new::<_, S>(
+            base_dir,
             consumer_name,
             message_name,
             tile_info,
-            timers: vec![None; PRODUCER_TIMER_SLOTS].into_boxed_slice(),
-        }
+        ))
     }
 
-    fn new_timer<D>(
-        base_dir: D,
-        app_name: &'static str,
-        consumer_name: TileName,
-        producer_name: Option<String>,
-        message_name: ShortTypename,
-    ) -> Timer
-    where
-        D: AsRef<Path>,
-    {
-        let name = producer_name.map_or_else(
-            || format!("{consumer_name}-{message_name}"),
-            |producer_name| format!("{consumer_name}-{producer_name}-{message_name}"),
-        );
-        Timer::new_with_base_dir(base_dir, app_name, name)
+    fn per_producer_from_config(config: ProducerTimerConfig) -> Self {
+        Self::PerProducer { config, timers: vec![None; PRODUCER_TIMER_SLOTS].into_boxed_slice() }
     }
 
     fn producer_slot(tile_id: u16) -> usize {
@@ -86,25 +124,10 @@ impl ConsumerTimers {
         if tile_id < UNKNOWN_PRODUCER_TIMER_SLOT { tile_id } else { UNKNOWN_PRODUCER_TIMER_SLOT }
     }
 
-    fn producer_name(tile_info: &TileInfo, slot: usize) -> String {
-        tile_info
-            .tiles
-            .get(slot)
-            .filter(|name| !name.is_empty())
-            .map_or_else(|| format!("producer-{slot}"), ToString::to_string)
-    }
-
     fn timer_mut(&mut self, key: ConsumerTimerKey) -> &mut Timer {
         match self {
             Self::Single(timer) => timer,
-            Self::PerProducer {
-                base_dir,
-                app_name,
-                consumer_name,
-                message_name,
-                tile_info,
-                timers,
-            } => {
+            Self::PerProducer { config, timers } => {
                 let ConsumerTimerKey::Producer(slot) = key else {
                     unreachable!("single timer key used with per-producer timers")
                 };
@@ -112,15 +135,9 @@ impl ConsumerTimers {
                     let producer_name = if slot == UNKNOWN_PRODUCER_TIMER_SLOT {
                         "unknown-producer".to_owned()
                     } else {
-                        Self::producer_name(tile_info, slot)
+                        config.producer_name(slot)
                     };
-                    timers[slot] = Some(Self::new_timer(
-                        base_dir,
-                        app_name,
-                        *consumer_name,
-                        Some(producer_name),
-                        *message_name,
-                    ));
+                    timers[slot] = Some(config.new_timer(Some(producer_name)));
                 }
                 timers[slot].as_mut().expect("timer was just initialised")
             }
@@ -144,6 +161,8 @@ impl ConsumerTimers {
 #[derive(Clone, Debug)]
 pub struct SpineConsumer<T: 'static + Copy> {
     timers: ConsumerTimers,
+    producer_timer_config: Option<ProducerTimerConfig>,
+    ad_hoc_producer_timers: Option<ConsumerTimers>,
     pub inner: queue::Consumer<InternalMessage<T>>,
 }
 
@@ -167,7 +186,38 @@ impl<T: 'static + Copy> SpineConsumer<T> {
         let timer_label: &'static str = Box::leak(label.as_str().to_owned().into_boxed_str());
         let timers = ConsumerTimers::single::<_, S>(base_dir, label, short_typename::<T>());
 
-        Self { timers, inner: queue::Consumer::new(queue, timer_label) }
+        Self {
+            timers,
+            producer_timer_config: None,
+            ad_hoc_producer_timers: None,
+            inner: queue::Consumer::new(queue, timer_label),
+        }
+    }
+
+    #[inline]
+    pub fn attach_with_tile_info<D, S, Tl>(
+        base_dir: D,
+        tile: &Tl,
+        queue: SpineQueue<T>,
+        tile_info: ShmemData<TileInfo>,
+    ) -> Self
+    where
+        D: AsRef<Path>,
+        S: FluxSpine,
+        Tl: Tile<S>,
+    {
+        let label = tile.name();
+        let timer_label: &'static str = Box::leak(label.as_str().to_owned().into_boxed_str());
+        let config =
+            ProducerTimerConfig::new::<_, S>(base_dir, label, short_typename::<T>(), tile_info);
+        let timers = ConsumerTimers::single_from_config(&config);
+
+        Self {
+            timers,
+            producer_timer_config: Some(config),
+            ad_hoc_producer_timers: None,
+            inner: queue::Consumer::new(queue, timer_label),
+        }
     }
 
     #[inline]
@@ -184,10 +234,34 @@ impl<T: 'static + Copy> SpineConsumer<T> {
     {
         let label = tile.name();
         let timer_label: &'static str = Box::leak(label.as_str().to_owned().into_boxed_str());
-        let timers =
-            ConsumerTimers::per_producer::<_, S>(base_dir, label, short_typename::<T>(), tile_info);
+        let config =
+            ProducerTimerConfig::new::<_, S>(base_dir, label, short_typename::<T>(), tile_info);
+        let timers = ConsumerTimers::per_producer_from_config(config.clone());
 
-        Self { timers, inner: queue::Consumer::new(queue, timer_label) }
+        Self {
+            timers,
+            producer_timer_config: Some(config),
+            ad_hoc_producer_timers: None,
+            inner: queue::Consumer::new(queue, timer_label),
+        }
+    }
+
+    #[inline]
+    fn producer_timers_or_init<'a>(
+        timers: &'a mut ConsumerTimers,
+        producer_timer_config: Option<&ProducerTimerConfig>,
+        ad_hoc_producer_timers: &'a mut Option<ConsumerTimers>,
+    ) -> &'a mut ConsumerTimers {
+        if matches!(timers, ConsumerTimers::PerProducer { .. }) {
+            return timers;
+        }
+
+        ad_hoc_producer_timers.get_or_insert_with(|| {
+            let config = producer_timer_config
+                .cloned()
+                .expect("producer timer metadata unavailable for this consumer");
+            ConsumerTimers::per_producer_from_config(config)
+        })
     }
 
     #[inline]
@@ -201,6 +275,27 @@ impl<T: 'static + Copy> SpineConsumer<T> {
             let timer = self.timers.start_for(m.tile_id());
             f(m.into_data(), producers);
             self.timers.record_processing_and_latency_from(
+                timer,
+                producers.timestamp().ingestion_t.into(),
+            );
+        })
+    }
+
+    #[inline]
+    pub fn consume_with_producer_timers<P, F>(&mut self, producers: &mut P, mut f: F) -> bool
+    where
+        P: SpineProducers,
+        F: FnMut(T, &mut P),
+    {
+        let Self { timers, producer_timer_config, ad_hoc_producer_timers, inner } = self;
+        let timers =
+            Self::producer_timers_or_init(timers, producer_timer_config.as_ref(), ad_hoc_producer_timers);
+
+        inner.consume(|m| {
+            *producers.timestamp_mut().ingestion_t_mut() = m.ingestion_time();
+            let timer = timers.start_for(m.tile_id());
+            f(m.into_data(), producers);
+            timers.record_processing_and_latency_from(
                 timer,
                 producers.timestamp().ingestion_t.into(),
             );

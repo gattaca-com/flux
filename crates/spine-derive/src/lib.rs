@@ -346,8 +346,12 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     });
                 } else {
                     consumer_init.push(quote! {
-                        #field_ident : ::flux::spine::SpineConsumer::attach::<_, #struct_ident, _>(
-                            &spine.base_dir, tile, spine.#field_ident)
+                        #field_ident : ::flux::spine::SpineConsumer::attach_with_tile_info::<_, #struct_ident, _>(
+                            &spine.base_dir,
+                            tile,
+                            spine.#field_ident,
+                            spine.tile_info.clone(),
+                        )
                     });
                 }
                 producer_init.push(quote! {

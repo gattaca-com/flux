@@ -161,6 +161,32 @@ impl<S: FluxSpine> SpineAdapter<S> {
     }
 
     #[inline]
+    pub fn consume_with_producer_timers<T, F>(&mut self, mut f: F)
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        S::Producers: SpineProducers,
+        F: FnMut(T, &mut S::Producers),
+    {
+        let c = self.consumers.as_mut();
+        while c.consume_with_producer_timers(&mut self.producers, &mut f) {
+            self.did_work = true;
+        }
+    }
+
+    #[deprecated(note = "use consume_with_producer_timers")]
+    #[inline]
+    pub fn consume_woth_producer_timers<T, F>(&mut self, f: F)
+    where
+        T: 'static + Copy,
+        S::Consumers: AsMut<SpineConsumer<T>>,
+        S::Producers: SpineProducers,
+        F: FnMut(T, &mut S::Producers),
+    {
+        self.consume_with_producer_timers(f);
+    }
+
+    #[inline]
     pub fn consume_n<T, F>(&mut self, mut n: usize, mut f: F)
     where
         T: 'static + Copy,
