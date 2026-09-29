@@ -4,6 +4,7 @@
 //! existing one.
 
 pub mod http;
+pub mod http2;
 pub mod network;
 mod tcp;
 pub mod tls;
