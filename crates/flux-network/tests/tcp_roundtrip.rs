@@ -4,33 +4,39 @@ use std::{
     time::Duration,
 };
 
-use flux_network::{NetworkDriver, PollEvent, SendBehavior, TcpConfig, Transport};
+use flux_network::{Network, NetworkEvent, ReplayPolicy, TcpGroupConfig};
+use wincode::io::std_write::WriteAdapter;
 use wincode_derive::{SchemaRead, SchemaWrite};
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
 struct TestMsg(u32);
 
-fn wincode_ser_into_vec<T>(buf: &mut Vec<u8>, value: &T)
+fn wincode_ser_into_vec<T>(buf: &mut flux_network::PayloadBuf<'_>, value: &T)
 where
     T: wincode::SchemaWrite<wincode::config::DefaultConfig, Src = T>,
 {
-    wincode::serialize_into(buf, value).unwrap();
+    wincode::serialize_into(WriteAdapter::new(buf), value).unwrap();
 }
 
 #[test]
 fn tcp_roundtrip() {
     let bind_addr = SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), 24712));
 
-    let mut listener = NetworkDriver::default();
-    let _listening_token = listener.listen_at(bind_addr).unwrap();
+    let mut listener = Network::default();
+    let listener_group = listener.add_group(TcpGroupConfig {
+        aligned_payloads: true,
+        replay: ReplayPolicy::Replay,
+        ..Default::default()
+    });
+    let _listening_token = listener.listen(listener_group, bind_addr).unwrap();
 
     let server = thread::spawn(move || {
         let mut accepted_stream = None;
 
         while accepted_stream.is_none() {
             listener.poll_with(|event| match event {
-                PollEvent::Accept { stream, .. } => accepted_stream = Some(stream),
-                PollEvent::Message { .. } => panic!("shouldn't have gotten here"),
+                NetworkEvent::Accepted { token: stream, .. } => accepted_stream = Some(stream),
+                NetworkEvent::Message { .. } => panic!("shouldn't have gotten here"),
                 _ => {}
             });
         }
@@ -40,7 +46,7 @@ fn tcp_roundtrip() {
         let mut recv = None;
         loop {
             listener.poll_with(|event| {
-                if let PollEvent::Message { token, payload: bytes, .. } = event {
+                if let NetworkEvent::Message { token, payload: bytes, .. } = event {
                     assert_eq!(token, stream_token);
                     let msg: TestMsg = wincode::deserialize(bytes).unwrap();
                     recv = Some(msg);
@@ -51,11 +57,11 @@ fn tcp_roundtrip() {
             }
             thread::sleep(Duration::from_micros(50));
         }
-        listener.write_or_enqueue_with(SendBehavior::Single(stream_token), |buf| {
+        listener.send_with(stream_token, |buf| {
             wincode_ser_into_vec(buf, &TestMsg(111));
         });
         listener.poll_with(|event| {
-            if let PollEvent::Message { .. } = event {
+            if let NetworkEvent::Message { .. } = event {
                 panic!("shouldn't have gotten here");
             }
         });
@@ -64,10 +70,15 @@ fn tcp_roundtrip() {
 
     let client = thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let mut conn = NetworkDriver::default();
-        let tok = conn.connect(bind_addr).unwrap();
+        let mut conn = Network::default();
+        let conn_group = conn.add_group(TcpGroupConfig {
+            aligned_payloads: true,
+            replay: ReplayPolicy::Replay,
+            ..Default::default()
+        });
+        let tok = conn.connect(conn_group, bind_addr);
         // Then responds
-        conn.write_or_enqueue_with(SendBehavior::Single(tok), |buf| {
+        conn.send_with(tok, |buf| {
             wincode_ser_into_vec(buf, &TestMsg(222));
         });
 
@@ -75,7 +86,7 @@ fn tcp_roundtrip() {
         let mut recv = None;
         loop {
             conn.poll_with(|event| {
-                if let PollEvent::Message { payload: bytes, .. } = event {
+                if let NetworkEvent::Message { payload: bytes, .. } = event {
                     let msg: TestMsg = wincode::deserialize(bytes).unwrap();
                     recv = Some(msg);
                 }
@@ -99,10 +110,15 @@ fn backlog_disconnect_is_reported() {
     let bind_addr = probe.local_addr().unwrap();
     drop(probe);
 
-    let mut listener = NetworkDriver::default()
-        .with_socket_buf_size(1024)
-        .with_max_backlog(0, flux_timing::Duration::ZERO);
-    listener.listen_at(bind_addr).unwrap();
+    let mut listener = Network::default();
+    let listener_group = listener.add_group(TcpGroupConfig {
+        aligned_payloads: true,
+        replay: ReplayPolicy::Replay,
+        socket_buf_size: Some(1024),
+        max_backlog_frames: Some((0, flux_timing::Duration::ZERO)),
+        ..Default::default()
+    });
+    listener.listen(listener_group, bind_addr).unwrap();
 
     let client = TcpStream::connect(bind_addr).expect("failed to connect client");
 
@@ -110,7 +126,7 @@ fn backlog_disconnect_is_reported() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while stream_token.is_none() && std::time::Instant::now() < deadline {
         listener.poll_with(|event| {
-            if let PollEvent::Accept { stream, .. } = event {
+            if let NetworkEvent::Accepted { token: stream, .. } = event {
                 stream_token = Some(stream);
             }
         });
@@ -120,7 +136,7 @@ fn backlog_disconnect_is_reported() {
     let stream_token = stream_token.expect("listener did not accept client");
 
     let payload = vec![7_u8; 16 * 1024 * 1024];
-    listener.write_or_enqueue_with(SendBehavior::Single(stream_token), |buf| {
+    listener.send_with(stream_token, |buf| {
         buf.extend_from_slice(&payload);
     });
 
@@ -128,7 +144,7 @@ fn backlog_disconnect_is_reported() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !disconnected && std::time::Instant::now() < deadline {
         listener.poll_with(|event| {
-            if let PollEvent::Disconnect { token } = event {
+            if let NetworkEvent::Disconnected { token, .. } = event {
                 assert_eq!(token, stream_token);
                 disconnected = true;
             }
@@ -146,22 +162,27 @@ fn receive_after_reconnect(drop_backlog: bool) -> Option<TestMsg> {
     let bind_addr = probe.local_addr().unwrap();
     drop(probe);
 
-    let mut listener = NetworkDriver::default();
-    listener.listen_at(bind_addr).unwrap();
+    let mut listener = Network::default();
+    let listener_group = listener.add_group(TcpGroupConfig {
+        aligned_payloads: true,
+        replay: ReplayPolicy::Replay,
+        ..Default::default()
+    });
+    listener.listen(listener_group, bind_addr).unwrap();
 
-    let mut client = NetworkDriver::default()
-        .with_transport(Transport::Tcp(TcpConfig {
-            reconnect_interval: flux_timing::Duration::from_millis(1),
-            ..TcpConfig::default()
-        }))
-        .with_drop_outbound_backlog_on_disconnect(drop_backlog);
-    let token = client.connect(bind_addr).unwrap();
+    let mut client = Network::default();
+    let client_group = client.add_group(TcpGroupConfig {
+        reconnect_interval: flux_timing::Duration::from_millis(1),
+        replay: if drop_backlog { ReplayPolicy::Drop } else { ReplayPolicy::Replay },
+        ..Default::default()
+    });
+    let token = client.connect(client_group, bind_addr);
 
     let mut accepted = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while accepted == 0 && std::time::Instant::now() < deadline {
         listener.poll_with(|event| {
-            if let PollEvent::Accept { .. } = event {
+            if let NetworkEvent::Accepted { .. } = event {
                 accepted += 1;
             }
         });
@@ -171,7 +192,7 @@ fn receive_after_reconnect(drop_backlog: bool) -> Option<TestMsg> {
     assert_eq!(accepted, 1, "listener did not accept initial client");
 
     client.disconnect(token);
-    client.write_or_enqueue_with(SendBehavior::Single(token), |buf| {
+    client.send_with(token, |buf| {
         wincode_ser_into_vec(buf, &TestMsg(333));
     });
     client.force_reconnect();
@@ -180,7 +201,7 @@ fn receive_after_reconnect(drop_backlog: bool) -> Option<TestMsg> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while recv.is_none() && std::time::Instant::now() < deadline {
         listener.poll_with(|event| {
-            if let PollEvent::Message { payload: bytes, .. } = event {
+            if let NetworkEvent::Message { payload: bytes, .. } = event {
                 recv = Some(wincode::deserialize(bytes).unwrap());
             }
         });
@@ -199,4 +220,59 @@ fn disconnected_outbound_replays_backlog_by_default() {
 #[test]
 fn disconnected_outbound_can_drop_backlog() {
     assert_eq!(receive_after_reconnect(true), None);
+}
+
+#[test]
+fn reconnect_replays_whole_pending_frames() {
+    use std::io::Read;
+
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let greeting = vec![0x31; 2 * 1024 * 1024];
+    let mut client = Network::default();
+    let group = client.add_group(TcpGroupConfig {
+        socket_buf_size: Some(1024),
+        replay: ReplayPolicy::Replay,
+        on_connect_msg: Some(greeting.clone()),
+        ..Default::default()
+    });
+    let token = client.connect(group, addr);
+    let (first, _) = listener.accept().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut connected = 0;
+    while connected == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        client.poll_with(|event| {
+            connected += usize::from(matches!(event, NetworkEvent::Connected { .. }));
+        });
+    }
+    // The unread peer and tiny send buffer leave part of this frame queued.
+    let payload = vec![0x59; 2 * 1024 * 1024];
+    assert!(client.send_with(token, |buf| buf.extend_from_slice(&payload)));
+    client.disconnect(token);
+    drop(first);
+    assert!(client.send_with(token, |buf| buf.extend_from_slice(b"tail")));
+    client.force_reconnect();
+    let (mut second, _) = listener.accept().unwrap();
+    second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let receiver = thread::spawn(move || {
+        for expected in [greeting.as_slice(), payload.as_slice(), b"tail".as_slice()] {
+            let mut header = [0; 12];
+            second.read_exact(&mut header).unwrap();
+            let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+            assert_eq!(length, expected.len(), "replay must start at a complete frame header");
+            let mut bytes = vec![0; length];
+            second.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+        }
+    });
+    while !receiver.is_finished() {
+        assert!(std::time::Instant::now() < deadline);
+        client.poll_with(|event| {
+            connected += usize::from(matches!(event, NetworkEvent::Connected { .. }));
+        });
+        thread::yield_now();
+    }
+    receiver.join().unwrap();
+    assert_eq!(connected, 2, "one Connected per outbound establishment");
 }

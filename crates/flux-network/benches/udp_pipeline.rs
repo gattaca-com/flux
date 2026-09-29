@@ -25,7 +25,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::{NetworkDriver, PollEvent, SendBehavior, Transport, UdpConfig};
+use flux_network::{
+    Group, GroupConfig, Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, UdpConfig,
+    UdpGroupConfig,
+};
 use flux_timing::Nanos;
 
 const SIZES: [(&str, usize); 3] = [("2k", 2 * 1024), ("64k", 64 * 1024), ("2m", 2 * 1024 * 1024)];
@@ -35,7 +38,13 @@ const BCAST_PEERS: usize = 8;
 const BIG_SOCKET_BUF: usize = 16 * 1024 * 1024;
 
 fn free_addr() -> SocketAddr {
-    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap()
+    loop {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        if UdpSocket::bind(addr).is_ok() {
+            return addr;
+        }
+    }
 }
 
 /// Core list captured before any thread is pinned: `get_core_ids` reports the
@@ -53,12 +62,25 @@ fn udp_config() -> UdpConfig {
     UdpConfig { max_message_size: 4 * 1024 * 1024, ..UdpConfig::lan() }
 }
 
-fn transports() -> [(&'static str, Transport); 2] {
-    [("tcp", Transport::default()), ("udp", Transport::Udp(udp_config()))]
+fn transports() -> [(&'static str, GroupConfig); 2] {
+    [
+        (
+            "tcp",
+            TcpGroupConfig {
+                aligned_payloads: true,
+                replay: ReplayPolicy::Replay,
+                ..Default::default()
+            }
+            .into(),
+        ),
+        ("udp", UdpGroupConfig { udp: udp_config(), ..Default::default() }.into()),
+    ]
 }
 
-fn connector(transport: Transport) -> NetworkDriver {
-    NetworkDriver::default().with_transport(transport).with_socket_buf_size(BIG_SOCKET_BUF)
+fn connector(config: GroupConfig) -> (Network, Group) {
+    let mut network = Network::default();
+    let group = network.add_group(config.with_socket_buf_size(BIG_SOCKET_BUF));
+    (network, group)
 }
 
 /// Message count and bound on outstanding messages for a burst of `size`.
@@ -93,17 +115,20 @@ impl Stats {
 /// Server listens, `clients` dial it; returns once every client is accepted
 /// and connected. The server is the sender for every scenario.
 fn connect(
-    transport: Transport,
+    transport: &GroupConfig,
     listen: SocketAddr,
     dial: SocketAddr,
     clients: usize,
-) -> (NetworkDriver, Vec<NetworkDriver>, Vec<mio::Token>) {
-    let mut server = connector(transport);
-    server.listen_at(listen).unwrap();
-    let mut receivers: Vec<NetworkDriver> = (0..clients).map(|_| connector(transport)).collect();
-    for r in &mut receivers {
-        r.connect(dial).unwrap();
-    }
+) -> (Network, Group, Vec<Network>, Vec<mio::Token>) {
+    let (mut server, server_group) = connector(transport.clone());
+    server.listen(server_group, listen).unwrap();
+    let mut receivers: Vec<Network> = (0..clients)
+        .map(|_| {
+            let (mut network, group) = connector(transport.clone());
+            let _ = network.connect(group, dial);
+            network
+        })
+        .collect();
     let mut accepted = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while accepted.len() < clients ||
@@ -111,7 +136,7 @@ fn connect(
     {
         assert!(Instant::now() < deadline, "handshake");
         server.poll_with(|e| {
-            if let PollEvent::Accept { stream, .. } = e {
+            if let NetworkEvent::Accepted { token: stream, .. } = e {
                 accepted.push(stream);
             }
         });
@@ -119,12 +144,12 @@ fn connect(
             r.poll_with(|_| {});
         }
     }
-    (server, receivers, accepted)
+    (server, server_group, receivers, accepted)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Scenario {
-    transport: Transport,
+    transport: GroupConfig,
     listen: SocketAddr,
     dial: SocketAddr,
     clients: usize,
@@ -140,7 +165,8 @@ struct Scenario {
 /// them and records one-way latency.
 fn run(sc: Scenario) -> Stats {
     let Scenario { transport, listen, dial, clients, size, count, pace, window } = sc;
-    let (mut server, receivers, _accepted) = connect(transport, listen, dial, clients);
+    let (mut server, server_group, receivers, _accepted) =
+        connect(&transport, listen, dial, clients);
     let msg = vec![0x5Au8; size];
     let stop = Arc::new(AtomicBool::new(false));
     let got = Arc::new(AtomicUsize::new(0));
@@ -156,7 +182,7 @@ fn run(sc: Scenario) -> Stats {
             while lat.len() < expected && !stop.load(Ordering::Relaxed) {
                 for r in &mut receivers {
                     r.poll_with(|e| {
-                        if let PollEvent::Message { send_ts, .. } = e {
+                        if let NetworkEvent::Message { send_ts, .. } = e {
                             lat.push(Nanos::now().0.saturating_sub(send_ts.0));
                         }
                     });
@@ -176,7 +202,7 @@ fn run(sc: Scenario) -> Stats {
         let received = got.load(Ordering::Relaxed) / clients;
         let now = Instant::now();
         if sent < count && sent - received < window && pace.is_none_or(|_| now >= next_send) {
-            server.write_or_enqueue_with(SendBehavior::Broadcast, |b| b.extend_from_slice(&msg));
+            server.broadcast_with(server_group, |b| b.extend_from_slice(&msg));
             sent += 1;
             if let Some(p) = pace {
                 next_send = now + p;
@@ -318,7 +344,7 @@ fn main() {
         // Drop the 900th of 1789 data datagrams.
         let relay = Relay::start(server_addr, 900);
         let s = run(Scenario {
-            transport: Transport::Udp(udp_config()),
+            transport: UdpGroupConfig { udp: udp_config(), ..Default::default() }.into(),
             listen: server_addr,
             dial: relay.addr,
             clients: 1,

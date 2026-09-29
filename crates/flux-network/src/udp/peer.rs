@@ -5,7 +5,7 @@ use std::{collections::VecDeque, io, net::SocketAddr, os::fd::AsRawFd};
 
 use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos};
-use flux_utils::{DCache, DCacheRef};
+use flux_utils::DCache;
 use mio::{Token, net::UdpSocket};
 use tracing::{debug, warn};
 
@@ -14,17 +14,13 @@ use super::{
     sys::{BATCH, SendBatch, SockAddr},
     wire::{HEADER_SIZE, Header, Kind, fragment_count, write_session},
 };
+use crate::network::RxPayload;
 
 /// Retransmit backoff saturates at `rto << MAX_BACKOFF_SHIFT` (and `max_rto`).
 const MAX_BACKOFF_SHIFT: u8 = 6;
 /// Most datagrams one timeout probe resends.
 const MAX_RECOVER: u64 = 64;
 const WARN_INTERVAL_SECS: u64 = 5;
-
-pub(crate) enum RxPayload<'a> {
-    Raw(&'a [u8]),
-    DCache(DCacheRef),
-}
 
 /// Result of a socket write. Errors other than `WouldBlock` are logged and
 /// treated as sent: the RTO path retries them.
@@ -411,6 +407,21 @@ impl TxWindow {
         }
     }
 
+    /// Drops every message none of whose fragments has been handed to the
+    /// kernel, keeping the ones already partly on the wire. Returns how many.
+    fn clear_unsent(&mut self, store: &mut MsgStore) -> usize {
+        let mut dropped = 0;
+        while let Some(m) = self.messages.back() &&
+            m.first_seq >= self.next_send
+        {
+            let m = self.messages.pop_back().unwrap();
+            store.release(m.slot);
+            self.next = m.first_seq;
+            dropped += 1;
+        }
+        dropped
+    }
+
     /// Applies an ack: everything below `ack_next` plus the bitmap words for
     /// `n_bits` sequences above it. Holes the ack reveals are resent.
     #[allow(clippy::too_many_arguments)]
@@ -733,6 +744,8 @@ impl RxWindow {
     }
 }
 
+// Session flags are independent; packing them would only obscure the state.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct UdpPeer {
     pub(crate) addr: SocketAddr,
     pub(crate) token: Token,
@@ -754,6 +767,8 @@ pub(crate) struct UdpPeer {
     hello_due: Instant,
     hello_backoff: u8,
     ack_due: bool,
+    /// Drop the session once every datagram is acked; sends are refused.
+    close_when_drained: bool,
     latency: Option<Timer>,
     dropped_full: u64,
     last_warn: Instant,
@@ -793,6 +808,7 @@ impl UdpPeer {
             hello_due: Instant::ZERO,
             hello_backoff: 0,
             ack_due: false,
+            close_when_drained: false,
             latency,
             dropped_full: 0,
             last_warn: Instant::ZERO,
@@ -843,6 +859,36 @@ impl UdpPeer {
         self.tx.release_all(store);
     }
 
+    /// Bytes of the oldest message still held for sending, if any.
+    pub(crate) fn oldest_retained<'a>(&self, store: &'a MsgStore) -> Option<&'a [u8]> {
+        self.tx.messages.front().map(|m| store.bytes(m.slot))
+    }
+
+    /// Whether a graceful close was requested and is still pending.
+    #[inline]
+    pub(crate) fn is_draining(&self) -> bool {
+        self.close_when_drained
+    }
+
+    /// Requests a close once every queued datagram is acked. Returns whether
+    /// that is already the case.
+    pub(crate) fn close_when_drained(&mut self) -> bool {
+        self.close_when_drained = true;
+        self.drained()
+    }
+
+    /// Whether a requested graceful close can happen now.
+    #[inline]
+    pub(crate) fn drained(&self) -> bool {
+        self.close_when_drained && self.tx.inflight() == 0
+    }
+
+    /// Drops queued messages that have not started going out. See
+    /// [`TxWindow::clear_unsent`].
+    pub(crate) fn clear_unsent(&mut self, store: &mut MsgStore) -> usize {
+        self.tx.clear_unsent(store)
+    }
+
     /// Drops the session and adopts `new_session` so the remote sees a fresh
     /// peer. Queued datagrams are kept for the next session unless
     /// `drop_backlog`; hello retries restart on the next tick.
@@ -853,6 +899,7 @@ impl UdpPeer {
         store: &mut MsgStore,
     ) {
         self.connected = false;
+        self.close_when_drained = false;
         self.remote_session = None;
         self.local_session = new_session;
         if drop_backlog {
@@ -873,11 +920,15 @@ impl UdpPeer {
         send_datagram(socket, addr, &buf);
     }
 
-    /// A reset naming our current session means the remote holds no peer for
-    /// this connection: renegotiate. Resets for earlier sessions are stale.
+    /// A reset, or a hello ack with a different remote session, means the
+    /// listener lost our peer. Only replies naming our current session count.
     #[inline]
-    pub(crate) fn on_reset(&self, header: &Header) -> bool {
-        self.connected && header.len == self.local_session
+    pub(crate) fn needs_reset(&self, header: &Header) -> bool {
+        self.connected &&
+            header.len == self.local_session &&
+            (header.kind == Kind::Reset ||
+                (header.kind == Kind::HelloAck &&
+                    self.remote_session != Some(header.session)))
     }
 
     /// `len` carries the echoed remote session in a hello ack.
@@ -1305,6 +1356,28 @@ mod tests {
     }
 
     #[test]
+    fn clear_unsent_keeps_messages_already_on_the_wire() {
+        let config = cfg();
+        let stride = config.stride();
+        let mut store = MsgStore::new();
+        let mut tx = TxWindow::new(config.send_window);
+        assert!(push(&mut tx, &mut store, stride, &vec![0; stride * 4]));
+        assert!(push(&mut tx, &mut store, stride, &vec![1; stride * 4]));
+        assert!(push(&mut tx, &mut store, stride, &vec![2; stride * 2]));
+        // First message out, second half way, third untouched.
+        send_all(&mut tx, 0..6);
+        assert_eq!(tx.clear_unsent(&mut store), 1, "only the untouched message goes");
+        assert_eq!((tx.next, tx.next_send), (8, 6));
+        assert_eq!(tx.messages.len(), 2);
+        assert_eq!(tx.clear_unsent(&mut store), 0);
+        assert!(push(&mut tx, &mut store, stride, &vec![3; stride]));
+        assert_eq!(tx.messages.back().unwrap().first_seq, 8, "sequences continue from the cut");
+        tx.rewind(1);
+        assert_eq!(tx.clear_unsent(&mut store), 3, "after a rewind nothing is on the wire");
+        assert_eq!(tx.next, 0);
+    }
+
+    #[test]
     fn rewind_replays_whole_messages_under_new_session() {
         let config = cfg();
         let stride = config.stride();
@@ -1365,6 +1438,42 @@ mod tests {
         fixed.reset(0);
         assert!(fixed.accept(1) && !fixed.accept(64));
         assert_eq!(fixed.ack_next, 0);
+    }
+
+    #[test]
+    fn control_replies_reset_only_the_current_session() {
+        let mut peer =
+            UdpPeer::new("127.0.0.1:1".parse().unwrap(), Token(0), Token(0), 1, cfg(), None);
+        let now = Instant::now();
+        let mut header =
+            Header { kind: Kind::HelloAck, session: 2, seq: 0, len: 1, index: 0, send_ts: 0 };
+        assert!(!peer.needs_reset(&header), "initial handshake");
+        assert_eq!(peer.on_hello_ack(&header, now), Some(false));
+        assert!(!peer.needs_reset(&header), "duplicate reply from the same peer");
+        assert_eq!(peer.on_hello_ack(&header, now), None);
+
+        header.session = 3;
+        assert!(peer.needs_reset(&header), "listener accepted a retry after losing our peer");
+        header.len = 0;
+        assert!(!peer.needs_reset(&header), "reply to an earlier attempt");
+        header.kind = Kind::Reset;
+        assert!(!peer.needs_reset(&header), "stale reset");
+        header.len = 1;
+        assert!(peer.needs_reset(&header), "reset naming our session");
+
+        peer.mark_disconnected(false, 4, &mut MsgStore::new());
+        assert!(!peer.needs_reset(&header), "already reconnecting");
+        header.kind = Kind::HelloAck;
+        assert_eq!(
+            peer.on_hello_ack(&header, now),
+            None,
+            "old reply cannot complete a new attempt"
+        );
+        header.len = 4;
+        assert_eq!(peer.on_hello_ack(&header, now), Some(true));
+        header.len = 1;
+        header.kind = Kind::Reset;
+        assert!(!peer.needs_reset(&header), "old reset cannot drop the new session");
     }
 
     #[test]

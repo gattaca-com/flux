@@ -5,8 +5,8 @@ use std::{
 };
 
 use flux_network::{
+    Network,
     http::{HttpEvent, HttpNetwork},
-    tcp::TcpNetwork,
 };
 use flux_s3::{Error, S3};
 
@@ -20,7 +20,7 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
     drop(listener);
     // One poll carries the fake server and the client, each with its own
     // HTTP layer.
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut server = HttpNetwork::default();
     server.listen(&mut net, addr).unwrap();
     let mut s3 = S3::new(addr, 2)

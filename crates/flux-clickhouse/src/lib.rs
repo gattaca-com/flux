@@ -22,8 +22,7 @@ use std::{
 };
 
 use flux_network::{
-    Token,
-    tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore},
+    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token,
 };
 use native::{BlockResume, Cursor, push_block, put_string, put_uvarint, read_compressed};
 pub use native::{Column, Output};
@@ -327,7 +326,7 @@ pub struct ClickHouse {
     max_queued_bytes: usize,
     compression: bool,
     request_timeout: Option<Duration>,
-    group: Option<TcpGroup>,
+    group: Option<Group>,
     conns: Vec<Conn>,
     queue: VecDeque<Request>,
     queued_bytes: usize,
@@ -515,11 +514,12 @@ impl ClickHouse {
 
     /// Opens the pool; the builders must have run, and [`ClickHouse::drive`]
     /// never opens anything itself.
-    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+    pub fn connect(&mut self, net: &mut NetworkCore) {
         assert!(self.group.is_none(), "connect once");
         let group = net.add_group(TcpGroupConfig {
             name: "clickhouse",
             framing: Framing::Raw,
+            replay: ReplayPolicy::Drop,
             max_frame_size: usize::MAX,
             on_connect_msg: Some(self.hello_bytes()),
             ..Default::default()
@@ -540,7 +540,7 @@ impl ClickHouse {
 
     /// Sends queued requests on idle connections, then delivers each finished
     /// request's outcome to `handler` exactly once.
-    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    pub fn drive<F>(&mut self, net: &mut NetworkCore, mut handler: F)
     where
         F: FnMut(QueryId, Result<Output, Error>),
     {
@@ -596,13 +596,13 @@ impl ClickHouse {
 
     /// Removes every pooled endpoint; queued and in-flight requests are
     /// dropped without outcomes.
-    pub fn close(self, net: &mut TcpNetworkCore) {
+    pub fn close(self, net: &mut NetworkCore) {
         for conn in &self.conns {
             net.remove(conn.token);
         }
     }
 
-    fn conn_index(&self, group: TcpGroup, token: Token) -> Option<usize> {
+    fn conn_index(&self, group: Group, token: Token) -> Option<usize> {
         if self.group != Some(group) {
             return None;
         }
@@ -611,24 +611,24 @@ impl ClickHouse {
 
     /// Returns whether the event belonged to this client. Outcomes queue
     /// inside and are delivered by [`ClickHouse::drive`].
-    pub fn on_event(&mut self, event: &TcpEvent<'_>) -> bool {
+    pub fn on_event(&mut self, event: &NetworkEvent<'_>) -> bool {
         match *event {
-            TcpEvent::Accepted { .. } => false,
-            TcpEvent::Connected { group, token, .. } |
-            TcpEvent::Disconnected { group, token, .. } => {
+            NetworkEvent::Accepted { .. } => false,
+            NetworkEvent::Connected { group, token, .. } |
+            NetworkEvent::Disconnected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
                 let conn = &mut self.conns[index];
                 if let Some(id) = conn.in_flight() {
                     self.outcomes.push((id, Err(Error::Disconnected)));
                 }
-                conn.reset(if matches!(event, TcpEvent::Connected { .. }) {
+                conn.reset(if matches!(event, NetworkEvent::Connected { .. }) {
                     State::Hello
                 } else {
                     State::Connecting
                 });
                 true
             }
-            TcpEvent::Message { group, token, payload, .. } => {
+            NetworkEvent::Message { group, token, payload, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
                 let max_output_bytes = self.max_output_bytes;
                 let conn = &mut self.conns[index];

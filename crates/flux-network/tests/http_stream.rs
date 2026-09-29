@@ -8,8 +8,8 @@ use std::{
 };
 
 use flux_network::{
+    Network,
     http::{HttpEvent, HttpNetwork, StreamEnd},
-    tcp::TcpNetwork,
 };
 
 #[test]
@@ -29,7 +29,7 @@ fn streams_one_chunked_response() {
         thread::sleep(Duration::from_secs(10));
     });
 
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut http = HttpNetwork::default();
     let token = http.connect(&mut net, addr);
     let mut requested = false;

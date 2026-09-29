@@ -1,4 +1,4 @@
-//! Reliable, unordered UDP transport for [`crate::NetworkDriver`].
+//! Reliable, unordered UDP transport for [`crate::Network`].
 //!
 //! Each message is fragmented into datagrams that carry consecutive sequence
 //! numbers. The receiver acks with a cumulative point plus a selective bitmap
@@ -22,7 +22,7 @@ mod wire;
 
 pub(crate) use connector::UdpManager;
 
-/// Tuning for [`crate::Transport::Udp`].
+/// Tuning for [`crate::UdpGroupConfig`].
 ///
 /// The retransmit timeout is measured from acks (RFC 6298) and clamped to
 /// `[min_rto, max_rto]`; `initial_rto` only applies before the first sample.

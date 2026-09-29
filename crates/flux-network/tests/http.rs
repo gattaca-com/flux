@@ -6,8 +6,8 @@ use std::{
 };
 
 use flux_network::{
+    Network,
     http::{HttpEvent, HttpNetwork},
-    tcp::TcpNetwork,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,16 +48,16 @@ fn response_len(bytes: &[u8]) -> Option<usize> {
     (bytes.len() >= head + length).then_some(head + length)
 }
 
-fn poll(net: &mut TcpNetwork, http: &mut HttpNetwork, handler: impl for<'a> FnMut(HttpEvent<'a>)) {
+fn poll(net: &mut Network, http: &mut HttpNetwork, handler: impl for<'a> FnMut(HttpEvent<'a>)) {
     net.poll_with(|event| {
         http.on_event(&event);
     });
     http.drive(net, handler);
 }
 
-fn server() -> (TcpNetwork, HttpNetwork, SocketAddr) {
+fn server() -> (Network, HttpNetwork, SocketAddr) {
     let addr = unused_addr();
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut server = HttpNetwork::default();
     server.listen(&mut net, addr).unwrap();
     (net, server, addr)
@@ -195,7 +195,7 @@ fn post_binary_body_lone_lf() {
 #[test]
 fn connection_close_large_body() {
     let addr = unused_addr();
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut server = HttpNetwork::default().with_socket_buf_size(1024);
     server.listen(&mut net, addr).unwrap();
     let body = vec![7; 256 * 1024];
@@ -228,7 +228,7 @@ fn limits_and_errors() {
         (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(), 501),
     ] {
         let addr = unused_addr();
-        let mut net = TcpNetwork::default();
+        let mut net = Network::default();
         let mut server = HttpNetwork::default().with_max_head_bytes(64).with_max_body_bytes(8);
         server.listen(&mut net, addr).unwrap();
         let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -359,7 +359,7 @@ fn client_chunked_response() {
         let _ = s.read(&mut b);
         s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3 \r\nhey\r\n2;ext=x\r\n!!\r\n0\r\nX: y\r\n\r\n").unwrap();
     });
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut client = HttpNetwork::default();
     let token = client.connect(&mut net, addr);
     let mut sent = false;
@@ -392,7 +392,7 @@ fn client_head_response_ignores_advisory_content_length() {
         let _ = stream.read(&mut request);
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999\r\n\r\n").unwrap();
     });
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut client = HttpNetwork::default().with_max_body_bytes(8);
     let token = client.connect(&mut net, addr);
     let deadline = Instant::now() + TIMEOUT;
@@ -440,7 +440,7 @@ fn client_binary_bodies() {
         .unwrap();
         s.write_all(&plain).unwrap();
     });
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut client = HttpNetwork::default();
     let token = client.connect(&mut net, addr);
     let mut sent = false;
@@ -473,7 +473,7 @@ fn client_binary_bodies() {
 #[test]
 fn client_reconnect_after_close() {
     let (mut server_net, mut server, addr) = server();
-    let mut client_net = TcpNetwork::default();
+    let mut client_net = Network::default();
     let mut client = HttpNetwork::default();
     let token = client.connect(&mut client_net, addr);
     let mut connected = 0;
@@ -596,7 +596,7 @@ fn assert_chunked_response_disconnect(response: &'static [u8], max_headers: usiz
         let _ = stream.read(&mut request);
         stream.write_all(response).unwrap();
     });
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut client = HttpNetwork::default().with_max_headers(max_headers);
     let token = client.connect(&mut net, addr);
     let deadline = Instant::now() + TIMEOUT;
@@ -647,7 +647,7 @@ fn client_chunked_overflow() {
             let _ = stream.read(&mut request);
             stream.write_all(response).unwrap();
         });
-        let mut net = TcpNetwork::default();
+        let mut net = Network::default();
         let mut client = HttpNetwork::default().with_max_body_bytes(16);
         let token = client.connect(&mut net, addr);
         let deadline = Instant::now() + TIMEOUT;
@@ -676,7 +676,7 @@ fn client_chunked_overflow() {
 #[test]
 fn idle_timeout_disconnects() {
     let addr = unused_addr();
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut server = HttpNetwork::default().with_idle_timeout(Duration::from_millis(200).into());
     server.listen(&mut net, addr).unwrap();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -723,7 +723,7 @@ fn idle_timeout_disconnects() {
 #[test]
 fn pending_buffer_cap_disconnects() {
     let addr = unused_addr();
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut server = HttpNetwork::default().with_max_head_bytes(64).with_max_body_bytes(64);
     server.listen(&mut net, addr).unwrap();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -792,7 +792,7 @@ fn pipelined_binary_bodies() {
 #[test]
 fn client_remove_stops_reconnect() {
     let (mut server_net, mut server, addr) = server();
-    let mut client_net = TcpNetwork::default();
+    let mut client_net = Network::default();
     let mut client = HttpNetwork::default();
     let token = client.connect(&mut client_net, addr);
     let deadline = Instant::now() + TIMEOUT;
@@ -859,7 +859,7 @@ fn server_disconnect_kicks() {
 #[test]
 fn wrong_role_calls_return_false() {
     let addr = unused_addr();
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut http = HttpNetwork::default();
     http.listen(&mut net, addr).unwrap();
     let outbound = http.connect(&mut net, addr);
@@ -882,7 +882,7 @@ fn wrong_role_calls_return_false() {
 #[test]
 fn single_instance_serves_itself() {
     let addr = unused_addr();
-    let mut net = TcpNetwork::default();
+    let mut net = Network::default();
     let mut http = HttpNetwork::default();
     http.listen(&mut net, addr).unwrap();
     let outbound = http.connect(&mut net, addr);
@@ -910,4 +910,16 @@ fn single_instance_serves_itself() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(body.as_deref(), Some(b"self".as_slice()));
+}
+
+#[test]
+fn close_removes_listeners_too() {
+    let (mut net, server, addr) = server();
+    assert!(std::net::TcpStream::connect(addr).is_ok(), "listening before close");
+    server.close(&mut net);
+    net.poll_with(|_| {});
+    assert!(std::net::TcpStream::connect(addr).is_err(), "refused once the listener is gone");
+    // The address is free again for a fresh layer.
+    let mut again = HttpNetwork::default();
+    again.listen(&mut net, addr).unwrap();
 }

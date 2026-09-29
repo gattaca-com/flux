@@ -4,21 +4,27 @@ use std::{
     time::Duration,
 };
 
-use flux_network::{NetworkDriver, PollEvent, SendBehavior};
+use flux_network::{Network, NetworkEvent, ReplayPolicy, TcpGroupConfig};
 
 const NUM_RECEIVERS: usize = 4;
 const BURST_SIZE: usize = 20;
 const PAYLOAD_SIZE: usize = 256 * 1024; // 256 KiB per message
 
-/// Spawns a receiver thread that connects to `addr` via `NetworkDriver` and
+/// Spawns a receiver thread that connects to `addr` via `Network` and
 /// collects frames via `poll_with` until the sender disconnects.
 fn spawn_receiver(addr: SocketAddr) -> thread::JoinHandle<Vec<Vec<u8>>> {
     thread::spawn(move || {
         // 32 KiB socket buf constrains the receiver (2× smaller than the
         // default 128 KiB recv buf) while staying >= loopback MSS (~32 KiB)
         // so TCP window updates still fire.
-        let mut conn = NetworkDriver::default().with_socket_buf_size(32768);
-        conn.connect(addr).expect("receiver: failed to connect");
+        let mut conn = Network::default();
+        let conn_group = conn.add_group(TcpGroupConfig {
+            aligned_payloads: true,
+            replay: ReplayPolicy::Replay,
+            socket_buf_size: Some(32768),
+            ..Default::default()
+        });
+        let _ = conn.connect(conn_group, addr);
 
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut disconnected = false;
@@ -26,7 +32,7 @@ fn spawn_receiver(addr: SocketAddr) -> thread::JoinHandle<Vec<Vec<u8>>> {
 
         while !disconnected && std::time::Instant::now() < deadline {
             conn.poll_with(|event| match event {
-                PollEvent::Message { payload: bytes, .. } => {
+                NetworkEvent::Message { payload: bytes, .. } => {
                     assert_eq!(
                         bytes.as_ptr() as usize % 8,
                         0,
@@ -34,7 +40,7 @@ fn spawn_receiver(addr: SocketAddr) -> thread::JoinHandle<Vec<Vec<u8>>> {
                     );
                     frames.push(bytes.to_vec());
                 }
-                PollEvent::Disconnect { .. } => {
+                NetworkEvent::Disconnected { .. } => {
                     disconnected = true;
                 }
                 _ => {}
@@ -46,7 +52,7 @@ fn spawn_receiver(addr: SocketAddr) -> thread::JoinHandle<Vec<Vec<u8>>> {
     })
 }
 
-fn pump(conn: &mut NetworkDriver, for_how_long: Duration) {
+fn pump(conn: &mut Network, for_how_long: Duration) {
     let deadline = std::time::Instant::now() + for_how_long;
     while std::time::Instant::now() < deadline {
         while conn.poll_with(|_| {}) {}
@@ -56,7 +62,7 @@ fn pump(conn: &mut NetworkDriver, for_how_long: Duration) {
 
 /// Broadcast a burst of large messages to multiple receivers.
 ///
-/// Sender listens via `NetworkDriver`, receivers connect via `NetworkDriver`.
+/// Sender listens via `Network`, receivers connect via `Network`.
 /// The sender uses a 4 KiB socket buffer to force backpressure and backlog
 /// queueing on the send side.  Receivers use a 32 KiB socket buffer —
 /// small enough to constrain the pipe (2× below the default 128 KiB) but
@@ -72,8 +78,14 @@ fn broadcast_burst_to_multiple_receivers() {
 
     // Small send buffer on the sender forces backpressure after the first
     // partial write of each 256 KiB frame.
-    let mut sender = NetworkDriver::default().with_socket_buf_size(4096);
-    sender.listen_at(addr).expect("failed to listen");
+    let mut sender = Network::default();
+    let sender_group = sender.add_group(TcpGroupConfig {
+        aligned_payloads: true,
+        replay: ReplayPolicy::Replay,
+        socket_buf_size: Some(4096),
+        ..Default::default()
+    });
+    sender.listen(sender_group, addr).expect("failed to listen");
 
     #[allow(clippy::needless_collect, reason = "Receivers need to be spawned at this point")]
     let handles: Vec<_> = (0..NUM_RECEIVERS).map(|_| spawn_receiver(addr)).collect();
@@ -83,7 +95,7 @@ fn broadcast_burst_to_multiple_receivers() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while accepted < NUM_RECEIVERS && std::time::Instant::now() < deadline {
         sender.poll_with(|event| {
-            if let PollEvent::Accept { .. } = event {
+            if let NetworkEvent::Accepted { .. } = event {
                 accepted += 1;
             }
         });
@@ -95,7 +107,7 @@ fn broadcast_burst_to_multiple_receivers() {
     // Each payload is tagged with its sequence number so we can verify order
     // and completeness on the receiver side.
     for seq in 0..BURST_SIZE {
-        sender.write_or_enqueue_with(SendBehavior::Broadcast, |buf| {
+        sender.broadcast_with(sender_group, |buf| {
             buf.extend_from_slice(&(seq as u32).to_le_bytes());
             buf.resize(PAYLOAD_SIZE, (seq & 0xFF) as u8);
         });

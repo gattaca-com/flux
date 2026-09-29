@@ -14,7 +14,7 @@ use std::{
 };
 
 use flux_network::{
-    tcp::{Framing, TcpEvent, TcpGroupConfig, TcpNetwork},
+    Framing, Network, NetworkEvent, ReplayPolicy, TcpGroupConfig,
     tls::{
         Session,
         rustls::{
@@ -77,6 +77,8 @@ fn connected_waits_for_the_handshake_and_frames_travel_encrypted() {
         let mut conn = ServerConnection::new(server_config).unwrap();
         conn.complete_io(&mut socket).unwrap();
         let mut tls = rustls::Stream::new(&mut conn, &mut socket);
+        tls.write_all(&frame(b"welcome")).unwrap();
+        tls.flush().unwrap();
         echo_tx.send(read_frame(&mut tls)).unwrap();
         echo_tx.send(read_frame(&mut tls)).unwrap();
         tls.write_all(&frame(b"pong")).unwrap();
@@ -96,11 +98,12 @@ fn connected_waits_for_the_handshake_and_frames_travel_encrypted() {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    let mut network = TcpNetwork::default();
+    let mut network = Network::default();
     let group = network.add_group(TcpGroupConfig {
         name: "tls-client",
         framing: Framing::LengthPrefixed,
         on_connect_msg: Some(HELLO.to_vec()),
+        replay: ReplayPolicy::Drop,
         ..TcpGroupConfig::default()
     });
     let token =
@@ -108,15 +111,18 @@ fn connected_waits_for_the_handshake_and_frames_travel_encrypted() {
 
     let mut connected = 0;
     let mut received = Vec::new();
-    let poll = |network: &mut TcpNetwork, connected: &mut usize, received: &mut Vec<Vec<u8>>| {
+    let poll = |network: &mut Network, connected: &mut usize, received: &mut Vec<Vec<u8>>| {
         network.poll_with(|event| match event {
-            TcpEvent::Connected { token: got, .. } => {
+            NetworkEvent::Connected { token: got, .. } => {
                 assert_eq!(got, token);
                 *connected += 1;
             }
-            TcpEvent::Message { payload, .. } => received.push(payload.to_vec()),
-            TcpEvent::Disconnected { .. } => panic!("the connection dropped"),
-            TcpEvent::Accepted { .. } => {}
+            NetworkEvent::Message { payload, .. } => {
+                assert!(*connected > 0, "Connected must precede plaintext");
+                received.push(payload.to_vec());
+            }
+            NetworkEvent::Disconnected { .. } => panic!("the connection dropped"),
+            NetworkEvent::Accepted { .. } => {}
         });
         thread::sleep(Duration::from_millis(1));
     };
@@ -129,7 +135,7 @@ fn connected_waits_for_the_handshake_and_frames_travel_encrypted() {
     }
 
     let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline && received.is_empty() {
+    while Instant::now() < deadline && received.len() < 2 {
         poll(&mut network, &mut connected, &mut received);
         if connected == 1 {
             // A send accepted right after Connected must reach the peer.
@@ -139,7 +145,7 @@ fn connected_waits_for_the_handshake_and_frames_travel_encrypted() {
     }
 
     assert_eq!(connected, 2, "the handshake never completed");
-    assert_eq!(received, [b"pong".to_vec()]);
+    assert_eq!(received, [b"welcome".to_vec(), b"pong".to_vec()]);
     // The server saw both payloads decrypted and correctly framed.
     assert_eq!(echo_rx.recv().unwrap(), HELLO);
     assert_eq!(echo_rx.recv().unwrap(), b"ping");
@@ -161,11 +167,12 @@ fn a_peer_that_never_speaks_tls_is_redialled_silently() {
         }
     });
 
-    let mut network = TcpNetwork::default();
+    let mut network = Network::default();
     let group = network.add_group(TcpGroupConfig {
         name: "tls-stalled",
         handshake_timeout: flux_timing::Duration::from_millis(200),
         reconnect_interval: flux_timing::Duration::from_millis(100),
+        replay: ReplayPolicy::Drop,
         ..TcpGroupConfig::default()
     });
     let _token = network.connect_tls(group, addr, Session::new("localhost"));
@@ -174,7 +181,7 @@ fn a_peer_that_never_speaks_tls_is_redialled_silently() {
     let deadline = Instant::now() + Duration::from_millis(1200);
     while Instant::now() < deadline {
         network.poll_with(|event| match event {
-            TcpEvent::Connected { .. } | TcpEvent::Disconnected { .. } => lifecycle += 1,
+            NetworkEvent::Connected { .. } | NetworkEvent::Disconnected { .. } => lifecycle += 1,
             _ => {}
         });
         thread::sleep(Duration::from_millis(1));

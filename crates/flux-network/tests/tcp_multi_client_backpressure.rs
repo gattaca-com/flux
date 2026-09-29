@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use flux_network::{NetworkDriver, SendBehavior};
+use flux_network::{Network, ReplayPolicy, TcpGroupConfig};
 use mio::Token;
 
 const FRAME_HEADER_SIZE: usize = core::mem::size_of::<u32>() + core::mem::size_of::<u64>();
@@ -45,7 +45,7 @@ fn spawn_frame_collector(read_delay: Duration) -> (SocketAddr, thread::JoinHandl
     (addr, handle)
 }
 
-fn pump(conn: &mut NetworkDriver, for_how_long: Duration) {
+fn pump(conn: &mut Network, for_how_long: Duration) {
     let deadline = std::time::Instant::now() + for_how_long;
     while std::time::Instant::now() < deadline {
         let mut worked = false;
@@ -59,8 +59,8 @@ fn pump(conn: &mut NetworkDriver, for_how_long: Duration) {
     }
 }
 
-fn send_payload(conn: &mut NetworkDriver, token: Token, payload: &[u8]) {
-    conn.write_or_enqueue_with(SendBehavior::Single(token), |buf| {
+fn send_payload(conn: &mut Network, token: Token, payload: &[u8]) {
+    conn.send_with(token, |buf| {
         buf.extend_from_slice(payload);
     });
 }
@@ -70,9 +70,15 @@ fn queued_messages_flush_on_second_connection_after_backpressure() {
     let (fast_addr, fast_handle) = spawn_frame_collector(Duration::from_millis(0));
     let (slow_addr, slow_handle) = spawn_frame_collector(Duration::from_millis(700));
 
-    let mut conn = NetworkDriver::default().with_socket_buf_size(1024);
-    let fast_token = conn.connect(fast_addr).expect("failed to connect to fast collector");
-    let slow_token = conn.connect(slow_addr).expect("failed to connect to slow collector");
+    let mut conn = Network::default();
+    let conn_group = conn.add_group(TcpGroupConfig {
+        aligned_payloads: true,
+        replay: ReplayPolicy::Replay,
+        socket_buf_size: Some(1024),
+        ..Default::default()
+    });
+    let fast_token = conn.connect(conn_group, fast_addr);
+    let slow_token = conn.connect(conn_group, slow_addr);
     assert_ne!(fast_token, slow_token);
 
     // Send a large payload while the second receiver is paused to exercise the

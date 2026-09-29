@@ -1,4 +1,4 @@
-//! Poll-driven HTTP over a caller-owned [`crate::tcp::TcpNetworkCore`],
+//! Poll-driven HTTP over a caller-owned [`crate::NetworkCore`],
 //! sharing one poll with the tile's other traffic.
 //!
 //! [`HttpNetwork`] can listen for requests and maintain outbound endpoints in
@@ -8,8 +8,8 @@
 //!
 //! ```no_run
 //! use std::net::SocketAddr;
-//! use flux_network::{http::{HttpEvent, HttpNetwork}, tcp::TcpNetwork};
-//! let mut net = TcpNetwork::default();
+//! use flux_network::{http::{HttpEvent, HttpNetwork}, Network};
+//! let mut net = Network::default();
 //! let mut http = HttpNetwork::default();
 //! http.listen(&mut net, "127.0.0.1:8080".parse::<SocketAddr>().unwrap())?;
 //! let peer = http.connect(&mut net, "127.0.0.1:8081".parse::<SocketAddr>().unwrap());
@@ -53,7 +53,7 @@ use std::{
 use flux_timing::{Duration, Instant};
 use mio::Token;
 
-use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore};
+use crate::{Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig};
 
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
@@ -214,13 +214,14 @@ enum Lifecycle {
     Disconnected(Token),
 }
 pub struct HttpNetwork {
-    group: Option<TcpGroup>,
+    group: Option<Group>,
     name: &'static str,
     max_head_bytes: usize,
     max_body_bytes: usize,
     max_headers: usize,
     idle_timeout: Option<Duration>,
     socket_buf_size: Option<usize>,
+    listeners: Vec<Token>,
     conns: Vec<Conn>,
     lifecycle: Vec<Lifecycle>,
     pools: Vec<Pool>,
@@ -242,6 +243,7 @@ impl Default for HttpNetwork {
             max_headers: 64,
             idle_timeout: Some(Duration::from_secs(30)),
             socket_buf_size: None,
+            listeners: Vec::new(),
             conns: Vec::new(),
             lifecycle: Vec::new(),
             pools: Vec::new(),
@@ -333,7 +335,7 @@ impl HttpNetwork {
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
     }
-    fn group(&mut self, net: &mut TcpNetworkCore) -> TcpGroup {
+    fn group(&mut self, net: &mut NetworkCore) -> Group {
         let Self {
             group,
             name,
@@ -348,6 +350,7 @@ impl HttpNetwork {
             net.add_group(TcpGroupConfig {
                 name,
                 framing: Framing::Raw,
+                replay: ReplayPolicy::Drop,
                 socket_buf_size: *socket_buf_size,
                 reconnect_interval: reconnect_interval.unwrap_or(defaults.reconnect_interval),
                 max_frame_size: usize::MAX,
@@ -363,12 +366,13 @@ impl HttpNetwork {
             })
         })
     }
-    pub fn listen(&mut self, net: &mut TcpNetworkCore, addr: SocketAddr) -> io::Result<()> {
+    pub fn listen(&mut self, net: &mut NetworkCore, addr: SocketAddr) -> io::Result<()> {
         let group = self.group(net);
-        net.listen(group, addr)
+        self.listeners.push(net.listen(group, addr)?);
+        Ok(())
     }
     /// Immediately disconnects an accepted client.
-    pub fn disconnect(&mut self, net: &mut TcpNetworkCore, token: Token) -> bool {
+    pub fn disconnect(&mut self, net: &mut NetworkCore, token: Token) -> bool {
         self.group.is_some() &&
             self.conns
                 .iter()
@@ -377,10 +381,12 @@ impl HttpNetwork {
     }
     /// Takes in one network event; returns whether it belonged to this
     /// layer's group. Call from the network's `poll_with` handler.
-    pub fn on_event(&mut self, event: &TcpEvent<'_>) -> bool {
+    pub fn on_event(&mut self, event: &NetworkEvent<'_>) -> bool {
         let Some(group) = self.group else { return false };
         match *event {
-            TcpEvent::Accepted { group: event_group, token, peer_addr } if event_group == group => {
+            NetworkEvent::Accepted { group: event_group, token, peer_addr }
+                if event_group == group =>
+            {
                 self.conns.push(Conn {
                     token,
                     buf: Vec::new(),
@@ -397,10 +403,10 @@ impl HttpNetwork {
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
-            TcpEvent::Connected { group: event_group, token, .. } if event_group == group => {
+            NetworkEvent::Connected { group: event_group, token, .. } if event_group == group => {
                 self.lifecycle.push(Lifecycle::Connected(token, None));
             }
-            TcpEvent::Message { group: event_group, token, payload, .. }
+            NetworkEvent::Message { group: event_group, token, payload, .. }
                 if event_group == group =>
             {
                 let limit = self.buffer_limit();
@@ -419,7 +425,9 @@ impl HttpNetwork {
                     conn.last_activity = Instant::now();
                 }
             }
-            TcpEvent::Disconnected { group: event_group, token, .. } if event_group == group => {
+            NetworkEvent::Disconnected { group: event_group, token, .. }
+                if event_group == group =>
+            {
                 self.lifecycle.push(Lifecycle::Disconnected(token));
             }
             _ => return false,
@@ -433,7 +441,7 @@ impl HttpNetwork {
     /// A request event remains pending until [`Self::respond`] is called. The
     /// handler may defer that call until a later drive; requests behind it
     /// stay buffered until the response is sent.
-    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    pub fn drive<F>(&mut self, net: &mut NetworkCore, mut handler: F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -493,7 +501,7 @@ impl HttpNetwork {
         }
         self.dispatch(net);
     }
-    fn emit_lifecycle<F>(&mut self, net: &mut TcpNetworkCore, event: Lifecycle, handler: &mut F)
+    fn emit_lifecycle<F>(&mut self, net: &mut NetworkCore, event: Lifecycle, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -529,7 +537,7 @@ impl HttpNetwork {
             }
         }
     }
-    fn parse_dirty<F>(&mut self, net: &mut TcpNetworkCore, handler: &mut F)
+    fn parse_dirty<F>(&mut self, net: &mut NetworkCore, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -539,7 +547,7 @@ impl HttpNetwork {
             }
         }
     }
-    fn parse_connection<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
+    fn parse_connection<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -551,7 +559,7 @@ impl HttpNetwork {
             self.parse_outbound(net, i, handler);
         }
     }
-    pub fn connect(&mut self, net: &mut TcpNetworkCore, addr: SocketAddr) -> Token {
+    pub fn connect(&mut self, net: &mut NetworkCore, addr: SocketAddr) -> Token {
         let group = self.group(net);
         let token = net.connect(group, addr);
         self.track_outbound(token, addr)
@@ -560,12 +568,7 @@ impl HttpNetwork {
     /// completes, verifying against the Mozilla roots and sending SNI
     /// `server`. Panics if `server` is not a valid DNS name or IP.
     #[cfg(feature = "tls")]
-    pub fn connect_tls(
-        &mut self,
-        net: &mut TcpNetworkCore,
-        addr: SocketAddr,
-        server: &str,
-    ) -> Token {
+    pub fn connect_tls(&mut self, net: &mut NetworkCore, addr: SocketAddr, server: &str) -> Token {
         let session = crate::tls::Session::new(server);
         let session = match &self.tls_config {
             Some(config) => session.with_config(config.clone()),
@@ -591,7 +594,7 @@ impl HttpNetwork {
     /// request queue; see [`Self::send`].
     pub fn pool(
         &mut self,
-        net: &mut TcpNetworkCore,
+        net: &mut NetworkCore,
         addr: SocketAddr,
         connections: usize,
     ) -> HttpPool {
@@ -602,7 +605,7 @@ impl HttpNetwork {
     #[cfg(feature = "tls")]
     pub fn pool_tls(
         &mut self,
-        net: &mut TcpNetworkCore,
+        net: &mut NetworkCore,
         addr: SocketAddr,
         server: &str,
         connections: usize,
@@ -611,10 +614,10 @@ impl HttpNetwork {
     }
     fn pool_with(
         &mut self,
-        net: &mut TcpNetworkCore,
+        net: &mut NetworkCore,
         addr: SocketAddr,
         connections: usize,
-        mut open: impl FnMut(&mut Self, &mut TcpNetworkCore) -> Token,
+        mut open: impl FnMut(&mut Self, &mut NetworkCore) -> Token,
     ) -> HttpPool {
         assert!(connections > 0, "a pool needs a connection");
         let pool = HttpPool(self.pools.len() as u32);
@@ -628,16 +631,15 @@ impl HttpNetwork {
         });
         pool
     }
-    /// Removes every connection and outbound endpoint; pending requests and
-    /// responses are dropped without events. Listeners stay registered, as
-    /// [`TcpNetworkCore`] has no way to remove them.
-    pub fn close(self, net: &mut TcpNetworkCore) {
-        for conn in &self.conns {
-            net.remove(conn.token);
+    /// Removes every listener, connection and outbound endpoint; pending
+    /// requests and responses are dropped without events.
+    pub fn close(self, net: &mut NetworkCore) {
+        for token in self.listeners.iter().chain(self.conns.iter().map(|conn| &conn.token)) {
+            net.remove(*token);
         }
     }
     /// Permanently removes an outbound endpoint and stops it reconnecting.
-    pub fn remove(&mut self, net: &mut TcpNetworkCore, token: Token) -> bool {
+    pub fn remove(&mut self, net: &mut NetworkCore, token: Token) -> bool {
         if self.group.is_none() ||
             !self
                 .conns
@@ -653,7 +655,7 @@ impl HttpNetwork {
     /// Sends one request on an outbound endpoint.
     pub fn request(
         &mut self,
-        net: &mut TcpNetworkCore,
+        net: &mut NetworkCore,
         token: Token,
         method: &str,
         path: &str,
@@ -694,7 +696,7 @@ impl HttpNetwork {
     /// as it runs, which would starve the pool.
     pub fn request_stream(
         &mut self,
-        net: &mut TcpNetworkCore,
+        net: &mut NetworkCore,
         token: Token,
         method: &str,
         path: &str,
@@ -744,7 +746,7 @@ impl HttpNetwork {
         });
         Ok(id)
     }
-    fn dispatch(&mut self, net: &mut TcpNetworkCore) {
+    fn dispatch(&mut self, net: &mut NetworkCore) {
         for p in 0..self.pools.len() {
             for t in 0..self.pools[p].tokens.len() {
                 let token = self.pools[p].tokens[t];
@@ -782,7 +784,7 @@ impl HttpNetwork {
         pool.queued_bytes += queued.head.len() + queued.body.len();
         pool.queue.push_front(queued);
     }
-    fn fail_outbound(&mut self, net: &mut TcpNetworkCore, i: usize) {
+    fn fail_outbound(&mut self, net: &mut NetworkCore, i: usize) {
         let token = self.conns[i].token;
         self.conns[i].buf.clear();
         self.conns[i].role.set_outbound_head(None);
@@ -791,7 +793,7 @@ impl HttpNetwork {
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
     }
-    fn parse_and_emit<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
+    fn parse_and_emit<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -874,7 +876,7 @@ impl HttpNetwork {
         self.conns[i].role.set_accepted_continued(false);
         self.conns[i].role.set_accepted_head_request(head_request);
     }
-    fn error(&mut self, net: &mut TcpNetworkCore, i: usize, status: u16) {
+    fn error(&mut self, net: &mut NetworkCore, i: usize, status: u16) {
         self.conns[i].role.set_accepted_state(State::Pending);
         self.conns[i].role.set_accepted_close(true);
         let token = self.conns[i].token;
@@ -887,7 +889,7 @@ impl HttpNetwork {
     /// one. Each call completes exactly one request for `token`.
     pub fn respond(
         &mut self,
-        net: &mut TcpNetworkCore,
+        net: &mut NetworkCore,
         token: Token,
         status: u16,
         headers: &[(&str, &str)],
@@ -958,7 +960,7 @@ impl HttpNetwork {
     }
     /// Delivers a streaming response: the head once, then body pieces
     /// borrowed straight out of the receive buffer as they arrive.
-    fn parse_stream<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
+    fn parse_stream<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -1032,7 +1034,7 @@ impl HttpNetwork {
     }
     /// Parses and delivers a streaming response head; returns whether the
     /// body may now be read.
-    fn parse_stream_head<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F) -> bool
+    fn parse_stream_head<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F) -> bool
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -1114,7 +1116,7 @@ impl HttpNetwork {
         handler(HttpEvent::StreamEnd { token, reason });
     }
     /// Drops a malformed or oversized stream; the endpoint reconnects.
-    fn fail_stream<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
+    fn fail_stream<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
@@ -1123,7 +1125,7 @@ impl HttpNetwork {
         self.end_stream(i, StreamEnd::Disconnected, handler);
         net.disconnect(token);
     }
-    fn parse_outbound<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
+    fn parse_outbound<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {

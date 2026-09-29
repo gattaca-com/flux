@@ -18,8 +18,7 @@ mod scram;
 use std::{collections::VecDeque, fmt, net::SocketAddr};
 
 use flux_network::{
-    Token,
-    tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore},
+    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token,
 };
 use rand::Rng as _;
 use serde::{Serialize, ser};
@@ -211,7 +210,7 @@ pub struct Postgres {
     connections: usize,
     max_output_bytes: usize,
     max_queued_bytes: usize,
-    group: Option<TcpGroup>,
+    group: Option<Group>,
     conns: Vec<Conn>,
     queue: VecDeque<Request>,
     queued_bytes: usize,
@@ -376,11 +375,12 @@ impl Postgres {
 
     /// Opens the pool; the builders must have run, and [`Postgres::drive`]
     /// never opens anything itself.
-    pub fn connect(&mut self, net: &mut TcpNetworkCore) {
+    pub fn connect(&mut self, net: &mut NetworkCore) {
         assert!(self.group.is_none(), "connect once");
         let group = net.add_group(TcpGroupConfig {
             name: "postgres",
             framing: Framing::Raw,
+            replay: ReplayPolicy::Drop,
             max_frame_size: usize::MAX,
             on_connect_msg: Some(Self::startup_bytes(&self.user, &self.database, &self.params)),
             ..Default::default()
@@ -399,7 +399,7 @@ impl Postgres {
 
     /// Sends queued requests on idle connections, then delivers each finished
     /// request's outcome to `handler` exactly once.
-    pub fn drive<F>(&mut self, net: &mut TcpNetworkCore, mut handler: F)
+    pub fn drive<F>(&mut self, net: &mut NetworkCore, mut handler: F)
     where
         F: FnMut(QueryId, Result<Output, Error>),
     {
@@ -454,13 +454,13 @@ impl Postgres {
 
     /// Removes every pooled endpoint; queued and in-flight requests are
     /// dropped without outcomes.
-    pub fn close(self, net: &mut TcpNetworkCore) {
+    pub fn close(self, net: &mut NetworkCore) {
         for conn in &self.conns {
             net.remove(conn.token);
         }
     }
 
-    fn conn_index(&self, group: TcpGroup, token: Token) -> Option<usize> {
+    fn conn_index(&self, group: Group, token: Token) -> Option<usize> {
         if self.group != Some(group) {
             return None;
         }
@@ -469,24 +469,24 @@ impl Postgres {
 
     /// Returns whether the event belonged to this client. Outcomes queue
     /// inside and are delivered by [`Postgres::drive`].
-    pub fn on_event(&mut self, event: &TcpEvent) -> bool {
+    pub fn on_event(&mut self, event: &NetworkEvent) -> bool {
         match *event {
-            TcpEvent::Accepted { .. } => false,
-            TcpEvent::Connected { group, token, .. } |
-            TcpEvent::Disconnected { group, token, .. } => {
+            NetworkEvent::Accepted { .. } => false,
+            NetworkEvent::Connected { group, token, .. } |
+            NetworkEvent::Disconnected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
                 let conn = &mut self.conns[index];
                 if let Some(id) = conn.in_flight() {
                     self.outcomes.push((id, Err(Error::Disconnected)));
                 }
-                conn.reset(if matches!(event, TcpEvent::Connected { .. }) {
+                conn.reset(if matches!(event, NetworkEvent::Connected { .. }) {
                     State::Startup(Startup::AwaitAuth)
                 } else {
                     State::Connecting
                 });
                 true
             }
-            TcpEvent::Message { group, token, payload, .. } => {
+            NetworkEvent::Message { group, token, payload, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
                 let Self { conns, outcomes, user, password, max_output_bytes, .. } = self;
                 let max_output_bytes = *max_output_bytes;
