@@ -443,17 +443,14 @@ enum GroupState {
 pub struct Network {
     events: Events,
     core: NetworkCore,
-    poll: Poll,
 }
 
 impl Default for Network {
     fn default() -> Self {
         let poll = Poll::new().expect("failed to create poll");
-        let registry = poll.registry().try_clone().expect("failed to clone poll registry");
         Self {
             events: Events::with_capacity(EVENTS_CAPACITY),
-            core: NetworkCore::new(registry, 0..usize::MAX),
-            poll,
+            core: NetworkCore::new(Poller::Owned(poll), 0..usize::MAX),
         }
     }
 }
@@ -500,7 +497,10 @@ impl Network {
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let mut work = self.core.pre_poll(handler);
-        if let Err(err) = self.poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
+        let Poller::Owned(poll) = &mut self.core.poller else {
+            unreachable!("a Network always owns its poll")
+        };
+        if let Err(err) = poll.poll(&mut self.events, Some(std::time::Duration::ZERO)) {
             if err.kind() != io::ErrorKind::Interrupted {
                 flux_utils::safe_panic!("couldn't poll network: {err}");
             }
@@ -557,19 +557,37 @@ impl Network {
     }
 }
 
+/// Where a [`NetworkCore`] registers its sockets. Every group borrows this one
+/// registry, so sockets are registered on the descriptor that is polled rather
+/// than on a `Registry::try_clone` duplicate of it.
+enum Poller {
+    Owned(Poll),
+    External(Registry),
+}
+
+impl Poller {
+    #[inline]
+    fn registry(&self) -> &Registry {
+        match self {
+            Self::Owned(poll) => poll.registry(),
+            Self::External(registry) => registry,
+        }
+    }
+}
+
 /// Transport state and operations, without an owned poll. Components can borrow
 /// this core to create their own groups and send through the shared network.
 pub struct NetworkCore {
-    registry: Registry,
+    poller: Poller,
     groups: Vec<GroupState>,
     tokens: Tokens,
     dcache: Option<DCachePtr>,
 }
 
 impl NetworkCore {
-    fn new(registry: Registry, tokens: Range<usize>) -> Self {
+    fn new(poller: Poller, tokens: Range<usize>) -> Self {
         Self {
-            registry,
+            poller,
             groups: Vec::with_capacity(INITIAL_GROUP_CAPACITY),
             tokens: Tokens::new(tokens),
             dcache: None,
@@ -588,18 +606,15 @@ impl NetworkCore {
     #[must_use = "the group handle identifies listeners and outbound endpoints"]
     pub fn add_group(&mut self, config: impl Into<GroupConfig>) -> Group {
         let group = Group(self.groups.len());
-        let registry = self.registry.try_clone().expect("clone registry");
         let state = match config.into() {
             GroupConfig::Tcp(config) => {
                 assert!(
                     self.dcache.is_none() || config.framing == Framing::LengthPrefixed,
                     "dcache requires framed TCP"
                 );
-                GroupState::Tcp(Box::new(TcpManager::new(config, registry, group)))
+                GroupState::Tcp(Box::new(TcpManager::new(config, group)))
             }
-            GroupConfig::Udp(config) => {
-                GroupState::Udp(Box::new(UdpManager::new(config, registry, group)))
-            }
+            GroupConfig::Udp(config) => GroupState::Udp(Box::new(UdpManager::new(config, group))),
         };
         self.groups.push(state);
         group
@@ -609,8 +624,12 @@ impl NetworkCore {
     /// listening.
     pub fn listen(&mut self, group: Group, addr: SocketAddr) -> io::Result<Token> {
         match self.groups.get_mut(group.0) {
-            Some(GroupState::Tcp(tcp)) => tcp.listen(addr, &mut self.tokens),
-            Some(GroupState::Udp(udp)) => udp.listen(addr, &mut self.tokens),
+            Some(GroupState::Tcp(tcp)) => {
+                tcp.listen(self.poller.registry(), addr, &mut self.tokens)
+            }
+            Some(GroupState::Udp(udp)) => {
+                udp.listen(self.poller.registry(), addr, &mut self.tokens)
+            }
             None => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown group")),
         }
     }
@@ -621,8 +640,10 @@ impl NetworkCore {
     #[must_use]
     pub fn connect(&mut self, group: Group, addr: SocketAddr) -> Token {
         match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.connect(addr, None, &mut self.tokens),
-            GroupState::Udp(udp) => udp.connect(addr, &mut self.tokens),
+            GroupState::Tcp(tcp) => {
+                tcp.connect(self.poller.registry(), addr, None, &mut self.tokens)
+            }
+            GroupState::Udp(udp) => udp.connect(self.poller.registry(), addr, &mut self.tokens),
         }
     }
     /// Client TLS is TCP-only. Panics when used with a UDP or replay group.
@@ -636,7 +657,7 @@ impl NetworkCore {
             "TLS does not support wire backlog replay"
         );
         assert!(tcp.config.max_backlog_frames.is_none(), "TLS requires byte backlog limits");
-        tcp.connect(addr, Some(Box::new(tls)), &mut self.tokens)
+        tcp.connect(self.poller.registry(), addr, Some(Box::new(tls)), &mut self.tokens)
     }
 
     /// Returns whether the message was accepted for sending or replay. Unknown,
@@ -648,8 +669,10 @@ impl NetworkCore {
     {
         let Some(group) = self.route(token) else { return false };
         match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.send_with(token, &mut self.tokens, serialise),
-            GroupState::Udp(udp) => udp.send_with(token, serialise),
+            GroupState::Tcp(tcp) => {
+                tcp.send_with(self.poller.registry(), token, &mut self.tokens, serialise)
+            }
+            GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, serialise),
         }
     }
     /// Sends a bounded batch. TCP stages one write; UDP retains message
@@ -662,8 +685,16 @@ impl NetworkCore {
     {
         let Some(group) = self.route(token) else { return false };
         match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.send_many_with(token, &mut self.tokens, items, serialise),
-            GroupState::Udp(udp) => udp.send_many_with(token, items, serialise),
+            GroupState::Tcp(tcp) => tcp.send_many_with(
+                self.poller.registry(),
+                token,
+                &mut self.tokens,
+                items,
+                serialise,
+            ),
+            GroupState::Udp(udp) => {
+                udp.send_many_with(self.poller.registry(), token, items, serialise)
+            }
         }
     }
     /// Serializes once for all eligible peers in this group. Returns the number
@@ -674,8 +705,10 @@ impl NetworkCore {
         F: FnOnce(&mut PayloadBuf<'_>),
     {
         match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.broadcast_with(&mut self.tokens, serialise),
-            GroupState::Udp(udp) => udp.broadcast_with(serialise),
+            GroupState::Tcp(tcp) => {
+                tcp.broadcast_with(self.poller.registry(), &mut self.tokens, serialise)
+            }
+            GroupState::Udp(udp) => udp.broadcast_with(self.poller.registry(), serialise),
         }
     }
     pub fn broadcast_many_with<I, F>(&mut self, group: Group, items: I, serialise: F) -> usize
@@ -684,14 +717,18 @@ impl NetworkCore {
         F: FnMut(&mut PayloadBuf<'_>, I::Item),
     {
         match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.broadcast_many_with(&mut self.tokens, items, serialise),
-            GroupState::Udp(udp) => udp.broadcast_many_with(items, serialise),
+            GroupState::Tcp(tcp) => {
+                tcp.broadcast_many_with(self.poller.registry(), &mut self.tokens, items, serialise)
+            }
+            GroupState::Udp(udp) => {
+                udp.broadcast_many_with(self.poller.registry(), items, serialise)
+            }
         }
     }
     pub fn disconnect(&mut self, token: Token) -> bool {
         let Some(group) = self.tokens.groups.get(&token).copied() else { return false };
         match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.disconnect(token, &mut self.tokens),
+            GroupState::Tcp(tcp) => tcp.disconnect(self.poller.registry(), token, &mut self.tokens),
             GroupState::Udp(udp) => udp.disconnect(token),
         }
     }
@@ -701,7 +738,9 @@ impl NetworkCore {
     pub fn disconnect_when_drained(&mut self, token: Token) -> bool {
         let Some(group) = self.tokens.groups.get(&token).copied() else { return false };
         match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.disconnect_when_drained(token, &mut self.tokens),
+            GroupState::Tcp(tcp) => {
+                tcp.disconnect_when_drained(self.poller.registry(), token, &mut self.tokens)
+            }
             GroupState::Udp(udp) => udp.disconnect_when_drained(token),
         }
     }
@@ -709,8 +748,8 @@ impl NetworkCore {
     pub fn remove(&mut self, token: Token) -> bool {
         let Some(group) = self.tokens.groups.get(&token).copied() else { return false };
         let removed = match &mut self.groups[group.0] {
-            GroupState::Tcp(tcp) => tcp.remove(token),
-            GroupState::Udp(udp) => udp.remove(token),
+            GroupState::Tcp(tcp) => tcp.remove(self.poller.registry(), token),
+            GroupState::Udp(udp) => udp.remove(self.poller.registry(), token),
         };
         if removed {
             self.tokens.retire(token);
@@ -770,15 +809,17 @@ impl NetworkCore {
     pub fn force_reconnect(&mut self) {
         for group in &mut self.groups {
             match group {
-                GroupState::Tcp(tcp) => tcp.force_reconnect(),
-                GroupState::Udp(udp) => udp.force_reconnect(),
+                GroupState::Tcp(tcp) => tcp.force_reconnect(self.poller.registry()),
+                GroupState::Udp(udp) => udp.force_reconnect(self.poller.registry()),
             }
         }
     }
     pub fn disconnect_outbound(&mut self) {
         for group in &mut self.groups {
             match group {
-                GroupState::Tcp(tcp) => tcp.disconnect_outbound(&mut self.tokens),
+                GroupState::Tcp(tcp) => {
+                    tcp.disconnect_outbound(self.poller.registry(), &mut self.tokens);
+                }
                 GroupState::Udp(udp) => udp.disconnect_outbound(),
             }
         }
@@ -791,8 +832,10 @@ impl NetworkCore {
         let mut work = false;
         for group in &mut self.groups {
             work |= match group {
-                GroupState::Tcp(tcp) => tcp.pre_poll(&mut self.tokens, handler),
-                GroupState::Udp(udp) => udp.pre_poll(handler),
+                GroupState::Tcp(tcp) => {
+                    tcp.pre_poll(self.poller.registry(), &mut self.tokens, handler)
+                }
+                GroupState::Udp(udp) => udp.pre_poll(self.poller.registry(), handler),
             };
         }
         work
@@ -817,10 +860,34 @@ impl NetworkCore {
         let Some(group) = self.route(event.token()) else { return };
         match &mut self.groups[group.0] {
             GroupState::Tcp(tcp) => {
-                tcp.handle_event(event, &mut self.tokens, self.dcache.as_deref(), handler);
+                tcp.handle_event(
+                    self.poller.registry(),
+                    event,
+                    &mut self.tokens,
+                    self.dcache.as_deref(),
+                    handler,
+                );
             }
             GroupState::Udp(udp) => {
-                udp.handle_event(event, &mut self.tokens, self.dcache.as_deref(), handler);
+                udp.handle_event(
+                    self.poller.registry(),
+                    event,
+                    &mut self.tokens,
+                    self.dcache.as_deref(),
+                    handler,
+                );
+            }
+        }
+    }
+}
+
+impl Drop for NetworkCore {
+    fn drop(&mut self) {
+        let registry = self.poller.registry();
+        for group in &mut self.groups {
+            match group {
+                GroupState::Tcp(tcp) => tcp.close_all(registry),
+                GroupState::Udp(udp) => udp.close_all(registry),
             }
         }
     }
@@ -853,7 +920,7 @@ impl DerefMut for NetworkWithExternalPoll {
 
 impl NetworkWithExternalPoll {
     pub fn new(registry: Registry, tokens: Range<usize>) -> Self {
-        Self { core: NetworkCore::new(registry, tokens) }
+        Self { core: NetworkCore::new(Poller::External(registry), tokens) }
     }
     pub fn max_poll_interval(&self) -> std::time::Duration {
         self.core
