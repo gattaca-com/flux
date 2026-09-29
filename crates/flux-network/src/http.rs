@@ -41,6 +41,13 @@
 //! discarded. There is no half-close support. After an error response, the
 //! connection closes without a lingering-close delay. Pipelined requests are
 //! served strictly one at a time per connection.
+//!
+//! # `DCache`
+//! With [`HttpNetwork::with_dcache`], request bodies land in the dcache:
+//! body bytes that arrive with the head are copied in, the rest is read from
+//! the socket straight into the dcache slot, and
+//! [`HttpNetwork::drive_with_produce`] produces requests into a spine queue
+//! with a reference to their body.
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -50,7 +57,9 @@ use std::{
     net::SocketAddr,
 };
 
-use flux_timing::{Duration, Instant};
+use flux::spine::{SpineProducerWithDCache, SpineProducers};
+use flux_timing::{Duration, Instant, Nanos};
+use flux_utils::{DCachePtr, DCacheRef};
 use mio::Token;
 
 use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore};
@@ -192,6 +201,17 @@ struct Conn {
     role: Role,
     /// Set while a streaming request owns this connection.
     stream: Option<Stream>,
+    /// The dcache slot receiving the pending request's body; bytes after
+    /// those already in `buf` are read into it by the network.
+    dcache_body: Option<DCacheBody>,
+}
+
+#[derive(Clone, Copy)]
+struct DCacheBody {
+    dref: DCacheRef,
+    filled: usize,
+    /// Body bytes copied from `buf` that still sit there after the head.
+    in_buf: usize,
 }
 
 /// A streaming request; `body` is set once its head has been delivered.
@@ -231,6 +251,9 @@ pub struct HttpNetwork {
     #[cfg(feature = "tls")]
     tls_config: Option<Arc<crate::tls::ClientConfig>>,
     failed: Vec<(RequestId, Failure)>,
+    dcache: Option<DCachePtr>,
+    /// Body and arrival time of each request delivered this drive, in order.
+    delivered: Vec<(DCacheRef, Nanos)>,
 }
 impl Default for HttpNetwork {
     fn default() -> Self {
@@ -252,6 +275,8 @@ impl Default for HttpNetwork {
             #[cfg(feature = "tls")]
             tls_config: None,
             failed: Vec::new(),
+            dcache: None,
+            delivered: Vec::new(),
         }
     }
 }
@@ -330,6 +355,11 @@ impl HttpNetwork {
         self.tls_config = Some(config);
         self
     }
+    /// Writes request bodies into `dcache`; see [`Self::drive_with_produce`].
+    pub fn with_dcache(mut self, dcache: DCachePtr) -> Self {
+        self.dcache = Some(dcache);
+        self
+    }
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
     }
@@ -394,6 +424,7 @@ impl HttpNetwork {
                         head_request: false,
                     },
                     stream: None,
+                    dcache_body: None,
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
@@ -437,6 +468,17 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
+        self.delivered.clear();
+        for conn in &mut self.conns {
+            if let Some(body) = &mut conn.dcache_body &&
+                let Some(filled) = net.dcache_read_filled(conn.token) &&
+                filled != body.filled
+            {
+                body.filled = filled;
+                conn.dirty = true;
+                conn.last_activity = Instant::now();
+            }
+        }
         for event in std::mem::take(&mut self.lifecycle) {
             self.emit_lifecycle(net, event, &mut handler);
         }
@@ -492,6 +534,37 @@ impl HttpNetwork {
             handler(HttpEvent::Failed { id, reason });
         }
         self.dispatch(net);
+    }
+    /// Like [`Self::drive`] but for dcache-backed servers: returning `Some(T)`
+    /// for a [`HttpEvent::Request`] produces it into the spine together with
+    /// a reference to the request body. Bodyless requests carry no reference.
+    ///
+    /// # Panics
+    /// Panics if no dcache was configured via [`Self::with_dcache`].
+    pub fn drive_with_produce<T, P, F>(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        produce: &mut P,
+        mut handler: F,
+    ) where
+        T: 'static + Copy,
+        P: SpineProducers + AsRef<SpineProducerWithDCache<T>>,
+        F: for<'a> FnMut(HttpEvent<'a>) -> Option<T>,
+    {
+        assert!(self.dcache.is_some(), "dcache required for drive_with_produce");
+        let mut produced = Vec::new();
+        self.drive(net, |event| {
+            let request = matches!(event, HttpEvent::Request { .. });
+            let value = handler(event);
+            if request {
+                produced.push(value);
+            }
+        });
+        for ((dref, ts), value) in self.delivered.drain(..).zip(produced) {
+            if let Some(value) = value {
+                produce.produce_with_dref(value, dref, ts);
+            }
+        }
     }
     fn emit_lifecycle<F>(&mut self, net: &mut TcpNetworkCore, event: Lifecycle, handler: &mut F)
     where
@@ -584,6 +657,7 @@ impl HttpNetwork {
             last_activity: Instant::now(),
             role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
             stream: None,
+            dcache_body: None,
         });
         token
     }
@@ -791,6 +865,7 @@ impl HttpNetwork {
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
     }
+    #[allow(clippy::too_many_lines)]
     fn parse_and_emit<F>(&mut self, net: &mut TcpNetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
@@ -839,7 +914,25 @@ impl HttpNetwork {
             self.error(net, i, 413);
             return
         };
-        if buf.len() < end {
+        let mut body = self.conns[i].dcache_body;
+        if let Some(dcache) = self.dcache &&
+            len > 0 &&
+            body.is_none()
+        {
+            let Ok(dref) = dcache.reserve(len) else {
+                self.error(net, i, 413);
+                return
+            };
+            let in_buf = (buf.len() - head).min(len);
+            let _ = dcache.write_into(dref, 0, |dst| {
+                dst[..in_buf].copy_from_slice(&buf[head..head + in_buf]);
+            });
+            if in_buf < len {
+                net.read_into_dcache(self.conns[i].token, dcache, dref, in_buf);
+            }
+            body = Some(DCacheBody { dref, filled: in_buf, in_buf });
+        }
+        if body.map_or(buf.len() < end, |body| body.filled < len) {
             if over_limit {
                 self.error(net, i, 413);
                 return
@@ -853,21 +946,38 @@ impl HttpNetwork {
                     self.conns[i].role.set_accepted_continued(true);
                 }
             }
+            self.conns[i].dcache_body = body;
             return
         }
         let close = req.version == Some(0) && !has_token(req.headers, "connection", b"keep-alive") ||
             has_token(req.headers, "connection", b"close");
         let token = self.conns[i].token;
         let head_request = req.method == Some("HEAD");
-        let request = HttpRequest {
-            method: req.method.unwrap_or(""),
-            path: req.path.unwrap_or(""),
-            version: req.version.unwrap_or(1),
-            headers: req.headers,
-            body: &buf[head..end],
+        let consumed = body.map_or(end, |body| head + body.in_buf);
+        let mut emit = |body: &[u8]| {
+            let request = HttpRequest {
+                method: req.method.unwrap_or(""),
+                path: req.path.unwrap_or(""),
+                version: req.version.unwrap_or(1),
+                headers: req.headers,
+                body,
+            };
+            handler(HttpEvent::Request { token, request });
         };
-        handler(HttpEvent::Request { token, request });
-        self.conns[i].buf.drain(..end);
+        match (self.dcache.as_deref(), body) {
+            (Some(dcache), Some(body)) => {
+                dcache.map(body.dref, emit).expect("reserved dcache slots are contiguous");
+                self.delivered.push((body.dref, Nanos::now()));
+            }
+            (dcache, _) => {
+                emit(&buf[head..end]);
+                if dcache.is_some() {
+                    self.delivered.push((DCacheRef::NONE, Nanos::now()));
+                }
+            }
+        }
+        self.conns[i].dcache_body = None;
+        self.conns[i].buf.drain(..consumed);
         self.conns[i].dirty = !self.conns[i].buf.is_empty();
         self.conns[i].role.set_accepted_state(State::Pending);
         self.conns[i].role.set_accepted_close(close);
