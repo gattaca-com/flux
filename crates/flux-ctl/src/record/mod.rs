@@ -314,6 +314,11 @@ impl Recorder {
         (self.timers.len(), self.tiles.len())
     }
 
+    /// Bytes the Parquet files take on disk, but for the rows still buffered.
+    pub fn bytes(&self) -> u64 {
+        self.timer_table.bytes() + self.tile_table.bytes()
+    }
+
     /// Polls until `stop` is set or a limit in `until` is reached, then
     /// finishes and reads the recording back with [`summarize`].
     pub fn run(mut self, until: Until, stop: &AtomicBool) -> Result<Recording, Box<dyn Error>> {
@@ -324,6 +329,9 @@ impl Recorder {
             }
             if until.duration.is_some_and(|d| started.elapsed() >= d) {
                 break Stop::Duration;
+            }
+            if until.bytes.is_some_and(|b| self.bytes() >= b) {
+                break Stop::Bytes;
             }
             if let Err(e) = self.poll() {
                 // Close what still closes, so the files so far stay readable.
@@ -435,6 +443,9 @@ impl Recorder {
 pub struct Until {
     /// Time since [`Recorder::run`] started.
     pub duration: Option<StdDuration>,
+    /// Bytes of Parquet on disk. A recording can pass it by what one poll
+    /// writes, a row group or a file's footer.
+    pub bytes: Option<u64>,
 }
 
 /// What ended a [`Recorder::run`].
@@ -444,6 +455,8 @@ pub enum Stop {
     Requested,
     /// [`Until::duration`].
     Duration,
+    /// [`Until::bytes`].
+    Bytes,
 }
 
 /// A finished recording: what [`Recorder::finish`] wrote, and its
@@ -469,6 +482,7 @@ impl Display for Recording {
         let why = match stopped {
             Stop::Requested => "stopped",
             Stop::Duration => "the duration ended",
+            Stop::Bytes => "the files reached --max-mb",
         };
         let secs = elapsed.as_secs_f64();
         writeln!(f, "{secs:.1} s of {app}, until {why}; tile rows are busy_max per window")?;

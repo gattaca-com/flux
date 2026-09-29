@@ -279,3 +279,20 @@ fn summarize_skips_and_names_a_file_a_killed_recording_left_open() {
     assert_eq!(report.unfinished, ["timers-001.parquet"]);
     cleanup_shmem(base);
 }
+
+#[test]
+fn run_stops_when_the_files_reach_the_byte_cap() {
+    let tmp = tempdir().unwrap();
+    let base = tmp.path();
+    let mut timer = Timer::new_with_base_dir(base, "testapp", "Tile-Msg");
+    // A zero period closes a file each poll, so its bytes count at once.
+    let rotate = Some(std::time::Duration::ZERO);
+    let recorder = Recorder::attach(base, "testapp", &base.join("run"), rotate, None).unwrap();
+    emit(&mut timer, 10);
+
+    let until = Until { bytes: Some(1), ..Until::default() };
+    let recording = recorder.run(until, &AtomicBool::new(false)).unwrap();
+    assert_eq!(recording.stopped, Stop::Bytes);
+    assert_eq!(recording.report.timers["timing/Tile-Msg"].samples, 10);
+    cleanup_shmem(base);
+}

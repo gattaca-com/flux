@@ -56,6 +56,8 @@ pub struct Table<C: Columns> {
     file: Option<SerializedFileWriter<File>>,
     period_start: Instant,
     written: Vec<PathBuf>,
+    /// Bytes of the files already closed.
+    closed_bytes: u64,
     pub rows: C,
 }
 
@@ -78,6 +80,7 @@ impl<C: Columns> Table<C> {
             file: None,
             period_start: Instant::now(),
             written: Vec::new(),
+            closed_bytes: 0,
             rows: C::default(),
         })
     }
@@ -92,6 +95,12 @@ impl<C: Columns> Table<C> {
             self.close_file()?;
         }
         Ok(())
+    }
+
+    /// Bytes on disk: the closed files, and what the open one has written.
+    /// Rows still buffered, at most a row group, are not counted.
+    pub fn bytes(&self) -> u64 {
+        self.closed_bytes + self.file.as_ref().map_or(0, |f| f.bytes_written() as u64)
     }
 
     /// Closes the last file and returns every file written. A table that got no
@@ -134,6 +143,8 @@ impl<C: Columns> Table<C> {
         self.flush()?;
         if let Some(file) = self.file.take() {
             file.close()?;
+            let path = self.written.last().expect("an open file was pushed to `written`");
+            self.closed_bytes += std::fs::metadata(path)?.len();
         }
         self.period_start = Instant::now();
         Ok(())

@@ -77,6 +77,10 @@ enum Commands {
         /// Seconds per file; 0 writes one file per table
         #[arg(long, default_value_t = 300)]
         rotate_secs: u64,
+        /// Stop once the Parquet files reach this many MB (10^6 bytes); 0 has
+        /// no limit
+        #[arg(long, default_value_t = 0)]
+        max_mb: u64,
         /// Only queues whose name contains this
         #[arg(long = "match")]
         filter: Option<String>,
@@ -132,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Commands::Record { app, out, duration, rotate_secs, filter } => {
+        Commands::Record { app, out, duration, rotate_secs, max_mb, filter } => {
             let secs = |s| (s > 0).then(|| Duration::from_secs(s));
             let out = out.unwrap_or_else(|| {
                 PathBuf::from(format!("{app}-{}", Nanos::now().with_fmt_utc("%Y%m%dT%H%M%SZ")))
@@ -148,7 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let on_signal = Arc::clone(&stop);
             ctrlc::set_handler(move || on_signal.store(true, Ordering::Relaxed))?;
 
-            let until = record::Until { duration: secs(duration) };
+            let until = record::Until {
+                duration: secs(duration),
+                bytes: (max_mb > 0).then(|| max_mb * 1_000_000),
+            };
             print!("{}", recorder.run(until, &stop)?);
             Ok(())
         }
