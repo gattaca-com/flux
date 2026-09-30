@@ -74,6 +74,7 @@ crossterm = "0.28.1"
 ctrlc = "3"
 directories = "5.0.1"
 governor = "0.6.3"
+hdrhistogram = { version = "7.5.4", default-features = false }
 hmac = "0.12"
 httparse = "1"
 humantime = "2.1"

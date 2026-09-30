@@ -19,8 +19,16 @@ shared_memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+core_affinity.workspace = true
+hdrhistogram.workspace = true
+
 [lints]
 workspace = true
 
 [features]
 park = ["dep:mio"]
+
+[[bench]]
+harness = false
+name = "queue"

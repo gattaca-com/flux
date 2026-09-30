@@ -111,6 +111,20 @@ impl<T: Copy> Seqlock<T> {
         self.version.store(v.wrapping_add(2), Ordering::Release);
     }
 
+    /// [`Self::write`] for a slot with exactly one writer: the version bump
+    /// is a plain load and store, not a locked read-modify-write. A locked
+    /// instruction is a full barrier that drains the store buffer, which
+    /// dominates the cost of a write on the SPMC path.
+    #[inline]
+    pub fn write_single_producer(&self, data: &T) {
+        let v = self.version.load(Ordering::Relaxed);
+        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        compiler_fence(Ordering::AcqRel);
+        unsafe { *self.data.get() = *data };
+        compiler_fence(Ordering::AcqRel);
+        self.version.store(v.wrapping_add(2), Ordering::Release);
+    }
+
     #[inline(never)]
     pub fn write_unpoison(&self, data: &T) {
         let v = self.version.load(Ordering::Relaxed);
