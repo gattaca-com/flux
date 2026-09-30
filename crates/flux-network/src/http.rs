@@ -55,6 +55,12 @@ use mio::Token;
 
 use crate::{Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig};
 
+/// Header slots parsed on the stack; a larger `max_headers` falls back to the
+/// heap.
+const STACK_HEADERS: usize = 64;
+/// Request head buffers kept for reuse once their request completes.
+const SPARE_HEADS: usize = 64;
+
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
 
@@ -232,6 +238,9 @@ pub struct HttpNetwork {
     #[cfg(feature = "tls")]
     tls_config: Option<Arc<crate::tls::ClientConfig>>,
     failed: Vec<(RequestId, Failure)>,
+    spare_heads: Vec<Vec<u8>>,
+    /// Decoded body of the chunked response being delivered.
+    chunked_body: Vec<u8>,
 }
 impl Default for HttpNetwork {
     fn default() -> Self {
@@ -254,6 +263,8 @@ impl Default for HttpNetwork {
             #[cfg(feature = "tls")]
             tls_config: None,
             failed: Vec::new(),
+            spare_heads: Vec::new(),
+            chunked_body: Vec::new(),
         }
     }
 }
@@ -491,6 +502,7 @@ impl HttpNetwork {
                 }
                 if let Some(in_flight) = self.conns[i].role.take_in_flight() {
                     self.failed.push((in_flight.queued.id, Failure::TimedOut));
+                    self.recycle(in_flight.queued);
                 }
                 self.conns[i].role.set_outbound_head(None);
                 net.disconnect(self.conns[i].token);
@@ -524,10 +536,12 @@ impl HttpNetwork {
                         self.conns[i].buf.clear();
                         self.conns[i].dirty = false;
                         self.conns[i].role.set_outbound_head(None);
-                        if let Some(in_flight) = self.conns[i].role.take_in_flight() &&
-                            !answered
-                        {
-                            self.requeue_or_fail(in_flight.queued);
+                        if let Some(in_flight) = self.conns[i].role.take_in_flight() {
+                            if answered {
+                                self.recycle(in_flight.queued);
+                            } else {
+                                self.requeue_or_fail(in_flight.queued);
+                            }
                         }
                     } else {
                         self.conns.remove(i);
@@ -772,9 +786,11 @@ impl HttpNetwork {
         if !valid_request(method, path, headers) || body.len() > self.max_body_bytes {
             return Err(body)
         }
-        let mut head = Vec::new();
+        let mut head = self.spare_heads.pop().unwrap_or_else(|| Vec::with_capacity(512));
         write_head(&mut head, method, path, headers, &p.addr, body.len());
         if p.queued_bytes + head.len() + body.len() > self.max_queued_bytes {
+            head.clear();
+            self.spare_heads.push(head);
             return Err(body)
         }
         let id = RequestId { pool, seq: p.next_seq };
@@ -820,12 +836,25 @@ impl HttpNetwork {
     fn requeue_or_fail(&mut self, mut queued: Queued) {
         if queued.retries == 0 {
             self.failed.push((queued.id, Failure::Disconnected));
+            self.recycle(queued);
             return
         }
         queued.retries -= 1;
         let pool = &mut self.pools[queued.id.pool.0 as usize];
         pool.queued_bytes += queued.head.len() + queued.body.len();
         pool.queue.push_front(queued);
+    }
+    fn complete_in_flight(&mut self, i: usize) {
+        if let Some(done) = self.conns[i].role.take_in_flight() {
+            self.recycle(done.queued);
+        }
+    }
+    fn recycle(&mut self, queued: Queued) {
+        if self.spare_heads.len() < SPARE_HEADS {
+            let mut head = queued.head;
+            head.clear();
+            self.spare_heads.push(head);
+        }
     }
     fn fail_outbound(&mut self, net: &mut NetworkCore, i: usize) {
         let token = self.conns[i].token;
@@ -845,8 +874,10 @@ impl HttpNetwork {
         }
         let over_limit = self.conns[i].over_limit;
         let buf = &self.conns[i].buf;
-        let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
-        let mut req = httparse::Request::new(&mut hs);
+        let (mut stack_slots, mut heap_slots) =
+            ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+        let hs = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
+        let mut req = httparse::Request::new(hs);
         let Ok(state) = req.parse(buf) else {
             self.error(net, i, 400);
             return
@@ -963,7 +994,11 @@ impl HttpNetwork {
             self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
         let ok = net.send_with(token, |out| {
-            write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
+            out.extend_from_slice(b"HTTP/1.1 ");
+            write_decimal(out, usize::from(status));
+            out.extend_from_slice(b" ");
+            out.extend_from_slice(reason_phrase(status).as_bytes());
+            out.extend_from_slice(b"\r\n");
             // Caller Connection headers only feed the close decision; exactly
             // one canonical Connection header is always written below.
             for (n, v) in headers {
@@ -976,7 +1011,9 @@ impl HttpNetwork {
                 out.extend_from_slice(b"\r\n");
             }
             if include_length {
-                write!(out, "Content-Length: {}\r\n", body.len()).unwrap();
+                out.extend_from_slice(b"Content-Length: ");
+                write_decimal(out, body.len());
+                out.extend_from_slice(b"\r\n");
             }
             out.extend_from_slice(if close {
                 b"Connection: close\r\n"
@@ -1083,8 +1120,10 @@ impl HttpNetwork {
     {
         let token = self.conns[i].token;
         let b = &self.conns[i].buf;
-        let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
-        let mut response = httparse::Response::new(&mut hs);
+        let (mut stack_slots, mut heap_slots) =
+            ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+        let hs = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
+        let mut response = httparse::Response::new(hs);
         let Ok(state) = response.parse(b) else {
             self.fail_stream(net, i, handler);
             return false
@@ -1155,7 +1194,7 @@ impl HttpNetwork {
         // and would otherwise be parsed as the next response head.
         self.conns[i].buf.clear();
         self.conns[i].role.set_outbound_head(None);
-        self.conns[i].role.take_in_flight();
+        self.complete_in_flight(i);
         handler(HttpEvent::StreamEnd { token, reason });
     }
     /// Drops a malformed or oversized stream; the endpoint reconnects.
@@ -1175,8 +1214,10 @@ impl HttpNetwork {
         self.conns[i].dirty = false;
         while self.conns[i].role.outbound_head().is_some() {
             let b = &self.conns[i].buf;
-            let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
-            let mut response = httparse::Response::new(&mut hs);
+            let (mut stack_slots, mut heap_slots) =
+                ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+            let hs = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
+            let mut response = httparse::Response::new(hs);
             let parsed = response.parse(b);
             let Ok(state) = parsed else {
                 self.fail_outbound(net, i);
@@ -1208,17 +1249,17 @@ impl HttpNetwork {
                 self.fail_outbound(net, i);
                 return
             }
-            let (consumed, decoded) = if no_body {
-                (head, None)
+            let (consumed, chunked_body) = if no_body {
+                (head, false)
             } else if chunked == Some(true) {
-                match Self::decode_chunked(&b[head..], self.max_body_bytes, self.max_headers) {
-                    Ok(Some((consumed, decoded))) => {
-                        let Some(consumed) = head.checked_add(consumed) else {
-                            self.fail_outbound(net, i);
-                            return
-                        };
-                        (consumed, Some(decoded))
-                    }
+                match Self::decode_chunked(
+                    b,
+                    head,
+                    self.max_body_bytes,
+                    self.max_headers,
+                    &mut self.chunked_body,
+                ) {
+                    Ok(Some(consumed)) => (consumed, true),
                     Ok(None) => return,
                     Err(()) => {
                         self.fail_outbound(net, i);
@@ -1233,7 +1274,7 @@ impl HttpNetwork {
                 if b.len() < consumed {
                     return
                 }
-                (consumed, None)
+                (consumed, false)
             } else {
                 return
             };
@@ -1254,8 +1295,8 @@ impl HttpNetwork {
                 headers: response.headers,
                 body: if no_body {
                     &[]
-                } else if let Some(decoded) = decoded.as_deref() {
-                    decoded
+                } else if chunked_body {
+                    &self.chunked_body
                 } else {
                     &b[head..consumed]
                 },
@@ -1264,7 +1305,7 @@ impl HttpNetwork {
             self.conns[i].buf.drain(..consumed);
             self.conns[i].dirty = !self.conns[i].buf.is_empty();
             self.conns[i].role.set_outbound_head(None);
-            self.conns[i].role.take_in_flight();
+            self.complete_in_flight(i);
             if close {
                 net.disconnect(token);
                 return
@@ -1279,8 +1320,10 @@ impl HttpNetwork {
             return false
         }
         let b = &self.conns[i].buf;
-        let mut headers = vec![httparse::EMPTY_HEADER; self.max_headers];
-        let mut response = httparse::Response::new(&mut headers);
+        let (mut stack_slots, mut heap_slots) =
+            ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+        let headers = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
+        let mut response = httparse::Response::new(headers);
         let Ok(httparse::Status::Complete(head)) = response.parse(b) else { return false };
         if !crlf_only(&b[..head]) || head > self.max_head_bytes {
             return false
@@ -1309,15 +1352,21 @@ impl HttpNetwork {
         });
         true
     }
+    /// Decodes the complete chunked body starting at `start` into `body`,
+    /// returning the offset just past it.
     fn decode_chunked(
         bytes: &[u8],
+        start: usize,
         max_body_bytes: usize,
         max_headers: usize,
-    ) -> Result<Option<(usize, Vec<u8>)>, ()> {
+        body: &mut Vec<u8>,
+    ) -> Result<Option<usize>, ()> {
+        let bytes = &bytes[start..];
         let Some((end, body_len)) = Self::chunked_end(bytes, max_body_bytes, max_headers)? else {
             return Ok(None)
         };
-        let mut body = Vec::with_capacity(body_len);
+        body.clear();
+        body.reserve(body_len);
         let mut at = 0;
         while at < end {
             let httparse::Status::Complete((consumed, size)) =
@@ -1328,7 +1377,7 @@ impl HttpNetwork {
             at = at.checked_add(consumed).ok_or(())?;
             let size = usize::try_from(size).map_err(|_| ())?;
             if size == 0 {
-                return Ok(Some((end, body)))
+                return start.checked_add(end).map(Some).ok_or(())
             }
             body.extend_from_slice(&bytes[at..at + size]);
             at = at.checked_add(size + 2).ok_or(())?;
@@ -1354,9 +1403,11 @@ impl HttpNetwork {
             }
             at = at.checked_add(consumed).ok_or(())?;
             if size == 0 {
-                let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
+                let (mut stack_slots, mut heap_slots) =
+                    ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+                let headers = header_slots(&mut stack_slots, &mut heap_slots, max_headers);
                 let httparse::Status::Complete((consumed, _)) =
-                    httparse::parse_headers(&bytes[at..], &mut headers).map_err(|_| ())?
+                    httparse::parse_headers(&bytes[at..], headers).map_err(|_| ())?
                 else {
                     return Ok(None)
                 };
@@ -1429,16 +1480,38 @@ fn write_head(
     addr: &SocketAddr,
     body_len: usize,
 ) {
-    write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
+    let mut put = |bytes: &[u8]| out.write_all(bytes).unwrap();
+    put(method.as_bytes());
+    put(b" ");
+    put(path.as_bytes());
+    put(b" HTTP/1.1\r\n");
     let mut has_host = false;
     for (n, v) in headers {
         has_host |= n.eq_ignore_ascii_case("host");
-        write!(out, "{n}: {v}\r\n").unwrap();
+        put(n.as_bytes());
+        put(b": ");
+        put(v.as_bytes());
+        put(b"\r\n");
     }
     if !has_host {
         write!(out, "Host: {addr}\r\n").unwrap();
     }
-    write!(out, "Content-Length: {body_len}\r\n\r\n").unwrap();
+    out.write_all(b"Content-Length: ").unwrap();
+    write_decimal(out, body_len);
+    out.write_all(b"\r\n\r\n").unwrap();
+}
+fn write_decimal(out: &mut impl io::Write, mut n: usize) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break
+        }
+    }
+    out.write_all(&digits[at..]).unwrap();
 }
 impl Role {
     fn in_flight_id(&self) -> Option<RequestId> {
@@ -1512,6 +1585,17 @@ enum ContentLength {
     Absent,
     Present(usize),
     Invalid,
+}
+fn header_slots<'s, 'b>(
+    stack: &'s mut [httparse::Header<'b>; STACK_HEADERS],
+    heap: &'s mut Vec<httparse::Header<'b>>,
+    max_headers: usize,
+) -> &'s mut [httparse::Header<'b>] {
+    if max_headers <= STACK_HEADERS {
+        return &mut stack[..max_headers]
+    }
+    heap.resize(max_headers, httparse::EMPTY_HEADER);
+    heap
 }
 fn response_content_length(headers: &[httparse::Header<'_>]) -> ContentLength {
     let mut length = None;
