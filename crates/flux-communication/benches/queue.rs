@@ -259,7 +259,11 @@ fn receive_throughput<const B: usize>(rx: &mut impl Rx<B>, count: usize, credit:
 }
 
 /// Messages per second, in millions, over the measured round.
-fn throughput<const B: usize>(sender: impl Tx<B>, receiver: impl Rx<B>, settings: &Settings) -> f64 {
+fn throughput<const B: usize>(
+    sender: impl Tx<B>,
+    receiver: impl Rx<B>,
+    settings: &Settings,
+) -> f64 {
     let pool = &source_pool::<B>();
     let counts = [WARMUP, settings.messages];
     let (starts, ends) = workers(
