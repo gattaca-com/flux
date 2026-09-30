@@ -845,3 +845,38 @@ fn connections_do_not_share_read_ahead() {
     assert_eq!(from(left_token), expected_left);
     assert_eq!(from(right_token), expected_right);
 }
+
+#[test]
+fn connect_from_binds_source_ip_across_reconnects() {
+    let addr = unused_addr();
+    let local_ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    let mut network = Network::default();
+    let server_group =
+        network.add_group(TcpGroupConfig { name: "server", ..TcpGroupConfig::default() });
+    let client_group = network.add_group(TcpGroupConfig {
+        name: "client",
+        reconnect_interval: flux_timing::Duration::from_millis(10),
+        ..TcpGroupConfig::default()
+    });
+    network.listen(server_group, addr).unwrap();
+    let _client = network.connect_from(client_group, addr, local_ip);
+
+    let mut accepted = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && accepted.len() < 2 {
+        let mut drop_token = None;
+        network.poll_with(|event| {
+            if let NetworkEvent::Accepted { token, peer_addr, .. } = event {
+                accepted.push(peer_addr.ip());
+                drop_token = Some(token);
+            }
+        });
+        if let Some(token) = drop_token &&
+            accepted.len() == 1
+        {
+            network.disconnect(token);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(accepted, [local_ip, local_ip]);
+}

@@ -923,3 +923,40 @@ fn close_removes_listeners_too() {
     let mut again = HttpNetwork::default();
     again.listen(&mut net, addr).unwrap();
 }
+
+#[test]
+fn pool_from_sends_from_local_ip() {
+    let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+    let (mut net, mut server, addr) = server();
+    let mut client = HttpNetwork::default();
+    let pool = client.pool_from(&mut net, addr, local_ip, 1);
+    let id = client.send(pool, "GET", "/", &[], Vec::new(), 0).unwrap();
+    let mut peer = None;
+    let mut body = None;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && body.is_none() {
+        net.poll_with(|e| {
+            if !server.on_event(&e) {
+                client.on_event(&e);
+            }
+        });
+        let mut replies = Vec::new();
+        server.drive(&mut net, |e| match e {
+            HttpEvent::Accepted { peer_addr, .. } => peer = Some(peer_addr.ip()),
+            HttpEvent::Request { token, .. } => replies.push(token),
+            _ => {}
+        });
+        for token in replies {
+            server.respond(&mut net, token, 200, &[], b"ok");
+        }
+        client.drive(&mut net, |e| {
+            if let Some((done, Ok(response))) = e.outcome(pool) {
+                assert_eq!(done, id);
+                body = Some(response.body.to_vec());
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(peer, Some(local_ip));
+    assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+}

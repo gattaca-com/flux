@@ -1,6 +1,6 @@
 use std::{
     io::{self, IoSlice, Read, Write},
-    net::{Shutdown, SocketAddr},
+    net::{IpAddr, Shutdown, SocketAddr},
     os::fd::{AsRawFd, FromRawFd},
     ptr,
 };
@@ -156,6 +156,8 @@ enum ConnectionState {
 struct Connection {
     token: Token,
     peer_addr: SocketAddr,
+    /// Source address every dial of this outbound connection binds first.
+    local_ip: Option<IpAddr>,
     kind: ConnectionKind,
     state: ConnectionState,
     close_when_drained: bool,
@@ -371,6 +373,7 @@ impl TcpManager {
         &mut self,
         registry: &Registry,
         peer_addr: SocketAddr,
+        local_ip: Option<IpAddr>,
         tls: Option<Box<Session>>,
         tokens: &mut Tokens,
     ) -> Token {
@@ -382,6 +385,7 @@ impl TcpManager {
         self.connections.push(Connection {
             token,
             peer_addr,
+            local_ip,
             kind: ConnectionKind::Outbound,
             state: ConnectionState::Disconnected,
             close_when_drained: false,
@@ -404,11 +408,16 @@ impl TcpManager {
 
         let token = connection.token;
         let peer_addr = connection.peer_addr;
+        let local_ip = connection.local_ip;
         let socket_buf_size = self.config.socket_buf_size;
 
-        let Ok(mut socket) = mio::net::TcpStream::connect(peer_addr)
-            .inspect_err(|err| debug!(?err, %peer_addr, "couldn't start tcp connection"))
-        else {
+        let socket = local_ip.map_or_else(
+            || mio::net::TcpStream::connect(peer_addr),
+            |local_ip| connect_from(peer_addr, local_ip),
+        );
+        let Ok(mut socket) = socket.inspect_err(
+            |err| debug!(?err, %peer_addr, ?local_ip, "couldn't start tcp connection"),
+        ) else {
             return;
         };
         if let Some(size) = socket_buf_size {
@@ -676,6 +685,7 @@ impl TcpManager {
             self.connections.push(Connection {
                 token,
                 peer_addr,
+                local_ip: None,
                 kind: ConnectionKind::Accepted,
                 state: ConnectionState::Connected(stream),
                 close_when_drained: false,
@@ -1183,6 +1193,43 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
     }
     // Accepted sockets inherit the receive window negotiated before accept().
     set_socket_buf_size(&listener, size);
+    let (storage, len) = sockaddr(addr);
+    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Match mio's kernel-capped listener backlog on Linux.
+    if unsafe { libc::listen(fd, -1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(TcpListener::from_std(listener))
+}
+
+/// Starts a nonblocking connect to `peer_addr` from `local_ip` and an
+/// ephemeral port.
+fn connect_from(peer_addr: SocketAddr, local_ip: IpAddr) -> io::Result<mio::net::TcpStream> {
+    let domain = if peer_addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let fd = unsafe {
+        libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    let (local, local_len) = sockaddr(SocketAddr::new(local_ip, 0));
+    if unsafe { libc::bind(fd, ptr::from_ref(&local).cast(), local_len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (peer, peer_len) = sockaddr(peer_addr);
+    if unsafe { libc::connect(fd, ptr::from_ref(&peer).cast(), peer_len) } != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(err);
+        }
+    }
+    Ok(mio::net::TcpStream::from_std(stream))
+}
+
+fn sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(addr) => {
@@ -1207,14 +1254,7 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
             size_of::<libc::sockaddr_in6>()
         }
     };
-    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len as libc::socklen_t) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Match mio's kernel-capped listener backlog on Linux.
-    if unsafe { libc::listen(fd, -1) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(TcpListener::from_std(listener))
+    (storage, len as libc::socklen_t)
 }
 
 /// Reads plaintext from `socket`, decrypting through `tls` when present.

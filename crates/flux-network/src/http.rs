@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::{
     collections::VecDeque,
     io::{self, Write as _},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
 };
 
 use flux_timing::{Duration, Instant};
@@ -564,18 +564,36 @@ impl HttpNetwork {
         let token = net.connect(group, addr);
         self.track_outbound(token, addr)
     }
+    fn connect_from(&mut self, net: &mut NetworkCore, addr: SocketAddr, local_ip: IpAddr) -> Token {
+        let group = self.group(net);
+        let token = net.connect_from(group, addr, local_ip);
+        self.track_outbound(token, addr)
+    }
     /// Like [`Self::connect`] but negotiates TLS once the TCP connect
     /// completes, verifying against the Mozilla roots and sending SNI
     /// `server`. Panics if `server` is not a valid DNS name or IP.
     #[cfg(feature = "tls")]
     pub fn connect_tls(&mut self, net: &mut NetworkCore, addr: SocketAddr, server: &str) -> Token {
+        self.connect_tls_with(net, addr, None, server)
+    }
+    #[cfg(feature = "tls")]
+    fn connect_tls_with(
+        &mut self,
+        net: &mut NetworkCore,
+        addr: SocketAddr,
+        local_ip: Option<IpAddr>,
+        server: &str,
+    ) -> Token {
         let session = crate::tls::Session::new(server);
         let session = match &self.tls_config {
             Some(config) => session.with_config(config.clone()),
             None => session,
         };
         let group = self.group(net);
-        let token = net.connect_tls(group, addr, session);
+        let token = match local_ip {
+            Some(local_ip) => net.connect_tls_from(group, addr, local_ip, session),
+            None => net.connect_tls(group, addr, session),
+        };
         self.track_outbound(token, addr)
     }
     fn track_outbound(&mut self, token: Token, addr: SocketAddr) -> Token {
@@ -611,6 +629,31 @@ impl HttpNetwork {
         connections: usize,
     ) -> HttpPool {
         self.pool_with(net, addr, connections, |http, net| http.connect_tls(net, addr, server))
+    }
+    /// Like [`Self::pool`] but every connection binds `local_ip` as its
+    /// source address, across reconnects too.
+    pub fn pool_from(
+        &mut self,
+        net: &mut NetworkCore,
+        addr: SocketAddr,
+        local_ip: IpAddr,
+        connections: usize,
+    ) -> HttpPool {
+        self.pool_with(net, addr, connections, |http, net| http.connect_from(net, addr, local_ip))
+    }
+    /// [`Self::pool_tls`] from `local_ip`; see [`Self::pool_from`].
+    #[cfg(feature = "tls")]
+    pub fn pool_tls_from(
+        &mut self,
+        net: &mut NetworkCore,
+        addr: SocketAddr,
+        server: &str,
+        local_ip: IpAddr,
+        connections: usize,
+    ) -> HttpPool {
+        self.pool_with(net, addr, connections, |http, net| {
+            http.connect_tls_with(net, addr, Some(local_ip), server)
+        })
     }
     fn pool_with(
         &mut self,

@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     ops::{Deref, DerefMut, Range},
     os::fd::AsRawFd,
     ptr,
@@ -641,14 +641,46 @@ impl NetworkCore {
     pub fn connect(&mut self, group: Group, addr: SocketAddr) -> Token {
         match &mut self.groups[group.0] {
             GroupState::Tcp(tcp) => {
-                tcp.connect(self.poller.registry(), addr, None, &mut self.tokens)
+                tcp.connect(self.poller.registry(), addr, None, None, &mut self.tokens)
             }
             GroupState::Udp(udp) => udp.connect(self.poller.registry(), addr, &mut self.tokens),
         }
     }
+    /// Like [`Self::connect`], but every dial binds `local_ip` as the source
+    /// address. TCP-only; panics when used with a UDP group or when `local_ip`
+    /// and `addr` are of different families.
+    #[must_use]
+    pub fn connect_from(&mut self, group: Group, addr: SocketAddr, local_ip: IpAddr) -> Token {
+        assert_eq!(addr.is_ipv4(), local_ip.is_ipv4(), "local and peer address families differ");
+        let GroupState::Tcp(tcp) = &mut self.groups[group.0] else {
+            panic!("operation requires a TCP group");
+        };
+        tcp.connect(self.poller.registry(), addr, Some(local_ip), None, &mut self.tokens)
+    }
     /// Client TLS is TCP-only. Panics when used with a UDP or replay group.
     #[must_use]
     pub fn connect_tls(&mut self, group: Group, addr: SocketAddr, tls: Session) -> Token {
+        self.connect_tls_with(group, addr, None, tls)
+    }
+    /// [`Self::connect_tls`] from `local_ip`; see [`Self::connect_from`].
+    #[must_use]
+    pub fn connect_tls_from(
+        &mut self,
+        group: Group,
+        addr: SocketAddr,
+        local_ip: IpAddr,
+        tls: Session,
+    ) -> Token {
+        assert_eq!(addr.is_ipv4(), local_ip.is_ipv4(), "local and peer address families differ");
+        self.connect_tls_with(group, addr, Some(local_ip), tls)
+    }
+    fn connect_tls_with(
+        &mut self,
+        group: Group,
+        addr: SocketAddr,
+        local_ip: Option<IpAddr>,
+        tls: Session,
+    ) -> Token {
         let GroupState::Tcp(tcp) = &mut self.groups[group.0] else {
             panic!("operation requires a TCP group");
         };
@@ -657,7 +689,7 @@ impl NetworkCore {
             "TLS does not support wire backlog replay"
         );
         assert!(tcp.config.max_backlog_frames.is_none(), "TLS requires byte backlog limits");
-        tcp.connect(self.poller.registry(), addr, Some(Box::new(tls)), &mut self.tokens)
+        tcp.connect(self.poller.registry(), addr, local_ip, Some(Box::new(tls)), &mut self.tokens)
     }
 
     /// Returns whether the message was accepted for sending or replay. Unknown,
