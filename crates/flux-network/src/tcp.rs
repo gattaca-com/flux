@@ -1183,6 +1183,18 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
     }
     // Accepted sockets inherit the receive window negotiated before accept().
     set_socket_buf_size(&listener, size);
+    let (storage, len) = sockaddr(addr);
+    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Match mio's kernel-capped listener backlog on Linux.
+    if unsafe { libc::listen(fd, -1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(TcpListener::from_std(listener))
+}
+
+fn sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(addr) => {
@@ -1207,14 +1219,7 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
             size_of::<libc::sockaddr_in6>()
         }
     };
-    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len as libc::socklen_t) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Match mio's kernel-capped listener backlog on Linux.
-    if unsafe { libc::listen(fd, -1) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(TcpListener::from_std(listener))
+    (storage, len as libc::socklen_t)
 }
 
 /// Reads plaintext from `socket`, decrypting through `tls` when present.
