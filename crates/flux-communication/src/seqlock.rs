@@ -118,7 +118,7 @@ impl<T: Copy> Seqlock<T> {
     #[inline]
     pub fn write_single_producer(&self, data: &T) {
         let v = self.version.load(Ordering::Relaxed);
-        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        self.version.store(v.wrapping_add(1), Ordering::Release);
         compiler_fence(Ordering::AcqRel);
         unsafe { *self.data.get() = *data };
         compiler_fence(Ordering::AcqRel);
