@@ -96,7 +96,7 @@ impl<T: Copy> Seqlock<T> {
         }
     }
 
-    #[inline(never)]
+    #[inline]
     pub fn write(&self, data: &T) {
         // Increment the sequence number. At this point, the number will be odd,
         // which will force readers to spin until we finish writing.
