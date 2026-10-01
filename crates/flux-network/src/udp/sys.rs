@@ -109,17 +109,41 @@ fn iovec_mut(bytes: &mut [u8]) -> libc::iovec {
     libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() }
 }
 
+/// Entries the kernel accepted, or -1 with `errno` when it refused the first.
+#[cfg(target_os = "linux")]
+#[inline]
+fn sendmmsg(fd: RawFd, hdrs: &mut [MMsgHdr]) -> libc::c_int {
+    unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, libc::MSG_DONTWAIT) }
+}
+
+/// Shortest run of equal-size datagrams to one peer sent as one `UDP_SEGMENT`
+/// packet; shorter runs go out as plain datagrams.
+#[cfg(target_os = "linux")]
+const GSO_MIN_SEGMENTS: usize = 4;
+
 #[cfg(target_os = "linux")]
 const SEGMENT_CONTROL_SPACE: usize =
     unsafe { libc::CMSG_SPACE(mem::size_of::<u16>() as _) as usize };
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SegmentControl {
     header: libc::cmsghdr,
     size: u16,
     padding: [u8; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
 }
+
+#[cfg(target_os = "linux")]
+const SEGMENT_CONTROL: SegmentControl = SegmentControl {
+    header: libc::cmsghdr {
+        cmsg_len: unsafe { libc::CMSG_LEN(mem::size_of::<u16>() as _) as usize },
+        cmsg_level: libc::SOL_UDP,
+        cmsg_type: libc::UDP_SEGMENT,
+    },
+    size: 0,
+    padding: [0; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
+};
 
 /// Up to [`BATCH`] outgoing datagrams, each a header plus a payload slice.
 ///
@@ -133,6 +157,12 @@ pub(crate) struct SendBatch {
     /// Kernel accepts `UDP_SEGMENT`; see [`Self::enable_gso`].
     #[cfg(target_os = "linux")]
     gso: bool,
+    /// One `UDP_SEGMENT` cmsg per segmented `hdrs` entry.
+    #[cfg(target_os = "linux")]
+    controls: [SegmentControl; BATCH],
+    /// Datagrams carried by each `hdrs` entry of the last send.
+    #[cfg(target_os = "linux")]
+    run_lens: [u8; BATCH],
 }
 
 // SAFETY: the raw pointers inside are written right before each syscall and
@@ -148,6 +178,10 @@ impl SendBatch {
             len: 0,
             #[cfg(target_os = "linux")]
             gso: false,
+            #[cfg(target_os = "linux")]
+            controls: [SEGMENT_CONTROL; BATCH],
+            #[cfg(target_os = "linux")]
+            run_lens: [0; BATCH],
         }
     }
 
@@ -180,63 +214,120 @@ impl SendBatch {
         self.len += 1;
     }
 
+    /// Points `hdrs[entry]` at datagram `i` alone.
+    #[inline]
+    fn stage_plain(&mut self, entry: usize, i: usize) {
+        let hdr = &mut self.hdrs[entry].msg_hdr;
+        hdr.msg_iov = self.iovs[i].as_mut_ptr();
+        hdr.msg_iovlen = 2;
+        hdr.msg_name = ptr::from_mut(&mut self.addrs[i].storage).cast();
+        hdr.msg_namelen = self.addrs[i].len;
+        hdr.msg_control = ptr::null_mut();
+        hdr.msg_controllen = 0;
+    }
+
+    /// Points `hdrs[entry]` at datagrams `i..i + run` as one `UDP_SEGMENT`
+    /// packet the kernel splits every `size` bytes.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn stage_segmented(&mut self, entry: usize, i: usize, run: usize, size: usize) {
+        self.controls[entry].size = size as u16;
+        let hdr = &mut self.hdrs[entry].msg_hdr;
+        hdr.msg_iov = self.iovs[i..].as_mut_ptr().cast();
+        hdr.msg_iovlen = 2 * run;
+        hdr.msg_name = ptr::from_mut(&mut self.addrs[i].storage).cast();
+        hdr.msg_namelen = self.addrs[i].len;
+        hdr.msg_control = ptr::from_mut(&mut self.controls[entry]).cast();
+        hdr.msg_controllen = SEGMENT_CONTROL_SPACE;
+    }
+
+    /// Stages `n` datagrams as `sendmmsg` entries. Each run of at least
+    /// [`GSO_MIN_SEGMENTS`] equal-size datagrams to one peer (the last may be
+    /// shorter) becomes one segmented entry; every other datagram gets its
+    /// own. Returns the entry count; `run_lens` records datagrams per entry.
+    #[cfg(target_os = "linux")]
+    fn stage_runs(&mut self, n: usize) -> usize {
+        let size_of = |iov: &[libc::iovec; 2]| iov[0].iov_len + iov[1].iov_len;
+        let mut entries = 0;
+        let mut i = 0;
+        while i < n {
+            let size = size_of(&self.iovs[i]);
+            // One packet holds at most this many segments of `size` bytes.
+            let room = if size == 0 { 1 } else { super::wire::MAX_DATAGRAM_SIZE / size };
+            let end = n.min(i + room);
+            let mut j = i + 1;
+            while j < end && self.addrs[j] == self.addrs[i] {
+                let next = size_of(&self.iovs[j]);
+                if next == 0 || next > size {
+                    break;
+                }
+                j += 1;
+                if next < size {
+                    break;
+                }
+            }
+            let run = j - i;
+            if run >= GSO_MIN_SEGMENTS {
+                self.stage_segmented(entries, i, run, size);
+                self.run_lens[entries] = run as u8;
+                entries += 1;
+            } else {
+                for k in i..j {
+                    self.stage_plain(entries, k);
+                    self.run_lens[entries] = 1;
+                    entries += 1;
+                }
+            }
+            i = j;
+        }
+        entries
+    }
+
     /// Sends what was pushed and empties the batch. Returns how many datagrams
     /// the kernel accepted; `WouldBlock` only when it accepted none.
     pub(crate) fn send(&mut self, fd: RawFd) -> io::Result<usize> {
         let n = mem::take(&mut self.len);
         #[cfg(target_os = "linux")]
-        if self.gso && n >= 4 {
-            let size = self.iovs[0][0].iov_len + self.iovs[0][1].iov_len;
-            let can_segment = size != 0 &&
-                size * n <= super::wire::MAX_DATAGRAM_SIZE &&
-                (1..n).all(|i| {
-                    let len = self.iovs[i][0].iov_len + self.iovs[i][1].iov_len;
-                    (len == size || (i == n - 1 && len != 0 && len < size)) &&
-                        self.addrs[i] == self.addrs[0]
-                });
-            if can_segment {
-                let mut control = SegmentControl {
-                    header: libc::cmsghdr {
-                        cmsg_len: unsafe { libc::CMSG_LEN(mem::size_of::<u16>() as _) as usize },
-                        cmsg_level: libc::SOL_UDP,
-                        cmsg_type: libc::UDP_SEGMENT,
-                    },
-                    size: size as u16,
-                    padding: [0; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
-                };
-                let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
-                hdr.msg_iov = self.iovs.as_mut_ptr().cast();
-                hdr.msg_iovlen = 2 * n;
-                hdr.msg_name = ptr::from_mut(&mut self.addrs[0].storage).cast();
-                hdr.msg_namelen = self.addrs[0].len;
-                hdr.msg_control = ptr::from_mut(&mut control).cast();
-                hdr.msg_controllen = SEGMENT_CONTROL_SPACE;
-                let sent = unsafe { libc::sendmsg(fd, ptr::from_ref(&hdr), libc::MSG_DONTWAIT) };
-                if sent >= 0 {
-                    // UDP sends are atomic; report wire datagrams, not GSO packets.
-                    return Ok(n);
-                }
-                // Route MTU, SG support, checksum offload and memory pressure
-                // all fail the whole GSO send; sendmmsg keeps per-datagram
-                // accounting and reports the same errno if it persists.
-            }
-        }
-        for i in 0..n {
-            let hdr = &mut self.hdrs[i].msg_hdr;
-            hdr.msg_iov = self.iovs[i].as_mut_ptr();
-            hdr.msg_name = ptr::from_mut(&mut self.addrs[i].storage).cast();
-            hdr.msg_namelen = self.addrs[i].len;
-        }
-        #[cfg(target_os = "linux")]
         {
-            let sent = unsafe {
-                libc::sendmmsg(fd, self.hdrs.as_mut_ptr(), n as libc::c_uint, libc::MSG_DONTWAIT)
+            let entries = if self.gso && n >= GSO_MIN_SEGMENTS {
+                self.stage_runs(n)
+            } else {
+                for i in 0..n {
+                    self.stage_plain(i, i);
+                }
+                self.run_lens[..n].fill(1);
+                n
             };
-            if sent < 0 { Err(io::Error::last_os_error()) } else { Ok(sent as usize) }
+            let sent = sendmmsg(fd, &mut self.hdrs[..entries]);
+            // The kernel stops at the first entry it refuses. UDP sends are
+            // atomic, so every accepted entry delivered all its datagrams.
+            let refused = usize::try_from(sent).unwrap_or(0);
+            let start: usize = self.run_lens[..refused].iter().map(|&k| usize::from(k)).sum();
+            if sent < 0 {
+                let err = io::Error::last_os_error();
+                // A full socket buffer refuses plain datagrams just the same.
+                if self.run_lens[0] == 1 || err.kind() == io::ErrorKind::WouldBlock {
+                    return Err(err);
+                }
+            } else if refused == entries || self.run_lens[refused] == 1 {
+                return Ok(start);
+            }
+            // Route MTU, SG support, checksum offload and memory pressure all
+            // refuse a segmented entry; retry the rest as plain datagrams,
+            // which reports the same errno if it persists.
+            for i in start..n {
+                self.stage_plain(i, i);
+            }
+            match sendmmsg(fd, &mut self.hdrs[start..n]) {
+                sent @ 0.. => Ok(start + sent as usize),
+                _ if start != 0 => Ok(start),
+                _ => Err(io::Error::last_os_error()),
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
             for i in 0..n {
+                self.stage_plain(i, i);
                 let r = unsafe { libc::sendmsg(fd, &self.hdrs[i].msg_hdr, libc::MSG_DONTWAIT) };
                 if r < 0 {
                     let err = io::Error::last_os_error();
