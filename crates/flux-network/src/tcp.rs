@@ -359,7 +359,7 @@ impl TcpManager {
         tokens: &mut Tokens,
     ) -> io::Result<Token> {
         let group = self.group;
-        let mut socket = bind_listener(addr, self.config.socket_buf_size)?;
+        let mut socket = bind_listener(addr, self.config.socket_buf_size, self.config.reuse_port)?;
         let token = tokens.allocate(group);
         if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
             tokens.retire(token);
@@ -1168,8 +1168,14 @@ impl TcpManager {
     }
 }
 
-fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result<TcpListener> {
-    let Some(size) = socket_buf_size else { return TcpListener::bind(addr) };
+fn bind_listener(
+    addr: SocketAddr,
+    socket_buf_size: Option<usize>,
+    reuse_port: bool,
+) -> io::Result<TcpListener> {
+    if socket_buf_size.is_none() && !reuse_port {
+        return TcpListener::bind(addr);
+    }
     let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     let fd = unsafe {
         libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
@@ -1178,21 +1184,27 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
         return Err(io::Error::last_os_error());
     }
     let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-    let reuse: libc::c_int = 1;
-    if unsafe {
-        libc::setsockopt(
-            listener.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            ptr::from_ref(&reuse).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
+    let enable: libc::c_int = 1;
+    let options: &[libc::c_int] =
+        if reuse_port { &[libc::SO_REUSEADDR, libc::SO_REUSEPORT] } else { &[libc::SO_REUSEADDR] };
+    for &option in options {
+        if unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                ptr::from_ref(&enable).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
     // Accepted sockets inherit the receive window negotiated before accept().
-    set_socket_buf_size(&listener, size);
+    if let Some(size) = socket_buf_size {
+        set_socket_buf_size(&listener, size);
+    }
     let (storage, len) = sockaddr(addr);
     if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
         return Err(io::Error::last_os_error());
