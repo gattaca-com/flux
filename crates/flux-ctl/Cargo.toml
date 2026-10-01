@@ -18,20 +18,24 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 crossterm.workspace = true
+# `termination`: SIGTERM and SIGHUP stop `record` as ^C does, so its files get
+# their footers.
+ctrlc = { workspace = true, features = ["termination"] }
 flux.workspace = true
 flux-communication.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
+hdrhistogram.workspace = true
+parquet.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shared_memory.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-ctrlc.workspace = true
 tempfile.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

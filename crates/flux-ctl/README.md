@@ -82,6 +82,48 @@ flux-ctl clean myapp       # scope to one app
 
 Finds segments whose backing shared memory can no longer be opened and (with `--force`) removes their flink files.
 
+#### `record`
+
+```bash
+flux-ctl record myapp                          # 60 s into ./myapp-<UTC time>/
+flux-ctl record myapp --out run --duration 0   # until ^C, SIGTERM or SIGHUP
+flux-ctl record myapp --match Tile-Msg         # only queues whose name contains this
+flux-ctl record myapp --cores 3               # keep the recorder off the app's cores
+```
+
+Reads every sample of an app's `timing-*`, `latency-*` and `tilemetrics-*` queues into Parquet, then prints a per-queue table. It attaches to the queues that exist when it starts; a queue created later is not read. The output directory holds one recording, and `record` refuses a directory that already holds one.
+
+| Option | Description |
+|---|---|
+| `--out <DIR>` | Output directory (default: `<app>-<UTC time>`) |
+| `--duration <S>` | Seconds to record; 0 records until a signal (default: 60) |
+| `--rotate-secs <S>` | Seconds per file; 0 writes one file per table (default: 300) |
+| `--max-mb <MB>` | Stop once the files reach this many MB, 10^6 bytes; the last poll can pass it by a row group (default: 0, no limit) |
+| `--match <TEXT>` | Only queues whose file name contains this |
+| `--cores <N,...>` | Pin the recorder to these cores; an error if it cannot |
+| `--nice <N>` | Niceness, -20 to 19; an error if it cannot be set (default: 10, which only warns if it cannot be set) |
+
+It writes:
+
+| File | Contents |
+|---|---|
+| `timers-<n>.parquet` | One row per timer sample: `wall_ns` (the handler's start on the wall clock), `timer`, `kind` (`timing` or `latency`), `dur_ns` |
+| `tiles-<n>.parquet` | One row per tile-metric window: `window_end_ns`, `tile`, `window_ns`, `busy_ns`, `busy_max_ns`, `busy_count`, `loop_count` |
+| `record.json` | Per queue: `samples`, `lost` (overwritten before they were read) and `invalid`; and the `late` queues (created after attach) and `skipped` ones (matched but did not open) |
+
+A Parquet file is readable only once it is closed, so a recording killed without the chance to close (SIGKILL, a crash) loses only the file it had open, and writes no `record.json`. `read_parquet('timers-*.parquet')` reads the rotated files as one table.
+
+#### `summarize`
+
+```bash
+flux-ctl summarize run                                     # the whole recording
+flux-ctl summarize run --from 1790000000000000000 --to 1790000060000000000
+```
+
+Prints per-queue statistics of a `record` directory as JSON: for a timer, its sample count and `dur` percentiles (p50, p90, p99, p99.9, max, to 3 significant figures); for a tile, its window count, `busy_ns`, `window_ns`, utilisation and `busy_max` percentiles. `lost` and `invalid` come from `record.json` and cover the whole recording.
+
+`--from` and `--to` bound the window in nanoseconds since the Unix epoch (`date +%s%N`), `--to` exclusive; a timer sample falls in it by its start, a tile window by its end. A file left without a footer is skipped and named in `unfinished`, and `late` and `skipped` repeat what `record.json` holds.
+
 ## TUI Keybindings
 
 ### List View

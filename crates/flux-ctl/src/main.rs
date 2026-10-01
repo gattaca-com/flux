@@ -1,7 +1,18 @@
-use std::{fs::File, io::IsTerminal, path::PathBuf, sync::Mutex};
+use std::{
+    fs::File,
+    io::IsTerminal,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use clap::{Parser, Subcommand};
-use flux_ctl::{discovery, tui};
+use flux_ctl::{discovery, record, tui};
+use flux_timing::Nanos;
+use flux_utils::{ThreadNiceness, thread_boot, try_thread_boot};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -52,6 +63,47 @@ enum Commands {
         /// App name filter
         app: Option<String>,
     },
+    /// Record an app's timer and tile-metric samples to Parquet
+    Record {
+        /// App name
+        app: String,
+        /// Directory for `timers-<n>.parquet` and `tiles-<n>.parquet`
+        /// (default: `<app>-<UTC time>` in the current directory)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Seconds; 0 records until ^C, SIGTERM or SIGHUP, which also end a
+        /// timed recording early
+        #[arg(long, default_value_t = 60)]
+        duration: u64,
+        /// Seconds per file; 0 writes one file per table
+        #[arg(long, default_value_t = 300)]
+        rotate_secs: u64,
+        /// Stop once the Parquet files reach this many MB (10^6 bytes); 0 has
+        /// no limit
+        #[arg(long, default_value_t = 0)]
+        max_mb: u64,
+        /// Only queues whose name contains this
+        #[arg(long = "match")]
+        filter: Option<String>,
+        /// Pin the recorder to these cores, e.g. `3` or `3,4`, off the app's
+        #[arg(long, value_delimiter = ',')]
+        cores: Vec<usize>,
+        /// Niceness, -20 to 19, an error if it cannot be set (default: 10,
+        /// which yields to the app on a shared core, and only warns)
+        #[arg(long, allow_negative_numbers = true, value_parser = clap::value_parser!(i32).range(-20..=19))]
+        nice: Option<i32>,
+    },
+    /// Per-queue statistics of a `record` directory, as JSON
+    Summarize {
+        /// A `record --out` directory
+        dir: PathBuf,
+        /// Window start, in nanoseconds since the Unix epoch (`date +%s%N`)
+        #[arg(long)]
+        from: Option<u64>,
+        /// Window end, exclusive
+        #[arg(long)]
+        to: Option<u64>,
+    },
     /// Show summary statistics for all registered segments
     Stats {
         /// Filter by app name
@@ -87,6 +139,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch { app } => tui::run(&base_dir, app.as_deref()),
         Commands::Clean { force, app } => discovery::clean(&base_dir, app.as_deref(), force),
         Commands::Stats { app, verbose } => discovery::stats(&base_dir, app.as_deref(), verbose),
+        Commands::Summarize { dir, from, to } => {
+            let report = record::summarize(&dir, from, to)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Commands::Record { app, out, duration, rotate_secs, max_mb, filter, cores, nice } => {
+            // A recorder left on the app's cores would disturb what it measures.
+            try_thread_boot(&cores, nice.map(ThreadNiceness::Custom))
+                .map_err(|e| format!("placing the recorder (--cores, --nice): {e}"))?;
+            if nice.is_none() {
+                // Only a yield, so a recorder already nicer, or off Linux, goes on.
+                thread_boot(&[], Some(ThreadNiceness::Custom(10)));
+            }
+            // Before attach, so a signal from then on still lets `run` finish
+            // the files; after `try_thread_boot`, so its thread is placed too.
+            let stop = Arc::new(AtomicBool::new(false));
+            let on_signal = Arc::clone(&stop);
+            ctrlc::set_handler(move || on_signal.store(true, Ordering::Relaxed))?;
+            let secs = |s| (s > 0).then(|| Duration::from_secs(s));
+            let out = out.unwrap_or_else(|| {
+                PathBuf::from(format!("{app}-{}", Nanos::now().with_fmt_utc("%Y%m%dT%H%M%SZ")))
+            });
+            let recorder = record::Recorder::attach(
+                &base_dir,
+                &app,
+                &out,
+                secs(rotate_secs),
+                filter.as_deref(),
+            )?;
+            let until = record::Until {
+                duration: secs(duration),
+                bytes: (max_mb > 0).then(|| max_mb * 1_000_000),
+            };
+            print!("{}", recorder.run(until, &stop)?);
+            Ok(())
+        }
     }
 }
 
