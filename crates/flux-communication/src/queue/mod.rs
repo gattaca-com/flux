@@ -337,19 +337,6 @@ impl<T: Copy> InnerQueue<T> {
     }
 
     #[inline]
-    fn next_count(&self) -> usize {
-        match self.header.queue_type {
-            QueueType::Unknown => panic!("Unknown queue"),
-            QueueType::MPMC => self.header.count.fetch_add(1, Ordering::AcqRel),
-            QueueType::SPMC => {
-                let c = self.header.count.load(Ordering::Relaxed);
-                self.header.count.store(c.wrapping_add(1), Ordering::Relaxed);
-                c
-            }
-        }
-    }
-
-    #[inline]
     pub(crate) fn load(&self, pos: usize) -> &Seqlock<T> {
         unsafe { self.buffer.get_unchecked(pos) }
     }
@@ -371,10 +358,23 @@ impl<T: Copy> InnerQueue<T> {
 
     #[inline]
     fn produce(&self, item: &T) -> usize {
-        let next_count = self.next_count();
-        let lock = self.load(next_count & self.header.mask);
-        lock.write(item);
-        next_count
+        let mask = self.header.mask;
+        match self.header.queue_type {
+            QueueType::Unknown => panic!("Unknown queue"),
+            QueueType::MPMC => {
+                let next_count = self.header.count.fetch_add(1, Ordering::AcqRel);
+                self.load(next_count & mask).write(item);
+                next_count
+            }
+            QueueType::SPMC => {
+                // The single producer owns both the position and the slot, so
+                // neither needs a locked read-modify-write.
+                let next_count = self.header.count.load(Ordering::Relaxed);
+                self.header.count.store(next_count.wrapping_add(1), Ordering::Relaxed);
+                self.load(next_count & mask).write_single_producer(item);
+                next_count
+            }
+        }
     }
 
     #[inline]

@@ -1,6 +1,6 @@
 use std::{
     io::{self, IoSlice, Read, Write},
-    net::{Shutdown, SocketAddr},
+    net::{IpAddr, Shutdown, SocketAddr},
     os::fd::{AsRawFd, FromRawFd},
     ptr,
 };
@@ -156,6 +156,8 @@ enum ConnectionState {
 struct Connection {
     token: Token,
     peer_addr: SocketAddr,
+    /// Source address every dial of this outbound connection binds first.
+    local_ip: Option<IpAddr>,
     kind: ConnectionKind,
     state: ConnectionState,
     close_when_drained: bool,
@@ -213,7 +215,6 @@ struct PendingDisconnect {
 pub(crate) struct TcpManager {
     pub(crate) config: TcpGroupConfig,
     group: Group,
-    registry: Registry,
     reconnector: Repeater,
     listeners: Vec<Listener>,
     connections: Vec<Connection>,
@@ -223,7 +224,7 @@ pub(crate) struct TcpManager {
 }
 
 impl TcpManager {
-    pub(crate) fn new(config: TcpGroupConfig, registry: Registry, group: Group) -> Self {
+    pub(crate) fn new(config: TcpGroupConfig, group: Group) -> Self {
         assert!(
             !config.aligned_payloads || config.framing == Framing::LengthPrefixed,
             "aligned receive requires framed TCP"
@@ -260,7 +261,6 @@ impl TcpManager {
         Self {
             config,
             group,
-            registry,
             reconnector,
             listeners: Vec::with_capacity(INITIAL_LISTENER_CAPACITY),
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
@@ -270,19 +270,36 @@ impl TcpManager {
         }
     }
 
+    /// Deregisters every socket before the group is dropped. On Linux, a
+    /// duplicated descriptor can keep an epoll registration alive after the
+    /// original descriptor closes.
+    pub(crate) fn close_all(&mut self, registry: &Registry) {
+        for index in 0..self.connections.len() {
+            self.close_connection_socket(registry, index);
+        }
+        for listener in &mut self.listeners {
+            let _ = registry.deregister(&mut listener.socket);
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.connections.is_empty() && self.listeners.is_empty()
     }
 
-    pub(crate) fn pre_poll<F>(&mut self, tokens: &mut Tokens, handler: &mut F) -> bool
+    pub(crate) fn pre_poll<F>(
+        &mut self,
+        registry: &Registry,
+        tokens: &mut Tokens,
+        handler: &mut F,
+    ) -> bool
     where
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let work = self.drain_pending_disconnects(handler);
         if !self.connections.is_empty() {
-            self.maybe_reconnect(tokens);
+            self.maybe_reconnect(registry, tokens);
             if let Some((max, timeout)) = self.config.max_backlog_frames {
-                self.check_backlogs(max, timeout, tokens);
+                self.check_backlogs(registry, max, timeout, tokens);
             }
         }
         work
@@ -305,16 +322,16 @@ impl TcpManager {
             .map(|c| c.token)
     }
 
-    pub(crate) fn force_reconnect(&mut self) {
+    pub(crate) fn force_reconnect(&mut self, registry: &Registry) {
         for index in 0..self.connections.len() {
-            self.start_connect(index);
+            self.start_connect(registry, index);
         }
     }
 
-    pub(crate) fn disconnect_outbound(&mut self, tokens: &mut Tokens) {
+    pub(crate) fn disconnect_outbound(&mut self, registry: &Registry, tokens: &mut Tokens) {
         for index in (0..self.connections.len()).rev() {
             if self.connections[index].kind == ConnectionKind::Outbound {
-                self.disconnect_index(index, true, tokens);
+                self.disconnect_index(registry, index, true, tokens);
             }
         }
     }
@@ -335,11 +352,16 @@ impl TcpManager {
         self.connections.iter().any(|c| c.token == token && c.broadcast_paused)
     }
 
-    pub(crate) fn listen(&mut self, addr: SocketAddr, tokens: &mut Tokens) -> io::Result<Token> {
+    pub(crate) fn listen(
+        &mut self,
+        registry: &Registry,
+        addr: SocketAddr,
+        tokens: &mut Tokens,
+    ) -> io::Result<Token> {
         let group = self.group;
         let mut socket = bind_listener(addr, self.config.socket_buf_size)?;
         let token = tokens.allocate(group);
-        if let Err(err) = self.registry.register(&mut socket, token, Interest::READABLE) {
+        if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
             tokens.retire(token);
             return Err(err);
         }
@@ -349,7 +371,9 @@ impl TcpManager {
 
     pub(crate) fn connect(
         &mut self,
+        registry: &Registry,
         peer_addr: SocketAddr,
+        local_ip: Option<IpAddr>,
         tls: Option<Box<Session>>,
         tokens: &mut Tokens,
     ) -> Token {
@@ -361,6 +385,7 @@ impl TcpManager {
         self.connections.push(Connection {
             token,
             peer_addr,
+            local_ip,
             kind: ConnectionKind::Outbound,
             state: ConnectionState::Disconnected,
             close_when_drained: false,
@@ -369,11 +394,11 @@ impl TcpManager {
             timers,
             tls,
         });
-        self.start_connect(self.connections.len() - 1);
+        self.start_connect(registry, self.connections.len() - 1);
         token
     }
 
-    fn start_connect(&mut self, index: usize) {
+    fn start_connect(&mut self, registry: &Registry, index: usize) {
         let connection = &self.connections[index];
         if connection.kind != ConnectionKind::Outbound ||
             !matches!(connection.state, ConnectionState::Disconnected)
@@ -383,17 +408,22 @@ impl TcpManager {
 
         let token = connection.token;
         let peer_addr = connection.peer_addr;
+        let local_ip = connection.local_ip;
         let socket_buf_size = self.config.socket_buf_size;
 
-        let Ok(mut socket) = mio::net::TcpStream::connect(peer_addr)
-            .inspect_err(|err| debug!(?err, %peer_addr, "couldn't start tcp connection"))
-        else {
+        let socket = local_ip.map_or_else(
+            || mio::net::TcpStream::connect(peer_addr),
+            |local_ip| connect_from(peer_addr, local_ip),
+        );
+        let Ok(mut socket) = socket.inspect_err(
+            |err| debug!(?err, %peer_addr, ?local_ip, "couldn't start tcp connection"),
+        ) else {
             return;
         };
         if let Some(size) = socket_buf_size {
             set_socket_buf_size(&socket, size);
         }
-        if let Err(err) = self.registry.register(&mut socket, token, Interest::WRITABLE) {
+        if let Err(err) = registry.register(&mut socket, token, Interest::WRITABLE) {
             warn!(?err, %peer_addr, "couldn't register connecting tcp stream");
             let _ = socket.shutdown(Shutdown::Both);
             return;
@@ -404,25 +434,25 @@ impl TcpManager {
     /// Drops TLS connections whose handshake never finished. They are
     /// redialled by the usual reconnect sweep; no lifecycle event is emitted
     /// because none was ever announced.
-    fn drop_stalled_handshake(&mut self, index: usize, tokens: &mut Tokens) {
+    fn drop_stalled_handshake(&mut self, registry: &Registry, index: usize, tokens: &mut Tokens) {
         let timeout = self.config.handshake_timeout;
         if !self.connections[index].tls.as_ref().is_some_and(|tls| tls.handshake_stalled(timeout)) {
             return;
         }
         let peer_addr = self.connections[index].peer_addr;
         warn!(%peer_addr, ?timeout, "tls handshake timed out");
-        self.disconnect_index(index, false, tokens);
+        self.disconnect_index(registry, index, false, tokens);
     }
 
-    fn maybe_reconnect(&mut self, tokens: &mut Tokens) {
+    fn maybe_reconnect(&mut self, registry: &Registry, tokens: &mut Tokens) {
         if !self.reconnector.fired_at(Instant::now()) {
             return;
         }
         // Handshake timeouts are swept on the reconnect tick.
         for index in 0..self.connections.len() {
-            self.drop_stalled_handshake(index, tokens);
+            self.drop_stalled_handshake(registry, index, tokens);
         }
-        self.force_reconnect();
+        self.force_reconnect(registry);
     }
 
     fn connect_complete(socket: &mio::net::TcpStream) -> io::Result<bool> {
@@ -444,7 +474,13 @@ impl TcpManager {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn finish_connect<F>(&mut self, index: usize, dcache: Option<&DCache>, handler: &mut F) -> bool
+    fn finish_connect<F>(
+        &mut self,
+        registry: &Registry,
+        index: usize,
+        dcache: Option<&DCache>,
+        handler: &mut F,
+    ) -> bool
     where
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
@@ -456,7 +492,7 @@ impl TcpManager {
             Err(err) => {
                 let peer_addr = self.connections[index].peer_addr;
                 debug!(?err, %peer_addr, "tcp connection attempt failed");
-                self.close_connection_socket(index);
+                self.close_connection_socket(registry, index);
                 return false;
             }
             Ok(true) => {}
@@ -484,7 +520,7 @@ impl TcpManager {
             let Err(err) = socket.set_nodelay(true)
         {
             warn!(?err, %peer_addr, "couldn't set nodelay on tcp stream");
-            let _ = self.registry.deregister(&mut socket);
+            let _ = registry.deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
@@ -492,12 +528,12 @@ impl TcpManager {
             let Err(err) = set_keepalive(&socket)
         {
             warn!(?err, %peer_addr, "couldn't set keepalive on tcp stream");
-            let _ = self.registry.deregister(&mut socket);
+            let _ = registry.deregister(&mut socket);
             let _ = socket.shutdown(Shutdown::Both);
             return false;
         }
         set_user_timeout(&socket, config.user_timeout_ms);
-        if let Err(err) = self.registry.reregister(&mut socket, token, Interest::READABLE) {
+        if let Err(err) = registry.reregister(&mut socket, token, Interest::READABLE) {
             warn!(?err, %peer_addr, "couldn't register connected tcp stream");
             let _ = socket.shutdown(Shutdown::Both);
             return false;
@@ -533,10 +569,10 @@ impl TcpManager {
                 write_frame_header(&mut header, message.len(), Nanos::now());
                 header
             });
-            if stream.write_frame(&self.registry, header.as_ref(), message, config, &mut timers) ==
+            if stream.write_frame(registry, header.as_ref(), message, config, &mut timers) ==
                 StreamState::Disconnected
             {
-                stream.close(&self.registry);
+                stream.close(registry);
                 self.connections[index].timers = timers;
                 return false;
             }
@@ -552,14 +588,14 @@ impl TcpManager {
                 // A queued greeting remainder precedes the retained frames.
                 stream.send_queue.append_raw_remainder(backlog.remaining(), 0);
             }
-            if stream.drain_queue(&self.registry, &self.config) == StreamState::Disconnected {
-                stream.close(&self.registry);
+            if stream.drain_queue(registry, &self.config) == StreamState::Disconnected {
+                stream.close(registry);
                 stream.send_queue.rewind_to_frame();
                 self.connections[index].backlog = stream.send_queue;
                 return false;
             }
             if !stream.send_queue.is_empty() {
-                stream.arm_writable(&self.registry);
+                stream.arm_writable(registry);
             }
         }
         self.connections[index].timers = timers;
@@ -573,6 +609,7 @@ impl TcpManager {
 
     fn accept_connections<F>(
         &mut self,
+        registry: &Registry,
         listener_index: usize,
         tokens: &mut Tokens,
         dcache: Option<&DCache>,
@@ -612,7 +649,7 @@ impl TcpManager {
                 }
                 set_user_timeout(&socket, config.user_timeout_ms);
                 let token = tokens.allocate(group);
-                if let Err(err) = self.registry.register(&mut socket, token, Interest::READABLE) {
+                if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
                     warn!(?err, %peer_addr, "couldn't register accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
                     tokens.retire(token);
@@ -634,15 +671,10 @@ impl TcpManager {
                         write_frame_header(&mut header, message.len(), Nanos::now());
                         header
                     });
-                    if stream.write_frame(
-                        &self.registry,
-                        header.as_ref(),
-                        message,
-                        config,
-                        &mut timers,
-                    ) == StreamState::Disconnected
+                    if stream.write_frame(registry, header.as_ref(), message, config, &mut timers) ==
+                        StreamState::Disconnected
                     {
-                        stream.close(&self.registry);
+                        stream.close(registry);
                         tokens.retire(token);
                         continue;
                     }
@@ -653,6 +685,7 @@ impl TcpManager {
             self.connections.push(Connection {
                 token,
                 peer_addr,
+                local_ip: None,
                 kind: ConnectionKind::Accepted,
                 state: ConnectionState::Connected(stream),
                 close_when_drained: false,
@@ -668,6 +701,7 @@ impl TcpManager {
 
     pub(crate) fn handle_event<F>(
         &mut self,
+        registry: &Registry,
         event: &MioEvent,
         tokens: &mut Tokens,
         dcache: Option<&DCache>,
@@ -677,7 +711,7 @@ impl TcpManager {
     {
         let token = event.token();
         if let Some(index) = self.listeners.iter().position(|listener| listener.token == token) {
-            self.accept_connections(index, tokens, dcache, handler);
+            self.accept_connections(registry, index, tokens, dcache, handler);
             return;
         }
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
@@ -687,7 +721,7 @@ impl TcpManager {
         };
 
         if matches!(self.connections[index].state, ConnectionState::Connecting(_)) &&
-            !self.finish_connect(index, dcache, handler)
+            !self.finish_connect(registry, index, dcache, handler)
         {
             return;
         }
@@ -702,7 +736,7 @@ impl TcpManager {
             let connection = &mut self.connections[index];
             let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
             let state = stream.poll_with(
-                &self.registry,
+                registry,
                 event,
                 config,
                 &mut connection.timers,
@@ -720,24 +754,24 @@ impl TcpManager {
             if self.connections[index].announced() {
                 handler(Event::Disconnected { group, token, peer_addr });
             }
-            self.disconnect_index(index, false, tokens);
+            self.disconnect_index(registry, index, false, tokens);
         } else if self.connections[index].close_when_drained && queue_empty {
-            self.disconnect_index(index, true, tokens);
+            self.disconnect_index(registry, index, true, tokens);
         }
     }
 
-    fn close_connection_socket(&mut self, index: usize) -> bool {
+    fn close_connection_socket(&mut self, registry: &Registry, index: usize) -> bool {
         let old_state =
             std::mem::replace(&mut self.connections[index].state, ConnectionState::Disconnected);
         match old_state {
             ConnectionState::Disconnected => false,
             ConnectionState::Connecting(mut socket) => {
-                let _ = self.registry.deregister(&mut socket);
+                let _ = registry.deregister(&mut socket);
                 let _ = socket.shutdown(Shutdown::Both);
                 false
             }
             ConnectionState::Connected(mut stream) => {
-                stream.close(&self.registry);
+                stream.close(registry);
                 if self.connections[index].kind == ConnectionKind::Outbound &&
                     self.config.replay == ReplayPolicy::Replay
                 {
@@ -749,7 +783,13 @@ impl TcpManager {
         }
     }
 
-    fn disconnect_index(&mut self, index: usize, notify: bool, tokens: &mut Tokens) {
+    fn disconnect_index(
+        &mut self,
+        registry: &Registry,
+        index: usize,
+        notify: bool,
+        tokens: &mut Tokens,
+    ) {
         let event = PendingDisconnect {
             token: self.connections[index].token,
             peer_addr: self.connections[index].peer_addr,
@@ -757,7 +797,7 @@ impl TcpManager {
         let kind = self.connections[index].kind;
         self.connections[index].close_when_drained = false;
         let announced = self.connections[index].announced();
-        let was_connected = self.close_connection_socket(index);
+        let was_connected = self.close_connection_socket(registry, index);
         if kind == ConnectionKind::Accepted {
             tokens.retire(event.token);
             self.connections.swap_remove(index);
@@ -861,8 +901,8 @@ impl TcpManager {
     /// Writes the staged frames to the connection at `index` in one socket
     /// write, disconnecting it on failure. Returns whether the write was
     /// accepted or queued.
-    fn write_staged(&mut self, index: usize, tokens: &mut Tokens) -> bool {
-        let Self { config, connections, registry, send_buffer, tls_buffer, .. } = self;
+    fn write_staged(&mut self, registry: &Registry, index: usize, tokens: &mut Tokens) -> bool {
+        let Self { config, connections, send_buffer, tls_buffer, .. } = self;
         let connection = &mut connections[index];
         let ConnectionState::Connected(stream) = &mut connection.state else {
             return Self::queue_offline(config, connection, send_buffer);
@@ -872,7 +912,7 @@ impl TcpManager {
         let payload = if let Some(session) = &mut connection.tls {
             tls_buffer.clear();
             if !session.encrypt(send_buffer, tls_buffer) {
-                self.disconnect_index(index, true, tokens);
+                self.disconnect_index(registry, index, true, tokens);
                 return false;
             }
             &tls_buffer[..]
@@ -887,7 +927,7 @@ impl TcpManager {
             let retain = connection.kind == ConnectionKind::Outbound &&
                 connection.tls.is_none() &&
                 config.replay == ReplayPolicy::Replay;
-            self.disconnect_index(index, true, tokens);
+            self.disconnect_index(registry, index, true, tokens);
             if retain {
                 let Self { config, connections, send_buffer, .. } = self;
                 return Self::queue_offline(config, &mut connections[index], send_buffer);
@@ -897,7 +937,13 @@ impl TcpManager {
         true
     }
 
-    pub(crate) fn send_with<F>(&mut self, token: Token, tokens: &mut Tokens, serialise: F) -> bool
+    pub(crate) fn send_with<F>(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        tokens: &mut Tokens,
+        serialise: F,
+    ) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
@@ -912,11 +958,12 @@ impl TcpManager {
         if config.framing == Framing::LengthPrefixed {
             write_frame_ts(&mut self.send_buffer[..FRAME_HEADER_SIZE], Nanos::now());
         }
-        self.write_staged(index, tokens)
+        self.write_staged(registry, index, tokens)
     }
 
     pub(crate) fn send_many_with<I, F>(
         &mut self,
+        registry: &Registry,
         token: Token,
         tokens: &mut Tokens,
         items: I,
@@ -940,7 +987,7 @@ impl TcpManager {
         if config.framing == Framing::LengthPrefixed {
             Self::stamp_frames(&mut self.send_buffer, Nanos::now());
         }
-        self.write_staged(index, tokens)
+        self.write_staged(registry, index, tokens)
     }
 
     /// Whether a member can receive a broadcast right now.
@@ -957,7 +1004,7 @@ impl TcpManager {
     /// Writes the staged frames to every connected member,
     /// disconnecting members whose write fails. Returns the number of
     /// recipients attempted.
-    fn broadcast_staged(&mut self, tokens: &mut Tokens) -> usize {
+    fn broadcast_staged(&mut self, registry: &Registry, tokens: &mut Tokens) -> usize {
         let mut attempted = 0;
         let mut index = self.connections.len();
         while index != 0 {
@@ -971,12 +1018,17 @@ impl TcpManager {
                 continue;
             }
             attempted += 1;
-            self.write_staged(index, tokens);
+            self.write_staged(registry, index, tokens);
         }
         attempted
     }
 
-    pub(crate) fn broadcast_with<F>(&mut self, tokens: &mut Tokens, serialise: F) -> usize
+    pub(crate) fn broadcast_with<F>(
+        &mut self,
+        registry: &Registry,
+        tokens: &mut Tokens,
+        serialise: F,
+    ) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
@@ -991,11 +1043,12 @@ impl TcpManager {
         if config.framing == Framing::LengthPrefixed {
             write_frame_ts(&mut self.send_buffer[..FRAME_HEADER_SIZE], Nanos::now());
         }
-        self.broadcast_staged(tokens)
+        self.broadcast_staged(registry, tokens)
     }
 
     pub(crate) fn broadcast_many_with<I, F>(
         &mut self,
+        registry: &Registry,
         tokens: &mut Tokens,
         items: I,
         mut serialise: F,
@@ -1018,10 +1071,15 @@ impl TcpManager {
         if config.framing == Framing::LengthPrefixed {
             Self::stamp_frames(&mut self.send_buffer, Nanos::now());
         }
-        self.broadcast_staged(tokens)
+        self.broadcast_staged(registry, tokens)
     }
 
-    pub(crate) fn disconnect(&mut self, token: Token, tokens: &mut Tokens) -> bool {
+    pub(crate) fn disconnect(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        tokens: &mut Tokens,
+    ) -> bool {
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             return false;
@@ -1029,11 +1087,16 @@ impl TcpManager {
         if matches!(self.connections[index].state, ConnectionState::Disconnected) {
             return false;
         }
-        self.disconnect_index(index, true, tokens);
+        self.disconnect_index(registry, index, true, tokens);
         true
     }
 
-    pub(crate) fn disconnect_when_drained(&mut self, token: Token, tokens: &mut Tokens) -> bool {
+    pub(crate) fn disconnect_when_drained(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        tokens: &mut Tokens,
+    ) -> bool {
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             return false;
@@ -1042,23 +1105,23 @@ impl TcpManager {
             return false;
         };
         if stream.send_queue.is_empty() {
-            return self.disconnect(token, tokens);
+            return self.disconnect(registry, token, tokens);
         }
         self.connections[index].close_when_drained = true;
         true
     }
 
-    pub(crate) fn remove(&mut self, token: Token) -> bool {
+    pub(crate) fn remove(&mut self, registry: &Registry, token: Token) -> bool {
         if let Some(index) = self.listeners.iter().position(|l| l.token == token) {
             let mut listener = self.listeners.swap_remove(index);
-            let _ = self.registry.deregister(&mut listener.socket);
+            let _ = registry.deregister(&mut listener.socket);
             return true;
         }
         let Some(index) = self.connections.iter().position(|connection| connection.token == token)
         else {
             return false;
         };
-        self.close_connection_socket(index);
+        self.close_connection_socket(registry, index);
         self.connections.swap_remove(index);
         self.pending_disconnects.retain(|event| event.token != token);
         true
@@ -1081,7 +1144,13 @@ impl TcpManager {
         };
         queue.clear_frames()
     }
-    fn check_backlogs(&mut self, max: usize, timeout: Duration, tokens: &mut Tokens) {
+    fn check_backlogs(
+        &mut self,
+        registry: &Registry,
+        max: usize,
+        timeout: Duration,
+        tokens: &mut Tokens,
+    ) {
         for index in (0..self.connections.len()).rev() {
             let ConnectionState::Connected(stream) = &mut self.connections[index].state else {
                 continue;
@@ -1090,24 +1159,11 @@ impl TcpManager {
                 if stream.send_queue.exceeded_since.get_or_insert_with(Instant::now).elapsed() >=
                     timeout
                 {
-                    self.disconnect_index(index, true, tokens);
+                    self.disconnect_index(registry, index, true, tokens);
                 }
             } else {
                 stream.send_queue.exceeded_since = None;
             }
-        }
-    }
-}
-
-impl Drop for TcpManager {
-    fn drop(&mut self) {
-        // Deregister before closing. On Linux, a duplicated descriptor can
-        // keep an epoll registration alive after the original descriptor closes.
-        for index in 0..self.connections.len() {
-            self.close_connection_socket(index);
-        }
-        for listener in &mut self.listeners {
-            let _ = self.registry.deregister(&mut listener.socket);
         }
     }
 }
@@ -1137,6 +1193,43 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
     }
     // Accepted sockets inherit the receive window negotiated before accept().
     set_socket_buf_size(&listener, size);
+    let (storage, len) = sockaddr(addr);
+    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Match mio's kernel-capped listener backlog on Linux.
+    if unsafe { libc::listen(fd, -1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(TcpListener::from_std(listener))
+}
+
+/// Starts a nonblocking connect to `peer_addr` from `local_ip` and an
+/// ephemeral port.
+fn connect_from(peer_addr: SocketAddr, local_ip: IpAddr) -> io::Result<mio::net::TcpStream> {
+    let domain = if peer_addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let fd = unsafe {
+        libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    let (local, local_len) = sockaddr(SocketAddr::new(local_ip, 0));
+    if unsafe { libc::bind(fd, ptr::from_ref(&local).cast(), local_len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (peer, peer_len) = sockaddr(peer_addr);
+    if unsafe { libc::connect(fd, ptr::from_ref(&peer).cast(), peer_len) } != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(err);
+        }
+    }
+    Ok(mio::net::TcpStream::from_std(stream))
+}
+
+fn sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(addr) => {
@@ -1161,14 +1254,7 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
             size_of::<libc::sockaddr_in6>()
         }
     };
-    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len as libc::socklen_t) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Match mio's kernel-capped listener backlog on Linux.
-    if unsafe { libc::listen(fd, -1) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(TcpListener::from_std(listener))
+    (storage, len as libc::socklen_t)
 }
 
 /// Reads plaintext from `socket`, decrypting through `tls` when present.

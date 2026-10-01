@@ -52,6 +52,10 @@ name = "connector"
 harness = false
 name = "udp_pipeline"
 
+[[bench]]
+harness = false
+name = "http_client"
+
 [lints]
 workspace = true
 
