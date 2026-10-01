@@ -180,6 +180,32 @@ impl wincode::io::Writer for PayloadBuf<'_> {
     }
 }
 
+// SAFETY: every method forwards to the `Vec<u8>`, whose writes only append, so
+// earlier frames before the payload start stay out of reach.
+unsafe impl bytes::BufMut for PayloadBuf<'_> {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        self.bytes.remaining_mut()
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        // SAFETY: the caller initialised `cnt` bytes of `chunk_mut`, which is
+        // the Vec's spare capacity.
+        unsafe { self.bytes.advance_mut(cnt) }
+    }
+
+    #[inline]
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        self.bytes.chunk_mut()
+    }
+
+    #[inline]
+    fn put_slice(&mut self, src: &[u8]) {
+        self.bytes.extend_from_slice(src);
+    }
+}
+
 impl Write for PayloadBuf<'_> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
