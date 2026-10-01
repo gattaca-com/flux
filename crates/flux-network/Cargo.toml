@@ -29,9 +29,14 @@ wincode = { workspace = true, optional = true }
 [dev-dependencies]
 core_affinity.workspace = true
 criterion.workspace = true
+hdrhistogram.workspace = true
 rcgen.workspace = true
 spine-derive.workspace = true
 tempfile.workspace = true
+# Only for the tonic interop test and the comparison benchmark.
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 wincode = { workspace = true }
 wincode-derive = { workspace = true }
 
@@ -44,6 +49,10 @@ required-features = ["tls"]
 
 [[test]]
 name = "tcp_network_tls"
+required-features = ["tls"]
+
+[[test]]
+name = "grpc_tonic"
 required-features = ["tls"]
 
 [[bench]]
@@ -65,6 +74,10 @@ name = "http2"
 [[bench]]
 harness = false
 name = "grpc"
+
+[[bench]]
+harness = false
+name = "grpc_tonic"
 
 [lints]
 workspace = true
