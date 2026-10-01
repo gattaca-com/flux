@@ -190,3 +190,113 @@ fn a_peer_that_never_speaks_tls_is_redialled_silently() {
     assert!(accepts.load(Ordering::Relaxed) >= 2, "the stalled handshake was never redialled");
     drop(keep_rx);
 }
+
+fn server_config(alpn: &[&[u8]]) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert = key.cert.der().clone();
+    let mut server = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.clone()],
+            PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+    server.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let client = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    (Arc::new(server), Arc::new(client))
+}
+
+/// Polls a raw TLS listener, echoing every received chunk, until a
+/// disconnect. Returns the lifecycle it saw.
+fn serve_echo(
+    server: Arc<ServerConfig>,
+    handshake_timeout: Duration,
+) -> (SocketAddr, thread::JoinHandle<Vec<&'static str>>) {
+    let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut net = Network::default();
+        let group = net.add_group(TcpGroupConfig {
+            framing: Framing::Raw,
+            handshake_timeout: handshake_timeout.into(),
+            reconnect_interval: Duration::from_millis(10).into(),
+            replay: ReplayPolicy::Drop,
+            ..TcpGroupConfig::default()
+        });
+        net.listen_tls(group, addr, server).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while !events.contains(&"disconnected") && Instant::now() < deadline {
+            let mut echo = Vec::new();
+            net.poll_with(|event| match event {
+                NetworkEvent::Accepted { .. } => events.push("accepted"),
+                NetworkEvent::Message { token, payload, .. } => {
+                    echo.push((token, payload.to_vec()));
+                }
+                NetworkEvent::Disconnected { .. } => events.push("disconnected"),
+                NetworkEvent::Connected { .. } => events.push("connected"),
+            });
+            for (token, payload) in echo {
+                assert!(net.pending_write_bytes(token).is_some());
+                assert!(net.send_with(token, |out| out.extend_from_slice(&payload)));
+                events.push("echoed");
+            }
+        }
+        events
+    });
+    ready_rx.recv().unwrap();
+    (addr, handle)
+}
+
+#[test]
+fn accepted_tls_negotiates_alpn_and_echoes() {
+    let (server, client) = server_config(&[b"h2"]);
+    let (addr, server) = serve_echo(server, TIMEOUT);
+    let mut client = Arc::unwrap_or_clone(client);
+    client.alpn_protocols = vec![b"h2".to_vec()];
+    let mut conn =
+        rustls::ClientConnection::new(Arc::new(client), "localhost".try_into().unwrap()).unwrap();
+    let mut socket = std::net::TcpStream::connect(addr).unwrap();
+    socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut socket);
+    tls.write_all(b"ping").unwrap();
+    let mut echoed = [0; 4];
+    tls.read_exact(&mut echoed).unwrap();
+    assert_eq!(&echoed, b"ping");
+    assert_eq!(conn.alpn_protocol(), Some(&b"h2"[..]));
+    drop(socket);
+    assert_eq!(server.join().unwrap(), ["accepted", "echoed", "disconnected"]);
+}
+
+#[test]
+fn accepted_tls_without_alpn_is_disconnected() {
+    let (server, client) = server_config(&[b"h2"]);
+    let (addr, server) = serve_echo(server, TIMEOUT);
+    let mut conn = rustls::ClientConnection::new(client, "localhost".try_into().unwrap()).unwrap();
+    let mut socket = std::net::TcpStream::connect(addr).unwrap();
+    socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut socket);
+    let _ = tls.write_all(b"ping");
+    let mut byte = [0; 1];
+    assert!(!matches!(tls.read(&mut byte), Ok(1)));
+    assert_eq!(server.join().unwrap(), ["accepted", "disconnected"]);
+}
+
+#[test]
+fn stalled_accepted_handshake_reports_disconnect() {
+    let (server, _) = server_config(&[]);
+    let (addr, server) = serve_echo(server, Duration::from_millis(50));
+    let _silent = std::net::TcpStream::connect(addr).unwrap();
+    assert_eq!(server.join().unwrap(), ["accepted", "disconnected"]);
+}

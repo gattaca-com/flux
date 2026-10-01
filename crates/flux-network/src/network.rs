@@ -637,6 +637,36 @@ impl NetworkCore {
     /// remains stable across retries, and a failed dial or socket open is
     /// retried from the poll. `Connected` reports every successful
     /// establishment.
+    /// Accepts TLS sockets on a TCP group. `Accepted` reports TCP acceptance,
+    /// before the handshake; sends fail and [`Self::pending_write_bytes`]
+    /// returns `None` until it completes. A nonempty ALPN list must be
+    /// negotiated. Early data, `on_connect_msg` and frame backlog limits are
+    /// rejected.
+    #[cfg(feature = "tls")]
+    pub fn listen_tls(
+        &mut self,
+        group: Group,
+        addr: SocketAddr,
+        config: std::sync::Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<Token> {
+        match self.groups.get_mut(group.0) {
+            Some(GroupState::Tcp(tcp)) => {
+                tcp.listen_tls(self.poller.registry(), addr, &mut self.tokens, config)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS requires a TCP group")),
+        }
+    }
+
+    /// Bytes queued behind the socket for a TCP connection, or `None` if it
+    /// cannot take writes (unknown, UDP, closing, or mid TLS handshake). Lets a
+    /// producer keep its own backlog instead of growing this one.
+    pub fn pending_write_bytes(&self, token: Token) -> Option<usize> {
+        let group = self.route(token)?;
+        match &self.groups[group.0] {
+            GroupState::Tcp(tcp) => tcp.pending_write_bytes(token),
+            GroupState::Udp(_) => None,
+        }
+    }
     #[must_use]
     pub fn connect(&mut self, group: Group, addr: SocketAddr) -> Token {
         match &mut self.groups[group.0] {
