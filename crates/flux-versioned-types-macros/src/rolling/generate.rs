@@ -94,44 +94,37 @@ fn generate_versioned_impls(
         } else {
             quote! { Ok(slice.iter().copied().map(::core::convert::Into::into).collect()) }
         };
-        quote! {
-            <#version as flux::type_hash::TypeHash>::TYPE_HASH => {
-                match ::flux_versioned_types::byte_stable::cast_slice::<#version>(bytes) {
-                    Ok(slice) if slice.len() != n => {
-                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
-                            expected: n,
-                            got: slice.len(),
-                        })
-                    }
-                    Ok(slice) => #migrate,
-                    Err(::flux_versioned_types::byte_stable::CastError::Unaligned) => {
-                        Err(::flux_versioned_types::DecodeError::Unaligned)
-                    }
-                    Err(::flux_versioned_types::byte_stable::CastError::Length { got, size }) => {
-                        Err(::flux_versioned_types::DecodeError::LengthMismatch {
-                            expected: if size == 0 {
-                                0
-                            } else {
-                                size.saturating_mul(got / size + 1)
-                            },
-                            got,
-                        })
-                    }
-                    Err(::flux_versioned_types::byte_stable::CastError::Invalid { .. }) => {
-                        Err(::flux_versioned_types::DecodeError::InvalidValue)
-                    }
-                    Err(::flux_versioned_types::byte_stable::CastError::ZeroSized) => {
-                        // SAFETY: `cast_slice` returns `ZeroSized` only when
-                        // `#version` has no bytes, so the all-zero value is its
-                        // sole inhabitant.
-                        Ok((0..n)
-                            .map(|_| unsafe { ::core::mem::zeroed::<#version>() }.into())
-                            .collect())
-                    }
-                }
-            }
-        }
+        // SAFETY: `cast_slice` returns `ZeroSized` only when `#version` has no
+        // bytes, so the all-zero value is its sole inhabitant.
+        let zero_sized = quote! {
+            Ok((0..n)
+                .map(|_| unsafe { ::core::mem::zeroed::<#version>() }.into())
+                .collect())
+        };
+        version_arm(version, &migrate, &zero_sized)
     });
+    let each_arms = wired.iter().map(|version| {
+        let value = if *version == last {
+            quote! { *value }
+        } else {
+            quote! { ::core::convert::Into::into(*value) }
+        };
+        let each = quote! {{
+            for value in slice {
+                f(#value);
+            }
+            Ok(())
+        }};
+        // SAFETY: as in `decode_versions`, the all-zero value is the only one.
+        let zero_sized = quote! {{
+            for _ in 0..n {
+                f(unsafe { ::core::mem::zeroed::<#version>() }.into());
+            }
+            Ok(())
+        }};
+        version_arm(version, &each, &zero_sized)
+    });
+    let leaf_impl = leaf_impl(last, &name_tokens);
     quote! {
         impl ::flux_versioned_types::Versioned for #last {
             const NAME: &'static str = #name_tokens;
@@ -154,6 +147,17 @@ fn generate_versioned_impls(
                     _ => Err(::flux_versioned_types::DecodeError::UnknownTypeHash(type_hash)),
                 }
             }
+            fn decode_versions_each<F: FnMut(Self)>(
+                type_hash: u64,
+                bytes: &[u8],
+                n: usize,
+                mut f: F,
+            ) -> Result<(), ::flux_versioned_types::DecodeError> {
+                match type_hash {
+                    #(#each_arms,)*
+                    _ => Err(::flux_versioned_types::DecodeError::UnknownTypeHash(type_hash)),
+                }
+            }
         }
 
         const _: () = assert!(
@@ -161,6 +165,14 @@ fn generate_versioned_impls(
             "wire name longer than TYPE_NAME_LEN"
         );
 
+        #leaf_impl
+    }
+}
+
+/// The leaf as its own single-name family, so `decode_blob_into` decodes a
+/// blob of this name straight into the sink.
+fn leaf_impl(last: &Ident, name_tokens: &TokenStream2) -> TokenStream2 {
+    quote! {
         impl ::flux_versioned_types::HasVersionedLeaves for #last {
             const LEAF_NAMES: &'static [&'static str] = &[#name_tokens];
             fn visit_leaf<V: ::flux_versioned_types::VisitorVersionedLeaf>(
@@ -173,11 +185,65 @@ fn generate_versioned_impls(
                 blob: &::flux_versioned_types::Blob,
                 scratch: &mut ::flux_versioned_types::Scratch,
             ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
+                let mut msgs = ::std::vec::Vec::new();
+                let meta = <Self as ::flux_versioned_types::HasVersionedLeaves>::decode_blob_into::<
+                    U,
+                    _,
+                >(blob, scratch, &mut msgs)?;
+                Some(meta.map(|meta| (meta, msgs)))
+            }
+            fn decode_blob_into<
+                U: ::flux_versioned_types::Versioned,
+                S: ::flux_versioned_types::MessageSink<Self>,
+            >(
+                blob: &::flux_versioned_types::Blob,
+                scratch: &mut ::flux_versioned_types::Scratch,
+                sink: &mut S,
+            ) -> Option<::core::result::Result<U, ::flux_versioned_types::DecodeError>> {
                 if blob.type_name() == #name_tokens && blob.is::<Self>() {
-                    Some(blob.decode::<U, Self>(scratch))
+                    Some(blob.decode_into::<U, Self, S>(scratch, sink))
                 } else {
                     None
                 }
+            }
+        }
+    }
+}
+
+/// One `type_hash` arm: casts `bytes` as `version` and checks the count, then
+/// hands the slice to `on_slice`, or a zero-sized version to `on_zero_sized`.
+fn version_arm(
+    version: &Ident,
+    on_slice: &TokenStream2,
+    on_zero_sized: &TokenStream2,
+) -> TokenStream2 {
+    quote! {
+        <#version as flux::type_hash::TypeHash>::TYPE_HASH => {
+            match ::flux_versioned_types::byte_stable::cast_slice::<#version>(bytes) {
+                Ok(slice) if slice.len() != n => {
+                    Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                        expected: n,
+                        got: slice.len(),
+                    })
+                }
+                Ok(slice) => #on_slice,
+                Err(::flux_versioned_types::byte_stable::CastError::Unaligned) => {
+                    Err(::flux_versioned_types::DecodeError::Unaligned)
+                }
+                Err(::flux_versioned_types::byte_stable::CastError::Length { got, size }) => {
+                    Err(::flux_versioned_types::DecodeError::LengthMismatch {
+                        expected: if size == 0 {
+                            0
+                        } else {
+                            size.saturating_mul(got / size + 1)
+                        },
+                        got,
+                    })
+                }
+                Err(::flux_versioned_types::byte_stable::CastError::Invalid { .. }) => {
+                    Err(::flux_versioned_types::DecodeError::InvalidValue)
+                }
+                Err(::flux_versioned_types::byte_stable::CastError::ZeroSized) => #on_zero_sized,
             }
         }
     }

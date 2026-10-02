@@ -18,7 +18,7 @@ use flux_utils::ArrayStr;
 
 use crate::{
     blob::TrackingTimestampWire,
-    leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf},
+    leaves::{Decoded, HasVersionedLeaves, MessageSink, Versioned, VisitorVersionedLeaf},
 };
 
 pub const MAGIC: [u8; 8] = *b"FLUXBLOB";
@@ -230,6 +230,18 @@ impl Blob {
     /// Rebuilt `publish_t` carries sub-millisecond clock noise across hosts;
     /// `ingestion_time().real()` and `tile_id` are exact.
     pub fn decode<U: Versioned, T: Versioned>(&self, scratch: &mut Scratch) -> Decoded<U, T> {
+        let mut msgs = Vec::new();
+        let meta = self.decode_into::<U, T, _>(scratch, &mut msgs)?;
+        Ok((meta, msgs))
+    }
+
+    /// [`decode`](Self::decode), handing the messages to `sink` as they
+    /// decode. No message is pushed on error.
+    pub fn decode_into<U: Versioned, T: Versioned, S: MessageSink<T>>(
+        &self,
+        scratch: &mut Scratch,
+        sink: &mut S,
+    ) -> Result<U, DecodeError> {
         if !self.is::<T>() {
             return Err(DecodeError::UnknownTypeHash(self.header.type_hash));
         }
@@ -261,15 +273,14 @@ impl Blob {
         let (ts_bytes, rest) = bytes.split_at(ts_len as usize);
         let leaf_bytes = &rest[leaf_off as usize - ts_len as usize..];
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
-        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes, n as usize)?;
-        Ok((
-            meta,
-            stamps
-                .iter()
-                .zip(leaves)
-                .map(|(stamp, leaf)| InternalMessage::new(stamp.to_tracking_timestamp(), leaf))
-                .collect(),
-        ))
+        let mut stamps = stamps.iter();
+        sink.reserve(n as usize);
+        T::decode_versions_each(self.header.type_hash, leaf_bytes, n as usize, |leaf| {
+            if let Some(stamp) = stamps.next() {
+                sink.push(InternalMessage::new(stamp.to_tracking_timestamp(), leaf));
+            }
+        })?;
+        Ok(meta)
     }
 }
 
