@@ -876,3 +876,32 @@ fn hand_written_family_gets_the_default_decode_blob_into() {
     let slots: Vec<u64> = sink.pushed.iter().map(|m| m.data().0.slot).collect();
     assert_eq!(slots, vec![0, 1, 2]);
 }
+
+/// A blob's messages map onto the TSC through one reading of the clocks, so
+/// ingestion times 1 ns apart on the wire keep their order once decoded.
+#[test]
+fn decoded_ingestion_times_keep_wire_order() {
+    let base = Nanos::now().0 - 1_000_000_000;
+    let mut cache = BlobCache::new();
+    for i in 0..10_000u64 {
+        let ingestion = IngestionTime::new(Nanos(base + i), Instant(1));
+        let stamp = TrackingTimestamp {
+            ingestion_t: ingestion,
+            publish_delta: PublishDelta::new(1)
+                .from_ingestion_and_publish_t(ingestion.internal(), ingestion.internal()),
+        };
+        cache.push(&InternalMessage::new(stamp, Leaf { slot: i, extra: 0, flags: 0 }));
+    }
+    let meta = MetaV1 { slot: 1, instance: ArrayStr::try_from("t").unwrap() };
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    cache.flush(&meta, 3, |blob| blobs.push(blob.as_bytes().to_vec()));
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    let (_, msgs): (MetaV1, Vec<InternalMessage<Leaf>>) =
+        a.load(&blobs[0]).unwrap().decode(&mut b).unwrap();
+    assert_eq!(msgs.len(), 10_000);
+    for (i, pair) in msgs.windows(2).enumerate() {
+        assert_eq!(pair[0].ingestion_time().real(), Nanos(base + i as u64));
+        assert!(pair[0].ingestion_time().internal() <= pair[1].ingestion_time().internal());
+    }
+}

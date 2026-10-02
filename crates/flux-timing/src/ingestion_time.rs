@@ -45,6 +45,16 @@ impl IngestionTime {
         Self { real: self.real, internal: now.internal - now.real().saturating_sub(self.real) }
     }
 
+    /// Projects wall-clock `real` onto the TSC through `now`, one reading of
+    /// both clocks. A batch converted against one `now` costs one pair of
+    /// clock reads instead of a pair per value, and keeps its wall-clock
+    /// order: a later `real` never lands on an earlier `internal`.
+    #[inline]
+    pub fn from_real_at(real: Nanos, now: Self) -> Self {
+        // Another host's clock can sit slightly ahead of ours.
+        Self { internal: now.internal - Duration::from(now.real.saturating_sub(real)), real }
+    }
+
     #[inline]
     pub fn internal(&self) -> Instant {
         self.internal
@@ -87,8 +97,28 @@ impl From<IngestionTime> for Nanos {
 impl From<Nanos> for IngestionTime {
     #[inline]
     fn from(value: Nanos) -> Self {
-        let curt = Instant::now();
-        // Another host's clock can sit slightly ahead of ours.
-        Self { internal: curt - Duration::from(value.elapsed_saturating()), real: value }
+        Self::from_real_at(value, Self::now())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Values converted against one reading keep their order on the TSC, one
+    /// ahead of our clock lands on the reading itself, and `real` is exact.
+    #[test]
+    fn from_real_at_keeps_wall_clock_order() {
+        let now = IngestionTime::now();
+        let base = now.real().0 - 1_000_000_000;
+        let mut last = Instant(0);
+        for i in 0..10_000 {
+            let t = IngestionTime::from_real_at(Nanos(base + i), now);
+            assert_eq!(t.real(), Nanos(base + i));
+            assert!(t.internal() >= last);
+            last = t.internal();
+        }
+        let ahead = IngestionTime::from_real_at(Nanos(now.real().0 + 5_000), now);
+        assert_eq!(ahead.internal(), now.internal());
     }
 }
