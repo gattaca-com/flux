@@ -95,6 +95,9 @@ impl std::error::Error for DecodeError {}
 pub struct Scratch {
     words: Vec<u128>,
     len: usize,
+    /// Kept across blobs: `zstd::bulk::decompress_to_buffer` builds and frees
+    /// a context on every call.
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
 }
 
 impl Scratch {
@@ -120,6 +123,29 @@ impl Scratch {
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
         &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..self.len]
+    }
+
+    /// Decompresses `compressed` into the buffer, which it must fill to
+    /// exactly `len` bytes. Nothing is zeroed first since zstd writes every
+    /// byte it reports, and `len` covers only those, so a later `resize`
+    /// zero-fills whatever zstd did not write.
+    fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
+        let words = len.div_ceil(LEAF_ALIGN_MAX);
+        if words > self.words.len() {
+            self.words.resize(words, 0);
+        }
+        if self.decompressor.is_none() {
+            self.decompressor = Some(zstd::bulk::Decompressor::new().map_err(DecodeError::Zstd)?);
+        }
+        let decompressor = self.decompressor.as_mut().expect("created above");
+        let out = &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..len];
+        let written = decompressor.decompress_to_buffer(compressed, out);
+        self.len = written.as_ref().map_or(0, |&n| n.min(len));
+        let written = written.map_err(DecodeError::Zstd)?;
+        if written != len {
+            return Err(DecodeError::LengthMismatch { expected: len, got: written });
+        }
+        Ok(())
     }
 
     /// For buffers that are not 8-aligned, such as `DiskIo` reads.
@@ -262,13 +288,7 @@ impl Blob {
                 got: usize::try_from(self.header.decompressed_len).unwrap_or(usize::MAX),
             });
         }
-        let expected_len = expected as usize;
-        scratch.resize(expected_len);
-        let written = zstd::bulk::decompress_to_buffer(self.compressed(), scratch.as_mut_bytes())
-            .map_err(DecodeError::Zstd)?;
-        if written != expected_len {
-            return Err(DecodeError::LengthMismatch { expected: expected_len, got: written });
-        }
+        scratch.decompress(self.compressed(), expected as usize)?;
         let bytes = scratch.as_bytes();
         let (ts_bytes, rest) = bytes.split_at(ts_len as usize);
         let leaf_bytes = &rest[leaf_off as usize - ts_len as usize..];
