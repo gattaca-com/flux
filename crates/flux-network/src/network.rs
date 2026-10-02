@@ -212,8 +212,8 @@ pub struct TcpGroupConfig {
     /// Requested `SO_SNDBUF` and `SO_RCVBUF` size.
     pub socket_buf_size: Option<usize>,
     /// Bind listeners with `SO_REUSEPORT`, so listeners in several networks
-    /// (for example one per tile) can share an address. The kernel spreads
-    /// new connections across them by hashing the peer address and port.
+    /// can share an address. The kernel spreads new connections across them by
+    /// hashing the peer address and port.
     pub reuse_port: bool,
     /// Whether to enable `TCP_NODELAY`.
     pub nodelay: bool,
