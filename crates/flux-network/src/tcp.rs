@@ -1207,14 +1207,24 @@ fn bind_listener(
     }
     let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
     let enable: libc::c_int = 1;
-    let options: &[libc::c_int] =
-        if reuse_port { &[libc::SO_REUSEADDR, libc::SO_REUSEPORT] } else { &[libc::SO_REUSEADDR] };
-    for &option in options {
+    if unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            ptr::from_ref(&enable).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if reuse_port {
         if unsafe {
             libc::setsockopt(
                 listener.as_raw_fd(),
                 libc::SOL_SOCKET,
-                option,
+                libc::SO_REUSEPORT,
                 ptr::from_ref(&enable).cast(),
                 size_of::<libc::c_int>() as libc::socklen_t,
             )
