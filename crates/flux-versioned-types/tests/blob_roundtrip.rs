@@ -905,3 +905,34 @@ fn decoded_ingestion_times_keep_wire_order() {
         assert!(pair[0].ingestion_time().internal() <= pair[1].ingestion_time().internal());
     }
 }
+
+/// One scratch decodes a large blob, a smaller one, a corrupt one and the
+/// large one again, each as a fresh scratch would.
+#[test]
+fn scratch_decodes_alike_across_sizes_and_after_a_corrupt_blob() {
+    let large = leaf_blob(64);
+    let small = leaf_blob(2);
+    let mut corrupt = leaf_blob(8);
+    let comp_off = size_of::<BlobHeader>() + size_of::<MetaV1>().next_multiple_of(8);
+    corrupt[comp_off] ^= 0xff;
+
+    let mut a = Scratch::new();
+    let mut reused = Scratch::new();
+    let slots = |bytes: &[u8], a: &mut Scratch, b: &mut Scratch| -> Vec<u64> {
+        let (_, msgs): (MetaV1, Vec<InternalMessage<Leaf>>) =
+            a.load(bytes).unwrap().decode(b).unwrap();
+        msgs.iter().map(|m| m.data().slot).collect()
+    };
+    let fresh_large = slots(&large, &mut a, &mut Scratch::new());
+    let fresh_small = slots(&small, &mut a, &mut Scratch::new());
+    assert_eq!(slots(&large, &mut a, &mut reused), fresh_large);
+    assert_eq!(slots(&small, &mut a, &mut reused), fresh_small);
+    assert!(a.load(&corrupt).unwrap().decode::<MetaV1, Leaf>(&mut reused).is_err());
+    assert_eq!(slots(&large, &mut a, &mut reused), fresh_large);
+}
+
+#[test]
+fn scratch_stays_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Scratch>();
+}
