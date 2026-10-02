@@ -367,11 +367,11 @@ impl<T: Copy> InnerQueue<T> {
                 next_count
             }
             QueueType::SPMC => {
-                // The single producer owns both the position and the slot, so
-                // neither needs a locked read-modify-write.
+                // The single producer owns the position so it doesn't need a locked
+                // read-modify-write.
                 let next_count = self.header.count.load(Ordering::Relaxed);
                 self.header.count.store(next_count.wrapping_add(1), Ordering::Relaxed);
-                self.load(next_count & mask).write_single_producer(item);
+                self.load(next_count & mask).write(item);
                 next_count
             }
         }
