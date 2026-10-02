@@ -219,9 +219,6 @@ pub(crate) struct TcpManager {
     reconnector: Repeater,
     listeners: Vec<Listener>,
     connections: Vec<Connection>,
-    /// Position of each connection in `connections`. Lookups by token stay
-    /// constant as connections grow, where a scan grows with their number;
-    /// a scan only wins with a single connection.
     by_token: FxHashMap<Token, usize>,
     pending_disconnects: Vec<PendingDisconnect>,
     send_buffer: Vec<u8>,
@@ -356,7 +353,6 @@ impl TcpManager {
         index
     }
 
-    /// Removes the connection at `index`, re-pointing the one moved into it.
     fn swap_remove_connection(&mut self, index: usize) {
         let removed = self.connections.swap_remove(index);
         self.by_token.remove(&removed.token);
