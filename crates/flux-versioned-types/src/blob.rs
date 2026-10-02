@@ -364,7 +364,14 @@ impl From<TrackingTimestampWireV1> for TrackingTimestampWire {
 impl TrackingTimestampWire {
     /// Reconstruct a local `TrackingTimestamp` from portable wall-clock values.
     pub fn to_tracking_timestamp(self) -> TrackingTimestamp {
-        let ingestion = IngestionTime::from(self.ingestion_t_real);
+        self.to_tracking_timestamp_at(IngestionTime::now())
+    }
+
+    /// [`to_tracking_timestamp`](Self::to_tracking_timestamp) against one
+    /// reading of the clocks, `now`, as [`IngestionTime::from_real_at`]
+    /// projects it.
+    pub fn to_tracking_timestamp_at(self, now: IngestionTime) -> TrackingTimestamp {
+        let ingestion = IngestionTime::from_real_at(self.ingestion_t_real, now);
         // The delta comes from the two exact wall-clock values. Projecting
         // publish onto the TSC on its own re-reads both clocks, and their
         // jitter between the two projections would land in the delta.

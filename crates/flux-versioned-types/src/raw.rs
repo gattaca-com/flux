@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use byte_stable::ByteStable;
-use flux_timing::{InternalMessage, Nanos};
+use flux_timing::{IngestionTime, InternalMessage, Nanos};
 use flux_utils::ArrayStr;
 
 use crate::{
@@ -274,10 +274,11 @@ impl Blob {
         let leaf_bytes = &rest[leaf_off as usize - ts_len as usize..];
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
         let mut stamps = stamps.iter();
+        let now = IngestionTime::now();
         sink.reserve(n as usize);
         T::decode_versions_each(self.header.type_hash, leaf_bytes, n as usize, |leaf| {
             if let Some(stamp) = stamps.next() {
-                sink.push(InternalMessage::new(stamp.to_tracking_timestamp(), leaf));
+                sink.push(InternalMessage::new(stamp.to_tracking_timestamp_at(now), leaf));
             }
         })?;
         Ok(meta)
