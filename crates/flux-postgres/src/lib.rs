@@ -9,16 +9,20 @@
 //! outages.
 //!
 //! Authentication covers trust, cleartext, and SCRAM-SHA-256; anything
-//! else fails the connection without an outcome.
+//! else fails the connection without an outcome. With the `tls` feature,
+//! [`Postgres::with_ssl_mode`] negotiates TLS on each connection before
+//! startup.
 
 pub mod copybinary;
 pub mod copytext;
 mod scram;
+#[cfg(feature = "tls")]
+mod tls;
 
-use std::{collections::VecDeque, fmt, net::SocketAddr};
+use std::{collections::VecDeque, fmt, io, net::SocketAddr};
 
 use flux_network::{
-    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token,
+    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token, tls::Session,
 };
 use rand::Rng as _;
 use serde::{Serialize, ser};
@@ -29,6 +33,27 @@ const SCRAM_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 const NONCE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 << 20;
 const DEFAULT_MAX_QUEUED_BYTES: usize = 256 << 20;
+const SSL_REQUEST_CODE: i32 = 80_877_103;
+/// Plaintext decrypted per step; one TLS record's worth.
+const TLS_READ_CHUNK: usize = 16 << 10;
+
+/// Whether connections negotiate TLS, after libpq's `sslmode`. Every mode but
+/// [`SslMode::Disable`] needs the `tls` feature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SslMode {
+    /// Plaintext; the server is never asked for TLS.
+    #[default]
+    Disable,
+    /// TLS when the server offers it, plaintext when it declines. An offered
+    /// certificate is still verified, as under [`SslMode::Require`].
+    Prefer,
+    /// TLS or no connection, with the certificate verified against the
+    /// Mozilla roots and the server name: libpq's `verify-full`.
+    Require,
+    /// TLS or no connection, accepting any certificate: libpq's `require`.
+    /// Encrypts, but does not authenticate the server.
+    RequireUnverified,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueryId(u64);
@@ -101,6 +126,20 @@ impl Request {
     fn queued_len(&self) -> usize {
         self.sql.len() + self.data.as_ref().map_or(0, Vec::len)
     }
+
+    fn encode(&self, out: &mut impl for<'b> Extend<&'b u8>) {
+        out.extend(b"Q");
+        out.extend(&((self.sql.len() + 5) as u32).to_be_bytes());
+        out.extend(self.sql.as_bytes());
+        out.extend(&[0]);
+        if let Some(data) = &self.data {
+            out.extend(b"d");
+            out.extend(&((data.len() + 4) as u32).to_be_bytes());
+            out.extend(data);
+            out.extend(b"c");
+            out.extend(&4u32.to_be_bytes());
+        }
+    }
 }
 
 struct ServerError {
@@ -126,6 +165,11 @@ enum Startup {
 
 enum State {
     Connecting,
+    /// Awaiting the server's one-byte answer to `SSLRequest`.
+    Negotiating,
+    /// The startup message waits for the TLS handshake.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    Handshaking,
     Startup(Startup),
     Ready,
     Busy(InFlight),
@@ -136,7 +180,9 @@ struct Conn {
     token: Token,
     state: State,
     rx: Vec<u8>,
+    /// Bytes for the wire, already encrypted when `tls` is set.
     outbox: Vec<u8>,
+    tls: Option<Box<Session>>,
 }
 
 impl Conn {
@@ -144,6 +190,21 @@ impl Conn {
         self.state = state;
         self.rx.clear();
         self.outbox.clear();
+        self.tls = None;
+    }
+
+    /// Appends the plaintext `cipher` carries to `rx`.
+    fn decrypt(session: &mut Session, mut cipher: &[u8], rx: &mut Vec<u8>) -> io::Result<()> {
+        loop {
+            let filled = rx.len();
+            rx.resize(filled + TLS_READ_CHUNK, 0);
+            let read = session.read_plain(&mut cipher, &mut rx[filled..]);
+            rx.truncate(filled + read.as_ref().map_or(0, |read| *read));
+            // A drained `cipher` reads as end of stream.
+            if read? == 0 {
+                return Ok(());
+            }
+        }
     }
 
     fn in_flight(&self) -> Option<QueryId> {
@@ -207,6 +268,12 @@ pub struct Postgres {
     password: String,
     database: String,
     params: Vec<(String, String)>,
+    ssl_mode: SslMode,
+    #[cfg(feature = "tls")]
+    server_name: Option<String>,
+    startup: Vec<u8>,
+    tls_plain: Vec<u8>,
+    tls_wire: Vec<u8>,
     connections: usize,
     max_output_bytes: usize,
     max_queued_bytes: usize,
@@ -226,6 +293,12 @@ impl Postgres {
             password: String::new(),
             database: String::new(),
             params: Vec::new(),
+            ssl_mode: SslMode::Disable,
+            #[cfg(feature = "tls")]
+            server_name: None,
+            startup: Vec::new(),
+            tls_plain: Vec::new(),
+            tls_wire: Vec::new(),
             connections: 1,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
@@ -259,6 +332,34 @@ impl Postgres {
             None => self.params.push((name.to_owned(), value.to_owned())),
         }
         self
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn with_ssl_mode(mut self, mode: SslMode) -> Self {
+        assert!(self.group.is_none(), "configure before connect");
+        self.ssl_mode = mode;
+        self
+    }
+
+    /// Names the server for TLS: sent as SNI and, when verifying, matched
+    /// against its certificate. Defaults to the address's IP. Panics if
+    /// `name` is neither a DNS name nor an IP address.
+    #[cfg(feature = "tls")]
+    pub fn with_server_name(mut self, name: &str) -> Self {
+        assert!(self.group.is_none(), "configure before connect");
+        tls::check_server_name(name);
+        self.server_name = Some(name.to_owned());
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    fn tls_session(&self) -> Session {
+        let name = self.server_name.clone().unwrap_or_else(|| self.addr.ip().to_string());
+        let session = Session::new(&name);
+        match self.ssl_mode {
+            SslMode::RequireUnverified => session.with_config(tls::unverified()),
+            _ => session,
+        }
     }
 
     pub fn with_connections(mut self, connections: usize) -> Self {
@@ -377,12 +478,18 @@ impl Postgres {
     /// never opens anything itself.
     pub fn connect(&mut self, net: &mut NetworkCore) {
         assert!(self.group.is_none(), "connect once");
+        self.startup = Self::startup_bytes(&self.user, &self.database, &self.params);
+        let on_connect_msg = if self.ssl_mode == SslMode::Disable {
+            self.startup.clone()
+        } else {
+            [8i32.to_be_bytes(), SSL_REQUEST_CODE.to_be_bytes()].concat()
+        };
         let group = net.add_group(TcpGroupConfig {
             name: "postgres",
             framing: Framing::Raw,
             replay: ReplayPolicy::Drop,
             max_frame_size: usize::MAX,
-            on_connect_msg: Some(Self::startup_bytes(&self.user, &self.database, &self.params)),
+            on_connect_msg: Some(on_connect_msg),
             ..Default::default()
         });
         self.group = Some(group);
@@ -393,6 +500,7 @@ impl Postgres {
                 state: State::Connecting,
                 rx: Vec::new(),
                 outbox: Vec::new(),
+                tls: None,
             });
         }
     }
@@ -418,18 +526,18 @@ impl Postgres {
                 continue;
             }
             let Some(request) = self.pop_queued() else { break };
-            let token = self.conns[index].token;
-            let sent = net.send_with(token, |buf| {
-                buf.push(b'Q');
-                buf.extend_from_slice(&((request.sql.len() + 5) as u32).to_be_bytes());
-                buf.extend_from_slice(request.sql.as_bytes());
-                buf.push(0);
-                if let Some(data) = &request.data {
-                    buf.push(b'd');
-                    buf.extend_from_slice(&((data.len() + 4) as u32).to_be_bytes());
-                    buf.extend_from_slice(data);
-                    buf.push(b'c');
-                    buf.extend_from_slice(&4u32.to_be_bytes());
+            let Self { conns, tls_plain, tls_wire, .. } = &mut *self;
+            let conn = &mut conns[index];
+            // Encrypting inside the serializer leaves the session untouched
+            // when the send is refused, so the request can be requeued.
+            let sent = net.send_with(conn.token, |buf| match conn.tls.as_mut() {
+                None => request.encode(buf),
+                Some(session) => {
+                    tls_plain.clear();
+                    request.encode(tls_plain);
+                    tls_wire.clear();
+                    session.encrypt(tls_plain, tls_wire);
+                    buf.extend_from_slice(tls_wire);
                 }
             });
             if !sent {
@@ -467,6 +575,34 @@ impl Postgres {
         self.conns.iter().position(|conn| conn.token == token)
     }
 
+    /// Handles the server's answer to `SSLRequest`, which precedes any TLS
+    /// and so arrives alone; anything after it is unencrypted and refused.
+    fn negotiate(&mut self, index: usize, payload: &[u8]) {
+        match payload {
+            #[cfg(feature = "tls")]
+            [b'S'] => {
+                let mut session = Box::new(self.tls_session());
+                let conn = &mut self.conns[index];
+                session.start(&mut conn.outbox);
+                conn.tls = Some(session);
+                conn.state = State::Handshaking;
+            }
+            [b'N'] if self.ssl_mode == SslMode::Prefer => {
+                let conn = &mut self.conns[index];
+                conn.outbox.extend_from_slice(&self.startup);
+                conn.state = State::Startup(Startup::AwaitAuth);
+            }
+            [b'N'] => {
+                warn!(ssl_mode = ?self.ssl_mode, "postgres refused TLS");
+                self.conns[index].state = State::Dead;
+            }
+            _ => {
+                warn!(len = payload.len(), "postgres answered SSLRequest unexpectedly");
+                self.conns[index].state = State::Dead;
+            }
+        }
+    }
+
     /// Returns whether the event belonged to this client. Outcomes queue
     /// inside and are delivered by [`Postgres::drive`].
     pub fn on_event(&mut self, event: &NetworkEvent) -> bool {
@@ -475,26 +611,45 @@ impl Postgres {
             NetworkEvent::Connected { group, token, .. } |
             NetworkEvent::Disconnected { group, token, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
+                let negotiate = self.ssl_mode != SslMode::Disable;
                 let conn = &mut self.conns[index];
                 if let Some(id) = conn.in_flight() {
                     self.outcomes.push((id, Err(Error::Disconnected)));
                 }
-                conn.reset(if matches!(event, NetworkEvent::Connected { .. }) {
-                    State::Startup(Startup::AwaitAuth)
-                } else {
-                    State::Connecting
+                conn.reset(match event {
+                    NetworkEvent::Connected { .. } if negotiate => State::Negotiating,
+                    NetworkEvent::Connected { .. } => State::Startup(Startup::AwaitAuth),
+                    _ => State::Connecting,
                 });
                 true
             }
             NetworkEvent::Message { group, token, payload, .. } => {
                 let Some(index) = self.conn_index(group, token) else { return false };
-                let Self { conns, outcomes, user, password, max_output_bytes, .. } = self;
+                if matches!(self.conns[index].state, State::Negotiating) {
+                    self.negotiate(index, payload);
+                    return true;
+                }
+                let Self { conns, outcomes, user, password, max_output_bytes, startup, .. } = self;
                 let max_output_bytes = *max_output_bytes;
                 let conn = &mut conns[index];
                 if matches!(conn.state, State::Dead) {
                     return true;
                 }
-                conn.rx.extend_from_slice(payload);
+                // Replies queued below are plaintext until encrypted at the end.
+                let plain_from = conn.outbox.len();
+                if let Some(session) = conn.tls.as_mut() {
+                    if let Err(error) = Conn::decrypt(session, payload, &mut conn.rx) {
+                        warn!(%error, "postgres TLS session failed");
+                        outcomes.extend(conn.fatal(Error::Protocol("TLS session failed")));
+                        return true;
+                    }
+                    if matches!(conn.state, State::Handshaking) && !session.is_handshaking() {
+                        conn.outbox.extend_from_slice(startup);
+                        conn.state = State::Startup(Startup::AwaitAuth);
+                    }
+                } else {
+                    conn.rx.extend_from_slice(payload);
+                }
                 let mut outcome = None;
                 if conn.rx.len() > max_output_bytes {
                     outcome = conn.fatal(Error::TooLarge);
@@ -538,6 +693,12 @@ impl Postgres {
                         rx.drain(..consumed);
                         conn.rx = rx;
                     }
+                }
+                // Also flushes the session's own records, such as the
+                // handshake's final flight.
+                if let Some(session) = conn.tls.as_mut() {
+                    let plain = conn.outbox.split_off(plain_from);
+                    session.encrypt(&plain, &mut conn.outbox);
                 }
                 if let Some(outcome) = outcome {
                     outcomes.push(outcome);
@@ -637,6 +798,9 @@ impl State {
     ) -> Result<Option<Outcome>, Error> {
         match self {
             Self::Connecting => Err(Error::Protocol("message arrived before connect completed")),
+            Self::Negotiating | Self::Handshaking => {
+                Err(Error::Protocol("message arrived before TLS was established"))
+            }
             Self::Dead => Ok(None),
             Self::Ready => match tag {
                 b'Z' | b'A' | b'K' | b'N' | b'S' => Ok(None),

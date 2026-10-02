@@ -19,5 +19,8 @@ tracing.workspace = true
 [dev-dependencies]
 flux-clickhouse.workspace = true
 
+[features]
+tls = ["flux-network/tls"]
+
 [lints]
 workspace = true
