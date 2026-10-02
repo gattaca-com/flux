@@ -13,7 +13,6 @@ use std::{
     os::fd::AsRawFd,
 };
 
-use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos};
 use flux_utils::DCache;
 use mio::{Interest, Registry, Token, event::Event as MioEvent, net::UdpSocket};
@@ -24,12 +23,8 @@ use super::{
     sys::{BATCH, RecvBatch, SendBatch},
     wire::{HEADER_SIZE, Header, Kind},
 };
-use crate::{
-    NetworkTelemetry,
-    network::{
-        Event, Group, PayloadBuf, ReplayPolicy, RxPayload, Tokens, UdpGroupConfig,
-        set_socket_buf_size,
-    },
+use crate::network::{
+    Event, Group, PayloadBuf, ReplayPolicy, RxPayload, Tokens, UdpGroupConfig, set_socket_buf_size,
 };
 
 struct Endpoint {
@@ -59,11 +54,6 @@ fn new_session(salt: usize) -> u32 {
     x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
     x ^= x >> 33;
     x as u32
-}
-
-fn latency_timer(telemetry: NetworkTelemetry, peer: SocketAddr) -> Option<Timer> {
-    let NetworkTelemetry::Enabled { app_name } = telemetry else { return None };
-    Some(Timer::new(app_name, format!("udp_latency_{peer}")))
 }
 
 #[inline]
@@ -205,14 +195,7 @@ impl UdpManager {
         tokens: &mut Tokens,
     ) -> Token {
         let token = tokens.allocate(self.group);
-        let mut peer = UdpPeer::new(
-            addr,
-            token,
-            token,
-            new_session(token.0),
-            self.config.udp,
-            latency_timer(self.config.telemetry, addr),
-        );
+        let mut peer = UdpPeer::new(addr, token, token, new_session(token.0), &self.config);
         let now = Instant::now();
         // First in the queue; nothing goes out before the handshake anyway.
         push_on_connect(&mut self.store, &self.config, &mut peer, now);
@@ -663,14 +646,8 @@ impl UdpManager {
     {
         let token = tokens.allocate(self.group);
         let entry = &self.sockets[k];
-        let mut peer = UdpPeer::new(
-            dgram.from,
-            token,
-            entry.token,
-            new_session(token.0),
-            self.config.udp,
-            latency_timer(self.config.telemetry, dgram.from),
-        );
+        let mut peer =
+            UdpPeer::new(dgram.from, token, entry.token, new_session(token.0), &self.config);
         peer.on_hello(&dgram.header, &entry.socket, dgram.now);
         push_on_connect(&mut self.store, &self.config, &mut peer, dgram.now);
         info!(addr = %dgram.from, "udp client connected");

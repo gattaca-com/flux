@@ -25,17 +25,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+use flux_communication::cleanup_shmem;
 use flux_network::{
-    Group, GroupConfig, Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, UdpConfig,
-    UdpGroupConfig,
+    Group, GroupConfig, Network, NetworkEvent, NetworkTelemetry, ReplayPolicy, TcpGroupConfig,
+    UdpConfig, UdpGroupConfig,
 };
 use flux_timing::Nanos;
+use flux_utils::directories::shmem_dir;
 
-const SIZES: [(&str, usize); 3] = [("2k", 2 * 1024), ("64k", 64 * 1024), ("2m", 2 * 1024 * 1024)];
+/// The largest size fits in half a 4 MiB receive buffer (`net.core.rmem_max`
+/// default on many hosts), so no scenario but `loss1` ever drops a datagram.
+const SIZES: [(&str, usize); 3] = [("2k", 2 * 1024), ("64k", 64 * 1024), ("1m", 1024 * 1024)];
 const PACED_MSGS: usize = 2000;
 const PACE: Duration = Duration::from_micros(100);
 const BCAST_PEERS: usize = 8;
 const BIG_SOCKET_BUF: usize = 16 * 1024 * 1024;
+/// Shared-memory telemetry queues of the `udp+tel` transport live here.
+const APP_NAME: &str = "udp-pipeline-bench";
 
 fn free_addr() -> SocketAddr {
     loop {
@@ -62,7 +68,7 @@ fn udp_config() -> UdpConfig {
     UdpConfig { max_message_size: 4 * 1024 * 1024, ..UdpConfig::lan() }
 }
 
-fn transports() -> [(&'static str, GroupConfig); 2] {
+fn transports() -> [(&'static str, GroupConfig); 3] {
     [
         (
             "tcp",
@@ -74,6 +80,15 @@ fn transports() -> [(&'static str, GroupConfig); 2] {
             .into(),
         ),
         ("udp", UdpGroupConfig { udp: udp_config(), ..Default::default() }.into()),
+        (
+            "udp+tel",
+            UdpGroupConfig {
+                udp: udp_config(),
+                telemetry: NetworkTelemetry::Enabled { app_name: APP_NAME },
+                ..Default::default()
+            }
+            .into(),
+        ),
     ]
 }
 
@@ -83,10 +98,33 @@ fn connector(config: GroupConfig) -> (Network, Group) {
     (network, group)
 }
 
+/// Payload bytes a receive buffer holds for ~1.2 KB datagrams. The kernel
+/// caps the grant at `net.core.rmem_max`, reports twice the granted size, and
+/// spends about half of it on skb bookkeeping.
+fn recv_capacity() -> usize {
+    use std::os::fd::AsRawFd;
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    big_buffers(&socket);
+    let mut granted: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::from_mut(&mut granted).cast(),
+            std::ptr::from_mut(&mut len),
+        );
+    }
+    granted as usize / 4
+}
+
 /// Message count and bound on outstanding messages for a burst of `size`.
+/// At most half the receive buffer is in flight, so a burst never overflows
+/// the receiver and the numbers measure the transport, not loss recovery.
 fn burst_plan(size: usize) -> (usize, usize) {
     let count = (64 * 1024 * 1024 / size).clamp(16, 4096);
-    let window = (UdpConfig::default().send_window / 2 / size.div_ceil(1171)).clamp(1, 256);
+    let window = (recv_capacity() / 2 / size).clamp(1, 256);
     (count, window)
 }
 
@@ -170,15 +208,23 @@ fn run(sc: Scenario) -> Stats {
     let msg = vec![0x5Au8; size];
     let stop = Arc::new(AtomicBool::new(false));
     let got = Arc::new(AtomicUsize::new(0));
+    // Set once the receiver is pinned and polling, so the first burst does
+    // not sit in the socket buffer long enough to trip the initial RTO.
+    let ready = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = mpsc::channel();
     let expected = count * clients;
     let rx_thread = {
         let stop = stop.clone();
         let got = got.clone();
+        let ready = ready.clone();
         let mut receivers = receivers;
         thread::spawn(move || {
             pin(0);
             let mut lat = Vec::with_capacity(expected);
+            for r in &mut receivers {
+                r.poll_with(|_| {});
+            }
+            ready.store(true, Ordering::Release);
             while lat.len() < expected && !stop.load(Ordering::Relaxed) {
                 for r in &mut receivers {
                     r.poll_with(|e| {
@@ -195,6 +241,9 @@ fn run(sc: Scenario) -> Stats {
     };
 
     pin(1);
+    while !ready.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
     let start = Instant::now();
     let mut sent = 0;
     let mut next_send = start;
@@ -301,6 +350,7 @@ impl Drop for Relay {
 
 fn main() {
     pin(usize::MAX);
+    cleanup_shmem(&shmem_dir(APP_NAME));
     println!("== paced: one message per 100µs, one receiver ==");
     for (size_name, size) in SIZES {
         for (name, transport) in transports() {
@@ -378,4 +428,5 @@ fn main() {
             s.row(&format!("bcast/{name}/{size_name}"), &format!("window={window}"));
         }
     }
+    cleanup_shmem(&shmem_dir(APP_NAME));
 }
