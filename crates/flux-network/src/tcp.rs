@@ -9,6 +9,7 @@ use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos, Repeater};
 use flux_utils::{DCache, DCacheRef};
 use mio::{Interest, Registry, Token, event::Event as MioEvent, net::TcpListener};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -220,6 +221,7 @@ pub(crate) struct TcpManager {
     reconnector: Repeater,
     listeners: Vec<Listener>,
     connections: Vec<Connection>,
+    by_token: FxHashMap<Token, usize>,
     pending_disconnects: Vec<PendingDisconnect>,
     send_buffer: Vec<u8>,
     tls_buffer: Vec<u8>,
@@ -266,6 +268,10 @@ impl TcpManager {
             reconnector,
             listeners: Vec::with_capacity(INITIAL_LISTENER_CAPACITY),
             connections: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
+            by_token: FxHashMap::with_capacity_and_hasher(
+                INITIAL_CONNECTION_CAPACITY,
+                FxBuildHasher,
+            ),
             pending_disconnects: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
             tls_buffer: Vec::new(),
@@ -338,20 +344,39 @@ impl TcpManager {
         }
     }
 
+    fn index_of(&self, token: Token) -> Option<usize> {
+        self.by_token.get(&token).copied()
+    }
+
+    fn push_connection(&mut self, connection: Connection) -> usize {
+        let index = self.connections.len();
+        self.by_token.insert(connection.token, index);
+        self.connections.push(connection);
+        index
+    }
+
+    fn swap_remove_connection(&mut self, index: usize) {
+        let removed = self.connections.swap_remove(index);
+        self.by_token.remove(&removed.token);
+        if let Some(moved) = self.connections.get(index) {
+            self.by_token.insert(moved.token, index);
+        }
+    }
+
     pub(crate) fn pause_broadcast(&mut self, token: Token) {
-        if let Some(connection) = self.connections.iter_mut().find(|c| c.token == token) {
-            connection.broadcast_paused = true;
+        if let Some(index) = self.index_of(token) {
+            self.connections[index].broadcast_paused = true;
         }
     }
 
     pub(crate) fn resume_broadcast(&mut self, token: Token) {
-        if let Some(connection) = self.connections.iter_mut().find(|c| c.token == token) {
-            connection.broadcast_paused = false;
+        if let Some(index) = self.index_of(token) {
+            self.connections[index].broadcast_paused = false;
         }
     }
 
     pub(crate) fn is_broadcast_paused(&self, token: Token) -> bool {
-        self.connections.iter().any(|c| c.token == token && c.broadcast_paused)
+        self.index_of(token).is_some_and(|index| self.connections[index].broadcast_paused)
     }
 
     pub(crate) fn listen(
@@ -361,7 +386,7 @@ impl TcpManager {
         tokens: &mut Tokens,
     ) -> io::Result<Token> {
         let group = self.group;
-        let mut socket = bind_listener(addr, self.config.socket_buf_size)?;
+        let mut socket = bind_listener(addr, self.config.socket_buf_size, self.config.reuse_port)?;
         let token = tokens.allocate(group);
         if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
             tokens.retire(token);
@@ -420,7 +445,7 @@ impl TcpManager {
         let config = &self.config;
         let timers =
             NetworkTimers::new(config.telemetry, config.name, token, peer_addr, config.framing);
-        self.connections.push(Connection {
+        let index = self.push_connection(Connection {
             token,
             peer_addr,
             local_ip,
@@ -432,7 +457,7 @@ impl TcpManager {
             timers,
             tls,
         });
-        self.start_connect(registry, self.connections.len() - 1);
+        self.start_connect(registry, index);
         token
     }
 
@@ -746,7 +771,7 @@ impl TcpManager {
                 (token, stream, timers, config.name)
             };
 
-            self.connections.push(Connection {
+            self.push_connection(Connection {
                 token,
                 peer_addr,
                 local_ip: None,
@@ -778,8 +803,7 @@ impl TcpManager {
             self.accept_connections(registry, index, tokens, dcache, handler);
             return;
         }
-        let Some(index) = self.connections.iter().position(|connection| connection.token == token)
-        else {
+        let Some(index) = self.index_of(token) else {
             debug!(?token, "ignoring stale tcp readiness event");
             return;
         };
@@ -864,7 +888,7 @@ impl TcpManager {
         let was_connected = self.close_connection_socket(registry, index);
         if kind == ConnectionKind::Accepted {
             tokens.retire(event.token);
-            self.connections.swap_remove(index);
+            self.swap_remove_connection(index);
         }
         if notify && was_connected && announced {
             self.pending_disconnects.push(event);
@@ -890,13 +914,13 @@ impl TcpManager {
 
     /// Finds the connection `token` can currently send on.
     fn sendable_index(&self, token: Token) -> Option<usize> {
-        self.connections.iter().position(|connection| {
-            connection.token == token &&
-                !connection.close_when_drained &&
-                !connection.is_handshaking() &&
-                (matches!(connection.state, ConnectionState::Connected(_)) ||
-                    self.config.replay == ReplayPolicy::Replay)
-        })
+        let index = self.index_of(token)?;
+        let connection = &self.connections[index];
+        (!connection.close_when_drained &&
+            !connection.is_handshaking() &&
+            (matches!(connection.state, ConnectionState::Connected(_)) ||
+                self.config.replay == ReplayPolicy::Replay))
+            .then_some(index)
     }
 
     /// Serialises one payload as a frame at the end of `send_buffer`.
@@ -1144,8 +1168,7 @@ impl TcpManager {
         token: Token,
         tokens: &mut Tokens,
     ) -> bool {
-        let Some(index) = self.connections.iter().position(|connection| connection.token == token)
-        else {
+        let Some(index) = self.index_of(token) else {
             return false;
         };
         if matches!(self.connections[index].state, ConnectionState::Disconnected) {
@@ -1161,8 +1184,7 @@ impl TcpManager {
         token: Token,
         tokens: &mut Tokens,
     ) -> bool {
-        let Some(index) = self.connections.iter().position(|connection| connection.token == token)
-        else {
+        let Some(index) = self.index_of(token) else {
             return false;
         };
         let ConnectionState::Connected(stream) = &self.connections[index].state else {
@@ -1181,12 +1203,11 @@ impl TcpManager {
             let _ = registry.deregister(&mut listener.socket);
             return true;
         }
-        let Some(index) = self.connections.iter().position(|connection| connection.token == token)
-        else {
+        let Some(index) = self.index_of(token) else {
             return false;
         };
         self.close_connection_socket(registry, index);
-        self.connections.swap_remove(index);
+        self.swap_remove_connection(index);
         self.pending_disconnects.retain(|event| event.token != token);
         true
     }
@@ -1196,9 +1217,10 @@ impl TcpManager {
         if self.config.framing != Framing::LengthPrefixed {
             return 0;
         }
-        let Some(connection) = self.connections.iter_mut().find(|c| c.token == token) else {
+        let Some(index) = self.index_of(token) else {
             return 0;
         };
+        let connection = &mut self.connections[index];
         if connection.tls.is_some() {
             return 0;
         }
@@ -1232,8 +1254,14 @@ impl TcpManager {
     }
 }
 
-fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result<TcpListener> {
-    let Some(size) = socket_buf_size else { return TcpListener::bind(addr) };
+fn bind_listener(
+    addr: SocketAddr,
+    socket_buf_size: Option<usize>,
+    reuse_port: bool,
+) -> io::Result<TcpListener> {
+    if socket_buf_size.is_none() && !reuse_port {
+        return TcpListener::bind(addr);
+    }
     let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     let fd = unsafe {
         libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
@@ -1242,21 +1270,37 @@ fn bind_listener(addr: SocketAddr, socket_buf_size: Option<usize>) -> io::Result
         return Err(io::Error::last_os_error());
     }
     let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-    let reuse: libc::c_int = 1;
+    let enable: libc::c_int = 1;
     if unsafe {
         libc::setsockopt(
             listener.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_REUSEADDR,
-            ptr::from_ref(&reuse).cast(),
+            ptr::from_ref(&enable).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         )
     } != 0
     {
         return Err(io::Error::last_os_error());
     }
+    if reuse_port {
+        if unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                ptr::from_ref(&enable).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
     // Accepted sockets inherit the receive window negotiated before accept().
-    set_socket_buf_size(&listener, size);
+    if let Some(size) = socket_buf_size {
+        set_socket_buf_size(&listener, size);
+    }
     let (storage, len) = sockaddr(addr);
     if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
         return Err(io::Error::last_os_error());

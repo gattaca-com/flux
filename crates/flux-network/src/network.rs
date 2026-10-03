@@ -227,6 +227,8 @@ impl Write for PayloadBuf<'_> {
 
 /// Configuration shared by every listener and connection in a [`Group`].
 #[derive(Clone)]
+// Independent socket options, not states of one value.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TcpGroupConfig {
     /// Stable label used in logs and telemetry.
     pub name: &'static str,
@@ -235,6 +237,10 @@ pub struct TcpGroupConfig {
     pub on_connect_msg: Option<Vec<u8>>,
     /// Requested `SO_SNDBUF` and `SO_RCVBUF` size.
     pub socket_buf_size: Option<usize>,
+    /// Bind listeners with `SO_REUSEPORT`, so listeners in several networks
+    /// can share an address. The kernel spreads new connections across them by
+    /// hashing the peer address and port.
+    pub reuse_port: bool,
     /// Whether to enable `TCP_NODELAY`.
     pub nodelay: bool,
     /// Whether to enable TCP keepalive.
@@ -280,6 +286,7 @@ impl Default for TcpGroupConfig {
             name: "tcp",
             on_connect_msg: None,
             socket_buf_size: None,
+            reuse_port: false,
             nodelay: true,
             keepalive: false,
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,

@@ -88,6 +88,14 @@ impl Header {
     }
 }
 
+#[inline]
+pub(crate) fn parse_len_and_index(header: &[u8]) -> (u32, u16) {
+    (
+        u32::from_le_bytes(header[15..19].try_into().unwrap()),
+        u16::from_le_bytes(header[19..21].try_into().unwrap()),
+    )
+}
+
 /// Rewrite only the session of an encoded header (replay after reconnect).
 #[inline]
 pub(crate) fn write_session(buf: &mut [u8], session: u32) {

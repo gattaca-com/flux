@@ -100,7 +100,8 @@ impl<T: Copy> Seqlock<T> {
     pub fn write(&self, data: &T) {
         // Increment the sequence number. At this point, the number will be odd,
         // which will force readers to spin until we finish writing.
-        let v = self.version.fetch_add(1, Ordering::Release);
+        let v = self.version.load(Ordering::Relaxed);
+        self.version.store(v.wrapping_add(1), Ordering::Release);
         compiler_fence(Ordering::AcqRel);
         // Make sure any writes to the data happen after incrementing the
         // sequence number. What we ideally want is a store(Acquire), but the
@@ -108,20 +109,6 @@ impl<T: Copy> Seqlock<T> {
         unsafe { *self.data.get() = *data };
         compiler_fence(Ordering::AcqRel);
         // unsafe {asm!("sti");}
-        self.version.store(v.wrapping_add(2), Ordering::Release);
-    }
-
-    /// [`Self::write`] for a slot with exactly one writer: the version bump
-    /// is a plain load and store, not a locked read-modify-write. A locked
-    /// instruction is a full barrier that drains the store buffer, which
-    /// dominates the cost of a write on the SPMC path.
-    #[inline]
-    pub fn write_single_producer(&self, data: &T) {
-        let v = self.version.load(Ordering::Relaxed);
-        self.version.store(v.wrapping_add(1), Ordering::Release);
-        compiler_fence(Ordering::AcqRel);
-        unsafe { *self.data.get() = *data };
-        compiler_fence(Ordering::AcqRel);
         self.version.store(v.wrapping_add(2), Ordering::Release);
     }
 

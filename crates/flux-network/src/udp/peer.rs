@@ -3,18 +3,27 @@
 
 use std::{collections::VecDeque, io, net::SocketAddr, os::fd::AsRawFd};
 
-use flux_communication::Timer;
+use flux_communication::{
+    Timer,
+    queue::{Producer, Queue, QueueType},
+};
 use flux_timing::{Duration, Instant, Nanos};
-use flux_utils::DCache;
+use flux_utils::{
+    DCache,
+    directories::{local_share_dir, shmem_dir_queues_with_base},
+};
 use mio::{Token, net::UdpSocket};
 use tracing::{debug, warn};
 
 use super::{
     UdpConfig,
     sys::{BATCH, SendBatch, SockAddr},
-    wire::{HEADER_SIZE, Header, Kind, fragment_count, write_session},
+    wire::{HEADER_SIZE, Header, Kind, fragment_count, parse_len_and_index, write_session},
 };
-use crate::network::RxPayload;
+use crate::{
+    NetworkTelemetry,
+    network::{RxPayload, UdpGroupConfig},
+};
 
 /// Retransmit backoff saturates at `rto << MAX_BACKOFF_SHIFT` (and `max_rto`).
 const MAX_BACKOFF_SHIFT: u8 = 6;
@@ -63,6 +72,44 @@ fn send_datagram(socket: &UdpSocket, addr: SocketAddr, bytes: &[u8]) -> SendOutc
             SendOutcome::Done
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UdpSend {
+    pub sent_at: Instant,
+    pub bytes: u32,
+    pub datagrams: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UdpRetransmit {
+    pub sent_at: Instant,
+    pub bytes: u32,
+    pub retries: u8,
+}
+
+fn telemetry_label(group_name: &str, token: Token, peer: SocketAddr) -> String {
+    format!("{group_name}_{}_{peer}", token.0)
+}
+
+fn latency_timer(telemetry: NetworkTelemetry, label: &str) -> Option<Timer> {
+    let NetworkTelemetry::Enabled { app_name } = telemetry else { return None };
+    Some(Timer::new(app_name, format!("udp_latency_{label}")))
+}
+
+fn telemetry_producer<T: Copy>(
+    telemetry: NetworkTelemetry,
+    kind: &str,
+    label: &str,
+) -> Option<Producer<T>> {
+    const QUEUE_SIZE: usize = 2usize.pow(13);
+    let NetworkTelemetry::Enabled { app_name } = telemetry else { return None };
+    let dir = shmem_dir_queues_with_base(local_share_dir(), app_name);
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join(format!("udp_{kind}_{label}"));
+    Some(Producer::from(Queue::create_or_open_shared(file, QUEUE_SIZE, QueueType::MPMC)))
 }
 
 /// RFC 6298 estimator in TSC ticks.
@@ -227,10 +274,12 @@ struct TxWindow {
     recover: u64,
     last_scan: Instant,
     exceeded_since: Option<Instant>,
+    sends: Option<Producer<UdpSend>>,
+    retransmits: Option<Producer<UdpRetransmit>>,
 }
 
 impl TxWindow {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, config: &UdpGroupConfig, label: &str) -> Self {
         let mut slots = Vec::with_capacity(capacity);
         slots.resize_with(capacity, || Fragment {
             header: [0; HEADER_SIZE],
@@ -253,6 +302,8 @@ impl TxWindow {
             recover: 1,
             last_scan: Instant::ZERO,
             exceeded_since: None,
+            sends: telemetry_producer(config.telemetry, "sends", label),
+            retransmits: telemetry_producer(config.telemetry, "retransmits", label),
         }
     }
 
@@ -339,8 +390,29 @@ impl TxWindow {
         f.sent_at = now;
         if retransmit {
             f.retries = f.retries.saturating_add(1);
-        } else if seq == self.next_send {
+            if let Some(retransmits) = &mut self.retransmits {
+                retransmits.produce(&UdpRetransmit {
+                    sent_at: now,
+                    bytes: (HEADER_SIZE + usize::from(f.len)) as u32,
+                    retries: f.retries,
+                });
+            }
+            return;
+        }
+        if seq == self.next_send {
             self.next_send += 1;
+        }
+        if let Some(sends) = &mut self.sends {
+            let (len, index) = parse_len_and_index(&f.header);
+            let last_datagram = f.offset + u32::from(f.len) == len;
+            if last_datagram {
+                let datagrams = u32::from(index) + 1;
+                sends.produce(&UdpSend {
+                    sent_at: now,
+                    bytes: len + datagrams * HEADER_SIZE as u32,
+                    datagrams,
+                });
+            }
         }
     }
 
@@ -782,10 +854,11 @@ impl UdpPeer {
         token: Token,
         socket_token: Token,
         local_session: u32,
-        config: UdpConfig,
-        latency: Option<Timer>,
+        group: &UdpGroupConfig,
     ) -> Self {
         let now = Instant::now();
+        let config = group.udp;
+        let label = telemetry_label(group.name, token, addr);
         // Whole 64-bit words of bitmap that fit in one datagram.
         let max_bits = (config.stride() / 8 * 64) as u64;
         let rx = RxWindow::new(config.recv_window, max_bits, !config.reliable);
@@ -799,7 +872,7 @@ impl UdpPeer {
             ever_connected: false,
             local_session,
             remote_session: None,
-            tx: TxWindow::new(config.send_window),
+            tx: TxWindow::new(config.send_window, group, &label),
             ctrl: vec![0; HEADER_SIZE + rx.max_bits.div_ceil(64) as usize * 8],
             rx,
             rto: Rto::new(&config),
@@ -809,7 +882,7 @@ impl UdpPeer {
             hello_backoff: 0,
             ack_due: false,
             close_when_drained: false,
-            latency,
+            latency: latency_timer(group.telemetry, &label),
             dropped_full: 0,
             last_warn: Instant::ZERO,
         }
@@ -1258,6 +1331,10 @@ impl UdpPeer {
 mod tests {
     use super::*;
 
+    fn group(udp: UdpConfig) -> UdpGroupConfig {
+        UdpGroupConfig { udp, ..Default::default() }
+    }
+
     fn cfg() -> UdpConfig {
         UdpConfig {
             send_window: 64,
@@ -1294,7 +1371,7 @@ mod tests {
         let config = cfg();
         let stride = config.stride();
         let mut store = MsgStore::new();
-        let mut tx = TxWindow::new(config.send_window);
+        let mut tx = TxWindow::new(config.send_window, &group(config), "");
         assert!(push(&mut tx, &mut store, stride, &vec![0; stride * 3]));
         assert!(push(&mut tx, &mut store, stride, &vec![7; stride * 5]));
         assert_eq!(tx.free(), 56);
@@ -1332,7 +1409,7 @@ mod tests {
         let config = cfg();
         let stride = config.stride();
         let mut store = MsgStore::new();
-        let mut tx = TxWindow::new(config.send_window);
+        let mut tx = TxWindow::new(config.send_window, &group(config), "");
         let (s, to) = sock();
         let fd = s.as_raw_fd();
         let mut batch = SendBatch::new();
@@ -1360,7 +1437,7 @@ mod tests {
         let config = cfg();
         let stride = config.stride();
         let mut store = MsgStore::new();
-        let mut tx = TxWindow::new(config.send_window);
+        let mut tx = TxWindow::new(config.send_window, &group(config), "");
         assert!(push(&mut tx, &mut store, stride, &vec![0; stride * 4]));
         assert!(push(&mut tx, &mut store, stride, &vec![1; stride * 4]));
         assert!(push(&mut tx, &mut store, stride, &vec![2; stride * 2]));
@@ -1382,7 +1459,7 @@ mod tests {
         let config = cfg();
         let stride = config.stride();
         let mut store = MsgStore::new();
-        let mut tx = TxWindow::new(config.send_window);
+        let mut tx = TxWindow::new(config.send_window, &group(config), "");
         let (s, to) = sock();
         let fd = s.as_raw_fd();
         let mut batch = SendBatch::new();
@@ -1443,7 +1520,7 @@ mod tests {
     #[test]
     fn control_replies_reset_only_the_current_session() {
         let mut peer =
-            UdpPeer::new("127.0.0.1:1".parse().unwrap(), Token(0), Token(0), 1, cfg(), None);
+            UdpPeer::new("127.0.0.1:1".parse().unwrap(), Token(0), Token(0), 1, &group(cfg()));
         let now = Instant::now();
         let mut header =
             Header { kind: Kind::HelloAck, session: 2, seq: 0, len: 1, index: 0, send_ts: 0 };
@@ -1481,7 +1558,7 @@ mod tests {
         let config = UdpConfig { reliable: false, ..cfg() };
         let (s, _) = sock();
         let mut store = MsgStore::new();
-        let mut peer = UdpPeer::new(s.local_addr().unwrap(), Token(0), Token(0), 1, config, None);
+        let mut peer = UdpPeer::new(s.local_addr().unwrap(), Token(0), Token(0), 1, &group(config));
         let mut batch = SendBatch::new();
         let now = Instant::now();
         let slot = store.insert(&mut vec![0; config.stride() * 3]);
