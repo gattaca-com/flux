@@ -31,6 +31,9 @@ impl TileConfig {
             thread_niceness,
             min_loop_duration: None,
             metrics: true,
+            #[cfg(feature = "park")]
+            park: true,
+            #[cfg(not(feature = "park"))]
             park: false,
         }
     }
