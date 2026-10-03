@@ -27,6 +27,9 @@ proptest-regressions/
 # Pi coding agent config (ask @louisponet for a .pi folder)
 .pi
 
+# Claude agent worktrees
+/.claude/worktrees/
+
 # Coverage report
 lcov.info
 
