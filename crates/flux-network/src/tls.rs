@@ -1,10 +1,11 @@
-//! Client-side TLS sessions for outbound connections.
+//! TLS sessions for outbound connections and accepted sockets.
 //!
-//! A [`Session`] wraps one rustls client connection. The transport hands it
-//! socket bytes to decrypt, plaintext to encrypt, and flushes whatever the
-//! session wants to send. Certificates verify against the Mozilla roots; the
-//! crypto provider is explicit (ring) and never installed process-wide, so a
-//! host using another provider is unaffected.
+//! A [`Session`] wraps one rustls connection. The transport hands it socket
+//! bytes to decrypt, plaintext to encrypt, and flushes whatever the session
+//! wants to send. Clients verify against the Mozilla roots by default; servers
+//! use the caller's [`ServerConfig`]. The crypto provider is explicit (ring)
+//! and never installed process-wide, so a host using another provider is
+//! unaffected.
 //!
 //! Without the `tls` feature `Session` is uninhabited: the transport keeps
 //! its `Option<Session>` fields, they are always `None`, and no TLS
@@ -13,7 +14,7 @@
 #[cfg(not(feature = "tls"))]
 pub use disabled::Session;
 #[cfg(feature = "tls")]
-pub use enabled::{ClientConfig, Session};
+pub use enabled::{ClientConfig, ServerConfig, Session};
 /// The rustls build these sessions use, so callers configuring TLS cannot
 /// drift onto a second version of the crate.
 #[cfg(feature = "tls")]
@@ -27,11 +28,13 @@ mod enabled {
     };
 
     use flux_timing::{Duration, Instant};
-    pub use rustls::ClientConfig;
+    pub use rustls::{ClientConfig, ServerConfig};
 
     /// Socket read size; one syscall feeds many TLS records.
     const CIPHER_CHUNK: usize = 32 * 1024;
-    use rustls::{ClientConnection, RootCertStore, pki_types::ServerName};
+    use rustls::{
+        ClientConnection, Connection, RootCertStore, ServerConnection, pki_types::ServerName,
+    };
 
     /// The shared default: Mozilla roots over the ring provider.
     fn default_config() -> Arc<ClientConfig> {
@@ -52,11 +55,15 @@ mod enabled {
     }
 
     pub struct Session {
-        server: ServerName<'static>,
+        /// `None` for accepted sockets.
+        server: Option<ServerName<'static>>,
         config: Option<Arc<ClientConfig>>,
-        conn: Option<ClientConnection>,
+        conn: Option<Connection>,
+        /// Servers advertising ALPN reject peers that negotiate none.
+        require_alpn: bool,
         started: Option<Instant>,
-        /// Whether the completed handshake has been reported once.
+        /// Whether the connection has been reported once. Accepted sockets
+        /// are reported at TCP acceptance; clients after the handshake.
         announced: bool,
         cipher: Vec<u8>,
         /// Plaintext that did not fit the caller's buffer, and how much of it
@@ -70,15 +77,36 @@ mod enabled {
         /// Panics if `server` is not a valid DNS name or IP.
         pub fn new(server: &str) -> Self {
             Self {
-                server: ServerName::try_from(server.to_owned()).expect("valid TLS server name"),
+                server: Some(
+                    ServerName::try_from(server.to_owned()).expect("valid TLS server name"),
+                ),
                 config: None,
                 conn: None,
+                require_alpn: false,
                 started: None,
                 announced: false,
                 cipher: Vec::new(),
                 plain: Vec::new(),
                 served: 0,
             }
+        }
+        /// Server side of an accepted socket; the handshake starts with the
+        /// peer's first flight.
+        pub(crate) fn accept(config: Arc<ServerConfig>) -> Result<Self, rustls::Error> {
+            let require_alpn = !config.alpn_protocols.is_empty();
+            let mut conn = ServerConnection::new(config)?;
+            conn.set_buffer_limit(None);
+            Ok(Self {
+                server: None,
+                config: None,
+                conn: Some(conn.into()),
+                require_alpn,
+                started: Some(Instant::now()),
+                announced: true,
+                cipher: vec![0; CIPHER_CHUNK],
+                plain: Vec::new(),
+                served: 0,
+            })
         }
         /// Trusts `config` instead of the Mozilla roots.
         #[must_use]
@@ -91,10 +119,11 @@ mod enabled {
         pub fn start(&mut self, out: &mut Vec<u8>) {
             let config = self.config.clone().unwrap_or_else(default_config);
             let mut conn =
-                ClientConnection::new(config, self.server.clone()).expect("valid TLS config");
+                ClientConnection::new(config, self.server.clone().expect("outbound TLS session"))
+                    .expect("valid TLS config");
             // Sends are bounded by the caller's frame limits, not by rustls.
             conn.set_buffer_limit(None);
-            self.conn = Some(conn);
+            self.conn = Some(conn.into());
             self.started = Some(Instant::now());
             self.announced = false;
             self.plain.clear();
@@ -168,7 +197,7 @@ mod enabled {
         fn fill<R: io::Read>(&mut self, socket: &mut R, buf: &mut [u8]) -> io::Result<usize> {
             use std::io::Read as _;
             loop {
-                let Self { conn, cipher, plain, .. } = self;
+                let Self { conn, cipher, plain, require_alpn, .. } = self;
                 let Some(conn) = conn.as_mut() else {
                     return Err(io::Error::other("TLS bytes before the handshake started"))
                 };
@@ -186,6 +215,9 @@ mod enabled {
                 while !pending.is_empty() {
                     conn.read_tls(&mut pending)?;
                     conn.process_new_packets().map_err(io::Error::other)?;
+                    if *require_alpn && !conn.is_handshaking() && conn.alpn_protocol().is_none() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS requires ALPN"));
+                    }
                     // Decrypt into the caller's buffer, which a whole fill
                     // normally fits, so nothing is copied twice.
                     while filled < buf.len() {

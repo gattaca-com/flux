@@ -76,6 +76,7 @@ directories = "5.0.1"
 governor = "0.6.3"
 hdrhistogram = { version = "7.5.4", default-features = false }
 hmac = "0.12"
+http = "1"
 httparse = "1"
 humantime = "2.1"
 indexmap = { features = ["serde"], version = "2.11.1" }
@@ -103,6 +104,9 @@ strum = { features = ["derive"], version = "0.26.1" }
 syn = { version = "2.0.101", features = ["full"] }
 tempfile = "3"
 thiserror = "1.0.58"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "tls-ring", "transport"] }
 tinyvec = "1.10.0"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

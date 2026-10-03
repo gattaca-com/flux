@@ -3,7 +3,9 @@
 //! Use [`Network`] for an owned poll or [`NetworkWithExternalPoll`] for an
 //! existing one.
 
+pub mod grpc;
 pub mod http;
+pub mod http2;
 pub mod network;
 mod tcp;
 pub mod tls;

@@ -139,6 +139,8 @@ pub(crate) fn set_keepalive(_stream: &mio::net::TcpStream) -> io::Result<()> {
 struct Listener {
     token: Token,
     socket: TcpListener,
+    #[cfg(feature = "tls")]
+    tls: Option<std::sync::Arc<crate::tls::ServerConfig>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,7 +167,7 @@ struct Connection {
     broadcast_paused: bool,
     backlog: ByteQueue,
     timers: Option<NetworkTimers>,
-    /// Client TLS for this endpoint; `None` leaves the wire in plaintext.
+    /// TLS for this socket; `None` leaves the wire in plaintext.
     /// Boxed so a plaintext connection carries a pointer, not a session.
     tls: Option<Box<Session>>,
 }
@@ -390,8 +392,44 @@ impl TcpManager {
             tokens.retire(token);
             return Err(err);
         }
-        self.listeners.push(Listener { token, socket });
+        self.listeners.push(Listener {
+            token,
+            socket,
+            #[cfg(feature = "tls")]
+            tls: None,
+        });
         Ok(token)
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn listen_tls(
+        &mut self,
+        registry: &Registry,
+        addr: SocketAddr,
+        tokens: &mut Tokens,
+        config: std::sync::Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<Token> {
+        if config.max_early_data_size != 0 ||
+            self.config.on_connect_msg.is_some() ||
+            self.config.max_backlog_frames.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS listeners need no early data, no connect message and byte backlog limits",
+            ));
+        }
+        let token = self.listen(registry, addr, tokens)?;
+        self.listeners.last_mut().unwrap().tls = Some(config);
+        Ok(token)
+    }
+
+    /// Queued wire bytes, or `None` if `token` cannot take writes yet.
+    pub(crate) fn pending_write_bytes(&self, token: Token) -> Option<usize> {
+        let index = self.sendable_index(token)?;
+        match &self.connections[index].state {
+            ConnectionState::Connected(stream) => Some(stream.send_queue.len()),
+            _ => None,
+        }
     }
 
     pub(crate) fn connect(
@@ -456,17 +494,26 @@ impl TcpManager {
         self.connections[index].state = ConnectionState::Connecting(socket);
     }
 
-    /// Drops TLS connections whose handshake never finished. They are
-    /// redialled by the usual reconnect sweep; no lifecycle event is emitted
-    /// because none was ever announced.
-    fn drop_stalled_handshake(&mut self, registry: &Registry, index: usize, tokens: &mut Tokens) {
+    /// Drops TLS connections whose handshake never finished. Outbound ones
+    /// are redialled by the usual reconnect sweep without an event, since none
+    /// was announced. Accepted ones were announced, so they report the
+    /// disconnect and leave the vector; returns true in that case.
+    fn drop_stalled_handshake(
+        &mut self,
+        registry: &Registry,
+        index: usize,
+        tokens: &mut Tokens,
+    ) -> bool {
         let timeout = self.config.handshake_timeout;
         if !self.connections[index].tls.as_ref().is_some_and(|tls| tls.handshake_stalled(timeout)) {
-            return;
+            return false;
         }
         let peer_addr = self.connections[index].peer_addr;
         warn!(%peer_addr, ?timeout, "tls handshake timed out");
-        self.disconnect_index(registry, index, false, tokens);
+        let accepted = self.connections[index].kind == ConnectionKind::Accepted;
+        let notify = self.connections[index].announced();
+        self.disconnect_index(registry, index, notify, tokens);
+        accepted
     }
 
     fn maybe_reconnect(&mut self, registry: &Registry, tokens: &mut Tokens) {
@@ -474,8 +521,11 @@ impl TcpManager {
             return;
         }
         // Handshake timeouts are swept on the reconnect tick.
-        for index in 0..self.connections.len() {
-            self.drop_stalled_handshake(registry, index, tokens);
+        let mut index = 0;
+        while index < self.connections.len() {
+            if !self.drop_stalled_handshake(registry, index, tokens) {
+                index += 1;
+            }
         }
         self.force_reconnect(registry);
     }
@@ -653,6 +703,20 @@ impl TcpManager {
                     break;
                 }
             };
+            #[cfg(feature = "tls")]
+            let tls = match &self.listeners[listener_index].tls {
+                Some(config) => match Session::accept(config.clone()) {
+                    Ok(session) => Some(Box::new(session)),
+                    Err(err) => {
+                        warn!(?err, %peer_addr, "couldn't create server TLS session");
+                        let _ = socket.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            #[cfg(not(feature = "tls"))]
+            let tls = None;
             let (token, stream, timers, group_name) = {
                 let config = &self.config;
                 if let Some(size) = config.socket_buf_size {
@@ -717,7 +781,7 @@ impl TcpManager {
                 broadcast_paused: false,
                 backlog: ByteQueue::framed(),
                 timers,
-                tls: None,
+                tls,
             });
             info!(group = group_name, %peer_addr, "tcp connection accepted");
             handler(Event::Accepted { group, token, peer_addr });
