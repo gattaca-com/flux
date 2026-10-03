@@ -65,6 +65,17 @@ impl TileConfig {
         self.park = true;
         self
     }
+
+    /// Disable the runner's automatic park for tiles with their own event loop,
+    /// including mio and `io_uring`. Their waits must handle spine signals,
+    /// deadlines, and shutdown.
+    ///
+    /// Register mio wakers directly with `flux::park::SIGNAL.register_waker`.
+    /// Registration alone does not disable runner parking.
+    pub fn without_park(mut self) -> Self {
+        self.park = false;
+        self
+    }
 }
 
 /// Tile is a fixed execution unit pinned to a CPU core.
@@ -182,7 +193,7 @@ where
 
             #[cfg(feature = "park")]
             {
-                if config.park && !worked && !adapter.waker_registered() {
+                if config.park && !worked {
                     crate::park::SIGNAL.park(expected);
                 }
                 expected = crate::park::SIGNAL.read_counter();

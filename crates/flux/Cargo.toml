@@ -17,7 +17,6 @@ flux-communication.workspace = true
 flux-timing.workspace = true
 flux-utils.workspace = true
 libc.workspace = true
-mio = { workspace = true, optional = true }
 serde.workspace = true
 signal-hook.workspace = true
 spine-derive.workspace = true
@@ -29,12 +28,16 @@ wincode-derive = { workspace = true, optional = true }
 zstd.workspace = true
 
 [dev-dependencies]
+mio.workspace = true
 shared_memory.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+io-uring.workspace = true
+
 [features]
 default = []
-park = ["dep:mio", "flux-communication/park"]
+park = ["flux-communication/park"]
 wincode = ["dep:wincode", "dep:wincode-derive", "flux-timing/wincode", "flux-utils/wincode"]
 
 [lints]

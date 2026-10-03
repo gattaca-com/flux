@@ -84,6 +84,17 @@ impl Signal {
         self.counter.load(Ordering::Acquire)
     }
 
+    /// Address for external 32-bit, shared futex waits, without private flags.
+    ///
+    /// Keep this signal alive at the same address until every wait completes,
+    /// including cancellation. Snapshot [`Self::read_counter`] before checking
+    /// for work, then use that snapshot as the expected futex value.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn futex_ptr(&self) -> *const u32 {
+        self.counter.as_ptr()
+    }
+
     /// Signal the sticky event. Increment the counter, wake all parked threads
     /// via `FUTEX_WAKE` (on Linux) or Condvar (on non-Linux), and wake all
     /// registered mio Wakers.
@@ -152,7 +163,8 @@ impl Signal {
     }
 
     /// Register a `mio::Waker` instance. It will be woken whenever `signal` is
-    /// called.
+    /// called. Registration does not change the tile runner's parking policy;
+    /// tiles polling mio should use `TileConfig::without_park()`.
     ///
     /// # Panics
     ///

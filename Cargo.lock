@@ -1509,6 +1509,7 @@ dependencies = [
  "flux-communication",
  "flux-timing",
  "flux-utils",
+ "io-uring",
  "libc",
  "mio",
  "serde",
