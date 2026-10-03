@@ -26,7 +26,7 @@ fn flush(server: &mut ServerConnection) {
 
 fn receive(server: &mut ServerConnection, input: &[u8]) {
     let consumed = server
-        .receive(black_box(input), |event| {
+        .receive(black_box(input), flux_timing::IngestionTime::default(), |event| {
             black_box(event);
         })
         .unwrap();

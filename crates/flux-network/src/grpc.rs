@@ -24,6 +24,7 @@ mod tests;
 use std::{borrow::Cow, fmt, net::SocketAddr};
 
 use bytes::BytesMut;
+use flux_timing::{Duration, IngestionTime};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 pub use server::{Closed, GrpcConfig, GrpcServer, Route};
 
@@ -135,6 +136,8 @@ struct Metadata {
     peer: SocketAddr,
     tls: bool,
     stream: Stream,
+    received_at: IngestionTime,
+    receive_duration: Duration,
 }
 
 impl Metadata {
@@ -147,6 +150,8 @@ impl Metadata {
             peer: SocketAddr::from(([0, 0, 0, 0], 0)),
             tls: false,
             stream: Stream { token: mio::Token(0), id: 0 },
+            received_at: IngestionTime::default(),
+            receive_duration: Duration(0),
         }
     }
 
@@ -158,6 +163,7 @@ impl Metadata {
         peer: SocketAddr,
         tls: bool,
         stream: Stream,
+        received_at: IngestionTime,
     ) {
         self.bytes.clear();
         self.fields.clear();
@@ -172,6 +178,8 @@ impl Metadata {
         self.peer = peer;
         self.tls = tls;
         self.stream = stream;
+        self.received_at = received_at;
+        self.receive_duration = Duration(0);
     }
 
     fn raw(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
@@ -232,6 +240,20 @@ impl<'a> Request<'a> {
 
     pub const fn peer(&self) -> SocketAddr {
         self.metadata.peer
+    }
+
+    /// When the read holding the first byte of the call's HEADERS frame was
+    /// received. Latency measured from here includes the time the rest of the
+    /// call took to arrive.
+    pub const fn received_at(&self) -> IngestionTime {
+        self.metadata.received_at
+    }
+
+    /// From [`Self::received_at`] to the read that completed the request
+    /// message: the rest of the call arriving, plus any time the poll loop took
+    /// between those reads.
+    pub const fn receive_duration(&self) -> Duration {
+        self.metadata.receive_duration
     }
 
     /// Whether the call arrived on a TLS listener.

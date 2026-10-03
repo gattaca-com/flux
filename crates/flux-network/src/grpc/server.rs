@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, fmt, io, net::SocketAddr};
 
 use bytes::BytesMut;
+use flux_timing::{IngestionTime, Instant};
 use http::{HeaderMap, StatusCode};
 use mio::Token;
 use rustc_hash::FxHashMap;
@@ -221,7 +222,7 @@ impl Call {
         self.ends.retain(|&end| end <= keep);
     }
 
-    fn receive(&mut self, data: &[u8], end: bool, route: &mut impl Route) {
+    fn receive(&mut self, data: &[u8], end: bool, read: IngestionTime, route: &mut impl Route) {
         self.input_closed |= end;
         if self.trailers.is_some() {
             return;
@@ -235,6 +236,8 @@ impl Call {
                 return;
             }
             *routed = true;
+            metadata.receive_duration =
+                read.internal().saturating_sub(metadata.received_at.internal());
             out.clear();
             out.extend_from_slice(&[0; 5]);
             let request = Request { metadata, message };
@@ -319,7 +322,10 @@ impl Call {
 
 struct Connection {
     h2: http2::ServerConnection,
+    /// A frame left incomplete by the previous read.
     input: Vec<u8>,
+    /// When the read holding the first byte of `input` was received.
+    input_received_at: IngestionTime,
     peer: SocketAddr,
     tls: bool,
     calls: FxHashMap<u32, Call>,
@@ -381,6 +387,7 @@ impl Connection {
         &mut self,
         token: Token,
         bytes: &[u8],
+        read: IngestionTime,
         config: &GrpcConfig,
         free: &mut Vec<Call>,
         route: &mut impl Route,
@@ -394,29 +401,39 @@ impl Connection {
             bytes = &bytes[n..];
             if missing(&self.input)? == 0 {
                 let mut input = std::mem::take(&mut self.input);
-                let consumed = self.receive_frames(token, &input, config, free, route)?;
+                let started = self.input_received_at;
+                let consumed =
+                    self.receive_frames(token, &input, started, read, config, free, route)?;
                 input.drain(..consumed);
                 self.input = input;
             }
         }
         if self.input.is_empty() {
-            let consumed = self.receive_frames(token, bytes, config, free, route)?;
-            self.input.extend_from_slice(&bytes[consumed..]);
+            let consumed = self.receive_frames(token, bytes, read, read, config, free, route)?;
+            if consumed < bytes.len() {
+                self.input.extend_from_slice(&bytes[consumed..]);
+                self.input_received_at = read;
+            }
         }
         Ok(())
     }
 
+    /// `started` is when the first byte of `input` was read, `read` when its
+    /// last byte was.
+    #[allow(clippy::too_many_arguments)]
     fn receive_frames(
         &mut self,
         token: Token,
         input: &[u8],
+        started: IngestionTime,
+        read: IngestionTime,
         config: &GrpcConfig,
         free: &mut Vec<Call>,
         route: &mut impl Route,
     ) -> Result<usize, http2::Error> {
         let Self { h2, peer, tls, calls, pending, .. } = self;
-        h2.receive(input, |event| match event {
-            http2::Event::Request { stream_id, head, end_stream } => {
+        h2.receive(input, started, |event| match event {
+            http2::Event::Request { stream_id, head, end_stream, received_at } => {
                 let stream = Stream { token, id: stream_id };
                 let mut call = free
                     .pop()
@@ -425,7 +442,7 @@ impl Connection {
                 match parse_request(&head) {
                     Ok(()) => {
                         let path = head.path.unwrap_or_default();
-                        call.metadata.fill(path, head.fields, *peer, *tls, stream);
+                        call.metadata.fill(path, head.fields, *peer, *tls, stream, received_at);
                         if end_stream {
                             call.finish(&Status::new(Code::Internal, "missing request message"));
                         }
@@ -440,13 +457,13 @@ impl Connection {
             http2::Event::Data { stream_id, data, end_stream } => {
                 if let Some(call) = calls.get_mut(&stream_id) {
                     call.credit += data.len() as u32;
-                    call.receive(data, end_stream, route);
+                    call.receive(data, end_stream, read, route);
                     mark(stream_id, call, pending);
                 }
             }
             http2::Event::Trailers { stream_id, .. } => {
                 if let Some(call) = calls.get_mut(&stream_id) {
-                    call.receive(&[], true, route);
+                    call.receive(&[], true, read, route);
                     mark(stream_id, call, pending);
                 }
             }
@@ -611,6 +628,7 @@ impl GrpcServer {
                 let connection = self.connections.entry(token).insert_entry(Connection {
                     h2,
                     input: Vec::new(),
+                    input_received_at: IngestionTime::default(),
                     peer: peer_addr,
                     tls,
                     calls: FxHashMap::default(),
@@ -621,13 +639,16 @@ impl GrpcServer {
                 // HTTP/2 queued its SETTINGS.
                 touch(token, connection.into_mut(), &mut self.dirty);
             }
-            NetworkEvent::Message { token, payload, .. } => {
+            NetworkEvent::Message { token, payload, send_ts, .. } => {
                 let Self { connections, dirty, free, config, .. } = self;
                 if let Some(connection) = connections.get_mut(&token) &&
                     !connection.closing
                 {
                     touch(token, connection, dirty);
-                    if connection.receive(token, payload, config, free, &mut route).is_err() {
+                    let read = IngestionTime::new(send_ts, Instant::now());
+                    let received =
+                        connection.receive(token, payload, read, config, free, &mut route);
+                    if received.is_err() {
                         // HTTP/2 queued GOAWAY; flush it and close.
                         connection.closing = true;
                         release(connection, free, config);

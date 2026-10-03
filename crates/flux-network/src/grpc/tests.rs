@@ -8,6 +8,7 @@ use std::{
 };
 
 use bytes::{BufMut, BytesMut};
+use flux_timing::Nanos;
 
 use super::{Code, GrpcConfig, GrpcServer, MessageDecoder, Request, Response, Route, Status};
 use crate::{
@@ -290,6 +291,39 @@ fn unary_calls_reply_and_reject() {
 
     assert_eq!(client.stream(5)[0].field(":status"), Some("415"));
     assert_eq!(client.stream(7)[0].field("grpc-status"), Some("13"));
+}
+
+#[test]
+fn received_at_is_when_the_headers_frame_started_arriving() {
+    let mut harness = Harness::new(GrpcConfig::default());
+    let mut client = harness.connect(65535);
+    let wire = request(1, "/test.Echo/Unary", "application/grpc", Some(b"hi"));
+    let start = Nanos::now();
+    // The HEADERS frame's first bytes, read on their own.
+    client.transport.send(&wire[..4]);
+    let gap = Duration::from_millis(20);
+    let end = Instant::now() + gap;
+    while Instant::now() < end {
+        harness.server.poll(&mut harness.net, echo);
+    }
+    let rest_sent = Nanos::now();
+    client.transport.send(&wire[4..]);
+    let mut timing = None;
+    client.run(
+        &mut harness,
+        |request: &Request<'_>, reply: &mut PayloadBuf<'_>| {
+            timing = Some((request.received_at(), request.receive_duration()));
+            echo(request, reply)
+        },
+        ended(1),
+    );
+    let (received_at, receive_duration) = timing.unwrap();
+    let received_at = received_at.real();
+    assert!(
+        start <= received_at && received_at < rest_sent,
+        "{start:?} {received_at:?} {rest_sent:?}"
+    );
+    assert!(receive_duration.0 >= gap.as_nanos() as u64, "{receive_duration:?}");
 }
 
 #[test]

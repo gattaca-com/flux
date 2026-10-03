@@ -3,6 +3,7 @@
 use std::{io::Cursor, ops::ControlFlow};
 
 use bytes::BytesMut;
+use flux_timing::IngestionTime;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use rustc_hash::FxHashMap;
 
@@ -83,6 +84,9 @@ pub enum Event<'a> {
         stream_id: u32,
         head: RequestHead<'a>,
         end_stream: bool,
+        /// When the input holding the first byte of the request's HEADERS
+        /// frame was received.
+        received_at: IngestionTime,
     },
     Data {
         stream_id: u32,
@@ -150,6 +154,8 @@ struct HeaderBlock {
     stream_id: u32,
     end_stream: bool,
     bytes: BytesMut,
+    /// When the input holding its HEADERS frame was received.
+    received_at: IngestionTime,
 }
 
 /// An HTTP/2 server connection without sockets, tasks, or an executor.
@@ -256,6 +262,8 @@ impl ServerConnection {
     }
 
     /// Process complete frames and return the number of input bytes consumed.
+    /// `received_at` is when the first byte of `input` arrived; requests
+    /// report it for their HEADERS frame.
     ///
     /// DATA borrows input for the callback. `release_capacity` counts DATA
     /// bytes, not padding. Control output is bounded; exhaustion terminates
@@ -264,12 +272,13 @@ impl ServerConnection {
     pub fn receive(
         &mut self,
         input: &[u8],
+        received_at: IngestionTime,
         mut handler: impl FnMut(Event<'_>),
     ) -> Result<usize, Error> {
         if self.failed {
             return Err(Error::Protocol);
         }
-        let result = self.receive_inner(input, &mut handler);
+        let result = self.receive_inner(input, received_at, &mut handler);
         if let Err(error) = result {
             self.failed = true;
             let mut payload = [0; 8];
@@ -284,6 +293,7 @@ impl ServerConnection {
     fn receive_inner(
         &mut self,
         input: &[u8],
+        received_at: IngestionTime,
         handler: &mut impl FnMut(Event<'_>),
     ) -> Result<usize, Error> {
         let prefix = (CLIENT_PREFACE.len() - self.preface_received).min(input.len());
@@ -303,7 +313,7 @@ impl ServerConnection {
                 }
                 self.peer_settings = true;
             }
-            self.on_frame(frame, handler)?;
+            self.on_frame(frame, received_at, handler)?;
             consumed += length;
         }
         Ok(consumed)
@@ -312,6 +322,7 @@ impl ServerConnection {
     fn on_frame(
         &mut self,
         frame: Frame<'_>,
+        received_at: IngestionTime,
         handler: &mut impl FnMut(Event<'_>),
     ) -> Result<(), Error> {
         let id = frame.stream_id;
@@ -351,7 +362,7 @@ impl ServerConnection {
                 let mut bytes = std::mem::take(&mut self.block_buffer);
                 bytes.clear();
                 bytes.extend_from_slice(fragment);
-                self.headers = Some(HeaderBlock { stream_id: id, end_stream, bytes });
+                self.headers = Some(HeaderBlock { stream_id: id, end_stream, bytes, received_at });
                 if end_headers {
                     self.finish_headers(handler)?;
                 }
@@ -424,7 +435,8 @@ impl ServerConnection {
         if oversized {
             return Err(Error::LimitExceeded);
         }
-        let result = self.dispatch_headers(block.stream_id, block.end_stream, handler);
+        let result =
+            self.dispatch_headers(block.stream_id, block.end_stream, block.received_at, handler);
         // Releases the block's bytes for reuse by the next header block.
         self.decoded_headers.clear();
         result
@@ -434,6 +446,7 @@ impl ServerConnection {
         &mut self,
         id: u32,
         end_stream: bool,
+        received_at: IngestionTime,
         handler: &mut impl FnMut(Event<'_>),
     ) -> Result<(), Error> {
         let headers = &self.decoded_headers;
@@ -481,7 +494,7 @@ impl ServerConnection {
                 method: head.method.clone(),
                 body_forbidden: false,
             });
-            handler(Event::Request { stream_id: id, head, end_stream });
+            handler(Event::Request { stream_id: id, head, end_stream, received_at });
         }
         Ok(())
     }
