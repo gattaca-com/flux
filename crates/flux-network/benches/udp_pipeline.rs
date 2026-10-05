@@ -1,5 +1,27 @@
 //! Sender and receiver on separate pinned threads, TCP vs reliable UDP.
 //!
+//! Traffic crosses a veth pair instead of loopback. Loopback hands a GSO
+//! buffer to the receiver whole, which hides every per-segment cost; the pair
+//! segments in software on transmit and runs real GRO on receive, like a NIC
+//! without UDP segmentation offload. The bench creates the pair itself and
+//! removes it when it exits, including on panic or Ctrl-C. It needs `ip`,
+//! `ethtool` and `sudo`. Outside the pair it touches two things for the run
+//! and undoes both afterwards: the `local` routing rule moves from priority 0
+//! to 1, and when `iptables` exists an accept rule for each end goes to the
+//! top of the INPUT chain, since a host firewall drops traffic arriving on
+//! them. A killed run leaves that state behind, which the next run cleans
+//! up, or by hand:
+//!
+//! ```text
+//! sudo ip rule add pref 0 lookup local
+//! sudo ip rule del pref 0 iif lo to 10.77.0.1 lookup 50
+//! sudo ip rule del pref 0 iif lo to 10.77.0.2 lookup 51
+//! sudo ip rule del pref 1 lookup local
+//! sudo iptables -D INPUT -i fluxbench0 -j ACCEPT
+//! sudo iptables -D INPUT -i fluxbench1 -j ACCEPT
+//! sudo ip link del fluxbench0
+//! ```
+//!
 //! Reports one-way latency (receiver clock minus the sender timestamp carried
 //! in every message, same host so no clock skew) as p50/p99, throughput, and
 //! for the loss scenario how many datagrams were retransmitted.
@@ -10,12 +32,15 @@
 //! - `loss1`: UDP through a relay that drops exactly one data datagram of a 2
 //!   MiB message. Recovery should resend one datagram, not the message.
 //! - `bcast`: one sender broadcasting to 8 receivers on one listener socket.
+//! - `many`: 50 messages of 64..100 bytes per `send_many_with` or
+//!   `broadcast_many_with` call, reporting the time spent in the call as well.
 //!
 //! Run with `cargo bench -p flux-network --bench udp_pipeline`.
 
 use std::{
     collections::HashSet,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
+    process::Command,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -40,12 +65,165 @@ const PACED_MSGS: usize = 2000;
 const PACE: Duration = Duration::from_micros(100);
 const BCAST_PEERS: usize = 8;
 const BIG_SOCKET_BUF: usize = 16 * 1024 * 1024;
+/// Messages per call in the `many` scenario, and their sizes.
+const MANY: usize = 50;
+const MANY_SIZES: std::ops::RangeInclusive<usize> = 64..=100;
+/// Payload bytes per fragment of a 1200-byte datagram.
+const STRIDE: usize = 1200 - 29;
 /// Shared-memory telemetry queues of the `udp+tel` transport live here.
 const APP_NAME: &str = "udp-pipeline-bench";
 
+/// The veth pair: clients and the relay live on end 0, the server on end 1.
+/// Packets to an end's address leave through the other end, via a routing
+/// table consulted before the `local` one for locally generated traffic.
+const VETH: [&str; 2] = ["fluxbench0", "fluxbench1"];
+const VETH_MAC: [&str; 2] = ["02:fb:00:00:00:01", "02:fb:00:00:00:02"];
+const VETH_IP: [Ipv4Addr; 2] = [Ipv4Addr::new(10, 77, 0, 1), Ipv4Addr::new(10, 77, 0, 2)];
+const VETH_TABLE: [u32; 2] = [50, 51];
+const CLIENT_IP: Ipv4Addr = VETH_IP[0];
+const SERVER_IP: Ipv4Addr = VETH_IP[1];
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_interrupt(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+/// Runs a whitespace-separated command through `sudo`, inheriting the
+/// terminal for the password prompt. Reports failure instead of panicking so
+/// teardown can go on with its remaining steps.
+fn sudo(command: &str) -> bool {
+    match Command::new("sudo").args(command.split_whitespace()).status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("sudo {command} failed: {status}");
+            false
+        }
+        Err(err) => {
+            eprintln!("sudo {command} failed: {err}");
+            false
+        }
+    }
+}
+
+fn has_iptables() -> bool {
+    Command::new("iptables").arg("--version").output().is_ok()
+}
+
+/// Whether the INPUT chain accepts everything arriving on `dev`.
+fn has_firewall_rule(dev: &str) -> bool {
+    let out = Command::new("sudo").args(["iptables", "-S", "INPUT"]).output().expect("iptables");
+    String::from_utf8_lossy(&out.stdout).contains(&format!("-A INPUT -i {dev} -j ACCEPT"))
+}
+
+/// Whether an `ip rule` at `pref` contains `needle`.
+fn has_rule(pref: u32, needle: &str) -> bool {
+    let out = Command::new("ip").args(["rule", "show"]).output().expect("ip rule show");
+    let prefix = format!("{pref}:");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.starts_with(&prefix) && line.contains(needle))
+}
+
+fn link_exists() -> bool {
+    Command::new("ip")
+        .args(["-o", "link", "show", VETH[0]])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The veth pair and routing for the run; dropping it removes them again.
+struct Link;
+
+impl Link {
+    fn up() -> Self {
+        assert!(
+            Command::new("ethtool").arg("--version").output().is_ok(),
+            "ethtool is required to configure the veth pair"
+        );
+        unsafe { libc::signal(libc::SIGINT, on_interrupt as libc::sighandler_t) };
+        println!("setting up veth pair {}/{} (sudo)", VETH[0], VETH[1]);
+        let link = Self;
+        Self::down();
+        let (v0, v1) = (VETH[0], VETH[1]);
+        let mut steps = vec![format!(
+            "ip link add {v0} address {} type veth peer name {v1} address {}",
+            VETH_MAC[0], VETH_MAC[1]
+        )];
+        for i in 0..2 {
+            let (dev, ip, peer_ip) = (VETH[i], VETH_IP[i], VETH_IP[1 - i]);
+            steps.push(format!("ip addr add {ip}/24 dev {dev}"));
+            steps.push(format!("ip link set {dev} up"));
+            steps.push(format!(
+                "ip neigh replace {peer_ip} lladdr {} dev {dev} nud permanent",
+                VETH_MAC[1 - i]
+            ));
+            steps.push(format!("sysctl -q -w net.ipv4.conf.{dev}.accept_local=1"));
+            steps.push(format!("ethtool -K {dev} tx-udp-segmentation off tso off gro on"));
+            if has_iptables() {
+                steps.push(format!("iptables -I INPUT 1 -i {dev} -j ACCEPT"));
+            }
+        }
+        for i in 0..2 {
+            let (ip, via, src, table) = (VETH_IP[i], VETH[1 - i], VETH_IP[1 - i], VETH_TABLE[i]);
+            steps.push(format!("ip route replace {ip}/32 dev {via} src {src} table {table}"));
+        }
+        if !has_rule(1, "lookup local") {
+            steps.push("ip rule add pref 1 lookup local".into());
+        }
+        if has_rule(0, "lookup local") {
+            steps.push("ip rule del pref 0 lookup local".into());
+        }
+        for i in 0..2 {
+            let (ip, table) = (VETH_IP[i], VETH_TABLE[i]);
+            if !has_rule(0, &format!("to {ip} ")) {
+                steps.push(format!("ip rule add pref 0 iif lo to {ip}/32 lookup {table}"));
+            }
+        }
+        for step in &steps {
+            assert!(sudo(step), "veth setup failed");
+        }
+        link
+    }
+
+    /// Undoes `up`, skipping whatever is already undone.
+    fn down() {
+        if !has_rule(0, "lookup local") {
+            sudo("ip rule add pref 0 lookup local");
+        }
+        for i in 0..2 {
+            let (ip, table) = (VETH_IP[i], VETH_TABLE[i]);
+            if has_rule(0, &format!("to {ip} ")) {
+                sudo(&format!("ip rule del pref 0 iif lo to {ip}/32 lookup {table}"));
+            }
+        }
+        if has_rule(1, "lookup local") {
+            sudo("ip rule del pref 1 lookup local");
+        }
+        if has_iptables() {
+            for dev in VETH {
+                if has_firewall_rule(dev) {
+                    sudo(&format!("iptables -D INPUT -i {dev} -j ACCEPT"));
+                }
+            }
+        }
+        if link_exists() {
+            sudo(&format!("ip link del {}", VETH[0]));
+        }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        println!("removing veth pair (sudo)");
+        Self::down();
+    }
+}
+
+/// A free port on the server address.
 fn free_addr() -> SocketAddr {
     loop {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = std::net::TcpListener::bind((SERVER_IP, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         if UdpSocket::bind(addr).is_ok() {
             return addr;
@@ -130,22 +308,39 @@ fn burst_plan(size: usize) -> (usize, usize) {
 
 struct Stats {
     latencies_ns: Vec<u64>,
+    /// Time spent inside each send call; only recorded by the `many` scenario.
+    send_ns: Vec<u64>,
     elapsed: Duration,
     bytes: usize,
+}
+
+fn percentile(sorted: &[u64], p: f64) -> f64 {
+    sorted[((sorted.len() - 1) as f64 * p) as usize] as f64 / 1000.0
 }
 
 impl Stats {
     fn row(&self, name: &str, extra: &str) {
         let mut l = self.latencies_ns.clone();
         l.sort_unstable();
-        let pct = |p: f64| l[((l.len() - 1) as f64 * p) as usize] as f64 / 1000.0;
         let mibps = self.bytes as f64 / self.elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        let send = if self.send_ns.is_empty() {
+            String::new()
+        } else {
+            let mut s = self.send_ns.clone();
+            s.sort_unstable();
+            let per_sec = self.latencies_ns.len() as f64 / self.elapsed.as_secs_f64() / 1e6;
+            format!(
+                " send p50={:>6.1}µs p99={:>6.1}µs {per_sec:>5.2} Mmsg/s",
+                percentile(&s, 0.5),
+                percentile(&s, 0.99),
+            )
+        };
         println!(
-            "{name:<28} n={:<6} p50={:>9.1}µs p99={:>9.1}µs max={:>9.1}µs {mibps:>9.0} MiB/s {extra}",
+            "{name:<28} n={:<6} p50={:>9.1}µs p99={:>9.1}µs max={:>9.1}µs {mibps:>9.0} MiB/s{send} {extra}",
             l.len(),
-            pct(0.5),
-            pct(0.99),
-            pct(1.0),
+            percentile(&l, 0.5),
+            percentile(&l, 0.99),
+            percentile(&l, 1.0),
         );
     }
 }
@@ -197,15 +392,27 @@ struct Scenario {
     pace: Option<Duration>,
     /// Bound on messages sent but not yet received by every client.
     window: usize,
+    /// Messages per send call: 1 uses `broadcast_with` with `size`-byte
+    /// messages; more uses `send_many_with` (one client) or
+    /// `broadcast_many_with` with [`MANY_SIZES`]-byte messages.
+    batch: usize,
 }
 
 /// Sends `count` messages from the server while the receiver thread counts
 /// them and records one-way latency.
 fn run(sc: Scenario) -> Stats {
-    let Scenario { transport, listen, dial, clients, size, count, pace, window } = sc;
-    let (mut server, server_group, receivers, _accepted) =
+    let Scenario { transport, listen, dial, clients, size, count, pace, window, batch } = sc;
+    assert!(count.is_multiple_of(batch));
+    let (mut server, server_group, receivers, accepted) =
         connect(&transport, listen, dial, clients);
-    let msg = vec![0x5Au8; size];
+    let msgs: Vec<Vec<u8>> = if batch == 1 {
+        vec![vec![0x5Au8; size]]
+    } else {
+        let span = MANY_SIZES.end() - MANY_SIZES.start() + 1;
+        (0..batch).map(|j| vec![0x5Au8; MANY_SIZES.start() + j % span]).collect()
+    };
+    let bytes = count / batch * clients * msgs.iter().map(Vec::len).sum::<usize>();
+    let mut send_ns = Vec::with_capacity(if batch == 1 { 0 } else { count / batch });
     let stop = Arc::new(AtomicBool::new(false));
     let got = Arc::new(AtomicUsize::new(0));
     // Set once the receiver is pinned and polling, so the first burst does
@@ -248,11 +455,29 @@ fn run(sc: Scenario) -> Stats {
     let mut sent = 0;
     let mut next_send = start;
     while done_rx.try_recv().is_err() {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            stop.store(true, Ordering::Relaxed);
+            let _ = rx_thread.join();
+            // Unwinds through `main`, so the `Link` guard still tears down.
+            panic!("interrupted");
+        }
         let received = got.load(Ordering::Relaxed) / clients;
         let now = Instant::now();
         if sent < count && sent - received < window && pace.is_none_or(|_| now >= next_send) {
-            server.broadcast_with(server_group, |b| b.extend_from_slice(&msg));
-            sent += 1;
+            if batch == 1 {
+                server.broadcast_with(server_group, |b| b.extend_from_slice(&msgs[0]));
+            } else {
+                let t = Instant::now();
+                if clients == 1 {
+                    server.send_many_with(accepted[0], &msgs, |b, m| b.extend_from_slice(m));
+                } else {
+                    server.broadcast_many_with(server_group, &msgs, |b, m| {
+                        b.extend_from_slice(m);
+                    });
+                }
+                send_ns.push(t.elapsed().as_nanos() as u64);
+            }
+            sent += batch;
             if let Some(p) = pace {
                 next_send = now + p;
             }
@@ -265,7 +490,7 @@ fn run(sc: Scenario) -> Stats {
     let elapsed = start.elapsed();
     let latencies_ns = rx_thread.join().unwrap();
     assert_eq!(latencies_ns.len(), expected, "receiver timed out");
-    Stats { latencies_ns, elapsed, bytes: expected * size }
+    Stats { latencies_ns, send_ns, elapsed, bytes }
 }
 
 /// Raises the relay's socket buffers so it never drops a burst itself.
@@ -298,7 +523,7 @@ struct Relay {
 
 impl Relay {
     fn start(server: SocketAddr, drop_nth: usize) -> Self {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let socket = UdpSocket::bind((CLIENT_IP, 0)).unwrap();
         big_buffers(&socket);
         socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
         let addr = socket.local_addr().unwrap();
@@ -320,16 +545,34 @@ impl Relay {
                     client = Some(from);
                     server
                 };
-                // Wire layout: magic, kind in the low nibble of byte 2, session
-                // at [3..7], sequence at [7..15]. Only data carries a payload.
-                if n >= 29 && buf[2] & 0x0f == 1 {
-                    n_data += 1;
-                    data_c.fetch_add(1, Ordering::Relaxed);
-                    let session = u32::from_le_bytes(buf[3..7].try_into().unwrap());
-                    let seq = u64::from_le_bytes(buf[7..15].try_into().unwrap());
+                // Wire layout: byte 2 holds the kind in its low nibble. Kind 0
+                // is a packet whose first record starts at the offset in
+                // [7..9]; kind 1 is a bare data record. A data record has its
+                // session at [3..7], sequence at [7..15], message length at
+                // [15..19] and fragment index at [19..21], which fixes its
+                // payload length.
+                let mut records = 0;
+                let kind = if n >= 29 { buf[2] & 0x0f } else { 0xff };
+                let mut off = match kind {
+                    0 => usize::from(u16::from_le_bytes(buf[7..9].try_into().unwrap())),
+                    1 => 0,
+                    _ => n,
+                };
+                while off + 29 <= n && buf[off + 2] & 0x0f == 1 {
+                    let r = &buf[off..off + 29];
+                    let session = u32::from_le_bytes(r[3..7].try_into().unwrap());
+                    let seq = u64::from_le_bytes(r[7..15].try_into().unwrap());
+                    let len = u32::from_le_bytes(r[15..19].try_into().unwrap()) as usize;
+                    let index = usize::from(u16::from_le_bytes(r[19..21].try_into().unwrap()));
+                    records += 1;
                     if !seen.insert((session, seq)) {
                         retx_c.fetch_add(1, Ordering::Relaxed);
                     }
+                    off += 29 + STRIDE.min(len - index * STRIDE);
+                }
+                if records != 0 {
+                    n_data += 1;
+                    data_c.fetch_add(1, Ordering::Relaxed);
                     if n_data == drop_nth {
                         continue;
                     }
@@ -351,6 +594,7 @@ impl Drop for Relay {
 fn main() {
     pin(usize::MAX);
     cleanup_shmem(&shmem_dir(APP_NAME));
+    let _link = Link::up();
     println!("== paced: one message per 100µs, one receiver ==");
     for (size_name, size) in SIZES {
         for (name, transport) in transports() {
@@ -364,6 +608,7 @@ fn main() {
                 count: PACED_MSGS,
                 pace: Some(PACE),
                 window: burst_plan(size).1,
+                batch: 1,
             });
             s.row(&format!("paced/{name}/{size_name}"), "");
         }
@@ -383,6 +628,7 @@ fn main() {
                 count,
                 pace: None,
                 window,
+                batch: 1,
             });
             s.row(&format!("burst/{name}/{size_name}"), &format!("window={window}"));
         }
@@ -391,7 +637,7 @@ fn main() {
     println!("\n== loss1: one 2 MiB message, exactly one datagram dropped by a relay ==");
     {
         let server_addr = free_addr();
-        // Drop the 900th of 1789 data datagrams.
+        // Drop the 900th of 1791 data datagrams.
         let relay = Relay::start(server_addr, 900);
         let s = run(Scenario {
             transport: UdpGroupConfig { udp: udp_config(), ..Default::default() }.into(),
@@ -402,6 +648,7 @@ fn main() {
             count: 1,
             pace: None,
             window: 1,
+            batch: 1,
         });
         let data = relay.data.load(Ordering::Relaxed);
         let retx = relay.retransmits.load(Ordering::Relaxed);
@@ -424,9 +671,42 @@ fn main() {
                 count,
                 pace: None,
                 window,
+                batch: 1,
             });
             s.row(&format!("bcast/{name}/{size_name}"), &format!("window={window}"));
         }
     }
     cleanup_shmem(&shmem_dir(APP_NAME));
+
+    many();
+}
+
+/// The `many` scenario: paced and burst to one receiver through
+/// `send_many_with`, burst to [`BCAST_PEERS`] through `broadcast_many_with`.
+fn many() {
+    println!(
+        "\n== many: {MANY} messages of {}..{} bytes per send_many_with / broadcast_many_with call ==",
+        MANY_SIZES.start(),
+        MANY_SIZES.end()
+    );
+    let many = |name: &str, clients: usize, count: usize, pace: Option<Duration>| {
+        for (tname, transport) in transports().into_iter().take(2) {
+            let addr = free_addr();
+            let s = run(Scenario {
+                transport,
+                listen: addr,
+                dial: addr,
+                clients,
+                size: 0,
+                count,
+                pace,
+                window: 10 * MANY,
+                batch: MANY,
+            });
+            s.row(&format!("many-{name}/{tname}/{clients}rx"), "");
+        }
+    };
+    many("paced", 1, PACED_MSGS * MANY, Some(PACE));
+    many("burst", 1, 1000 * MANY, None);
+    many("bcast", BCAST_PEERS, 400 * MANY, None);
 }
