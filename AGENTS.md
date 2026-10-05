@@ -1,12 +1,5 @@
 # Repository guidance
 
-## Communication
-
-- Be concise and direct. Use short sentences and the active voice.
-- Use the same term for the same item.
-- State what a result means and how you verified it. Say when you did not verify it.
-- If you find that an earlier statement was wrong, say so directly and correct it.
-
 ## Engineering priorities
 
 Success means the smallest complete change that solves the requested problem and preserves existing behavior.
