@@ -367,9 +367,6 @@ impl TrackingTimestampWire {
         self.to_tracking_timestamp_at(IngestionTime::now())
     }
 
-    /// [`to_tracking_timestamp`](Self::to_tracking_timestamp) against one
-    /// reading of the clocks, `now`, as [`IngestionTime::from_real_at`]
-    /// projects it.
     pub fn to_tracking_timestamp_at(self, now: IngestionTime) -> TrackingTimestamp {
         let ingestion = IngestionTime::from_real_at(self.ingestion_t_real, now);
         // The delta comes from the two exact wall-clock values. Projecting

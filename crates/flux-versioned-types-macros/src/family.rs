@@ -36,7 +36,7 @@ impl Kept<'_> {
             if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob_into::<U, _>(
                 blob,
                 scratch,
-                &mut ::flux_versioned_types::leaves::WrapSink::new(&mut *sink, Self::#v),
+                |msg| f(msg.map(Self::#v)),
             ) {
                 return Some(found);
             }
@@ -157,16 +157,21 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
                 let meta = <Self as ::flux_versioned_types::HasVersionedLeaves>::decode_blob_into::<
                     U,
                     _,
-                >(blob, scratch, &mut msgs)?;
+                >(blob, scratch, |msg| {
+                    if msgs.capacity() == 0 {
+                        msgs.reserve_exact(blob.header.n_messages as usize);
+                    }
+                    msgs.push(msg);
+                })?;
                 Some(meta.map(|meta| (meta, msgs)))
             }
             fn decode_blob_into<
                 U: ::flux_versioned_types::Versioned,
-                S: ::flux_versioned_types::MessageSink<Self>,
+                F: FnMut(::flux::timing::InternalMessage<Self>),
             >(
                 blob: &::flux_versioned_types::Blob,
                 scratch: &mut ::flux_versioned_types::Scratch,
-                sink: &mut S,
+                mut f: F,
             ) -> Option<::core::result::Result<U, ::flux_versioned_types::DecodeError>> {
                 #(#decode_steps)*
                 None
