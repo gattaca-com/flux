@@ -1,12 +1,15 @@
 //! Reliable, unordered UDP transport for [`crate::Network`].
 //!
-//! Each message is fragmented into datagrams that carry consecutive sequence
-//! numbers. The receiver acks with a cumulative point plus a selective bitmap
-//! covering everything it holds above it. The sender resends holes below the
-//! highest acked sequence at once, and after an RTO of ack silence probes the
-//! oldest unacked datagram, doubling the probe size per round. Messages are
-//! delivered as soon as all their fragments are in, so a lost datagram delays
-//! only its own message.
+//! Each message is fragmented into records that carry consecutive sequence
+//! numbers. Records to one peer are packed back to back into datagrams of
+//! `max_datagram_size`, so a burst of small messages costs a few datagrams,
+//! while a record that fills a datagram on its own travels bare, so a large
+//! message costs the same datagrams it would without packing. The receiver
+//! acks with a cumulative point plus a selective bitmap covering everything it
+//! holds above it. The sender resends holes below the highest acked sequence at
+//! once, and after an RTO of ack silence probes the oldest unacked datagram,
+//! doubling the probe size per round. Messages are delivered as soon as all
+//! their fragments are in, so a lost datagram delays only its own message.
 //!
 //! With [`UdpConfig::reliable`] off the same wire format carries a fire-and-
 //! forget stream: the sender releases a datagram once the kernel takes it and
@@ -31,7 +34,8 @@ pub(crate) use connector::UdpManager;
 /// `max_datagram_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
-    /// Datagram size including the 29-byte header. 1200 stays under the
+    /// Datagram size including the 29-byte fragment header. Smaller records
+    /// share datagrams behind a 9-byte packet header. 1200 stays under the
     /// 1280-byte IPv6 minimum MTU.
     pub max_datagram_size: usize,
     /// Datagrams a sender may have in flight per peer, counted from the oldest

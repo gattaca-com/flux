@@ -11,6 +11,9 @@ use std::{
 use flux_network::{Network, NetworkEvent, ReplayPolicy, UdpConfig, UdpGroupConfig};
 use mio::Token;
 
+/// Payload bytes per fragment of a 1200-byte datagram.
+const STRIDE: usize = 1200 - 29;
+
 fn free_addr() -> SocketAddr {
     UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap()
 }
@@ -261,9 +264,11 @@ fn udp_delivers_everything_exactly_once_under_loss() {
         connect_via(&mut server, server_group, &mut client, client_group, server_addr, relay.addr);
 
     // Both directions at once: server pushes to the client, client replies.
+    // Mixed sizes queued in batches, so packets carry several records and
+    // records straddle packets, both of which recovery has to handle.
     let msgs: Vec<Vec<u8>> = (0..N).map(|i| make_msg(i, 1 + (i as usize * 613) % 4000)).collect();
-    for m in &msgs {
-        server.send_with(accepted, |b| b.extend_from_slice(m));
+    for chunk in msgs.chunks(25) {
+        server.send_many_with(accepted, chunk, |b, m| b.extend_from_slice(m));
     }
 
     let mut seen = vec![false; N as usize];
@@ -684,7 +689,7 @@ fn udp_server_disconnect_reconnects_client() {
 #[test]
 fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let addr = free_addr();
-    let config = UdpConfig { send_window: 64, max_message_size: 64 * 1171, ..UdpConfig::lan() };
+    let config = UdpConfig { send_window: 64, max_message_size: 64 * STRIDE, ..UdpConfig::lan() };
     let mut server = Network::default();
     let server_group = server.add_group(UdpGroupConfig { udp: config, ..Default::default() });
     let mut client = Network::default();
@@ -715,7 +720,7 @@ fn udp_unreliable_keeps_streaming_through_loss() {
         reliable: false,
         send_window: 64,
         recv_window: 64,
-        max_message_size: 4 * 1171,
+        max_message_size: 4 * STRIDE,
         ..UdpConfig::lan()
     };
     let server_addr = free_addr();
@@ -729,7 +734,7 @@ fn udp_unreliable_keeps_streaming_through_loss() {
         connect_via(&mut server, server_group, &mut client, client_group, server_addr, relay.addr);
 
     // Mostly two-fragment messages: losing either fragment loses the message.
-    let stride = config.max_datagram_size - 29;
+    let stride = STRIDE;
     let msgs: Vec<Vec<u8>> =
         (0..N).map(|i| make_msg(i, 1 + (i as usize * 613) % (2 * stride))).collect();
     let mut seen = vec![false; N as usize];
