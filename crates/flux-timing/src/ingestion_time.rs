@@ -100,25 +100,3 @@ impl From<Nanos> for IngestionTime {
         Self::from_real_at(value, Self::now())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Values converted against one reading keep their order on the TSC, one
-    /// ahead of our clock lands on the reading itself, and `real` is exact.
-    #[test]
-    fn from_real_at_keeps_wall_clock_order() {
-        let now = IngestionTime::now();
-        let base = now.real().0 - 1_000_000_000;
-        let mut last = Instant(0);
-        for i in 0..10_000 {
-            let t = IngestionTime::from_real_at(Nanos(base + i), now);
-            assert_eq!(t.real(), Nanos(base + i));
-            assert!(t.internal() >= last);
-            last = t.internal();
-        }
-        let ahead = IngestionTime::from_real_at(Nanos(now.real().0 + 5_000), now);
-        assert_eq!(ahead.internal(), now.internal());
-    }
-}

@@ -45,54 +45,6 @@ pub trait Versioned: type_hash::TypeHash + byte_stable::ByteStable {
     }
 }
 
-/// Where [`HasVersionedLeaves::decode_blob_into`] puts a blob's messages.
-pub trait MessageSink<T> {
-    /// Called once per blob, before its messages, with their count. The blob
-    /// can still fail to decode after it.
-    fn reserve(&mut self, n: usize);
-
-    fn push(&mut self, msg: InternalMessage<T>);
-}
-
-impl<T> MessageSink<T> for Vec<InternalMessage<T>> {
-    #[inline]
-    fn reserve(&mut self, n: usize) {
-        Self::reserve(self, n);
-    }
-
-    #[inline]
-    fn push(&mut self, msg: InternalMessage<T>) {
-        Self::push(self, msg);
-    }
-}
-
-/// Wraps a variant's messages into their family on the way to the family's
-/// sink. The derive builds one per family level.
-#[doc(hidden)]
-pub struct WrapSink<'a, S, F> {
-    sink: &'a mut S,
-    wrap: F,
-}
-
-impl<'a, S, F> WrapSink<'a, S, F> {
-    #[inline]
-    pub fn new(sink: &'a mut S, wrap: F) -> Self {
-        Self { sink, wrap }
-    }
-}
-
-impl<T, P, S: MessageSink<P>, F: Fn(T) -> P> MessageSink<T> for WrapSink<'_, S, F> {
-    #[inline]
-    fn reserve(&mut self, n: usize) {
-        self.sink.reserve(n);
-    }
-
-    #[inline]
-    fn push(&mut self, msg: InternalMessage<T>) {
-        self.sink.push(msg.map(&self.wrap));
-    }
-}
-
 pub trait VisitorVersionedLeaf {
     fn visit_leaf<L: Versioned>(&mut self, leaf: &L);
 }
@@ -106,21 +58,21 @@ pub trait HasVersionedLeaves: Copy {
     /// `None` when `blob`'s name and type match none of this type's positions.
     fn decode_blob<U: Versioned>(blob: &Blob, scratch: &mut Scratch) -> Option<Decoded<U, Self>>;
 
-    /// [`decode_blob`](Self::decode_blob) straight into `sink`, with no
-    /// intermediate batch per family level. No message is pushed when the
-    /// blob is not this type's or fails to decode.
+    /// [`decode_blob`](Self::decode_blob), handing each message to `f` as it
+    /// decodes, with no intermediate batch per family level. Nothing reaches
+    /// `f` when the blob is not this type's or fails to decode, so a caller
+    /// can size its buffer from `blob.header.n_messages` on the first call.
     ///
     /// The derive decodes in one pass and builds `decode_blob` on this; the
     /// default suits a hand-written `decode_blob` and moves its batch across.
-    fn decode_blob_into<U: Versioned, S: MessageSink<Self>>(
+    fn decode_blob_into<U: Versioned, F: FnMut(InternalMessage<Self>)>(
         blob: &Blob,
         scratch: &mut Scratch,
-        sink: &mut S,
+        mut f: F,
     ) -> Option<Result<U, DecodeError>> {
         Some(Self::decode_blob::<U>(blob, scratch)?.map(|(meta, msgs)| {
-            sink.reserve(msgs.len());
             for msg in msgs {
-                sink.push(msg);
+                f(msg);
             }
             meta
         }))

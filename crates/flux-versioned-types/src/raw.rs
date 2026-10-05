@@ -18,7 +18,7 @@ use flux_utils::ArrayStr;
 
 use crate::{
     blob::TrackingTimestampWire,
-    leaves::{Decoded, HasVersionedLeaves, MessageSink, Versioned, VisitorVersionedLeaf},
+    leaves::{Decoded, HasVersionedLeaves, Versioned, VisitorVersionedLeaf},
 };
 
 pub const MAGIC: [u8; 8] = *b"FLUXBLOB";
@@ -257,16 +257,21 @@ impl Blob {
     /// `ingestion_time().real()` and `tile_id` are exact.
     pub fn decode<U: Versioned, T: Versioned>(&self, scratch: &mut Scratch) -> Decoded<U, T> {
         let mut msgs = Vec::new();
-        let meta = self.decode_into::<U, T, _>(scratch, &mut msgs)?;
+        let meta = self.decode_into::<U, T, _>(scratch, |msg| {
+            if msgs.capacity() == 0 {
+                msgs.reserve_exact(self.header.n_messages as usize);
+            }
+            msgs.push(msg);
+        })?;
         Ok((meta, msgs))
     }
 
-    /// [`decode`](Self::decode), handing the messages to `sink` as they
-    /// decode. No message is pushed on error.
-    pub fn decode_into<U: Versioned, T: Versioned, S: MessageSink<T>>(
+    /// [`decode`](Self::decode), handing each message to `f` as it decodes.
+    /// Nothing reaches `f` on error.
+    pub fn decode_into<U: Versioned, T: Versioned, F: FnMut(InternalMessage<T>)>(
         &self,
         scratch: &mut Scratch,
-        sink: &mut S,
+        mut f: F,
     ) -> Result<U, DecodeError> {
         if !self.is::<T>() {
             return Err(DecodeError::UnknownTypeHash(self.header.type_hash));
@@ -295,10 +300,9 @@ impl Blob {
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
         let mut stamps = stamps.iter();
         let now = IngestionTime::now();
-        sink.reserve(n as usize);
         T::decode_versions_each(self.header.type_hash, leaf_bytes, n as usize, |leaf| {
             if let Some(stamp) = stamps.next() {
-                sink.push(InternalMessage::new(stamp.to_tracking_timestamp_at(now), leaf));
+                f(InternalMessage::new(stamp.to_tracking_timestamp_at(now), leaf));
             }
         })?;
         Ok(meta)

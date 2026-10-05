@@ -185,23 +185,22 @@ fn leaf_impl(last: &Ident, name_tokens: &TokenStream2) -> TokenStream2 {
                 blob: &::flux_versioned_types::Blob,
                 scratch: &mut ::flux_versioned_types::Scratch,
             ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
-                let mut msgs = ::std::vec::Vec::new();
-                let meta = <Self as ::flux_versioned_types::HasVersionedLeaves>::decode_blob_into::<
-                    U,
-                    _,
-                >(blob, scratch, &mut msgs)?;
-                Some(meta.map(|meta| (meta, msgs)))
+                if blob.type_name() == #name_tokens && blob.is::<Self>() {
+                    Some(blob.decode::<U, Self>(scratch))
+                } else {
+                    None
+                }
             }
             fn decode_blob_into<
                 U: ::flux_versioned_types::Versioned,
-                S: ::flux_versioned_types::MessageSink<Self>,
+                F: FnMut(::flux::timing::InternalMessage<Self>),
             >(
                 blob: &::flux_versioned_types::Blob,
                 scratch: &mut ::flux_versioned_types::Scratch,
-                sink: &mut S,
+                f: F,
             ) -> Option<::core::result::Result<U, ::flux_versioned_types::DecodeError>> {
                 if blob.type_name() == #name_tokens && blob.is::<Self>() {
-                    Some(blob.decode_into::<U, Self, S>(scratch, sink))
+                    Some(blob.decode_into::<U, Self, F>(scratch, f))
                 } else {
                     None
                 }
