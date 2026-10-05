@@ -770,67 +770,84 @@ impl HttpNetwork {
         }
         true
     }
-    /// Queues one request on a pool for the next [`Self::drive`] to send,
-    /// handing the body back when it exceeds `max_body_bytes` or the queue
-    /// is full.
+    /// Sends one request on a pool. Without retries and with nothing queued
+    /// ahead, it is written now on an idle connection straight from `body`.
+    /// Otherwise `body` is copied into the queue and sent once a connection is
+    /// idle; a retried request keeps that copy to resend. `None` when the
+    /// request is invalid, too large, or the queue is full.
+    #[allow(clippy::too_many_arguments)]
     pub fn send(
         &mut self,
+        net: &mut NetworkCore,
         pool: HttpPool,
         method: &str,
         path: &str,
         headers: &[(&str, &str)],
-        body: Vec<u8>,
+        body: &[u8],
         retries: u8,
-    ) -> Result<RequestId, Vec<u8>> {
-        let p = &mut self.pools[pool.0 as usize];
+    ) -> Option<RequestId> {
         if !valid_request(method, path, headers) || body.len() > self.max_body_bytes {
-            return Err(body)
+            return None
         }
+        let p = pool.0 as usize;
+        let head_request = method.eq_ignore_ascii_case("HEAD");
+        let id = RequestId { pool, seq: self.pools[p].next_seq };
         let mut head = self.spare_heads.pop().unwrap_or_else(|| Vec::with_capacity(512));
-        write_head(&mut head, method, path, headers, &p.addr, body.len());
-        if p.queued_bytes + head.len() + body.len() > self.max_queued_bytes {
+        write_head(&mut head, method, path, headers, &self.pools[p].addr, body.len());
+        if retries == 0 &&
+            self.pools[p].queue.is_empty() &&
+            let Some(i) = self.write_idle(net, p, &head, body)
+        {
+            self.pools[p].next_seq += 1;
+            self.start(i, Queued { id, head_request, head, body: Vec::new(), retries });
+            return Some(id)
+        }
+        let pending = &mut self.pools[p];
+        if pending.queued_bytes + head.len() + body.len() > self.max_queued_bytes {
             head.clear();
             self.spare_heads.push(head);
-            return Err(body)
+            return None
         }
-        let id = RequestId { pool, seq: p.next_seq };
-        p.next_seq += 1;
-        p.queued_bytes += head.len() + body.len();
-        p.queue.push_back(Queued {
-            id,
-            head_request: method.eq_ignore_ascii_case("HEAD"),
-            head,
-            body,
-            retries,
-        });
-        Ok(id)
+        pending.next_seq += 1;
+        pending.queued_bytes += head.len() + body.len();
+        pending.queue.push_back(Queued { id, head_request, head, body: body.to_vec(), retries });
+        self.dispatch_pool(net, p);
+        Some(id)
     }
     fn dispatch(&mut self, net: &mut NetworkCore) {
         for p in 0..self.pools.len() {
-            for t in 0..self.pools[p].tokens.len() {
-                let token = self.pools[p].tokens[t];
-                let Some(i) = self
-                    .conns
-                    .iter()
-                    .position(|c| c.token == token && c.role.outbound_head().is_none())
-                else {
-                    continue
-                };
-                let Some(front) = self.pools[p].queue.front() else { break };
-                let sent = net.send_with(token, |out| {
-                    out.extend_from_slice(&front.head);
-                    out.extend_from_slice(&front.body);
-                });
-                if !sent {
-                    continue
-                }
-                let queued = self.pools[p].queue.pop_front().unwrap();
-                self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
-                self.conns[i].role.set_outbound_head(Some(queued.head_request));
-                if let Role::Outbound { in_flight, .. } = &mut self.conns[i].role {
-                    *in_flight = Some(InFlight { queued, sent_at: Instant::now() });
-                }
-            }
+            self.dispatch_pool(net, p);
+        }
+    }
+    fn dispatch_pool(&mut self, net: &mut NetworkCore, p: usize) {
+        while let Some(front) = self.pools[p].queue.front() {
+            let Some(i) = self.write_idle(net, p, &front.head, &front.body) else { break };
+            let queued = self.pools[p].queue.pop_front().unwrap();
+            self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
+            self.start(i, queued);
+        }
+    }
+    /// Writes a request on the first idle connection of pool `p` that takes
+    /// it, returning that connection's index.
+    fn write_idle(
+        &self,
+        net: &mut NetworkCore,
+        p: usize,
+        head: &[u8],
+        body: &[u8],
+    ) -> Option<usize> {
+        self.pools[p].tokens.iter().find_map(|&token| {
+            let i = self
+                .conns
+                .iter()
+                .position(|c| c.token == token && c.role.outbound_head().is_none())?;
+            net.send_parts(token, head, body).then_some(i)
+        })
+    }
+    fn start(&mut self, i: usize, queued: Queued) {
+        self.conns[i].role.set_outbound_head(Some(queued.head_request));
+        if let Role::Outbound { in_flight, .. } = &mut self.conns[i].role {
+            *in_flight = Some(InFlight { queued, sent_at: Instant::now() });
         }
     }
     fn requeue_or_fail(&mut self, mut queued: Queued) {

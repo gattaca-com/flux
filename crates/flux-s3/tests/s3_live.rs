@@ -80,20 +80,20 @@ fn signed_round_trip() {
     s3.connect(&mut net);
 
     let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-    let id = s3.put_object(&bucket, KEY, body.clone()).unwrap();
+    let id = s3.put_object(&mut net, &bucket, KEY, &body).unwrap();
     ok(&mut net, &mut s3, id);
 
-    let id = s3.get_object(&bucket, KEY).unwrap();
+    let id = s3.get_object(&mut net, &bucket, KEY).unwrap();
     assert_eq!(ok(&mut net, &mut s3, id), body);
 
-    let id = s3.list_objects(&bucket, Some(PREFIX), None).unwrap();
+    let id = s3.list_objects(&mut net, &bucket, Some(PREFIX), None).unwrap();
     let listing = String::from_utf8(ok(&mut net, &mut s3, id)).unwrap();
     assert!(listing.contains("nested key+1.bin"), "{listing}");
 
-    let id = s3.delete_object(&bucket, KEY).unwrap();
+    let id = s3.delete_object(&mut net, &bucket, KEY).unwrap();
     ok(&mut net, &mut s3, id);
 
-    let id = s3.get_object(&bucket, KEY).unwrap();
+    let id = s3.get_object(&mut net, &bucket, KEY).unwrap();
     let error = settle(&mut net, &mut s3, id).expect_err("the deleted object is still readable");
     assert!(error.starts_with("404 "), "{error}");
 }

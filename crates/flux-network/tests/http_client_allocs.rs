@@ -67,7 +67,7 @@ fn client_allocs(response: &'static [u8]) -> u64 {
     let mut counted = 0;
     for i in 0..200 {
         let before = ALLOCS.with(Cell::get);
-        http.send(pool, "GET", "/path", &[("X-Key", "value")], Vec::new(), 0).unwrap();
+        http.send(&mut net, pool, "GET", "/path", &[("X-Key", "value")], &[], 0).unwrap();
         let mut body_ok = false;
         let deadline = Instant::now() + Duration::from_secs(5);
         while !body_ok && Instant::now() < deadline {
