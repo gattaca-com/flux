@@ -1248,6 +1248,17 @@ impl TcpManager {
         self.pending_disconnects.retain(|event| event.token != token);
         true
     }
+    pub(crate) fn queued_bytes(&self, token: Token) -> usize {
+        let Some(index) = self.index_of(token) else {
+            return 0;
+        };
+        let connection = &self.connections[index];
+        let sending = match &connection.state {
+            ConnectionState::Connected(stream) => stream.send_queue.len(),
+            _ => 0,
+        };
+        sending + connection.backlog.len()
+    }
     /// Raw streams have no frame boundaries and a TLS queue holds records
     /// that cannot be cut, so both keep everything and report 0.
     pub(crate) fn clear_backlog(&mut self, token: Token) -> usize {
