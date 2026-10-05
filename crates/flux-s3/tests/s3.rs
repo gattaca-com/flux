@@ -26,11 +26,11 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
     let mut s3 = S3::new(addr, 2)
         .with_credentials("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
     s3.connect(&mut net);
-    let put = s3.put_object("bucket", "some key+a/b", b"hello".to_vec()).unwrap();
-    let get = s3.get_object("bucket", "key").unwrap();
-    let missing = s3.get_object("bucket", "missing").unwrap();
-    let delete = s3.delete_object("bucket", "key").unwrap();
-    let list = s3.list_objects("bucket", Some("a/b"), Some("t/0")).unwrap();
+    let put = s3.put_object(&mut net, "bucket", "some key+a/b", b"hello").unwrap();
+    let get = s3.get_object(&mut net, "bucket", "key").unwrap();
+    let missing = s3.get_object(&mut net, "bucket", "missing").unwrap();
+    let delete = s3.delete_object(&mut net, "bucket", "key").unwrap();
+    let list = s3.list_objects(&mut net, "bucket", Some("a/b"), Some("t/0")).unwrap();
     let mut requests = Vec::new();
     let mut outcomes = Vec::new();
     let mut puts = 0;

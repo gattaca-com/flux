@@ -1049,6 +1049,43 @@ impl TcpManager {
         self.write_staged(registry, index, tokens)
     }
 
+    /// Plain connected streams write in place; framed, TLS and replaying
+    /// sends stage like `send_with`.
+    pub(crate) fn send_parts(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        tokens: &mut Tokens,
+        head: &[u8],
+        body: &[u8],
+    ) -> bool {
+        let Some(index) = self.sendable_index(token) else {
+            return false;
+        };
+        let total = head.len() + body.len();
+        if total == 0 || total > self.config.max_frame_size {
+            return false;
+        }
+        let Self { config, connections, .. } = self;
+        let connection = &mut connections[index];
+        if config.framing == Framing::Raw &&
+            config.replay == ReplayPolicy::Drop &&
+            connection.tls.is_none() &&
+            let ConnectionState::Connected(stream) = &mut connection.state
+        {
+            let state = stream.write_parts(registry, head, body, config, &mut connection.timers);
+            if state == StreamState::Disconnected {
+                self.disconnect_index(registry, index, true, tokens);
+                return false;
+            }
+            return true;
+        }
+        self.send_with(registry, token, tokens, |out| {
+            out.extend_from_slice(head);
+            out.extend_from_slice(body);
+        })
+    }
+
     pub(crate) fn send_many_with<I, F>(
         &mut self,
         registry: &Registry,
@@ -1912,6 +1949,40 @@ impl FramedStream {
         }
     }
 
+    /// Writes `head` then `body` unframed in one vectored write, queueing
+    /// whatever the socket does not take.
+    fn write_parts(
+        &mut self,
+        registry: &Registry,
+        head: &[u8],
+        body: &[u8],
+        config: &TcpGroupConfig,
+        timers: &mut Option<NetworkTimers>,
+    ) -> StreamState {
+        let written = if self.send_queue.is_empty() {
+            match self.socket.write_vectored(&[IoSlice::new(head), IoSlice::new(body)]) {
+                Ok(0) => return StreamState::Disconnected,
+                Ok(written) if written == head.len() + body.len() => return StreamState::Alive,
+                Ok(written) => written,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => 0,
+                Err(err) => {
+                    debug!(?err, %self.peer_addr, "tcp write failed");
+                    return StreamState::Disconnected;
+                }
+            }
+        } else {
+            0
+        };
+        let (head, body) = if written < head.len() {
+            (&head[written..], body)
+        } else {
+            (&[][..], &body[written - head.len()..])
+        };
+        self.enqueue(registry, head.len() + body.len(), config, timers, |queue| {
+            queue.append_remainder(head, body)
+        })
+    }
+
     fn enqueue_remainder(
         &mut self,
         registry: &Registry,
@@ -1926,7 +1997,25 @@ impl FramedStream {
             flux_utils::safe_assert!(written < total);
             return StreamState::Disconnected;
         }
-        let additional = total - written;
+        self.enqueue(registry, total - written, config, timers, |queue| {
+            if let Some(header) = header {
+                queue.append_frame_remainder(header, payload, written)
+            } else {
+                queue.append_raw_remainder(payload, written)
+            }
+        })
+    }
+
+    /// Queues `additional` unwritten bytes through `append` under the
+    /// backlog limit, arming writable interest first.
+    fn enqueue(
+        &mut self,
+        registry: &Registry,
+        additional: usize,
+        config: &TcpGroupConfig,
+        timers: &mut Option<NetworkTimers>,
+        append: impl FnOnce(&mut ByteQueue) -> bool,
+    ) -> StreamState {
         if let Some(max) = config.max_backlog_bytes &&
             self.send_queue.would_exceed(additional, max)
         {
@@ -1948,11 +2037,7 @@ impl FramedStream {
             return StreamState::Disconnected;
         }
         let started = Nanos::now();
-        let allocated = if let Some(header) = header {
-            self.send_queue.append_frame_remainder(header, payload, written)
-        } else {
-            self.send_queue.append_raw_remainder(payload, written)
-        };
+        let allocated = append(&mut self.send_queue);
         if allocated && let Some(timers) = timers {
             timers.alloc.emit_latency_from_nanos(started, Nanos::now());
         }

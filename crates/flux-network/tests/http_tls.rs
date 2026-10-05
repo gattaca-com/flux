@@ -73,8 +73,8 @@ fn tls_pool_round_trips_big_bodies() {
     let mut http =
         HttpNetwork::default().with_max_body_bytes(64 * 1024).with_tls_config(client_config);
     let pool = http.pool_tls(&mut net, addr, "localhost", 1);
-    let first = http.send(pool, "GET", "/", &[("Host", "localhost")], Vec::new(), 0).unwrap();
-    let second = http.send(pool, "GET", "/", &[("Host", "localhost")], Vec::new(), 0).unwrap();
+    let first = http.send(&mut net, pool, "GET", "/", &[("Host", "localhost")], &[], 0).unwrap();
+    let second = http.send(&mut net, pool, "GET", "/", &[("Host", "localhost")], &[], 0).unwrap();
     let expected = body();
     let mut bodies = Vec::new();
     let mut disconnects = 0;

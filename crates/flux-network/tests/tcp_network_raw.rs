@@ -356,3 +356,62 @@ fn raw_disconnect_when_drained_flushes_queue() {
 
     assert_eq!(received, payload);
 }
+
+#[test]
+fn raw_send_parts_keeps_order_through_backlog() {
+    let addr = unused_addr();
+    let first: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let second: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+    let mut network = Network::default();
+    let group = network.add_group(TcpGroupConfig {
+        name: "raw-parts",
+        framing: Framing::Raw,
+        replay: ReplayPolicy::Drop,
+        socket_buf_size: Some(1024),
+        max_frame_size: first.len() + 16,
+        ..TcpGroupConfig::default()
+    });
+    network.listen(group, addr).unwrap();
+
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let mut token = None;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && token.is_none() {
+        network.poll_with(|event| {
+            if let NetworkEvent::Accepted { token: accepted, .. } = event {
+                token = Some(accepted);
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    let token = token.expect("raw connection was not accepted");
+
+    // The first write is cut short by the socket buffer; the second lands
+    // entirely behind its remainder.
+    assert!(network.send_parts(token, b"head-1:", &first));
+    assert!(network.send_parts(token, b"head-2:", &second));
+    assert!(network.disconnect_when_drained(token));
+
+    let mut expected = b"head-1:".to_vec();
+    expected.extend_from_slice(&first);
+    expected.extend_from_slice(b"head-2:");
+    expected.extend_from_slice(&second);
+    let mut received = Vec::with_capacity(expected.len());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let mut buffer = [0; 16 * 1024];
+        match client.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => received.extend_from_slice(&buffer[..read]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "raw parts did not reach EOF");
+                network.poll_with(|_| {});
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => panic!("client read failed: {err}"),
+        }
+    }
+
+    assert!(received == expected, "received {} of {} bytes", received.len(), expected.len());
+}
