@@ -930,7 +930,7 @@ fn pool_from_sends_from_local_ip() {
     let (mut net, mut server, addr) = server();
     let mut client = HttpNetwork::default();
     let pool = client.pool_from(&mut net, addr, local_ip, 1);
-    let id = client.send(pool, "GET", "/", &[], Vec::new(), 0).unwrap();
+    let id = client.send(&mut net, pool, "GET", "/", &[], &[], 0).unwrap();
     let mut peer = None;
     let mut body = None;
     let deadline = Instant::now() + TIMEOUT;

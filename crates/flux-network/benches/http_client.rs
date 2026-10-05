@@ -1,9 +1,9 @@
 //! Client-side cost of pooled HTTP requests on a warm loopback connection.
 //!
 //! The server runs on its own thread and network. The client thread times its
-//! own calls and counts its own allocations: `send` queues a request, the
-//! next `drive` writes it, and the drive that delivers the response parses it.
-//! An idle drive is the per-poll cost with a request in flight.
+//! own calls and counts its own allocations: `send` writes the request, and
+//! the drive that delivers the response parses it. An idle drive is the
+//! per-poll cost with a request in flight.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -102,7 +102,7 @@ fn run(name: &str, body: &'static [u8]) {
     for i in 0..REQUESTS + WARMUP {
         let a0 = allocs();
         let t = Instant::now();
-        http.send(pool, "GET", PATH, &headers, Vec::new(), 0).unwrap();
+        http.send(&mut net, pool, "GET", PATH, &headers, &[], 0).unwrap();
         let send_ns = t.elapsed().as_nanos() as u64;
         let a1 = allocs();
 

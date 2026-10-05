@@ -707,6 +707,21 @@ impl NetworkCore {
             GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, serialise),
         }
     }
+    /// Sends `head` then `body` as one message. A plain TCP connection
+    /// writes them from the slices in one vectored write and copies only the
+    /// unwritten remainder; elsewhere it behaves like [`Self::send_with`].
+    pub fn send_parts(&mut self, token: Token, head: &[u8], body: &[u8]) -> bool {
+        let Some(group) = self.route(token) else { return false };
+        match &mut self.groups[group.0] {
+            GroupState::Tcp(tcp) => {
+                tcp.send_parts(self.poller.registry(), token, &mut self.tokens, head, body)
+            }
+            GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, |out| {
+                out.extend_from_slice(head);
+                out.extend_from_slice(body);
+            }),
+        }
+    }
     /// Sends a bounded batch. TCP stages one write; UDP retains message
     /// boundaries. Invalid payloads are skipped. Returns whether any
     /// message was accepted.

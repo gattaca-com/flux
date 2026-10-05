@@ -147,48 +147,61 @@ impl S3 {
     pub fn close(self, net: &mut NetworkCore) {
         self.http.close(net);
     }
-    /// Queues a PUT of `body` to `bucket/key`; returns it back when the
-    /// network refuses it (full queue, or over `max_body_bytes`). S3 answers
+    /// Sends a PUT of `body` to `bucket/key`; `None` when the network
+    /// refuses it (full queue, or over `max_body_bytes`). S3 answers
     /// `503 SlowDown` under load; back off and resend on it.
     pub fn put_object(
         &mut self,
+        net: &mut NetworkCore,
         bucket: &str,
         key: &str,
-        body: Vec<u8>,
-    ) -> Result<RequestId, Vec<u8>> {
-        self.queue("PUT", &object_resource(bucket, key), "", body)
+        body: &[u8],
+    ) -> Option<RequestId> {
+        self.queue(net, "PUT", &object_resource(bucket, key), "", body)
     }
-    /// Queues a GET of `bucket/key`.
-    pub fn get_object(&mut self, bucket: &str, key: &str) -> Result<RequestId, Vec<u8>> {
-        self.queue("GET", &object_resource(bucket, key), "", Vec::new())
+    /// Sends a GET of `bucket/key`.
+    pub fn get_object(
+        &mut self,
+        net: &mut NetworkCore,
+        bucket: &str,
+        key: &str,
+    ) -> Option<RequestId> {
+        self.queue(net, "GET", &object_resource(bucket, key), "", &[])
     }
-    /// Queues a DELETE of `bucket/key`.
-    pub fn delete_object(&mut self, bucket: &str, key: &str) -> Result<RequestId, Vec<u8>> {
-        self.queue("DELETE", &object_resource(bucket, key), "", Vec::new())
+    /// Sends a DELETE of `bucket/key`.
+    pub fn delete_object(
+        &mut self,
+        net: &mut NetworkCore,
+        bucket: &str,
+        key: &str,
+    ) -> Option<RequestId> {
+        self.queue(net, "DELETE", &object_resource(bucket, key), "", &[])
     }
-    /// Queues a `ListObjectsV2` of `bucket`, returning the raw XML. A
+    /// Sends a `ListObjectsV2` of `bucket`, returning the raw XML. A
     /// truncated listing carries a `NextContinuationToken`; pass it back as
     /// `continuation_token` for the next page.
     pub fn list_objects(
         &mut self,
+        net: &mut NetworkCore,
         bucket: &str,
         prefix: Option<&str>,
         continuation_token: Option<&str>,
-    ) -> Result<RequestId, Vec<u8>> {
+    ) -> Option<RequestId> {
         let mut resource = String::from("/");
         resource.push_str(bucket);
         let query = list_query(prefix, continuation_token);
-        self.queue("GET", &resource, &query, Vec::new())
+        self.queue(net, "GET", &resource, &query, &[])
     }
     fn queue(
         &mut self,
+        net: &mut NetworkCore,
         method: &str,
         resource: &str,
         query: &str,
-        body: Vec<u8>,
-    ) -> Result<RequestId, Vec<u8>> {
+        body: &[u8],
+    ) -> Option<RequestId> {
         let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let (authorization, payload) = self.signer.sign(method, resource, query, &date, &body);
+        let (authorization, payload) = self.signer.sign(method, resource, query, &date, body);
         let mut path = resource.to_owned();
         if !query.is_empty() {
             path.push('?');
@@ -202,7 +215,7 @@ impl S3 {
             ("X-Amz-Content-Sha256", payload.as_str()),
             ("Host", signer.host()),
         ];
-        http.send(pool, method, &path, &headers, body, RETRIES)
+        http.send(net, pool, method, &path, &headers, body, RETRIES)
     }
 }
 
