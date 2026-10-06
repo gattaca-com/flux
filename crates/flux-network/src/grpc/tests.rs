@@ -366,7 +366,7 @@ fn streams_fan_out_finish_and_close() {
     let large = vec![7; 40_000];
     harness.server.send(streams[0], &large).unwrap();
     harness.server.finish(streams[0], &Status::ok()).unwrap();
-    assert_eq!(harness.server.send(streams[0], b"late"), Err(super::Closed));
+    assert_eq!(harness.server.send(streams[0], b"late"), Err(super::Closed::Ended));
     let never = |_: &Request<'_>, _: &mut PayloadBuf<'_>| -> Response { unreachable!() };
     clients[0].run(&mut harness, never, ended(1));
     let first = clients[0].stream(1);
@@ -413,7 +413,7 @@ fn lagging_stream_finishes_with_resource_exhausted() {
     // 11 framed bytes each: two fit in 30, the third lags.
     harness.server.send(stream, b"queued").unwrap();
     harness.server.send(stream, b"queued").unwrap();
-    assert_eq!(harness.server.send(stream, b"queued"), Err(super::Closed));
+    assert_eq!(harness.server.send(stream, b"queued"), Err(super::Closed::Lagged));
     client.run(&mut harness, |_, _| unreachable!(), ended(1));
     let got = client.stream(1);
     assert_eq!(got.len(), 2, "queued messages are dropped: {got:?}");
@@ -440,7 +440,7 @@ fn lag_keeps_a_partly_written_message_whole() {
     harness.server.send(stream, b"first!").unwrap();
     harness.server.send(stream, b"second").unwrap();
     client.run(&mut harness, |_, _| unreachable!(), |got| got.len() >= 2);
-    assert_eq!(harness.server.send(stream, b"third!"), Err(super::Closed));
+    assert_eq!(harness.server.send(stream, b"third!"), Err(super::Closed::Lagged));
     let mut update = Vec::new();
     frame(&mut update, kind::WINDOW_UPDATE, 0, 1, &1000u32.to_be_bytes());
     client.transport.send(&update);
