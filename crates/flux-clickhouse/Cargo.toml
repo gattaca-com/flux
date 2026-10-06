@@ -36,3 +36,8 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "chmig"
+path = "src/bin/chmig.rs"
+required-features = ["cli"]

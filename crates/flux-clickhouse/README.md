@@ -10,6 +10,24 @@ Optional features add HTTP helpers, embedded migrations, and a migration CLI.
 | `migrations` | `migrations::MigrationSet`, `migrations::rollback`; enables `http` |
 | `cli` | `migrations::run_cli`; enables `migrations` |
 
+## Standalone migration CLI
+
+Install `chmig` from a Flux checkout:
+
+```sh
+cargo install --path crates/flux-clickhouse --features cli --bin chmig --locked
+chmig --migrations-dir path/to/migrations validate
+chmig --migrations-dir path/to/migrations --config config.toml sync
+chmig --migrations-dir path/to/migrations create add_events
+chmig --migrations-dir path/to/migrations --config config.toml rollback 1
+```
+
+The default migration directory is `migrations`. Pass
+`--compatibility-lint-baseline N` to exempt migrations through version N from
+backward-compatibility linting (default: 0). SQL is read at runtime, so applications
+using this executable do not need their own CLI entry point. Embedded migrations
+remain available for application startup.
+
 ## Embedded migrations
 
 The application owns SQL files, its lint baseline, and its binary entry point:
