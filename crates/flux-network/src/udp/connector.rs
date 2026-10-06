@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     peer::{MsgStore, PushOutcome, SendOutcome, Staged, UdpPeer, send_batch},
-    sys::{RecvBatch, SEND_BATCH, SendBatch},
+    sys::{Layout, RecvBatch, SEND_BATCH, SendBatch},
     wire::{HEADER_SIZE, Header, Kind, PACKET_HEADER_SIZE, Packet},
 };
 use crate::network::{
@@ -95,7 +95,7 @@ fn arm_writable(registry: &Registry, entry: &mut Endpoint) {
 fn push_on_connect(store: &mut MsgStore, cfg: &UdpGroupConfig, peer: &mut UdpPeer, now: Instant) {
     if let Some(msg) = &cfg.on_connect_msg {
         let slot = store.insert(&mut msg.clone());
-        peer.push_message(store, slot, Nanos::now(), now);
+        peer.push_message(store, slot, Nanos::now(), now, Layout::Bare);
         store.release(slot);
     }
 }
@@ -390,7 +390,7 @@ impl UdpManager {
     {
         let Some(index) = self.sendable_index(token) else { return false };
         let now = Instant::now();
-        let sent = self.stage_serialised(index, Nanos::now(), now, serialise);
+        let sent = self.stage_serialised(index, Nanos::now(), now, Layout::Bare, serialise);
         if sent {
             self.flush_peer_socket(registry, index, now);
         }
@@ -418,7 +418,8 @@ impl UdpManager {
                 // The peer was dropped for violating a limit.
                 return false;
             }
-            sent |= self.stage_serialised(index, ts, now, |buf| serialise(buf, item));
+            sent |=
+                self.stage_serialised(index, ts, now, Layout::Packed, |buf| serialise(buf, item));
         }
         if sent {
             self.flush_peer_socket(registry, index, now);
@@ -434,7 +435,7 @@ impl UdpManager {
             return 0;
         }
         let now = Instant::now();
-        let recipients = self.stage_broadcast(Nanos::now(), now, serialise);
+        let recipients = self.stage_broadcast(Nanos::now(), now, Layout::Bare, serialise);
         self.flush_all(registry, now);
         recipients
     }
@@ -457,7 +458,8 @@ impl UdpManager {
         let ts = Nanos::now();
         let mut recipients = 0;
         for item in items {
-            recipients = recipients.max(self.stage_broadcast(ts, now, |buf| serialise(buf, item)));
+            recipients = recipients
+                .max(self.stage_broadcast(ts, now, Layout::Packed, |buf| serialise(buf, item)));
         }
         self.flush_all(registry, now);
         recipients
@@ -488,12 +490,19 @@ impl UdpManager {
 
     /// Serialises and queues one message for the peer at `index`, dropping
     /// the peer if it cannot take it. Returns whether it was queued.
-    fn stage_serialised<F>(&mut self, index: usize, ts: Nanos, now: Instant, serialise: F) -> bool
+    fn stage_serialised<F>(
+        &mut self,
+        index: usize,
+        ts: Nanos,
+        now: Instant,
+        layout: Layout,
+        serialise: F,
+    ) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
         let Some(slot) = self.serialise_into_store(serialise) else { return false };
-        let queued = self.stage_message(index, slot, ts, now);
+        let queued = self.stage_message(index, slot, ts, now, layout);
         self.store.release(slot);
         if !queued {
             self.drop_peer_pending(index, now);
@@ -503,7 +512,7 @@ impl UdpManager {
 
     /// Serialises and queues one message for every eligible peer. Returns the
     /// number of recipients.
-    fn stage_broadcast<F>(&mut self, ts: Nanos, now: Instant, serialise: F) -> usize
+    fn stage_broadcast<F>(&mut self, ts: Nanos, now: Instant, layout: Layout, serialise: F) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
@@ -516,7 +525,7 @@ impl UdpManager {
                 continue;
             }
             recipients += 1;
-            if !self.stage_message(i, slot, ts, now) {
+            if !self.stage_message(i, slot, ts, now, layout) {
                 self.drop_peer_pending(i, now);
             }
         }
@@ -539,9 +548,16 @@ impl UdpManager {
     /// Queues the stored message for one peer. `false` when the peer must be
     /// dropped: it violated the backlog limit or cannot hold the message.
     #[inline]
-    fn stage_message(&mut self, index: usize, slot: u32, ts: Nanos, now: Instant) -> bool {
+    fn stage_message(
+        &mut self,
+        index: usize,
+        slot: u32,
+        ts: Nanos,
+        now: Instant,
+        layout: Layout,
+    ) -> bool {
         let peer = &mut self.peers[index];
-        match peer.push_message(&mut self.store, slot, ts, now) {
+        match peer.push_message(&mut self.store, slot, ts, now, layout) {
             PushOutcome::Queued => !peer.backlog_exceeded(self.config.max_backlog_datagrams),
             PushOutcome::WindowFull => false,
             PushOutcome::TooLarge => true,
