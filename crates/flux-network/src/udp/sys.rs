@@ -9,13 +9,11 @@ use std::{
     ptr, slice,
 };
 
-#[cfg(target_os = "linux")]
 use super::wire::MAX_DATAGRAM_SIZE;
-use super::wire::{PACKET_HEADER_SIZE, Packet};
 
 /// Receive entries per syscall.
 pub(crate) const BATCH: usize = 32;
-/// Records per send batch.
+/// Datagrams per send batch.
 pub(crate) const SEND_BATCH: usize = 256;
 
 #[cfg(target_os = "linux")]
@@ -120,13 +118,16 @@ fn sendmmsg(fd: RawFd, hdrs: &mut [MMsgHdr]) -> libc::c_int {
     unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, libc::MSG_DONTWAIT) }
 }
 
-/// Shortest run of packets to one peer sent as one `UDP_SEGMENT` entry;
-/// shorter runs go out as plain datagrams.
+/// Shortest run of equal-size datagrams to one destination sent as one
+/// `UDP_SEGMENT` entry; shorter runs go out as plain datagrams.
 const GSO_MIN_SEGMENTS: usize = 4;
 /// `UDP_MAX_SEGMENTS` of the first kernels with `UDP_SEGMENT`.
 const GSO_MAX_SEGMENTS: usize = 64;
 /// Most iovecs one `sendmsg` accepts.
 const UIO_MAXIOV: usize = 1024;
+/// Payloads shorter than this are copied next to their header, so a
+/// datagram of small records is one iovec; longer ones are borrowed.
+const COPY_THRESHOLD: usize = 256;
 
 #[cfg(target_os = "linux")]
 const SEGMENT_CONTROL_SPACE: usize =
@@ -152,91 +153,47 @@ const SEGMENT_CONTROL: SegmentControl = SegmentControl {
     padding: [0; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
 };
 
-/// How a record goes on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Layout {
-    /// Its own datagram, header first.
-    Bare,
-    /// Back to back with its neighbours in packets, cut wherever the
-    /// datagram size falls.
-    Packed,
-}
-
-/// A record pushed for sending: header plus payload to one destination.
 #[derive(Clone, Copy)]
-struct Record {
-    header: libc::iovec,
-    payload: libc::iovec,
-    stream: u32,
-    layout: Layout,
-}
-
-/// One wire datagram: a run of iovecs holding a packet header and record
-/// pieces, or one bare record.
-#[derive(Clone, Copy)]
-struct Segment {
+struct Datagram {
     iov_start: u32,
     iov_len: u32,
-    stream: u32,
-    /// Records whose last byte lies in this segment.
-    ends: u32,
-    len: u32,
+    bytes: u32,
+    addr: u32,
 }
 
-/// One `sendmmsg` entry: a run of segments to one destination.
+/// One `sendmmsg` entry: a run of datagrams to one destination.
 #[derive(Clone, Copy)]
 struct Entry {
-    seg_start: u32,
+    first: u32,
+    count: u32,
     iov_len: u32,
-    ends: u32,
     segmented: bool,
 }
 
-/// A packet under construction.
-#[derive(Clone, Copy)]
-struct Open {
-    /// Its header's slot in `packets`.
-    slot: usize,
-    iov_start: usize,
-    used: usize,
-    first: Option<usize>,
-    ends: u32,
-}
-
-/// Up to [`SEND_BATCH`] outgoing records, each a header plus a payload slice.
+/// Up to [`SEND_BATCH`] outgoing datagrams built piece by piece.
 ///
-/// Destinations are copied in; the slices passed to [`Self::push`] must stay
-/// alive and unmodified until [`Self::send`] returns. Consecutive packed
-/// records to one destination form a stream that `send` lays out back to
-/// back and cuts every `segment_size` bytes into packets (see
-/// [`super::wire`]), so a record may straddle two consecutive packets. A bare
-/// record is its own datagram and ends any packet before it.
+/// Headers and small payloads are copied into an arena the batch owns; a
+/// payload of [`COPY_THRESHOLD`] bytes or more is borrowed and must stay
+/// alive and unmodified until [`Self::send`] returns.
 pub(crate) struct SendBatch {
-    segment_size: usize,
-    records: Vec<Record>,
-    /// One per stream.
-    addrs: Vec<SockAddr>,
+    datagram_size: usize,
+    arena: Box<[u8]>,
+    arena_len: usize,
     iovs: Vec<libc::iovec>,
-    /// Packet headers by segment index; iovecs point here, so it never moves.
-    packets: Box<[[u8; PACKET_HEADER_SIZE]]>,
-    segments: Vec<Segment>,
+    /// Whether the last iovec is the arena's tail and can be extended.
+    arena_tail: bool,
+    datagrams: Vec<Datagram>,
+    addrs: Vec<SockAddr>,
+    /// Bytes of the datagram being built.
+    building: usize,
     entries: Vec<Entry>,
     hdrs: Vec<MMsgHdr>,
-    next_packet: u32,
     /// Kernel accepts `UDP_SEGMENT`; see [`Self::enable_gso`].
     #[cfg(target_os = "linux")]
     gso: bool,
-    /// One `UDP_SEGMENT` cmsg per entry; only segmented ones point at theirs.
     #[cfg(target_os = "linux")]
     controls: Vec<SegmentControl>,
 }
-
-/// A segment ends at most once inside each record and once more per bare
-/// record or stream, so a batch never has more segments than this.
-const MAX_SEGMENTS: usize = 3 * SEND_BATCH;
-/// Two pieces per record plus one packet header and one straddle cut per
-/// segment keep every entry under the kernel's iovec limit.
-const _: () = assert!(2 * SEND_BATCH + 2 * GSO_MAX_SEGMENTS <= UIO_MAXIOV);
 
 // SAFETY: the raw pointers inside are written right before each syscall and
 // only read by it; nothing is shared or dereferenced across threads.
@@ -244,23 +201,26 @@ const _: () = assert!(2 * SEND_BATCH + 2 * GSO_MAX_SEGMENTS <= UIO_MAXIOV);
 unsafe impl Send for SendBatch {}
 
 impl SendBatch {
-    /// `segment_size` is the wire datagram size, packet header included.
-    pub(crate) fn new(segment_size: usize) -> Self {
-        assert!(segment_size > PACKET_HEADER_SIZE);
+    /// `datagram_size` bounds every datagram built.
+    pub(crate) fn new(datagram_size: usize) -> Self {
+        // Two iovecs per borrowed payload plus one for the arena run in
+        // between, and a borrowed payload needs COPY_THRESHOLD bytes.
+        let iovs_per_datagram = 1 + 2 * datagram_size.div_ceil(COPY_THRESHOLD);
         Self {
-            segment_size,
-            records: Vec::with_capacity(SEND_BATCH),
+            datagram_size,
+            arena: vec![0; SEND_BATCH * datagram_size].into_boxed_slice(),
+            arena_len: 0,
+            iovs: Vec::with_capacity(SEND_BATCH * iovs_per_datagram),
+            arena_tail: false,
+            datagrams: Vec::with_capacity(SEND_BATCH),
             addrs: Vec::with_capacity(SEND_BATCH),
-            iovs: Vec::with_capacity(4 * SEND_BATCH),
-            packets: vec![[0; PACKET_HEADER_SIZE]; MAX_SEGMENTS].into_boxed_slice(),
-            segments: Vec::with_capacity(MAX_SEGMENTS),
-            entries: Vec::with_capacity(MAX_SEGMENTS),
-            hdrs: Vec::with_capacity(MAX_SEGMENTS),
-            next_packet: 0,
+            building: 0,
+            entries: Vec::with_capacity(SEND_BATCH),
+            hdrs: Vec::with_capacity(SEND_BATCH),
             #[cfg(target_os = "linux")]
             gso: false,
             #[cfg(target_os = "linux")]
-            controls: Vec::with_capacity(MAX_SEGMENTS),
+            controls: Vec::with_capacity(SEND_BATCH),
         }
     }
 
@@ -285,138 +245,109 @@ impl SendBatch {
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, header: &[u8], payload: &[u8], to: &SockAddr, layout: Layout) {
-        let stream = match self.addrs.last() {
-            Some(last) if last == to => self.addrs.len() - 1,
-            _ => {
-                self.addrs.push(*to);
-                self.addrs.len() - 1
-            }
-        };
-        self.records.push(Record {
-            header: iovec(header),
-            payload: iovec(payload),
-            stream: stream as u32,
-            layout,
+    pub(crate) fn is_full(&self) -> bool {
+        self.datagrams.len() == SEND_BATCH
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.datagrams.is_empty()
+    }
+
+    /// Starts a datagram to `to`; the batch must not be full.
+    pub(crate) fn open(&mut self, to: &SockAddr) {
+        debug_assert!(!self.is_full());
+        match self.addrs.last() {
+            Some(last) if last == to => {}
+            _ => self.addrs.push(*to),
+        }
+        self.datagrams.push(Datagram {
+            iov_start: self.iovs.len() as u32,
+            iov_len: 0,
+            bytes: 0,
+            addr: (self.addrs.len() - 1) as u32,
         });
+        self.arena_tail = false;
+        self.building = 0;
     }
 
-    fn open(&mut self) -> Open {
-        let (slot, iov_start) = (self.segments.len(), self.iovs.len());
-        self.iovs.push(iovec(&self.packets[slot]));
-        Open { slot, iov_start, used: PACKET_HEADER_SIZE, first: None, ends: 0 }
-    }
-
-    fn close(&mut self, open: Open, stream: u32) {
-        Packet { seq: self.next_packet, first: open.first.unwrap_or(open.used) as u16 }
-            .encode(&mut self.packets[open.slot]);
-        self.next_packet = self.next_packet.wrapping_add(1);
-        self.segments.push(Segment {
-            iov_start: open.iov_start as u32,
-            iov_len: (self.iovs.len() - open.iov_start) as u32,
-            stream,
-            ends: open.ends,
-            len: open.used as u32,
-        });
-    }
-
-    /// Cuts every stream into segments.
-    fn layout(&mut self) {
-        self.iovs.clear();
-        self.segments.clear();
-        let size = self.segment_size;
-        let mut i = 0;
-        while i < self.records.len() {
-            let stream = self.records[i].stream;
-            let mut open: Option<Open> = None;
-            while i < self.records.len() && self.records[i].stream == stream {
-                let record = self.records[i];
-                i += 1;
-                let len = record.header.iov_len + record.payload.iov_len;
-                if record.layout == Layout::Bare {
-                    if let Some(o) = open.take() {
-                        self.close(o, stream);
-                    }
-                    let iov_start = self.iovs.len() as u32;
-                    self.iovs.push(record.header);
-                    self.iovs.push(record.payload);
-                    self.segments.push(Segment {
-                        iov_start,
-                        iov_len: 2,
-                        stream,
-                        ends: 1,
-                        len: len as u32,
-                    });
-                    continue;
-                }
-                let o = open.get_or_insert_with(|| self.open());
-                o.first.get_or_insert(o.used);
-                for (piece, last) in [(record.header, false), (record.payload, true)] {
-                    let mut off = 0;
-                    while off < piece.iov_len {
-                        let o = open.get_or_insert_with(|| self.open());
-                        let take = (size - o.used).min(piece.iov_len - off);
-                        self.iovs.push(libc::iovec {
-                            iov_base: piece.iov_base.cast::<u8>().wrapping_add(off).cast(),
-                            iov_len: take,
-                        });
-                        o.used += take;
-                        off += take;
-                        if last && off == piece.iov_len {
-                            o.ends += 1;
-                        }
-                        if o.used == size {
-                            self.close(open.take().unwrap(), stream);
-                        }
-                    }
-                }
-            }
-            if let Some(o) = open {
-                self.close(o, stream);
-            }
+    /// Appends bytes the batch copies; headers always go this way.
+    pub(crate) fn copy(&mut self, bytes: &[u8]) {
+        let start = self.arena_len;
+        self.arena[start..start + bytes.len()].copy_from_slice(bytes);
+        self.arena_len += bytes.len();
+        self.building += bytes.len();
+        if self.arena_tail {
+            self.iovs.last_mut().unwrap().iov_len += bytes.len();
+        } else {
+            self.iovs.push(iovec(&self.arena[start..self.arena_len]));
+            self.arena_tail = true;
         }
     }
 
-    /// Groups the segments from `from` on into entries. With `gso`, a run of
-    /// at least [`GSO_MIN_SEGMENTS`] full segments to one destination (the
-    /// last may be shorter) becomes segmented entries of near-equal length,
-    /// so capping a long run never strands a short plain tail.
+    /// Appends a payload, borrowing it when it is long enough to be worth
+    /// an iovec of its own.
+    #[inline]
+    pub(crate) fn payload(&mut self, bytes: &[u8]) {
+        if bytes.len() < COPY_THRESHOLD {
+            self.copy(bytes);
+        } else {
+            self.iovs.push(iovec(bytes));
+            self.arena_tail = false;
+            self.building += bytes.len();
+        }
+    }
+
+    /// Finishes the datagram being built. Returns its size.
+    pub(crate) fn close(&mut self) -> usize {
+        debug_assert!(self.building <= self.datagram_size);
+        let datagram = self.datagrams.last_mut().unwrap();
+        datagram.iov_len = self.iovs.len() as u32 - datagram.iov_start;
+        datagram.bytes = self.building as u32;
+        self.building
+    }
+
+    /// Groups the datagrams from `from` on into entries. With `gso`, a run of
+    /// at least [`GSO_MIN_SEGMENTS`] equal-size datagrams to one destination
+    /// (the last may be shorter) becomes segmented entries of near-equal
+    /// length, so capping a long run never strands a short plain tail.
     fn build_entries(&mut self, from: usize, gso: bool) {
         self.entries.clear();
-        let size = self.segment_size as u32;
-        #[cfg(target_os = "linux")]
-        let max_segments = GSO_MAX_SEGMENTS.min(MAX_DATAGRAM_SIZE / self.segment_size).max(1);
-        #[cfg(not(target_os = "linux"))]
-        let max_segments = 1;
+        let max_segments = GSO_MAX_SEGMENTS.min(MAX_DATAGRAM_SIZE / self.datagram_size).max(1);
         let mut s = from;
-        while s < self.segments.len() {
-            let first = self.segments[s];
+        while s < self.datagrams.len() {
+            let first = self.datagrams[s];
             let mut e = s + 1;
-            while gso &&
-                e < self.segments.len() &&
-                self.segments[e].stream == first.stream &&
-                self.segments[e - 1].len == size
-            {
+            let mut iov_len = first.iov_len;
+            while gso && e < self.datagrams.len() {
+                let next = self.datagrams[e];
+                if next.addr != first.addr ||
+                    self.datagrams[e - 1].bytes != first.bytes ||
+                    iov_len + next.iov_len > UIO_MAXIOV as u32
+                {
+                    break;
+                }
+                iov_len += next.iov_len;
                 e += 1;
             }
             if e - s >= GSO_MIN_SEGMENTS {
                 let parts = (e - s).div_ceil(max_segments);
                 let per = (e - s).div_ceil(parts);
                 for k in (s..e).step_by(per) {
-                    let part = &self.segments[k..(k + per).min(e)];
+                    let part = &self.datagrams[k..(k + per).min(e)];
                     self.entries.push(Entry {
-                        seg_start: k as u32,
-                        iov_len: part.iter().map(|g| g.iov_len).sum(),
-                        ends: part.iter().map(|g| g.ends).sum(),
+                        first: k as u32,
+                        count: part.len() as u32,
+                        iov_len: part.iter().map(|d| d.iov_len).sum(),
                         segmented: true,
                     });
                 }
             } else {
-                for (k, segment) in self.segments[s..e].iter().enumerate() {
+                for (k, datagram) in self.datagrams[s..e].iter().enumerate() {
                     self.entries.push(Entry {
-                        seg_start: (s + k) as u32,
-                        iov_len: segment.iov_len,
-                        ends: segment.ends,
+                        first: (s + k) as u32,
+                        count: 1,
+                        iov_len: datagram.iov_len,
                         segmented: false,
                     });
                 }
@@ -436,8 +367,8 @@ impl SendBatch {
             self.controls.resize(n, SEGMENT_CONTROL);
         }
         for (e, entry) in self.entries.iter().enumerate() {
-            let first = self.segments[entry.seg_start as usize];
-            let addr = &mut self.addrs[first.stream as usize];
+            let first = self.datagrams[entry.first as usize];
+            let addr = &mut self.addrs[first.addr as usize];
             let hdr = &mut self.hdrs[e].msg_hdr;
             hdr.msg_iov = self.iovs[first.iov_start as usize..].as_mut_ptr();
             hdr.msg_iovlen = entry.iov_len as _;
@@ -445,75 +376,73 @@ impl SendBatch {
             hdr.msg_namelen = addr.len;
             #[cfg(target_os = "linux")]
             if entry.segmented {
-                self.controls[e].size = self.segment_size as u16;
+                self.controls[e].size = first.bytes as u16;
                 hdr.msg_control = ptr::from_mut(&mut self.controls[e]).cast();
                 hdr.msg_controllen = SEGMENT_CONTROL_SPACE;
             }
         }
     }
 
-    /// Records that ended inside the first `entries` entries.
+    /// Datagrams inside the first `entries` entries.
     #[inline]
-    fn records_in(&self, entries: usize) -> usize {
-        self.entries[..entries].iter().map(|e| e.ends as usize).sum()
+    fn datagrams_in(&self, entries: usize) -> usize {
+        self.entries[..entries].iter().map(|e| e.count as usize).sum()
     }
 
-    /// Sends what was pushed and empties the batch. Returns how many records
-    /// the kernel accepted whole; `WouldBlock` only when it accepted none. A
-    /// record cut off by a refused entry counts as not sent even though its
-    /// head went out: the receiver drops that head.
+    /// Sends the closed datagrams and empties the batch. Returns how many
+    /// the kernel accepted, in order; `WouldBlock` only when it accepted
+    /// none.
     pub(crate) fn send(&mut self, fd: RawFd) -> io::Result<usize> {
-        self.layout();
-        let result = self.send_segments(fd);
-        self.records.clear();
+        let result = self.send_datagrams(fd);
+        self.datagrams.clear();
         self.addrs.clear();
+        self.iovs.clear();
+        self.arena_len = 0;
         result
     }
 
     #[cfg(target_os = "linux")]
-    fn send_segments(&mut self, fd: RawFd) -> io::Result<usize> {
+    fn send_datagrams(&mut self, fd: RawFd) -> io::Result<usize> {
         self.build_entries(0, self.gso);
         self.stage();
         let sent = sendmmsg(fd, &mut self.hdrs);
         let err = (sent < 0).then(io::Error::last_os_error);
         // The kernel stops at the first entry it refuses. UDP sends are
-        // atomic, so every accepted entry delivered all its segments.
+        // atomic, so every accepted entry delivered all its datagrams.
         let accepted = usize::try_from(sent).unwrap_or(0);
-        let records = self.records_in(accepted);
+        let datagrams = self.datagrams_in(accepted);
         // Route MTU, SG support, checksum offload and memory pressure all
         // refuse a segmented entry; a full socket buffer refuses plain
         // datagrams just the same.
         let retry = self.entries.get(accepted).is_some_and(|entry| entry.segmented) &&
             err.as_ref().is_none_or(|err| err.kind() != io::ErrorKind::WouldBlock);
         if !retry {
-            return err.map_or(Ok(records), Err);
+            return err.map_or(Ok(datagrams), Err);
         }
         // Retry the rest as plain datagrams, which reports the same errno if
         // it persists.
-        let resume = self.entries[accepted].seg_start as usize;
+        let resume = self.entries[accepted].first as usize;
         self.build_entries(resume, false);
         self.stage();
         match sendmmsg(fd, &mut self.hdrs) {
-            sent @ 0.. => Ok(records + self.records_in(sent as usize)),
-            _ if records != 0 => Ok(records),
+            sent @ 0.. => Ok(datagrams + sent as usize),
+            _ if datagrams != 0 => Ok(datagrams),
             _ => Err(io::Error::last_os_error()),
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn send_segments(&mut self, fd: RawFd) -> io::Result<usize> {
+    fn send_datagrams(&mut self, fd: RawFd) -> io::Result<usize> {
         self.build_entries(0, false);
         self.stage();
-        let mut records = 0;
-        for (i, entry) in self.entries.iter().enumerate() {
+        for i in 0..self.entries.len() {
             let r = unsafe { libc::sendmsg(fd, &self.hdrs[i].msg_hdr, libc::MSG_DONTWAIT) };
             if r < 0 {
                 let err = io::Error::last_os_error();
-                return if i == 0 { Err(err) } else { Ok(records) };
+                return if i == 0 { Err(err) } else { Ok(i) };
             }
-            records += entry.ends as usize;
         }
-        Ok(records)
+        Ok(self.entries.len())
     }
 }
 
@@ -696,89 +625,44 @@ mod tests {
         (sender, receiver, to)
     }
 
-    /// `records` laid back to back, and where each one starts.
-    fn stream(records: &[(&[u8], &[u8])]) -> (Vec<u8>, Vec<usize>) {
-        let mut bytes = Vec::new();
-        let mut starts = Vec::new();
-        for (header, payload) in records {
-            starts.push(bytes.len());
-            bytes.extend_from_slice(header);
-            bytes.extend_from_slice(payload);
+    /// Builds a datagram of `small` copied pieces followed by one borrowed
+    /// payload of `big` bytes.
+    fn build(batch: &mut SendBatch, to: &SockAddr, small: &[&[u8]], big: &[u8]) -> Vec<u8> {
+        batch.open(to);
+        let mut expect = Vec::new();
+        for piece in small {
+            batch.copy(piece);
+            expect.extend_from_slice(piece);
         }
-        (bytes, starts)
-    }
-
-    /// `first` of the packet carrying stream bytes `from..to`.
-    fn expected_first(starts: &[usize], from: usize, to: usize) -> usize {
-        let p = starts.iter().copied().find(|&p| p >= from && p < to).unwrap_or(to);
-        PACKET_HEADER_SIZE + p - from
-    }
-
-    /// `count` datagrams with consecutive packet sequences, as `(first, body)`.
-    fn recv_packets(receiver: &UdpSocket, count: usize) -> Vec<(usize, Vec<u8>)> {
-        let mut buf = [0; 2048];
-        let mut out = Vec::new();
-        let mut seq = None;
-        for _ in 0..count {
-            let n = receiver.recv(&mut buf).unwrap();
-            let packet = Packet::decode(&buf[..n]).expect("packet header");
-            assert_eq!(packet.seq, *seq.get_or_insert(packet.seq));
-            seq = Some(packet.seq + 1);
-            out.push((usize::from(packet.first), buf[PACKET_HEADER_SIZE..n].to_vec()));
+        if !big.is_empty() {
+            batch.payload(big);
+            expect.extend_from_slice(big);
         }
-        out
+        batch.close();
+        expect
     }
 
     #[test]
-    fn packets_cut_the_record_stream() {
+    fn datagrams_keep_their_bytes_and_order() {
         let (sender, receiver, to) = pair();
         let mut batch = SendBatch::new(1200);
         #[cfg(target_os = "linux")]
         offload_available(batch.enable_gso(sender.as_raw_fd()));
-        let headers: Vec<[u8; 29]> = (0..50).map(|i| [i as u8; 29]).collect();
-        let payloads: Vec<Vec<u8>> = (0..50).map(|i| vec![0x80 | i as u8; 64 + i % 37]).collect();
-        for (header, payload) in headers.iter().zip(&payloads) {
-            batch.push(header, payload, &to, Layout::Packed);
+        let big = vec![7; 900];
+        let mut expected = Vec::new();
+        for i in 0..6u8 {
+            let (head, tail) = ([i; 25], [i; 200]);
+            let small = [head.as_slice(), b"abc", tail.as_slice()];
+            let big_len = if i == 5 { 100 } else { big.len() };
+            expected.push(build(&mut batch, &to, &small, &big[..big_len]));
         }
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 50);
-        let records: Vec<(&[u8], &[u8])> =
-            headers.iter().zip(&payloads).map(|(h, p)| (&h[..], &p[..])).collect();
-        let (bytes, starts) = stream(&records);
-        let room = 1200 - PACKET_HEADER_SIZE;
-        let packets = recv_packets(&receiver, bytes.len().div_ceil(room));
-        assert!(packets.len() >= GSO_MIN_SEGMENTS);
-        for (k, (first, body)) in packets.iter().enumerate() {
-            let from = k * room;
-            let to = (from + room).min(bytes.len());
-            assert_eq!(body, &bytes[from..to], "packet {k}");
-            assert_eq!(*first, expected_first(&starts, from, to), "packet {k}");
-        }
-    }
-
-    #[test]
-    fn bare_records_split_the_stream() {
-        let (sender, receiver, to) = pair();
-        let mut batch = SendBatch::new(1200);
-        let full = vec![4; 1200 - 29];
-        batch.push(&[1; 29], &[2; 10], &to, Layout::Packed);
-        batch.push(&[3; 29], &full, &to, Layout::Bare);
-        batch.push(&[5; 29], &[6; 10], &to, Layout::Packed);
-        batch.push(&[7; 29], &full, &to, Layout::Packed);
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
+        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 6);
+        assert!(batch.is_empty());
         let mut buf = [0; 2048];
-        let (first, body) = recv_packets(&receiver, 1).pop().unwrap();
-        assert_eq!((first, body.len()), (PACKET_HEADER_SIZE, 39));
-        let n = receiver.recv(&mut buf).unwrap();
-        assert_eq!(n, 1200);
-        assert_eq!(&buf[..29], &[3; 29]);
-        assert_eq!(&buf[29..n], &full[..]);
-        // The packed full record straddles: 39 bytes of the small record,
-        // then 1152 of it, then its last 48 in a packet of its own.
-        let packets = recv_packets(&receiver, 2);
-        assert_eq!((packets[0].0, packets[0].1.len()), (PACKET_HEADER_SIZE, 1191));
-        assert_eq!(&packets[0].1[39..68], &[7; 29]);
-        assert_eq!((packets[1].0, packets[1].1.len()), (57, 48));
-        assert_eq!(packets[1].1, vec![4; 48]);
+        for expect in expected {
+            let n = receiver.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &expect[..]);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -798,24 +682,25 @@ mod tests {
             },
             0
         );
-        // Six 13-byte records over 23-byte packet bodies: four packets.
-        let mut batch = SendBatch::new(32);
+        let mut batch = SendBatch::new(64);
         if !offload_available(batch.enable_gso(sender.as_raw_fd())) {
             return;
         }
-        for _ in 0..6 {
-            batch.push(b"header", b"payload", &to, Layout::Packed);
+        for _ in 0..5 {
+            build(&mut batch, &to, &[b"headerpayload"], &[]);
         }
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 6);
+        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 5);
         // Per-socket EIO is not a kernel capability; offload stays enabled.
         assert!(batch.gso);
-        let packets = recv_packets(&receiver, 4);
-        let body: Vec<u8> = packets.into_iter().flat_map(|(_, body)| body).collect();
-        assert_eq!(body, b"headerpayload".repeat(6));
+        let mut buf = [0; 32];
+        for _ in 0..5 {
+            let n = receiver.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"headerpayload");
+        }
     }
 
     #[test]
-    fn mixed_batch_preserves_destinations_and_lengths() {
+    fn mixed_destinations_keep_their_datagrams() {
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         let receivers =
             [UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap()];
@@ -824,25 +709,17 @@ mod tests {
         }
         let to = receivers.each_ref().map(|r| SockAddr::new(r.local_addr().unwrap()));
         let mut batch = SendBatch::new(1200);
-        #[cfg(target_os = "linux")]
-        offload_available(batch.enable_gso(sender.as_raw_fd()));
         let payloads: [&[u8]; 4] = [b"a", b"bbbb", b"cc", b"ddd"];
         for (i, payload) in payloads.iter().enumerate() {
-            batch.push(b"h", payload, &to[i % 2], Layout::Packed);
+            build(&mut batch, &to[i % 2], &[b"h", payload], &[]);
         }
         assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
+        let mut buf = [0; 32];
         for (i, payload) in payloads.iter().enumerate() {
-            let (first, body) = recv_packets(&receivers[i % 2], 1).pop().unwrap();
-            assert_eq!(first, PACKET_HEADER_SIZE);
-            assert_eq!(body[0], b'h');
-            assert_eq!(&body[1..], *payload);
+            let n = receivers[i % 2].recv(&mut buf).unwrap();
+            assert_eq!(buf[0], b'h');
+            assert_eq!(&buf[1..n], *payload);
         }
-        for payload in &payloads {
-            batch.push(b"h", payload, &to[0], Layout::Packed);
-        }
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
-        let (_, body) = recv_packets(&receivers[0], 1).pop().unwrap();
-        assert_eq!(body, b"hahbbbbhcchddd");
     }
 
     #[cfg(target_os = "linux")]
@@ -863,14 +740,11 @@ mod tests {
             if !offload_available(tx.enable_gso(sender.as_raw_fd())) {
                 return;
             }
-            // Three bare full fragments and a short tail packed into a
-            // packet: one GSO run, the last segment shorter.
-            let headers = [[1; 29], [2; 29], [3; 29], [4; 29]];
+            // Three full datagrams and a short one: one GSO run.
             let payload = [0x5a; 1200 - 29];
             let len = |i: usize| if i == 3 { 17 } else { payload.len() };
-            for (i, header) in headers.iter().enumerate() {
-                let layout = if i == 3 { Layout::Packed } else { Layout::Bare };
-                tx.push(header, &payload[..len(i)], &to, layout);
+            for i in 0..4u8 {
+                build(&mut tx, &to, &[&[i + 1; 29]], &payload[..len(i as usize)]);
             }
             assert_eq!(tx.send(sender.as_raw_fd()).unwrap(), 4);
             let mut rx = RecvBatch::new(1200);
@@ -882,14 +756,8 @@ mod tests {
                 let (datagrams, from) = rx.datagrams(i).unwrap();
                 assert_eq!(from, sender.local_addr().unwrap());
                 for bytes in datagrams {
-                    let packet = Packet::decode(bytes);
-                    assert_eq!(packet.is_some(), seen == 3);
-                    if let Some(packet) = packet {
-                        assert_eq!(usize::from(packet.first), PACKET_HEADER_SIZE);
-                    }
-                    let body = &bytes[if packet.is_some() { PACKET_HEADER_SIZE } else { 0 }..];
-                    assert_eq!(&body[..29], &headers[seen]);
-                    assert_eq!(&body[29..], &payload[..len(seen)]);
+                    assert_eq!(&bytes[..29], &[seen as u8 + 1; 29]);
+                    assert_eq!(&bytes[29..], &payload[..len(seen)]);
                     seen += 1;
                 }
             }

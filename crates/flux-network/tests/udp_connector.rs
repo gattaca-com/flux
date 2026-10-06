@@ -11,8 +11,8 @@ use std::{
 use flux_network::{Network, NetworkEvent, ReplayPolicy, UdpConfig, UdpGroupConfig};
 use mio::Token;
 
-/// Payload bytes per fragment of a 1200-byte datagram.
-const STRIDE: usize = 1200 - 29;
+/// Message bytes a 1200-byte packet carries in one fragment.
+const STRIDE: usize = 1200 - 25 - 14;
 
 fn free_addr() -> SocketAddr {
     UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap()
@@ -701,14 +701,14 @@ fn udp_server_disconnect_reconnects_client() {
 #[test]
 fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let addr = free_addr();
-    let config = UdpConfig { send_window: 64, max_message_size: 64 * STRIDE, ..UdpConfig::lan() };
+    let config = UdpConfig { send_window: 64, max_message_size: 4096, ..UdpConfig::lan() };
     let mut server = Network::default();
     let server_group = server.add_group(UdpGroupConfig { udp: config, ..Default::default() });
     let mut client = Network::default();
     let client_group = client.add_group(UdpGroupConfig { udp: config, ..Default::default() });
     let (accepted, _) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
     // Client never polls: nothing is acked, the window fills, the 65th
-    // single-fragment message cannot be queued.
+    // single-packet message cannot be queued.
     let mut disconnected = None;
     for _ in 0..70 {
         server.send_with(accepted, |b| b.extend_from_slice(b"m"));
@@ -1109,11 +1109,22 @@ fn udp_batched_sends_deliver_every_item() {
 /// lossy relays whose buffers hold a burst, with no peer dropped.
 #[test]
 fn udp_broadcast_bursts_to_many_peers_survive_loss() {
+    broadcast_bursts(97, 1, 16_000);
+}
+
+/// Receivers that poll rarely keep deep queues, so round trips are long; a
+/// rare loss must still be repaired before the window fills.
+#[test]
+fn udp_slow_receivers_repair_a_rare_loss_in_time() {
+    broadcast_bursts(5000, 40, 6000);
+}
+
+fn broadcast_bursts(drop_every: usize, poll_every: usize, max_lag: u32) {
     const PEERS: usize = 5;
     const N: u32 = 60_000;
     let server_addr = free_addr();
     let relays: Vec<LossyRelay> =
-        (0..PEERS).map(|i| LossyRelay::start(server_addr, 97 + i)).collect();
+        (0..PEERS).map(|i| LossyRelay::start(server_addr, drop_every + i)).collect();
     let mut server = Network::default();
     let server_group = server.add_group(UdpGroupConfig {
         udp: UdpConfig::lan(),
@@ -1156,10 +1167,12 @@ fn udp_broadcast_bursts_to_many_peers_survive_loss() {
     let mut burst = 1usize;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut disconnects = 0;
+    let mut iteration = 0usize;
     while received.iter().any(|&r| r < N) {
+        iteration += 1;
         assert!(Instant::now() < deadline, "delivery stalled: received={received:?} sent={next}");
         let lag = next as u32 - *received.iter().min().unwrap();
-        if next < N as usize && lag < 16_000 {
+        if next < N as usize && lag < max_lag {
             let end = (next + burst).min(N as usize);
             server.broadcast_many_with(server_group, next..end, |b, i| {
                 b.extend_from_slice(&make_msg(i as u32, sizes[i]));
@@ -1173,6 +1186,9 @@ fn udp_broadcast_bursts_to_many_peers_survive_loss() {
             }
         });
         for (p, (c, _)) in clients.iter_mut().enumerate() {
+            if !iteration.is_multiple_of(poll_every) {
+                continue;
+            }
             c.poll_with(|e| match e {
                 NetworkEvent::Message { payload, .. } => {
                     let id = msg_id(payload) as usize;

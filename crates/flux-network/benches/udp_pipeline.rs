@@ -27,7 +27,8 @@
 //! for the loss scenario how many datagrams were retransmitted.
 //!
 //! Scenarios:
-//! - `paced`: at most one message every 100 µs, with bounded outstanding sends.
+//! - `paced`: one send per 100 µs, or slower so that no size exceeds 1 GiB/s.
+//!   Latency of an unloaded transport; the run asserts the pace was kept.
 //! - `burst`: as fast as the send window allows. Throughput and queueing.
 //! - `loss1`: UDP through a relay that drops exactly one data datagram of a 2
 //!   MiB message. Recovery should resend one datagram, not the message.
@@ -63,14 +64,19 @@ use flux_utils::directories::shmem_dir;
 /// default on many hosts), so no scenario but `loss1` ever drops a datagram.
 const SIZES: [(&str, usize); 3] = [("2k", 2 * 1024), ("64k", 64 * 1024), ("1m", 1024 * 1024)];
 const PACED_MSGS: usize = 2000;
-const PACE: Duration = Duration::from_micros(100);
+const PACE_FLOOR: Duration = Duration::from_micros(100);
+const PACE_RATE: usize = 1024 * 1024 * 1024;
+
+/// Interval between paced sends of `bytes`: [`PACE_FLOOR`], or longer so the
+/// rate stays at [`PACE_RATE`].
+fn pace_for(bytes: usize) -> Duration {
+    PACE_FLOOR.max(Duration::from_secs(1) * bytes as u32 / PACE_RATE as u32)
+}
 const BCAST_PEERS: usize = 8;
 const BIG_SOCKET_BUF: usize = 16 * 1024 * 1024;
 /// Message sizes of the `many` scenario; a batch cycles through its range.
 const MANY_SIZES: [(&str, std::ops::RangeInclusive<usize>); 2] =
-    [("tiny", 64..=100), ("few-kb", 2048..=4096)];
-/// Payload bytes per fragment of a 1200-byte datagram.
-const STRIDE: usize = 1200 - 29;
+    [("small", 64..=256), ("few-kb", 2048..=4096)];
 /// Shared-memory telemetry queues of the `udp+tel` transport live here.
 const APP_NAME: &str = "udp-pipeline-bench";
 
@@ -496,6 +502,10 @@ fn run(sc: Scenario) -> Stats {
     let elapsed = start.elapsed();
     let latencies_ns = rx_thread.join().unwrap();
     assert_eq!(latencies_ns.len(), expected, "receiver timed out");
+    if let Some(p) = pace {
+        let ideal = p * (count / batch) as u32;
+        assert!(elapsed < ideal + ideal / 10 + Duration::from_millis(10), "pace of {p:?} not kept");
+    }
     Stats { latencies_ns, send_ns, elapsed, bytes }
 }
 
@@ -551,30 +561,16 @@ impl Relay {
                     client = Some(from);
                     server
                 };
-                // Wire layout: byte 2 holds the kind in its low nibble. Kind 0
-                // is a packet whose first record starts at the offset in
-                // [7..9]; kind 1 is a bare data record. A data record has its
-                // session at [3..7], sequence at [7..15], message length at
-                // [15..19] and fragment index at [19..21], which fixes its
-                // payload length.
-                let mut records = 0;
-                let kind = if n >= 29 { buf[2] & 0x0f } else { 0xff };
-                let mut off = match kind {
-                    0 => usize::from(u16::from_le_bytes(buf[7..9].try_into().unwrap())),
-                    1 => 0,
-                    _ => n,
-                };
-                while off + 29 <= n && buf[off + 2] & 0x0f == 1 {
-                    let r = &buf[off..off + 29];
-                    let session = u32::from_le_bytes(r[3..7].try_into().unwrap());
-                    let seq = u64::from_le_bytes(r[7..15].try_into().unwrap());
-                    let len = u32::from_le_bytes(r[15..19].try_into().unwrap()) as usize;
-                    let index = usize::from(u16::from_le_bytes(r[19..21].try_into().unwrap()));
-                    records += 1;
+                // Wire layout: byte 2 holds the kind in its low nibble, 1 for
+                // a packet of records, with the session at [3..7] and the
+                // packet sequence at [7..15].
+                let records = usize::from(n >= 25 && buf[2] & 0x0f == 1);
+                if records != 0 {
+                    let session = u32::from_le_bytes(buf[3..7].try_into().unwrap());
+                    let seq = u64::from_le_bytes(buf[7..15].try_into().unwrap());
                     if !seen.insert((session, seq)) {
                         retx_c.fetch_add(1, Ordering::Relaxed);
                     }
-                    off += 29 + STRIDE.min(len - index * STRIDE);
                 }
                 if records != 0 {
                     n_data += 1;
@@ -601,7 +597,7 @@ fn main() {
     pin(usize::MAX);
     cleanup_shmem(&shmem_dir(APP_NAME));
     let _link = Link::up();
-    println!("== paced: one message per 100µs, one receiver ==");
+    println!("== paced: one message per 100µs or 1 GiB/s, one receiver ==");
     for (size_name, size) in SIZES {
         for (name, transport) in transports() {
             let addr = free_addr();
@@ -612,7 +608,7 @@ fn main() {
                 clients: 1,
                 sizes: size..=size,
                 count: PACED_MSGS,
-                pace: Some(PACE),
+                pace: Some(pace_for(size)),
                 window: burst_plan(size).1,
                 batch: 1,
                 grouped: false,
@@ -645,7 +641,7 @@ fn main() {
     println!("\n== loss1: one 2 MiB message, exactly one datagram dropped by a relay ==");
     {
         let server_addr = free_addr();
-        // Drop the 900th of 1791 data datagrams.
+        // Drop the 900th of about 1810 packets.
         let relay = Relay::start(server_addr, 900);
         let s = run(Scenario {
             transport: UdpGroupConfig { udp: udp_config(), ..Default::default() }.into(),
@@ -727,7 +723,8 @@ fn many() {
             row(name("udp-grouped"), &udp, sizes.clone(), 1, batch, true, None);
             row(name("udp-loop"), &udp, sizes.clone(), 1, batch, false, None);
             row(name("tcp-grouped"), &tcp, sizes.clone(), 1, batch, true, None);
-            row(name("udp-grouped-paced"), &udp, sizes.clone(), 1, batch, true, Some(PACE));
+            let pace = pace_for(batch * (sizes.start() + sizes.end()) / 2);
+            row(name("udp-grouped-paced"), &udp, sizes.clone(), 1, batch, true, Some(pace));
             row(name("udp-grouped-8rx"), &udp, sizes.clone(), BCAST_PEERS, batch, true, None);
             row(name("udp-loop-8rx"), &udp, sizes.clone(), BCAST_PEERS, batch, false, None);
         }
