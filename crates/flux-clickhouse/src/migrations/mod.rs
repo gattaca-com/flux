@@ -15,7 +15,7 @@ use tracing::info;
 #[cfg(feature = "cli")]
 mod cli;
 #[cfg(feature = "cli")]
-pub use cli::run as run_cli;
+pub use cli::{run as run_cli, run_directory as run_directory_cli};
 
 /// Embedded SQL and the last version exempt from compatibility linting.
 pub struct MigrationSet<'a> {
@@ -31,7 +31,7 @@ impl<'a> MigrationSet<'a> {
     /// Apply missing versions and check existing checksums. Newer database
     /// versions are retained.
     pub async fn sync(&self, client: &clickhouse::Client) -> eyre::Result<()> {
-        sync_migrations(self, client).await
+        sync_migrations(client, &parse_migrations(&self.migrations_dir)?).await
     }
 
     pub async fn rollback(
@@ -86,12 +86,6 @@ fn parse_migrations(migrations_dir: &Dir<'_>) -> eyre::Result<Vec<Migration>> {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| eyre::eyre!("invalid migration directory name"))?;
-        let (version_str, name) = dir_name
-            .split_once('_')
-            .ok_or_else(|| eyre::eyre!("migration dir must be NNNN_name: {dir_name}"))?;
-        let version = version_str
-            .parse::<u32>()
-            .map_err(|_| eyre::eyre!("invalid version number in {dir_name}"))?;
         let up_sql = entry
             .get_file(entry.path().join("up.sql"))
             .and_then(|file| file.contents_utf8())
@@ -102,13 +96,23 @@ fn parse_migrations(migrations_dir: &Dir<'_>) -> eyre::Result<Vec<Migration>> {
             .and_then(|file| file.contents_utf8())
             .ok_or_else(|| eyre::eyre!("missing down.sql in {dir_name}"))?
             .to_owned();
-        let checksum = sha256_hex(up_sql.as_bytes());
-        migrations.push(Migration { version, name: name.to_owned(), up_sql, down_sql, checksum });
+        migrations.push(parse_migration(dir_name, up_sql, down_sql)?);
     }
 
     migrations.sort_by_key(|migration| migration.version);
     validate_migration_sequence(&migrations)?;
     Ok(migrations)
+}
+
+fn parse_migration(dir_name: &str, up_sql: String, down_sql: String) -> eyre::Result<Migration> {
+    let (version_str, name) = dir_name
+        .split_once('_')
+        .ok_or_else(|| eyre::eyre!("migration dir must be NNNN_name: {dir_name}"))?;
+    let version = version_str
+        .parse::<u32>()
+        .map_err(|_| eyre::eyre!("invalid version number in {dir_name}"))?;
+    let checksum = sha256_hex(up_sql.as_bytes());
+    Ok(Migration { version, name: name.to_owned(), up_sql, down_sql, checksum })
 }
 
 fn validate_migration_sequence(migrations: &[Migration]) -> eyre::Result<()> {
@@ -187,18 +191,14 @@ async fn record_applied(client: &clickhouse::Client, migration: &Migration) -> e
     Ok(())
 }
 
-async fn sync_migrations(
-    migration_set: &MigrationSet<'_>,
-    client: &clickhouse::Client,
-) -> eyre::Result<()> {
+async fn sync_migrations(client: &clickhouse::Client, embedded: &[Migration]) -> eyre::Result<()> {
     client.query(CREATE_TRACKING_TABLE).execute().await?;
 
-    let embedded = parse_migrations(&migration_set.migrations_dir)?;
     let applied = get_applied(client).await?;
     let applied_versions: rustc_hash::FxHashSet<u32> =
         applied.iter().map(|migration| migration.version).collect();
 
-    for migration in &embedded {
+    for migration in embedded {
         if let Some(database) = applied.iter().find(|row| row.version == migration.version) {
             ensure!(
                 migration.checksum == database.checksum,
@@ -212,7 +212,7 @@ async fn sync_migrations(
     }
 
     let mut applied_count = 0u32;
-    for migration in &embedded {
+    for migration in embedded {
         if applied_versions.contains(&migration.version) {
             continue;
         }

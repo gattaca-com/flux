@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use super::MigrationSet;
+use super::{Migration, MigrationSet};
 
 #[derive(Parser)]
 #[command(name = "chmig", about = "ClickHouse migration sync")]
@@ -11,6 +11,17 @@ struct Cli {
     config: PathBuf,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Parser)]
+#[command(name = "chmig", about = "ClickHouse migration sync")]
+struct DirectoryCli {
+    #[arg(long, default_value = "migrations")]
+    migrations_dir: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    compatibility_lint_baseline: u32,
+    #[command(flatten)]
+    cli: Cli,
 }
 
 #[derive(Subcommand)]
@@ -53,22 +64,69 @@ impl ClickhouseSection {
 /// or an async runtime.
 pub fn run(migrations: &MigrationSet<'_>, migrations_dir: &Path) -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
-    let cli = Cli::parse();
+    execute(
+        Cli::parse(),
+        || super::parse_migrations(&migrations.migrations_dir),
+        migrations_dir,
+        migrations.compatibility_lint_baseline,
+    )
+}
 
+/// Run `chmig` against SQL files selected by `--migrations-dir`.
+pub fn run_directory() -> eyre::Result<()> {
+    tracing_subscriber::fmt::init();
+    let cli = DirectoryCli::parse();
+    execute(
+        cli.cli,
+        || load_migrations(&cli.migrations_dir),
+        &cli.migrations_dir,
+        cli.compatibility_lint_baseline,
+    )
+}
+
+fn execute(
+    cli: Cli,
+    migrations: impl FnOnce() -> eyre::Result<Vec<Migration>>,
+    migrations_dir: &Path,
+    compatibility_lint_baseline: u32,
+) -> eyre::Result<()> {
     match cli.command {
         Command::Sync => {
             let config = load_config(&cli.config)?;
-            runtime()?.block_on(migrations.sync(&config.client()))?;
+            runtime()?.block_on(super::sync_migrations(&config.client(), &migrations()?))?;
         }
         Command::Rollback { target_version } => {
             let config = load_config(&cli.config)?;
-            runtime()?.block_on(migrations.rollback(&config.client(), target_version))?;
+            runtime()?.block_on(super::rollback(&config.client(), target_version))?;
         }
-        Command::Validate => migrations.validate()?,
+        Command::Validate => {
+            super::lint_backward_compatibility(&migrations()?, compatibility_lint_baseline)?;
+        }
         Command::Create { name } => create_migration(migrations_dir, &name)?,
     }
 
     Ok(())
+}
+
+fn load_migrations(directory: &Path) -> eyre::Result<Vec<Migration>> {
+    let mut migrations = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| eyre::eyre!("invalid migration directory name"))?;
+        migrations.push(super::parse_migration(
+            name,
+            std::fs::read_to_string(path.join("up.sql"))?,
+            std::fs::read_to_string(path.join("down.sql"))?,
+        )?);
+    }
+    migrations.sort_by_key(|migration| migration.version);
+    super::validate_migration_sequence(&migrations)?;
+    Ok(migrations)
 }
 
 fn runtime() -> eyre::Result<tokio::runtime::Runtime> {
@@ -149,6 +207,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(first).unwrap(), "SELECT 1");
         assert_eq!(std::fs::read(directory.path().join("0002_next/up.sql")).unwrap(), b"");
         assert_eq!(std::fs::read(directory.path().join("0002_next/down.sql")).unwrap(), b"");
+        let migrations = super::load_migrations(directory.path()).unwrap();
+        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations[0].up_sql, "SELECT 1");
+        assert_eq!(migrations[0].checksum, crate::migrations::sha256_hex(b"SELECT 1"));
         assert!(super::create_migration(directory.path(), "../escape").is_err());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
     }
