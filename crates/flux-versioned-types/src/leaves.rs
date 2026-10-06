@@ -59,12 +59,7 @@ pub trait HasVersionedLeaves: Copy {
     fn decode_blob<U: Versioned>(blob: &Blob, scratch: &mut Scratch) -> Option<Decoded<U, Self>>;
 
     /// [`decode_blob`](Self::decode_blob), handing each message to `f` as it
-    /// decodes, with no intermediate batch per family level. Nothing reaches
-    /// `f` when the blob is not this type's or fails to decode, so a caller
-    /// can size its buffer from `blob.header.n_messages` on the first call.
-    ///
-    /// The derive decodes in one pass and builds `decode_blob` on this; the
-    /// default suits a hand-written `decode_blob` and moves its batch across.
+    /// decodes.
     fn decode_blob_into<U: Versioned, F: FnMut(InternalMessage<Self>)>(
         blob: &Blob,
         scratch: &mut Scratch,

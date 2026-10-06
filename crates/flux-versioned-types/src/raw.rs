@@ -95,8 +95,6 @@ impl std::error::Error for DecodeError {}
 pub struct Scratch {
     words: Vec<u128>,
     len: usize,
-    /// Kept across blobs: `zstd::bulk::decompress_to_buffer` builds and frees
-    /// a context on every call.
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
 }
 

@@ -45,10 +45,6 @@ impl IngestionTime {
         Self { real: self.real, internal: now.internal - now.real().saturating_sub(self.real) }
     }
 
-    /// Projects wall-clock `real` onto the TSC through `now`, one reading of
-    /// both clocks. A batch converted against one `now` costs one pair of
-    /// clock reads instead of a pair per value, and keeps its wall-clock
-    /// order: a later `real` never lands on an earlier `internal`.
     #[inline]
     pub fn from_real_at(real: Nanos, now: Self) -> Self {
         // Another host's clock can sit slightly ahead of ours.
