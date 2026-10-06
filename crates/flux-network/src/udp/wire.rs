@@ -3,7 +3,8 @@
 //! Every datagram starts with the magic, a version nibble and a kind nibble.
 //! Kind 0 is a packet: a container the sender cuts out of a byte stream of
 //! records every `max_datagram_size` bytes, so one datagram can carry several
-//! messages and one record can straddle two consecutive packets.
+//! messages and one record can straddle two consecutive packets. Messages
+//! sent together travel this way; everything else is a bare record.
 //!
 //! ```text
 //! packet header
@@ -23,11 +24,10 @@
 //! [21..29] send_ts      sender wall clock, for receive-side latency telemetry
 //! ```
 //!
-//! Control records (Hello, `HelloAck`, Reset, Ack) and any record too large
-//! to share a packet travel as bare datagrams: a record header at offset 0.
-//! A record's payload length follows from its header
-//! ([`Header::payload_len`]), which is what delimits records in a packet. An
-//! Ack's payload is its bitmap: bit `i` set means `seq + 1 + i` arrived.
+//! A bare datagram is a record header at offset 0 followed by its payload. A
+//! record's payload length follows from its header ([`Header::payload_len`]),
+//! which is what delimits records in a packet. An Ack's payload is its
+//! bitmap: bit `i` set means `seq + 1 + i` arrived.
 //!
 //! A message is split into `ceil(len / stride)` fragments carrying
 //! consecutive sequence numbers, so the message is identified by the sequence

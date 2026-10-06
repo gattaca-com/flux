@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use super::{
     UdpConfig,
-    sys::{SEND_BATCH, SendBatch, SockAddr},
+    sys::{Layout, SEND_BATCH, SendBatch, SockAddr},
     wire::{HEADER_SIZE, Header, Kind, fragment_count, parse_len_and_index, write_session},
 };
 use crate::{
@@ -211,7 +211,7 @@ impl MsgStore {
     }
 }
 
-/// One datagram: its header and where its payload lives in the store.
+/// One record: its header and where its payload lives in the store.
 struct Fragment {
     header: [u8; HEADER_SIZE],
     slot: u32,
@@ -219,6 +219,7 @@ struct Fragment {
     len: u16,
     sent_at: Instant,
     retries: u8,
+    layout: Layout,
 }
 
 /// A message this peer holds a store reference on.
@@ -288,6 +289,7 @@ impl TxWindow {
             len: 0,
             sent_at: Instant::ZERO,
             retries: 0,
+            layout: Layout::Bare,
         });
         Self {
             slots,
@@ -351,6 +353,7 @@ impl TxWindow {
         store: &mut MsgStore,
         slot: u32,
         ts: Nanos,
+        layout: Layout,
     ) -> bool {
         let payload = store.bytes(slot);
         let total = fragment_count(payload.len(), stride);
@@ -368,6 +371,7 @@ impl TxWindow {
             f.offset = (index * stride) as u32;
             f.len = chunk.len() as u16;
             f.retries = 0;
+            f.layout = layout;
             self.next += 1;
         }
         self.messages.push_back(MsgRef { slot, first_seq, last_seq: self.next - 1 });
@@ -380,7 +384,7 @@ impl TxWindow {
     #[inline]
     fn stage(&self, seq: u64, store: &MsgStore, to: &SockAddr, batch: &mut SendBatch) {
         let f = &self.slots[(seq & self.mask) as usize];
-        batch.push(&f.header, payload_of(store, f), to);
+        batch.push(&f.header, payload_of(store, f), to, f.layout);
     }
 
     /// Records that the kernel accepted `seq`.
@@ -1080,13 +1084,14 @@ impl UdpPeer {
         slot: u32,
         ts: Nanos,
         now: Instant,
+        layout: Layout,
     ) -> PushOutcome {
         let len = store.bytes(slot).len();
         if len > self.config.max_message_size {
             warn!(%self.addr, len, max = self.config.max_message_size, "udp message too large");
             return PushOutcome::TooLarge;
         }
-        if self.tx.push(self.local_session, self.config.stride(), store, slot, ts) {
+        if self.tx.push(self.local_session, self.config.stride(), store, slot, ts, layout) {
             return PushOutcome::Queued;
         }
         self.dropped_full += 1;
@@ -1381,7 +1386,7 @@ mod tests {
     /// Stores a payload and pushes it, dropping the owner reference.
     fn push(tx: &mut TxWindow, store: &mut MsgStore, stride: usize, payload: &[u8]) -> bool {
         let slot = store.insert(&mut payload.to_vec());
-        let ok = tx.push(1, stride, store, slot, Nanos(1));
+        let ok = tx.push(1, stride, store, slot, Nanos(1), Layout::Bare);
         store.release(slot);
         ok
     }
@@ -1590,7 +1595,10 @@ mod tests {
         let mut batch = SendBatch::new(config.max_datagram_size);
         let now = Instant::now();
         let slot = store.insert(&mut vec![0; config.stride() * 3]);
-        assert_eq!(peer.push_message(&mut store, slot, Nanos(1), now), PushOutcome::Queued);
+        assert_eq!(
+            peer.push_message(&mut store, slot, Nanos(1), now, Layout::Bare),
+            PushOutcome::Queued
+        );
         store.release(slot);
         assert_eq!(store.free.len(), 0);
         for seq in 0..3 {

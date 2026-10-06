@@ -32,8 +32,9 @@
 //! - `loss1`: UDP through a relay that drops exactly one data datagram of a 2
 //!   MiB message. Recovery should resend one datagram, not the message.
 //! - `bcast`: one sender broadcasting to 8 receivers on one listener socket.
-//! - `many`: 50 messages of 64..100 bytes per `send_many_with` or
-//!   `broadcast_many_with` call, reporting the time spent in the call as well.
+//! - `many`: batches of small or few-KiB messages per `send_many_with` or
+//!   `broadcast_many_with` call, against the same batch as a loop of single
+//!   sends, reporting the time spent in the call as well.
 //!
 //! Run with `cargo bench -p flux-network --bench udp_pipeline`.
 
@@ -65,9 +66,9 @@ const PACED_MSGS: usize = 2000;
 const PACE: Duration = Duration::from_micros(100);
 const BCAST_PEERS: usize = 8;
 const BIG_SOCKET_BUF: usize = 16 * 1024 * 1024;
-/// Messages per call in the `many` scenario, and their sizes.
-const MANY: usize = 50;
-const MANY_SIZES: std::ops::RangeInclusive<usize> = 64..=100;
+/// Message sizes of the `many` scenario; a batch cycles through its range.
+const MANY_SIZES: [(&str, std::ops::RangeInclusive<usize>); 2] =
+    [("tiny", 64..=100), ("few-kb", 2048..=4096)];
 /// Payload bytes per fragment of a 1200-byte datagram.
 const STRIDE: usize = 1200 - 29;
 /// Shared-memory telemetry queues of the `udp+tel` transport live here.
@@ -308,7 +309,7 @@ fn burst_plan(size: usize) -> (usize, usize) {
 
 struct Stats {
     latencies_ns: Vec<u64>,
-    /// Time spent inside each send call; only recorded by the `many` scenario.
+    /// Time spent sending each batch; only recorded by the `many` scenario.
     send_ns: Vec<u64>,
     elapsed: Duration,
     bytes: usize,
@@ -386,31 +387,30 @@ struct Scenario {
     listen: SocketAddr,
     dial: SocketAddr,
     clients: usize,
-    size: usize,
+    /// Message sizes, cycled through within a batch.
+    sizes: std::ops::RangeInclusive<usize>,
     count: usize,
     /// Minimum gap between sends; `None` sends as fast as `window` allows.
     pace: Option<Duration>,
     /// Bound on messages sent but not yet received by every client.
     window: usize,
-    /// Messages per send call: 1 uses `broadcast_with` with `size`-byte
-    /// messages; more uses `send_many_with` (one client) or
-    /// `broadcast_many_with` with [`MANY_SIZES`]-byte messages.
+    /// Messages per send step.
     batch: usize,
+    /// Send a batch with one `send_many_with` or `broadcast_many_with` call
+    /// rather than one `send_with` or `broadcast_with` call per message.
+    grouped: bool,
 }
 
 /// Sends `count` messages from the server while the receiver thread counts
 /// them and records one-way latency.
 fn run(sc: Scenario) -> Stats {
-    let Scenario { transport, listen, dial, clients, size, count, pace, window, batch } = sc;
+    let Scenario { transport, listen, dial, clients, sizes, count, pace, window, batch, grouped } =
+        sc;
     assert!(count.is_multiple_of(batch));
     let (mut server, server_group, receivers, accepted) =
         connect(&transport, listen, dial, clients);
-    let msgs: Vec<Vec<u8>> = if batch == 1 {
-        vec![vec![0x5Au8; size]]
-    } else {
-        let span = MANY_SIZES.end() - MANY_SIZES.start() + 1;
-        (0..batch).map(|j| vec![0x5Au8; MANY_SIZES.start() + j % span]).collect()
-    };
+    let span = sizes.end() - sizes.start() + 1;
+    let msgs: Vec<Vec<u8>> = (0..batch).map(|j| vec![0x5Au8; sizes.start() + j % span]).collect();
     let bytes = count / batch * clients * msgs.iter().map(Vec::len).sum::<usize>();
     let mut send_ns = Vec::with_capacity(if batch == 1 { 0 } else { count / batch });
     let stop = Arc::new(AtomicBool::new(false));
@@ -464,17 +464,23 @@ fn run(sc: Scenario) -> Stats {
         let received = got.load(Ordering::Relaxed) / clients;
         let now = Instant::now();
         if sent < count && sent - received < window && pace.is_none_or(|_| now >= next_send) {
-            if batch == 1 {
-                server.broadcast_with(server_group, |b| b.extend_from_slice(&msgs[0]));
-            } else {
-                let t = Instant::now();
-                if clients == 1 {
+            let t = Instant::now();
+            match (grouped, clients) {
+                (false, _) => {
+                    for m in &msgs {
+                        server.broadcast_with(server_group, |b| b.extend_from_slice(m));
+                    }
+                }
+                (true, 1) => {
                     server.send_many_with(accepted[0], &msgs, |b, m| b.extend_from_slice(m));
-                } else {
+                }
+                (true, _) => {
                     server.broadcast_many_with(server_group, &msgs, |b, m| {
                         b.extend_from_slice(m);
                     });
                 }
+            }
+            if batch > 1 {
                 send_ns.push(t.elapsed().as_nanos() as u64);
             }
             sent += batch;
@@ -604,11 +610,12 @@ fn main() {
                 listen: addr,
                 dial: addr,
                 clients: 1,
-                size,
+                sizes: size..=size,
                 count: PACED_MSGS,
                 pace: Some(PACE),
                 window: burst_plan(size).1,
                 batch: 1,
+                grouped: false,
             });
             s.row(&format!("paced/{name}/{size_name}"), "");
         }
@@ -624,11 +631,12 @@ fn main() {
                 listen: addr,
                 dial: addr,
                 clients: 1,
-                size,
+                sizes: size..=size,
                 count,
                 pace: None,
                 window,
                 batch: 1,
+                grouped: false,
             });
             s.row(&format!("burst/{name}/{size_name}"), &format!("window={window}"));
         }
@@ -644,11 +652,12 @@ fn main() {
             listen: server_addr,
             dial: relay.addr,
             clients: 1,
-            size: 2 * 1024 * 1024,
+            sizes: 2 * 1024 * 1024..=2 * 1024 * 1024,
             count: 1,
             pace: None,
             window: 1,
             batch: 1,
+            grouped: false,
         });
         let data = relay.data.load(Ordering::Relaxed);
         let retx = relay.retransmits.load(Ordering::Relaxed);
@@ -667,11 +676,12 @@ fn main() {
                 listen: addr,
                 dial: addr,
                 clients: BCAST_PEERS,
-                size,
+                sizes: size..=size,
                 count,
                 pace: None,
                 window,
                 batch: 1,
+                grouped: false,
             });
             s.row(&format!("bcast/{name}/{size_name}"), &format!("window={window}"));
         }
@@ -681,32 +691,45 @@ fn main() {
     many();
 }
 
-/// The `many` scenario: paced and burst to one receiver through
-/// `send_many_with`, burst to [`BCAST_PEERS`] through `broadcast_many_with`.
+/// The `many` scenario: each size range and batch as one grouped call and as
+/// a loop of single sends, burst to one receiver, grouped burst to
+/// [`BCAST_PEERS`], and paced grouped to one receiver.
 fn many() {
-    println!(
-        "\n== many: {MANY} messages of {}..{} bytes per send_many_with / broadcast_many_with call ==",
-        MANY_SIZES.start(),
-        MANY_SIZES.end()
-    );
-    let many = |name: &str, clients: usize, count: usize, pace: Option<Duration>| {
-        for (tname, transport) in transports().into_iter().take(2) {
-            let addr = free_addr();
-            let s = run(Scenario {
-                transport,
-                listen: addr,
-                dial: addr,
-                clients,
-                size: 0,
-                count,
-                pace,
-                window: 10 * MANY,
-                batch: MANY,
-            });
-            s.row(&format!("many-{name}/{tname}/{clients}rx"), "");
-        }
+    println!("\n== many: messages per call, grouped (send_many_with) vs loop of single sends ==");
+    let udp: GroupConfig = UdpGroupConfig { udp: udp_config(), ..Default::default() }.into();
+    let tcp = transports().into_iter().next().unwrap().1;
+    let row = |name: String,
+               transport: &GroupConfig,
+               sizes: std::ops::RangeInclusive<usize>,
+               clients: usize,
+               batch: usize,
+               grouped: bool,
+               pace: Option<Duration>| {
+        let addr = free_addr();
+        let calls = if pace.is_some() { 1000 } else { 400 };
+        let s = run(Scenario {
+            transport: transport.clone(),
+            listen: addr,
+            dial: addr,
+            clients,
+            sizes,
+            count: calls * batch,
+            pace,
+            window: 10 * batch,
+            batch,
+            grouped,
+        });
+        s.row(&name, "");
     };
-    many("paced", 1, PACED_MSGS * MANY, Some(PACE));
-    many("burst", 1, 1000 * MANY, None);
-    many("bcast", BCAST_PEERS, 400 * MANY, None);
+    for (size_name, sizes) in MANY_SIZES {
+        for batch in [5, 50] {
+            let name = |what: &str| format!("many/{size_name}x{batch}/{what}");
+            row(name("udp-grouped"), &udp, sizes.clone(), 1, batch, true, None);
+            row(name("udp-loop"), &udp, sizes.clone(), 1, batch, false, None);
+            row(name("tcp-grouped"), &tcp, sizes.clone(), 1, batch, true, None);
+            row(name("udp-grouped-paced"), &udp, sizes.clone(), 1, batch, true, Some(PACE));
+            row(name("udp-grouped-8rx"), &udp, sizes.clone(), BCAST_PEERS, batch, true, None);
+            row(name("udp-loop-8rx"), &udp, sizes.clone(), BCAST_PEERS, batch, false, None);
+        }
+    }
 }

@@ -152,12 +152,23 @@ const SEGMENT_CONTROL: SegmentControl = SegmentControl {
     padding: [0; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
 };
 
+/// How a record goes on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layout {
+    /// Its own datagram, header first.
+    Bare,
+    /// Back to back with its neighbours in packets, cut wherever the
+    /// datagram size falls.
+    Packed,
+}
+
 /// A record pushed for sending: header plus payload to one destination.
 #[derive(Clone, Copy)]
 struct Record {
     header: libc::iovec,
     payload: libc::iovec,
     stream: u32,
+    layout: Layout,
 }
 
 /// One wire datagram: a run of iovecs holding a packet header and record
@@ -195,11 +206,11 @@ struct Open {
 /// Up to [`SEND_BATCH`] outgoing records, each a header plus a payload slice.
 ///
 /// Destinations are copied in; the slices passed to [`Self::push`] must stay
-/// alive and unmodified until [`Self::send`] returns. Consecutive records to
-/// one destination form a stream that `send` lays out back to back and cuts
-/// every `segment_size` bytes into packets (see [`super::wire`]), so a record
-/// may straddle two consecutive packets. A record that no packet could share
-/// goes out bare, exactly as it would without packing.
+/// alive and unmodified until [`Self::send`] returns. Consecutive packed
+/// records to one destination form a stream that `send` lays out back to
+/// back and cuts every `segment_size` bytes into packets (see
+/// [`super::wire`]), so a record may straddle two consecutive packets. A bare
+/// record is its own datagram and ends any packet before it.
 pub(crate) struct SendBatch {
     segment_size: usize,
     records: Vec<Record>,
@@ -274,7 +285,7 @@ impl SendBatch {
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, header: &[u8], payload: &[u8], to: &SockAddr) {
+    pub(crate) fn push(&mut self, header: &[u8], payload: &[u8], to: &SockAddr, layout: Layout) {
         let stream = match self.addrs.last() {
             Some(last) if last == to => self.addrs.len() - 1,
             _ => {
@@ -286,6 +297,7 @@ impl SendBatch {
             header: iovec(header),
             payload: iovec(payload),
             stream: stream as u32,
+            layout,
         });
     }
 
@@ -308,9 +320,7 @@ impl SendBatch {
         });
     }
 
-    /// Cuts every stream into segments. A record too large to share a packet
-    /// is its own bare segment, so the fragments of a large message stay one
-    /// per datagram with no packing overhead.
+    /// Cuts every stream into segments.
     fn layout(&mut self) {
         self.iovs.clear();
         self.segments.clear();
@@ -323,7 +333,7 @@ impl SendBatch {
                 let record = self.records[i];
                 i += 1;
                 let len = record.header.iov_len + record.payload.iov_len;
-                if len + PACKET_HEADER_SIZE > size {
+                if record.layout == Layout::Bare {
                     if let Some(o) = open.take() {
                         self.close(o, stream);
                     }
@@ -728,7 +738,7 @@ mod tests {
         let headers: Vec<[u8; 29]> = (0..50).map(|i| [i as u8; 29]).collect();
         let payloads: Vec<Vec<u8>> = (0..50).map(|i| vec![0x80 | i as u8; 64 + i % 37]).collect();
         for (header, payload) in headers.iter().zip(&payloads) {
-            batch.push(header, payload, &to);
+            batch.push(header, payload, &to, Layout::Packed);
         }
         assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 50);
         let records: Vec<(&[u8], &[u8])> =
@@ -746,14 +756,15 @@ mod tests {
     }
 
     #[test]
-    fn full_records_travel_bare() {
+    fn bare_records_split_the_stream() {
         let (sender, receiver, to) = pair();
         let mut batch = SendBatch::new(1200);
         let full = vec![4; 1200 - 29];
-        batch.push(&[1; 29], &[2; 10], &to);
-        batch.push(&[3; 29], &full, &to);
-        batch.push(&[5; 29], &[6; 10], &to);
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 3);
+        batch.push(&[1; 29], &[2; 10], &to, Layout::Packed);
+        batch.push(&[3; 29], &full, &to, Layout::Bare);
+        batch.push(&[5; 29], &[6; 10], &to, Layout::Packed);
+        batch.push(&[7; 29], &full, &to, Layout::Packed);
+        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
         let mut buf = [0; 2048];
         let (first, body) = recv_packets(&receiver, 1).pop().unwrap();
         assert_eq!((first, body.len()), (PACKET_HEADER_SIZE, 39));
@@ -761,8 +772,13 @@ mod tests {
         assert_eq!(n, 1200);
         assert_eq!(&buf[..29], &[3; 29]);
         assert_eq!(&buf[29..n], &full[..]);
-        let (first, body) = recv_packets(&receiver, 1).pop().unwrap();
-        assert_eq!((first, body.len()), (PACKET_HEADER_SIZE, 39));
+        // The packed full record straddles: 39 bytes of the small record,
+        // then 1152 of it, then its last 48 in a packet of its own.
+        let packets = recv_packets(&receiver, 2);
+        assert_eq!((packets[0].0, packets[0].1.len()), (PACKET_HEADER_SIZE, 1191));
+        assert_eq!(&packets[0].1[39..68], &[7; 29]);
+        assert_eq!((packets[1].0, packets[1].1.len()), (57, 48));
+        assert_eq!(packets[1].1, vec![4; 48]);
     }
 
     #[cfg(target_os = "linux")]
@@ -788,7 +804,7 @@ mod tests {
             return;
         }
         for _ in 0..6 {
-            batch.push(b"header", b"payload", &to);
+            batch.push(b"header", b"payload", &to, Layout::Packed);
         }
         assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 6);
         // Per-socket EIO is not a kernel capability; offload stays enabled.
@@ -812,7 +828,7 @@ mod tests {
         offload_available(batch.enable_gso(sender.as_raw_fd()));
         let payloads: [&[u8]; 4] = [b"a", b"bbbb", b"cc", b"ddd"];
         for (i, payload) in payloads.iter().enumerate() {
-            batch.push(b"h", payload, &to[i % 2]);
+            batch.push(b"h", payload, &to[i % 2], Layout::Packed);
         }
         assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
         for (i, payload) in payloads.iter().enumerate() {
@@ -822,7 +838,7 @@ mod tests {
             assert_eq!(&body[1..], *payload);
         }
         for payload in &payloads {
-            batch.push(b"h", payload, &to[0]);
+            batch.push(b"h", payload, &to[0], Layout::Packed);
         }
         assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
         let (_, body) = recv_packets(&receivers[0], 1).pop().unwrap();
@@ -853,7 +869,8 @@ mod tests {
             let payload = [0x5a; 1200 - 29];
             let len = |i: usize| if i == 3 { 17 } else { payload.len() };
             for (i, header) in headers.iter().enumerate() {
-                tx.push(header, &payload[..len(i)], &to);
+                let layout = if i == 3 { Layout::Packed } else { Layout::Bare };
+                tx.push(header, &payload[..len(i)], &to, layout);
             }
             assert_eq!(tx.send(sender.as_raw_fd()).unwrap(), 4);
             let mut rx = RecvBatch::new(1200);
