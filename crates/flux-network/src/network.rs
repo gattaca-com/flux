@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Write},
+    io::{self, IoSlice, Write},
     net::{IpAddr, SocketAddr},
     ops::{Deref, DerefMut, Range},
     os::fd::AsRawFd,
@@ -774,14 +774,22 @@ impl NetworkCore {
     /// writes them from the slices in one vectored write and copies only the
     /// unwritten remainder; elsewhere it behaves like [`Self::send_with`].
     pub fn send_parts(&mut self, token: Token, head: &[u8], body: &[u8]) -> bool {
+        self.send_vectored(token, &[IoSlice::new(head), IoSlice::new(body)])
+    }
+    /// Sends the slices as one message. Connected non-TLS TCP writes them
+    /// directly (up to 16 slices for framed messages); other paths stage them.
+    /// Partial framed writes retain the complete frame for reconnect replay.
+    pub fn send_vectored(&mut self, token: Token, parts: &[IoSlice<'_>]) -> bool {
         let Some(group) = self.route(token) else { return false };
         match &mut self.groups[group.0] {
             GroupState::Tcp(tcp) => {
-                tcp.send_parts(self.poller.registry(), token, &mut self.tokens, head, body)
+                tcp.send_vectored(self.poller.registry(), token, &mut self.tokens, parts)
             }
             GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, |out| {
-                out.extend_from_slice(head);
-                out.extend_from_slice(body);
+                out.reserve(parts.iter().map(|part| part.len()).sum());
+                for part in parts {
+                    out.extend_from_slice(part);
+                }
             }),
         }
     }
