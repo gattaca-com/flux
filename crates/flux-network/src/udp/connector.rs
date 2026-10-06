@@ -735,11 +735,17 @@ impl UdpManager {
             let mut joined = mem::take(&mut self.joined);
             if self.peers[i].take_carry(packet.seq, &mut joined) {
                 joined.extend_from_slice(&bytes[PACKET_HEADER_SIZE..first]);
-                if let Cut::Whole(header, payload) = cut_record(&joined, stride) &&
-                    HEADER_SIZE + payload.len() == joined.len()
-                {
-                    let record = Record { header, payload, from, now };
-                    self.on_record(registry, k, &mut peer, &record, dcache, tokens, deliver);
+                match cut_record(&joined, stride) {
+                    Cut::Whole(header, payload) if HEADER_SIZE + payload.len() == joined.len() => {
+                        let record = Record { header, payload, from, now };
+                        self.on_record(registry, k, &mut peer, &record, dcache, tokens, deliver);
+                    }
+                    // A record longer than a packet body runs through whole
+                    // packets before it ends.
+                    Cut::Short if first == bytes.len() => {
+                        self.peers[i].set_carry(packet.seq, &joined);
+                    }
+                    _ => {}
                 }
                 joined.clear();
             }
