@@ -104,14 +104,12 @@ impl UdpConfig {
 
     /// Most packets one message can occupy.
     pub(crate) fn packets_per_message(&self) -> usize {
-        self.max_message_size /
-            (self.max_datagram_size - wire::PACKET_HEADER - wire::FRAGMENT_HEADER) +
-            2
+        self.max_message_size / (self.max_datagram_size - wire::PACKET_HEADER) + 2
     }
 
     pub(crate) fn validate(&self) {
         assert!(
-            self.max_datagram_size > wire::PACKET_HEADER + wire::FRAGMENT_HEADER &&
+            self.max_datagram_size > wire::PACKET_HEADER + wire::LONG_HEADER &&
                 self.max_datagram_size <= wire::MAX_DATAGRAM_SIZE,
             "udp max_datagram_size {} out of range",
             self.max_datagram_size

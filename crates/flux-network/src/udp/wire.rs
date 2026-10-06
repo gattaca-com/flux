@@ -1,5 +1,4 @@
-//! Datagram encodings. Nothing spans two datagrams: each one decodes on its
-//! own, in any order.
+//! Datagram encodings. Each datagram decodes on its own, in any order.
 //!
 //! Every datagram starts with the same prefix:
 //!
@@ -9,21 +8,28 @@
 //! [3..7]  session of the sender; 0 in a reset, which has none
 //! ```
 //!
-//! A packet (kind 1) carries records of one session:
+//! A packet (kind 1) carries a slice of the sender's message stream:
 //!
 //! ```text
 //! [7..15]  seq       per packet; the unit of acks and retransmission
 //! [15..23] send_ts   sender wall clock when the packet first went out
-//! [23..25] count     records that follow
+//! [23..25] start     1 + offset of the first message header in the payload,
+//!                    0 when no message starts in this packet
 //! ```
 //!
-//! A record is a whole message or a fragment of one, each prefixed by its
-//! length; a fragment also names the message and its byte range:
+//! The payload is the rest of the message cut at the end of the previous
+//! packet, then messages, each its length followed by its bytes; the last
+//! may be cut at the packet end and continue in the next. A length is 2
+//! bytes below 32768, else 4 with the top bit set:
 //!
 //! ```text
-//! whole:     [len u16, top bit clear][len bytes]
-//! fragment:  [len u16, top bit set][message u32][offset u32][total u32][len bytes]
+//! short:  [len u16, top bit clear]
+//! long:   [len u32 big-endian halves: (len >> 16) | 0x8000 u16][len & 0xffff u16]
 //! ```
+//!
+//! A header is never cut and is always followed by at least one byte of its
+//! message in the same packet, so trailing bytes too few for that are
+//! padding, written as 0xff.
 //!
 //! An ack (kind 2) carries the cumulative point `ack_next` and a bitmap of
 //! `bits` sequences above it: bit `i` set means `ack_next + 1 + i` arrived.
@@ -38,15 +44,16 @@ pub(crate) const MAX_DATAGRAM_SIZE: usize = 65_507;
 
 const PREFIX: usize = 7;
 pub(crate) const PACKET_HEADER: usize = PREFIX + 8 + 8 + 2;
-pub(crate) const WHOLE_HEADER: usize = 2;
-pub(crate) const FRAGMENT_HEADER: usize = 2 + 4 + 4 + 4;
-/// Longest record payload: the length field keeps one bit for the kind.
-pub(crate) const MAX_RECORD: usize = (1 << 15) - 1;
+pub(crate) const SHORT_HEADER: usize = 2;
+pub(crate) const LONG_HEADER: usize = 4;
+/// Longest message with a short header.
+const MAX_SHORT: usize = (1 << 15) - 1;
+pub(crate) const PADDING: [u8; LONG_HEADER] = [0xff; LONG_HEADER];
 pub(crate) const ACK_HEADER: usize = PREFIX + 8 + 2;
 pub(crate) const HELLO_SIZE: usize = PREFIX + 8;
 pub(crate) const HELLO_ACK_SIZE: usize = PREFIX + 4 + 8;
 pub(crate) const RESET_SIZE: usize = PREFIX + 4;
-const FRAGMENT: u16 = 1 << 15;
+const LONG: u16 = 1 << 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -68,34 +75,54 @@ pub(crate) enum Datagram<'a> {
     Reset { their_session: u32 },
 }
 
-/// A received packet of records.
-#[derive(Clone, Debug)]
+/// A received packet.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Packet<'a> {
     pub(crate) session: u32,
     pub(crate) seq: u64,
     pub(crate) send_ts: u64,
-    pub(crate) records: Records<'a>,
+    start: u16,
+    payload: &'a [u8],
 }
 
-/// The records of a packet, decoded one at a time; stops early at a
-/// malformed one.
+impl<'a> Packet<'a> {
+    /// Bytes continuing the message cut at the end of the previous packet,
+    /// and the messages starting here. `None` when `start` points past the
+    /// payload.
+    pub(crate) fn split(&self) -> Option<(&'a [u8], Records<'a>)> {
+        let at = match self.start {
+            0 => self.payload.len(),
+            s => usize::from(s) - 1,
+        };
+        let (continuation, rest) = self.payload.split_at_checked(at)?;
+        Some((continuation, Records { bytes: rest, ok: true }))
+    }
+}
+
+/// The messages starting in a packet, decoded one at a time. Stops at the
+/// padding, or at a header nothing follows, which [`Self::ok`] reports.
 #[derive(Clone, Debug)]
 pub(crate) struct Records<'a> {
-    left: u16,
     bytes: &'a [u8],
+    ok: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Record<'a> {
     Whole(&'a [u8]),
-    Fragment { message: u32, offset: u32, total: u32, bytes: &'a [u8] },
+    /// The first `bytes` of a message of `total` bytes; the rest follows in
+    /// the next packets.
+    Head {
+        total: usize,
+        bytes: &'a [u8],
+    },
 }
 
 impl Records<'_> {
-    /// Records the packet announces, decoded or not.
+    /// Whether everything decoded so far was well formed.
     #[inline]
-    pub(crate) fn len(&self) -> usize {
-        usize::from(self.left)
+    pub(crate) fn ok(&self) -> bool {
+        self.ok
     }
 }
 
@@ -103,31 +130,27 @@ impl<'a> Iterator for Records<'a> {
     type Item = Record<'a>;
 
     fn next(&mut self) -> Option<Record<'a>> {
-        if self.left == 0 {
-            return None;
-        }
-        self.left -= 1;
-        let len = u16::from_le_bytes(self.bytes.get(..2)?.try_into().unwrap());
-        let (header, payload) = if len & FRAGMENT == 0 {
-            (WHOLE_HEADER, usize::from(len))
+        let v = u16::from_le_bytes(self.bytes.get(..2)?.try_into().unwrap());
+        let (header, len) = if v & LONG == 0 {
+            (SHORT_HEADER, usize::from(v))
         } else {
-            (FRAGMENT_HEADER, usize::from(len & !FRAGMENT))
+            if self.bytes.len() < LONG_HEADER + 1 {
+                return None;
+            }
+            let low = u16::from_le_bytes(self.bytes[2..4].try_into().unwrap());
+            (LONG_HEADER, usize::from(v & !LONG) << 16 | usize::from(low))
         };
-        let end = header + payload;
-        let bytes = self.bytes.get(..end)?;
-        self.bytes = &self.bytes[end..];
-        if len & FRAGMENT == 0 {
-            return Some(Record::Whole(&bytes[WHOLE_HEADER..]));
+        let rest = &self.bytes[header..];
+        if rest.len() >= len {
+            self.bytes = &rest[len..];
+            return Some(Record::Whole(&rest[..len]));
         }
-        let message = u32_at(bytes, 2);
-        let offset = u32_at(bytes, 6);
-        let total = u32_at(bytes, 10);
-        // A fragment that could not be part of its message is malformed.
-        if payload == 0 || offset.checked_add(payload as u32)? > total {
-            self.left = 0;
+        self.bytes = &[];
+        if rest.is_empty() {
+            self.ok = false;
             return None;
         }
-        Some(Record::Fragment { message, offset, total, bytes: &bytes[FRAGMENT_HEADER..] })
+        Some(Record::Head { total: len, bytes: rest })
     }
 }
 
@@ -153,10 +176,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram<'_>> {
             session,
             seq: u64_at(body, 0),
             send_ts: u64_at(body, 8),
-            records: Records {
-                left: u16::from_le_bytes(body[16..18].try_into().unwrap()),
-                bytes: &body[18..],
-            },
+            start: u16::from_le_bytes(body[16..18].try_into().unwrap()),
+            payload: &body[18..],
         })),
         2 if bytes.len() >= ACK_HEADER => {
             let bits = u16::from_le_bytes(body[8..10].try_into().unwrap());
@@ -190,31 +211,41 @@ pub(crate) fn packet_header(
     session: u32,
     seq: u64,
     send_ts: u64,
-    count: u16,
+    start: u16,
 ) {
     prefix(buf, Kind::Packet, session);
     buf[7..15].copy_from_slice(&seq.to_le_bytes());
     buf[15..23].copy_from_slice(&send_ts.to_le_bytes());
-    buf[23..25].copy_from_slice(&count.to_le_bytes());
+    buf[23..25].copy_from_slice(&start.to_le_bytes());
 }
 
-pub(crate) fn whole_header(buf: &mut [u8; WHOLE_HEADER], len: usize) {
-    debug_assert!(len <= MAX_RECORD);
-    buf.copy_from_slice(&(len as u16).to_le_bytes());
+/// Header and body length of the record at the start of `bytes`; `(0, 0)`
+/// past the end of a stream.
+#[inline]
+pub(crate) fn record_len(bytes: &[u8]) -> (usize, usize) {
+    if bytes.len() < SHORT_HEADER {
+        return (0, 0);
+    }
+    let v = u16::from_le_bytes(bytes[..2].try_into().unwrap());
+    if v & LONG == 0 {
+        (SHORT_HEADER, usize::from(v))
+    } else {
+        let low = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        (LONG_HEADER, usize::from(v & !LONG) << 16 | usize::from(low))
+    }
 }
 
-pub(crate) fn fragment_header(
-    buf: &mut [u8; FRAGMENT_HEADER],
-    len: usize,
-    message: u32,
-    offset: u32,
-    total: u32,
-) {
-    debug_assert!(len <= MAX_RECORD);
-    buf[0..2].copy_from_slice(&(len as u16 | FRAGMENT).to_le_bytes());
-    buf[2..6].copy_from_slice(&message.to_le_bytes());
-    buf[6..10].copy_from_slice(&offset.to_le_bytes());
-    buf[10..14].copy_from_slice(&total.to_le_bytes());
+/// Writes the header of a message of `len` bytes; returns its size.
+pub(crate) fn message_header(buf: &mut [u8; LONG_HEADER], len: usize) -> usize {
+    if len <= MAX_SHORT {
+        buf[0..2].copy_from_slice(&(len as u16).to_le_bytes());
+        SHORT_HEADER
+    } else {
+        debug_assert!(len >> 16 <= usize::from(!LONG));
+        buf[0..2].copy_from_slice(&((len >> 16) as u16 | LONG).to_le_bytes());
+        buf[2..4].copy_from_slice(&(len as u16).to_le_bytes());
+        LONG_HEADER
+    }
 }
 
 /// Writes an ack header; the caller appends `bits.div_ceil(64) * 8` bitmap
@@ -250,48 +281,70 @@ pub(crate) fn reset(buf: &mut [u8; RESET_SIZE], their_session: u32) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn packet_round_trip() {
+    fn packet(seq: u64, start: u16, payload: &[u8]) -> Vec<u8> {
         let mut header = [0; PACKET_HEADER];
-        packet_header(&mut header, 7, 42, 99, 3);
+        packet_header(&mut header, 7, seq, 99, start);
         let mut bytes = header.to_vec();
-        let mut whole = [0; WHOLE_HEADER];
-        whole_header(&mut whole, 3);
-        bytes.extend_from_slice(&whole);
-        bytes.extend_from_slice(b"abc");
-        let mut fragment = [0; FRAGMENT_HEADER];
-        fragment_header(&mut fragment, 2, 5, 10, 12);
-        bytes.extend_from_slice(&fragment);
-        bytes.extend_from_slice(b"xy");
-        whole_header(&mut whole, 0);
-        bytes.extend_from_slice(&whole);
-        let Some(Datagram::Packet(Packet { session: 7, seq: 42, send_ts: 99, records })) =
-            decode(&bytes)
-        else {
-            panic!("not a packet");
-        };
-        let records: Vec<Record<'_>> = records.collect();
-        assert_eq!(records, [
-            Record::Whole(b"abc"),
-            Record::Fragment { message: 5, offset: 10, total: 12, bytes: b"xy" },
-            Record::Whole(b""),
-        ]);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn message(bytes: &[u8]) -> Vec<u8> {
+        let mut h = [0; LONG_HEADER];
+        let n = message_header(&mut h, bytes.len());
+        let mut out = h[..n].to_vec();
+        out.extend_from_slice(bytes);
+        out
     }
 
     #[test]
-    fn truncated_records_stop_cleanly() {
-        let mut header = [0; PACKET_HEADER];
-        packet_header(&mut header, 1, 1, 0, 2);
-        let mut bytes = header.to_vec();
-        let mut whole = [0; WHOLE_HEADER];
-        whole_header(&mut whole, 2);
-        bytes.extend_from_slice(&whole);
-        bytes.extend_from_slice(b"ok");
-        whole_header(&mut whole, 9);
-        bytes.extend_from_slice(&whole);
-        bytes.extend_from_slice(b"short");
-        let Some(Datagram::Packet(Packet { records, .. })) = decode(&bytes) else { panic!() };
-        assert_eq!(records.collect::<Vec<_>>(), [Record::Whole(b"ok")]);
+    fn packet_round_trip() {
+        let mut payload = b"tail".to_vec();
+        payload.extend(message(b"abc"));
+        payload.extend(message(b""));
+        let long = vec![7u8; 40_000];
+        let mut h = [0; LONG_HEADER];
+        assert_eq!(message_header(&mut h, long.len()), LONG_HEADER);
+        payload.extend_from_slice(&h);
+        payload.extend_from_slice(&long[..2]);
+        let bytes = packet(42, 5, &payload);
+        let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
+        assert_eq!((p.session, p.seq, p.send_ts), (7, 42, 99));
+        let (continuation, mut records) = p.split().unwrap();
+        assert_eq!(continuation, b"tail");
+        assert_eq!(records.next(), Some(Record::Whole(b"abc")));
+        assert_eq!(records.next(), Some(Record::Whole(b"")));
+        assert_eq!(records.next(), Some(Record::Head { total: 40_000, bytes: &long[..2] }));
+        assert_eq!(records.next(), None);
+        assert!(records.ok());
+        let mut payload = message(b"ok");
+        payload.extend_from_slice(&PADDING[..3]);
+        let bytes = packet(43, 1, &payload);
+        let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
+        let (_, mut records) = p.split().unwrap();
+        assert_eq!(records.next(), Some(Record::Whole(b"ok")));
+        assert_eq!(records.next(), None);
+        assert!(records.ok());
+    }
+
+    #[test]
+    fn a_header_nothing_follows_is_malformed() {
+        let mut payload = message(b"ok");
+        payload.extend_from_slice(&9u16.to_le_bytes());
+        let bytes = packet(1, 1, &payload);
+        let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
+        let (_, mut records) = p.split().unwrap();
+        assert_eq!(records.next(), Some(Record::Whole(b"ok")));
+        assert_eq!(records.next(), None);
+        assert!(!records.ok());
+        let bytes = packet(1, 9, b"short");
+        let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
+        assert!(p.split().is_none());
+        let bytes = packet(1, 0, b"all tail");
+        let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
+        let (continuation, mut records) = p.split().unwrap();
+        assert_eq!(continuation, b"all tail");
+        assert_eq!(records.next(), None);
     }
 
     #[test]

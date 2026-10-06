@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::{
     inbound::Inbound,
-    outbound::{Full, MessageStore, Outbound},
+    outbound::{MessageStore, Outbound, WindowFull},
     sys::{SendBatch, SockAddr},
     wire::{self, ACK_HEADER, HELLO_ACK_SIZE, HELLO_SIZE, Packet, RESET_SIZE, Record, Records},
 };
@@ -167,33 +167,26 @@ impl Peer {
         self.close_when_drained && self.outbound.inflight() == 0
     }
 
-    /// Queues the message in store `slot`. On `Full::Window` the peer is
+    /// Queues the stream in store `slot`. On [`WindowFull`] the peer is
     /// unusable and must be dropped.
     pub(crate) fn enqueue(
         &mut self,
         store: &mut MessageStore,
         slot: u32,
         now: Instant,
-    ) -> Result<(), Full> {
+    ) -> Result<(), WindowFull> {
         let result = self.outbound.enqueue(store, slot);
-        match result {
-            Err(Full::TooLarge) => {
-                let len = store.bytes(slot).len();
-                warn!(%self.addr, len, max = self.max_message_size, "udp message too large");
+        if result.is_err() {
+            self.dropped_full += 1;
+            if now.saturating_sub(self.last_warn) >= Duration::from_secs(WARN_INTERVAL_SECS) {
+                warn!(
+                    %self.addr,
+                    dropped = self.dropped_full,
+                    inflight = self.outbound.inflight(),
+                    "udp send window full"
+                );
+                self.last_warn = now;
             }
-            Err(Full::Window) => {
-                self.dropped_full += 1;
-                if now.saturating_sub(self.last_warn) >= Duration::from_secs(WARN_INTERVAL_SECS) {
-                    warn!(
-                        %self.addr,
-                        dropped = self.dropped_full,
-                        inflight = self.outbound.inflight(),
-                        "udp send window full"
-                    );
-                    self.last_warn = now;
-                }
-            }
-            Ok(()) => {}
         }
         result
     }
@@ -351,49 +344,45 @@ impl Peer {
     ) where
         F: FnMut(RxPayload<'_>, Nanos),
     {
-        let Packet { session, seq, send_ts, records } = packet;
+        let (session, seq, send_ts) = (packet.session, packet.seq, packet.send_ts);
         if !self.current_session(session) {
             return;
         }
         self.last_recv = now;
-        if let Err(why) = self.validate(records.clone(), dcache) {
-            if why == Refused::ExceedsDcache {
+        let checked =
+            packet.split().ok_or(Refused::Malformed).and_then(|(continuation, records)| {
+                self.validate(records.clone(), dcache).map(|()| (continuation, records))
+            });
+        let (continuation, records) = match checked {
+            Ok(split) => split,
+            Err(Refused::ExceedsDcache) => {
                 warn!(%self.addr, "udp message exceeds dcache capacity, not acked");
-            } else {
-                debug!(%self.addr, ?why, seq, "udp packet refused");
+                return;
             }
-            return;
-        }
+            Err(why) => {
+                debug!(%self.addr, ?why, seq, "udp packet refused");
+                return;
+            }
+        };
         if self.reliable {
             self.ack_due = true;
         }
         if !self.inbound.accept(seq) {
             return;
         }
-        for record in records {
-            match record {
-                Record::Whole(bytes) => self.deliver(bytes, Nanos(send_ts), dcache, deliver),
-                Record::Fragment { message, offset, total, bytes } => {
-                    if let Some(done) =
-                        self.inbound.fragment(seq, message, offset, total, bytes, send_ts)
-                    {
-                        self.deliver(done.bytes(), Nanos(done.send_ts()), dcache, deliver);
-                        self.inbound.recycle(done);
-                    }
-                }
-            }
-        }
+        let latency = &mut self.latency;
+        self.inbound.packet(seq, continuation, records, send_ts, &mut |bytes, ts| {
+            deliver_message(latency, bytes, Nanos(ts), dcache, deliver);
+        });
     }
 
-    /// Checks every record of a packet before any is taken in. A packet
-    /// cut short in transit shows up here as a record count mismatch.
-    fn validate(&self, records: Records<'_>, dcache: Option<&DCache>) -> Result<(), Refused> {
-        let mut left = records.len();
-        for record in records {
-            left -= 1;
+    /// Checks every message starting in a packet before any byte is taken
+    /// in.
+    fn validate(&self, mut records: Records<'_>, dcache: Option<&DCache>) -> Result<(), Refused> {
+        for record in records.by_ref() {
             let len = match record {
                 Record::Whole(bytes) => bytes.len(),
-                Record::Fragment { total, .. } => total as usize,
+                Record::Head { total, .. } => total,
             };
             if len > self.max_message_size {
                 return Err(Refused::TooLarge);
@@ -402,24 +391,7 @@ impl Peer {
                 return Err(Refused::ExceedsDcache);
             }
         }
-        if left != 0 { Err(Refused::Malformed) } else { Ok(()) }
-    }
-
-    #[inline]
-    fn deliver<F>(&mut self, bytes: &[u8], send_ts: Nanos, dcache: Option<&DCache>, deliver: &mut F)
-    where
-        F: FnMut(RxPayload<'_>, Nanos),
-    {
-        if let Some(t) = &mut self.latency {
-            t.emit_latency_from_nanos(send_ts, Nanos::now());
-        }
-        match dcache {
-            None => deliver(RxPayload::Raw(bytes), send_ts),
-            Some(dc) => match dc.write(bytes.len(), |buf| buf.copy_from_slice(bytes)) {
-                Ok(dref) => deliver(RxPayload::DCache(dref), send_ts),
-                Err(e) => warn!("dcache write failed: {e}"),
-            },
-        }
+        if records.ok() { Ok(()) } else { Err(Refused::Malformed) }
     }
 
     /// Takes in an ack. Unreliable: the ack is a liveness signal only, its
@@ -473,12 +445,34 @@ impl Peer {
     }
 }
 
+#[inline]
+fn deliver_message<F>(
+    latency: &mut Option<Timer>,
+    bytes: &[u8],
+    send_ts: Nanos,
+    dcache: Option<&DCache>,
+    deliver: &mut F,
+) where
+    F: FnMut(RxPayload<'_>, Nanos),
+{
+    if let Some(t) = latency {
+        t.emit_latency_from_nanos(send_ts, Nanos::now());
+    }
+    match dcache {
+        None => deliver(RxPayload::Raw(bytes), send_ts),
+        Some(dc) => match dc.write(bytes.len(), |buf| buf.copy_from_slice(bytes)) {
+            Ok(dref) => deliver(RxPayload::DCache(dref), send_ts),
+            Err(e) => warn!("dcache write failed: {e}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::udp::{
         UdpConfig,
-        wire::{self, FRAGMENT_HEADER, PACKET_HEADER, WHOLE_HEADER},
+        wire::{self, LONG_HEADER, PACKET_HEADER},
     };
 
     const SESSION: u32 = 7;
@@ -493,28 +487,20 @@ mod tests {
         peer
     }
 
-    /// A record to encode: the fragment's `(message, offset, total)`, or
-    /// `None` for a whole message, and its bytes.
-    type Piece<'a> = (Option<(u32, u32, u32)>, &'a [u8]);
-
-    fn packet(seq: u64, records: &[Piece<'_>]) -> Vec<u8> {
+    /// A packet of `continuation` then `messages`, the last cut to `head`
+    /// bytes if given.
+    fn packet(seq: u64, continuation: &[u8], messages: &[&[u8]], head: Option<usize>) -> Vec<u8> {
         let mut header = [0; PACKET_HEADER];
-        wire::packet_header(&mut header, SESSION, seq, seq * 100, records.len() as u16);
+        let start = if messages.is_empty() { 0 } else { continuation.len() as u16 + 1 };
+        wire::packet_header(&mut header, SESSION, seq, seq * 100, start);
         let mut bytes = header.to_vec();
-        for (fragment, payload) in records {
-            match fragment {
-                None => {
-                    let mut h = [0; WHOLE_HEADER];
-                    wire::whole_header(&mut h, payload.len());
-                    bytes.extend_from_slice(&h);
-                }
-                Some((message, offset, total)) => {
-                    let mut h = [0; FRAGMENT_HEADER];
-                    wire::fragment_header(&mut h, payload.len(), *message, *offset, *total);
-                    bytes.extend_from_slice(&h);
-                }
-            }
-            bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(continuation);
+        for (i, m) in messages.iter().enumerate() {
+            let mut h = [0; LONG_HEADER];
+            let n = wire::message_header(&mut h, m.len());
+            bytes.extend_from_slice(&h[..n]);
+            let cut = if i + 1 == messages.len() { head.unwrap_or(m.len()) } else { m.len() };
+            bytes.extend_from_slice(&m[..cut]);
         }
         bytes
     }
@@ -534,9 +520,9 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut peer = peer(&socket);
         let message: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
-        let a = packet(10, &[(None, b"first"), (Some((3, 0, 2500)), &message[..1000])]);
-        let b = packet(11, &[(Some((3, 1000, 2500)), &message[1000..2000])]);
-        let c = packet(12, &[(Some((3, 2000, 2500)), &message[2000..]), (None, b"last")]);
+        let a = packet(10, b"", &[b"first", &message], Some(1000));
+        let b = packet(11, &message[1000..2000], &[], None);
+        let c = packet(12, &message[2000..], &[b"last"], None);
         let mut out = Vec::new();
         feed(&mut peer, &c, &mut out);
         feed(&mut peer, &b, &mut out);
@@ -557,8 +543,8 @@ mod tests {
     fn a_lost_packet_is_a_hole_until_its_copy_arrives() {
         let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut peer = peer(&socket);
-        let lost = packet(10, &[(Some((1, 0, 6)), b"abc")]);
-        let after = packet(11, &[(Some((1, 3, 6)), b"def"), (None, b"solo")]);
+        let lost = packet(10, b"", &[b"abcdef"], Some(3));
+        let after = packet(11, b"def", &[b"solo"], None);
         let mut out = Vec::new();
         feed(&mut peer, &after, &mut out);
         assert_eq!(out, [(b"solo".to_vec(), 1100)]);
@@ -573,24 +559,30 @@ mod tests {
     fn packets_of_another_session_are_ignored() {
         let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut peer = peer(&socket);
-        let mut stale = packet(10, &[(None, b"old")]);
+        let mut stale = packet(10, b"", &[b"old"], None);
         stale[3..7].copy_from_slice(&(SESSION + 1).to_le_bytes());
         let mut out = Vec::new();
         feed(&mut peer, &stale, &mut out);
         assert!(out.is_empty());
-        feed(&mut peer, &packet(10, &[(None, b"new")]), &mut out);
+        feed(&mut peer, &packet(10, b"", &[b"new"], None), &mut out);
         assert_eq!(out, [(b"new".to_vec(), 1000)]);
     }
 
     #[test]
-    fn a_cut_short_packet_leaves_its_sequence_unacked() {
+    fn a_packet_cut_at_a_header_leaves_its_sequence_unacked() {
         let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut peer = peer(&socket);
-        let mut bytes = packet(10, &[(None, b"one"), (None, b"two")]);
-        bytes.truncate(bytes.len() - 1);
+        let mut bytes = packet(10, b"", &[b"one", b"two"], None);
+        bytes.truncate(bytes.len() - 3);
         let mut out = Vec::new();
         feed(&mut peer, &bytes, &mut out);
         assert!(out.is_empty());
         assert_eq!(peer.inbound.ack_next(), 10);
+        // Cut inside a message it reads as a head, which only the next
+        // packet can refute.
+        bytes.truncate(bytes.len() - 1);
+        feed(&mut peer, &bytes, &mut out);
+        assert_eq!(out, [(b"one".to_vec(), 1000)]);
+        assert_eq!(peer.inbound.ack_next(), 11);
     }
 }

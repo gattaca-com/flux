@@ -1,41 +1,33 @@
 //! The receiving half of a peer: which packets arrived, and messages put
-//! back together from fragments. Delivery is the caller's business; a
-//! completed message comes back by value.
+//! back together from the run of packets they were cut across. A whole
+//! message is delivered straight from its packet; a cut one once every
+//! packet of its run is in, whatever order they came.
 
-use super::wire::{ACK_HEADER, FRAGMENT_HEADER, PACKET_HEADER};
+use super::wire::{ACK_HEADER, Record, Records};
 
-/// A message being reassembled in owned memory. Recycled whole; stale bytes
-/// are overwritten before delivery so nothing is zeroed.
-pub(crate) struct Partial {
-    message: u32,
-    total: u32,
-    received: u32,
+/// A message cut across packets, in owned memory, waiting for packet
+/// `expect` to continue it.
+struct Partial {
+    total: usize,
+    received: usize,
     /// Kept at its largest past length; the message is `buf[..total]`.
     buf: Vec<u8>,
-    /// Lowest packet sequence a fragment arrived in.
-    first_packet: u64,
+    expect: u64,
     send_ts: u64,
 }
 
-impl Partial {
-    #[inline]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.buf[..self.total as usize]
-    }
-
-    #[inline]
-    pub(crate) fn send_ts(&self) -> u64 {
-        self.send_ts
-    }
+/// The leading bytes of a packet that arrived before the message they
+/// continue was known, kept until its head packet comes.
+struct Stash {
+    seq: Option<u64>,
+    buf: Vec<u8>,
 }
 
 /// Packet sequence tracking above the ack point plus in-progress messages.
 ///
-/// A packet is accepted once; its records are then processed exactly once,
-/// so fragments of one message never overlap and a message is complete when
-/// its received bytes reach its length. An incomplete message always waits
-/// on a packet at or above the ack point, so the window bounds how many can
-/// exist.
+/// A packet is accepted once, so its bytes join a message exactly once. A
+/// partial always waits on a packet at or above the ack point, and a stash
+/// belongs to one, so the window bounds both.
 pub(crate) struct Inbound {
     ack_next: u64,
     /// Highest sequence accepted; the ack bitmap runs from `ack_next + 1` to
@@ -49,9 +41,8 @@ pub(crate) struct Inbound {
     /// Unreliable mode: the window follows the highest sequence instead of
     /// waiting at a hole that no retransmit will ever fill.
     slide: bool,
-    /// Packets a message's fragments can span: a sliver in the first, full
-    /// packets, a sliver in the last.
-    fragment_room: u64,
+    /// One slot per sequence of the window.
+    stash: Box<[Stash]>,
     partials: Vec<Partial>,
     spare: Vec<Partial>,
 }
@@ -67,7 +58,7 @@ impl Inbound {
             capacity: capacity as u64,
             max_bits: max_bits.min(capacity as u64 - 1),
             slide,
-            fragment_room: (datagram_size - PACKET_HEADER - FRAGMENT_HEADER) as u64,
+            stash: (0..capacity).map(|_| Stash { seq: None, buf: Vec::new() }).collect(),
             partials: Vec::new(),
             spare: Vec::new(),
         }
@@ -79,6 +70,9 @@ impl Inbound {
         self.highest = first;
         self.bits.fill(0);
         self.spare.append(&mut self.partials);
+        for s in &mut self.stash {
+            s.seq = None;
+        }
     }
 
     #[inline]
@@ -105,7 +99,7 @@ impl Inbound {
     }
 
     /// Records packet `seq`; `false` for duplicates and sequences outside
-    /// the window, whose records must not be processed.
+    /// the window, whose bytes must not be taken in.
     pub(crate) fn accept(&mut self, seq: u64) -> bool {
         if seq < self.ack_next {
             return false;
@@ -129,7 +123,7 @@ impl Inbound {
     }
 
     /// Moves the ack point past holes. Everything below it is lost for good,
-    /// so a message that could still have had a fragment there is dropped.
+    /// so a message waiting on a packet there is dropped.
     fn slide_to(&mut self, ack_next: u64) {
         if ack_next - self.ack_next >= self.capacity {
             self.bits.fill(0);
@@ -141,9 +135,7 @@ impl Inbound {
         self.ack_next = ack_next;
         let mut i = 0;
         while i < self.partials.len() {
-            let p = &self.partials[i];
-            let span = (u64::from(p.total) - 1) / self.fragment_room + 2;
-            if p.first_packet + span <= ack_next {
+            if self.partials[i].expect < ack_next {
                 let dead = self.partials.swap_remove(i);
                 self.spare.push(dead);
             } else {
@@ -152,59 +144,103 @@ impl Inbound {
         }
     }
 
-    /// Takes in a fragment of packet `seq`. Returns the message once it is
-    /// complete; hand it back with [`Self::recycle`] after delivery.
-    pub(crate) fn fragment(
+    /// Takes in accepted packet `seq`: `continuation` finishes or extends
+    /// the message cut before it, `records` are the messages starting in it.
+    /// Every completed message goes to `deliver` with its first packet's
+    /// `send_ts`.
+    pub(crate) fn packet(
         &mut self,
         seq: u64,
-        message: u32,
-        offset: u32,
-        total: u32,
-        bytes: &[u8],
+        continuation: &[u8],
+        records: Records<'_>,
         send_ts: u64,
-    ) -> Option<Partial> {
-        let pos = self
-            .partials
-            .iter()
-            .position(|p| p.message == message)
-            .unwrap_or_else(|| self.start(message, total, seq, send_ts));
-        let partial = &mut self.partials[pos];
-        if partial.total != total {
-            return None;
+        deliver: &mut dyn FnMut(&[u8], u64),
+    ) {
+        match self.partials.iter().position(|p| p.expect == seq) {
+            Some(i) => {
+                if !self.feed(i, continuation, deliver) {
+                    self.drain(i, deliver);
+                }
+            }
+            None if !continuation.is_empty() => {
+                let stash = &mut self.stash[(seq & self.mask) as usize];
+                stash.seq = Some(seq);
+                stash.buf.clear();
+                stash.buf.extend_from_slice(continuation);
+            }
+            None => {}
         }
-        let start = offset as usize;
-        partial.buf[start..start + bytes.len()].copy_from_slice(bytes);
-        partial.received += bytes.len() as u32;
-        partial.first_packet = partial.first_packet.min(seq);
-        if offset == 0 {
-            partial.send_ts = send_ts;
+        for record in records {
+            match record {
+                Record::Whole(bytes) => deliver(bytes, send_ts),
+                Record::Head { total, bytes } => {
+                    let i = self.start(total, bytes, seq + 1, send_ts);
+                    self.drain(i, deliver);
+                }
+            }
         }
-        (partial.received == total).then(|| self.partials.swap_remove(pos))
     }
 
-    fn start(&mut self, message: u32, total: u32, seq: u64, send_ts: u64) -> usize {
+    /// Appends the packet partial `i` waits for. `true` once the partial is
+    /// gone: delivered, or dropped because the packet started a message
+    /// where it should have continued this one.
+    fn feed(&mut self, i: usize, bytes: &[u8], deliver: &mut dyn FnMut(&[u8], u64)) -> bool {
+        let p = &mut self.partials[i];
+        if bytes.is_empty() {
+            let dead = self.partials.swap_remove(i);
+            self.spare.push(dead);
+            return true;
+        }
+        let n = (p.total - p.received).min(bytes.len());
+        p.buf[p.received..p.received + n].copy_from_slice(&bytes[..n]);
+        p.received += n;
+        if p.received < p.total {
+            p.expect += 1;
+            return false;
+        }
+        let done = self.partials.swap_remove(i);
+        deliver(&done.buf[..done.total], done.send_ts);
+        self.spare.push(done);
+        true
+    }
+
+    /// Feeds partial `i` the stashed packets that already arrived after the
+    /// one it waits for.
+    fn drain(&mut self, i: usize, deliver: &mut dyn FnMut(&[u8], u64)) {
+        loop {
+            let seq = self.partials[i].expect;
+            let slot = (seq & self.mask) as usize;
+            if self.stash[slot].seq != Some(seq) {
+                return;
+            }
+            self.stash[slot].seq = None;
+            let buf = std::mem::take(&mut self.stash[slot].buf);
+            let gone = self.feed(i, &buf, deliver);
+            self.stash[slot].buf = buf;
+            if gone {
+                return;
+            }
+        }
+    }
+
+    fn start(&mut self, total: usize, bytes: &[u8], expect: u64, send_ts: u64) -> usize {
         let mut partial = self.spare.pop().unwrap_or(Partial {
-            message: 0,
             total: 0,
             received: 0,
             buf: Vec::new(),
-            first_packet: 0,
+            expect: 0,
             send_ts: 0,
         });
-        if partial.buf.len() < total as usize {
-            partial.buf.resize(total as usize, 0);
+        if partial.buf.len() < total {
+            partial.buf.resize(total, 0);
         }
-        partial.message = message;
+        partial.buf[..bytes.len()].copy_from_slice(bytes);
         partial.total = total;
-        partial.received = 0;
-        partial.first_packet = seq;
+        partial.received = bytes.len();
+        partial.expect = expect;
         partial.send_ts = send_ts;
         self.partials.push(partial);
         self.partials.len() - 1
-    }
-
-    pub(crate) fn recycle(&mut self, partial: Partial) {
-        self.spare.push(partial);
     }
 
     /// Bits an ack should carry: one per sequence in `ack_next + 1 ..=
@@ -244,6 +280,34 @@ impl Inbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::udp::wire::{self, LONG_HEADER, PACKET_HEADER};
+
+    /// Feeds a packet of `continuation` then `messages`, the last cut to
+    /// `head` bytes if given, collecting deliveries as `(bytes, send_ts)`.
+    fn feed(
+        rx: &mut Inbound,
+        seq: u64,
+        continuation: &[u8],
+        messages: &[&[u8]],
+        head: Option<usize>,
+        out: &mut Vec<(Vec<u8>, u64)>,
+    ) {
+        let mut bytes = [0; PACKET_HEADER].to_vec();
+        let start = if messages.is_empty() { 0 } else { continuation.len() as u16 + 1 };
+        wire::packet_header(bytes.as_mut_slice().try_into().unwrap(), 1, seq, seq * 10, start);
+        bytes.extend_from_slice(continuation);
+        for (i, m) in messages.iter().enumerate() {
+            let mut h = [0; LONG_HEADER];
+            let n = wire::message_header(&mut h, m.len());
+            bytes.extend_from_slice(&h[..n]);
+            let cut = if i + 1 == messages.len() { head.unwrap_or(m.len()) } else { m.len() };
+            bytes.extend_from_slice(&m[..cut]);
+        }
+        let Some(wire::Datagram::Packet(p)) = wire::decode(&bytes) else { panic!() };
+        let (continuation, records) = p.split().unwrap();
+        assert!(rx.accept(seq));
+        rx.packet(seq, continuation, records, p.send_ts, &mut |b, ts| out.push((b.to_vec(), ts)));
+    }
 
     #[test]
     fn accepts_once_and_reports_bitmap() {
@@ -265,28 +329,42 @@ mod tests {
     }
 
     #[test]
-    fn fragments_complete_in_any_order() {
+    fn a_cut_message_completes_in_any_packet_order() {
         let mut rx = Inbound::new(64, 1200, false);
         rx.reset(0);
-        assert!(rx.fragment(5, 1, 3, 6, b"def", 50).is_none());
-        assert!(rx.fragment(7, 2, 0, 2, b"z", 70).is_none());
-        let done = rx.fragment(4, 1, 0, 6, b"abc", 40).unwrap();
-        assert_eq!(done.bytes(), b"abcdef");
-        assert_eq!(done.send_ts(), 40);
-        rx.recycle(done);
-        let done = rx.fragment(8, 2, 1, 2, b"y", 80).unwrap();
-        assert_eq!(done.bytes(), b"zy");
-        assert_eq!(rx.partials.len(), 0);
+        let mut out = Vec::new();
+        // "abc" is cut after "a", runs through packet 4 and ends in 5.
+        feed(&mut rx, 5, b"c", &[b"next"], None, &mut out);
+        feed(&mut rx, 4, b"b", &[], None, &mut out);
+        assert_eq!(out, [(b"next".to_vec(), 50)]);
+        feed(&mut rx, 3, b"", &[b"first", b"abc"], Some(1), &mut out);
+        assert_eq!(out[1..], [(b"first".to_vec(), 30), (b"abc".to_vec(), 30)]);
+        assert!(rx.partials.is_empty());
+        // In order, with the tail and a new head in the same packet.
+        feed(&mut rx, 6, b"", &[b"xyz"], Some(2), &mut out);
+        feed(&mut rx, 7, b"z", &[b"pq"], Some(1), &mut out);
+        feed(&mut rx, 8, b"q", &[], None, &mut out);
+        assert_eq!(out[3..], [(b"xyz".to_vec(), 60), (b"pq".to_vec(), 70)]);
+    }
+
+    #[test]
+    fn a_packet_that_does_not_continue_drops_the_cut_message() {
+        let mut rx = Inbound::new(64, 1200, false);
+        rx.reset(0);
+        let mut out = Vec::new();
+        feed(&mut rx, 1, b"", &[b"abc"], Some(1), &mut out);
+        feed(&mut rx, 2, b"", &[b"other"], None, &mut out);
+        assert_eq!(out, [(b"other".to_vec(), 20)]);
+        assert!(rx.partials.is_empty());
     }
 
     #[test]
     fn sliding_drops_messages_that_can_no_longer_complete() {
         let mut rx = Inbound::new(64, 1200, true);
         rx.reset(0);
-        assert!(rx.fragment(3, 9, 0, 2000, &[0; 1000], 0).is_none());
-        assert!(rx.accept(3));
+        let mut out = Vec::new();
+        feed(&mut rx, 3, b"", &[&[0; 2000]], Some(1000), &mut out);
         assert_eq!(rx.partials.len(), 1);
-        // Message 9 spans at most 3 packets from 3; the window slides past.
         assert!(rx.accept(3 + 64 + 10));
         assert_eq!(rx.partials.len(), 0);
     }
