@@ -58,13 +58,22 @@ impl Default for GrpcConfig {
     }
 }
 
-/// The stream has ended: finished, lagged, reset, or disconnected.
+/// Why a stream has ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Closed;
+pub enum Closed {
+    /// Finished, reset, or disconnected.
+    Ended,
+    /// Held more than `max_queued_bytes` unsent: its messages were dropped
+    /// and it finished with `RESOURCE_EXHAUSTED`.
+    Lagged,
+}
 
 impl fmt::Display for Closed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("gRPC stream is closed")
+        f.write_str(match self {
+            Self::Ended => "gRPC stream is closed",
+            Self::Lagged => "gRPC stream lagged",
+        })
     }
 }
 
@@ -672,10 +681,13 @@ impl GrpcServer {
     /// closes. Panics above 4 GiB.
     pub fn send(&mut self, stream: Stream, payload: &[u8]) -> Result<(), Closed> {
         let max_queued = self.config.max_queued_bytes;
-        let connection = self.connections.get_mut(&stream.token).ok_or(Closed)?;
+        let connection = self.connections.get_mut(&stream.token).ok_or(Closed::Ended)?;
         touch(stream.token, connection, &mut self.dirty);
-        let call =
-            connection.calls.get_mut(&stream.id).filter(|call| call.is_open()).ok_or(Closed)?;
+        let call = connection
+            .calls
+            .get_mut(&stream.id)
+            .filter(|call| call.is_open())
+            .ok_or(Closed::Ended)?;
         let prefix = prefix(payload.len());
         if call.headers_sent && call.out.is_empty() {
             // Fast path: header, prefix and payload go straight into HTTP/2.
@@ -689,14 +701,14 @@ impl GrpcServer {
                     }
                     let call = connection.calls.remove(&stream.id).unwrap();
                     recycle(call, &mut self.free, &self.config);
-                    return Err(Closed);
+                    return Err(Closed::Ended);
                 }
             }
         } else if call.out.len() - call.offset + prefix.len() + payload.len() > max_queued {
             call.drop_unsent();
             call.finish(&Status::new(Code::ResourceExhausted, "stream lagged"));
             mark(stream.id, call, &mut connection.pending);
-            return Err(Closed);
+            return Err(Closed::Lagged);
         }
         call.push(&prefix, payload);
         mark(stream.id, call, &mut connection.pending);
@@ -705,10 +717,13 @@ impl GrpcServer {
 
     /// Ends an open stream after its queued messages.
     pub fn finish(&mut self, stream: Stream, status: &Status) -> Result<(), Closed> {
-        let connection = self.connections.get_mut(&stream.token).ok_or(Closed)?;
+        let connection = self.connections.get_mut(&stream.token).ok_or(Closed::Ended)?;
         touch(stream.token, connection, &mut self.dirty);
-        let call =
-            connection.calls.get_mut(&stream.id).filter(|call| call.is_open()).ok_or(Closed)?;
+        let call = connection
+            .calls
+            .get_mut(&stream.id)
+            .filter(|call| call.is_open())
+            .ok_or(Closed::Ended)?;
         call.finish(status);
         mark(stream.id, call, &mut connection.pending);
         Ok(())
