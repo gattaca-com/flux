@@ -29,6 +29,20 @@ pub trait Versioned: type_hash::TypeHash + byte_stable::ByteStable {
     /// migrates them to `Self`. Zero-sized versions have no bytes, so `n` is
     /// the only source of the count.
     fn decode_versions(type_hash: u64, bytes: &[u8], n: usize) -> Result<Vec<Self>, DecodeError>;
+
+    /// [`decode_versions`](Self::decode_versions), handing each value to `f`
+    /// in order instead of collecting them. Nothing reaches `f` on error.
+    fn decode_versions_each<F: FnMut(Self)>(
+        type_hash: u64,
+        bytes: &[u8],
+        n: usize,
+        mut f: F,
+    ) -> Result<(), DecodeError> {
+        for value in Self::decode_versions(type_hash, bytes, n)? {
+            f(value);
+        }
+        Ok(())
+    }
 }
 
 pub trait VisitorVersionedLeaf {
@@ -43,6 +57,21 @@ pub trait HasVersionedLeaves: Copy {
 
     /// `None` when `blob`'s name and type match none of this type's positions.
     fn decode_blob<U: Versioned>(blob: &Blob, scratch: &mut Scratch) -> Option<Decoded<U, Self>>;
+
+    /// [`decode_blob`](Self::decode_blob), handing each message to `f` as it
+    /// decodes.
+    fn decode_blob_into<U: Versioned, F: FnMut(InternalMessage<Self>)>(
+        blob: &Blob,
+        scratch: &mut Scratch,
+        mut f: F,
+    ) -> Option<Result<U, DecodeError>> {
+        Some(Self::decode_blob::<U>(blob, scratch)?.map(|(meta, msgs)| {
+            for msg in msgs {
+                f(msg);
+            }
+            meta
+        }))
+    }
 }
 
 pub const fn concat_names<const N: usize>(parts: &[&'static [&'static str]]) -> [&'static str; N] {

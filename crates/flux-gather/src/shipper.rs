@@ -112,6 +112,11 @@ impl BlobShipper {
         self.driver.send_with(token, |buf| buf.extend_from_slice(bytes));
     }
 
+    /// Bytes shipped to `token` that have not reached its socket yet.
+    pub fn queued_bytes(&self, token: Token) -> usize {
+        self.driver.queued_bytes(token)
+    }
+
     /// Takes an endpoint out of [`Self::ship`] until resumed; [`Self::ship_to`]
     /// still reaches it.
     pub fn pause_broadcast(&mut self, token: Token) {
