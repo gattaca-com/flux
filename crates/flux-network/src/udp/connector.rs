@@ -8,7 +8,7 @@
 //! one `sendmmsg` batch.
 
 use std::{
-    io,
+    io, mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
 };
@@ -20,8 +20,8 @@ use tracing::{debug, info, warn};
 
 use super::{
     peer::{MsgStore, PushOutcome, SendOutcome, Staged, UdpPeer, send_batch},
-    sys::{BATCH, RecvBatch, SendBatch},
-    wire::{HEADER_SIZE, Header, Kind},
+    sys::{Layout, RecvBatch, SEND_BATCH, SendBatch},
+    wire::{HEADER_SIZE, Header, Kind, PACKET_HEADER_SIZE, Packet},
 };
 use crate::network::{
     Event, Group, PayloadBuf, ReplayPolicy, RxPayload, Tokens, UdpGroupConfig, set_socket_buf_size,
@@ -34,12 +34,33 @@ struct Endpoint {
     writable_armed: bool,
 }
 
-/// One decoded datagram and where it came from.
-struct Datagram<'a> {
+/// One decoded record and where it came from.
+struct Record<'a> {
     header: Header,
     payload: &'a [u8],
     from: SocketAddr,
     now: Instant,
+}
+
+/// The record at the start of `bytes`.
+enum Cut<'a> {
+    Whole(Header, &'a [u8]),
+    /// Fewer bytes than the header announces: the rest is in the next packet.
+    Short,
+    Malformed,
+}
+
+#[inline]
+fn cut_record(bytes: &[u8], stride: usize) -> Cut<'_> {
+    if bytes.len() < HEADER_SIZE {
+        return Cut::Short;
+    }
+    let Some(header) = Header::decode(bytes) else { return Cut::Malformed };
+    let Some(len) = header.payload_len(stride) else { return Cut::Malformed };
+    if bytes.len() < HEADER_SIZE + len {
+        return Cut::Short;
+    }
+    Cut::Whole(header, &bytes[HEADER_SIZE..HEADER_SIZE + len])
 }
 
 /// Session id for a new connection attempt: mixes the TSC, the pid and the
@@ -74,7 +95,7 @@ fn arm_writable(registry: &Registry, entry: &mut Endpoint) {
 fn push_on_connect(store: &mut MsgStore, cfg: &UdpGroupConfig, peer: &mut UdpPeer, now: Instant) {
     if let Some(msg) = &cfg.on_connect_msg {
         let slot = store.insert(&mut msg.clone());
-        peer.push_message(store, slot, Nanos::now(), now);
+        peer.push_message(store, slot, Nanos::now(), now, Layout::Bare);
         store.release(slot);
     }
 }
@@ -102,9 +123,11 @@ pub(crate) struct UdpManager {
     store: MsgStore,
     send_buffer: Vec<u8>,
     batch: SendBatch,
-    staged: [Staged; BATCH],
+    staged: [Staged; SEND_BATCH],
     /// Taken out while datagrams are dispatched so peers can be borrowed.
     recv: Option<RecvBatch>,
+    /// A record reassembled from two packets, kept for its capacity.
+    joined: Vec<u8>,
     pending_disconnects: Vec<(Token, SocketAddr)>,
     retired: Vec<Token>,
     broadcast_paused: Vec<Token>,
@@ -136,9 +159,10 @@ impl UdpManager {
             peers: Vec::new(),
             store: MsgStore::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
-            batch: SendBatch::new(),
-            staged: [Staged { peer: 0, seq: 0 }; BATCH],
+            batch: SendBatch::new(udp.max_datagram_size),
+            staged: [Staged { peer: 0, seq: 0 }; SEND_BATCH],
             recv: Some(RecvBatch::new(udp.max_datagram_size)),
+            joined: Vec::new(),
             pending_disconnects: Vec::new(),
             broadcast_paused: Vec::new(),
             retired: Vec::new(),
@@ -366,7 +390,7 @@ impl UdpManager {
     {
         let Some(index) = self.sendable_index(token) else { return false };
         let now = Instant::now();
-        let sent = self.stage_serialised(index, Nanos::now(), now, serialise);
+        let sent = self.stage_serialised(index, Nanos::now(), now, Layout::Bare, serialise);
         if sent {
             self.flush_peer_socket(registry, index, now);
         }
@@ -394,7 +418,8 @@ impl UdpManager {
                 // The peer was dropped for violating a limit.
                 return false;
             }
-            sent |= self.stage_serialised(index, ts, now, |buf| serialise(buf, item));
+            sent |=
+                self.stage_serialised(index, ts, now, Layout::Packed, |buf| serialise(buf, item));
         }
         if sent {
             self.flush_peer_socket(registry, index, now);
@@ -410,7 +435,7 @@ impl UdpManager {
             return 0;
         }
         let now = Instant::now();
-        let recipients = self.stage_broadcast(Nanos::now(), now, serialise);
+        let recipients = self.stage_broadcast(Nanos::now(), now, Layout::Bare, serialise);
         self.flush_all(registry, now);
         recipients
     }
@@ -433,7 +458,8 @@ impl UdpManager {
         let ts = Nanos::now();
         let mut recipients = 0;
         for item in items {
-            recipients = recipients.max(self.stage_broadcast(ts, now, |buf| serialise(buf, item)));
+            recipients = recipients
+                .max(self.stage_broadcast(ts, now, Layout::Packed, |buf| serialise(buf, item)));
         }
         self.flush_all(registry, now);
         recipients
@@ -464,12 +490,19 @@ impl UdpManager {
 
     /// Serialises and queues one message for the peer at `index`, dropping
     /// the peer if it cannot take it. Returns whether it was queued.
-    fn stage_serialised<F>(&mut self, index: usize, ts: Nanos, now: Instant, serialise: F) -> bool
+    fn stage_serialised<F>(
+        &mut self,
+        index: usize,
+        ts: Nanos,
+        now: Instant,
+        layout: Layout,
+        serialise: F,
+    ) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
         let Some(slot) = self.serialise_into_store(serialise) else { return false };
-        let queued = self.stage_message(index, slot, ts, now);
+        let queued = self.stage_message(index, slot, ts, now, layout);
         self.store.release(slot);
         if !queued {
             self.drop_peer_pending(index, now);
@@ -479,7 +512,7 @@ impl UdpManager {
 
     /// Serialises and queues one message for every eligible peer. Returns the
     /// number of recipients.
-    fn stage_broadcast<F>(&mut self, ts: Nanos, now: Instant, serialise: F) -> usize
+    fn stage_broadcast<F>(&mut self, ts: Nanos, now: Instant, layout: Layout, serialise: F) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
@@ -492,7 +525,7 @@ impl UdpManager {
                 continue;
             }
             recipients += 1;
-            if !self.stage_message(i, slot, ts, now) {
+            if !self.stage_message(i, slot, ts, now, layout) {
                 self.drop_peer_pending(i, now);
             }
         }
@@ -515,9 +548,16 @@ impl UdpManager {
     /// Queues the stored message for one peer. `false` when the peer must be
     /// dropped: it violated the backlog limit or cannot hold the message.
     #[inline]
-    fn stage_message(&mut self, index: usize, slot: u32, ts: Nanos, now: Instant) -> bool {
+    fn stage_message(
+        &mut self,
+        index: usize,
+        slot: u32,
+        ts: Nanos,
+        now: Instant,
+        layout: Layout,
+    ) -> bool {
         let peer = &mut self.peers[index];
-        match peer.push_message(&mut self.store, slot, ts, now) {
+        match peer.push_message(&mut self.store, slot, ts, now, layout) {
             PushOutcome::Queued => !peer.backlog_exceeded(self.config.max_backlog_datagrams),
             PushOutcome::WindowFull => false,
             PushOutcome::TooLarge => true,
@@ -538,7 +578,7 @@ impl UdpManager {
                 self.peers[i].stage(seq, &self.store, &mut self.batch);
                 self.staged[n] = Staged { peer: i, seq };
                 n += 1;
-                if n == BATCH {
+                if n == SEND_BATCH {
                     if !Self::dispatch(
                         &mut self.batch,
                         &self.staged,
@@ -574,7 +614,7 @@ impl UdpManager {
     /// kernel took less than everything.
     fn dispatch(
         batch: &mut SendBatch,
-        staged: &[Staged; BATCH],
+        staged: &[Staged; SEND_BATCH],
         peers: &mut [UdpPeer],
         store: &mut MsgStore,
         fd: i32,
@@ -638,7 +678,7 @@ impl UdpManager {
         &mut self,
         registry: &Registry,
         k: usize,
-        dgram: &Datagram<'_>,
+        record: &Record<'_>,
         tokens: &mut Tokens,
         deliver: &mut F,
     ) where
@@ -647,49 +687,126 @@ impl UdpManager {
         let token = tokens.allocate(self.group);
         let entry = &self.sockets[k];
         let mut peer =
-            UdpPeer::new(dgram.from, token, entry.token, new_session(token.0), &self.config);
-        peer.on_hello(&dgram.header, &entry.socket, dgram.now);
-        push_on_connect(&mut self.store, &self.config, &mut peer, dgram.now);
-        info!(addr = %dgram.from, "udp client connected");
-        deliver(Event::Accepted { group: self.group, token, peer_addr: dgram.from });
+            UdpPeer::new(record.from, token, entry.token, new_session(token.0), &self.config);
+        peer.on_hello(&record.header, &entry.socket, record.now);
+        push_on_connect(&mut self.store, &self.config, &mut peer, record.now);
+        info!(addr = %record.from, "udp client connected");
+        deliver(Event::Accepted { group: self.group, token, peer_addr: record.from });
         self.peers.push(peer);
-        self.flush_socket(registry, k, dgram.now);
+        self.flush_socket(registry, k, record.now);
     }
 
-    /// One received datagram.
+    #[inline]
+    fn peer_index(&self, k: usize, from: SocketAddr) -> Option<usize> {
+        let socket_token = self.sockets[k].token;
+        self.peers.iter().position(|p| p.socket_token == socket_token && p.addr == from)
+    }
+
+    /// One received datagram: a packet of records, or a bare record.
+    #[allow(clippy::too_many_arguments)]
     fn on_datagram<F>(
         &mut self,
         registry: &Registry,
         k: usize,
-        dgram: &Datagram<'_>,
+        bytes: &[u8],
+        from: SocketAddr,
+        now: Instant,
         dcache: Option<&DCache>,
         tokens: &mut Tokens,
         deliver: &mut F,
     ) where
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
-        let Datagram { header, payload, from, now } = *dgram;
+        let mut peer = self.peer_index(k, from);
+        let Some(packet) = Packet::decode(bytes) else {
+            if let Some(header) = Header::decode(bytes) {
+                let record = Record { header, payload: &bytes[HEADER_SIZE..], from, now };
+                self.on_record(registry, k, &mut peer, &record, dcache, tokens, deliver);
+            }
+            return;
+        };
+        let stride = self.config.udp.stride();
+        let first = usize::from(packet.first);
+        // Bytes before the first record finish the record the previous
+        // packet cut off; without that packet they belong to nothing.
+        if first > PACKET_HEADER_SIZE &&
+            let Some(i) = peer
+        {
+            let mut joined = mem::take(&mut self.joined);
+            if self.peers[i].take_carry(packet.seq, &mut joined) {
+                joined.extend_from_slice(&bytes[PACKET_HEADER_SIZE..first]);
+                if let Cut::Whole(header, payload) = cut_record(&joined, stride) &&
+                    HEADER_SIZE + payload.len() == joined.len()
+                {
+                    let record = Record { header, payload, from, now };
+                    self.on_record(registry, k, &mut peer, &record, dcache, tokens, deliver);
+                }
+                joined.clear();
+            }
+            self.joined = joined;
+        }
+        let mut rest = &bytes[first..];
+        let mut answered = false;
+        while !rest.is_empty() {
+            match cut_record(rest, stride) {
+                Cut::Whole(header, payload) => {
+                    rest = &rest[HEADER_SIZE + payload.len()..];
+                    // One reset answers every record of an unknown sender.
+                    if peer.is_none() &&
+                        header.kind != Kind::Hello &&
+                        mem::replace(&mut answered, true)
+                    {
+                        continue;
+                    }
+                    let record = Record { header, payload, from, now };
+                    self.on_record(registry, k, &mut peer, &record, dcache, tokens, deliver);
+                }
+                Cut::Short => {
+                    if let Some(i) = peer {
+                        self.peers[i].set_carry(packet.seq, rest);
+                    }
+                    return;
+                }
+                Cut::Malformed => return,
+            }
+        }
+    }
+
+    /// One received record. `peer_index` is the sender's peer, kept current
+    /// across the records of one packet.
+    #[allow(clippy::too_many_arguments)]
+    fn on_record<F>(
+        &mut self,
+        registry: &Registry,
+        k: usize,
+        peer_index: &mut Option<usize>,
+        record: &Record<'_>,
+        dcache: Option<&DCache>,
+        tokens: &mut Tokens,
+        deliver: &mut F,
+    ) where
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
+    {
+        let Record { header, payload, from, now } = *record;
         let header = &header;
-        let socket_token = self.sockets[k].token;
-        let peer_index =
-            self.peers.iter().position(|p| p.socket_token == socket_token && p.addr == from);
 
         match header.kind {
             Kind::Hello => {
                 if !self.sockets[k].listener {
                     return;
                 }
-                if let Some(i) = peer_index {
+                if let Some(i) = *peer_index {
                     if self.peers[i].on_hello(header, &self.sockets[k].socket, now) {
                         return;
                     }
                     let old = self.remove_peer(i);
                     deliver(Event::Disconnected { group: self.group, token: old, peer_addr: from });
                 }
-                self.accept(registry, k, dgram, tokens, deliver);
+                self.accept(registry, k, record, tokens, deliver);
+                *peer_index = self.peer_index(k, from);
             }
             Kind::HelloAck | Kind::Reset => {
-                let Some(i) = peer_index else { return };
+                let Some(i) = *peer_index else { return };
                 let peer = &mut self.peers[i];
                 if !peer.is_outbound() {
                     return;
@@ -699,6 +816,7 @@ impl UdpManager {
                     warn!(addr = %from, "udp peer lost our session, reconnecting");
                     deliver(Event::Disconnected { group: self.group, token, peer_addr: from });
                     self.drop_peer(i, now);
+                    *peer_index = self.peer_index(k, from);
                 } else if header.kind == Kind::HelloAck && peer.on_hello_ack(header, now).is_some()
                 {
                     debug!(addr = %from, "udp connected");
@@ -708,7 +826,7 @@ impl UdpManager {
             }
             Kind::Data | Kind::Ack => {
                 let entry = &mut self.sockets[k];
-                let Some(i) = peer_index else {
+                let Some(i) = *peer_index else {
                     // Unknown sender on a listener: a client from before our
                     // restart, or one we dropped. Tell it to renegotiate.
                     if entry.listener {
@@ -766,9 +884,7 @@ impl UdpManager {
                 for i in 0..n {
                     let Some((datagrams, from)) = recv.datagrams(i) else { continue };
                     for bytes in datagrams {
-                        let Some(header) = Header::decode(bytes) else { continue };
-                        let dgram = Datagram { header, payload: &bytes[HEADER_SIZE..], from, now };
-                        self.on_datagram(registry, k, &dgram, dcache, tokens, deliver);
+                        self.on_datagram(registry, k, bytes, from, now, dcache, tokens, deliver);
                     }
                 }
             }

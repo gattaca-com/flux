@@ -1,12 +1,16 @@
 //! Reliable, unordered UDP transport for [`crate::Network`].
 //!
-//! Each message is fragmented into datagrams that carry consecutive sequence
-//! numbers. The receiver acks with a cumulative point plus a selective bitmap
-//! covering everything it holds above it. The sender resends holes below the
-//! highest acked sequence at once, and after an RTO of ack silence probes the
-//! oldest unacked datagram, doubling the probe size per round. Messages are
-//! delivered as soon as all their fragments are in, so a lost datagram delays
-//! only its own message.
+//! Each message is fragmented into records that carry consecutive sequence
+//! numbers. A message sent on its own goes out as one datagram per record.
+//! Messages handed over together, by `send_many_with` or
+//! `broadcast_many_with`, are packed back to back and cut into datagrams of
+//! exactly `max_datagram_size`, so a burst costs the fewest datagrams its
+//! bytes allow and they form one segmentation-offload run. The receiver
+//! acks with a cumulative point plus a selective bitmap covering everything it
+//! holds above it. The sender resends holes below the highest acked sequence at
+//! once, and after an RTO of ack silence probes the oldest unacked datagram,
+//! doubling the probe size per round. Messages are delivered as soon as all
+//! their fragments are in, so a lost datagram delays only its own message.
 //!
 //! With [`UdpConfig::reliable`] off the same wire format carries a fire-and-
 //! forget stream: the sender releases a datagram once the kernel takes it and
@@ -31,8 +35,9 @@ pub(crate) use connector::UdpManager;
 /// `max_datagram_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
-    /// Datagram size including the 29-byte header. 1200 stays under the
-    /// 1280-byte IPv6 minimum MTU.
+    /// Datagram size including the 29-byte fragment header. Messages sent
+    /// together share datagrams behind a 9-byte packet header. 1200 stays
+    /// under the 1280-byte IPv6 minimum MTU.
     pub max_datagram_size: usize,
     /// Datagrams a sender may have in flight per peer, counted from the oldest
     /// message not yet fully acked. Power of two, at least 64. A message that

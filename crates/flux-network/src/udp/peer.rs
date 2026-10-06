@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use super::{
     UdpConfig,
-    sys::{BATCH, SendBatch, SockAddr},
+    sys::{Layout, SEND_BATCH, SendBatch, SockAddr},
     wire::{HEADER_SIZE, Header, Kind, fragment_count, parse_len_and_index, write_session},
 };
 use crate::{
@@ -211,7 +211,7 @@ impl MsgStore {
     }
 }
 
-/// One datagram: its header and where its payload lives in the store.
+/// One record: its header and where its payload lives in the store.
 struct Fragment {
     header: [u8; HEADER_SIZE],
     slot: u32,
@@ -219,6 +219,7 @@ struct Fragment {
     len: u16,
     sent_at: Instant,
     retries: u8,
+    layout: Layout,
 }
 
 /// A message this peer holds a store reference on.
@@ -288,6 +289,7 @@ impl TxWindow {
             len: 0,
             sent_at: Instant::ZERO,
             retries: 0,
+            layout: Layout::Bare,
         });
         Self {
             slots,
@@ -351,6 +353,7 @@ impl TxWindow {
         store: &mut MsgStore,
         slot: u32,
         ts: Nanos,
+        layout: Layout,
     ) -> bool {
         let payload = store.bytes(slot);
         let total = fragment_count(payload.len(), stride);
@@ -368,6 +371,7 @@ impl TxWindow {
             f.offset = (index * stride) as u32;
             f.len = chunk.len() as u16;
             f.retries = 0;
+            f.layout = layout;
             self.next += 1;
         }
         self.messages.push_back(MsgRef { slot, first_seq, last_seq: self.next - 1 });
@@ -380,7 +384,7 @@ impl TxWindow {
     #[inline]
     fn stage(&self, seq: u64, store: &MsgStore, to: &SockAddr, batch: &mut SendBatch) {
         let f = &self.slots[(seq & self.mask) as usize];
-        batch.push(&f.header, payload_of(store, f), to);
+        batch.push(&f.header, payload_of(store, f), to, f.layout);
     }
 
     /// Records that the kernel accepted `seq`.
@@ -430,7 +434,7 @@ impl TxWindow {
         batch: &mut SendBatch,
         now: Instant,
     ) -> (u64, bool) {
-        let mut pushed = [0u64; BATCH];
+        let mut pushed = [0u64; SEND_BATCH];
         let mut n = 0;
         let mut sent = 0;
         for seq in range {
@@ -440,7 +444,7 @@ impl TxWindow {
             self.stage(seq, store, to, batch);
             pushed[n] = seq;
             n += 1;
-            if n == BATCH {
+            if n == SEND_BATCH {
                 let accepted = send_batch(batch, fd, n);
                 for &seq in &pushed[..accepted] {
                     self.mark_sent(seq, true, now);
@@ -846,6 +850,10 @@ pub(crate) struct UdpPeer {
     last_warn: Instant,
     /// Control datagram staging: header plus the largest ack bitmap.
     ctrl: Vec<u8>,
+    /// Head of a record cut off by the end of packet `carry_seq`; empty when
+    /// there is none.
+    carry: Vec<u8>,
+    carry_seq: u32,
 }
 
 impl UdpPeer {
@@ -885,7 +893,29 @@ impl UdpPeer {
             latency: latency_timer(group.telemetry, &label),
             dropped_full: 0,
             last_warn: Instant::ZERO,
+            carry: Vec::new(),
+            carry_seq: 0,
         }
+    }
+
+    /// Swaps the head of the record cut off by the packet before `seq` into
+    /// `head`, if the carry holds one; `head` must come in empty.
+    #[inline]
+    pub(crate) fn take_carry(&mut self, seq: u32, head: &mut Vec<u8>) -> bool {
+        if self.carry.is_empty() || self.carry_seq.wrapping_add(1) != seq {
+            return false;
+        }
+        std::mem::swap(&mut self.carry, head);
+        true
+    }
+
+    /// Keeps the head of the record packet `seq` ended in, replacing any
+    /// older one.
+    #[inline]
+    pub(crate) fn set_carry(&mut self, seq: u32, head: &[u8]) {
+        self.carry.clear();
+        self.carry.extend_from_slice(head);
+        self.carry_seq = seq;
     }
 
     #[inline]
@@ -1054,13 +1084,14 @@ impl UdpPeer {
         slot: u32,
         ts: Nanos,
         now: Instant,
+        layout: Layout,
     ) -> PushOutcome {
         let len = store.bytes(slot).len();
         if len > self.config.max_message_size {
             warn!(%self.addr, len, max = self.config.max_message_size, "udp message too large");
             return PushOutcome::TooLarge;
         }
-        if self.tx.push(self.local_session, self.config.stride(), store, slot, ts) {
+        if self.tx.push(self.local_session, self.config.stride(), store, slot, ts, layout) {
             return PushOutcome::Queued;
         }
         self.dropped_full += 1;
@@ -1098,6 +1129,7 @@ impl UdpPeer {
             None => {
                 self.remote_session = Some(header.session);
                 self.rx.reset(header.seq);
+                self.carry.clear();
                 self.connected = true;
                 self.ever_connected = true;
             }
@@ -1117,6 +1149,7 @@ impl UdpPeer {
         self.last_recv = now;
         self.remote_session = Some(header.session);
         self.rx.reset(header.seq);
+        self.carry.clear();
         self.connected = true;
         let was = std::mem::replace(&mut self.ever_connected, true);
         self.hello_backoff = 0;
@@ -1353,7 +1386,7 @@ mod tests {
     /// Stores a payload and pushes it, dropping the owner reference.
     fn push(tx: &mut TxWindow, store: &mut MsgStore, stride: usize, payload: &[u8]) -> bool {
         let slot = store.insert(&mut payload.to_vec());
-        let ok = tx.push(1, stride, store, slot, Nanos(1));
+        let ok = tx.push(1, stride, store, slot, Nanos(1), Layout::Bare);
         store.release(slot);
         ok
     }
@@ -1381,7 +1414,7 @@ mod tests {
         assert_eq!(payload_of(&store, &tx.slots[4]), &vec![7; stride][..]);
 
         let (s, to) = sock();
-        let mut batch = SendBatch::new();
+        let mut batch = SendBatch::new(config.max_datagram_size);
         let now = Instant::now();
         let fd = s.as_raw_fd();
         send_all(&mut tx, 0..8);
@@ -1412,7 +1445,7 @@ mod tests {
         let mut tx = TxWindow::new(config.send_window, &group(config), "");
         let (s, to) = sock();
         let fd = s.as_raw_fd();
-        let mut batch = SendBatch::new();
+        let mut batch = SendBatch::new(config.max_datagram_size);
         let now = Instant::now();
         let zero = Duration::ZERO;
         for _ in 0..64 {
@@ -1462,7 +1495,7 @@ mod tests {
         let mut tx = TxWindow::new(config.send_window, &group(config), "");
         let (s, to) = sock();
         let fd = s.as_raw_fd();
-        let mut batch = SendBatch::new();
+        let mut batch = SendBatch::new(config.max_datagram_size);
         let now = Instant::now();
         let zero = Duration::ZERO;
         assert!(push(&mut tx, &mut store, stride, &vec![0; stride * 4]));
@@ -1559,10 +1592,13 @@ mod tests {
         let (s, _) = sock();
         let mut store = MsgStore::new();
         let mut peer = UdpPeer::new(s.local_addr().unwrap(), Token(0), Token(0), 1, &group(config));
-        let mut batch = SendBatch::new();
+        let mut batch = SendBatch::new(config.max_datagram_size);
         let now = Instant::now();
         let slot = store.insert(&mut vec![0; config.stride() * 3]);
-        assert_eq!(peer.push_message(&mut store, slot, Nanos(1), now), PushOutcome::Queued);
+        assert_eq!(
+            peer.push_message(&mut store, slot, Nanos(1), now, Layout::Bare),
+            PushOutcome::Queued
+        );
         store.release(slot);
         assert_eq!(store.free.len(), 0);
         for seq in 0..3 {
