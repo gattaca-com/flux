@@ -591,6 +591,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         syn::Fields::Unit => quote! { {base_dir: std::path::PathBuf}},
     };
 
+    // `{ #x, timestamp }` leaves a stray comma when the spine has no queues.
+    let producer_fields = producer_fields.iter();
+    let producer_init = producer_init.iter();
+
     let reconstructed_input_struct = quote! {
         #(#input_attrs)*
         #vis struct #struct_ident #generics_decl
@@ -622,11 +626,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[derive(Clone, Copy, Debug)]
-        #vis struct #producers_ident { #producer_fields, timestamp: ::flux::timing::TrackingTimestamp }
+        #vis struct #producers_ident { #(#producer_fields,)* timestamp: ::flux::timing::TrackingTimestamp }
         impl #producers_ident {
             pub fn attach<Tl: ::flux::tile::Tile<#struct_ident>>(tile: &Tl, spine:&mut #struct_ident)->Self {
                 let id = spine.tile_info.register_tile(tile.name());
-                Self { #producer_init, timestamp: ::flux::timing::TrackingTimestamp::new(id) }
+                Self { #(#producer_init,)* timestamp: ::flux::timing::TrackingTimestamp::new(id) }
             }
         }
 
