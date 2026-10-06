@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::{ClickHouse, Error, Output, QueryId, rowbinary};
 
-const MAX_ROWS: usize = 10_000;
+const DEFAULT_MAX_ROWS: usize = 10_000;
 const RETRY_INTERVAL: Nanos = Nanos::from_secs(2);
 
 /// Retains native insert rows until success, with one batch in flight per
@@ -17,6 +17,7 @@ const RETRY_INTERVAL: Nanos = Nanos::from_secs(2);
 /// during an outage.
 pub struct BufferedTable<T> {
     sql: String,
+    max_rows_per_batch: usize,
     pending: VecDeque<T>,
     in_flight: Option<(QueryId, usize)>,
     retry_after: Instant,
@@ -29,10 +30,18 @@ impl<T: Serialize> BufferedTable<T> {
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
+            max_rows_per_batch: DEFAULT_MAX_ROWS,
             pending: VecDeque::new(),
             in_flight: None,
             retry_after: Instant::ZERO,
         }
+    }
+
+    /// Set the maximum rows per insert. Defaults to 10,000; panics if zero.
+    pub fn with_max_rows_per_batch(mut self, max_rows_per_batch: usize) -> Self {
+        assert!(max_rows_per_batch > 0, "max_rows_per_batch must be nonzero");
+        self.max_rows_per_batch = max_rows_per_batch;
+        self
     }
 
     pub fn push(&mut self, row: T) {
@@ -48,15 +57,15 @@ impl<T: Serialize> BufferedTable<T> {
         self.pending.is_empty()
     }
 
-    /// Queue up to 10,000 rows. A full queue or failed request backs off for
-    /// two seconds. An encoding error drops only the invalid row and
-    /// returns its error.
+    /// Queue up to the configured row limit. A full queue or failed request
+    /// backs off for two seconds. An encoding error drops only the invalid
+    /// row and returns its error.
     pub fn flush(&mut self, client: &mut ClickHouse) -> Result<(), rowbinary::Error> {
         if self.in_flight.is_some() || self.pending.is_empty() || Instant::now() < self.retry_after
         {
             return Ok(());
         }
-        let count = self.pending.len().min(MAX_ROWS);
+        let count = self.pending.len().min(self.max_rows_per_batch);
         let mut body = Vec::new();
         for (index, row) in self.pending.iter().take(count).enumerate() {
             if let Err(error) = rowbinary::encode(&mut body, row) {

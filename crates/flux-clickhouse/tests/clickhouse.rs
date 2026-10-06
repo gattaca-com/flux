@@ -453,7 +453,8 @@ async fn buffered_rows_survive_refusal_and_retry() -> clickhouse::error::Result<
         .with_credentials("flux_test", "flux_test")
         .with_database(&database)
         .with_max_queued_bytes(0);
-    let mut rows = BufferedTable::new("INSERT INTO buffered (id) SETTINGS async_insert = 0 VALUES");
+    let mut rows = BufferedTable::new("INSERT INTO buffered (id) SETTINGS async_insert = 0 VALUES")
+        .with_max_rows_per_batch(1);
     rows.push(Row { id: 7 });
     rows.flush(&mut client).unwrap();
     assert_eq!(rows.len(), 1);
@@ -461,6 +462,7 @@ async fn buffered_rows_survive_refusal_and_retry() -> clickhouse::error::Result<
     client.connect(&mut net);
 
     let mut failed = false;
+    let mut successful_batches = 0;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline && !rows.is_empty() {
         rows.flush(&mut client).unwrap();
@@ -475,6 +477,7 @@ async fn buffered_rows_survive_refusal_and_retry() -> clickhouse::error::Result<
             assert!(rows.on_result(id, &result));
             if failed {
                 assert!(result.is_ok(), "{result:?}");
+                successful_batches += 1;
             } else {
                 assert!(matches!(result, Err(Error::Server { .. })), "{result:?}");
                 assert_eq!(rows.len(), 1);
@@ -489,6 +492,7 @@ async fn buffered_rows_survive_refusal_and_retry() -> clickhouse::error::Result<
         thread::yield_now();
     }
     assert!(failed && rows.is_empty());
+    assert_eq!(successful_batches, 2);
     assert_eq!(http.query("SELECT id FROM buffered ORDER BY id").fetch_all::<u64>().await?, [7, 9]);
     client.close(&mut net);
     http.query(&format!("DROP DATABASE {database}")).execute().await?;

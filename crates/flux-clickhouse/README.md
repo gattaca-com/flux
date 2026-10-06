@@ -54,7 +54,8 @@ statements and added columns without `DEFAULT` require the existing
 ```rust,ignore
 let mut rows = flux_clickhouse::BufferedTable::new(
     "INSERT INTO events (`results.cost_units`) SETTINGS async_insert = 0 VALUES",
-);
+)
+.with_max_rows_per_batch(1_000);
 rows.push(row);
 rows.flush(&mut client)?;
 client.drive(&mut network, |id, result| {
@@ -65,8 +66,9 @@ client.drive(&mut network, |id, result| {
 ```
 
 Use one client for the table's lifetime. Call `flush` on each poll iteration.
-The buffer keeps rows until success, with one batch of at most 10,000 rows in
-flight. Queue refusal and request failure delay retries for two seconds.
+The buffer keeps rows until success, with one batch in flight. The default limit
+is 10,000 rows per batch; `with_max_rows_per_batch` accepts any nonzero limit.
+Queue refusal and request failure delay retries for two seconds.
 Encoding failure drops only the invalid row and returns the error to the caller.
 Retries can duplicate committed rows after a lost response. Pending rows have no
 size limit; the application owns ingestion limits and shutdown draining.
