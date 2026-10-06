@@ -211,6 +211,18 @@ struct LossyRelay {
 impl LossyRelay {
     fn start(server: SocketAddr, drop_every: usize) -> Self {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+            let size: libc::c_int = 64 * 1024 * 1024;
+            unsafe {
+                libc::setsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&socket),
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::from_ref(&size).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
         socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
         let addr = socket.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -1091,4 +1103,93 @@ fn udp_batched_sends_deliver_every_item() {
         });
         thread::sleep(Duration::from_micros(50));
     }
+}
+
+/// Bursts of up to 512 mixed-size messages broadcast to five peers through
+/// lossy relays whose buffers hold a burst, with no peer dropped.
+#[test]
+fn udp_broadcast_bursts_to_many_peers_survive_loss() {
+    const PEERS: usize = 5;
+    const N: u32 = 60_000;
+    let server_addr = free_addr();
+    let relays: Vec<LossyRelay> =
+        (0..PEERS).map(|i| LossyRelay::start(server_addr, 97 + i)).collect();
+    let mut server = Network::default();
+    let server_group = server.add_group(UdpGroupConfig {
+        udp: UdpConfig::lan(),
+        socket_buf_size: Some(64 * 1024 * 1024),
+        ..Default::default()
+    });
+    let mut clients: Vec<(Network, flux_network::Group)> = (0..PEERS)
+        .map(|_| {
+            let mut c = Network::default();
+            let g = c.add_group(UdpGroupConfig {
+                udp: UdpConfig::lan(),
+                socket_buf_size: Some(64 * 1024 * 1024),
+                ..Default::default()
+            });
+            (c, g)
+        })
+        .collect();
+    server.listen(server_group, server_addr).unwrap();
+    for ((c, g), relay) in clients.iter_mut().zip(&relays) {
+        let _ = c.connect(*g, relay.addr);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut accepted = 0;
+    while accepted < PEERS {
+        assert!(Instant::now() < deadline, "handshake");
+        server.poll_with(|e| accepted += usize::from(matches!(e, NetworkEvent::Accepted { .. })));
+        for (c, _) in &mut clients {
+            c.poll_with(|_| {});
+        }
+    }
+    let sizes: Vec<usize> = (0..N as usize)
+        .map(|i| match i % 11 {
+            0 => 160 + (i * 613) % 5800,
+            _ => 160 + (i * 613) % 1100,
+        })
+        .collect();
+    let mut seen: Vec<Vec<bool>> = vec![vec![false; N as usize]; PEERS];
+    let mut received = vec![0u32; PEERS];
+    let mut next = 0usize;
+    let mut burst = 1usize;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut disconnects = 0;
+    while received.iter().any(|&r| r < N) {
+        assert!(Instant::now() < deadline, "delivery stalled: received={received:?} sent={next}");
+        let lag = next as u32 - *received.iter().min().unwrap();
+        if next < N as usize && lag < 16_000 {
+            let end = (next + burst).min(N as usize);
+            server.broadcast_many_with(server_group, next..end, |b, i| {
+                b.extend_from_slice(&make_msg(i as u32, sizes[i]));
+            });
+            next = end;
+            burst = burst % 512 + 7;
+        }
+        server.poll_with(|e| {
+            if matches!(e, NetworkEvent::Disconnected { .. }) {
+                disconnects += 1;
+            }
+        });
+        for (p, (c, _)) in clients.iter_mut().enumerate() {
+            c.poll_with(|e| match e {
+                NetworkEvent::Message { payload, .. } => {
+                    let id = msg_id(payload) as usize;
+                    assert_eq!(
+                        checksum(payload),
+                        checksum(&make_msg(id as u32, sizes[id])),
+                        "corrupted"
+                    );
+                    assert!(!seen[p][id], "peer {p} got {id} twice");
+                    seen[p][id] = true;
+                    received[p] += 1;
+                }
+                NetworkEvent::Disconnected { .. } => disconnects += 1,
+                _ => {}
+            });
+        }
+        assert_eq!(disconnects, 0, "a peer was dropped: received={received:?} sent={next}");
+    }
+    assert!(relays.iter().all(|r| r.dropped.load(Ordering::Relaxed) > 0));
 }
