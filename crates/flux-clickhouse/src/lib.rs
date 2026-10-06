@@ -12,7 +12,14 @@
 //! the server has named the target columns, so the server's types, not the
 //! Rust ones, decide the wire layout.
 
+mod buffered;
+#[cfg(feature = "http")]
+pub mod http;
+#[cfg(feature = "migrations")]
+pub mod migrations;
 mod native;
+
+pub use buffered::BufferedTable;
 pub mod rowbinary;
 
 use std::{

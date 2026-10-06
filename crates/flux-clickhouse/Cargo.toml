@@ -7,11 +7,32 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+http = ["dep:clickhouse"]
+migrations = ["http", "dep:eyre", "dep:include_dir", "dep:rustc-hash", "dep:sha2", "dep:tracing"]
+cli = ["migrations", "dep:clap", "dep:tokio", "dep:toml", "dep:tracing-subscriber"]
+
 [dependencies]
 cityhash-rs.workspace = true
 flux-network.workspace = true
+flux-timing.workspace = true
 lz4_flex.workspace = true
 serde.workspace = true
+
+clap = { workspace = true, optional = true }
+clickhouse = { workspace = true, optional = true }
+eyre = { workspace = true, optional = true }
+include_dir = { workspace = true, optional = true }
+rustc-hash = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

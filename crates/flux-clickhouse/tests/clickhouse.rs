@@ -427,3 +427,70 @@ fn timeouts_budgets_and_recovery() {
     assert_eq!(outcomes[2].1, Ok(Output::default()));
     assert_eq!(seen.iter().filter(|msg| **msg == hello).count(), 3);
 }
+
+#[cfg(feature = "http")]
+#[tokio::test]
+#[ignore = "requires FLUX_CLICKHOUSE_TEST_URL and FLUX_CLICKHOUSE_TEST_ADDR for a disposable local server"]
+async fn buffered_rows_survive_refusal_and_retry() -> clickhouse::error::Result<()> {
+    use flux_clickhouse::BufferedTable;
+
+    #[derive(serde::Serialize)]
+    struct Row {
+        id: u64,
+    }
+
+    let http = clickhouse::Client::default()
+        .with_url(std::env::var("FLUX_CLICKHOUSE_TEST_URL").expect("local HTTP URL"))
+        .with_user("flux_test")
+        .with_password("flux_test");
+    let database = format!("flux_buffered_test_{}", std::process::id());
+    http.query(&format!("CREATE DATABASE {database}")).execute().await?;
+    let http = http.with_database(&database);
+    let addr =
+        std::env::var("FLUX_CLICKHOUSE_TEST_ADDR").expect("local native address").parse().unwrap();
+    let mut net = Network::default();
+    let mut client = ClickHouse::new(addr, 1)
+        .with_credentials("flux_test", "flux_test")
+        .with_database(&database)
+        .with_max_queued_bytes(0);
+    let mut rows = BufferedTable::new("INSERT INTO buffered (id) SETTINGS async_insert = 0 VALUES");
+    rows.push(Row { id: 7 });
+    rows.flush(&mut client).unwrap();
+    assert_eq!(rows.len(), 1);
+    client = client.with_max_queued_bytes(1024);
+    client.connect(&mut net);
+
+    let mut failed = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !rows.is_empty() {
+        rows.flush(&mut client).unwrap();
+        net.poll_with(|event| {
+            client.on_event(&event);
+        });
+        let mut outcome = None;
+        client.drive(&mut net, |id, result| {
+            outcome = Some((id, result));
+        });
+        if let Some((id, result)) = outcome {
+            assert!(rows.on_result(id, &result));
+            if failed {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(matches!(result, Err(Error::Server { .. })), "{result:?}");
+                assert_eq!(rows.len(), 1);
+                // Repair the missing table only after observing a real insert failure.
+                http.query("CREATE TABLE buffered (id UInt64) ENGINE = MergeTree ORDER BY id")
+                    .execute()
+                    .await?;
+                rows.push(Row { id: 9 });
+                failed = true;
+            }
+        }
+        thread::yield_now();
+    }
+    assert!(failed && rows.is_empty());
+    assert_eq!(http.query("SELECT id FROM buffered ORDER BY id").fetch_all::<u64>().await?, [7, 9]);
+    client.close(&mut net);
+    http.query(&format!("DROP DATABASE {database}")).execute().await?;
+    Ok(())
+}
