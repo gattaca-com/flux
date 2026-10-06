@@ -1049,40 +1049,63 @@ impl TcpManager {
         self.write_staged(registry, index, tokens)
     }
 
-    /// Plain connected streams write in place; framed, TLS and replaying
-    /// sends stage like `send_with`.
-    pub(crate) fn send_parts(
+    /// Connected non-TLS streams borrow the slices through the socket write.
+    /// TLS, offline replay and large slice lists use the staging buffer.
+    pub(crate) fn send_vectored(
         &mut self,
         registry: &Registry,
         token: Token,
         tokens: &mut Tokens,
-        head: &[u8],
-        body: &[u8],
+        parts: &[IoSlice<'_>],
     ) -> bool {
         let Some(index) = self.sendable_index(token) else {
             return false;
         };
-        let total = head.len() + body.len();
+        let Some(total) = parts.iter().try_fold(0usize, |len, part| len.checked_add(part.len()))
+        else {
+            return false;
+        };
         if total == 0 || total > self.config.max_frame_size {
             return false;
         }
-        let Self { config, connections, .. } = self;
-        let connection = &mut connections[index];
-        if config.framing == Framing::Raw &&
-            config.replay == ReplayPolicy::Drop &&
-            connection.tls.is_none() &&
+        let config = &self.config;
+        let connection = &mut self.connections[index];
+        if connection.tls.is_none() &&
+            (config.framing == Framing::Raw || parts.len() <= 16) &&
             let ConnectionState::Connected(stream) = &mut connection.state
         {
-            let state = stream.write_parts(registry, head, body, config, &mut connection.timers);
-            if state == StreamState::Disconnected {
-                self.disconnect_index(registry, index, true, tokens);
+            let mut header = [0; FRAME_HEADER_SIZE];
+            let mut framed = [IoSlice::new(&[]); 17];
+            let slices = if config.framing == Framing::LengthPrefixed {
+                write_frame_header(&mut header, total, Nanos::now());
+                framed[0] = IoSlice::new(&header);
+                framed[1..=parts.len()].copy_from_slice(parts);
+                &framed[..=parts.len()]
+            } else {
+                parts
+            };
+            let wire_len = if config.framing == Framing::LengthPrefixed {
+                total + FRAME_HEADER_SIZE
+            } else {
+                total
+            };
+            let state =
+                stream.write_vectored(registry, slices, wire_len, config, &mut connection.timers);
+            if state != StreamState::Disconnected {
+                return true;
+            }
+            let retain = connection.kind == ConnectionKind::Outbound &&
+                config.replay == ReplayPolicy::Replay;
+            self.disconnect_index(registry, index, true, tokens);
+            if !retain {
                 return false;
             }
-            return true;
         }
         self.send_with(registry, token, tokens, |out| {
-            out.extend_from_slice(head);
-            out.extend_from_slice(body);
+            out.reserve(total);
+            for part in parts {
+                out.extend_from_slice(part);
+            }
         })
     }
 
@@ -1642,7 +1665,11 @@ impl ByteQueue {
     }
 
     fn append_remainder(&mut self, prefix: &[u8], payload: &[u8]) -> bool {
-        let additional = prefix.len() + payload.len();
+        self.append_vectored(&[IoSlice::new(prefix), IoSlice::new(payload)], 0)
+    }
+
+    fn append_vectored(&mut self, parts: &[IoSlice<'_>], mut written: usize) -> bool {
+        let additional = parts.iter().map(|part| part.len()).sum::<usize>() - written;
         let old_capacity = self.bytes.capacity();
 
         if self.head != 0 && self.bytes.capacity() - self.bytes.len() < additional {
@@ -1653,8 +1680,14 @@ impl ByteQueue {
             self.frame_start = 0;
         }
         self.bytes.reserve(additional);
-        self.bytes.extend_from_slice(prefix);
-        self.bytes.extend_from_slice(payload);
+        for part in parts {
+            if written >= part.len() {
+                written -= part.len();
+                continue;
+            }
+            self.bytes.extend_from_slice(&part[written..]);
+            written = 0;
+        }
         self.queued_since.get_or_insert_with(Instant::now);
         self.bytes.capacity() != old_capacity
     }
@@ -1960,20 +1993,19 @@ impl FramedStream {
         }
     }
 
-    /// Writes `head` then `body` unframed in one vectored write, queueing
-    /// whatever the socket does not take.
-    fn write_parts(
+    /// Framed callers include the header as the first slice.
+    fn write_vectored(
         &mut self,
         registry: &Registry,
-        head: &[u8],
-        body: &[u8],
+        parts: &[IoSlice<'_>],
+        total: usize,
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
     ) -> StreamState {
         let written = if self.send_queue.is_empty() {
-            match self.socket.write_vectored(&[IoSlice::new(head), IoSlice::new(body)]) {
+            match self.socket.write_vectored(parts) {
                 Ok(0) => return StreamState::Disconnected,
-                Ok(written) if written == head.len() + body.len() => return StreamState::Alive,
+                Ok(written) if written == total => return StreamState::Alive,
                 Ok(written) => written,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => 0,
                 Err(err) => {
@@ -1984,13 +2016,16 @@ impl FramedStream {
         } else {
             0
         };
-        let (head, body) = if written < head.len() {
-            (&head[written..], body)
-        } else {
-            (&[][..], &body[written - head.len()..])
-        };
-        self.enqueue(registry, head.len() + body.len(), config, timers, |queue| {
-            queue.append_remainder(head, body)
+        self.enqueue(registry, total - written, config, timers, |queue| {
+            if queue.framed {
+                // Keep the complete partially written frame for reconnect replay.
+                let allocated = queue.append_vectored(parts, 0);
+                queue.frames += 1;
+                queue.consume(written);
+                allocated
+            } else {
+                queue.append_vectored(parts, written)
+            }
         })
     }
 

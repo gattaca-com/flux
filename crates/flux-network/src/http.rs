@@ -46,7 +46,7 @@
 use std::sync::Arc;
 use std::{
     collections::VecDeque,
-    io::{self, Write as _},
+    io::{self, IoSlice, Write as _},
     net::{IpAddr, SocketAddr},
 };
 
@@ -60,6 +60,7 @@ use crate::{Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupCon
 const STACK_HEADERS: usize = 64;
 /// Request head buffers kept for reuse once their request completes.
 const SPARE_HEADS: usize = 64;
+const MAX_BODY_PARTS: usize = 16;
 
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
@@ -786,14 +787,34 @@ impl HttpNetwork {
         body: &[u8],
         retries: u8,
     ) -> Option<RequestId> {
-        if !valid_request(method, path, headers) || body.len() > self.max_body_bytes {
+        self.send_vectored(net, pool, method, path, headers, &[IoSlice::new(body)], retries)
+    }
+    /// Like [`Self::send`], with a body of up to 16 borrowed slices. An idle,
+    /// plain connection writes the request head and body in one syscall;
+    /// queued or retried requests retain a contiguous copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_vectored(
+        &mut self,
+        net: &mut NetworkCore,
+        pool: HttpPool,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[IoSlice<'_>],
+        retries: u8,
+    ) -> Option<RequestId> {
+        if body.len() > MAX_BODY_PARTS || !valid_request(method, path, headers) {
+            return None
+        }
+        let body_len = body.iter().try_fold(0usize, |len, part| len.checked_add(part.len()))?;
+        if body_len > self.max_body_bytes {
             return None
         }
         let p = pool.0 as usize;
         let head_request = method.eq_ignore_ascii_case("HEAD");
         let id = RequestId { pool, seq: self.pools[p].next_seq };
         let mut head = self.spare_heads.pop().unwrap_or_else(|| Vec::with_capacity(512));
-        write_head(&mut head, method, path, headers, &self.pools[p].addr, body.len());
+        write_head(&mut head, method, path, headers, &self.pools[p].addr, body_len);
         if retries == 0 &&
             self.pools[p].queue.is_empty() &&
             let Some(i) = self.write_idle(net, p, &head, body)
@@ -803,14 +824,18 @@ impl HttpNetwork {
             return Some(id)
         }
         let pending = &mut self.pools[p];
-        if pending.queued_bytes + head.len() + body.len() > self.max_queued_bytes {
+        if pending.queued_bytes + head.len() + body_len > self.max_queued_bytes {
             head.clear();
             self.spare_heads.push(head);
             return None
         }
         pending.next_seq += 1;
-        pending.queued_bytes += head.len() + body.len();
-        pending.queue.push_back(Queued { id, head_request, head, body: body.to_vec(), retries });
+        pending.queued_bytes += head.len() + body_len;
+        let mut owned_body = Vec::with_capacity(body_len);
+        for part in body {
+            owned_body.extend_from_slice(part);
+        }
+        pending.queue.push_back(Queued { id, head_request, head, body: owned_body, retries });
         self.dispatch_pool(net, p);
         Some(id)
     }
@@ -821,7 +846,9 @@ impl HttpNetwork {
     }
     fn dispatch_pool(&mut self, net: &mut NetworkCore, p: usize) {
         while let Some(front) = self.pools[p].queue.front() {
-            let Some(i) = self.write_idle(net, p, &front.head, &front.body) else { break };
+            let Some(i) = self.write_idle(net, p, &front.head, &[IoSlice::new(&front.body)]) else {
+                break
+            };
             let queued = self.pools[p].queue.pop_front().unwrap();
             self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
             self.start(i, queued);
@@ -834,14 +861,18 @@ impl HttpNetwork {
         net: &mut NetworkCore,
         p: usize,
         head: &[u8],
-        body: &[u8],
+        body: &[IoSlice<'_>],
     ) -> Option<usize> {
+        let mut parts = [IoSlice::new(&[]); MAX_BODY_PARTS + 1];
+        parts[0] = IoSlice::new(head);
+        parts[1..=body.len()].copy_from_slice(body);
+        let parts = &parts[..=body.len()];
         self.pools[p].tokens.iter().find_map(|&token| {
             let i = self
                 .conns
                 .iter()
                 .position(|c| c.token == token && c.role.outbound_head().is_none())?;
-            net.send_parts(token, head, body).then_some(i)
+            net.send_vectored(token, parts).then_some(i)
         })
     }
     fn start(&mut self, i: usize, queued: Queued) {
