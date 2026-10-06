@@ -123,10 +123,6 @@ impl Scratch {
         &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..self.len]
     }
 
-    /// Decompresses `compressed` into the buffer, which it must fill to
-    /// exactly `len` bytes. Nothing is zeroed first since zstd writes every
-    /// byte it reports, and `len` covers only those, so a later `resize`
-    /// zero-fills whatever zstd did not write.
     fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
         let words = len.div_ceil(LEAF_ALIGN_MAX);
         if words > self.words.len() {

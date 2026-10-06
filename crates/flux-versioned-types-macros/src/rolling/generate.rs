@@ -169,8 +169,6 @@ fn generate_versioned_impls(
     }
 }
 
-/// The leaf as its own single-name family, so `decode_blob_into` decodes a
-/// blob of this name straight into the sink.
 fn leaf_impl(last: &Ident, name_tokens: &TokenStream2) -> TokenStream2 {
     quote! {
         impl ::flux_versioned_types::HasVersionedLeaves for #last {
