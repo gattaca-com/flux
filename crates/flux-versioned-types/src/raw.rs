@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use byte_stable::ByteStable;
-use flux_timing::{InternalMessage, Nanos};
+use flux_timing::{IngestionTime, InternalMessage, Nanos};
 use flux_utils::ArrayStr;
 
 use crate::{
@@ -95,6 +95,7 @@ impl std::error::Error for DecodeError {}
 pub struct Scratch {
     words: Vec<u128>,
     len: usize,
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
 }
 
 impl Scratch {
@@ -120,6 +121,25 @@ impl Scratch {
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
         &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..self.len]
+    }
+
+    fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
+        let words = len.div_ceil(LEAF_ALIGN_MAX);
+        if words > self.words.len() {
+            self.words.resize(words, 0);
+        }
+        if self.decompressor.is_none() {
+            self.decompressor = Some(zstd::bulk::Decompressor::new().map_err(DecodeError::Zstd)?);
+        }
+        let decompressor = self.decompressor.as_mut().expect("created above");
+        let out = &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..len];
+        let written = decompressor.decompress_to_buffer(compressed, out);
+        self.len = written.as_ref().map_or(0, |&n| n.min(len));
+        let written = written.map_err(DecodeError::Zstd)?;
+        if written != len {
+            return Err(DecodeError::LengthMismatch { expected: len, got: written });
+        }
+        Ok(())
     }
 
     /// For buffers that are not 8-aligned, such as `DiskIo` reads.
@@ -230,6 +250,23 @@ impl Blob {
     /// Rebuilt `publish_t` carries sub-millisecond clock noise across hosts;
     /// `ingestion_time().real()` and `tile_id` are exact.
     pub fn decode<U: Versioned, T: Versioned>(&self, scratch: &mut Scratch) -> Decoded<U, T> {
+        let mut msgs = Vec::new();
+        let meta = self.decode_into::<U, T, _>(scratch, |msg| {
+            if msgs.capacity() == 0 {
+                msgs.reserve_exact(self.header.n_messages as usize);
+            }
+            msgs.push(msg);
+        })?;
+        Ok((meta, msgs))
+    }
+
+    /// [`decode`](Self::decode), handing each message to `f` as it decodes.
+    /// Nothing reaches `f` on error.
+    pub fn decode_into<U: Versioned, T: Versioned, F: FnMut(InternalMessage<T>)>(
+        &self,
+        scratch: &mut Scratch,
+        mut f: F,
+    ) -> Result<U, DecodeError> {
         if !self.is::<T>() {
             return Err(DecodeError::UnknownTypeHash(self.header.type_hash));
         }
@@ -250,26 +287,19 @@ impl Blob {
                 got: usize::try_from(self.header.decompressed_len).unwrap_or(usize::MAX),
             });
         }
-        let expected_len = expected as usize;
-        scratch.resize(expected_len);
-        let written = zstd::bulk::decompress_to_buffer(self.compressed(), scratch.as_mut_bytes())
-            .map_err(DecodeError::Zstd)?;
-        if written != expected_len {
-            return Err(DecodeError::LengthMismatch { expected: expected_len, got: written });
-        }
+        scratch.decompress(self.compressed(), expected as usize)?;
         let bytes = scratch.as_bytes();
         let (ts_bytes, rest) = bytes.split_at(ts_len as usize);
         let leaf_bytes = &rest[leaf_off as usize - ts_len as usize..];
         let stamps = ref_timestamps(ts_bytes, n as usize)?;
-        let leaves = T::decode_versions(self.header.type_hash, leaf_bytes, n as usize)?;
-        Ok((
-            meta,
-            stamps
-                .iter()
-                .zip(leaves)
-                .map(|(stamp, leaf)| InternalMessage::new(stamp.to_tracking_timestamp(), leaf))
-                .collect(),
-        ))
+        let mut stamps = stamps.iter();
+        let now = IngestionTime::now();
+        T::decode_versions_each(self.header.type_hash, leaf_bytes, n as usize, |leaf| {
+            if let Some(stamp) = stamps.next() {
+                f(InternalMessage::new(stamp.to_tracking_timestamp_at(now), leaf));
+            }
+        })?;
+        Ok(meta)
     }
 }
 

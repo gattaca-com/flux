@@ -46,6 +46,12 @@ impl IngestionTime {
     }
 
     #[inline]
+    pub fn from_real_at(real: Nanos, now: Self) -> Self {
+        // Another host's clock can sit slightly ahead of ours.
+        Self { internal: now.internal - Duration::from(now.real.saturating_sub(real)), real }
+    }
+
+    #[inline]
     pub fn internal(&self) -> Instant {
         self.internal
     }
@@ -87,8 +93,6 @@ impl From<IngestionTime> for Nanos {
 impl From<Nanos> for IngestionTime {
     #[inline]
     fn from(value: Nanos) -> Self {
-        let curt = Instant::now();
-        // Another host's clock can sit slightly ahead of ours.
-        Self { internal: curt - Duration::from(value.elapsed_saturating()), real: value }
+        Self::from_real_at(value, Self::now())
     }
 }

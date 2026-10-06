@@ -898,6 +898,15 @@ impl NetworkCore {
             GroupState::Udp(udp) => udp.clear_backlog(token),
         }
     }
+    /// Bytes accepted for `token` that have not reached its socket yet,
+    /// including a disconnected endpoint's backlog. UDP groups report 0.
+    pub fn queued_bytes(&self, token: Token) -> usize {
+        let Some(group) = self.tokens.groups.get(&token).copied() else { return 0 };
+        match &self.groups[group.0] {
+            GroupState::Tcp(tcp) => tcp.queued_bytes(token),
+            GroupState::Udp(_) => 0,
+        }
+    }
     pub fn currently_disconnected(&self) -> impl Iterator<Item = Token> + '_ {
         self.groups
             .iter()

@@ -33,10 +33,12 @@ impl Kept<'_> {
     fn decode_step(&self) -> Tokens {
         let (v, ty) = (self.variant, self.ty);
         quote! {
-            if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob::<U>(blob, scratch) {
-                return Some(found.map(|(meta, msgs): (U, Vec<_>)| {
-                    (meta, msgs.into_iter().map(|m| m.map(Self::#v)).collect())
-                }));
+            if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob_into::<U, _>(
+                blob,
+                scratch,
+                |msg| f(msg.map(Self::#v)),
+            ) {
+                return Some(found);
             }
         }
     }
@@ -151,6 +153,26 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
                 blob: &::flux_versioned_types::Blob,
                 scratch: &mut ::flux_versioned_types::Scratch,
             ) -> Option<::flux_versioned_types::Decoded<U, Self>> {
+                let mut msgs = ::std::vec::Vec::new();
+                let meta = <Self as ::flux_versioned_types::HasVersionedLeaves>::decode_blob_into::<
+                    U,
+                    _,
+                >(blob, scratch, |msg| {
+                    if msgs.capacity() == 0 {
+                        msgs.reserve_exact(blob.header.n_messages as usize);
+                    }
+                    msgs.push(msg);
+                })?;
+                Some(meta.map(|meta| (meta, msgs)))
+            }
+            fn decode_blob_into<
+                U: ::flux_versioned_types::Versioned,
+                F: FnMut(::flux::timing::InternalMessage<Self>),
+            >(
+                blob: &::flux_versioned_types::Blob,
+                scratch: &mut ::flux_versioned_types::Scratch,
+                mut f: F,
+            ) -> Option<::core::result::Result<U, ::flux_versioned_types::DecodeError>> {
                 #(#decode_steps)*
                 None
             }
