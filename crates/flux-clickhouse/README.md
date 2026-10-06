@@ -5,7 +5,7 @@ Optional features add HTTP helpers, embedded migrations, and a migration CLI.
 
 | Feature | API |
 | --- | --- |
-| Default | `ClickHouse`, `BufferedTable`, `rowbinary` |
+| Default | `ClickHouse`, `BufferedTable`, `buffered_batch!`, `rowbinary` |
 | `http` | `http::insert_rows` using `clickhouse::Client` |
 | `migrations` | `migrations::MigrationSet`, `migrations::rollback`; enables `http` |
 | `cli` | `migrations::run_cli`; enables `migrations` |
@@ -72,6 +72,35 @@ Queue refusal and request failure delay retries for two seconds.
 Encoding failure drops only the invalid row and returns the error to the caller.
 Retries can duplicate committed rows after a lost response. Pending rows have no
 size limit; the application owns ingestion limits and shutdown draining.
+
+`buffered_batch!` groups different row types without changing each table's settings:
+
+```rust,ignore
+flux_clickhouse::buffered_batch! {
+    pub struct TelemetryBatch {
+        pub events: EventRow,
+        pub health: HealthRow,
+    }
+}
+
+let mut batch = TelemetryBatch {
+    events: flux_clickhouse::BufferedTable::new(events_sql).with_max_rows_per_batch(1_000),
+    health: flux_clickhouse::BufferedTable::new(health_sql).with_max_rows_per_batch(100),
+};
+batch.events.push(event);
+batch.flush(&mut client, |field, error| eprintln!("{field}: {error}"));
+client.drive(&mut network, |id, result| {
+    if let Some(field) = batch.on_result(id, &result) {
+        if let Err(error) = result {
+            eprintln!("{field}: {error:?}");
+        }
+    }
+});
+```
+
+`flush` attempts every table and reports encoding errors through the callback.
+`on_result` returns the matching field name. `is_empty` includes rows still in flight.
+Use the same client for all tables in a batch.
 
 `http::insert_rows(&client, table, &rows).await` writes owned rows without copying
 them. Empty batches make no request. HTTP timeouts, retry, and discard policies

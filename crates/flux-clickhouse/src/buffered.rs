@@ -98,3 +98,47 @@ impl<T: Serialize> BufferedTable<T> {
         true
     }
 }
+
+/// Define a named group of typed `BufferedTable` fields.
+///
+/// Initialize the fields with configured tables using a struct literal. `flush`
+/// calls the error handler with the field name and encoding error, then
+/// continues to the remaining tables. `on_result` returns the matching field
+/// name.
+#[macro_export]
+macro_rules! buffered_batch {
+    ($vis:vis struct $name:ident {
+        $($field_vis:vis $field:ident: $row:ty),+ $(,)?
+    }) => {
+        $vis struct $name {
+            $($field_vis $field: $crate::BufferedTable<$row>,)+
+        }
+
+        impl $name {
+            $vis fn is_empty(&self) -> bool {
+                true $(&& self.$field.is_empty())+
+            }
+
+            $vis fn flush(
+                &mut self,
+                client: &mut $crate::ClickHouse,
+                mut on_error: impl ::core::ops::FnMut(&'static str, $crate::rowbinary::Error),
+            ) {
+                $(if let ::core::result::Result::Err(error) = self.$field.flush(client) {
+                    on_error(stringify!($field), error);
+                })+
+            }
+
+            $vis fn on_result(
+                &mut self,
+                id: $crate::QueryId,
+                result: &::core::result::Result<$crate::Output, $crate::Error>,
+            ) -> ::core::option::Option<&'static str> {
+                $(if self.$field.on_result(id, result) {
+                    return ::core::option::Option::Some(stringify!($field));
+                })+
+                ::core::option::Option::None
+            }
+        }
+    };
+}
