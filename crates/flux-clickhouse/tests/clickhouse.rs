@@ -427,3 +427,98 @@ fn timeouts_budgets_and_recovery() {
     assert_eq!(outcomes[2].1, Ok(Output::default()));
     assert_eq!(seen.iter().filter(|msg| **msg == hello).count(), 3);
 }
+
+#[cfg(feature = "http")]
+#[tokio::test]
+#[ignore = "requires FLUX_CLICKHOUSE_TEST_URL and FLUX_CLICKHOUSE_TEST_ADDR for a disposable local server"]
+async fn buffered_rows_survive_refusal_and_retry() -> clickhouse::error::Result<()> {
+    use flux_clickhouse::BufferedTable;
+
+    #[derive(serde::Serialize)]
+    struct Row {
+        id: u64,
+    }
+
+    flux_clickhouse::buffered_batch! {
+        struct Batch {
+            invalid: char,
+            rows: Row,
+        }
+    }
+
+    let http = clickhouse::Client::default()
+        .with_url(std::env::var("FLUX_CLICKHOUSE_TEST_URL").expect("local HTTP URL"))
+        .with_user("flux_test")
+        .with_password("flux_test");
+    let database = format!("flux_buffered_test_{}", std::process::id());
+    http.query(&format!("CREATE DATABASE {database}")).execute().await?;
+    let http = http.with_database(&database);
+    let addr =
+        std::env::var("FLUX_CLICKHOUSE_TEST_ADDR").expect("local native address").parse().unwrap();
+    let mut net = Network::default();
+    let mut client = ClickHouse::new(addr, 1)
+        .with_credentials("flux_test", "flux_test")
+        .with_database(&database)
+        .with_max_queued_bytes(0);
+    let mut batch = Batch {
+        invalid: BufferedTable::new("INSERT INTO invalid (value) VALUES"),
+        rows: BufferedTable::new("INSERT INTO buffered (id) SETTINGS async_insert = 0 VALUES")
+            .with_max_rows_per_batch(1),
+    };
+    batch.rows.push(Row { id: 7 });
+    batch.flush(&mut client, |field, error| panic!("{field}: {error}"));
+    assert_eq!(batch.rows.len(), 1);
+    client = client.with_max_queued_bytes(1024);
+    client.connect(&mut net);
+
+    let mut failed = false;
+    let mut successful_batches = 0;
+    let mut encoding_failed = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && successful_batches < 3 {
+        if successful_batches == 2 && !encoding_failed {
+            batch.invalid.push('x');
+            batch.rows.push(Row { id: 11 });
+        }
+        // After the encoding error, only poll: a skipped table cannot recover on a
+        // later flush.
+        if !encoding_failed {
+            batch.flush(&mut client, |field, _| {
+                assert_eq!(field, "invalid");
+                encoding_failed = true;
+            });
+        }
+        net.poll_with(|event| {
+            client.on_event(&event);
+        });
+        let mut outcome = None;
+        client.drive(&mut net, |id, result| {
+            outcome = Some((id, result));
+        });
+        if let Some((id, result)) = outcome {
+            assert_eq!(batch.on_result(id, &result), Some("rows"));
+            if failed {
+                assert!(result.is_ok(), "{result:?}");
+                successful_batches += 1;
+            } else {
+                assert!(matches!(result, Err(Error::Server { .. })), "{result:?}");
+                assert_eq!(batch.rows.len(), 1);
+                // Repair the missing table only after observing a real insert failure.
+                http.query("CREATE TABLE buffered (id UInt64) ENGINE = MergeTree ORDER BY id")
+                    .execute()
+                    .await?;
+                batch.rows.push(Row { id: 9 });
+                failed = true;
+            }
+        }
+        thread::yield_now();
+    }
+    assert!(failed && encoding_failed && batch.is_empty());
+    assert_eq!(successful_batches, 3);
+    assert_eq!(http.query("SELECT id FROM buffered ORDER BY id").fetch_all::<u64>().await?, [
+        7, 9, 11
+    ]);
+    client.close(&mut net);
+    http.query(&format!("DROP DATABASE {database}")).execute().await?;
+    Ok(())
+}
