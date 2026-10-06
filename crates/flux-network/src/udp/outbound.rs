@@ -1,12 +1,15 @@
-//! The sending half of a peer: messages queued, cut into packets, kept until
-//! acked, and sent again when the receiver's acks show a hole or go quiet.
+//! The sending half of a peer: record streams queued, cut into packets, kept
+//! until acked, and sent again when the receiver's acks show a hole or go
+//! quiet.
 //!
-//! A packet is built once and sent byte for byte the same every time, so the
-//! receiver tells copies apart by sequence alone. Packets `[base, next_send)`
-//! have been handed to the kernel at least once; `[next_send, next)` are
-//! built and waiting for socket room. Message bytes live in the
-//! [`MessageStore`], shared by every peer sending them, and a message's
-//! packets reference it until the last of them is acked.
+//! A stream is one or more messages serialised back to back, each behind its
+//! wire header, so a packet is a span of it. A packet is built once and sent
+//! byte for byte the same every time, so the receiver tells copies apart by
+//! sequence alone. Packets `[base, next_send)` have been handed to the kernel
+//! at least once; `[next_send, next)` are built and waiting for socket room.
+//! Stream bytes live in the [`MessageStore`], shared by every peer sending
+//! them, and a stream's packets reference it until the last of them is
+//! acked.
 
 use std::collections::VecDeque;
 
@@ -16,7 +19,7 @@ use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
 
 use super::{
     sys::{SendBatch, SockAddr},
-    wire::{self, FRAGMENT_HEADER, MAX_RECORD, PACKET_HEADER, WHOLE_HEADER},
+    wire::{self, LONG_HEADER, PACKET_HEADER, PADDING},
 };
 use crate::{NetworkTelemetry, network::UdpGroupConfig};
 
@@ -28,7 +31,8 @@ const MAX_RECOVER: u64 = 64;
 /// reordered: one flow does not reorder that far, while the reorder window
 /// grows with queueing delay.
 const FAST_RETRANSMIT_GAP: u64 = 64;
-/// Record slots per packet of window; small messages pack many per packet.
+/// Slice slots per packet of window: a packet holds spans of the streams
+/// that meet in it.
 const RECORDS_PER_PACKET: usize = 4;
 
 /// Serialised messages shared by every peer that still has packets of them
@@ -159,39 +163,87 @@ impl Rto {
     }
 }
 
-/// A message this peer holds a store reference on.
+/// A stream this peer holds a store reference on.
 struct Message {
     slot: u32,
-    id: u32,
     first_packet: u64,
     last_packet: u64,
 }
 
-/// One record of a packet: a byte range of a stored message.
+/// One piece of a packet: a span of a stored stream.
 #[derive(Clone, Copy, Default)]
 struct Slice {
     slot: u32,
-    message: u32,
     offset: u32,
     len: u16,
-    /// The whole message; sent without fragment metadata.
-    whole: bool,
+    /// 1 + offset within the span of the first record header; 0 without one.
+    start: u16,
 }
 
-impl Slice {
+/// Record boundaries of a stream, walked forward as it is cut into packets.
+struct Records<'a> {
+    stream: &'a [u8],
+    start: usize,
+    header: usize,
+    body: usize,
+}
+
+impl<'a> Records<'a> {
+    fn new(stream: &'a [u8]) -> Self {
+        let (header, body) = wire::record_len(stream);
+        Self { stream, start: 0, header, body }
+    }
+
     #[inline]
-    fn wire_len(&self) -> usize {
-        usize::from(self.len) + if self.whole { WHOLE_HEADER } else { FRAGMENT_HEADER }
+    fn end(&self) -> usize {
+        self.start + self.header + self.body
+    }
+
+    fn next(&mut self) {
+        self.start = self.end();
+        (self.header, self.body) = wire::record_len(&self.stream[self.start..]);
+    }
+
+    /// Where to end a span starting at `pos` that may run to `want`: never
+    /// inside a record header or right after one, so such an end moves back
+    /// to the header. Also the first record start inside the span.
+    fn cut(&mut self, pos: usize, want: usize) -> (usize, Option<usize>) {
+        while self.end() <= pos && self.end() < self.stream.len() {
+            self.next();
+        }
+        let mut first = None;
+        let mut end = want;
+        loop {
+            let (rs, re) = (self.start, self.end());
+            if rs >= pos && rs < end {
+                first.get_or_insert(rs);
+            }
+            let past_header = rs + self.header + usize::from(self.body > 0);
+            if end > rs && end < past_header {
+                end = rs;
+                if first == Some(rs) {
+                    first = None;
+                }
+                break;
+            }
+            if end <= re || re >= self.stream.len() {
+                break;
+            }
+            self.next();
+        }
+        (end, first)
     }
 }
 
 #[derive(Clone, Copy)]
 struct Packet {
-    /// Index of its first record in the slice ring.
+    /// Index of its first slice in the slice ring.
     records: u32,
     count: u16,
     /// Size on the wire, padding included.
     bytes: u16,
+    /// 1 + payload offset of the first message header; 0 without one.
+    start: u16,
     pad: u8,
     retries: u8,
     /// Staged into a batch whose result is not in yet.
@@ -206,6 +258,7 @@ impl Default for Packet {
             records: 0,
             count: 0,
             bytes: 0,
+            start: 0,
             pad: 0,
             retries: 0,
             staged: false,
@@ -215,14 +268,9 @@ impl Default for Packet {
     }
 }
 
-/// Why a message could not be queued.
+/// No room in the send window for the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Full {
-    /// Larger than `max_message_size`; the peer is unaffected.
-    TooLarge,
-    /// No room in the send window.
-    Window,
-}
+pub(crate) struct WindowFull;
 
 /// What an ack told the sender.
 pub(crate) struct Acked {
@@ -233,7 +281,6 @@ pub(crate) struct Acked {
 
 pub(crate) struct Outbound {
     datagram_size: usize,
-    max_message_size: usize,
     packets: Box<[Packet]>,
     acked: Box<[u64]>,
     mask: u64,
@@ -249,7 +296,6 @@ pub(crate) struct Outbound {
     slice_mask: u32,
     slice_next: u32,
     messages: VecDeque<Message>,
-    next_id: u32,
     /// Highest sequence the receiver has ever acked. Unacked sequences below
     /// it are holes the receiver has moved past; above it, silence proves
     /// nothing (they may be queued behind a slow link).
@@ -275,7 +321,6 @@ impl Outbound {
         let slice_capacity = capacity * RECORDS_PER_PACKET;
         Self {
             datagram_size: udp.max_datagram_size,
-            max_message_size: udp.max_message_size,
             packets: vec![Packet::default(); capacity].into_boxed_slice(),
             acked: vec![0; capacity.div_ceil(u64::BITS as usize)].into_boxed_slice(),
             mask: capacity as u64 - 1,
@@ -287,7 +332,6 @@ impl Outbound {
             slice_mask: slice_capacity as u32 - 1,
             slice_next: 0,
             messages: VecDeque::new(),
-            next_id: 0,
             highest_acked: None,
             last_ack_at: Instant::ZERO,
             recover: 1,
@@ -382,62 +426,59 @@ impl Outbound {
         self.slices[(self.slice_next & self.slice_mask) as usize] = slice;
         self.slice_next = self.slice_next.wrapping_add(1);
         let packet = self.packet_mut(seq);
+        if slice.start != 0 && packet.start == 0 {
+            packet.start = packet.bytes - PACKET_HEADER as u16 + slice.start;
+        }
         packet.count += 1;
-        packet.bytes += slice.wire_len() as u16;
+        packet.bytes += slice.len;
     }
 
-    /// Queues the message in store `slot`, cutting it into packets behind
+    /// Queues the stream in store `slot`, cutting it into packets behind
     /// whatever is already queued, and takes a reference on it.
-    pub(crate) fn enqueue(&mut self, store: &mut MessageStore, slot: u32) -> Result<(), Full> {
-        let len = store.bytes(slot).len();
-        if len > self.max_message_size {
-            return Err(Full::TooLarge);
-        }
-        let room = self.datagram_size - PACKET_HEADER - FRAGMENT_HEADER;
-        // A sliver in the open packet, full packets, a sliver at the end.
+    pub(crate) fn enqueue(
+        &mut self,
+        store: &mut MessageStore,
+        slot: u32,
+    ) -> Result<(), WindowFull> {
+        let stream = store.bytes(slot);
+        let len = stream.len();
+        // A sliver in the open packet, full packets, a sliver at the end;
+        // a cut moved back before a header wastes at most a header.
+        let room = self.datagram_size - PACKET_HEADER - LONG_HEADER;
         let packets = (len / room + 2) as u64;
         if packets > self.free_packets() || packets > u64::from(self.free_slices()) {
-            return Err(Full::Window);
+            return Err(WindowFull);
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        let mut offset = 0usize;
+        let mut records = Records::new(stream);
+        let mut pos = 0usize;
         let mut first_packet = None;
         loop {
             let seq = if self.open { self.next - 1 } else { self.open_packet() };
             let space = self.datagram_size - usize::from(self.packet(seq).bytes);
-            let remaining = len - offset;
-            if offset == 0 && WHOLE_HEADER + remaining <= space && remaining <= MAX_RECORD {
-                let slice =
-                    Slice { slot, message: id, offset: 0, len: remaining as u16, whole: true };
-                self.push_slice(seq, slice);
-                first_packet.get_or_insert(seq);
-                offset = len;
-            } else if space > FRAGMENT_HEADER {
-                let n = remaining.min(space - FRAGMENT_HEADER).min(MAX_RECORD);
-                let slice =
-                    Slice { slot, message: id, offset: offset as u32, len: n as u16, whole: false };
-                self.push_slice(seq, slice);
-                first_packet.get_or_insert(seq);
-                offset += n;
-            } else {
-                // Too little room for a fragment: pad the packet full so it
-                // still segments with its neighbours.
+            let (end, start) = records.cut(pos, (pos + space).min(len));
+            if end == pos {
+                // Not even a header and a byte fit: pad the packet full so
+                // it still segments with its neighbours.
                 let packet = self.packet_mut(seq);
                 packet.pad = space as u8;
                 packet.bytes += space as u16;
+            } else {
+                let start = start.map_or(0, |s| (s - pos + 1) as u16);
+                let slice = Slice { slot, offset: pos as u32, len: (end - pos) as u16, start };
+                self.push_slice(seq, slice);
+                first_packet.get_or_insert(seq);
+                pos = end;
             }
             if usize::from(self.packet(seq).bytes) == self.datagram_size {
                 self.open = false;
             }
-            if offset == len {
+            if pos == len {
                 break;
             }
         }
         store.add_ref(slot);
         self.messages.push_back(Message {
             slot,
-            id,
             first_packet: first_packet.unwrap(),
             last_packet: self.next - 1,
         });
@@ -473,7 +514,7 @@ impl Outbound {
         }
     }
 
-    /// Drops every message none of whose bytes has been handed to the
+    /// Drops every stream none of whose bytes has been handed to the
     /// kernel, keeping the ones already partly on the wire. Returns how many.
     pub(crate) fn clear_unsent(&mut self, store: &mut MessageStore) -> usize {
         let mut dropped = 0;
@@ -488,13 +529,17 @@ impl Outbound {
             let packet = *self.packet(seq);
             let mut count = 0;
             let mut bytes = PACKET_HEADER;
+            let mut start = 0;
             for i in 0..packet.count {
                 let slice =
                     self.slices[((packet.records + u32::from(i)) & self.slice_mask) as usize];
-                if slice.message == m.id {
+                if slice.slot == m.slot {
                     break;
                 }
-                bytes += slice.wire_len();
+                if slice.start != 0 && start == 0 {
+                    start = bytes - PACKET_HEADER + usize::from(slice.start);
+                }
+                bytes += usize::from(slice.len);
                 count += 1;
             }
             self.slice_next = packet.records.wrapping_add(count);
@@ -505,6 +550,7 @@ impl Outbound {
                 let packet = self.packet_mut(seq);
                 packet.count = count as u16;
                 packet.bytes = bytes as u16;
+                packet.start = start as u16;
                 packet.pad = 0;
                 self.next = seq + 1;
                 self.open = true;
@@ -721,25 +767,15 @@ impl Outbound {
         let packet = *packet;
         batch.open(to);
         let mut header = [0; PACKET_HEADER];
-        wire::packet_header(&mut header, session, seq, packet.send_ts.0, packet.count);
+        wire::packet_header(&mut header, session, seq, packet.send_ts.0, packet.start);
         batch.copy(&header);
         for i in 0..packet.count {
             let slice = self.slices[((packet.records + u32::from(i)) & self.slice_mask) as usize];
             let bytes = store.bytes(slice.slot);
-            let len = usize::from(slice.len);
-            if slice.whole {
-                let mut h = [0; WHOLE_HEADER];
-                wire::whole_header(&mut h, len);
-                batch.copy(&h);
-            } else {
-                let mut h = [0; FRAGMENT_HEADER];
-                wire::fragment_header(&mut h, len, slice.message, slice.offset, bytes.len() as u32);
-                batch.copy(&h);
-            }
-            batch.payload(&bytes[slice.offset as usize..][..len]);
+            batch.payload(&bytes[slice.offset as usize..][..usize::from(slice.len)]);
         }
         if packet.pad != 0 {
-            batch.copy(&[0; FRAGMENT_HEADER][..usize::from(packet.pad)]);
+            batch.copy(&PADDING[..usize::from(packet.pad)]);
         }
         batch.close();
         self.staged.push(seq);

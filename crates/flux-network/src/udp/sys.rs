@@ -119,8 +119,9 @@ fn sendmmsg(fd: RawFd, hdrs: &mut [MMsgHdr]) -> libc::c_int {
 }
 
 /// Shortest run of equal-size datagrams to one destination sent as one
-/// `UDP_SEGMENT` entry; shorter runs go out as plain datagrams.
-const GSO_MIN_SEGMENTS: usize = 4;
+/// `UDP_SEGMENT` entry; a lone datagram goes out plain. Even a pair is one
+/// skb through the stack, which a 2 KiB broadcast is made of per receiver.
+const GSO_MIN_SEGMENTS: usize = 2;
 /// `UDP_MAX_SEGMENTS` of the first kernels with `UDP_SEGMENT`.
 const GSO_MAX_SEGMENTS: usize = 64;
 /// Most iovecs one `sendmsg` accepts.
@@ -321,7 +322,11 @@ impl SendBatch {
             let mut iov_len = first.iov_len;
             while gso && e < self.datagrams.len() {
                 let next = self.datagrams[e];
+                // Only the last of a run may differ in size, and only by
+                // being shorter: the kernel cuts the whole entry at the
+                // first datagram's size.
                 if next.addr != first.addr ||
+                    next.bytes > first.bytes ||
                     self.datagrams[e - 1].bytes != first.bytes ||
                     iov_len + next.iov_len > UIO_MAXIOV as u32
                 {
@@ -719,6 +724,34 @@ mod tests {
             let n = receivers[i % 2].recv(&mut buf).unwrap();
             assert_eq!(buf[0], b'h');
             assert_eq!(&buf[1..n], *payload);
+        }
+    }
+
+    /// A short datagram followed by a full one must not become one
+    /// segmented entry: the kernel would cut the full one at the short size.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_short_datagram_never_leads_a_segmented_run() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let to = SockAddr::new(receiver.local_addr().unwrap());
+        let mut batch = SendBatch::new(1200);
+        if !offload_available(batch.enable_gso(sender.as_raw_fd())) {
+            return;
+        }
+        let short = [1u8; 300];
+        let full = [2u8; 1200];
+        let expect = [
+            build(&mut batch, &to, &[], &short),
+            build(&mut batch, &to, &[], &full),
+            build(&mut batch, &to, &[], &full),
+        ];
+        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 3);
+        let mut buf = [0; 1500];
+        for e in &expect {
+            let n = receiver.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], e.as_slice());
         }
     }
 

@@ -12,7 +12,7 @@ use flux_network::{Network, NetworkEvent, ReplayPolicy, UdpConfig, UdpGroupConfi
 use mio::Token;
 
 /// Message bytes a 1200-byte packet carries in one fragment.
-const STRIDE: usize = 1200 - 25 - 14;
+const STRIDE: usize = 1200 - 25 - 2;
 
 fn free_addr() -> SocketAddr {
     UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap()

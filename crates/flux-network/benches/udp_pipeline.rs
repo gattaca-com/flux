@@ -1,9 +1,11 @@
 //! Sender and receiver on separate pinned threads, TCP vs reliable UDP.
 //!
-//! Traffic crosses a veth pair instead of loopback. Loopback hands a GSO
-//! buffer to the receiver whole, which hides every per-segment cost; the pair
-//! segments in software on transmit and runs real GRO on receive, like a NIC
-//! without UDP segmentation offload. The bench creates the pair itself and
+//! Traffic crosses a veth pair instead of loopback, with UDP segmentation
+//! and TCP segmentation offload on and GRO on, like a NIC that offloads
+//! both: a segmented send is one skb through the stack and the receiver gets
+//! coalesced buffers, so the per-datagram cost on the wire path is what the
+//! kernel charges, not software segmentation. The bench creates the pair
+//! itself and
 //! removes it when it exits, including on panic or Ctrl-C. It needs `ip`,
 //! `ethtool` and `sudo`. Outside the pair it touches two things for the run
 //! and undoes both afterwards: the `local` routing rule moves from priority 0
@@ -36,6 +38,12 @@
 //! - `many`: batches of small or few-KiB messages per `send_many_with` or
 //!   `broadcast_many_with` call, against the same batch as a loop of single
 //!   sends, reporting the time spent in the call as well.
+//! - `packed`: the grouped call against the caller packing the batch into one
+//!   length-prefixed message of up to 64 KiB and sending that; the receiver
+//!   unpacks it. Packing time counts as send time.
+//! - `fanout`: one 1 KiB message, a single datagram, paced to 4, 8 and 16
+//!   receivers, and 20 of them per grouped call: send-call and one-way latency
+//!   per receiver count.
 //!
 //! Run with `cargo bench -p flux-network --bench udp_pipeline`.
 
@@ -166,7 +174,7 @@ impl Link {
                 VETH_MAC[1 - i]
             ));
             steps.push(format!("sysctl -q -w net.ipv4.conf.{dev}.accept_local=1"));
-            steps.push(format!("ethtool -K {dev} tx-udp-segmentation off tso off gro on"));
+            steps.push(format!("ethtool -K {dev} tx-udp-segmentation on tso on gro on"));
             if has_iptables() {
                 steps.push(format!("iptables -I INPUT 1 -i {dev} -j ACCEPT"));
             }
@@ -247,6 +255,13 @@ fn pin(index_from_end: usize) {
     if ids.len() > index_from_end {
         core_affinity::set_for_current(ids[ids.len() - 1 - index_from_end]);
     }
+}
+
+/// Whether a scenario section runs: all but `profile` unless `SCENARIOS`
+/// lists some, comma separated, e.g. `SCENARIOS=bcast,many`.
+fn wanted(section: &str) -> bool {
+    std::env::var("SCENARIOS")
+        .map_or(section != "profile", |list| list.split(',').any(|s| s == section))
 }
 
 fn udp_config() -> UdpConfig {
@@ -402,68 +417,141 @@ struct Scenario {
     window: usize,
     /// Messages per send step.
     batch: usize,
-    /// Send a batch with one `send_many_with` or `broadcast_many_with` call
-    /// rather than one `send_with` or `broadcast_with` call per message.
-    grouped: bool,
+    mode: Mode,
+}
+
+/// How a batch is sent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// One `send_with` or `broadcast_with` call per message.
+    Loop,
+    /// One `send_many_with` or `broadcast_many_with` call.
+    Grouped,
+    /// One message holding the batch as `[len u16][bytes]` records, which
+    /// the receiver unpacks.
+    Packed,
+}
+
+/// One send step of `run`: the batch in `msgs`, the way `mode` says.
+fn send_batch(
+    server: &mut Network,
+    group: Group,
+    accepted: &[mio::Token],
+    msgs: &[Vec<u8>],
+    mode: Mode,
+    packed: &mut Vec<u8>,
+) {
+    match (mode, accepted.len()) {
+        (Mode::Loop, _) => {
+            for m in msgs {
+                server.broadcast_with(group, |b| b.extend_from_slice(m));
+            }
+        }
+        (Mode::Grouped, 1) => {
+            server.send_many_with(accepted[0], msgs, |b, m| b.extend_from_slice(m));
+        }
+        (Mode::Grouped, _) => {
+            server.broadcast_many_with(group, msgs, |b, m| b.extend_from_slice(m));
+        }
+        (Mode::Packed, clients) => {
+            packed.clear();
+            for m in msgs {
+                packed.extend_from_slice(&(m.len() as u16).to_le_bytes());
+                packed.extend_from_slice(m);
+            }
+            if clients == 1 {
+                server.send_with(accepted[0], |b| b.extend_from_slice(packed));
+            } else {
+                server.broadcast_with(group, |b| b.extend_from_slice(packed));
+            }
+        }
+    }
+}
+
+type Shared = (Arc<AtomicBool>, Arc<AtomicUsize>, Arc<AtomicUsize>, mpsc::Sender<()>);
+
+/// Receiver `i`: polls until `count` messages are in, recording one-way
+/// latencies, and reports progress through `shared`.
+fn receive(mut r: Network, i: usize, count: usize, mode: Mode, shared: Shared) -> Vec<u64> {
+    let (stop, got, ready, done_tx) = shared;
+    pin(1 + i);
+    let mut lat = Vec::with_capacity(count);
+    r.poll_with(|_| {});
+    ready.fetch_add(1, Ordering::Release);
+    while lat.len() < count && !stop.load(Ordering::Relaxed) {
+        let before = lat.len();
+        r.poll_with(|e| {
+            if let NetworkEvent::Message { send_ts, payload, .. } = e {
+                let latency = Nanos::now().0.saturating_sub(send_ts.0);
+                if mode == Mode::Packed {
+                    let mut at = 0;
+                    while at < payload.len() {
+                        let n = u16::from_le_bytes([payload[at], payload[at + 1]]);
+                        at += 2 + usize::from(n);
+                        lat.push(latency);
+                    }
+                } else {
+                    lat.push(latency);
+                }
+            }
+        });
+        got.fetch_add(lat.len() - before, Ordering::Relaxed);
+    }
+    let _ = done_tx.send(());
+    lat
 }
 
 /// Sends `count` messages from the server while the receiver thread counts
 /// them and records one-way latency.
 fn run(sc: Scenario) -> Stats {
-    let Scenario { transport, listen, dial, clients, sizes, count, pace, window, batch, grouped } =
-        sc;
+    let Scenario { transport, listen, dial, clients, sizes, count, pace, window, batch, mode } = sc;
     assert!(count.is_multiple_of(batch));
     let (mut server, server_group, receivers, accepted) =
         connect(&transport, listen, dial, clients);
     let span = sizes.end() - sizes.start() + 1;
     let msgs: Vec<Vec<u8>> = (0..batch).map(|j| vec![0x5Au8; sizes.start() + j % span]).collect();
     let bytes = count / batch * clients * msgs.iter().map(Vec::len).sum::<usize>();
-    let mut send_ns = Vec::with_capacity(if batch == 1 { 0 } else { count / batch });
+    let mut send_ns = Vec::with_capacity(count / batch);
     let stop = Arc::new(AtomicBool::new(false));
     let got = Arc::new(AtomicUsize::new(0));
-    // Set once the receiver is pinned and polling, so the first burst does
-    // not sit in the socket buffer long enough to trip the initial RTO.
-    let ready = Arc::new(AtomicBool::new(false));
+    // Counts receivers pinned and polling, so the first burst does not sit
+    // in a socket buffer long enough to trip the initial RTO.
+    let ready = Arc::new(AtomicUsize::new(0));
     let (done_tx, done_rx) = mpsc::channel();
-    let expected = count * clients;
-    let rx_thread = {
-        let stop = stop.clone();
-        let got = got.clone();
-        let ready = ready.clone();
-        let mut receivers = receivers;
-        thread::spawn(move || {
-            pin(0);
-            let mut lat = Vec::with_capacity(expected);
-            for r in &mut receivers {
-                r.poll_with(|_| {});
-            }
-            ready.store(true, Ordering::Release);
-            while lat.len() < expected && !stop.load(Ordering::Relaxed) {
-                for r in &mut receivers {
-                    r.poll_with(|e| {
-                        if let NetworkEvent::Message { send_ts, .. } = e {
-                            lat.push(Nanos::now().0.saturating_sub(send_ts.0));
-                        }
-                    });
-                }
-                got.store(lat.len(), Ordering::Relaxed);
-            }
-            let _ = done_tx.send(());
-            lat
+    // One thread per receiver on its own core, as separate processes would
+    // be, so the receive side never bounds a fan-out.
+    let rx_threads: Vec<_> = receivers
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let shared = (stop.clone(), got.clone(), ready.clone(), done_tx.clone());
+            thread::Builder::new()
+                .name(format!("rx-{i}"))
+                .spawn(move || receive(r, i, count, mode, shared))
+                .unwrap()
         })
-    };
+        .collect();
+    drop(done_tx);
 
-    pin(1);
-    while !ready.load(Ordering::Acquire) {
+    pin(0);
+    while ready.load(Ordering::Acquire) < clients {
         std::hint::spin_loop();
     }
     let start = Instant::now();
     let mut sent = 0;
     let mut next_send = start;
-    while done_rx.try_recv().is_err() {
+    let mut packed = Vec::with_capacity(batch * (sizes.end() + 2));
+    let mut finished = 0;
+    while finished < clients {
+        if done_rx.try_recv().is_ok() {
+            finished += 1;
+            continue;
+        }
         if INTERRUPTED.load(Ordering::Relaxed) {
             stop.store(true, Ordering::Relaxed);
-            let _ = rx_thread.join();
+            for t in rx_threads {
+                let _ = t.join();
+            }
             // Unwinds through `main`, so the `Link` guard still tears down.
             panic!("interrupted");
         }
@@ -471,24 +559,8 @@ fn run(sc: Scenario) -> Stats {
         let now = Instant::now();
         if sent < count && sent - received < window && pace.is_none_or(|_| now >= next_send) {
             let t = Instant::now();
-            match (grouped, clients) {
-                (false, _) => {
-                    for m in &msgs {
-                        server.broadcast_with(server_group, |b| b.extend_from_slice(m));
-                    }
-                }
-                (true, 1) => {
-                    server.send_many_with(accepted[0], &msgs, |b, m| b.extend_from_slice(m));
-                }
-                (true, _) => {
-                    server.broadcast_many_with(server_group, &msgs, |b, m| {
-                        b.extend_from_slice(m);
-                    });
-                }
-            }
-            if batch > 1 {
-                send_ns.push(t.elapsed().as_nanos() as u64);
-            }
+            send_batch(&mut server, server_group, &accepted, &msgs, mode, &mut packed);
+            send_ns.push(t.elapsed().as_nanos() as u64);
             sent += batch;
             if let Some(p) = pace {
                 next_send = now + p;
@@ -500,8 +572,11 @@ fn run(sc: Scenario) -> Stats {
         }
     }
     let elapsed = start.elapsed();
-    let latencies_ns = rx_thread.join().unwrap();
-    assert_eq!(latencies_ns.len(), expected, "receiver timed out");
+    let mut latencies_ns = Vec::with_capacity(count * clients);
+    for t in rx_threads {
+        latencies_ns.extend(t.join().unwrap());
+    }
+    assert_eq!(latencies_ns.len(), count * clients, "receiver timed out");
     if let Some(p) = pace {
         let ideal = p * (count / batch) as u32;
         assert!(elapsed < ideal + ideal / 10 + Duration::from_millis(10), "pace of {p:?} not kept");
@@ -597,7 +672,96 @@ fn main() {
     pin(usize::MAX);
     cleanup_shmem(&shmem_dir(APP_NAME));
     let _link = Link::up();
-    println!("== paced: one message per 100µs or 1 GiB/s, one receiver ==");
+    let sections: [(&str, fn()); 8] = [
+        ("paced", paced),
+        ("burst", burst),
+        ("loss1", loss1),
+        ("bcast", bcast),
+        ("fanout", fanout),
+        ("many", many),
+        ("packed", packed),
+        ("profile", profile),
+    ];
+    for (name, section) in sections {
+        if wanted(name) {
+            section();
+        }
+    }
+    cleanup_shmem(&shmem_dir(APP_NAME));
+}
+
+/// One single-datagram message paced to 4, 8 and 16 receivers over each
+/// transport, so send-call and one-way latency show their growth with the
+/// receiver count.
+fn fanout() {
+    println!("\n== fanout: one 1 KiB message per 100 µs, by receiver count ==");
+    for clients in [4, 8, 16] {
+        for (name, transport) in transports() {
+            if name == "udp+tel" {
+                continue;
+            }
+            let addr = free_addr();
+            let s = run(Scenario {
+                transport,
+                listen: addr,
+                dial: addr,
+                clients,
+                sizes: 1024..=1024,
+                count: PACED_MSGS,
+                pace: Some(PACE_FLOOR),
+                window: 64,
+                batch: 1,
+                mode: Mode::Loop,
+            });
+            s.row(&format!("fanout/{name}/{clients}rx"), "");
+        }
+    }
+    println!("\n== fanout: 20 × 1 KiB per grouped call, one call per ms, by receiver count ==");
+    for clients in [4, 8, 16] {
+        for (name, transport) in transports() {
+            if name == "udp+tel" {
+                continue;
+            }
+            let addr = free_addr();
+            let s = run(Scenario {
+                transport,
+                listen: addr,
+                dial: addr,
+                clients,
+                sizes: 1024..=1024,
+                count: PACED_MSGS * 20,
+                pace: Some(Duration::from_millis(1)),
+                window: 64 * 20,
+                batch: 20,
+                mode: Mode::Grouped,
+            });
+            s.row(&format!("fanout/{name}/{clients}rx-x20"), "");
+        }
+    }
+}
+
+/// A long UDP broadcast of 2 KiB messages to [`BCAST_PEERS`], for attaching
+/// a profiler to; opt in with `SCENARIOS=profile`.
+fn profile() {
+    println!("\n== profile: 500k broadcasts of 2 KiB to {BCAST_PEERS} receivers ==");
+    let addr = free_addr();
+    let s = run(Scenario {
+        transport: UdpGroupConfig { udp: udp_config(), ..Default::default() }.into(),
+        listen: addr,
+        dial: addr,
+        clients: BCAST_PEERS,
+        sizes: 2048..=2048,
+        count: 500_000,
+        pace: None,
+        window: 256,
+        batch: 1,
+        mode: Mode::Loop,
+    });
+    s.row("profile/udp/2k", "");
+}
+
+fn paced() {
+    println!("\n== paced: one message per 100µs or 1 GiB/s, one receiver ==");
     for (size_name, size) in SIZES {
         for (name, transport) in transports() {
             let addr = free_addr();
@@ -611,12 +775,14 @@ fn main() {
                 pace: Some(pace_for(size)),
                 window: burst_plan(size).1,
                 batch: 1,
-                grouped: false,
+                mode: Mode::Loop,
             });
             s.row(&format!("paced/{name}/{size_name}"), "");
         }
     }
+}
 
+fn burst() {
     println!("\n== burst: bounded outstanding, one receiver ==");
     for (size_name, size) in SIZES {
         let (count, window) = burst_plan(size);
@@ -632,12 +798,14 @@ fn main() {
                 pace: None,
                 window,
                 batch: 1,
-                grouped: false,
+                mode: Mode::Loop,
             });
             s.row(&format!("burst/{name}/{size_name}"), &format!("window={window}"));
         }
     }
+}
 
+fn loss1() {
     println!("\n== loss1: one 2 MiB message, exactly one datagram dropped by a relay ==");
     {
         let server_addr = free_addr();
@@ -653,14 +821,16 @@ fn main() {
             pace: None,
             window: 1,
             batch: 1,
-            grouped: false,
+            mode: Mode::Loop,
         });
         let data = relay.data.load(Ordering::Relaxed);
         let retx = relay.retransmits.load(Ordering::Relaxed);
         drop(relay);
         s.row("loss1/udp/2m", &format!("datagrams={data} retransmitted={retx}"));
     }
+}
 
+fn bcast() {
     println!("\n== bcast: one sender, {BCAST_PEERS} receivers on one listener ==");
     for (size_name, size) in SIZES {
         let (count, window) = burst_plan(size);
@@ -677,14 +847,38 @@ fn main() {
                 pace: None,
                 window,
                 batch: 1,
-                grouped: false,
+                mode: Mode::Loop,
             });
             s.row(&format!("bcast/{name}/{size_name}"), &format!("window={window}"));
         }
     }
-    cleanup_shmem(&shmem_dir(APP_NAME));
+}
 
-    many();
+/// One batch row: `calls` batches of `batch` messages, 1000 when paced.
+fn batch_row(
+    name: &str,
+    transport: &GroupConfig,
+    sizes: std::ops::RangeInclusive<usize>,
+    clients: usize,
+    batch: usize,
+    mode: Mode,
+    pace: Option<Duration>,
+) {
+    let addr = free_addr();
+    let calls = if pace.is_some() { 1000 } else { 400 };
+    let s = run(Scenario {
+        transport: transport.clone(),
+        listen: addr,
+        dial: addr,
+        clients,
+        sizes,
+        count: calls * batch,
+        pace,
+        window: 10 * batch,
+        batch,
+        mode,
+    });
+    s.row(name, "");
 }
 
 /// The `many` scenario: each size range and batch as one grouped call and as
@@ -694,39 +888,94 @@ fn many() {
     println!("\n== many: messages per call, grouped (send_many_with) vs loop of single sends ==");
     let udp: GroupConfig = UdpGroupConfig { udp: udp_config(), ..Default::default() }.into();
     let tcp = transports().into_iter().next().unwrap().1;
-    let row = |name: String,
-               transport: &GroupConfig,
-               sizes: std::ops::RangeInclusive<usize>,
-               clients: usize,
-               batch: usize,
-               grouped: bool,
-               pace: Option<Duration>| {
-        let addr = free_addr();
-        let calls = if pace.is_some() { 1000 } else { 400 };
-        let s = run(Scenario {
-            transport: transport.clone(),
-            listen: addr,
-            dial: addr,
-            clients,
-            sizes,
-            count: calls * batch,
-            pace,
-            window: 10 * batch,
-            batch,
-            grouped,
-        });
-        s.row(&name, "");
-    };
     for (size_name, sizes) in MANY_SIZES {
         for batch in [5, 50] {
             let name = |what: &str| format!("many/{size_name}x{batch}/{what}");
-            row(name("udp-grouped"), &udp, sizes.clone(), 1, batch, true, None);
-            row(name("udp-loop"), &udp, sizes.clone(), 1, batch, false, None);
-            row(name("tcp-grouped"), &tcp, sizes.clone(), 1, batch, true, None);
+            batch_row(&name("udp-grouped"), &udp, sizes.clone(), 1, batch, Mode::Grouped, None);
+            batch_row(&name("udp-loop"), &udp, sizes.clone(), 1, batch, Mode::Loop, None);
+            batch_row(&name("tcp-grouped"), &tcp, sizes.clone(), 1, batch, Mode::Grouped, None);
             let pace = pace_for(batch * (sizes.start() + sizes.end()) / 2);
-            row(name("udp-grouped-paced"), &udp, sizes.clone(), 1, batch, true, Some(pace));
-            row(name("udp-grouped-8rx"), &udp, sizes.clone(), BCAST_PEERS, batch, true, None);
-            row(name("udp-loop-8rx"), &udp, sizes.clone(), BCAST_PEERS, batch, false, None);
+            batch_row(
+                &name("udp-grouped-paced"),
+                &udp,
+                sizes.clone(),
+                1,
+                batch,
+                Mode::Grouped,
+                Some(pace),
+            );
+            batch_row(
+                &name("udp-grouped-8rx"),
+                &udp,
+                sizes.clone(),
+                BCAST_PEERS,
+                batch,
+                Mode::Grouped,
+                None,
+            );
+            batch_row(
+                &name("udp-loop-8rx"),
+                &udp,
+                sizes.clone(),
+                BCAST_PEERS,
+                batch,
+                Mode::Loop,
+                None,
+            );
+            batch_row(
+                &name("tcp-grouped-8rx"),
+                &tcp,
+                sizes.clone(),
+                BCAST_PEERS,
+                batch,
+                Mode::Grouped,
+                None,
+            );
+        }
+    }
+}
+
+/// The `packed` scenario: batches of up to 64 KiB as one grouped call, as one
+/// message packed by the caller, and grouped over TCP.
+fn packed() {
+    let udp: GroupConfig = UdpGroupConfig { udp: udp_config(), ..Default::default() }.into();
+    let tcp = transports().into_iter().next().unwrap().1;
+    println!("\n== packed: one grouped call vs the batch packed by the caller into one message ==");
+    for (size_name, sizes, batches) in
+        [("small", 64..=256, [50, 400]), ("few-kb", 2048..=4096, [5, 20])]
+    {
+        for batch in batches {
+            let name = |what: &str| format!("packed/{size_name}x{batch}/{what}");
+            batch_row(&name("udp-grouped"), &udp, sizes.clone(), 1, batch, Mode::Grouped, None);
+            batch_row(&name("udp-packed"), &udp, sizes.clone(), 1, batch, Mode::Packed, None);
+            batch_row(&name("tcp-grouped"), &tcp, sizes.clone(), 1, batch, Mode::Grouped, None);
+            batch_row(
+                &name("udp-grouped-8rx"),
+                &udp,
+                sizes.clone(),
+                BCAST_PEERS,
+                batch,
+                Mode::Grouped,
+                None,
+            );
+            batch_row(
+                &name("udp-packed-8rx"),
+                &udp,
+                sizes.clone(),
+                BCAST_PEERS,
+                batch,
+                Mode::Packed,
+                None,
+            );
+            batch_row(
+                &name("tcp-grouped-8rx"),
+                &tcp,
+                sizes.clone(),
+                BCAST_PEERS,
+                batch,
+                Mode::Grouped,
+                None,
+            );
         }
     }
 }

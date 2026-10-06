@@ -18,10 +18,10 @@ use mio::{Interest, Registry, Token, event::Event as MioEvent, net::UdpSocket};
 use tracing::{debug, info, warn};
 
 use super::{
-    outbound::{Full, MessageStore},
+    outbound::{MessageStore, WindowFull},
     peer::{Peer, SendOutcome},
     sys::{RecvBatch, SendBatch},
-    wire::{self, Datagram},
+    wire::{self, Datagram, LONG_HEADER, SHORT_HEADER},
 };
 use crate::network::{
     Event, Group, PayloadBuf, ReplayPolicy, RxPayload, Tokens, UdpGroupConfig, set_socket_buf_size,
@@ -62,13 +62,29 @@ fn arm_writable(registry: &Registry, entry: &mut Endpoint) {
     entry.writable_armed = true;
 }
 
-/// Queues the on-connect message for a peer whose session was just set up.
-fn push_on_connect(store: &mut MessageStore, cfg: &UdpGroupConfig, peer: &mut Peer, now: Instant) {
-    if let Some(msg) = &cfg.on_connect_msg {
-        let slot = store.insert(&mut msg.clone());
+/// Queues the on-connect message, as the stream `greeting`, for a peer
+/// whose session was just set up.
+fn push_on_connect(
+    store: &mut MessageStore,
+    greeting: Option<&[u8]>,
+    peer: &mut Peer,
+    now: Instant,
+) {
+    if let Some(stream) = greeting {
+        let slot = store.insert(&mut stream.to_vec());
         let _ = peer.enqueue(store, slot, now);
         store.release(slot);
     }
+}
+
+/// The on-connect message as a one-record stream.
+fn greeting_stream(msg: &[u8]) -> Vec<u8> {
+    let mut header = [0; LONG_HEADER];
+    let n = wire::message_header(&mut header, msg.len());
+    let mut stream = Vec::with_capacity(n + msg.len());
+    stream.extend_from_slice(&header[..n]);
+    stream.extend_from_slice(msg);
+    stream
 }
 
 /// A hello and where it came from.
@@ -101,6 +117,10 @@ pub(crate) struct UdpManager {
     peers: Vec<Peer>,
     store: MessageStore,
     send_buffer: Vec<u8>,
+    /// A record that did not fit the stream being queued, kept for the next.
+    spill: Vec<u8>,
+    /// `on_connect_msg` as a stream.
+    greeting: Option<Vec<u8>>,
     batch: SendBatch,
     /// Peers with packets in `batch` and how many each, in order.
     staged: Vec<(usize, usize)>,
@@ -130,13 +150,16 @@ impl UdpManager {
                 .is_none_or(|msg| !msg.is_empty() && msg.len() <= udp.max_message_size),
             "invalid UDP on-connect message length"
         );
+        let greeting = config.on_connect_msg.as_deref().map(greeting_stream);
         Self {
             config,
+            greeting,
             group,
             sockets: Vec::new(),
             peers: Vec::new(),
             store: MessageStore::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
+            spill: Vec::new(),
             batch: SendBatch::new(udp.max_datagram_size),
             staged: Vec::new(),
             recv: Some(RecvBatch::new(udp.max_datagram_size)),
@@ -199,7 +222,7 @@ impl UdpManager {
         let mut peer = Peer::new(addr, token, token, new_session(token.0), &self.config);
         let now = Instant::now();
         // First in the queue; nothing goes out before the handshake anyway.
-        push_on_connect(&mut self.store, &self.config, &mut peer, now);
+        push_on_connect(&mut self.store, self.greeting.as_deref(), &mut peer, now);
         match self.open_socket(registry, outbound_bind_addr(addr), token, false) {
             Ok(()) => {
                 peer.send_hello(&self.sockets.last().unwrap().socket, now);
@@ -254,12 +277,11 @@ impl UdpManager {
         let session = new_session(peer.token.0);
         peer.mark_disconnected(self.config.replay == ReplayPolicy::Drop, session, &mut self.store);
         let greeting_retained = self
-            .config
-            .on_connect_msg
+            .greeting
             .as_deref()
             .is_some_and(|msg| peer.outbound.oldest_retained(&self.store) == Some(msg));
         if !greeting_retained {
-            push_on_connect(&mut self.store, &self.config, peer, now);
+            push_on_connect(&mut self.store, self.greeting.as_deref(), peer, now);
         }
         if let Some(k) = socket_of(&self.sockets, peer.token) {
             peer.send_hello(&self.sockets[k].socket, now);
@@ -367,14 +389,19 @@ impl UdpManager {
     {
         let Some(index) = self.sendable_index(token) else { return false };
         let now = Instant::now();
-        let sent = self.enqueue_serialised(index, now, serialise);
+        if self.append_record(serialise).is_none() {
+            return false;
+        }
+        let sent = self.queue_stream_for(index, token, now);
         if sent {
             self.flush_peer_socket(registry, index, now);
         }
         sent
     }
 
-    /// Queues every item for `token`, then flushes its socket once.
+    /// Serialises every item into one stream for `token`, queues it and
+    /// flushes the socket once. A stream that outgrows `max_message_size`
+    /// is queued in parts.
     pub(crate) fn send_many_with<I, F>(
         &mut self,
         registry: &Registry,
@@ -390,13 +417,20 @@ impl UdpManager {
         let now = Instant::now();
         let mut sent = false;
         for item in items {
-            if self.peers.get(index).is_none_or(|p| p.token != token) {
-                // The peer was dropped for violating a limit.
-                return false;
+            if let Some(at) = self.append_record(|buf| serialise(buf, item)) &&
+                self.spill_overflow(at)
+            {
+                sent |= self.queue_stream_for(index, token, now);
+                std::mem::swap(&mut self.send_buffer, &mut self.spill);
+                if !self.peer_is(index, token) {
+                    // The peer was dropped for violating a limit.
+                    self.send_buffer.clear();
+                    return false;
+                }
             }
-            sent |= self.enqueue_serialised(index, now, |buf| serialise(buf, item));
         }
-        if sent {
+        sent |= self.queue_stream_for(index, token, now);
+        if sent && self.peer_is(index, token) {
             self.flush_peer_socket(registry, index, now);
         }
         sent
@@ -410,12 +444,17 @@ impl UdpManager {
             return 0;
         }
         let now = Instant::now();
-        let recipients = self.enqueue_broadcast(now, serialise);
+        if self.append_record(serialise).is_none() {
+            return 0;
+        }
+        let recipients = self.queue_stream_broadcast(now);
         self.flush_all(registry, now);
         recipients
     }
 
-    /// Queues every item for every recipient, then flushes each socket once.
+    /// Serialises every item into one stream for every recipient, queues it
+    /// and flushes each socket once. A stream that outgrows
+    /// `max_message_size` is queued in parts.
     pub(crate) fn broadcast_many_with<I, F>(
         &mut self,
         registry: &Registry,
@@ -432,42 +471,79 @@ impl UdpManager {
         let now = Instant::now();
         let mut recipients = 0;
         for item in items {
-            recipients = recipients.max(self.enqueue_broadcast(now, |buf| serialise(buf, item)));
+            if let Some(at) = self.append_record(|buf| serialise(buf, item)) &&
+                self.spill_overflow(at)
+            {
+                recipients = recipients.max(self.queue_stream_broadcast(now));
+                std::mem::swap(&mut self.send_buffer, &mut self.spill);
+            }
         }
+        recipients = recipients.max(self.queue_stream_broadcast(now));
         self.flush_all(registry, now);
         recipients
     }
 
-    /// Serialises one message into the store. `None` if it is empty or too
-    /// large, which the TCP path also skips without sending.
-    fn serialise_into_store<F>(&mut self, serialise: F) -> Option<u32>
+    /// Serialises one message behind its wire header at the end of the
+    /// stream in `send_buffer`. Returns where the record starts, or `None`
+    /// when the message was empty or too large and nothing was appended,
+    /// which the TCP path also skips without sending.
+    fn append_record<F>(&mut self, serialise: F) -> Option<usize>
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
-        self.send_buffer.clear();
+        let at = self.send_buffer.len();
+        self.send_buffer.extend_from_slice(&[0; SHORT_HEADER]);
         serialise(&mut PayloadBuf::new(&mut self.send_buffer));
-        if self.send_buffer.is_empty() {
+        let len = self.send_buffer.len() - at - SHORT_HEADER;
+        if len == 0 || len > self.config.udp.max_message_size {
+            if len != 0 {
+                warn!(
+                    group = self.config.name,
+                    len,
+                    max = self.config.udp.max_message_size,
+                    "udp message exceeds max_message_size"
+                );
+            }
+            self.send_buffer.truncate(at);
             return None;
         }
-        if self.send_buffer.len() > self.config.udp.max_message_size {
-            warn!(
-                group = self.config.name,
-                len = self.send_buffer.len(),
-                max = self.config.udp.max_message_size,
-                "udp message exceeds max_message_size"
-            );
-            return None;
+        let mut header = [0; LONG_HEADER];
+        let n = wire::message_header(&mut header, len);
+        if n > SHORT_HEADER {
+            self.send_buffer.resize(at + n + len, 0);
+            self.send_buffer.copy_within(at + SHORT_HEADER..at + SHORT_HEADER + len, at + n);
         }
-        Some(self.store.insert(&mut self.send_buffer))
+        self.send_buffer[at..at + n].copy_from_slice(&header[..n]);
+        Some(at)
     }
 
-    /// Serialises and queues one message for the peer at `index`, dropping
-    /// the peer if it cannot take it. Returns whether it was queued.
-    fn enqueue_serialised<F>(&mut self, index: usize, now: Instant, serialise: F) -> bool
-    where
-        F: FnOnce(&mut PayloadBuf<'_>),
-    {
-        let Some(slot) = self.serialise_into_store(serialise) else { return false };
+    /// When the record at `at` took the stream past `max_message_size`, the
+    /// size a window is sure to hold, moves it into `spill` so the stream
+    /// before it can be queued on its own. Returns whether it did.
+    fn spill_overflow(&mut self, at: usize) -> bool {
+        if at == 0 || self.send_buffer.len() <= self.config.udp.max_message_size {
+            return false;
+        }
+        self.spill.clear();
+        self.spill.extend_from_slice(&self.send_buffer[at..]);
+        self.send_buffer.truncate(at);
+        true
+    }
+
+    #[inline]
+    fn peer_is(&self, index: usize, token: Token) -> bool {
+        self.peers.get(index).is_some_and(|p| p.token == token)
+    }
+
+    /// Moves the stream into the store and queues it for the peer at
+    /// `index`, dropping the peer if it cannot take it. Leaves the stream
+    /// empty. Returns whether it was queued.
+    fn queue_stream_for(&mut self, index: usize, token: Token, now: Instant) -> bool {
+        if self.send_buffer.is_empty() || !self.peer_is(index, token) {
+            self.send_buffer.clear();
+            return false;
+        }
+        let slot = self.store.insert(&mut self.send_buffer);
         let queued = self.enqueue(index, slot, now);
         self.store.release(slot);
         if !queued {
@@ -476,13 +552,13 @@ impl UdpManager {
         queued
     }
 
-    /// Serialises and queues one message for every eligible peer. Returns the
-    /// number of recipients.
-    fn enqueue_broadcast<F>(&mut self, now: Instant, serialise: F) -> usize
-    where
-        F: FnOnce(&mut PayloadBuf<'_>),
-    {
-        let Some(slot) = self.serialise_into_store(serialise) else { return 0 };
+    /// Moves the stream into the store and queues it for every eligible
+    /// peer. Leaves the stream empty. Returns the number of recipients.
+    fn queue_stream_broadcast(&mut self, now: Instant) -> usize {
+        if self.send_buffer.is_empty() {
+            return 0;
+        }
+        let slot = self.store.insert(&mut self.send_buffer);
         let mut recipients = 0;
         let mut i = self.peers.len();
         while i != 0 {
@@ -499,15 +575,14 @@ impl UdpManager {
         recipients
     }
 
-    /// Queues the stored message for one peer. `false` when the peer must be
-    /// dropped: it violated the backlog limit or cannot hold the message.
+    /// Queues the stored stream for one peer. `false` when the peer must be
+    /// dropped: it violated the backlog limit or has no window room.
     #[inline]
     fn enqueue(&mut self, index: usize, slot: u32, now: Instant) -> bool {
         let peer = &mut self.peers[index];
         match peer.enqueue(&mut self.store, slot, now) {
             Ok(()) => !peer.outbound.backlog_exceeded(self.config.max_backlog_datagrams, now),
-            Err(Full::Window) => false,
-            Err(Full::TooLarge) => true,
+            Err(WindowFull) => false,
         }
     }
 
@@ -647,7 +722,7 @@ impl UdpManager {
         let entry = &self.sockets[k];
         let mut peer = Peer::new(from, token, entry.token, new_session(token.0), &self.config);
         peer.on_hello(session, base, &entry.socket, now);
-        push_on_connect(&mut self.store, &self.config, &mut peer, now);
+        push_on_connect(&mut self.store, self.greeting.as_deref(), &mut peer, now);
         info!(addr = %from, "udp client connected");
         deliver(Event::Accepted { group: self.group, token, peer_addr: from });
         self.peers.push(peer);
