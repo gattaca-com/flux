@@ -19,6 +19,7 @@ pub struct TileConfig {
     cores: Vec<usize>,
     thread_niceness: Option<ThreadNiceness>,
     min_loop_duration: Option<Duration>,
+    stack_size: Option<usize>,
     metrics: bool,
     #[cfg_attr(not(feature = "park"), allow(dead_code))]
     park: bool,
@@ -30,6 +31,7 @@ impl TileConfig {
             cores: vec![core],
             thread_niceness,
             min_loop_duration: None,
+            stack_size: None,
             metrics: true,
             #[cfg(feature = "park")]
             park: true,
@@ -46,12 +48,25 @@ impl TileConfig {
 
     /// Background config pinned to a set of cores. Empty pins nowhere.
     pub fn background_on_cores(cores: Vec<usize>, min_loop_duration: Option<Duration>) -> Self {
-        Self { cores, thread_niceness: None, min_loop_duration, metrics: true, park: false }
+        Self {
+            cores,
+            thread_niceness: None,
+            min_loop_duration,
+            stack_size: None,
+            metrics: true,
+            park: false,
+        }
     }
 
     /// Cores the tile is pinned to on startup. Empty means unpinned.
     pub fn cores(&self) -> &[usize] {
         &self.cores
+    }
+
+    /// Stack size of the tile thread in bytes.
+    pub fn with_stack_size(mut self, bytes: usize) -> Self {
+        self.stack_size = Some(bytes);
+        self
     }
 
     pub fn without_metrics(mut self) -> Self {
@@ -106,16 +121,17 @@ where
     T: Tile<S> + 'a,
 {
     let name = tile.name();
+    let stack_size = config.stack_size;
     let run = tile_runner(tile, spine, config);
 
-    if name.as_str().is_empty() {
-        spine.scope.spawn(run);
-    } else {
-        std::thread::Builder::new()
-            .name(name.as_str().to_owned())
-            .spawn_scoped(spine.scope, run)
-            .expect("spawn tile thread");
+    let mut builder = std::thread::Builder::new();
+    if !name.as_str().is_empty() {
+        builder = builder.name(name.as_str().to_owned());
     }
+    if let Some(bytes) = stack_size {
+        builder = builder.stack_size(bytes);
+    }
+    builder.spawn_scoped(spine.scope, run).expect("spawn tile thread");
 }
 
 /// The tile's whole life as one closure.
