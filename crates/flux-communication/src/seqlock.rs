@@ -79,10 +79,7 @@ impl<T: Copy> Seqlock<T> {
             if v1 == v2 && v1 & 1 == 0 {
                 return Ok(());
             }
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                std::arch::x86_64::_mm_pause();
-            };
+            std::hint::spin_loop();
         }
     }
 
@@ -198,10 +195,7 @@ impl<T: Copy> Seqlock<T> {
             if v1 == v2 {
                 return Ok((result, v2));
             }
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                std::arch::x86_64::_mm_pause();
-            };
+            std::hint::spin_loop();
         }
     }
 }
