@@ -1,15 +1,6 @@
-//! The sending half of a peer: record streams queued, cut into packets, kept
-//! until acked, and sent again when the receiver's acks show a hole or go
-//! quiet.
-//!
-//! A stream is one or more messages serialised back to back, each behind its
-//! wire header, so a packet is a span of it. A packet is built once and sent
-//! byte for byte the same every time, so the receiver tells copies apart by
-//! sequence alone. Packets `[base, next_send)` have been handed to the kernel
-//! at least once; `[next_send, next)` are built and waiting for socket room.
-//! Stream bytes live in the [`MessageStore`], shared by every peer sending
-//! them, and a stream's packets reference it until the last of them is
-//! acked.
+//! The sending half of a peer. A packet is byte-identical on every send, so
+//! the receiver dedups by sequence; its bytes live in the shared
+//! [`MessageStore`] and are held until the packet is acked.
 
 use std::collections::VecDeque;
 
@@ -31,15 +22,14 @@ const MAX_RECOVER: u64 = 64;
 /// reordered: one flow does not reorder that far, while the reorder window
 /// grows with queueing delay.
 const FAST_RETRANSMIT_GAP: u64 = 64;
-/// Slice slots per packet of window: a packet holds spans of the streams
-/// that meet in it.
-const RECORDS_PER_PACKET: usize = 4;
+/// Most streams one packet carries spans of; it closes short at this many,
+/// which bounds the slice ring at this multiple of the packet window.
+const MAX_SLICES_PER_PACKET: u16 = 4;
 
-/// Serialised messages shared by every peer that still has packets of them
-/// in flight. A broadcast is stored once and referenced per peer.
+/// Message bytes shared by every peer with packets of them in flight, so a
+/// broadcast is stored once and referenced per peer.
 pub(crate) struct MessageStore {
     entries: Vec<Entry>,
-    /// Entries with no references; their buffers are reused by `insert`.
     free: Vec<u32>,
 }
 
@@ -53,9 +43,8 @@ impl MessageStore {
         Self { entries: Vec::new(), free: Vec::new() }
     }
 
-    /// Takes `payload`'s buffer into the store, leaving a recycled buffer in
-    /// its place. The caller holds one reference and must [`Self::release`]
-    /// it once every peer has taken its own.
+    /// Takes `payload`'s buffer, leaving a recycled one in its place. The
+    /// caller holds one reference and must [`Self::release`] it.
     pub(crate) fn insert(&mut self, payload: &mut Vec<u8>) -> u32 {
         if let Some(slot) = self.free.pop() {
             let e = &mut self.entries[slot as usize];
@@ -74,7 +63,6 @@ impl MessageStore {
         self.entries[slot as usize].refs += 1;
     }
 
-    /// Drops one reference; the last frees the entry for reuse.
     pub(crate) fn release(&mut self, slot: u32) {
         let e = &mut self.entries[slot as usize];
         e.refs -= 1;
@@ -163,14 +151,12 @@ impl Rto {
     }
 }
 
-/// A stream this peer holds a store reference on.
 struct Message {
     slot: u32,
     first_packet: u64,
     last_packet: u64,
 }
 
-/// One piece of a packet: a span of a stored stream.
 #[derive(Clone, Copy, Default)]
 struct Slice {
     slot: u32,
@@ -180,7 +166,6 @@ struct Slice {
     start: u16,
 }
 
-/// Record boundaries of a stream, walked forward as it is cut into packets.
 struct Records<'a> {
     stream: &'a [u8],
     start: usize,
@@ -235,7 +220,7 @@ impl<'a> Records<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Packet {
     /// Index of its first slice in the slice ring.
     records: u32,
@@ -250,22 +235,6 @@ struct Packet {
     staged: bool,
     send_ts: Nanos,
     sent_at: Instant,
-}
-
-impl Default for Packet {
-    fn default() -> Self {
-        Self {
-            records: 0,
-            count: 0,
-            bytes: 0,
-            start: 0,
-            pad: 0,
-            retries: 0,
-            staged: false,
-            send_ts: Nanos(0),
-            sent_at: Instant::ZERO,
-        }
-    }
 }
 
 /// No room in the send window for the stream.
@@ -318,7 +287,7 @@ impl Outbound {
     pub(crate) fn new(config: &UdpGroupConfig, label: &str) -> Self {
         let udp = config.udp;
         let capacity = udp.send_window;
-        let slice_capacity = capacity * RECORDS_PER_PACKET;
+        let slice_capacity = capacity * usize::from(MAX_SLICES_PER_PACKET);
         Self {
             datagram_size: udp.max_datagram_size,
             packets: vec![Packet::default(); capacity].into_boxed_slice(),
@@ -349,14 +318,11 @@ impl Outbound {
         &self.rto
     }
 
-    /// First packet never handed to the kernel, which a hello announces as
-    /// the receiver's starting point.
     #[inline]
     pub(crate) fn base(&self) -> u64 {
         self.base
     }
 
-    /// Packets built and not yet acked.
     #[inline]
     pub(crate) fn inflight(&self) -> u64 {
         self.next - self.base
@@ -385,12 +351,6 @@ impl Outbound {
     }
 
     #[inline]
-    fn free_slices(&self) -> u32 {
-        let retained = self.packet(self.retained_start()).records;
-        self.slice_mask + 1 - self.slice_next.wrapping_sub(retained)
-    }
-
-    #[inline]
     fn is_acked(&self, seq: u64) -> bool {
         let i = seq & self.mask;
         self.acked[(i >> 6) as usize] & (1 << (i & 63)) != 0
@@ -408,7 +368,6 @@ impl Outbound {
         }
     }
 
-    /// Bytes of the oldest message still held, if any.
     pub(crate) fn oldest_retained<'a>(&self, store: &'a MessageStore) -> Option<&'a [u8]> {
         self.messages.front().map(|m| store.bytes(m.slot))
     }
@@ -446,7 +405,7 @@ impl Outbound {
         // a cut moved back before a header wastes at most a header.
         let room = self.datagram_size - PACKET_HEADER - LONG_HEADER;
         let packets = (len / room + 2) as u64;
-        if packets > self.free_packets() || packets > u64::from(self.free_slices()) {
+        if packets > self.free_packets() {
             return Err(WindowFull);
         }
         let mut records = Records::new(stream);
@@ -469,7 +428,10 @@ impl Outbound {
                 first_packet.get_or_insert(seq);
                 pos = end;
             }
-            if usize::from(self.packet(seq).bytes) == self.datagram_size {
+            let packet = self.packet(seq);
+            if usize::from(packet.bytes) == self.datagram_size ||
+                packet.count == MAX_SLICES_PER_PACKET
+            {
                 self.open = false;
             }
             if pos == len {
@@ -500,14 +462,12 @@ impl Outbound {
         now.saturating_sub(*since) >= timeout
     }
 
-    /// Releases store references whose last packet is below `base`.
     fn release_messages(&mut self, store: &mut MessageStore) {
         while self.messages.front().is_some_and(|m| m.last_packet < self.base) {
             store.release(self.messages.pop_front().unwrap().slot);
         }
     }
 
-    /// Releases every store reference this peer holds.
     pub(crate) fn release_all(&mut self, store: &mut MessageStore) {
         for m in self.messages.drain(..) {
             store.release(m.slot);
@@ -523,37 +483,22 @@ impl Outbound {
         {
             let m = self.messages.pop_back().unwrap();
             store.release(m.slot);
-            // Rebuild the packet it started in without it; a kept message
-            // may still end there.
+            // Rebuild the packet it started in from the slices before its
+            // own: a kept message may still end there.
             let seq = m.first_packet;
             let packet = *self.packet(seq);
-            let mut count = 0;
-            let mut bytes = PACKET_HEADER;
-            let mut start = 0;
-            for i in 0..packet.count {
-                let slice =
-                    self.slices[((packet.records + u32::from(i)) & self.slice_mask) as usize];
-                if slice.slot == m.slot {
-                    break;
+            let mask = self.slice_mask;
+            let at = |i: u16| ((packet.records + u32::from(i)) & mask) as usize;
+            let kept = (0..packet.count).take_while(|&i| self.slices[at(i)].slot != m.slot).count();
+            self.slice_next = packet.records;
+            self.next = seq;
+            self.open = false;
+            if kept != 0 {
+                self.open_packet();
+                for i in 0..kept as u16 {
+                    let slice = self.slices[at(i)];
+                    self.push_slice(seq, slice);
                 }
-                if slice.start != 0 && start == 0 {
-                    start = bytes - PACKET_HEADER + usize::from(slice.start);
-                }
-                bytes += usize::from(slice.len);
-                count += 1;
-            }
-            self.slice_next = packet.records.wrapping_add(count);
-            if count == 0 {
-                self.next = seq;
-                self.open = false;
-            } else {
-                let packet = self.packet_mut(seq);
-                packet.count = count as u16;
-                packet.bytes = bytes as u16;
-                packet.start = start as u16;
-                packet.pad = 0;
-                self.next = seq + 1;
-                self.open = true;
             }
             dropped += 1;
         }
@@ -728,13 +673,11 @@ impl Outbound {
         let end = if probes != 0 { self.next_send } else { hole_end };
         let mut seq = self.base;
         while seq < end && !batch.is_full() {
-            let due = (seq < hole_end && self.is_hole(seq, now)) ||
-                (probes != 0 && !self.is_acked(seq) && !self.packet(seq).staged && {
-                    probes -= 1;
-                    true
-                });
-            if due {
+            let hole = seq < hole_end && self.is_hole(seq, now);
+            let probe = !hole && probes != 0 && !self.is_acked(seq) && !self.packet(seq).staged;
+            if hole || probe {
                 self.put(store, batch, to, session, seq, send_ts);
+                probes -= u64::from(probe);
             }
             seq += 1;
         }
