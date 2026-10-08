@@ -5,12 +5,14 @@ use syn::{
 };
 
 /// Generic macro input: optional `roll_into Name`, optional
-/// `default_attrs { ... }` block + base definition + evolution steps.
+/// `default_attrs { ... }`, `extra_attrs { ... }` and `final_attrs { ... }`
+/// blocks + base definition + evolution steps.
 pub(crate) struct EvolveInputGeneric<B, E> {
     pub wire_name: Option<LitStr>,
     pub wire_skip: bool,
     pub roll_into: Option<Ident>,
     pub default_attrs: Vec<Attribute>,
+    pub extra_attrs: Vec<Attribute>,
     pub final_attrs: Vec<Attribute>,
     pub base: B,
     pub evolutions: Vec<E>,
@@ -22,12 +24,14 @@ impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
         let roll_into = parse_optional_keyword(input, "roll_into")?;
 
         let mut default_attrs = Vec::new();
+        let mut extra_attrs = Vec::new();
         let mut final_attrs = Vec::new();
         while input.peek(Ident) {
             let fork = input.fork();
             let ident: Ident = fork.parse()?;
             let attrs = match ident.to_string().as_str() {
                 "default_attrs" => &mut default_attrs,
+                "extra_attrs" => &mut extra_attrs,
                 "final_attrs" => &mut final_attrs,
                 _ => break,
             };
@@ -43,7 +47,16 @@ impl<B: Parse, E: Parse> Parse for EvolveInputGeneric<B, E> {
             evolutions.push(input.parse()?);
         }
 
-        Ok(Self { wire_name, wire_skip, roll_into, default_attrs, final_attrs, base, evolutions })
+        Ok(Self {
+            wire_name,
+            wire_skip,
+            roll_into,
+            default_attrs,
+            extra_attrs,
+            final_attrs,
+            base,
+            evolutions,
+        })
     }
 }
 
@@ -52,6 +65,7 @@ impl<B, E> EvolveInputGeneric<B, E> {
         if self.default_attrs.is_empty() && self.roll_into.is_some() {
             self.default_attrs = defaults();
         }
+        self.default_attrs.append(&mut self.extra_attrs);
     }
 }
 

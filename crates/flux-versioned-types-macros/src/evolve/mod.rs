@@ -48,6 +48,9 @@ use syn::parse_macro_input;
 /// - `MyTypeV2 { a: u32, b, c }` with `Into<MyTypeV2> for MyTypeV1`
 /// - `MyTypeV3 { a: u64, c, d }` with `Into<MyTypeV3> for MyTypeV2`
 ///
+/// `extra_attrs { ... }` adds attributes to every version after the default
+/// attrs, so callers can extend the defaults without restating them.
+///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
 /// padding-free `Copy`; it excludes `#[wire_name]`.
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
