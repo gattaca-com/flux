@@ -219,7 +219,7 @@ pub struct TileInfo {
 
 impl TileInfo {
     pub fn register_tile(&mut self, name: TileName) -> u16 {
-        debug_assert!(!name.is_empty(), "tile name must not be empty");
+        assert!(!name.is_empty(), "tile name must not be empty");
         let mut i = 0;
         while i < 255 {
             let slot = &mut self.tiles[i];
