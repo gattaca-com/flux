@@ -87,14 +87,6 @@ fn greeting_stream(msg: &[u8]) -> Vec<u8> {
     stream
 }
 
-/// A hello and where it came from.
-#[derive(Clone, Copy)]
-struct Hello {
-    from: SocketAddr,
-    session: u32,
-    base: u64,
-}
-
 /// The socket registered under `token`. An outbound peer whose bind failed
 /// has none until the next retry.
 #[inline]
@@ -102,7 +94,6 @@ fn socket_of(sockets: &[Endpoint], token: Token) -> Option<usize> {
     sockets.iter().position(|s| s.token == token)
 }
 
-/// Local address an outbound socket for `peer` binds to.
 fn outbound_bind_addr(peer: SocketAddr) -> SocketAddr {
     match peer {
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
@@ -706,28 +697,6 @@ impl UdpManager {
         self.peers.iter().position(|p| p.socket_token == socket_token && p.addr == from)
     }
 
-    /// Creates the accepted peer for a hello.
-    fn accept<F>(
-        &mut self,
-        k: usize,
-        hello: Hello,
-        now: Instant,
-        tokens: &mut Tokens,
-        deliver: &mut F,
-    ) where
-        F: for<'a> FnMut(Event<RxPayload<'a>>),
-    {
-        let Hello { from, session, base } = hello;
-        let token = tokens.allocate(self.group);
-        let entry = &self.sockets[k];
-        let mut peer = Peer::new(from, token, entry.token, new_session(token.0), &self.config);
-        peer.on_hello(session, base, &entry.socket, now);
-        push_on_connect(&mut self.store, self.greeting.as_deref(), &mut peer, now);
-        info!(addr = %from, "udp client connected");
-        deliver(Event::Accepted { group: self.group, token, peer_addr: from });
-        self.peers.push(peer);
-    }
-
     /// One received datagram.
     #[allow(clippy::too_many_arguments)]
     fn on_datagram<F>(
@@ -782,7 +751,15 @@ impl UdpManager {
                     let old = self.remove_peer(i);
                     deliver(Event::Disconnected { group: self.group, token: old, peer_addr: from });
                 }
-                self.accept(k, Hello { from, session, base }, now, tokens, deliver);
+                let token = tokens.allocate(self.group);
+                let entry = &self.sockets[k];
+                let mut peer =
+                    Peer::new(from, token, entry.token, new_session(token.0), &self.config);
+                peer.on_hello(session, base, &entry.socket, now);
+                push_on_connect(&mut self.store, self.greeting.as_deref(), &mut peer, now);
+                info!(addr = %from, "udp client connected");
+                deliver(Event::Accepted { group: self.group, token, peer_addr: from });
+                self.peers.push(peer);
                 self.pump(registry, k, now, false);
             }
             Datagram::HelloAck { session, their_session, base } => {

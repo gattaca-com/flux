@@ -148,20 +148,17 @@ impl Peer {
         std::mem::take(&mut self.ack_due)
     }
 
-    /// Whether a graceful close was requested and is still pending.
     #[inline]
     pub(crate) fn is_draining(&self) -> bool {
         self.close_when_drained
     }
 
-    /// Requests a close once every queued packet is acked. Returns whether
-    /// that is already the case.
+    /// Requests a close; returns whether it can happen already.
     pub(crate) fn close_when_drained(&mut self) -> bool {
         self.close_when_drained = true;
         self.drained()
     }
 
-    /// Whether a requested graceful close can happen now.
     #[inline]
     pub(crate) fn drained(&self) -> bool {
         self.close_when_drained && self.outbound.inflight() == 0

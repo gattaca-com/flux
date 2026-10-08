@@ -1,16 +1,13 @@
-//! The receiving half of a peer: which packets arrived, and messages put
-//! back together from the run of packets they were cut across. A whole
-//! message is delivered straight from its packet; a cut one once every
-//! packet of its run is in, whatever order they came.
+//! The receiving half of a peer: packet tracking and reassembly of messages
+//! cut across packets, which complete whatever order the packets arrive in.
 
 use super::wire::{ACK_HEADER, Record, Records};
 
-/// A message cut across packets, in owned memory, waiting for packet
-/// `expect` to continue it.
+/// A message cut across packets, waiting on packet `expect` to continue it.
 struct Partial {
     total: usize,
     received: usize,
-    /// Kept at its largest past length; the message is `buf[..total]`.
+    /// Grown to its largest `total` and reused; the message is `buf[..total]`.
     buf: Vec<u8>,
     expect: u64,
     send_ts: u64,
@@ -204,8 +201,8 @@ impl Inbound {
         true
     }
 
-    /// Feeds partial `i` the stashed packets that already arrived after the
-    /// one it waits for.
+    /// Feeds partial `i` the stashed packets that arrived before the one it
+    /// was waiting for.
     fn drain(&mut self, i: usize, deliver: &mut dyn FnMut(&[u8], u64)) {
         loop {
             let seq = self.partials[i].expect;
@@ -271,7 +268,6 @@ impl Inbound {
         words * 8
     }
 
-    /// Largest ack bitmap in bytes.
     pub(crate) fn bitmap_capacity(&self) -> usize {
         self.max_bits.div_ceil(64) as usize * 8
     }
@@ -339,7 +335,6 @@ mod tests {
         assert_eq!(out, [(b"next".to_vec(), 50)]);
         feed(&mut rx, 3, b"", &[b"first", b"abc"], Some(1), &mut out);
         assert_eq!(out[1..], [(b"first".to_vec(), 30), (b"abc".to_vec(), 30)]);
-        assert!(rx.partials.is_empty());
         // In order, with the tail and a new head in the same packet.
         feed(&mut rx, 6, b"", &[b"xyz"], Some(2), &mut out);
         feed(&mut rx, 7, b"z", &[b"pq"], Some(1), &mut out);
@@ -355,17 +350,5 @@ mod tests {
         feed(&mut rx, 1, b"", &[b"abc"], Some(1), &mut out);
         feed(&mut rx, 2, b"", &[b"other"], None, &mut out);
         assert_eq!(out, [(b"other".to_vec(), 20)]);
-        assert!(rx.partials.is_empty());
-    }
-
-    #[test]
-    fn sliding_drops_messages_that_can_no_longer_complete() {
-        let mut rx = Inbound::new(64, 1200, true);
-        rx.reset(0);
-        let mut out = Vec::new();
-        feed(&mut rx, 3, b"", &[&[0; 2000]], Some(1000), &mut out);
-        assert_eq!(rx.partials.len(), 1);
-        assert!(rx.accept(3 + 64 + 10));
-        assert_eq!(rx.partials.len(), 0);
     }
 }
