@@ -44,6 +44,8 @@ pub struct GrpcConfig {
     /// Capacity of a pooled call's reply and metadata buffers. Buffers that
     /// grew for a larger message shrink back to it when the call is reused.
     pub pooled_buffer: usize,
+    /// See [`TcpGroupConfig::max_accepts_per_poll`].
+    pub max_accepts_per_poll: Option<usize>,
 }
 
 impl Default for GrpcConfig {
@@ -54,6 +56,7 @@ impl Default for GrpcConfig {
             max_queued_bytes: 4 * 1024 * 1024,
             pooled_calls: 128,
             pooled_buffer: 4 * 1024,
+            max_accepts_per_poll: None,
         }
     }
 }
@@ -584,6 +587,7 @@ impl GrpcServer {
             max_frame_size: config.http2.max_send_buffer,
             backlog_warn_bytes: None,
             max_backlog_bytes: Some(4 * (TCP_BACKLOG + config.http2.max_send_buffer)),
+            max_accepts_per_poll: config.max_accepts_per_poll,
             ..TcpGroupConfig::default()
         }
     }
