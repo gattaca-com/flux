@@ -124,10 +124,7 @@ where
     let stack_size = config.stack_size;
     let run = tile_runner(tile, spine, config);
 
-    let mut builder = std::thread::Builder::new();
-    if !name.as_str().is_empty() {
-        builder = builder.name(name.as_str().to_owned());
-    }
+    let mut builder = std::thread::Builder::new().name(name.as_str().to_owned());
     if let Some(bytes) = stack_size {
         builder = builder.stack_size(bytes);
     }
@@ -222,6 +219,7 @@ pub struct TileInfo {
 
 impl TileInfo {
     pub fn register_tile(&mut self, name: TileName) -> u16 {
+        assert!(!name.is_empty(), "tile name must not be empty");
         let mut i = 0;
         while i < 255 {
             let slot = &mut self.tiles[i];
