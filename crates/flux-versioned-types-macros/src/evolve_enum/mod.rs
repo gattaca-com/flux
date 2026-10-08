@@ -49,6 +49,9 @@ use syn::parse_macro_input;
 /// Pair this with `roll_chain_into!(MyEnum, [MyEnumV1, MyEnumV2])` to get
 /// the type alias and `versioned_deserialize_vec`.
 ///
+/// `extra_attrs { ... }` adds attributes to every version after the default
+/// attrs, as in `evolve_struct!`.
+///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
 /// padding-free `Copy`; it excludes `#[wire_name]`.
 pub fn evolve_enum(input: TokenStream) -> TokenStream {
