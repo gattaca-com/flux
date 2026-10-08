@@ -880,3 +880,32 @@ fn connect_from_binds_source_ip_across_reconnects() {
     }
     assert_eq!(accepted, [local_ip, local_ip]);
 }
+
+/// Readiness is edge-triggered, so connections left queued at the per-pass
+/// limit get no new event; later polls must still accept them.
+#[test]
+fn accept_limit_defers_queued_connections_to_later_polls() {
+    let addr = unused_addr();
+    let mut network = Network::default();
+    let group = network.add_group(TcpGroupConfig {
+        name: "server",
+        max_accepts_per_poll: Some(2),
+        ..Default::default()
+    });
+    network.listen(group, addr).unwrap();
+    let peers: Vec<_> = (0..5).map(|_| std::net::TcpStream::connect(addr).unwrap()).collect();
+
+    let mut per_poll = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && per_poll.iter().sum::<usize>() < peers.len() {
+        let mut accepted = 0;
+        network.poll_with(|event| {
+            if let NetworkEvent::Accepted { .. } = event {
+                accepted += 1;
+            }
+        });
+        per_poll.push(accepted);
+    }
+    assert_eq!(per_poll.iter().sum::<usize>(), peers.len());
+    assert!(per_poll.iter().all(|&accepted| accepted <= 2), "{per_poll:?}");
+}

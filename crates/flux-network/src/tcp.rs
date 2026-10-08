@@ -83,9 +83,8 @@ pub(crate) fn frame_send_ts(header: &[u8]) -> Nanos {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
+pub(crate) fn set_user_timeout(socket: &impl AsRawFd, timeout_ms: u32) {
+    let fd = socket.as_raw_fd();
     unsafe {
         libc::setsockopt(
             fd,
@@ -97,18 +96,16 @@ pub(crate) fn set_user_timeout(stream: &mio::net::TcpStream, timeout_ms: u32) {
     }
 }
 
-/// Set `TCP_USER_TIMEOUT` on a mio `TcpStream`. Stub for non-Linux platforms.
+/// Set `TCP_USER_TIMEOUT` on a socket. Stub for non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn set_user_timeout(_stream: &mio::net::TcpStream, _timeout_ms: u32) {
+pub(crate) fn set_user_timeout(_socket: &impl AsRawFd, _timeout_ms: u32) {
     // TCP_USER_TIMEOUT is not supported on non-Linux platforms.
 }
 
 /// Enable TCP keepalive with short failure detection for silent connections.
 #[cfg(target_os = "linux")]
-pub(crate) fn set_keepalive(stream: &mio::net::TcpStream) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let fd = stream.as_raw_fd();
+pub(crate) fn set_keepalive(socket: &impl AsRawFd) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
     for (level, option, value) in [
         (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
         (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, DEFAULT_TCP_KEEPALIVE_IDLE_SECS),
@@ -132,13 +129,16 @@ pub(crate) fn set_keepalive(stream: &mio::net::TcpStream) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn set_keepalive(_stream: &mio::net::TcpStream) -> io::Result<()> {
+pub(crate) fn set_keepalive(_socket: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
 struct Listener {
     token: Token,
     socket: TcpListener,
+    /// Stopped at `max_accepts_per_poll` with connections still queued.
+    /// Readiness is edge-triggered, so no new event announces them.
+    accept_deferred: bool,
     #[cfg(feature = "tls")]
     tls: Option<std::sync::Arc<crate::tls::ServerConfig>>,
 }
@@ -247,6 +247,7 @@ impl TcpManager {
                 "on_connect_msg exceeds max_frame_size"
             );
         }
+        assert!(config.max_accepts_per_poll != Some(0), "max_accepts_per_poll must be nonzero");
         if let Some(max) = config.max_backlog_bytes {
             assert!(max > 0, "max_backlog_bytes must be nonzero");
             if let Some(warn) = config.backlog_warn_bytes {
@@ -298,12 +299,19 @@ impl TcpManager {
         &mut self,
         registry: &Registry,
         tokens: &mut Tokens,
+        dcache: Option<&DCache>,
         handler: &mut F,
     ) -> bool
     where
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
-        let work = self.drain_pending_disconnects(handler);
+        let mut work = self.drain_pending_disconnects(handler);
+        for index in 0..self.listeners.len() {
+            if self.listeners[index].accept_deferred {
+                work = true;
+                self.accept_connections(registry, index, tokens, dcache, handler);
+            }
+        }
         if !self.connections.is_empty() {
             self.maybe_reconnect(registry, tokens);
             if let Some((max, timeout)) = self.config.max_backlog_frames {
@@ -311,6 +319,10 @@ impl TcpManager {
             }
         }
         work
+    }
+
+    pub(crate) fn has_deferred_accepts(&self) -> bool {
+        self.listeners.iter().any(|listener| listener.accept_deferred)
     }
 
     pub(crate) fn post_poll<F>(&mut self, handler: &mut F) -> bool
@@ -386,7 +398,7 @@ impl TcpManager {
         tokens: &mut Tokens,
     ) -> io::Result<Token> {
         let group = self.group;
-        let mut socket = bind_listener(addr, self.config.socket_buf_size, self.config.reuse_port)?;
+        let mut socket = bind_listener(addr, &self.config)?;
         let token = tokens.allocate(group);
         if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
             tokens.retire(token);
@@ -395,6 +407,7 @@ impl TcpManager {
         self.listeners.push(Listener {
             token,
             socket,
+            accept_deferred: false,
             #[cfg(feature = "tls")]
             tls: None,
         });
@@ -509,7 +522,7 @@ impl TcpManager {
             return false;
         }
         let peer_addr = self.connections[index].peer_addr;
-        warn!(%peer_addr, ?timeout, "tls handshake timed out");
+        warn!(%peer_addr, %timeout, "tls handshake timed out");
         let accepted = self.connections[index].kind == ConnectionKind::Accepted;
         let notify = self.connections[index].announced();
         self.disconnect_index(registry, index, notify, tokens);
@@ -693,7 +706,14 @@ impl TcpManager {
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let group = self.group;
+        let max_accepts = self.config.max_accepts_per_poll.unwrap_or(usize::MAX);
+        let mut accepts = 0;
+        self.listeners[listener_index].accept_deferred = false;
         loop {
+            if accepts == max_accepts {
+                self.listeners[listener_index].accept_deferred = true;
+                return;
+            }
             let accepted = self.listeners[listener_index].socket.accept();
             let (mut socket, peer_addr) = match accepted {
                 Ok(accepted) => accepted,
@@ -703,6 +723,7 @@ impl TcpManager {
                     break;
                 }
             };
+            accepts += 1;
             #[cfg(feature = "tls")]
             let tls = match &self.listeners[listener_index].tls {
                 Some(config) => match Session::accept(config.clone()) {
@@ -719,24 +740,6 @@ impl TcpManager {
             let tls = None;
             let (token, stream, timers, group_name) = {
                 let config = &self.config;
-                if let Some(size) = config.socket_buf_size {
-                    set_socket_buf_size(&socket, size);
-                }
-                if config.nodelay &&
-                    let Err(err) = socket.set_nodelay(true)
-                {
-                    warn!(?err, %peer_addr, "couldn't set nodelay on accepted tcp stream");
-                    let _ = socket.shutdown(Shutdown::Both);
-                    continue;
-                }
-                if config.keepalive &&
-                    let Err(err) = set_keepalive(&socket)
-                {
-                    warn!(?err, %peer_addr, "couldn't set keepalive on accepted tcp stream");
-                    let _ = socket.shutdown(Shutdown::Both);
-                    continue;
-                }
-                set_user_timeout(&socket, config.user_timeout_ms);
                 let token = tokens.allocate(group);
                 if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
                     warn!(?err, %peer_addr, "couldn't register accepted tcp stream");
@@ -800,7 +803,10 @@ impl TcpManager {
     {
         let token = event.token();
         if let Some(index) = self.listeners.iter().position(|listener| listener.token == token) {
-            self.accept_connections(registry, index, tokens, dcache, handler);
+            // A deferred listener is serviced once per poll, from `pre_poll`.
+            if !self.listeners[index].accept_deferred {
+                self.accept_connections(registry, index, tokens, dcache, handler);
+            }
             return;
         }
         let Some(index) = self.index_of(token) else {
@@ -1325,14 +1331,7 @@ impl TcpManager {
     }
 }
 
-fn bind_listener(
-    addr: SocketAddr,
-    socket_buf_size: Option<usize>,
-    reuse_port: bool,
-) -> io::Result<TcpListener> {
-    if socket_buf_size.is_none() && !reuse_port {
-        return TcpListener::bind(addr);
-    }
+fn bind_listener(addr: SocketAddr, config: &TcpGroupConfig) -> io::Result<TcpListener> {
     let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     let fd = unsafe {
         libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
@@ -1354,7 +1353,7 @@ fn bind_listener(
     {
         return Err(io::Error::last_os_error());
     }
-    if reuse_port {
+    if config.reuse_port {
         if unsafe {
             libc::setsockopt(
                 listener.as_raw_fd(),
@@ -1368,10 +1367,28 @@ fn bind_listener(
             return Err(io::Error::last_os_error());
         }
     }
-    // Accepted sockets inherit the receive window negotiated before accept().
-    if let Some(size) = socket_buf_size {
+    // Accepted sockets inherit these options, and the receive window
+    // negotiated before accept(), so they are set once here, not per accept.
+    if let Some(size) = config.socket_buf_size {
         set_socket_buf_size(&listener, size);
     }
+    if config.nodelay &&
+        unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                ptr::from_ref(&enable).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if config.keepalive {
+        set_keepalive(&listener)?;
+    }
+    set_user_timeout(&listener, config.user_timeout_ms);
     let (storage, len) = sockaddr(addr);
     if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
         return Err(io::Error::last_os_error());
@@ -1735,35 +1752,20 @@ impl FramedStream {
         config: &TcpGroupConfig,
         dcache: bool,
     ) -> Self {
-        // Allocated here so the read path only allocates for an oversized
-        // frame. Raw reads at most `max_frame_size` at a time.
+        // Receive buffers are allocated by the first read, so connections that
+        // never send cost no buffer.
         let direct = dcache || config.aligned_payloads;
-        let rx_len = match config.framing {
-            Framing::Raw => INITIAL_RX_BUFFER_SIZE.min(config.max_frame_size),
-            Framing::LengthPrefixed => INITIAL_RX_BUFFER_SIZE,
-        };
         Self {
             socket,
             token,
             peer_addr,
-            rx_buffer: RxBuffer {
-                bytes: if direct { Vec::new() } else { vec![0; rx_len] },
-                head: 0,
-                tail: 0,
-            },
+            rx_buffer: RxBuffer { bytes: Vec::new(), head: 0, tail: 0 },
             send_queue: ByteQueue {
                 framed: config.framing == Framing::LengthPrefixed,
                 ..ByteQueue::default()
             },
             writable_armed: false,
-            direct_rx: direct.then(|| DirectRx {
-                words: if dcache {
-                    Vec::new()
-                } else {
-                    vec![0; INITIAL_RX_BUFFER_SIZE.min(config.max_frame_size).div_ceil(8)]
-                },
-                ..DirectRx::default()
-            }),
+            direct_rx: direct.then(DirectRx::default),
         }
     }
 
@@ -1783,6 +1785,13 @@ impl FramedStream {
     {
         if event.is_readable() {
             if config.framing == Framing::Raw {
+                // An empty buffer reads as a closed peer. Raw reads at most
+                // `max_frame_size` at a time.
+                if self.rx_buffer.bytes.is_empty() {
+                    self.rx_buffer
+                        .bytes
+                        .resize(INITIAL_RX_BUFFER_SIZE.min(config.max_frame_size), 0);
+                }
                 loop {
                     match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
                         Ok(0) => return StreamState::Disconnected,
@@ -2360,7 +2369,8 @@ impl DirectRx {
                             .map_err(|err| io::Error::other(format!("dcache reserve: {err}")))?
                     } else {
                         if self.words.len() < len.div_ceil(8) {
-                            self.words.resize(len.div_ceil(8), 0);
+                            self.words
+                                .resize(len.max(INITIAL_RX_BUFFER_SIZE.min(max)).div_ceil(8), 0);
                         }
                         DCacheRef { offset: 0, len }
                     };

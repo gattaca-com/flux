@@ -278,6 +278,11 @@ pub struct TcpGroupConfig {
     /// disconnected the limit is hard: sends that would exceed it are
     /// rejected at once.
     pub max_backlog_frames: Option<(usize, Duration)>,
+    /// Most connections a listener accepts in one pass. While more stay queued
+    /// in the kernel, the listener gets one pass per poll, so a burst of
+    /// connections can't stall one poll. `None` accepts until the queue is
+    /// empty.
+    pub max_accepts_per_poll: Option<usize>,
 }
 
 impl Default for TcpGroupConfig {
@@ -300,6 +305,7 @@ impl Default for TcpGroupConfig {
             telemetry: NetworkTelemetry::Disabled,
             replay: ReplayPolicy::Replay,
             max_backlog_frames: None,
+            max_accepts_per_poll: None,
         }
     }
 }
@@ -959,9 +965,12 @@ impl NetworkCore {
         let mut work = false;
         for group in &mut self.groups {
             work |= match group {
-                GroupState::Tcp(tcp) => {
-                    tcp.pre_poll(self.poller.registry(), &mut self.tokens, handler)
-                }
+                GroupState::Tcp(tcp) => tcp.pre_poll(
+                    self.poller.registry(),
+                    &mut self.tokens,
+                    self.dcache.as_deref(),
+                    handler,
+                ),
                 GroupState::Udp(udp) => udp.pre_poll(self.poller.registry(), handler),
             };
         }
@@ -1054,6 +1063,7 @@ impl NetworkWithExternalPoll {
             .groups
             .iter()
             .map(|group| match group {
+                GroupState::Tcp(tcp) if tcp.has_deferred_accepts() => Duration::ZERO,
                 GroupState::Tcp(tcp) => {
                     tcp.config.reconnect_interval.min(tcp.config.handshake_timeout).min(
                         tcp.config.max_backlog_frames.map_or(Duration::MAX, |(_, timeout)| timeout),
