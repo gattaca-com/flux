@@ -271,3 +271,51 @@ fn foreign_token_trips_the_containment_assert() {
     // Debug builds reject the token; release builds emit no NetworkEvent for it.
     network.handle_event(event, &mut |_| panic!("no NetworkEvent expected for a foreign token"));
 }
+
+/// The per-poll accept limit covers both phases: leftovers accepted in
+/// `pre_poll` count against new arrivals handled in the same poll.
+#[test]
+fn accept_limit_is_shared_by_pre_poll_and_readiness() {
+    let addr = unused_addr();
+    let mut poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(128);
+    let mut server =
+        NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), SERVER_TOKENS);
+    let group = server.add_group(TcpGroupConfig {
+        name: "server",
+        max_accepts_per_poll: Some(2),
+        ..TcpGroupConfig::default()
+    });
+    server.listen(group, addr).unwrap();
+
+    let accepted = Cell::new(0);
+    let mut on_event = |event: NetworkEvent<'_>| {
+        if let NetworkEvent::Accepted { .. } = event {
+            accepted.set(accepted.get() + 1);
+        }
+    };
+    let mut peers: Vec<_> = (0..3).map(|_| std::net::TcpStream::connect(addr).unwrap()).collect();
+
+    server.pre_poll(&mut on_event);
+    poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
+    for event in &events {
+        server.handle_event(event, &mut on_event);
+    }
+    server.post_poll(&mut on_event);
+    assert_eq!(accepted.replace(0), 2);
+    assert_eq!(server.max_poll_interval(), Duration::ZERO);
+
+    server.pre_poll(&mut on_event);
+    assert_eq!(accepted.get(), 1);
+    peers.extend((0..2).map(|_| std::net::TcpStream::connect(addr).unwrap()));
+    poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
+    for event in &events {
+        server.handle_event(event, &mut on_event);
+    }
+    server.post_poll(&mut on_event);
+    assert_eq!(accepted.replace(0), 2);
+
+    server.pre_poll(&mut on_event);
+    assert_eq!(accepted.get(), 1);
+    assert_eq!(peers.len(), 5);
+}

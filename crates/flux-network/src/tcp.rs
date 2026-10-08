@@ -139,6 +139,9 @@ struct Listener {
     /// Stopped at `max_accepts_per_poll` with connections still queued.
     /// Readiness is edge-triggered, so no new event announces them.
     accept_deferred: bool,
+    /// Connections accepted since this poll's `pre_poll`, across its
+    /// `pre_poll` and readiness phases.
+    accepts_this_poll: usize,
     #[cfg(feature = "tls")]
     tls: Option<std::sync::Arc<crate::tls::ServerConfig>>,
 }
@@ -307,6 +310,7 @@ impl TcpManager {
     {
         let mut work = self.drain_pending_disconnects(handler);
         for index in 0..self.listeners.len() {
+            self.listeners[index].accepts_this_poll = 0;
             if self.listeners[index].accept_deferred {
                 work = true;
                 self.accept_connections(registry, index, tokens, dcache, handler);
@@ -408,6 +412,7 @@ impl TcpManager {
             token,
             socket,
             accept_deferred: false,
+            accepts_this_poll: 0,
             #[cfg(feature = "tls")]
             tls: None,
         });
@@ -707,10 +712,9 @@ impl TcpManager {
     {
         let group = self.group;
         let max_accepts = self.config.max_accepts_per_poll.unwrap_or(usize::MAX);
-        let mut accepts = 0;
         self.listeners[listener_index].accept_deferred = false;
         loop {
-            if accepts == max_accepts {
+            if self.listeners[listener_index].accepts_this_poll == max_accepts {
                 self.listeners[listener_index].accept_deferred = true;
                 return;
             }
@@ -723,7 +727,7 @@ impl TcpManager {
                     break;
                 }
             };
-            accepts += 1;
+            self.listeners[listener_index].accepts_this_poll += 1;
             #[cfg(feature = "tls")]
             let tls = match &self.listeners[listener_index].tls {
                 Some(config) => match Session::accept(config.clone()) {
@@ -803,10 +807,7 @@ impl TcpManager {
     {
         let token = event.token();
         if let Some(index) = self.listeners.iter().position(|listener| listener.token == token) {
-            // A deferred listener is serviced once per poll, from `pre_poll`.
-            if !self.listeners[index].accept_deferred {
-                self.accept_connections(registry, index, tokens, dcache, handler);
-            }
+            self.accept_connections(registry, index, tokens, dcache, handler);
             return;
         }
         let Some(index) = self.index_of(token) else {

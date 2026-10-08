@@ -278,10 +278,9 @@ pub struct TcpGroupConfig {
     /// disconnected the limit is hard: sends that would exceed it are
     /// rejected at once.
     pub max_backlog_frames: Option<(usize, Duration)>,
-    /// Most connections a listener accepts in one pass. While more stay queued
-    /// in the kernel, the listener gets one pass per poll, so a burst of
-    /// connections can't stall one poll. `None` accepts until the queue is
-    /// empty.
+    /// Most connections a listener accepts per poll. The rest stay queued in
+    /// the kernel and are accepted on later polls, so a burst of connections
+    /// can't stall one poll. `None` accepts until the queue is empty.
     pub max_accepts_per_poll: Option<usize>,
 }
 
