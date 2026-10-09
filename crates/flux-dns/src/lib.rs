@@ -12,9 +12,17 @@ use std::{
 };
 
 use flux_timing::{Duration, Instant};
+use flux_utils::ArrayVec;
 
 const TIMEOUT_SECS: u64 = 2;
 const MAX_MESSAGE: usize = 512;
+/// Longest host name: 253 characters encode to 255 bytes.
+const MAX_HOST: usize = 253;
+/// The encoded name (the first label's length byte, the host, the closing root
+/// label), then type and class.
+const MAX_QUESTION: usize = 1 + MAX_HOST + 1 + 4;
+/// More `A` records than a 512-byte message can hold.
+const MAX_ADDRS: usize = 32;
 
 pub struct Resolver {
     socket: UdpSocket,
@@ -24,8 +32,8 @@ pub struct Resolver {
     pending: Vec<Pending>,
     rng: u64,
     timeout: Duration,
-    buf: Vec<u8>,
-    addrs: Vec<Ipv4Addr>,
+    buf: [u8; MAX_MESSAGE],
+    addrs: ArrayVec<Ipv4Addr, MAX_ADDRS>,
 }
 
 struct Pending {
@@ -33,12 +41,13 @@ struct Pending {
     id: u16,
     sent: Instant,
     /// The question as sent, which the answer must repeat.
-    question: Vec<u8>,
+    question: ArrayVec<u8, MAX_QUESTION>,
 }
 
 impl Resolver {
     /// Answers from `/etc/hosts`, else queries the first `nameserver` in
     /// `/etc/resolv.conf`, or `127.0.0.1` as glibc does without one.
+    #[cfg(target_os = "linux")]
     pub fn system() -> io::Result<Self> {
         let server = fs::read_to_string("/etc/resolv.conf")
             .ok()
@@ -69,8 +78,8 @@ impl Resolver {
             pending: Vec::new(),
             rng: RandomState::new().hash_one(0) | 1,
             timeout: Duration::from_secs(TIMEOUT_SECS),
-            buf: Vec::with_capacity(MAX_MESSAGE),
-            addrs: Vec::new(),
+            buf: [0; MAX_MESSAGE],
+            addrs: ArrayVec::new(),
         })
     }
 
@@ -91,29 +100,29 @@ impl Resolver {
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
         let id = self.rng as u16;
-        self.buf.clear();
-        self.buf.extend_from_slice(&id.to_be_bytes());
-        // Recursion desired, one question.
-        self.buf.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let invalid =
+            || io::Error::new(io::ErrorKind::InvalidInput, format!("invalid host name {host}"));
+        if host.len() > MAX_HOST {
+            return Err(invalid());
+        }
+        let mut question = ArrayVec::<u8, MAX_QUESTION>::new();
         for label in host.split('.') {
             let len = u8::try_from(label.len())
                 .ok()
                 .filter(|len| (1..64).contains(len))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid host name {host}"))
-                })?;
-            self.buf.push(len);
-            self.buf.extend_from_slice(label.as_bytes());
+                .ok_or_else(invalid)?;
+            question.push(len);
+            question.extend(label.bytes());
         }
         // Root label, type A, class IN.
-        self.buf.extend_from_slice(&[0, 0, 1, 0, 1]);
-        self.socket.send(&self.buf)?;
-        self.pending.push(Pending {
-            key,
-            id,
-            sent: Instant::now(),
-            question: self.buf[12..].to_vec(),
-        });
+        question.extend([0, 0, 1, 0, 1]);
+        let mut query = ArrayVec::<u8, { 12 + MAX_QUESTION }>::new();
+        query.extend(id.to_be_bytes());
+        // Recursion desired, one question.
+        query.extend([0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        query.extend(question.iter().copied());
+        self.socket.send(query.as_slice())?;
+        self.pending.push(Pending { key, id, sent: Instant::now(), question });
         Ok(())
     }
 
@@ -126,7 +135,6 @@ impl Resolver {
         if self.pending.is_empty() {
             return;
         }
-        self.buf.resize(MAX_MESSAGE, 0);
         while let Ok(len) = self.socket.recv(&mut self.buf) {
             let msg = &self.buf[..len];
             let Some(id) = msg.get(..2).map(|id| u16::from_be_bytes([id[0], id[1]])) else {
@@ -134,15 +142,16 @@ impl Resolver {
             };
             let Some(index) = self.pending.iter().position(|pending| {
                 pending.id == id &&
-                    msg.get(12..12 + pending.question.len())
-                        .is_some_and(|question| question.eq_ignore_ascii_case(&pending.question))
+                    msg.get(12..12 + pending.question.len()).is_some_and(|question| {
+                        question.eq_ignore_ascii_case(pending.question.as_slice())
+                    })
             }) else {
                 continue
             };
             let key = self.pending.swap_remove(index).key;
             self.addrs.clear();
             parse_a(msg, &mut self.addrs);
-            f(key, &self.addrs);
+            f(key, self.addrs.as_slice());
         }
         let now = Instant::now();
         self.pending.retain(|pending| {
@@ -155,7 +164,7 @@ impl Resolver {
     }
 }
 
-fn parse_a(msg: &[u8], addrs: &mut Vec<Ipv4Addr>) {
+fn parse_a(msg: &[u8], addrs: &mut ArrayVec<Ipv4Addr, MAX_ADDRS>) {
     let u16_at =
         |at: usize| msg.get(at..at + 2).map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
     let (Some(flags), Some(questions), Some(answers)) = (u16_at(2), u16_at(4), u16_at(6)) else {
@@ -180,9 +189,10 @@ fn parse_a(msg: &[u8], addrs: &mut Vec<Ipv4Addr>) {
         let Some(rdata) = msg.get(data..data + usize::from(len)) else { return };
         if kind == 1 &&
             class == 1 &&
-            let Ok(ip) = <[u8; 4]>::try_from(rdata)
+            let Ok(ip) = <[u8; 4]>::try_from(rdata) &&
+            addrs.try_push(Ipv4Addr::from(ip)).is_some()
         {
-            addrs.push(Ipv4Addr::from(ip));
+            return;
         }
         at = data + usize::from(len);
     }
@@ -226,8 +236,8 @@ mod tests {
         msg.extend_from_slice(&[0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xC0, 16]);
         // github.com A 140.82.121.4.
         msg.extend_from_slice(&[0xC0, 16, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 140, 82, 121, 4]);
-        let mut addrs = Vec::new();
+        let mut addrs = ArrayVec::new();
         parse_a(&msg, &mut addrs);
-        assert_eq!(addrs, [Ipv4Addr::new(140, 82, 121, 4)]);
+        assert_eq!(addrs.as_slice(), [Ipv4Addr::new(140, 82, 121, 4)]);
     }
 }
