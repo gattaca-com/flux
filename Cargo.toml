@@ -5,6 +5,7 @@ members = [
   "crates/flux-communication",
   "crates/flux-ctl",
   "crates/flux-disk",
+  "crates/flux-dns",
   "crates/flux-gather",
   "crates/flux-mongo",
   "crates/flux-network",

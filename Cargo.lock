@@ -1732,6 +1732,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-dns"
+version = "0.7.5"
+
+[[package]]
 name = "flux-gather"
 version = "0.7.5"
 dependencies = [
