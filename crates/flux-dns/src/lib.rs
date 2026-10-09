@@ -9,10 +9,11 @@ use std::{
     hash::BuildHasher,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    time::{Duration, Instant},
 };
 
-const TIMEOUT: Duration = Duration::from_secs(2);
+use flux_timing::{Duration, Instant};
+
+const TIMEOUT_SECS: u64 = 2;
 const MAX_MESSAGE: usize = 512;
 
 pub struct Resolver {
@@ -22,6 +23,7 @@ pub struct Resolver {
     ready: Vec<(usize, Ipv4Addr)>,
     pending: Vec<Pending>,
     rng: u64,
+    timeout: Duration,
     buf: Vec<u8>,
     addrs: Vec<Ipv4Addr>,
 }
@@ -66,6 +68,7 @@ impl Resolver {
             ready: Vec::new(),
             pending: Vec::new(),
             rng: RandomState::new().hash_one(0) | 1,
+            timeout: Duration::from_secs(TIMEOUT_SECS),
             buf: Vec::with_capacity(MAX_MESSAGE),
             addrs: Vec::new(),
         })
@@ -143,7 +146,7 @@ impl Resolver {
         }
         let now = Instant::now();
         self.pending.retain(|pending| {
-            let waiting = now.duration_since(pending.sent) < TIMEOUT;
+            let waiting = now.saturating_sub(pending.sent) < self.timeout;
             if !waiting {
                 f(pending.key, &[]);
             }
