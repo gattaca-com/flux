@@ -917,10 +917,10 @@ fn udp_disconnect_when_drained_waits_for_acks() {
     assert_eq!(disconnected, Some(accepted));
 }
 
-/// Clearing the backlog drops what has not started going out and nothing
-/// else; a following send still arrives.
+/// Clearing the backlog leaves the greeting, which rides in the handshake;
+/// a following send still arrives.
 #[test]
-fn udp_clear_backlog_drops_unsent_messages() {
+fn udp_clear_backlog_leaves_the_greeting() {
     let mut server = Network::default();
     let server_group =
         server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
@@ -932,15 +932,14 @@ fn udp_clear_backlog_drops_unsent_messages() {
     });
     let (_, tok) = connect_pair(&mut server, server_group, &mut client, client_group, free_addr());
     assert_eq!(client.clear_backlog(tok), 0, "nothing queued on an idle session");
-    // The new greeting waits for the handshake and can still be discarded.
     client.disconnect(tok);
-    assert_eq!(client.clear_backlog(tok), 1);
+    assert_eq!(client.clear_backlog(tok), 0);
 
     let mut got = Vec::new();
     let mut connected = false;
     let mut sent = false;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while got.is_empty() {
+    while got.len() < 2 {
         assert!(Instant::now() < deadline, "delivery after clear");
         client.poll_with(|e| connected |= matches!(e, NetworkEvent::Connected { .. }));
         if connected && !sent {
@@ -963,7 +962,7 @@ fn udp_clear_backlog_drops_unsent_messages() {
             }
         });
     }
-    assert_eq!(got, [b"after".to_vec()]);
+    assert_eq!(got, [b"hello".to_vec(), b"after".to_vec()]);
 }
 
 /// A listener token is not a session: `disconnect` leaves it alone, while

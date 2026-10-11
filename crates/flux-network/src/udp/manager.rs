@@ -5,16 +5,16 @@ use std::{
     os::fd::AsRawFd,
 };
 
-use flux_timing::{Duration, Instant};
+use flux_timing::{Duration, Instant, Nanos};
 use flux_utils::{DCache, safe_assert};
 use mio::{Interest, Registry, Token, event::Event as MioEvent, net::UdpSocket};
 use tracing::{debug, error, info, warn};
 
 use super::{
     outbound::MessageStore,
-    peer::{Peer, SendOutcome},
+    peer::{Peer, SendOutcome, deliver_message},
     sys::{RecvBatch, SendBatch},
-    wire::{self, Datagram, MESSAGE_HEADER},
+    wire::{self, Datagram, HELLO_ACK_SIZE, MESSAGE_HEADER},
 };
 use crate::network::{
     Event, Group, PayloadBuf, RxPayload, Tokens, UdpGroupConfig, set_socket_buf_size,
@@ -41,23 +41,9 @@ fn arm_writable(registry: &Registry, entry: &mut Endpoint) {
     entry.writable_armed = true;
 }
 
-fn push_on_connect(
-    store: &mut MessageStore,
-    on_connect_wire_msg: Option<Vec<u8>>,
-    peer: &mut Peer,
-) {
-    if let Some(mut stream) = on_connect_wire_msg {
-        let slot = store.insert(&mut stream);
-        let _ = peer.outbound.enqueue(store, slot);
-        store.release(slot);
-    }
-}
-
-fn with_header(msg: &[u8]) -> Vec<u8> {
-    let mut stream = Vec::with_capacity(MESSAGE_HEADER + msg.len());
-    stream.extend_from_slice(&(msg.len() as u32).to_le_bytes());
-    stream.extend_from_slice(msg);
-    stream
+#[inline]
+fn on_connect_msg(config: &UdpGroupConfig) -> &[u8] {
+    config.on_connect_msg.as_deref().unwrap_or_default()
 }
 
 fn outbound_bind_addr(peer: SocketAddr) -> SocketAddr {
@@ -124,7 +110,6 @@ pub(crate) struct UdpManagerState {
     store: MessageStore,
     /// users serialise here. and then it's moved to `MessageStore`
     send_buffer: Vec<u8>,
-    on_connect_wire_msg: Option<Vec<u8>>,
 
     batch: SendBatch,
     // entries here correspond to `SendBatch` order
@@ -141,17 +126,19 @@ impl UdpManagerState {
     fn new(config: UdpGroupConfig, group: Group) -> Self {
         let udp = config.udp;
         udp.validate();
-        assert!(
-            config
-                .on_connect_msg
-                .as_ref()
-                .is_none_or(|msg| !msg.is_empty() && msg.len() <= udp.max_message_size),
-            "invalid UDP on-connect message length"
-        );
-        let on_connect_wire_msg = config.on_connect_msg.as_deref().map(with_header);
+        if let Some(msg) = &config.on_connect_msg {
+            assert!(!msg.is_empty(), "udp on_connect_msg must be nonempty");
+            assert!(
+                msg.len() <= udp.max_message_size,
+                "udp on_connect_msg exceeds max_message_size"
+            );
+            assert!(
+                HELLO_ACK_SIZE + msg.len() <= udp.max_datagram_size,
+                "udp on_connect_msg does not fit in a hello ack of max_datagram_size"
+            );
+        }
         Self {
             config,
-            on_connect_wire_msg,
             group,
             sockets: Vec::new(),
             peers: Vec::new(),
@@ -211,8 +198,7 @@ impl UdpManagerState {
         };
         let mut peer = Peer::new(addr, token, token, &self.config);
         let now = Instant::now();
-        peer.send_hello(&socket, now);
-        push_on_connect(&mut self.store, self.on_connect_wire_msg.clone(), &mut peer);
+        peer.send_hello(&socket, on_connect_msg(&self.config), now);
         self.sockets.push(Endpoint { token, socket, listener: false, writable_armed: false });
         self.peers.push(peer);
         token
@@ -242,13 +228,12 @@ impl UdpManagerState {
             self.pending_disconnect_notifications.push((peer.token, peer.addr));
         }
         peer.reset_connection(&mut self.store);
-        push_on_connect(&mut self.store, self.on_connect_wire_msg.clone(), peer);
         let endpoint = self
             .sockets
             .iter()
             .find(|s| s.token == peer.socket_token)
             .expect("outbound peer must have a socket");
-        peer.send_hello(&endpoint.socket, now);
+        peer.send_hello(&endpoint.socket, on_connect_msg(&self.config), now);
     }
 
     fn remove_peer(&mut self, index: usize) -> Token {
@@ -556,7 +541,7 @@ impl UdpManagerState {
                 .iter()
                 .find(|s| s.token == peer.socket_token)
                 .expect("outbound peer must have a socket");
-            peer.send_hello(&endpoint.socket, now);
+            peer.send_hello(&endpoint.socket, on_connect_msg(&self.config), now);
         }
     }
 
@@ -581,7 +566,7 @@ impl UdpManagerState {
                 .iter_mut()
                 .find(|s| s.token == peer.socket_token)
                 .expect("peer must have a socket");
-            match peer.tick(&entry.socket, now, peer_timeout) {
+            match peer.tick(&entry.socket, on_connect_msg(&self.config), now, peer_timeout) {
                 Ok(SendOutcome::Done) => {}
                 Ok(SendOutcome::WouldBlock) => arm_writable(registry, entry),
                 Err(()) => {
@@ -648,12 +633,13 @@ impl UdpManagerState {
                 };
                 self.peers[i].on_ack(session, ack_next, bits, bitmap, &mut self.store, now);
             }
-            Datagram::Hello { session, base } => {
-                if !self.sockets[k].listener {
+            Datagram::Hello { session, base, msg } => {
+                if !self.sockets[k].listener || !self.on_connect_fits(msg, from) {
                     return;
                 }
                 if let Some(i) = peer {
-                    if self.peers[i].on_hello(session, base, &self.sockets[k].socket, now) {
+                    let (socket, ours) = (&self.sockets[k].socket, on_connect_msg(&self.config));
+                    if self.peers[i].on_hello(session, base, socket, ours, now) {
                         return;
                     }
                     let old = self.remove_peer(i);
@@ -662,15 +648,18 @@ impl UdpManagerState {
                 let token = tokens.allocate(self.group);
                 let entry = &self.sockets[k];
                 let mut peer = Peer::new(from, token, entry.token, &self.config);
-                peer.on_hello(session, base, &entry.socket, now);
-                push_on_connect(&mut self.store, self.on_connect_wire_msg.clone(), &mut peer);
+                peer.on_hello(session, base, &entry.socket, on_connect_msg(&self.config), now);
                 info!(addr = %from, "udp client connected");
                 deliver(Event::Accepted { group: self.group, token, peer_addr: from });
+                self.deliver_on_connect(token, msg, dcache, deliver);
                 self.peers.push(peer);
                 self.pump(registry, k, now, false);
             }
-            Datagram::HelloAck { session, their_session, base } => {
+            Datagram::HelloAck { session, their_session, base, msg } => {
                 let Some(i) = peer.filter(|&i| self.peers[i].is_outbound()) else { return };
+                if !self.on_connect_fits(msg, from) {
+                    return;
+                }
                 let token = self.peers[i].token;
                 if self.peers[i].lost_by_remote(their_session, Some(session)) {
                     warn!(addr = %from, "udp peer lost our session, reconnecting");
@@ -680,6 +669,7 @@ impl UdpManagerState {
                     self.drain_pending_disconnects(deliver);
                     debug!(addr = %from, "udp connected");
                     deliver(Event::Connected { group: self.group, token, peer_addr: from });
+                    self.deliver_on_connect(token, msg, dcache, deliver);
                     self.pump(registry, k, now, false);
                 }
             }
@@ -750,6 +740,35 @@ impl UdpManagerState {
 
     pub(crate) fn tick_interval(&self) -> Duration {
         self.config.udp.min_rto / 2
+    }
+
+    /// Whether a received on-connect message is one we take; a hello that
+    /// carries a larger one is ignored, so the handshake never completes.
+    fn on_connect_fits(&self, msg: &[u8], from: SocketAddr) -> bool {
+        let fits = msg.len() <= self.config.udp.max_message_size;
+        if !fits {
+            warn!(addr = %from, len = msg.len(), "udp on-connect message exceeds max_message_size");
+        }
+        fits
+    }
+
+    /// Delivers the remote's on-connect message, if it sent one.
+    fn deliver_on_connect<F>(
+        &self,
+        token: Token,
+        msg: &[u8],
+        dcache: Option<&DCache>,
+        deliver: &mut F,
+    ) where
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
+    {
+        if msg.is_empty() {
+            return;
+        }
+        let group = self.group;
+        deliver_message(&mut None, msg, Nanos::now(), dcache, &mut |payload, send_ts| {
+            deliver(Event::Message { group, token, payload, send_ts });
+        });
     }
 
     #[inline]

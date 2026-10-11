@@ -13,10 +13,7 @@ use super::{
     inbound::Inbound,
     outbound::{MessageStore, Outbound},
     sys::{SendBatch, SockAddr},
-    wire::{
-        self, ACK_HEADER, HELLO_ACK_SIZE, HELLO_SIZE, MESSAGE_HEADER, Packet, RESET_SIZE, Record,
-        Records,
-    },
+    wire::{self, ACK_HEADER, HELLO_ACK_SIZE, MESSAGE_HEADER, Packet, RESET_SIZE, Record, Records},
 };
 use crate::{
     NetworkTelemetry,
@@ -98,7 +95,8 @@ pub(crate) struct Peer {
     /// Drop the session once every packet is acked; sends are refused.
     close_when_drained: bool,
     latency: Option<Timer>,
-    /// Control datagram staging: the largest ack.
+    /// Control datagram staging: the largest ack, or a hello ack carrying
+    /// the on-connect message.
     ctrl: Vec<u8>,
 }
 
@@ -119,6 +117,9 @@ impl Peer {
             !udp.reliable,
         );
         let local_session = new_session(token.0);
+        let on_connect_len = config.on_connect_msg.as_ref().map_or(0, Vec::len);
+        let ctrl_len =
+            (ACK_HEADER + inbound.bitmap_capacity()).max(HELLO_ACK_SIZE + on_connect_len);
         Self {
             addr,
             token,
@@ -132,7 +133,7 @@ impl Peer {
             local_session,
             remote_session: None,
             outbound: Outbound::new(config, &label),
-            ctrl: vec![0; ACK_HEADER + inbound.bitmap_capacity()],
+            ctrl: vec![0; ctrl_len],
             inbound,
             last_recv: now,
             last_send: now,
@@ -223,15 +224,20 @@ impl Peer {
     }
 
     /// Also schedules the retry, backing off per attempt up to `max_rto`.
-    pub(crate) fn send_hello(&mut self, socket: &UdpSocket, now: Instant) -> SendOutcome {
+    /// `msg` is our on-connect message; empty without one.
+    pub(crate) fn send_hello(
+        &mut self,
+        socket: &UdpSocket,
+        msg: &[u8],
+        now: Instant,
+    ) -> SendOutcome {
         let rto = self.outbound.rto().current();
         let interval = (rto.0 << self.hello_backoff.min(6)).min(self.max_rto.0);
         self.hello_due = now + Duration(interval);
         self.hello_backoff = self.hello_backoff.saturating_add(1);
-        let mut buf = [0; HELLO_SIZE];
-        wire::hello(&mut buf, self.local_session, self.outbound.base());
+        let n = wire::hello(&mut self.ctrl, self.local_session, self.outbound.base(), msg);
         self.last_send = now;
-        send_datagram(socket, self.addr, &buf)
+        send_datagram(socket, self.addr, &self.ctrl[..n])
     }
 
     pub(crate) fn send_ack(&mut self, socket: &UdpSocket, now: Instant) -> SendOutcome {
@@ -244,14 +250,16 @@ impl Peer {
         send_datagram(socket, self.addr, &self.ctrl[..ACK_HEADER + n])
     }
 
-    /// Accepted side. Establishes the session and replies with a hello ack.
-    /// `false` when the hello carries a different session than the one we
-    /// hold: the remote restarted and this peer must be replaced.
+    /// Accepted side. Establishes the session and replies with a hello ack
+    /// carrying `msg`, our on-connect message. `false` when the hello
+    /// carries a different session than the one we hold: the remote
+    /// restarted and this peer must be replaced.
     pub(crate) fn on_hello(
         &mut self,
         session: u32,
         base: u64,
         socket: &UdpSocket,
+        msg: &[u8],
         now: Instant,
     ) -> bool {
         match self.remote_session {
@@ -264,10 +272,10 @@ impl Peer {
             }
         }
         self.last_recv = now;
-        let mut buf = [0; HELLO_ACK_SIZE];
-        wire::hello_ack(&mut buf, self.local_session, session, self.outbound.base());
+        let n =
+            wire::hello_ack(&mut self.ctrl, self.local_session, session, self.outbound.base(), msg);
         self.last_send = now;
-        send_datagram(socket, self.addr, &buf);
+        send_datagram(socket, self.addr, &self.ctrl[..n]);
         true
     }
 
@@ -408,18 +416,20 @@ impl Peer {
         }
     }
 
-    /// Periodic work: hello retries while disconnected; heartbeats while
-    /// connected. `Err(())` means the peer timed out. Retransmit probes are
-    /// granted through [`Self::probe_budget`] and sent with the next flush.
+    /// Periodic work: hello retries, carrying our on-connect message `msg`,
+    /// while disconnected; heartbeats while connected. `Err(())` means the
+    /// peer timed out. Retransmit probes are granted through
+    /// [`Self::probe_budget`] and sent with the next flush.
     pub(crate) fn tick(
         &mut self,
         socket: &UdpSocket,
+        msg: &[u8],
         now: Instant,
         peer_timeout: Duration,
     ) -> Result<SendOutcome, ()> {
         if !self.connected {
             if now >= self.hello_due {
-                return Ok(self.send_hello(socket, now));
+                return Ok(self.send_hello(socket, msg, now));
             }
             return Ok(SendOutcome::Done);
         }
@@ -440,7 +450,7 @@ impl Peer {
 }
 
 #[inline]
-fn deliver_message<F>(
+pub(crate) fn deliver_message<F>(
     latency: &mut Option<Timer>,
     bytes: &[u8],
     send_ts: Nanos,

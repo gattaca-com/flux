@@ -26,7 +26,9 @@
 //! `bits` sequences above it: bit `i` set means `ack_next + 1 + i` arrived.
 //! A hello (kind 3) announces the sender's first unacked packet sequence; a
 //! hello ack (kind 4) echoes the session it answers and announces its own
-//! base; a reset (kind 5) names the session a listener holds no peer for.
+//! base. Both carry the sender's on-connect message, if any, as the rest of
+//! the datagram. A reset (kind 5) names the session a listener holds no
+//! peer for.
 
 pub(crate) const MAGIC: [u8; 2] = *b"FX";
 pub(crate) const VERSION: u8 = 2;
@@ -55,10 +57,27 @@ enum Kind {
 #[derive(Debug)]
 pub(crate) enum Datagram<'a> {
     Packet(Packet<'a>),
-    Ack { session: u32, ack_next: u64, bits: u16, bitmap: &'a [u8] },
-    Hello { session: u32, base: u64 },
-    HelloAck { session: u32, their_session: u32, base: u64 },
-    Reset { their_session: u32 },
+    Ack {
+        session: u32,
+        ack_next: u64,
+        bits: u16,
+        bitmap: &'a [u8],
+    },
+    /// `msg` is the on-connect message; empty without one.
+    Hello {
+        session: u32,
+        base: u64,
+        msg: &'a [u8],
+    },
+    HelloAck {
+        session: u32,
+        their_session: u32,
+        base: u64,
+        msg: &'a [u8],
+    },
+    Reset {
+        their_session: u32,
+    },
 }
 
 /// A received packet.
@@ -152,11 +171,14 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram<'_>> {
                 bitmap,
             })
         }
-        3 if bytes.len() >= HELLO_SIZE => Some(Datagram::Hello { session, base: u64_at(body, 0) }),
+        3 if bytes.len() >= HELLO_SIZE => {
+            Some(Datagram::Hello { session, base: u64_at(body, 0), msg: &body[8..] })
+        }
         4 if bytes.len() >= HELLO_ACK_SIZE => Some(Datagram::HelloAck {
             session,
             their_session: u32_at(body, 0),
             base: u64_at(body, 4),
+            msg: &body[12..],
         }),
         5 if bytes.len() >= RESET_SIZE => Some(Datagram::Reset { their_session: u32_at(body, 0) }),
         _ => None,
@@ -200,20 +222,28 @@ pub(crate) fn ack_header(buf: &mut [u8; ACK_HEADER], session: u32, ack_next: u64
     buf[15..17].copy_from_slice(&bits.to_le_bytes());
 }
 
-pub(crate) fn hello(buf: &mut [u8; HELLO_SIZE], session: u32, base: u64) {
+/// Writes a hello carrying `msg` to the front of `buf`; returns its length.
+pub(crate) fn hello(buf: &mut [u8], session: u32, base: u64, msg: &[u8]) -> usize {
     prefix(buf, Kind::Hello, session);
     buf[7..15].copy_from_slice(&base.to_le_bytes());
+    buf[HELLO_SIZE..][..msg.len()].copy_from_slice(msg);
+    HELLO_SIZE + msg.len()
 }
 
+/// Writes a hello ack carrying `msg` to the front of `buf`; returns its
+/// length.
 pub(crate) fn hello_ack(
-    buf: &mut [u8; HELLO_ACK_SIZE],
+    buf: &mut [u8],
     session: u32,
     their_session: u32,
     base: u64,
-) {
+    msg: &[u8],
+) -> usize {
     prefix(buf, Kind::HelloAck, session);
     buf[7..11].copy_from_slice(&their_session.to_le_bytes());
     buf[11..19].copy_from_slice(&base.to_le_bytes());
+    buf[HELLO_ACK_SIZE..][..msg.len()].copy_from_slice(msg);
+    HELLO_ACK_SIZE + msg.len()
 }
 
 pub(crate) fn reset(buf: &mut [u8; RESET_SIZE], their_session: u32) {
@@ -271,14 +301,18 @@ mod tests {
 
     #[test]
     fn control_round_trips() {
-        let mut buf = [0; HELLO_SIZE];
-        hello(&mut buf, 3, 9);
-        assert!(matches!(decode(&buf), Some(Datagram::Hello { session: 3, base: 9 })));
-        let mut buf = [0; HELLO_ACK_SIZE];
-        hello_ack(&mut buf, 4, 3, 11);
+        let mut buf = [0; 64];
+        let n = hello(&mut buf, 3, 9, b"hi");
         assert!(matches!(
-            decode(&buf),
-            Some(Datagram::HelloAck { session: 4, their_session: 3, base: 11 })
+            decode(&buf[..n]),
+            Some(Datagram::Hello { session: 3, base: 9, msg: b"hi" })
+        ));
+        let n = hello(&mut buf, 3, 9, b"");
+        assert!(matches!(decode(&buf[..n]), Some(Datagram::Hello { msg: b"", .. })));
+        let n = hello_ack(&mut buf, 4, 3, 11, b"yo");
+        assert!(matches!(
+            decode(&buf[..n]),
+            Some(Datagram::HelloAck { session: 4, their_session: 3, base: 11, msg: b"yo" })
         ));
         let mut buf = [0; RESET_SIZE];
         reset(&mut buf, 3);
