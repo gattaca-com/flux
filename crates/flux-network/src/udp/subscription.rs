@@ -151,7 +151,7 @@ impl Subscription {
         F: FnMut(RxPayload<'_>, Nanos),
     {
         let (seq, send_ts) = (packet.seq, packet.send_ts);
-        if !self.current(packet.session) {
+        if !self.current(packet.publisher) {
             return;
         }
         let checked =

@@ -563,15 +563,15 @@ impl UdpManagerState {
                     deliver(Event::Message { group, token, payload, send_ts });
                 });
             }
-            Datagram::HelloAck { session, subscriber, join, msg } => {
+            Datagram::HelloAck { publisher, subscriber, join, msg } => {
                 if !self.on_connect_fits(msg, from) {
                     return;
                 }
                 let token = self.subscriptions[i].token;
-                if self.subscriptions[i].lost(subscriber, Some(session)) {
+                if self.subscriptions[i].lost(subscriber, Some(publisher)) {
                     warn!(addr = %from, "udp publisher lost our subscription, resubscribing");
                     self.resubscribe(i, now);
-                } else if self.subscriptions[i].on_hello_ack(session, subscriber, join) {
+                } else if self.subscriptions[i].on_hello_ack(publisher, subscriber, join) {
                     // A resubscribe can complete before post_poll drains the old disconnect.
                     self.drain_pending_disconnects(deliver);
                     debug!(addr = %from, "udp subscribed");
@@ -606,9 +606,9 @@ impl UdpManagerState {
         let index =
             self.subscribers.iter().position(|s| s.socket_token == socket_token && s.addr == from);
         match datagram {
-            Datagram::Ack { session, subscriber, ack_next, bitmap } => {
+            Datagram::Ack { publisher, subscriber, ack_next, bitmap } => {
                 let Some(i) = index.filter(|&i| {
-                    session == self.stream.session() && self.subscribers[i].session == subscriber
+                    publisher == self.stream.session() && self.subscribers[i].session == subscriber
                 }) else {
                     send_reset(&self.sockets[k].socket, from, subscriber);
                     return;
