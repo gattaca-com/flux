@@ -19,17 +19,8 @@
 //!
 //! The payload is the rest of the message cut at the end of the previous
 //! packet, then messages, each its length followed by its bytes; the last
-//! may be cut at the packet end and continue in the next. A length is 2
-//! bytes below 32768, else 4 with the top bit set:
-//!
-//! ```text
-//! short:  [len u16, top bit clear]
-//! long:   [len u32 big-endian halves: (len >> 16) | 0x8000 u16][len & 0xffff u16]
-//! ```
-//!
-//! A header is never cut and is always followed by at least one byte of its
-//! message in the same packet, so trailing bytes too few for that are
-//! padding, written as 0xff.
+//! may be cut at any byte, its length included, and continue in the next.
+//! Every message starts with a four-byte little-endian `u32` payload length.
 //!
 //! An ack (kind 2) carries the cumulative point `ack_next` and a bitmap of
 //! `bits` sequences above it: bit `i` set means `ack_next + 1 + i` arrived.
@@ -44,16 +35,11 @@ pub(crate) const MAX_DATAGRAM_SIZE: usize = 65_507;
 
 const PREFIX: usize = 7;
 pub(crate) const PACKET_HEADER: usize = PREFIX + 8 + 8 + 2;
-pub(crate) const SHORT_HEADER: usize = 2;
-pub(crate) const LONG_HEADER: usize = 4;
-/// Longest message with a short header.
-const MAX_SHORT: usize = (1 << 15) - 1;
-pub(crate) const PADDING: [u8; LONG_HEADER] = [0xff; LONG_HEADER];
+pub(crate) const MESSAGE_HEADER: usize = 4;
 pub(crate) const ACK_HEADER: usize = PREFIX + 8 + 2;
 pub(crate) const HELLO_SIZE: usize = PREFIX + 8;
 pub(crate) const HELLO_ACK_SIZE: usize = PREFIX + 4 + 8;
 pub(crate) const RESET_SIZE: usize = PREFIX + 4;
-const LONG: u16 = 1 << 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -95,62 +81,39 @@ impl<'a> Packet<'a> {
             s => usize::from(s) - 1,
         };
         let (continuation, rest) = self.payload.split_at_checked(at)?;
-        Some((continuation, Records { bytes: rest, ok: true }))
+        Some((continuation, Records { bytes: rest }))
     }
 }
 
-/// The messages starting in a packet, decoded one at a time. Stops at the
-/// padding, or at a header nothing follows, which [`Self::ok`] reports.
+/// The messages starting in a packet, decoded one at a time.
 #[derive(Clone, Debug)]
 pub(crate) struct Records<'a> {
     bytes: &'a [u8],
-    ok: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Record<'a> {
     Whole(&'a [u8]),
-    /// The first `bytes` of a message of `total` bytes; the rest follows in
-    /// the next packets.
-    Head {
-        total: usize,
-        bytes: &'a [u8],
-    },
-}
-
-impl Records<'_> {
-    /// Whether everything decoded so far was well formed.
-    #[inline]
-    pub(crate) fn ok(&self) -> bool {
-        self.ok
-    }
+    /// The leading bytes of a message, header first, possibly not all of
+    /// the header; the rest follows in the next packets.
+    Head(&'a [u8]),
 }
 
 impl<'a> Iterator for Records<'a> {
     type Item = Record<'a>;
 
     fn next(&mut self) -> Option<Record<'a>> {
-        let v = u16::from_le_bytes(self.bytes.get(..2)?.try_into().unwrap());
-        let (header, len) = if v & LONG == 0 {
-            (SHORT_HEADER, usize::from(v))
-        } else {
-            if self.bytes.len() < LONG_HEADER + 1 {
-                return None;
-            }
-            let low = u16::from_le_bytes(self.bytes[2..4].try_into().unwrap());
-            (LONG_HEADER, usize::from(v & !LONG) << 16 | usize::from(low))
-        };
-        let rest = &self.bytes[header..];
-        if rest.len() >= len {
-            self.bytes = &rest[len..];
-            return Some(Record::Whole(&rest[..len]));
-        }
-        self.bytes = &[];
-        if rest.is_empty() {
-            self.ok = false;
+        if self.bytes.is_empty() {
             return None;
         }
-        Some(Record::Head { total: len, bytes: rest })
+        let record = self.bytes;
+        let len = record_len(record);
+        if len != 0 && len <= record.len() {
+            self.bytes = &record[len..];
+            return Some(Record::Whole(&record[MESSAGE_HEADER..len]));
+        }
+        self.bytes = &[];
+        Some(Record::Head(record))
     }
 }
 
@@ -219,33 +182,14 @@ pub(crate) fn packet_header(
     buf[23..25].copy_from_slice(&start.to_le_bytes());
 }
 
-/// Header and body length of the record at the start of `bytes`; `(0, 0)`
-/// past the end of a stream.
+/// Total record length, including its header; zero when `bytes` holds less
+/// than a header.
 #[inline]
-pub(crate) fn record_len(bytes: &[u8]) -> (usize, usize) {
-    if bytes.len() < SHORT_HEADER {
-        return (0, 0);
+pub(crate) fn record_len(bytes: &[u8]) -> usize {
+    if bytes.len() < MESSAGE_HEADER {
+        return 0;
     }
-    let v = u16::from_le_bytes(bytes[..2].try_into().unwrap());
-    if v & LONG == 0 {
-        (SHORT_HEADER, usize::from(v))
-    } else {
-        let low = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
-        (LONG_HEADER, usize::from(v & !LONG) << 16 | usize::from(low))
-    }
-}
-
-/// Writes the header of a message of `len` bytes; returns its size.
-pub(crate) fn message_header(buf: &mut [u8; LONG_HEADER], len: usize) -> usize {
-    if len <= MAX_SHORT {
-        buf[0..2].copy_from_slice(&(len as u16).to_le_bytes());
-        SHORT_HEADER
-    } else {
-        debug_assert!(len >> 16 <= usize::from(!LONG));
-        buf[0..2].copy_from_slice(&((len >> 16) as u16 | LONG).to_le_bytes());
-        buf[2..4].copy_from_slice(&(len as u16).to_le_bytes());
-        LONG_HEADER
-    }
+    MESSAGE_HEADER + u32_at(bytes, 0) as usize
 }
 
 /// Writes an ack header; the caller appends `bits.div_ceil(64) * 8` bitmap
@@ -290,9 +234,7 @@ mod tests {
     }
 
     fn message(bytes: &[u8]) -> Vec<u8> {
-        let mut h = [0; LONG_HEADER];
-        let n = message_header(&mut h, bytes.len());
-        let mut out = h[..n].to_vec();
+        let mut out = (bytes.len() as u32).to_le_bytes().to_vec();
         out.extend_from_slice(bytes);
         out
     }
@@ -302,11 +244,8 @@ mod tests {
         let mut payload = b"tail".to_vec();
         payload.extend(message(b"abc"));
         payload.extend(message(b""));
-        let long = vec![7u8; 40_000];
-        let mut h = [0; LONG_HEADER];
-        assert_eq!(message_header(&mut h, long.len()), LONG_HEADER);
-        payload.extend_from_slice(&h);
-        payload.extend_from_slice(&long[..2]);
+        payload.extend_from_slice(&40_000u32.to_le_bytes());
+        payload.extend_from_slice(&[7; 2]);
         let bytes = packet(42, 5, &payload);
         let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
         assert_eq!((p.session, p.seq, p.send_ts), (7, 42, 99));
@@ -314,29 +253,12 @@ mod tests {
         assert_eq!(continuation, b"tail");
         assert_eq!(records.next(), Some(Record::Whole(b"abc")));
         assert_eq!(records.next(), Some(Record::Whole(b"")));
-        assert_eq!(records.next(), Some(Record::Head { total: 40_000, bytes: &long[..2] }));
+        assert_eq!(records.next(), Some(Record::Head(&payload[15..])));
         assert_eq!(records.next(), None);
-        assert!(records.ok());
-        let mut payload = message(b"ok");
-        payload.extend_from_slice(&PADDING[..3]);
-        let bytes = packet(43, 1, &payload);
-        let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
-        let (_, mut records) = p.split().unwrap();
-        assert_eq!(records.next(), Some(Record::Whole(b"ok")));
-        assert_eq!(records.next(), None);
-        assert!(records.ok());
     }
 
     #[test]
-    fn a_header_nothing_follows_is_malformed() {
-        let mut payload = message(b"ok");
-        payload.extend_from_slice(&9u16.to_le_bytes());
-        let bytes = packet(1, 1, &payload);
-        let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
-        let (_, mut records) = p.split().unwrap();
-        assert_eq!(records.next(), Some(Record::Whole(b"ok")));
-        assert_eq!(records.next(), None);
-        assert!(!records.ok());
+    fn start_past_the_payload_is_malformed() {
         let bytes = packet(1, 9, b"short");
         let Some(Datagram::Packet(p)) = decode(&bytes) else { panic!() };
         assert!(p.split().is_none());

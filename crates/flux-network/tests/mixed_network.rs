@@ -137,7 +137,7 @@ fn one_external_poll_observes_readiness_and_drives_both_transports() {
     while log.messages.len() < 4 {
         assert!(Instant::now() < deadline, "shared poll exchange timed out");
         network.pre_poll(&mut |event| log.record(&event));
-        poll.poll(&mut events, Some(network.max_poll_interval())).unwrap();
+        poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
         for readiness in &events {
             network.handle_event(readiness, &mut |event| {
                 if let NetworkEvent::Message { group, token, .. } = &event {

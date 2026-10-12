@@ -41,7 +41,7 @@ struct NetworkTile {
 impl Tile<TcpDcacheSpine> for NetworkTile {
     fn try_init(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) -> bool {
         let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
-        let mut conn = Network::default().with_dcache(sp.dcache_ptr());
+        let mut conn = Network::with_dcache(sp.dcache_ptr());
         let conn_group = conn.add_group(self.transport.clone());
         conn.listen(conn_group, self.bind_addr).unwrap();
         self.conn = Some(conn);
@@ -134,9 +134,15 @@ fn dcache_multi_stream(transport: flux_network::GroupConfig) {
             let mut conn = Network::default();
             let conn_group = conn.add_group(client_config.clone());
             let tok = conn.connect(conn_group, bind_addr);
-            conn.send_with(tok, |buf| {
+            let mut connected = false;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !connected {
+                assert!(Instant::now() < deadline, "handshake");
+                conn.poll_with(|e| connected |= matches!(e, NetworkEvent::Connected { .. }));
+            }
+            assert!(conn.send_with(tok, |buf| {
                 buf.extend_from_slice(msg);
-            });
+            }));
             let flush = Instant::now() + Duration::from_millis(100);
             while Instant::now() < flush {
                 conn.poll_with(|_| {});

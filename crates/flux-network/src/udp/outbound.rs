@@ -10,7 +10,7 @@ use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
 
 use super::{
     sys::{SendBatch, SockAddr},
-    wire::{self, LONG_HEADER, PACKET_HEADER, PADDING},
+    wire::{self, PACKET_HEADER},
 };
 use crate::{NetworkTelemetry, network::UdpGroupConfig};
 
@@ -166,57 +166,27 @@ struct Slice {
     start: u16,
 }
 
+/// Record starts of a stream, walked forward once.
 struct Records<'a> {
     stream: &'a [u8],
     start: usize,
-    header: usize,
-    body: usize,
 }
 
 impl<'a> Records<'a> {
     fn new(stream: &'a [u8]) -> Self {
-        let (header, body) = wire::record_len(stream);
-        Self { stream, start: 0, header, body }
+        Self { stream, start: 0 }
     }
 
-    #[inline]
-    fn end(&self) -> usize {
-        self.start + self.header + self.body
-    }
-
-    fn next(&mut self) {
-        self.start = self.end();
-        (self.header, self.body) = wire::record_len(&self.stream[self.start..]);
-    }
-
-    /// Where to end a span starting at `pos` that may run to `want`: never
-    /// inside a record header or right after one, so such an end moves back
-    /// to the header. Also the first record start inside the span.
-    fn cut(&mut self, pos: usize, want: usize) -> (usize, Option<usize>) {
-        while self.end() <= pos && self.end() < self.stream.len() {
-            self.next();
+    /// The first record start in `pos..end`; calls must not move backwards.
+    fn first(&mut self, pos: usize, end: usize) -> Option<usize> {
+        while self.start < pos {
+            let len = self.stream.get(self.start..).map_or(0, wire::record_len);
+            if len == 0 {
+                return None;
+            }
+            self.start += len;
         }
-        let mut first = None;
-        let mut end = want;
-        loop {
-            let (rs, re) = (self.start, self.end());
-            if rs >= pos && rs < end {
-                first.get_or_insert(rs);
-            }
-            let past_header = rs + self.header + usize::from(self.body > 0);
-            if end > rs && end < past_header {
-                end = rs;
-                if first == Some(rs) {
-                    first = None;
-                }
-                break;
-            }
-            if end <= re || re >= self.stream.len() {
-                break;
-            }
-            self.next();
-        }
-        (end, first)
+        (self.start < end).then_some(self.start)
     }
 }
 
@@ -225,21 +195,16 @@ struct Packet {
     /// Index of its first slice in the slice ring.
     records: u32,
     count: u16,
-    /// Size on the wire, padding included.
+    /// Size on the wire.
     bytes: u16,
     /// 1 + payload offset of the first message header; 0 without one.
     start: u16,
-    pad: u8,
     retries: u8,
     /// Staged into a batch whose result is not in yet.
     staged: bool,
     send_ts: Nanos,
     sent_at: Instant,
 }
-
-/// No room in the send window for the stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WindowFull;
 
 /// What an ack told the sender.
 pub(crate) struct Acked {
@@ -275,7 +240,6 @@ pub(crate) struct Outbound {
     /// round and resets when acks flow again, like slow start after an RTO.
     recover: u64,
     last_scan: Instant,
-    exceeded_since: Option<Instant>,
     /// Sequences put in the current batch, in order, until `commit`.
     staged: Vec<u64>,
     rto: Rto,
@@ -305,7 +269,6 @@ impl Outbound {
             last_ack_at: Instant::ZERO,
             recover: 1,
             last_scan: Instant::ZERO,
-            exceeded_since: None,
             staged: Vec::new(),
             rto: Rto::new(udp.initial_rto, udp.min_rto, udp.max_rto),
             sends: telemetry_producer(config.telemetry, "sends", label),
@@ -338,16 +301,9 @@ impl Outbound {
         &mut self.packets[(seq & self.mask) as usize]
     }
 
-    /// First packet whose slot is still needed: a reconnect replays whole
-    /// messages, so slots stay reserved back to the oldest retained one.
-    #[inline]
-    fn retained_start(&self) -> u64 {
-        self.messages.front().map_or(self.base, |m| m.first_packet)
-    }
-
     #[inline]
     fn free_packets(&self) -> u64 {
-        self.mask + 1 - (self.next - self.retained_start())
+        self.mask + 1 - self.inflight()
     }
 
     #[inline]
@@ -366,10 +322,6 @@ impl Outbound {
         } else {
             *word &= !bit;
         }
-    }
-
-    pub(crate) fn oldest_retained<'a>(&self, store: &'a MessageStore) -> Option<&'a [u8]> {
-        self.messages.front().map(|m| store.bytes(m.slot))
     }
 
     fn open_packet(&mut self) -> u64 {
@@ -392,42 +344,29 @@ impl Outbound {
         packet.bytes += slice.len;
     }
 
-    /// Queues the stream in store `slot`, cutting it into packets behind
-    /// whatever is already queued, and takes a reference on it.
-    pub(crate) fn enqueue(
-        &mut self,
-        store: &mut MessageStore,
-        slot: u32,
-    ) -> Result<(), WindowFull> {
+    /// Returns false without queueing the stream when the send window has no
+    /// room.
+    pub(crate) fn enqueue(&mut self, store: &mut MessageStore, slot: u32) -> bool {
         let stream = store.bytes(slot);
         let len = stream.len();
-        // A sliver in the open packet, full packets, a sliver at the end;
-        // a cut moved back before a header wastes at most a header.
-        let room = self.datagram_size - PACKET_HEADER - LONG_HEADER;
+        // A sliver in the open packet, full packets, a sliver at the end.
+        let room = self.datagram_size - PACKET_HEADER;
         let packets = (len / room + 2) as u64;
         if packets > self.free_packets() {
-            return Err(WindowFull);
+            // TODO: Emit telemetry on window exhaustion.
+            return false;
         }
         let mut records = Records::new(stream);
         let mut pos = 0usize;
-        let mut first_packet = None;
+        let first_packet = if self.open { self.next - 1 } else { self.next };
         loop {
             let seq = if self.open { self.next - 1 } else { self.open_packet() };
             let space = self.datagram_size - usize::from(self.packet(seq).bytes);
-            let (end, start) = records.cut(pos, (pos + space).min(len));
-            if end == pos {
-                // Not even a header and a byte fit: pad the packet full so
-                // it still segments with its neighbours.
-                let packet = self.packet_mut(seq);
-                packet.pad = space as u8;
-                packet.bytes += space as u16;
-            } else {
-                let start = start.map_or(0, |s| (s - pos + 1) as u16);
-                let slice = Slice { slot, offset: pos as u32, len: (end - pos) as u16, start };
-                self.push_slice(seq, slice);
-                first_packet.get_or_insert(seq);
-                pos = end;
-            }
+            let end = (pos + space).min(len);
+            let start = records.first(pos, end).map_or(0, |s| (s - pos + 1) as u16);
+            let slice = Slice { slot, offset: pos as u32, len: (end - pos) as u16, start };
+            self.push_slice(seq, slice);
+            pos = end;
             let packet = self.packet(seq);
             if usize::from(packet.bytes) == self.datagram_size ||
                 packet.count == MAX_SLICES_PER_PACKET
@@ -439,27 +378,8 @@ impl Outbound {
             }
         }
         store.add_ref(slot);
-        self.messages.push_back(Message {
-            slot,
-            first_packet: first_packet.unwrap(),
-            last_packet: self.next - 1,
-        });
-        Ok(())
-    }
-
-    /// Mirrors the TCP backlog rule on the in-flight packet count.
-    pub(crate) fn backlog_exceeded(
-        &mut self,
-        max_backlog: Option<(usize, Duration)>,
-        now: Instant,
-    ) -> bool {
-        let Some((max, timeout)) = max_backlog else { return false };
-        if self.inflight() <= max as u64 {
-            self.exceeded_since = None;
-            return false;
-        }
-        let since = self.exceeded_since.get_or_insert(now);
-        now.saturating_sub(*since) >= timeout
+        self.messages.push_back(Message { slot, first_packet, last_packet: self.next - 1 });
+        true
     }
 
     fn release_messages(&mut self, store: &mut MessageStore) {
@@ -505,20 +425,6 @@ impl Outbound {
         dropped
     }
 
-    /// Restarts every retained message from its first packet: the new
-    /// remote holds none of the old acks.
-    pub(crate) fn rewind(&mut self) {
-        self.acked.fill(0);
-        self.base = self.retained_start();
-        self.next_send = self.base;
-        for seq in self.base..self.next {
-            self.packet_mut(seq).retries = 0;
-        }
-        self.highest_acked = None;
-        self.recover = 1;
-        self.exceeded_since = None;
-    }
-
     /// Forgets everything queued or in flight.
     pub(crate) fn clear(&mut self, store: &mut MessageStore) {
         self.acked.fill(0);
@@ -528,7 +434,6 @@ impl Outbound {
         self.highest_acked = None;
         self.recover = 1;
         self.release_all(store);
-        self.exceeded_since = None;
     }
 
     /// Applies an ack: everything below `ack_next` plus the bitmap words for
@@ -716,9 +621,6 @@ impl Outbound {
             let slice = self.slices[((packet.records + u32::from(i)) & self.slice_mask) as usize];
             let bytes = store.bytes(slice.slot);
             batch.payload(&bytes[slice.offset as usize..][..usize::from(slice.len)]);
-        }
-        if packet.pad != 0 {
-            batch.copy(&PADDING[..usize::from(packet.pad)]);
         }
         batch.close();
         self.staged.push(seq);

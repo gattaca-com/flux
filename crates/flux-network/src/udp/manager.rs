@@ -1,30 +1,23 @@
-//! UDP group sockets and peers driven by the shared network poll.
-//!
-//! One socket per `listen` (shared by every peer that dials it) and one per
-//! `connect` (owned by that single peer). Peers hold all session state, see
-//! [`Peer`]. Message bytes live once in a [`MessageStore`] shared by every
-//! peer sending them, and due packets of all peers on a socket go out in one
-//! `sendmmsg` batch.
-
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::{Deref, DerefMut},
     os::fd::AsRawFd,
 };
 
 use flux_timing::{Duration, Instant};
-use flux_utils::DCache;
+use flux_utils::{DCache, safe_assert};
 use mio::{Interest, Registry, Token, event::Event as MioEvent, net::UdpSocket};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{
-    outbound::{MessageStore, WindowFull},
+    outbound::MessageStore,
     peer::{Peer, SendOutcome},
     sys::{RecvBatch, SendBatch},
-    wire::{self, Datagram, LONG_HEADER, SHORT_HEADER},
+    wire::{self, Datagram, MESSAGE_HEADER},
 };
 use crate::network::{
-    Event, Group, PayloadBuf, ReplayPolicy, RxPayload, Tokens, UdpGroupConfig, set_socket_buf_size,
+    Event, Group, PayloadBuf, RxPayload, Tokens, UdpGroupConfig, set_socket_buf_size,
 };
 
 struct Endpoint {
@@ -32,20 +25,6 @@ struct Endpoint {
     socket: UdpSocket,
     listener: bool,
     writable_armed: bool,
-}
-
-/// Session id for a new connection attempt: mixes the TSC, the pid and the
-/// peer token. Called once per connect, accept and reconnect.
-fn new_session(salt: usize) -> u32 {
-    let t = Instant::now().0;
-    let mut x = t ^
-        (t >> 32) ^
-        (u64::from(std::process::id()) << 20) ^
-        (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    x ^= x >> 33;
-    x as u32
 }
 
 #[inline]
@@ -62,36 +41,23 @@ fn arm_writable(registry: &Registry, entry: &mut Endpoint) {
     entry.writable_armed = true;
 }
 
-/// Queues the on-connect message, as the stream `greeting`, for a peer
-/// whose session was just set up.
 fn push_on_connect(
     store: &mut MessageStore,
-    greeting: Option<&[u8]>,
+    on_connect_wire_msg: Option<Vec<u8>>,
     peer: &mut Peer,
-    now: Instant,
 ) {
-    if let Some(stream) = greeting {
-        let slot = store.insert(&mut stream.to_vec());
-        let _ = peer.enqueue(store, slot, now);
+    if let Some(mut stream) = on_connect_wire_msg {
+        let slot = store.insert(&mut stream);
+        let _ = peer.outbound.enqueue(store, slot);
         store.release(slot);
     }
 }
 
-/// The on-connect message as a one-record stream.
-fn greeting_stream(msg: &[u8]) -> Vec<u8> {
-    let mut header = [0; LONG_HEADER];
-    let n = wire::message_header(&mut header, msg.len());
-    let mut stream = Vec::with_capacity(n + msg.len());
-    stream.extend_from_slice(&header[..n]);
+fn with_header(msg: &[u8]) -> Vec<u8> {
+    let mut stream = Vec::with_capacity(MESSAGE_HEADER + msg.len());
+    stream.extend_from_slice(&(msg.len() as u32).to_le_bytes());
     stream.extend_from_slice(msg);
     stream
-}
-
-/// The socket registered under `token`. An outbound peer whose bind failed
-/// has none until the next retry.
-#[inline]
-fn socket_of(sockets: &[Endpoint], token: Token) -> Option<usize> {
-    sockets.iter().position(|s| s.token == token)
 }
 
 fn outbound_bind_addr(peer: SocketAddr) -> SocketAddr {
@@ -101,37 +67,78 @@ fn outbound_bind_addr(peer: SocketAddr) -> SocketAddr {
     }
 }
 
+struct StagedPeerBatch {
+    peer_idx: usize,
+    packets: usize,
+}
+
 pub(crate) struct UdpManager {
-    pub(crate) config: UdpGroupConfig,
-    group: Group,
-    sockets: Vec<Endpoint>,
-    peers: Vec<Peer>,
-    store: MessageStore,
-    send_buffer: Vec<u8>,
-    /// A record that did not fit the stream being queued, kept for the next.
-    spill: Vec<u8>,
-    /// `on_connect_msg` as a stream.
-    greeting: Option<Vec<u8>>,
-    batch: SendBatch,
-    /// Peers with packets in `batch` and how many each, in order.
-    staged: Vec<(usize, usize)>,
-    /// Taken out while datagrams are dispatched so peers can be borrowed.
-    recv: Option<RecvBatch>,
-    pending_disconnects: Vec<(Token, SocketAddr)>,
-    retired: Vec<Token>,
-    broadcast_paused: Vec<Token>,
-    /// Peer maintenance runs at most this often; half the minimum RTO keeps
-    /// recovery timing within tolerance while idle polls stay cheap.
-    tick_interval: Duration,
-    next_tick: Instant,
-    /// Outbound peers whose socket could not be opened; retried on the
-    /// heartbeat interval and by `force_reconnect`.
-    unbound: usize,
-    next_bind: Instant,
+    // separate from `state` to avoid borrow-checker issues in handle_event
+    recv: RecvBatch,
+    state: UdpManagerState,
+}
+
+impl Deref for UdpManager {
+    type Target = UdpManagerState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for UdpManager {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 impl UdpManager {
     pub(crate) fn new(config: UdpGroupConfig, group: Group) -> Self {
+        Self {
+            recv: RecvBatch::new(config.udp.max_datagram_size),
+            state: UdpManagerState::new(config, group),
+        }
+    }
+
+    pub(crate) fn handle_event<F>(
+        &mut self,
+        registry: &Registry,
+        event: &MioEvent,
+        tokens: &mut Tokens,
+        dcache: Option<&DCache>,
+        deliver: &mut F,
+    ) where
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
+    {
+        self.state.handle_event(&mut self.recv, registry, event, tokens, dcache, deliver);
+    }
+}
+
+pub(crate) struct UdpManagerState {
+    config: UdpGroupConfig,
+    group: Group,
+
+    sockets: Vec<Endpoint>,
+    peers: Vec<Peer>,
+
+    store: MessageStore,
+    /// users serialise here. and then it's moved to `MessageStore`
+    send_buffer: Vec<u8>,
+    on_connect_wire_msg: Option<Vec<u8>>,
+
+    batch: SendBatch,
+    // entries here correspond to `SendBatch` order
+    staged_peer_batches: Vec<StagedPeerBatch>,
+
+    pending_disconnect_notifications: Vec<(Token, SocketAddr)>,
+    // to avoid passing &mut Tokens everywhere
+    retired: Vec<Token>,
+
+    next_tick: Instant,
+}
+
+impl UdpManagerState {
+    fn new(config: UdpGroupConfig, group: Group) -> Self {
         let udp = config.udp;
         udp.validate();
         assert!(
@@ -141,26 +148,20 @@ impl UdpManager {
                 .is_none_or(|msg| !msg.is_empty() && msg.len() <= udp.max_message_size),
             "invalid UDP on-connect message length"
         );
-        let greeting = config.on_connect_msg.as_deref().map(greeting_stream);
+        let on_connect_wire_msg = config.on_connect_msg.as_deref().map(with_header);
         Self {
             config,
-            greeting,
+            on_connect_wire_msg,
             group,
             sockets: Vec::new(),
             peers: Vec::new(),
             store: MessageStore::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
-            spill: Vec::new(),
             batch: SendBatch::new(udp.max_datagram_size),
-            staged: Vec::new(),
-            recv: Some(RecvBatch::new(udp.max_datagram_size)),
-            pending_disconnects: Vec::new(),
-            broadcast_paused: Vec::new(),
+            staged_peer_batches: Vec::new(),
+            pending_disconnect_notifications: Vec::new(),
             retired: Vec::new(),
-            tick_interval: udp.min_rto / 2_u32,
             next_tick: Instant::ZERO,
-            unbound: 0,
-            next_bind: Instant::ZERO,
         }
     }
 
@@ -171,19 +172,12 @@ impl UdpManager {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.sockets.is_empty()
-    }
-
-    /// Opens a socket on `bind` registered under `token` and adds it to the
-    /// endpoints.
     fn open_socket(
         &mut self,
         registry: &Registry,
         bind: SocketAddr,
         token: Token,
-        listener: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<UdpSocket> {
         let mut socket = UdpSocket::bind(bind)?;
         #[cfg(target_os = "linux")]
         if let Err(err) = RecvBatch::enable_gro(socket.as_raw_fd()) {
@@ -197,12 +191,9 @@ impl UdpManager {
             set_socket_buf_size(&socket, size);
         }
         registry.register(&mut socket, token, Interest::READABLE)?;
-        self.sockets.push(Endpoint { token, socket, listener, writable_armed: false });
-        Ok(())
+        Ok(socket)
     }
 
-    /// Registers an outbound peer. If its socket cannot be opened now, the
-    /// peer waits unbound and the open is retried like a redial.
     pub(crate) fn connect(
         &mut self,
         registry: &Registry,
@@ -210,40 +201,21 @@ impl UdpManager {
         tokens: &mut Tokens,
     ) -> Token {
         let token = tokens.allocate(self.group);
-        let mut peer = Peer::new(addr, token, token, new_session(token.0), &self.config);
-        let now = Instant::now();
-        // First in the queue; nothing goes out before the handshake anyway.
-        push_on_connect(&mut self.store, self.greeting.as_deref(), &mut peer, now);
-        match self.open_socket(registry, outbound_bind_addr(addr), token, false) {
-            Ok(()) => {
-                peer.send_hello(&self.sockets.last().unwrap().socket, now);
-            }
+        let socket = match self.open_socket(registry, outbound_bind_addr(addr), token) {
+            Ok(socket) => socket,
             Err(err) => {
-                warn!(?err, %addr, "couldn't open udp socket, retrying");
-                self.unbound += 1;
+                error!(?err, %addr, ?token, "couldn't open udp socket");
+                tokens.retire(token);
+                return token;
             }
-        }
+        };
+        let mut peer = Peer::new(addr, token, token, &self.config);
+        let now = Instant::now();
+        peer.send_hello(&socket, now);
+        push_on_connect(&mut self.store, self.on_connect_wire_msg.clone(), &mut peer);
+        self.sockets.push(Endpoint { token, socket, listener: false, writable_armed: false });
         self.peers.push(peer);
         token
-    }
-
-    /// Retries the socket open for every unbound outbound peer.
-    fn bind_unbound(&mut self, registry: &Registry, now: Instant) {
-        for i in 0..self.peers.len() {
-            let peer = &self.peers[i];
-            if !peer.is_outbound() || socket_of(&self.sockets, peer.token).is_some() {
-                continue;
-            }
-            let (addr, token) = (peer.addr, peer.token);
-            match self.open_socket(registry, outbound_bind_addr(addr), token, false) {
-                Ok(()) => {
-                    self.unbound -= 1;
-                    let socket = &self.sockets.last().unwrap().socket;
-                    self.peers[i].send_hello(socket, now);
-                }
-                Err(err) => debug!(?err, %addr, "udp socket open failed again"),
-            }
-        }
     }
 
     pub(crate) fn listen(
@@ -253,78 +225,54 @@ impl UdpManager {
         tokens: &mut Tokens,
     ) -> io::Result<Token> {
         let token = tokens.allocate(self.group);
-        if let Err(err) = self.open_socket(registry, addr, token, true) {
-            tokens.retire(token);
-            return Err(err);
-        }
+        let socket = match self.open_socket(registry, addr, token) {
+            Ok(socket) => socket,
+            Err(err) => {
+                tokens.retire(token);
+                return Err(err);
+            }
+        };
+        self.sockets.push(Endpoint { token, socket, listener: true, writable_armed: false });
         Ok(token)
     }
 
-    /// Resets an outbound peer to a fresh session and starts dialling again.
-    /// The on-connect message is queued behind any retained backlog unless a
-    /// never-acked copy still heads it; UDP delivery is unordered regardless.
-    fn reset_outbound(&mut self, index: usize, now: Instant) {
+    fn reconnect_outbound(&mut self, index: usize, now: Instant) {
         let peer = &mut self.peers[index];
-        let session = new_session(peer.token.0);
-        peer.mark_disconnected(self.config.replay == ReplayPolicy::Drop, session, &mut self.store);
-        let greeting_retained = self
-            .greeting
-            .as_deref()
-            .is_some_and(|msg| peer.outbound.oldest_retained(&self.store) == Some(msg));
-        if !greeting_retained {
-            push_on_connect(&mut self.store, self.greeting.as_deref(), peer, now);
+        if peer.is_connected() {
+            self.pending_disconnect_notifications.push((peer.token, peer.addr));
         }
-        if let Some(k) = socket_of(&self.sockets, peer.token) {
-            peer.send_hello(&self.sockets[k].socket, now);
-        }
+        peer.reset_connection(&mut self.store);
+        push_on_connect(&mut self.store, self.on_connect_wire_msg.clone(), peer);
+        let endpoint = self
+            .sockets
+            .iter()
+            .find(|s| s.token == peer.socket_token)
+            .expect("outbound peer must have a socket");
+        peer.send_hello(&endpoint.socket, now);
     }
 
-    /// Removes an accepted peer, returning its token.
     fn remove_peer(&mut self, index: usize) -> Token {
         let mut peer = self.peers.swap_remove(index);
         peer.outbound.release_all(&mut self.store);
-        self.resume_broadcast(peer.token);
         self.retired.push(peer.token);
         peer.token
     }
 
-    pub(crate) fn pause_broadcast(&mut self, token: Token) {
-        if !self.broadcast_paused.contains(&token) {
-            self.broadcast_paused.push(token);
-        }
-    }
-
-    pub(crate) fn resume_broadcast(&mut self, token: Token) {
-        if let Some(i) = self.broadcast_paused.iter().position(|t| *t == token) {
-            self.broadcast_paused.swap_remove(i);
-        }
-    }
-
-    pub(crate) fn is_broadcast_paused(&self, token: Token) -> bool {
-        self.broadcast_paused.contains(&token)
-    }
-
-    /// Outbound peers renegotiate; accepted peers are dropped.
-    fn drop_peer(&mut self, index: usize, now: Instant) {
-        if self.peers[index].is_outbound() {
-            self.reset_outbound(index, now);
-        } else {
-            self.remove_peer(index);
-        }
-    }
-
-    fn drop_peer_pending(&mut self, index: usize, now: Instant) {
-        if self.peers[index].is_connected() {
-            self.pending_disconnects.push((self.peers[index].token, self.peers[index].addr));
-        }
-        self.drop_peer(index, now);
+    fn disconnect_accepted(&mut self, index: usize) {
+        let peer = &self.peers[index];
+        self.pending_disconnect_notifications.push((peer.token, peer.addr));
+        self.remove_peer(index);
     }
 
     /// Drops a peer's session: accepted peers go, outbound ones redial. A
     /// listener token is not a session and is left alone.
     pub(crate) fn disconnect(&mut self, token: Token) -> bool {
         let Some(i) = self.peers.iter().position(|p| p.token == token) else { return false };
-        self.drop_peer_pending(i, Instant::now());
+        if self.peers[i].is_outbound() {
+            self.reconnect_outbound(i, Instant::now());
+        } else {
+            self.disconnect_accepted(i);
+        }
         true
     }
 
@@ -333,7 +281,11 @@ impl UdpManager {
     pub(crate) fn disconnect_when_drained(&mut self, token: Token) -> bool {
         let Some(i) = self.peers.iter().position(|p| p.token == token) else { return false };
         if self.peers[i].close_when_drained() {
-            self.drop_peer_pending(i, Instant::now());
+            if self.peers[i].is_outbound() {
+                self.reconnect_outbound(i, Instant::now());
+            } else {
+                self.disconnect_accepted(i);
+            }
         }
         true
     }
@@ -354,9 +306,7 @@ impl UdpManager {
         while i != 0 {
             i -= 1;
             if self.peers[i].socket_token == token {
-                let addr = self.peers[i].addr;
-                let dropped = self.remove_peer(i);
-                self.pending_disconnects.push((dropped, addr));
+                self.disconnect_accepted(i);
             }
         }
         let mut entry = self.sockets.swap_remove(k);
@@ -369,7 +319,7 @@ impl UdpManager {
         let now = Instant::now();
         for i in 0..self.peers.len() {
             if self.peers[i].is_outbound() {
-                self.drop_peer_pending(i, now);
+                self.reconnect_outbound(i, now);
             }
         }
     }
@@ -380,10 +330,10 @@ impl UdpManager {
     {
         let Some(index) = self.sendable_index(token) else { return false };
         let now = Instant::now();
-        if self.append_record(serialise).is_none() {
+        if !self.append_record(serialise) {
             return false;
         }
-        let sent = self.queue_stream_for(index, token, now);
+        let sent = self.queue_stream_for(index, now);
         if sent {
             self.flush_peer_socket(registry, index, now);
         }
@@ -391,8 +341,7 @@ impl UdpManager {
     }
 
     /// Serialises every item into one stream for `token`, queues it and
-    /// flushes the socket once. A stream that outgrows `max_message_size`
-    /// is queued in parts.
+    /// flushes the socket once.
     pub(crate) fn send_many_with<I, F>(
         &mut self,
         registry: &Registry,
@@ -406,22 +355,15 @@ impl UdpManager {
     {
         let Some(index) = self.sendable_index(token) else { return false };
         let now = Instant::now();
-        let mut sent = false;
+        let mut appended = false;
         for item in items {
-            if let Some(at) = self.append_record(|buf| serialise(buf, item)) &&
-                self.spill_overflow(at)
-            {
-                sent |= self.queue_stream_for(index, token, now);
-                std::mem::swap(&mut self.send_buffer, &mut self.spill);
-                if !self.peer_is(index, token) {
-                    // The peer was dropped for violating a limit.
-                    self.send_buffer.clear();
-                    return false;
-                }
-            }
+            appended |= self.append_record(|buf| serialise(buf, item));
         }
-        sent |= self.queue_stream_for(index, token, now);
-        if sent && self.peer_is(index, token) {
+        if !appended {
+            return false;
+        }
+        let sent = self.queue_stream_for(index, now);
+        if sent {
             self.flush_peer_socket(registry, index, now);
         }
         sent
@@ -435,7 +377,7 @@ impl UdpManager {
             return 0;
         }
         let now = Instant::now();
-        if self.append_record(serialise).is_none() {
+        if !self.append_record(serialise) {
             return 0;
         }
         let recipients = self.queue_stream_broadcast(now);
@@ -444,8 +386,7 @@ impl UdpManager {
     }
 
     /// Serialises every item into one stream for every recipient, queues it
-    /// and flushes each socket once. A stream that outgrows
-    /// `max_message_size` is queued in parts.
+    /// and flushes each socket once.
     pub(crate) fn broadcast_many_with<I, F>(
         &mut self,
         registry: &Registry,
@@ -460,127 +401,86 @@ impl UdpManager {
             return 0;
         }
         let now = Instant::now();
-        let mut recipients = 0;
+        let mut appended = false;
         for item in items {
-            if let Some(at) = self.append_record(|buf| serialise(buf, item)) &&
-                self.spill_overflow(at)
-            {
-                recipients = recipients.max(self.queue_stream_broadcast(now));
-                std::mem::swap(&mut self.send_buffer, &mut self.spill);
-            }
+            appended |= self.append_record(|buf| serialise(buf, item));
         }
-        recipients = recipients.max(self.queue_stream_broadcast(now));
+        if !appended {
+            return 0;
+        }
+        let recipients = self.queue_stream_broadcast(now);
         self.flush_all(registry, now);
         recipients
     }
 
-    /// Serialises one message behind its wire header at the end of the
-    /// stream in `send_buffer`. Returns where the record starts, or `None`
-    /// when the message was empty or too large and nothing was appended,
-    /// which the TCP path also skips without sending.
-    fn append_record<F>(&mut self, serialise: F) -> Option<usize>
+    fn append_record<F>(&mut self, serialise: F) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
-        let at = self.send_buffer.len();
-        self.send_buffer.extend_from_slice(&[0; SHORT_HEADER]);
+        let start = self.send_buffer.len();
+        self.send_buffer.extend_from_slice(&[0; MESSAGE_HEADER]);
         serialise(&mut PayloadBuf::new(&mut self.send_buffer));
-        let len = self.send_buffer.len() - at - SHORT_HEADER;
+        let len = self.send_buffer.len() - start - MESSAGE_HEADER;
         if len == 0 || len > self.config.udp.max_message_size {
             if len != 0 {
-                warn!(
+                // TODO: Emit telemetry.
+                error!(
                     group = self.config.name,
                     len,
                     max = self.config.udp.max_message_size,
                     "udp message exceeds max_message_size"
                 );
             }
-            self.send_buffer.truncate(at);
-            return None;
-        }
-        let mut header = [0; LONG_HEADER];
-        let n = wire::message_header(&mut header, len);
-        if n > SHORT_HEADER {
-            self.send_buffer.resize(at + n + len, 0);
-            self.send_buffer.copy_within(at + SHORT_HEADER..at + SHORT_HEADER + len, at + n);
-        }
-        self.send_buffer[at..at + n].copy_from_slice(&header[..n]);
-        Some(at)
-    }
-
-    /// When the record at `at` took the stream past `max_message_size`, the
-    /// size a window is sure to hold, moves it into `spill` so the stream
-    /// before it can be queued on its own. Returns whether it did.
-    fn spill_overflow(&mut self, at: usize) -> bool {
-        if at == 0 || self.send_buffer.len() <= self.config.udp.max_message_size {
+            self.send_buffer.truncate(start);
             return false;
         }
-        self.spill.clear();
-        self.spill.extend_from_slice(&self.send_buffer[at..]);
-        self.send_buffer.truncate(at);
+        self.send_buffer[start..start + MESSAGE_HEADER]
+            .copy_from_slice(&(len as u32).to_le_bytes());
         true
     }
 
-    #[inline]
-    fn peer_is(&self, index: usize, token: Token) -> bool {
-        self.peers.get(index).is_some_and(|p| p.token == token)
-    }
-
-    /// Moves the stream into the store and queues it for the peer at
-    /// `index`, dropping the peer if it cannot take it. Leaves the stream
-    /// empty. Returns whether it was queued.
-    fn queue_stream_for(&mut self, index: usize, token: Token, now: Instant) -> bool {
-        if self.send_buffer.is_empty() || !self.peer_is(index, token) {
-            self.send_buffer.clear();
-            return false;
-        }
+    fn queue_stream_for(&mut self, index: usize, now: Instant) -> bool {
+        safe_assert!(!self.send_buffer.is_empty());
         let slot = self.store.insert(&mut self.send_buffer);
-        let queued = self.enqueue(index, slot, now);
-        self.store.release(slot);
+        let queued = self.peers[index].outbound.enqueue(&mut self.store, slot);
         if !queued {
-            self.drop_peer_pending(index, now);
+            if self.peers[index].is_outbound() {
+                self.reconnect_outbound(index, now);
+            } else {
+                self.disconnect_accepted(index);
+            }
         }
+        self.store.release(slot);
         queued
     }
 
-    /// Moves the stream into the store and queues it for every eligible
-    /// peer. Leaves the stream empty. Returns the number of recipients.
+    /// Returns the number of recipients.
     fn queue_stream_broadcast(&mut self, now: Instant) -> usize {
-        if self.send_buffer.is_empty() {
-            return 0;
-        }
+        safe_assert!(!self.send_buffer.is_empty());
         let slot = self.store.insert(&mut self.send_buffer);
         let mut recipients = 0;
-        let mut i = self.peers.len();
-        while i != 0 {
-            i -= 1;
-            if !self.is_broadcast_recipient(&self.peers[i]) {
-                continue;
-            }
+        // iterating in the reverse order not to skip anything because of swap_remove
+        for i in (0..self.peers.len()).rev() {
             recipients += 1;
-            if !self.enqueue(i, slot, now) {
-                self.drop_peer_pending(i, now);
+            if !self.peers[i].outbound.enqueue(&mut self.store, slot) {
+                if self.peers[i].is_outbound() {
+                    self.reconnect_outbound(i, now);
+                } else {
+                    self.disconnect_accepted(i);
+                }
             }
         }
         self.store.release(slot);
         recipients
     }
 
-    /// Queues the stored stream for one peer. `false` when the peer must be
-    /// dropped: it violated the backlog limit or has no window room.
-    #[inline]
-    fn enqueue(&mut self, index: usize, slot: u32, now: Instant) -> bool {
-        let peer = &mut self.peers[index];
-        match peer.enqueue(&mut self.store, slot, now) {
-            Ok(()) => !peer.outbound.backlog_exceeded(self.config.max_backlog_datagrams, now),
-            Err(WindowFull) => false,
-        }
-    }
-
     fn flush_peer_socket(&mut self, registry: &Registry, index: usize, now: Instant) {
-        if let Some(k) = socket_of(&self.sockets, self.peers[index].socket_token) {
-            self.pump(registry, k, now, false);
-        }
+        let k = self
+            .sockets
+            .iter()
+            .position(|s| s.token == self.peers[index].socket_token)
+            .expect("peer must have a socket");
+        self.pump(registry, k, now, false);
     }
 
     fn flush_all(&mut self, registry: &Registry, now: Instant) {
@@ -601,10 +501,10 @@ impl UdpManager {
             }
             let mut probes = if probing { self.peers[i].probe_budget(now) } else { 0 };
             loop {
-                let n = self.peers[i].stage(&self.store, &mut self.batch, probes, now);
+                let packets = self.peers[i].stage(&self.store, &mut self.batch, probes, now);
                 probes = 0;
-                if n != 0 {
-                    self.staged.push((i, n));
+                if packets != 0 {
+                    self.staged_peer_batches.push(StagedPeerBatch { peer_idx: i, packets });
                 }
                 if !self.batch.is_full() {
                     break;
@@ -623,66 +523,74 @@ impl UdpManager {
     /// Sends the batch and tells each peer what the kernel took. `false` if
     /// it took less than everything.
     fn dispatch(&mut self, fd: i32, now: Instant) -> bool {
-        let total: usize = self.staged.iter().map(|&(_, n)| n).sum();
-        let accepted = match self.batch.send(fd) {
+        let total_packets: usize =
+            self.staged_peer_batches.iter().map(|staged| staged.packets).sum();
+        let accepted_packets = match self.batch.send(fd) {
             Ok(k) => k,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
             // Other errors count as sent so the retransmit path retries.
             Err(e) => {
                 debug!(?e, "udp send failed");
-                total
+                total_packets
             }
         };
-        let mut remaining = accepted;
-        for &(i, n) in &self.staged {
-            let take = remaining.min(n);
-            remaining -= take;
-            self.peers[i].commit(&mut self.store, take, now);
+        let mut remaining_packets = accepted_packets;
+        for staged in &self.staged_peer_batches {
+            let take = remaining_packets.min(staged.packets);
+            remaining_packets -= take;
+            self.peers[staged.peer_idx].commit(&mut self.store, take, now);
         }
-        self.staged.clear();
-        accepted == total
+        self.staged_peer_batches.clear();
+        accepted_packets == total_packets
     }
 
     pub(crate) fn currently_disconnected(&self) -> impl Iterator<Item = Token> {
         self.peers.iter().filter(|p| p.is_outbound() && !p.is_connected()).map(|p| p.token)
     }
 
-    pub(crate) fn force_reconnect(&mut self, registry: &Registry) {
+    pub(crate) fn force_reconnect(&mut self) {
         let now = Instant::now();
-        if self.unbound != 0 {
-            self.bind_unbound(registry, now);
-        }
         for peer in self.peers.iter_mut().filter(|p| p.is_outbound() && !p.is_connected()) {
-            if let Some(k) = socket_of(&self.sockets, peer.token) {
-                peer.send_hello(&self.sockets[k].socket, now);
-            }
+            let endpoint = self
+                .sockets
+                .iter()
+                .find(|s| s.token == peer.socket_token)
+                .expect("outbound peer must have a socket");
+            peer.send_hello(&endpoint.socket, now);
         }
     }
 
-    /// Hello retries, heartbeats, peer timeouts, drained closes,
-    /// retransmit probes and socket-open retries.
+    /// Hello retries, heartbeats, peer timeouts, drained closes and retransmit
+    /// probes.
     fn tick(&mut self, registry: &Registry, now: Instant) {
-        if self.unbound != 0 && now >= self.next_bind {
-            self.next_bind = now + self.config.udp.heartbeat_interval;
-            self.bind_unbound(registry, now);
-        }
         let peer_timeout = self.config.peer_timeout;
         let mut i = self.peers.len();
         while i != 0 {
             i -= 1;
             let peer = &mut self.peers[i];
             if peer.drained() {
-                self.drop_peer_pending(i, now);
+                if peer.is_outbound() {
+                    self.reconnect_outbound(i, now);
+                } else {
+                    self.disconnect_accepted(i);
+                }
                 continue;
             }
-            let Some(k) = socket_of(&self.sockets, peer.socket_token) else { continue };
-            let entry = &mut self.sockets[k];
+            let entry = self
+                .sockets
+                .iter_mut()
+                .find(|s| s.token == peer.socket_token)
+                .expect("peer must have a socket");
             match peer.tick(&entry.socket, now, peer_timeout) {
                 Ok(SendOutcome::Done) => {}
                 Ok(SendOutcome::WouldBlock) => arm_writable(registry, entry),
                 Err(()) => {
                     warn!(addr = %peer.addr, "udp peer timed out");
-                    self.drop_peer_pending(i, now);
+                    if peer.is_outbound() {
+                        self.reconnect_outbound(i, now);
+                    } else {
+                        self.disconnect_accepted(i);
+                    }
                 }
             }
         }
@@ -753,10 +661,9 @@ impl UdpManager {
                 }
                 let token = tokens.allocate(self.group);
                 let entry = &self.sockets[k];
-                let mut peer =
-                    Peer::new(from, token, entry.token, new_session(token.0), &self.config);
+                let mut peer = Peer::new(from, token, entry.token, &self.config);
                 peer.on_hello(session, base, &entry.socket, now);
-                push_on_connect(&mut self.store, self.greeting.as_deref(), &mut peer, now);
+                push_on_connect(&mut self.store, self.on_connect_wire_msg.clone(), &mut peer);
                 info!(addr = %from, "udp client connected");
                 deliver(Event::Accepted { group: self.group, token, peer_addr: from });
                 self.peers.push(peer);
@@ -767,9 +674,10 @@ impl UdpManager {
                 let token = self.peers[i].token;
                 if self.peers[i].lost_by_remote(their_session, Some(session)) {
                     warn!(addr = %from, "udp peer lost our session, reconnecting");
-                    deliver(Event::Disconnected { group: self.group, token, peer_addr: from });
-                    self.drop_peer(i, now);
+                    self.reconnect_outbound(i, now);
                 } else if self.peers[i].on_hello_ack(session, their_session, base, now) {
+                    // A reconnect can complete before post_poll drains the old disconnect.
+                    self.drain_pending_disconnects(deliver);
                     debug!(addr = %from, "udp connected");
                     deliver(Event::Connected { group: self.group, token, peer_addr: from });
                     self.pump(registry, k, now, false);
@@ -778,18 +686,16 @@ impl UdpManager {
             Datagram::Reset { their_session } => {
                 let Some(i) = peer.filter(|&i| self.peers[i].is_outbound()) else { return };
                 if self.peers[i].lost_by_remote(their_session, None) {
-                    let token = self.peers[i].token;
                     warn!(addr = %from, "udp peer lost our session, reconnecting");
-                    deliver(Event::Disconnected { group: self.group, token, peer_addr: from });
-                    self.drop_peer(i, now);
+                    self.reconnect_outbound(i, now);
                 }
             }
         }
     }
 
-    /// Handles readiness for the socket identified by `event.token()`.
-    pub(crate) fn handle_event<F>(
+    fn handle_event<F>(
         &mut self,
+        recv: &mut RecvBatch,
         registry: &Registry,
         event: &MioEvent,
         tokens: &mut Tokens,
@@ -802,7 +708,6 @@ impl UdpManager {
         let now = Instant::now();
         if event.is_readable() {
             let fd = self.sockets[k].socket.as_raw_fd();
-            let mut recv = self.recv.take().expect("recv batch in use");
             loop {
                 let n = match recv.recv(fd) {
                     Ok(n) => n,
@@ -820,7 +725,6 @@ impl UdpManager {
                     }
                 }
             }
-            self.recv = Some(recv);
         }
         if event.is_writable() {
             self.sockets[k].writable_armed = false;
@@ -844,13 +748,17 @@ impl UdpManager {
         }
     }
 
+    pub(crate) fn tick_interval(&self) -> Duration {
+        self.config.udp.min_rto / 2
+    }
+
     #[inline]
     fn drain_pending_disconnects<F>(&mut self, deliver: &mut F) -> bool
     where
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
-        let had_pending = !self.pending_disconnects.is_empty();
-        for (token, peer_addr) in self.pending_disconnects.drain(..) {
+        let had_pending = !self.pending_disconnect_notifications.is_empty();
+        for (token, peer_addr) in self.pending_disconnect_notifications.drain(..) {
             deliver(Event::Disconnected { group: self.group, token, peer_addr });
         }
         had_pending
@@ -863,7 +771,7 @@ impl UdpManager {
         let work = self.drain_pending_disconnects(deliver);
         let now = Instant::now();
         if now >= self.next_tick {
-            self.next_tick = now + self.tick_interval;
+            self.next_tick = now + self.tick_interval();
             self.tick(registry, now);
         }
         work
@@ -879,30 +787,17 @@ impl UdpManager {
         self.drain_pending_disconnects(deliver)
     }
 
-    pub(crate) fn tick_interval(&self) -> Duration {
-        self.tick_interval
-    }
-
-    /// Whether the peer can take a message now: connected, or an outbound
-    /// peer whose group replays, and not closing.
     #[inline]
-    fn is_sendable(&self, peer: &Peer) -> bool {
-        !peer.is_draining() &&
-            (peer.is_connected() ||
-                (peer.is_outbound() && self.config.replay == ReplayPolicy::Replay))
-    }
-
-    #[inline]
-    fn is_broadcast_recipient(&self, peer: &Peer) -> bool {
-        self.is_sendable(peer) && !self.broadcast_paused.contains(&peer.token)
+    fn is_sendable(peer: &Peer) -> bool {
+        peer.is_connected() && !peer.is_draining()
     }
 
     fn sendable_index(&self, token: Token) -> Option<usize> {
-        self.peers.iter().position(|p| p.token == token && self.is_sendable(p))
+        self.peers.iter().position(|p| p.token == token && Self::is_sendable(p))
     }
 
     fn has_broadcast_recipient(&self) -> bool {
-        self.peers.iter().any(|p| self.is_broadcast_recipient(p))
+        self.peers.iter().any(Self::is_sendable)
     }
 
     /// Permanently removes a peer, or a listener with every session on it.
@@ -910,14 +805,15 @@ impl UdpManager {
         if let Some(i) = self.peers.iter().position(|p| p.token == token) {
             let outbound = self.peers[i].is_outbound();
             self.remove_peer(i);
-            self.pending_disconnects.retain(|(t, _)| *t != token);
+            self.pending_disconnect_notifications.retain(|(t, _)| *t != token);
             if outbound {
-                if let Some(k) = socket_of(&self.sockets, token) {
-                    let mut endpoint = self.sockets.swap_remove(k);
-                    let _ = registry.deregister(&mut endpoint.socket);
-                } else {
-                    self.unbound -= 1;
-                }
+                let k = self
+                    .sockets
+                    .iter()
+                    .position(|s| s.token == token)
+                    .expect("outbound peer must have a socket");
+                let mut endpoint = self.sockets.swap_remove(k);
+                let _ = registry.deregister(&mut endpoint.socket);
             }
             return true;
         }

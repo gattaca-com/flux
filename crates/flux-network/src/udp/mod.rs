@@ -1,19 +1,4 @@
 //! Reliable, unordered UDP transport for [`crate::Network`].
-//!
-//! Messages are cut into packets of `max_datagram_size`: several small
-//! messages share a packet, a large one spans several. The packet is the
-//! unit of acks, retention and retransmission, and every packet decodes on
-//! its own, so datagrams may arrive in any order. The receiver acks with a
-//! cumulative point plus a selective bitmap covering everything it holds
-//! above it. The sender resends holes below the highest acked sequence at
-//! once, and after an RTO of ack silence probes the oldest unacked packet,
-//! doubling the probe size per round. Messages are delivered as soon as all
-//! their bytes are in, so a lost packet delays only the messages in it.
-//!
-//! With [`UdpConfig::reliable`] off the same wire format carries a fire-and-
-//! forget stream: the sender releases a packet once the kernel takes it and
-//! never resends, the receiver acks only as a heartbeat and skips past holes.
-//! A lost packet loses the messages in it and nothing else.
 
 use flux_timing::Duration;
 
@@ -26,23 +11,15 @@ mod wire;
 
 pub(crate) use manager::UdpManager;
 
-/// Tuning for [`crate::UdpGroupConfig`].
-///
 /// The retransmit timeout is measured from acks (RFC 6298) and clamped to
 /// `[min_rto, max_rto]`; `initial_rto` only applies before the first sample.
-/// [`Self::lan`] and [`Self::wan`] preset the clamps for co-located and
-/// cross-region pairs.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
-    /// Datagram size including the 25-byte packet header. 1200 stays under
-    /// the 1280-byte IPv6 minimum MTU. A receiver must have been configured
-    /// with at least the sender's size.
+    /// Should be link MTU - 48 byte
     pub max_datagram_size: usize,
-    /// Packets a sender may have in flight per peer, counted from the oldest
-    /// message not yet fully acked. Power of two, at least 64. A message that
-    /// does not fit disconnects the peer, like an exceeded backlog. There is
-    /// no flow control, so the receiver's socket buffer should hold a full
-    /// window.
+    /// Packets a sender may have in flight per peer. Power of two, at least 64.
+    /// A message that does not fit disconnects the peer. There is no flow
+    /// control, so the receiver's socket buffer should hold a full window.
     pub send_window: usize,
     /// Packets a receiver tracks above its ack point. Power of two, at least
     /// 64. Should be at least the peer's `send_window`.
@@ -109,7 +86,7 @@ impl UdpConfig {
 
     pub(crate) fn validate(&self) {
         assert!(
-            self.max_datagram_size > wire::PACKET_HEADER + wire::LONG_HEADER &&
+            self.max_datagram_size > wire::PACKET_HEADER + wire::MESSAGE_HEADER &&
                 self.max_datagram_size <= wire::MAX_DATAGRAM_SIZE,
             "udp max_datagram_size {} out of range",
             self.max_datagram_size

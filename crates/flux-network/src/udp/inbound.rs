@@ -1,16 +1,56 @@
 //! The receiving half of a peer: packet tracking and reassembly of messages
 //! cut across packets, which complete whatever order the packets arrive in.
 
-use super::wire::{ACK_HEADER, Record, Records};
+use super::wire::{ACK_HEADER, MESSAGE_HEADER, Record, Records};
 
 /// A message cut across packets, waiting on packet `expect` to continue it.
 struct Partial {
+    /// Its length header, which may itself be cut; `total` is known once
+    /// all of it is in.
+    header: [u8; MESSAGE_HEADER],
+    header_len: usize,
     total: usize,
     received: usize,
     /// Grown to its largest `total` and reused; the message is `buf[..total]`.
     buf: Vec<u8>,
     expect: u64,
     send_ts: u64,
+}
+
+impl Partial {
+    /// Takes in the next bytes of the message: `Some(true)` once it is
+    /// complete, `None` when its header names more than `max_len`.
+    fn append(&mut self, mut bytes: &[u8], max_len: usize) -> Option<bool> {
+        if self.header_len < MESSAGE_HEADER {
+            let n = (MESSAGE_HEADER - self.header_len).min(bytes.len());
+            self.header[self.header_len..][..n].copy_from_slice(&bytes[..n]);
+            self.header_len += n;
+            bytes = &bytes[n..];
+            if self.header_len < MESSAGE_HEADER {
+                return Some(false);
+            }
+            self.total = u32::from_le_bytes(self.header) as usize;
+            if self.total > max_len {
+                return None;
+            }
+            if self.buf.len() < self.total {
+                self.buf.resize(self.total, 0);
+            }
+        }
+        let n = (self.total - self.received).min(bytes.len());
+        self.buf[self.received..][..n].copy_from_slice(&bytes[..n]);
+        self.received += n;
+        Some(self.received == self.total)
+    }
+}
+
+/// The length a header cut into `head` and `rest` names, once `rest` holds
+/// all of it that `head` lacks.
+fn joined_len(head: &[u8], rest: &[u8]) -> Option<usize> {
+    let mut header = [0; MESSAGE_HEADER];
+    header[..head.len()].copy_from_slice(head);
+    header[head.len()..].copy_from_slice(rest.get(..MESSAGE_HEADER - head.len())?);
+    Some(u32::from_le_bytes(header) as usize)
 }
 
 /// The leading bytes of a packet that arrived before the message they
@@ -35,6 +75,9 @@ pub(crate) struct Inbound {
     capacity: u64,
     /// Most bits one ack datagram can carry.
     max_bits: u64,
+    /// Largest message taken in; a header cut over more than two packets
+    /// is only checked here.
+    max_len: usize,
     /// Unreliable mode: the window follows the highest sequence instead of
     /// waiting at a hole that no retransmit will ever fill.
     slide: bool,
@@ -45,7 +88,7 @@ pub(crate) struct Inbound {
 }
 
 impl Inbound {
-    pub(crate) fn new(capacity: usize, datagram_size: usize, slide: bool) -> Self {
+    pub(crate) fn new(capacity: usize, datagram_size: usize, max_len: usize, slide: bool) -> Self {
         let max_bits = ((datagram_size - ACK_HEADER) / 8 * 64) as u64;
         Self {
             ack_next: 0,
@@ -54,6 +97,7 @@ impl Inbound {
             mask: capacity as u64 - 1,
             capacity: capacity as u64,
             max_bits: max_bits.min(capacity as u64 - 1),
+            max_len,
             slide,
             stash: (0..capacity).map(|_| Stash { seq: None, buf: Vec::new() }).collect(),
             partials: Vec::new(),
@@ -170,9 +214,10 @@ impl Inbound {
         for record in records {
             match record {
                 Record::Whole(bytes) => deliver(bytes, send_ts),
-                Record::Head { total, bytes } => {
-                    let i = self.start(total, bytes, seq + 1, send_ts);
-                    self.drain(i, deliver);
+                Record::Head(bytes) => {
+                    if let Some(i) = self.start(bytes, seq + 1, send_ts) {
+                        self.drain(i, deliver);
+                    }
                 }
             }
         }
@@ -180,23 +225,18 @@ impl Inbound {
 
     /// Appends the packet partial `i` waits for. `true` once the partial is
     /// gone: delivered, or dropped because the packet started a message
-    /// where it should have continued this one.
+    /// where it should have continued this one, or because it is too large.
     fn feed(&mut self, i: usize, bytes: &[u8], deliver: &mut dyn FnMut(&[u8], u64)) -> bool {
         let p = &mut self.partials[i];
-        if bytes.is_empty() {
-            let dead = self.partials.swap_remove(i);
-            self.spare.push(dead);
-            return true;
-        }
-        let n = (p.total - p.received).min(bytes.len());
-        p.buf[p.received..p.received + n].copy_from_slice(&bytes[..n]);
-        p.received += n;
-        if p.received < p.total {
+        let complete = if bytes.is_empty() { None } else { p.append(bytes, self.max_len) };
+        if complete == Some(false) {
             p.expect += 1;
             return false;
         }
         let done = self.partials.swap_remove(i);
-        deliver(&done.buf[..done.total], done.send_ts);
+        if complete.is_some() {
+            deliver(&done.buf[..done.total], done.send_ts);
+        }
         self.spare.push(done);
         true
     }
@@ -220,24 +260,46 @@ impl Inbound {
         }
     }
 
-    fn start(&mut self, total: usize, bytes: &[u8], expect: u64, send_ts: u64) -> usize {
+    /// Starts a message from its leading bytes, header first. `None` when
+    /// its header names more than `max_len`.
+    fn start(&mut self, head: &[u8], expect: u64, send_ts: u64) -> Option<usize> {
         let mut partial = self.spare.pop().unwrap_or(Partial {
+            header: [0; MESSAGE_HEADER],
+            header_len: 0,
             total: 0,
             received: 0,
             buf: Vec::new(),
             expect: 0,
             send_ts: 0,
         });
-        if partial.buf.len() < total {
-            partial.buf.resize(total, 0);
-        }
-        partial.buf[..bytes.len()].copy_from_slice(bytes);
-        partial.total = total;
-        partial.received = bytes.len();
+        partial.header_len = 0;
+        partial.total = 0;
+        partial.received = 0;
         partial.expect = expect;
         partial.send_ts = send_ts;
+        if partial.append(head, self.max_len) != Some(false) {
+            self.spare.push(partial);
+            return None;
+        }
         self.partials.push(partial);
-        self.partials.len() - 1
+        Some(self.partials.len() - 1)
+    }
+
+    /// The length named by the header of the message waiting on packet
+    /// `seq`, when that header was cut and `continuation` finishes it.
+    pub(crate) fn waiting_len(&self, seq: u64, continuation: &[u8]) -> Option<usize> {
+        let p = self.partials.iter().find(|p| p.expect == seq && p.header_len < MESSAGE_HEADER)?;
+        joined_len(&p.header[..p.header_len], continuation)
+    }
+
+    /// The length named by a header cut into `head` at the end of packet
+    /// `seq`, when the stashed packet `seq + 1` finishes it.
+    pub(crate) fn stashed_len(&self, seq: u64, head: &[u8]) -> Option<usize> {
+        let stash = &self.stash[((seq + 1) & self.mask) as usize];
+        if stash.seq != Some(seq + 1) {
+            return None;
+        }
+        joined_len(head, &stash.buf)
     }
 
     /// Bits an ack should carry: one per sequence in `ack_next + 1 ..=
@@ -276,7 +338,7 @@ impl Inbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::udp::wire::{self, LONG_HEADER, PACKET_HEADER};
+    use crate::udp::wire::{self, PACKET_HEADER};
 
     /// Feeds a packet of `continuation` then `messages`, the last cut to
     /// `head` bytes if given, collecting deliveries as `(bytes, send_ts)`.
@@ -293,9 +355,7 @@ mod tests {
         wire::packet_header(bytes.as_mut_slice().try_into().unwrap(), 1, seq, seq * 10, start);
         bytes.extend_from_slice(continuation);
         for (i, m) in messages.iter().enumerate() {
-            let mut h = [0; LONG_HEADER];
-            let n = wire::message_header(&mut h, m.len());
-            bytes.extend_from_slice(&h[..n]);
+            bytes.extend_from_slice(&(m.len() as u32).to_le_bytes());
             let cut = if i + 1 == messages.len() { head.unwrap_or(m.len()) } else { m.len() };
             bytes.extend_from_slice(&m[..cut]);
         }
@@ -307,7 +367,7 @@ mod tests {
 
     #[test]
     fn accepts_once_and_reports_bitmap() {
-        let mut rx = Inbound::new(64, 1200, false);
+        let mut rx = Inbound::new(64, 1200, 1 << 20, false);
         rx.reset(10);
         assert!(rx.accept(10));
         assert!(!rx.accept(10));
@@ -326,7 +386,7 @@ mod tests {
 
     #[test]
     fn a_cut_message_completes_in_any_packet_order() {
-        let mut rx = Inbound::new(64, 1200, false);
+        let mut rx = Inbound::new(64, 1200, 1 << 20, false);
         rx.reset(0);
         let mut out = Vec::new();
         // "abc" is cut after "a", runs through packet 4 and ends in 5.
@@ -344,7 +404,7 @@ mod tests {
 
     #[test]
     fn a_packet_that_does_not_continue_drops_the_cut_message() {
-        let mut rx = Inbound::new(64, 1200, false);
+        let mut rx = Inbound::new(64, 1200, 1 << 20, false);
         rx.reset(0);
         let mut out = Vec::new();
         feed(&mut rx, 1, b"", &[b"abc"], Some(1), &mut out);

@@ -11,19 +11,18 @@ use tracing::{debug, warn};
 
 use super::{
     inbound::Inbound,
-    outbound::{MessageStore, Outbound, WindowFull},
+    outbound::{MessageStore, Outbound},
     sys::{SendBatch, SockAddr},
-    wire::{self, ACK_HEADER, HELLO_ACK_SIZE, HELLO_SIZE, Packet, RESET_SIZE, Record, Records},
+    wire::{
+        self, ACK_HEADER, HELLO_ACK_SIZE, HELLO_SIZE, MESSAGE_HEADER, Packet, RESET_SIZE, Record,
+        Records,
+    },
 };
 use crate::{
     NetworkTelemetry,
     network::{RxPayload, UdpGroupConfig},
 };
 
-const WARN_INTERVAL_SECS: u64 = 5;
-
-/// Result of a socket write. Errors other than `WouldBlock` are logged and
-/// treated as sent: the retransmit path tries again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
     Done,
@@ -51,8 +50,7 @@ fn latency_timer(telemetry: NetworkTelemetry, label: &str) -> Option<Timer> {
     Some(Timer::new(app_name, format!("udp_latency_{label}")))
 }
 
-/// Why a packet was not taken in, leaving its sequence unacked so the
-/// sender's backlog policy surfaces the mismatch.
+/// Why a packet was not taken in, leaving its sequence unacked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refused {
     Malformed,
@@ -60,7 +58,20 @@ enum Refused {
     ExceedsDcache,
 }
 
-// Session flags are independent; packing them would only obscure the state.
+/// Session id for a new connection attempt: mixes the TSC, the pid and the
+/// peer token. Called once per connect, accept and reconnect.
+fn new_session(salt: usize) -> u32 {
+    let t = Instant::now().0;
+    let mut x = t ^
+        (t >> 32) ^
+        (u64::from(std::process::id()) << 20) ^
+        (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x as u32
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Peer {
     pub(crate) addr: SocketAddr,
@@ -87,8 +98,6 @@ pub(crate) struct Peer {
     /// Drop the session once every packet is acked; sends are refused.
     close_when_drained: bool,
     latency: Option<Timer>,
-    dropped_full: u64,
-    last_warn: Instant,
     /// Control datagram staging: the largest ack.
     ctrl: Vec<u8>,
 }
@@ -98,13 +107,18 @@ impl Peer {
         addr: SocketAddr,
         token: Token,
         socket_token: Token,
-        local_session: u32,
-        group: &UdpGroupConfig,
+        config: &UdpGroupConfig,
     ) -> Self {
         let now = Instant::now();
-        let udp = group.udp;
-        let label = telemetry_label(group.name, token, addr);
-        let inbound = Inbound::new(udp.recv_window, udp.max_datagram_size, !udp.reliable);
+        let udp = config.udp;
+        let label = telemetry_label(config.name, token, addr);
+        let inbound = Inbound::new(
+            udp.recv_window,
+            udp.max_datagram_size,
+            udp.max_message_size,
+            !udp.reliable,
+        );
+        let local_session = new_session(token.0);
         Self {
             addr,
             token,
@@ -117,7 +131,7 @@ impl Peer {
             connected: false,
             local_session,
             remote_session: None,
-            outbound: Outbound::new(group, &label),
+            outbound: Outbound::new(config, &label),
             ctrl: vec![0; ACK_HEADER + inbound.bitmap_capacity()],
             inbound,
             last_recv: now,
@@ -126,9 +140,7 @@ impl Peer {
             hello_backoff: 0,
             ack_due: false,
             close_when_drained: false,
-            latency: latency_timer(group.telemetry, &label),
-            dropped_full: 0,
-            last_warn: Instant::ZERO,
+            latency: latency_timer(config.telemetry, &label),
         }
     }
 
@@ -164,30 +176,6 @@ impl Peer {
         self.close_when_drained && self.outbound.inflight() == 0
     }
 
-    /// Queues the stream in store `slot`. On [`WindowFull`] the peer is
-    /// unusable and must be dropped.
-    pub(crate) fn enqueue(
-        &mut self,
-        store: &mut MessageStore,
-        slot: u32,
-        now: Instant,
-    ) -> Result<(), WindowFull> {
-        let result = self.outbound.enqueue(store, slot);
-        if result.is_err() {
-            self.dropped_full += 1;
-            if now.saturating_sub(self.last_warn) >= Duration::from_secs(WARN_INTERVAL_SECS) {
-                warn!(
-                    %self.addr,
-                    dropped = self.dropped_full,
-                    inflight = self.outbound.inflight(),
-                    "udp send window full"
-                );
-                self.last_warn = now;
-            }
-        }
-        result
-    }
-
     /// Puts due packets into `batch`; see [`Outbound::stage`]. Nothing goes
     /// out before the session is up.
     pub(crate) fn stage(
@@ -214,24 +202,14 @@ impl Peer {
         }
     }
 
-    /// Drops the session and adopts `new_session` so the remote sees a fresh
-    /// peer. Queued packets are kept for the next session unless
-    /// `drop_backlog`; hello retries restart on the next tick.
-    pub(crate) fn mark_disconnected(
-        &mut self,
-        drop_backlog: bool,
-        new_session: u32,
-        store: &mut MessageStore,
-    ) {
+    /// Starts a fresh session and discards queued packets.
+    /// Hello retries restart on the next tick.
+    pub(crate) fn reset_connection(&mut self, store: &mut MessageStore) {
         self.connected = false;
         self.close_when_drained = false;
         self.remote_session = None;
-        self.local_session = new_session;
-        if drop_backlog {
-            self.outbound.clear(store);
-        } else {
-            self.outbound.rewind();
-        }
+        self.local_session = new_session(self.token.0);
+        self.outbound.clear(store);
         self.hello_due = Instant::ZERO;
         self.hello_backoff = 0;
     }
@@ -348,7 +326,8 @@ impl Peer {
         self.last_recv = now;
         let checked =
             packet.split().ok_or(Refused::Malformed).and_then(|(continuation, records)| {
-                self.validate(records.clone(), dcache).map(|()| (continuation, records))
+                self.validate(seq, continuation, records.clone(), dcache)
+                    .map(|()| (continuation, records))
             });
         let (continuation, records) = match checked {
             Ok(split) => split,
@@ -373,22 +352,40 @@ impl Peer {
         });
     }
 
-    /// Checks every message starting in a packet before any byte is taken
-    /// in.
-    fn validate(&self, mut records: Records<'_>, dcache: Option<&DCache>) -> Result<(), Refused> {
-        for record in records.by_ref() {
-            let len = match record {
-                Record::Whole(bytes) => bytes.len(),
-                Record::Head { total, .. } => total,
-            };
+    /// Checks every message length a packet makes known before any byte is
+    /// taken in: those of the messages starting in it, and that of a header
+    /// cut across it and a packet already in.
+    fn validate(
+        &self,
+        seq: u64,
+        continuation: &[u8],
+        records: Records<'_>,
+        dcache: Option<&DCache>,
+    ) -> Result<(), Refused> {
+        let check = |len: usize| {
             if len > self.max_message_size {
                 return Err(Refused::TooLarge);
             }
             if dcache.is_some_and(|dc| len > dc.capacity()) {
                 return Err(Refused::ExceedsDcache);
             }
+            Ok(())
+        };
+        if let Some(len) = self.inbound.waiting_len(seq, continuation) {
+            check(len)?;
         }
-        if records.ok() { Ok(()) } else { Err(Refused::Malformed) }
+        for record in records {
+            let len = match record {
+                Record::Whole(bytes) => Some(bytes.len()),
+                Record::Head(bytes) => wire::record_len(bytes)
+                    .checked_sub(MESSAGE_HEADER)
+                    .or_else(|| self.inbound.stashed_len(seq, bytes)),
+            };
+            if let Some(len) = len {
+                check(len)?;
+            }
+        }
+        Ok(())
     }
 
     /// Takes in an ack. Unreliable: the ack is a liveness signal only, its
@@ -469,7 +466,7 @@ mod tests {
     use super::*;
     use crate::udp::{
         UdpConfig,
-        wire::{self, LONG_HEADER, PACKET_HEADER},
+        wire::{self, PACKET_HEADER},
     };
 
     const SESSION: u32 = 7;
@@ -479,8 +476,9 @@ mod tests {
             udp: UdpConfig { send_window: 64, recv_window: 64, ..UdpConfig::lan() },
             ..Default::default()
         };
-        let mut peer = Peer::new(socket.local_addr().unwrap(), Token(1), Token(1), 1, &group);
-        assert!(peer.on_hello_ack(SESSION, 1, 10, Instant::now()));
+        let mut peer = Peer::new(socket.local_addr().unwrap(), Token(1), Token(1), &group);
+        let local = peer.local_session;
+        assert!(peer.on_hello_ack(SESSION, local, 10, Instant::now()));
         peer
     }
 
@@ -493,9 +491,7 @@ mod tests {
         let mut bytes = header.to_vec();
         bytes.extend_from_slice(continuation);
         for (i, m) in messages.iter().enumerate() {
-            let mut h = [0; LONG_HEADER];
-            let n = wire::message_header(&mut h, m.len());
-            bytes.extend_from_slice(&h[..n]);
+            bytes.extend_from_slice(&(m.len() as u32).to_le_bytes());
             let cut = if i + 1 == messages.len() { head.unwrap_or(m.len()) } else { m.len() };
             bytes.extend_from_slice(&m[..cut]);
         }
@@ -565,21 +561,41 @@ mod tests {
         assert_eq!(out, [(b"new".to_vec(), 1000)]);
     }
 
+    /// A packet whose payload starts with a message header at `start` (0
+    /// for none), unlike [`packet`] not split into messages.
+    fn raw(seq: u64, start: u16, payload: &[u8]) -> Vec<u8> {
+        let mut header = [0; PACKET_HEADER];
+        wire::packet_header(&mut header, SESSION, seq, seq * 100, start);
+        [&header[..], payload].concat()
+    }
+
     #[test]
-    fn a_packet_cut_at_a_header_leaves_its_sequence_unacked() {
+    fn a_message_cut_in_or_right_after_its_header_completes_in_any_order() {
         let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut peer = peer(&socket);
-        let mut bytes = packet(10, b"", &[b"one", b"two"], None);
-        bytes.truncate(bytes.len() - 3);
+        let stream = [&6u32.to_le_bytes()[..], b"abcdef"].concat();
         let mut out = Vec::new();
-        feed(&mut peer, &bytes, &mut out);
+        let mut seq = 10;
+        for cut in 1..=MESSAGE_HEADER {
+            for head_first in [true, false] {
+                let head = raw(seq, 1, &stream[..cut]);
+                let tail = raw(seq + 1, 0, &stream[cut..]);
+                let order = if head_first { [&head, &tail] } else { [&tail, &head] };
+                for bytes in order {
+                    feed(&mut peer, bytes, &mut out);
+                }
+                assert_eq!(out, [(b"abcdef".to_vec(), seq * 100)]);
+                out.clear();
+                seq += 2;
+            }
+        }
+        assert_eq!(peer.inbound.ack_next(), seq);
+        // A cut header naming too much: the packet that completes it is
+        // refused and stays unacked.
+        let header = u32::MAX.to_le_bytes();
+        feed(&mut peer, &raw(seq, 1, &header[..2]), &mut out);
+        feed(&mut peer, &raw(seq + 1, 0, &[&header[2..], b"x"].concat()), &mut out);
         assert!(out.is_empty());
-        assert_eq!(peer.inbound.ack_next(), 10);
-        // Cut inside a message it reads as a head, which only the next
-        // packet can refute.
-        bytes.truncate(bytes.len() - 1);
-        feed(&mut peer, &bytes, &mut out);
-        assert_eq!(out, [(b"one".to_vec(), 1000)]);
-        assert_eq!(peer.inbound.ack_next(), 11);
+        assert_eq!(peer.inbound.ack_next(), seq + 1);
     }
 }

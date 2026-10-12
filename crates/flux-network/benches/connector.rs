@@ -6,6 +6,8 @@
 //! datagrams. TCP has no loss variant: a byte-dropping proxy is not packet
 //! loss, and netem needs root.
 
+// TODO: delete, benching against loopback is misleading.
+
 use std::{
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
