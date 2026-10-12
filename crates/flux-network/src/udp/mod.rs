@@ -1,15 +1,54 @@
-//! Reliable, unordered UDP transport for [`crate::Network`].
+//! Reliable, unordered, one-way UDP transport for [`crate::Network`]: a
+//! group's listeners publish one stream, the same packets to every
+//! subscriber, and its `connect` tokens subscribe.
 
-use flux_timing::Duration;
+use std::{io, net::SocketAddr};
+
+use flux_timing::{Duration, Instant};
+use mio::net::UdpSocket;
+use tracing::debug;
 
 mod inbound;
 mod manager;
-mod outbound;
-mod peer;
+mod stream;
+mod subscriber;
+mod subscription;
 mod sys;
 mod wire;
 
 pub(crate) use manager::UdpManager;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    Done,
+    WouldBlock,
+}
+
+#[inline]
+fn send_datagram(socket: &UdpSocket, addr: SocketAddr, bytes: &[u8]) -> SendOutcome {
+    match socket.send_to(bytes, addr) {
+        Ok(_) => SendOutcome::Done,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => SendOutcome::WouldBlock,
+        Err(e) => {
+            debug!(?e, %addr, "udp send failed");
+            SendOutcome::Done
+        }
+    }
+}
+
+/// Session id for a new stream or subscription attempt: mixes the TSC, the
+/// pid and `salt`.
+fn new_session(salt: usize) -> u32 {
+    let t = Instant::now().0;
+    let mut x = t ^
+        (t >> 32) ^
+        (u64::from(std::process::id()) << 20) ^
+        (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x as u32
+}
 
 /// The retransmit timeout is measured from acks (RFC 6298) and clamped to
 /// `[min_rto, max_rto]`; `initial_rto` only applies before the first sample.
@@ -17,27 +56,31 @@ pub(crate) use manager::UdpManager;
 pub struct UdpConfig {
     /// Should be link MTU - 48 byte
     pub max_datagram_size: usize,
-    /// Packets a sender may have in flight per peer. Power of two, at least 64.
-    /// A message that does not fit disconnects the peer. There is no flow
-    /// control, so the receiver's socket buffer should hold a full window.
+    /// Packets a publisher holds until every subscriber is done with them.
+    /// Power of two, at least 64. When a message does not fit, every
+    /// subscriber still holding the oldest packet is dropped. There is no
+    /// flow control, so a subscriber's socket buffer should hold a full
+    /// window.
     pub send_window: usize,
-    /// Packets a receiver tracks above its ack point. Power of two, at least
-    /// 64. Should be at least the peer's `send_window`.
+    /// Packets a subscriber tracks above its ack point. Power of two, at
+    /// least 64. Should be at least the publisher's `send_window`.
     pub recv_window: usize,
     /// Largest message accepted or sent. Must fit in `send_window`.
     pub max_message_size: usize,
     pub initial_rto: Duration,
     pub min_rto: Duration,
     pub max_rto: Duration,
-    /// Idle interval after which a connected peer sends a bare ack so the
-    /// other side can tell it is alive. Peer death is detected by the
-    /// connector's user timeout.
+    /// Idle interval after which a subscriber sends a bare ack, so its
+    /// publisher can tell it is alive and, once restarted, reset it. A
+    /// publisher drops a subscriber silent for the group's `peer_timeout`; a
+    /// subscriber never times out an idle publisher.
     pub heartbeat_interval: Duration,
     /// Off: no retransmits, no per-packet acks; a packet is done once the
     /// kernel takes it and the receiver drops whatever a lost packet leaves
-    /// incomplete. Acks still flow at `heartbeat_interval` for liveness. Both
-    /// ends of a link must agree. Nothing throttles a burst, so the receiver's
-    /// socket buffer must hold the largest one or its overflow is loss too.
+    /// incomplete. Acks still flow at `heartbeat_interval`. A
+    /// publisher and its subscribers must agree. Nothing throttles a burst, so
+    /// the receiver's socket buffer must hold the largest one or its overflow
+    /// is loss too.
     pub reliable: bool,
 }
 

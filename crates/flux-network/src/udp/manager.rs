@@ -1,3 +1,7 @@
+//! One UDP group: its listeners publish one stream to every subscriber, and
+//! its `connect` tokens subscribe to other publishers. Data only flows from
+//! a publisher to its subscribers.
+
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -11,10 +15,12 @@ use mio::{Interest, Registry, Token, event::Event as MioEvent, net::UdpSocket};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    outbound::MessageStore,
-    peer::{Peer, SendOutcome, deliver_message},
+    SendOutcome, new_session, send_datagram,
+    stream::{MessageStore, Stream},
+    subscriber::Subscriber,
+    subscription::{Subscription, deliver_message},
     sys::{RecvBatch, SendBatch},
-    wire::{self, Datagram, HELLO_ACK_SIZE, MESSAGE_HEADER},
+    wire::{self, Datagram, HELLO_ACK_SIZE, MESSAGE_HEADER, RESET_SIZE},
 };
 use crate::network::{
     Event, Group, PayloadBuf, RxPayload, Tokens, UdpGroupConfig, set_socket_buf_size,
@@ -53,8 +59,16 @@ fn outbound_bind_addr(peer: SocketAddr) -> SocketAddr {
     }
 }
 
-struct StagedPeerBatch {
-    peer_idx: usize,
+/// Tells the sender of a datagram naming `subscriber` that we hold no
+/// subscriber for it.
+fn send_reset(socket: &UdpSocket, addr: SocketAddr, subscriber: u32) {
+    let mut buf = [0; RESET_SIZE];
+    wire::reset(&mut buf, subscriber);
+    send_datagram(socket, addr, &buf);
+}
+
+struct StagedBatch {
+    subscriber: usize,
     packets: usize,
 }
 
@@ -105,15 +119,23 @@ pub(crate) struct UdpManagerState {
     group: Group,
 
     sockets: Vec<Endpoint>,
-    peers: Vec<Peer>,
-
+    stream: Stream,
     store: MessageStore,
+    subscribers: Vec<Subscriber>,
+    /// Subscribers dropped within `peer_timeout`, with when: a hello naming
+    /// one is a stale retry, answered with a reset rather than a new
+    /// subscriber.
+    dropped: Vec<(SocketAddr, u32, Instant)>,
+    subscriptions: Vec<Subscription>,
+
     /// users serialise here. and then it's moved to `MessageStore`
     send_buffer: Vec<u8>,
+    /// Hello ack staging, sized for the on-connect message.
+    ctrl: Vec<u8>,
 
     batch: SendBatch,
     // entries here correspond to `SendBatch` order
-    staged_peer_batches: Vec<StagedPeerBatch>,
+    staged: Vec<StagedBatch>,
 
     pending_disconnect_notifications: Vec<(Token, SocketAddr)>,
     // to avoid passing &mut Tokens everywhere
@@ -138,14 +160,18 @@ impl UdpManagerState {
             );
         }
         Self {
+            ctrl: vec![0; HELLO_ACK_SIZE + on_connect_msg(&config).len()],
+            stream: Stream::new(&udp, new_session(0)),
             config,
             group,
             sockets: Vec::new(),
-            peers: Vec::new(),
             store: MessageStore::new(),
+            subscribers: Vec::new(),
+            dropped: Vec::new(),
+            subscriptions: Vec::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
             batch: SendBatch::new(udp.max_datagram_size),
-            staged_peer_batches: Vec::new(),
+            staged: Vec::new(),
             pending_disconnect_notifications: Vec::new(),
             retired: Vec::new(),
             next_tick: Instant::ZERO,
@@ -181,6 +207,7 @@ impl UdpManagerState {
         Ok(socket)
     }
 
+    /// Subscribes to the publisher at `addr` from a socket of its own.
     pub(crate) fn connect(
         &mut self,
         registry: &Registry,
@@ -196,14 +223,14 @@ impl UdpManagerState {
                 return token;
             }
         };
-        let mut peer = Peer::new(addr, token, token, &self.config);
-        let now = Instant::now();
-        peer.send_hello(&socket, on_connect_msg(&self.config), now);
+        let mut subscription = Subscription::new(addr, token, &self.config);
+        subscription.send_hello(&socket, on_connect_msg(&self.config), Instant::now());
         self.sockets.push(Endpoint { token, socket, listener: false, writable_armed: false });
-        self.peers.push(peer);
+        self.subscriptions.push(subscription);
         token
     }
 
+    /// Publishes the group's stream on `addr`.
     pub(crate) fn listen(
         &mut self,
         registry: &Registry,
@@ -222,76 +249,87 @@ impl UdpManagerState {
         Ok(token)
     }
 
-    fn reconnect_outbound(&mut self, index: usize, now: Instant) {
-        let peer = &mut self.peers[index];
-        if peer.is_connected() {
-            self.pending_disconnect_notifications.push((peer.token, peer.addr));
+    /// Starts subscription `i` over with a fresh session.
+    fn resubscribe(&mut self, i: usize, now: Instant) {
+        let subscription = &mut self.subscriptions[i];
+        if subscription.is_connected() {
+            self.pending_disconnect_notifications.push((subscription.token, subscription.addr));
         }
-        peer.reset_connection(&mut self.store);
-        let endpoint = self
+        subscription.reset();
+        let socket = &self
             .sockets
             .iter()
-            .find(|s| s.token == peer.socket_token)
-            .expect("outbound peer must have a socket");
-        peer.send_hello(&endpoint.socket, on_connect_msg(&self.config), now);
+            .find(|s| s.token == subscription.token)
+            .expect("subscription must have a socket")
+            .socket;
+        subscription.send_hello(socket, on_connect_msg(&self.config), now);
     }
 
-    fn remove_peer(&mut self, index: usize) -> Token {
-        let mut peer = self.peers.swap_remove(index);
-        peer.outbound.release_all(&mut self.store);
-        self.retired.push(peer.token);
-        peer.token
+    /// Lets the stream drop what no subscriber needs any more.
+    fn release(&mut self) {
+        let base = self
+            .subscribers
+            .iter()
+            .map(Subscriber::base)
+            .min()
+            .unwrap_or_else(|| self.stream.next());
+        if base > self.stream.base() {
+            self.stream.release_to(base, &mut self.store);
+        }
     }
 
-    fn disconnect_accepted(&mut self, index: usize) {
-        let peer = &self.peers[index];
-        self.pending_disconnect_notifications.push((peer.token, peer.addr));
-        self.remove_peer(index);
+    fn remove_subscriber(&mut self, index: usize) -> Token {
+        let subscriber = self.subscribers.swap_remove(index);
+        self.dropped.push((subscriber.addr, subscriber.session, Instant::now()));
+        self.retired.push(subscriber.token);
+        self.release();
+        subscriber.token
     }
 
-    /// Drops a peer's session: accepted peers go, outbound ones redial. A
-    /// listener token is not a session and is left alone.
+    fn drop_subscriber(&mut self, index: usize) {
+        let subscriber = &self.subscribers[index];
+        self.pending_disconnect_notifications.push((subscriber.token, subscriber.addr));
+        self.remove_subscriber(index);
+    }
+
+    /// Drops a subscriber, which learns of it from the reset its next ack
+    /// draws, or restarts a subscription. A listener token is not a session
+    /// and is left alone.
     pub(crate) fn disconnect(&mut self, token: Token) -> bool {
-        let Some(i) = self.peers.iter().position(|p| p.token == token) else { return false };
-        if self.peers[i].is_outbound() {
-            self.reconnect_outbound(i, Instant::now());
-        } else {
-            self.disconnect_accepted(i);
+        if let Some(i) = self.subscribers.iter().position(|s| s.token == token) {
+            self.drop_subscriber(i);
+            return true;
         }
+        let Some(i) = self.subscriptions.iter().position(|s| s.token == token) else {
+            return false;
+        };
+        self.resubscribe(i, Instant::now());
         true
     }
 
-    /// Closes the session once everything queued for it is acked. Sends to
-    /// it are refused meanwhile.
+    /// Drops a subscriber once it has acked everything published so far. A
+    /// subscription has nothing of its own to drain and restarts at once.
     pub(crate) fn disconnect_when_drained(&mut self, token: Token) -> bool {
-        let Some(i) = self.peers.iter().position(|p| p.token == token) else { return false };
-        if self.peers[i].close_when_drained() {
-            if self.peers[i].is_outbound() {
-                self.reconnect_outbound(i, Instant::now());
-            } else {
-                self.disconnect_accepted(i);
+        if let Some(i) = self.subscribers.iter().position(|s| s.token == token) {
+            let end = self.stream.next();
+            if self.subscribers[i].close_when_drained(end) {
+                self.drop_subscriber(i);
             }
+            return true;
         }
-        true
+        self.disconnect(token)
     }
 
-    /// Drops the messages queued for `token` that have not started going
-    /// out. Returns how many.
-    pub(crate) fn clear_backlog(&mut self, token: Token) -> usize {
-        let Some(i) = self.peers.iter().position(|p| p.token == token) else { return 0 };
-        self.peers[i].outbound.clear_unsent(&mut self.store)
-    }
-
-    /// Removes a listener and every session accepted on it.
+    /// Removes a listener and every subscriber that joined through it.
     fn remove_listener(&mut self, registry: &Registry, token: Token) -> bool {
         let Some(k) = self.sockets.iter().position(|s| s.token == token && s.listener) else {
             return false;
         };
-        let mut i = self.peers.len();
+        let mut i = self.subscribers.len();
         while i != 0 {
             i -= 1;
-            if self.peers[i].socket_token == token {
-                self.disconnect_accepted(i);
+            if self.subscribers[i].socket_token == token {
+                self.drop_subscriber(i);
             }
         }
         let mut entry = self.sockets.swap_remove(k);
@@ -302,76 +340,29 @@ impl UdpManagerState {
 
     pub(crate) fn disconnect_outbound(&mut self) {
         let now = Instant::now();
-        for i in 0..self.peers.len() {
-            if self.peers[i].is_outbound() {
-                self.reconnect_outbound(i, now);
-            }
+        for i in 0..self.subscriptions.len() {
+            self.resubscribe(i, now);
         }
     }
 
-    pub(crate) fn send_with<F>(&mut self, registry: &Registry, token: Token, serialise: F) -> bool
-    where
-        F: FnOnce(&mut PayloadBuf<'_>),
-    {
-        let Some(index) = self.sendable_index(token) else { return false };
-        let now = Instant::now();
-        if !self.append_record(serialise) {
-            return false;
-        }
-        let sent = self.queue_stream_for(index, now);
-        if sent {
-            self.flush_peer_socket(registry, index, now);
-        }
-        sent
-    }
-
-    /// Serialises every item into one stream for `token`, queues it and
-    /// flushes the socket once.
-    pub(crate) fn send_many_with<I, F>(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        items: I,
-        mut serialise: F,
-    ) -> bool
-    where
-        I: IntoIterator,
-        F: FnMut(&mut PayloadBuf<'_>, I::Item),
-    {
-        let Some(index) = self.sendable_index(token) else { return false };
-        let now = Instant::now();
-        let mut appended = false;
-        for item in items {
-            appended |= self.append_record(|buf| serialise(buf, item));
-        }
-        if !appended {
-            return false;
-        }
-        let sent = self.queue_stream_for(index, now);
-        if sent {
-            self.flush_peer_socket(registry, index, now);
-        }
-        sent
+    /// One-way: there is no per-token send. Publish with a broadcast.
+    pub(crate) fn send_with(&self, token: Token) -> bool {
+        error!(group = self.config.name, ?token, "udp is one-way: broadcast on a listening group");
+        false
     }
 
     pub(crate) fn broadcast_with<F>(&mut self, registry: &Registry, serialise: F) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),
     {
-        if !self.has_broadcast_recipient() {
+        if !self.can_publish() || !self.append_record(serialise) {
             return 0;
         }
-        let now = Instant::now();
-        if !self.append_record(serialise) {
-            return 0;
-        }
-        let recipients = self.queue_stream_broadcast(now);
-        self.flush_all(registry, now);
-        recipients
+        self.publish(registry)
     }
 
-    /// Serialises every item into one stream for every recipient, queues it
-    /// and flushes each socket once.
+    /// Serialises every item into one stream, queues it and flushes each
+    /// listener once.
     pub(crate) fn broadcast_many_with<I, F>(
         &mut self,
         registry: &Registry,
@@ -382,10 +373,9 @@ impl UdpManagerState {
         I: IntoIterator,
         F: FnMut(&mut PayloadBuf<'_>, I::Item),
     {
-        if !self.has_broadcast_recipient() {
+        if !self.can_publish() {
             return 0;
         }
-        let now = Instant::now();
         let mut appended = false;
         for item in items {
             appended |= self.append_record(|buf| serialise(buf, item));
@@ -393,9 +383,17 @@ impl UdpManagerState {
         if !appended {
             return 0;
         }
-        let recipients = self.queue_stream_broadcast(now);
-        self.flush_all(registry, now);
-        recipients
+        self.publish(registry)
+    }
+
+    /// Whether a broadcast has anyone to reach; nothing is serialised
+    /// otherwise.
+    fn can_publish(&self) -> bool {
+        if !self.sockets.iter().any(|s| s.listener) {
+            error!(group = self.config.name, "udp broadcast on a group that does not listen");
+            return false;
+        }
+        self.subscribers.iter().any(|s| !s.is_draining())
     }
 
     fn append_record<F>(&mut self, serialise: F) -> bool
@@ -424,72 +422,63 @@ impl UdpManagerState {
         true
     }
 
-    fn queue_stream_for(&mut self, index: usize, now: Instant) -> bool {
+    /// Queues the serialised records on the stream and sends them. Makes
+    /// room by dropping every subscriber still holding the oldest packet.
+    /// Returns how many subscribers it was queued for.
+    fn publish(&mut self, registry: &Registry) -> usize {
         safe_assert!(!self.send_buffer.is_empty());
-        let slot = self.store.insert(&mut self.send_buffer);
-        let queued = self.peers[index].outbound.enqueue(&mut self.store, slot);
-        if !queued {
-            if self.peers[index].is_outbound() {
-                self.reconnect_outbound(index, now);
-            } else {
-                self.disconnect_accepted(index);
-            }
-        }
-        self.store.release(slot);
-        queued
-    }
-
-    /// Returns the number of recipients.
-    fn queue_stream_broadcast(&mut self, now: Instant) -> usize {
-        safe_assert!(!self.send_buffer.is_empty());
-        let slot = self.store.insert(&mut self.send_buffer);
-        let mut recipients = 0;
-        // iterating in the reverse order not to skip anything because of swap_remove
-        for i in (0..self.peers.len()).rev() {
-            recipients += 1;
-            if !self.peers[i].outbound.enqueue(&mut self.store, slot) {
-                if self.peers[i].is_outbound() {
-                    self.reconnect_outbound(i, now);
-                } else {
-                    self.disconnect_accepted(i);
+        let len = self.send_buffer.len();
+        while !self.stream.fits(len) && !self.subscribers.is_empty() {
+            let oldest = self.stream.base();
+            let mut i = self.subscribers.len();
+            while i != 0 {
+                i -= 1;
+                if self.subscribers[i].base() == oldest {
+                    warn!(addr = %self.subscribers[i].addr, "udp subscriber fell a window behind");
+                    self.drop_subscriber(i);
                 }
             }
         }
+        if !self.stream.fits(len) {
+            error!(group = self.config.name, len, "udp broadcast batch exceeds send_window");
+            self.send_buffer.clear();
+            return 0;
+        }
+        let slot = self.store.insert(&mut self.send_buffer);
+        self.stream.enqueue(&mut self.store, slot);
         self.store.release(slot);
+        let recipients = self.subscribers.iter().filter(|s| !s.is_draining()).count();
+        let now = Instant::now();
+        for k in 0..self.sockets.len() {
+            if self.sockets[k].listener {
+                self.pump(registry, k, now, false);
+            }
+        }
         recipients
     }
 
-    fn flush_peer_socket(&mut self, registry: &Registry, index: usize, now: Instant) {
-        let k = self
-            .sockets
-            .iter()
-            .position(|s| s.token == self.peers[index].socket_token)
-            .expect("peer must have a socket");
-        self.pump(registry, k, now, false);
-    }
-
-    fn flush_all(&mut self, registry: &Registry, now: Instant) {
-        for k in 0..self.sockets.len() {
-            self.pump(registry, k, now, false);
-        }
-    }
-
-    /// Sends every due packet of every peer on socket `k`, batched across
-    /// peers. With `probing`, each peer may also resend what its timeout
-    /// allows. Arms WRITABLE if the kernel stopped accepting.
+    /// Sends every due packet of every subscriber on listener `k`, batched
+    /// across subscribers. With `probing`, each may also be resent what its
+    /// timeout allows. Arms WRITABLE if the kernel stopped accepting.
     fn pump(&mut self, registry: &Registry, k: usize, now: Instant, probing: bool) {
         let token = self.sockets[k].token;
         let fd = self.sockets[k].socket.as_raw_fd();
-        for i in 0..self.peers.len() {
-            if self.peers[i].socket_token != token {
+        for i in 0..self.subscribers.len() {
+            if self.subscribers[i].socket_token != token {
                 continue;
             }
-            let mut probes = if probing { self.peers[i].probe_budget(now) } else { 0 };
+            let mut probes = if probing { self.subscribers[i].probe_budget(now) } else { 0 };
             loop {
-                let packets = self.peers[i].stage(&self.store, &mut self.batch, probes, now);
+                let packets = self.subscribers[i].stage(
+                    &mut self.stream,
+                    &self.store,
+                    &mut self.batch,
+                    probes,
+                    now,
+                );
                 probes = 0;
                 if packets != 0 {
-                    self.staged_peer_batches.push(StagedPeerBatch { peer_idx: i, packets });
+                    self.staged.push(StagedBatch { subscriber: i, packets });
                 }
                 if !self.batch.is_full() {
                     break;
@@ -505,11 +494,10 @@ impl UdpManagerState {
         }
     }
 
-    /// Sends the batch and tells each peer what the kernel took. `false` if
-    /// it took less than everything.
+    /// Sends the batch and tells each subscriber what the kernel took.
+    /// `false` if it took less than everything.
     fn dispatch(&mut self, fd: i32, now: Instant) -> bool {
-        let total_packets: usize =
-            self.staged_peer_batches.iter().map(|staged| staged.packets).sum();
+        let total_packets: usize = self.staged.iter().map(|staged| staged.packets).sum();
         let accepted_packets = match self.batch.send(fd) {
             Ok(k) => k,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
@@ -520,81 +508,75 @@ impl UdpManagerState {
             }
         };
         let mut remaining_packets = accepted_packets;
-        for staged in &self.staged_peer_batches {
+        for staged in &self.staged {
             let take = remaining_packets.min(staged.packets);
             remaining_packets -= take;
-            self.peers[staged.peer_idx].commit(&mut self.store, take, now);
+            self.subscribers[staged.subscriber].commit(&self.stream, take, now);
         }
-        self.staged_peer_batches.clear();
+        self.staged.clear();
+        if !self.config.udp.reliable {
+            self.release();
+        }
         accepted_packets == total_packets
     }
 
     pub(crate) fn currently_disconnected(&self) -> impl Iterator<Item = Token> {
-        self.peers.iter().filter(|p| p.is_outbound() && !p.is_connected()).map(|p| p.token)
+        self.subscriptions.iter().filter(|s| !s.is_connected()).map(|s| s.token)
     }
 
     pub(crate) fn force_reconnect(&mut self) {
         let now = Instant::now();
-        for peer in self.peers.iter_mut().filter(|p| p.is_outbound() && !p.is_connected()) {
-            let endpoint = self
+        for subscription in self.subscriptions.iter_mut().filter(|s| !s.is_connected()) {
+            let socket = &self
                 .sockets
                 .iter()
-                .find(|s| s.token == peer.socket_token)
-                .expect("outbound peer must have a socket");
-            peer.send_hello(&endpoint.socket, on_connect_msg(&self.config), now);
+                .find(|s| s.token == subscription.token)
+                .expect("subscription must have a socket")
+                .socket;
+            subscription.send_hello(socket, on_connect_msg(&self.config), now);
         }
     }
 
-    /// Hello retries, heartbeats, peer timeouts, drained closes and retransmit
-    /// probes.
+    /// Hello retries, heartbeat acks, subscriber timeouts, drained closes and
+    /// retransmit probes.
     fn tick(&mut self, registry: &Registry, now: Instant) {
         let peer_timeout = self.config.peer_timeout;
-        let mut i = self.peers.len();
+        self.dropped.retain(|&(_, _, at)| now.saturating_sub(at) < peer_timeout);
+        let mut i = self.subscribers.len();
         while i != 0 {
             i -= 1;
-            let peer = &mut self.peers[i];
-            if peer.drained() {
-                if peer.is_outbound() {
-                    self.reconnect_outbound(i, now);
-                } else {
-                    self.disconnect_accepted(i);
-                }
-                continue;
+            let subscriber = &self.subscribers[i];
+            if subscriber.drained() {
+                self.drop_subscriber(i);
+            } else if now.saturating_sub(subscriber.last_recv) >= peer_timeout {
+                warn!(addr = %subscriber.addr, "udp subscriber timed out");
+                self.drop_subscriber(i);
             }
+        }
+        for i in 0..self.subscriptions.len() {
+            let subscription = &mut self.subscriptions[i];
             let entry = self
                 .sockets
                 .iter_mut()
-                .find(|s| s.token == peer.socket_token)
-                .expect("peer must have a socket");
-            match peer.tick(&entry.socket, on_connect_msg(&self.config), now, peer_timeout) {
-                Ok(SendOutcome::Done) => {}
-                Ok(SendOutcome::WouldBlock) => arm_writable(registry, entry),
-                Err(()) => {
-                    warn!(addr = %peer.addr, "udp peer timed out");
-                    if peer.is_outbound() {
-                        self.reconnect_outbound(i, now);
-                    } else {
-                        self.disconnect_accepted(i);
-                    }
-                }
+                .find(|s| s.token == subscription.token)
+                .expect("subscription must have a socket");
+            if subscription.tick(&entry.socket, on_connect_msg(&self.config), now) ==
+                SendOutcome::WouldBlock
+            {
+                arm_writable(registry, entry);
             }
         }
         for k in 0..self.sockets.len() {
-            self.pump(registry, k, now, true);
+            if self.sockets[k].listener {
+                self.pump(registry, k, now, true);
+            }
         }
     }
 
-    #[inline]
-    fn peer_index(&self, k: usize, from: SocketAddr) -> Option<usize> {
-        let socket_token = self.sockets[k].token;
-        self.peers.iter().position(|p| p.socket_token == socket_token && p.addr == from)
-    }
-
-    /// One received datagram.
+    /// One received datagram on socket `k`.
     #[allow(clippy::too_many_arguments)]
     fn on_datagram<F>(
         &mut self,
-        registry: &Registry,
         k: usize,
         bytes: &[u8],
         from: SocketAddr,
@@ -606,81 +588,142 @@ impl UdpManagerState {
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let Some(datagram) = wire::decode(bytes) else { return };
-        let peer = self.peer_index(k, from);
+        if self.sockets[k].listener {
+            self.on_publisher_datagram(k, datagram, from, now, dcache, tokens, deliver);
+            return;
+        }
+        let socket_token = self.sockets[k].token;
+        let Some(i) =
+            self.subscriptions.iter().position(|s| s.token == socket_token && s.addr == from)
+        else {
+            return;
+        };
+        let group = self.group;
         match datagram {
             Datagram::Packet(packet) => {
-                let Some(i) = peer else {
-                    // Unknown sender on a listener: a client from before our
-                    // restart, or one we dropped. Tell it to renegotiate.
-                    if self.sockets[k].listener {
-                        Peer::send_reset(&self.sockets[k].socket, from, packet.session);
-                    }
-                    return;
-                };
-                let peer = &mut self.peers[i];
-                let token = peer.token;
-                let group = self.group;
-                peer.on_packet(packet, dcache, now, &mut |payload, send_ts| {
+                let subscription = &mut self.subscriptions[i];
+                let token = subscription.token;
+                subscription.on_packet(packet, dcache, &mut |payload, send_ts| {
                     deliver(Event::Message { group, token, payload, send_ts });
                 });
             }
-            Datagram::Ack { session, ack_next, bits, bitmap } => {
-                let Some(i) = peer else {
-                    if self.sockets[k].listener {
-                        Peer::send_reset(&self.sockets[k].socket, from, session);
-                    }
-                    return;
-                };
-                self.peers[i].on_ack(session, ack_next, bits, bitmap, &mut self.store, now);
-            }
-            Datagram::Hello { session, base, msg } => {
-                if !self.sockets[k].listener || !self.on_connect_fits(msg, from) {
-                    return;
-                }
-                if let Some(i) = peer {
-                    let (socket, ours) = (&self.sockets[k].socket, on_connect_msg(&self.config));
-                    if self.peers[i].on_hello(session, base, socket, ours, now) {
-                        return;
-                    }
-                    let old = self.remove_peer(i);
-                    deliver(Event::Disconnected { group: self.group, token: old, peer_addr: from });
-                }
-                let token = tokens.allocate(self.group);
-                let entry = &self.sockets[k];
-                let mut peer = Peer::new(from, token, entry.token, &self.config);
-                peer.on_hello(session, base, &entry.socket, on_connect_msg(&self.config), now);
-                info!(addr = %from, "udp client connected");
-                deliver(Event::Accepted { group: self.group, token, peer_addr: from });
-                self.deliver_on_connect(token, msg, dcache, deliver);
-                self.peers.push(peer);
-                self.pump(registry, k, now, false);
-            }
-            Datagram::HelloAck { session, their_session, base, msg } => {
-                let Some(i) = peer.filter(|&i| self.peers[i].is_outbound()) else { return };
+            Datagram::HelloAck { session, subscriber, join, msg } => {
                 if !self.on_connect_fits(msg, from) {
                     return;
                 }
-                let token = self.peers[i].token;
-                if self.peers[i].lost_by_remote(their_session, Some(session)) {
-                    warn!(addr = %from, "udp peer lost our session, reconnecting");
-                    self.reconnect_outbound(i, now);
-                } else if self.peers[i].on_hello_ack(session, their_session, base, now) {
-                    // A reconnect can complete before post_poll drains the old disconnect.
+                let token = self.subscriptions[i].token;
+                if self.subscriptions[i].lost(subscriber, Some(session)) {
+                    warn!(addr = %from, "udp publisher lost our subscription, resubscribing");
+                    self.resubscribe(i, now);
+                } else if self.subscriptions[i].on_hello_ack(session, subscriber, join) {
+                    // A resubscribe can complete before post_poll drains the old disconnect.
                     self.drain_pending_disconnects(deliver);
-                    debug!(addr = %from, "udp connected");
-                    deliver(Event::Connected { group: self.group, token, peer_addr: from });
+                    debug!(addr = %from, "udp subscribed");
+                    deliver(Event::Connected { group, token, peer_addr: from });
                     self.deliver_on_connect(token, msg, dcache, deliver);
-                    self.pump(registry, k, now, false);
                 }
             }
-            Datagram::Reset { their_session } => {
-                let Some(i) = peer.filter(|&i| self.peers[i].is_outbound()) else { return };
-                if self.peers[i].lost_by_remote(their_session, None) {
-                    warn!(addr = %from, "udp peer lost our session, reconnecting");
-                    self.reconnect_outbound(i, now);
+            Datagram::Reset { subscriber } => {
+                if self.subscriptions[i].lost(subscriber, None) {
+                    warn!(addr = %from, "udp publisher lost our subscription, resubscribing");
+                    self.resubscribe(i, now);
                 }
             }
+            Datagram::Ack { .. } | Datagram::Hello { .. } => {}
         }
+    }
+
+    /// A datagram on listener `k`: a subscriber's hello or ack.
+    #[allow(clippy::too_many_arguments)]
+    fn on_publisher_datagram<F>(
+        &mut self,
+        k: usize,
+        datagram: Datagram<'_>,
+        from: SocketAddr,
+        now: Instant,
+        dcache: Option<&DCache>,
+        tokens: &mut Tokens,
+        deliver: &mut F,
+    ) where
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
+    {
+        let socket_token = self.sockets[k].token;
+        let index =
+            self.subscribers.iter().position(|s| s.socket_token == socket_token && s.addr == from);
+        match datagram {
+            Datagram::Ack { session, subscriber, ack_next, bits, bitmap } => {
+                let Some(i) = index.filter(|&i| {
+                    session == self.stream.session() && self.subscribers[i].session == subscriber
+                }) else {
+                    // A subscriber we dropped, or one from before our restart.
+                    send_reset(&self.sockets[k].socket, from, subscriber);
+                    return;
+                };
+                let held_oldest = self.subscribers[i].base() == self.stream.base();
+                self.subscribers[i].on_ack(ack_next, u64::from(bits), bitmap, now);
+                if self.subscribers[i].drained() {
+                    self.drop_subscriber(i);
+                } else if held_oldest {
+                    self.release();
+                }
+            }
+            Datagram::Hello { subscriber, msg } => {
+                if !self.on_connect_fits(msg, from) {
+                    return;
+                }
+                if self
+                    .dropped
+                    .iter()
+                    .any(|&(addr, session, _)| addr == from && session == subscriber)
+                {
+                    send_reset(&self.sockets[k].socket, from, subscriber);
+                    return;
+                }
+                if let Some(i) = index {
+                    if self.subscribers[i].session == subscriber {
+                        // A retry: the hello ack was lost or is still on its way.
+                        self.subscribers[i].last_recv = now;
+                        let join = self.subscribers[i].join;
+                        self.send_hello_ack(k, from, subscriber, join);
+                        return;
+                    }
+                    let old = self.remove_subscriber(i);
+                    deliver(Event::Disconnected { group: self.group, token: old, peer_addr: from });
+                }
+                // The open packet may already be on its way to others; a
+                // newcomer starts after it.
+                self.stream.seal();
+                let join = self.stream.next();
+                let token = tokens.allocate(self.group);
+                self.subscribers.push(Subscriber::new(
+                    from,
+                    token,
+                    socket_token,
+                    subscriber,
+                    join,
+                    &self.config,
+                    now,
+                ));
+                self.send_hello_ack(k, from, subscriber, join);
+                info!(addr = %from, "udp subscriber joined");
+                deliver(Event::Accepted { group: self.group, token, peer_addr: from });
+                // Right after `Accepted`, so the caller can vet the subscriber
+                // before its next broadcast.
+                self.deliver_on_connect(token, msg, dcache, deliver);
+            }
+            Datagram::Packet(_) | Datagram::HelloAck { .. } | Datagram::Reset { .. } => {}
+        }
+    }
+
+    fn send_hello_ack(&mut self, k: usize, to: SocketAddr, subscriber: u32, join: u64) {
+        let n = wire::hello_ack(
+            &mut self.ctrl,
+            self.stream.session(),
+            subscriber,
+            join,
+            on_connect_msg(&self.config),
+        );
+        send_datagram(&self.sockets[k].socket, to, &self.ctrl[..n]);
     }
 
     fn handle_event<F>(
@@ -711,7 +754,7 @@ impl UdpManagerState {
                 for i in 0..n {
                     let Some((datagrams, from)) = recv.datagrams(i) else { continue };
                     for bytes in datagrams {
-                        self.on_datagram(registry, k, bytes, from, now, dcache, tokens, deliver);
+                        self.on_datagram(k, bytes, from, now, dcache, tokens, deliver);
                     }
                 }
             }
@@ -719,16 +762,21 @@ impl UdpManagerState {
         if event.is_writable() {
             self.sockets[k].writable_armed = false;
         }
-        // Acks just taken in may have exposed holes; packets just queued
-        // behind a full buffer may fit now.
-        self.pump(registry, k, now, false);
-        let entry = &mut self.sockets[k];
-        let token = entry.token;
-        for peer in self.peers.iter_mut().filter(|p| p.socket_token == token) {
-            if peer.take_ack_due() && peer.send_ack(&entry.socket, now) == SendOutcome::WouldBlock {
+        if self.sockets[k].listener {
+            // Acks just taken in may have exposed holes; packets just queued
+            // behind a full buffer may fit now.
+            self.pump(registry, k, now, false);
+        } else {
+            let entry = &mut self.sockets[k];
+            let token = entry.token;
+            if let Some(subscription) = self.subscriptions.iter_mut().find(|s| s.token == token) &&
+                subscription.take_ack_due() &&
+                subscription.send_ack(&entry.socket, now) == SendOutcome::WouldBlock
+            {
                 arm_writable(registry, entry);
             }
         }
+        let entry = &mut self.sockets[k];
         if event.is_writable() && !entry.writable_armed {
             if let Err(err) =
                 registry.reregister(&mut entry.socket, entry.token, Interest::READABLE)
@@ -806,34 +854,25 @@ impl UdpManagerState {
         self.drain_pending_disconnects(deliver)
     }
 
-    #[inline]
-    fn is_sendable(peer: &Peer) -> bool {
-        peer.is_connected() && !peer.is_draining()
-    }
-
-    fn sendable_index(&self, token: Token) -> Option<usize> {
-        self.peers.iter().position(|p| p.token == token && Self::is_sendable(p))
-    }
-
-    fn has_broadcast_recipient(&self) -> bool {
-        self.peers.iter().any(Self::is_sendable)
-    }
-
-    /// Permanently removes a peer, or a listener with every session on it.
+    /// Permanently removes a subscriber, a subscription, or a listener with
+    /// every subscriber on it.
     pub(crate) fn remove(&mut self, registry: &Registry, token: Token) -> bool {
-        if let Some(i) = self.peers.iter().position(|p| p.token == token) {
-            let outbound = self.peers[i].is_outbound();
-            self.remove_peer(i);
+        if let Some(i) = self.subscribers.iter().position(|s| s.token == token) {
+            self.remove_subscriber(i);
             self.pending_disconnect_notifications.retain(|(t, _)| *t != token);
-            if outbound {
-                let k = self
-                    .sockets
-                    .iter()
-                    .position(|s| s.token == token)
-                    .expect("outbound peer must have a socket");
-                let mut endpoint = self.sockets.swap_remove(k);
-                let _ = registry.deregister(&mut endpoint.socket);
-            }
+            return true;
+        }
+        if let Some(i) = self.subscriptions.iter().position(|s| s.token == token) {
+            self.subscriptions.swap_remove(i);
+            self.pending_disconnect_notifications.retain(|(t, _)| *t != token);
+            let k = self
+                .sockets
+                .iter()
+                .position(|s| s.token == token)
+                .expect("subscription must have a socket");
+            let mut endpoint = self.sockets.swap_remove(k);
+            let _ = registry.deregister(&mut endpoint.socket);
+            self.retired.push(token);
             return true;
         }
         self.remove_listener(registry, token)

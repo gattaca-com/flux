@@ -1,5 +1,6 @@
-//! The receiving half of a peer: packet tracking and reassembly of messages
-//! cut across packets, which complete whatever order the packets arrive in.
+//! The receiving half of a subscription: packet tracking and reassembly of
+//! messages cut across packets, which complete whatever order the packets
+//! arrive in.
 
 use super::wire::{ACK_HEADER, MESSAGE_HEADER, Record, Records};
 

@@ -388,8 +388,16 @@ pub enum ReplayPolicy {
     Replay,
 }
 
-/// Settings for one reliable, unordered UDP group.
-/// Sends require an established session; disconnects discard queued messages.
+/// Settings for one reliable, unordered, one-way UDP group.
+///
+/// Its listeners publish one stream that every subscriber receives byte for
+/// byte; its `connect` tokens subscribe to other publishers and only receive.
+/// Two-way traffic takes a group on each side. A subscriber joins at the live
+/// end of the stream, and one that falls a send window behind is dropped.
+///
+/// On the publisher, a subscriber's on-connect message is delivered right
+/// after its `Accepted`, before any other event, so it can be vetted and
+/// disconnected before the next broadcast reaches it.
 #[derive(Clone)]
 pub struct UdpGroupConfig {
     pub name: &'static str,
@@ -743,10 +751,11 @@ impl NetworkCore {
     }
 
     /// Returns whether the message was accepted for sending or TCP replay.
-    /// UDP requires a connected peer; TCP can queue while disconnected when
-    /// replay is enabled. Unknown or draining tokens reject without
-    /// serializing. Empty/oversized payloads reject after the serializer
-    /// runs.
+    /// TCP can queue while disconnected when replay is enabled. Unknown or
+    /// draining tokens reject without serializing. Empty/oversized payloads
+    /// reject after the serializer runs. UDP is one-way and has no per-token
+    /// send: it logs an error and returns `false`; publish with
+    /// [`Self::broadcast_with`].
     pub fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
@@ -756,7 +765,7 @@ impl NetworkCore {
             GroupState::Tcp(tcp) => {
                 tcp.send_with(self.poller.registry(), token, &mut self.tokens, serialise)
             }
-            GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, serialise),
+            GroupState::Udp(udp) => udp.send_with(token),
         }
     }
     /// Sends `head` then `body` as one message. A plain TCP connection
@@ -774,17 +783,12 @@ impl NetworkCore {
             GroupState::Tcp(tcp) => {
                 tcp.send_vectored(self.poller.registry(), token, &mut self.tokens, parts)
             }
-            GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, |out| {
-                out.reserve(parts.iter().map(|part| part.len()).sum());
-                for part in parts {
-                    out.extend_from_slice(part);
-                }
-            }),
+            GroupState::Udp(udp) => udp.send_with(token),
         }
     }
-    /// Sends a bounded batch. TCP stages one write; UDP retains message
-    /// boundaries. Invalid payloads are skipped. Returns whether any
-    /// message was accepted.
+    /// Sends a bounded batch as one TCP write. Invalid payloads are skipped.
+    /// Returns whether any message was accepted. UDP is one-way, as for
+    /// [`Self::send_with`].
     pub fn send_many_with<I, F>(&mut self, token: Token, items: I, serialise: F) -> bool
     where
         I: IntoIterator,
@@ -799,14 +803,13 @@ impl NetworkCore {
                 items,
                 serialise,
             ),
-            GroupState::Udp(udp) => {
-                udp.send_many_with(self.poller.registry(), token, items, serialise)
-            }
+            GroupState::Udp(udp) => udp.send_with(token),
         }
     }
     /// Serializes once for all eligible peers in this group. Returns the number
     /// attempted; a paused peer is excluded. No recipients means no
-    /// serialization.
+    /// serialization. A UDP group publishes to its subscribers; one that
+    /// does not listen logs an error and returns 0.
     pub fn broadcast_with<F>(&mut self, group: Group, serialise: F) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),
@@ -898,7 +901,7 @@ impl NetworkCore {
         let Some(group) = self.tokens.groups.get(&token).copied() else { return 0 };
         match &mut self.groups[group.0] {
             GroupState::Tcp(tcp) => tcp.clear_backlog(token),
-            GroupState::Udp(udp) => udp.clear_backlog(token),
+            GroupState::Udp(_) => 0,
         }
     }
     /// Bytes accepted for `token` that have not reached its socket yet,

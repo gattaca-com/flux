@@ -93,16 +93,12 @@ fn mixed_groups_keep_configuration_broadcasts_and_disconnects_independent() {
     // The TCP limit must not restrict a fragmented UDP message in another group.
     let large = vec![0x5a; 2048];
     assert!(!client.send_with(tokens[0], |buf| buf.extend_from_slice(&large)));
-    assert!(client.send_with(tokens[1], |buf| buf.extend_from_slice(&large)));
     assert_eq!(server.broadcast_with(server_groups[0], |buf| buf.extend_from_slice(b"tcp")), 1);
-    assert_eq!(server.broadcast_with(server_groups[1], |buf| buf.extend_from_slice(b"udp")), 1);
-    until(&mut server, &mut client, &mut server_log, &mut client_log, |s, c| {
-        s.messages.len() == 1 && c.messages.len() == 2
-    });
-    let accepted_udp = server_log.accepted.iter().find(|(g, _)| *g == server_groups[1]).unwrap().1;
-    assert_eq!(server_log.messages, [(server_groups[1], accepted_udp, large)]);
+    assert_eq!(server.broadcast_with(server_groups[1], |buf| buf.extend_from_slice(&large)), 1);
+    until(&mut server, &mut client, &mut server_log, &mut client_log, |_, c| c.messages.len() == 2);
+    assert!(server_log.messages.is_empty());
     assert!(client_log.messages.contains(&(client_groups[0], tokens[0], b"tcp".to_vec())));
-    assert!(client_log.messages.contains(&(client_groups[1], tokens[1], b"udp".to_vec())));
+    assert!(client_log.messages.contains(&(client_groups[1], tokens[1], large)));
 
     let accepted_tcp = server_log.accepted.iter().find(|(g, _)| *g == server_groups[0]).unwrap().1;
     assert!(server.disconnect(accepted_tcp));
@@ -134,7 +130,7 @@ fn one_external_poll_observes_readiness_and_drives_both_transports() {
     let mut sent = false;
     let mut readable = [false; 2];
     let deadline = Instant::now() + Duration::from_secs(5);
-    while log.messages.len() < 4 {
+    while log.messages.len() < 3 {
         assert!(Instant::now() < deadline, "shared poll exchange timed out");
         network.pre_poll(&mut |event| log.record(&event));
         poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
@@ -155,21 +151,22 @@ fn one_external_poll_observes_readiness_and_drives_both_transports() {
         }
         network.post_poll(&mut |event| log.record(&event));
         if !sent && log.accepted.len() == 2 && log.connected.len() == 2 {
-            for token in outbound {
-                assert!(network.send_with(token, |buf| buf.extend_from_slice(b"request")));
-            }
-            for &(_, token) in &log.accepted {
-                assert!(network.send_with(token, |buf| buf.extend_from_slice(b"reply")));
-            }
+            // UDP is one-way: the publisher broadcasts, the subscriber only
+            // receives.
+            let accepted_tcp =
+                log.accepted.iter().find(|(group, _)| *group == groups[0]).unwrap().1;
+            assert!(network.send_with(outbound[0], |buf| buf.extend_from_slice(b"request")));
+            assert!(network.send_with(accepted_tcp, |buf| buf.extend_from_slice(b"reply")));
+            assert_eq!(network.broadcast_with(groups[1], |buf| buf.extend_from_slice(b"reply")), 1);
             sent = true;
         }
     }
     assert_eq!(readable, [true, true]);
     assert!(log.disconnected.is_empty());
-    assert_eq!(log.messages.len(), 4);
+    assert_eq!(log.messages.len(), 3);
+    let accepted_tcp = log.accepted.iter().find(|(group, _)| *group == groups[0]).unwrap().1;
+    assert!(log.messages.contains(&(groups[0], accepted_tcp, b"request".to_vec())));
     for i in 0..2 {
-        let accepted = log.accepted.iter().find(|(group, _)| *group == groups[i]).unwrap().1;
-        assert!(log.messages.contains(&(groups[i], accepted, b"request".to_vec())));
         assert!(log.messages.contains(&(groups[i], outbound[i], b"reply".to_vec())));
     }
 }

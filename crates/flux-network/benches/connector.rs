@@ -39,12 +39,31 @@ fn free_addr() -> SocketAddr {
     }
 }
 
-/// A connected pair. The server echoes everything back on `Single(accepted)`.
+/// Where one side sends: a TCP connection, or the UDP group it publishes on.
+#[derive(Clone, Copy)]
+enum Route {
+    Token(Token),
+    Group(Group),
+}
+
+fn send(network: &mut Network, route: Route, msg: &[u8]) {
+    match route {
+        Route::Token(token) => {
+            network.send_with(token, |b| b.extend_from_slice(msg));
+        }
+        Route::Group(group) => {
+            network.broadcast_with(group, |b| b.extend_from_slice(msg));
+        }
+    }
+}
+
+/// A connected pair. UDP is one-way, so over UDP each side publishes and
+/// subscribes to the other.
 struct Pair {
     server: Network,
     client: Network,
-    accepted: Token,
-    client_token: Token,
+    to_client: Route,
+    to_server: Route,
 }
 
 fn udp_config() -> UdpConfig {
@@ -59,40 +78,58 @@ fn connector(config: GroupConfig) -> (Network, Group) {
     (network, group)
 }
 
-fn pair(transport: GroupConfig, listen: SocketAddr, dial: SocketAddr) -> Pair {
+/// `back` is where the client publishes and where the server dials it,
+/// which differ when a relay sits between; TCP ignores it.
+fn pair(
+    transport: GroupConfig,
+    listen: SocketAddr,
+    dial: SocketAddr,
+    back: (SocketAddr, SocketAddr),
+) -> Pair {
+    let udp = matches!(transport, GroupConfig::Udp(_));
     let (mut server, server_group) = connector(transport.clone());
     let (mut client, client_group) = connector(transport);
     server.listen(server_group, listen).unwrap();
     let client_token = client.connect(client_group, dial);
+    if udp {
+        client.listen(client_group, back.0).unwrap();
+        let _ = server.connect(server_group, back.1);
+    }
     let mut accepted = None;
+    let mut client_accepted = !udp;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while accepted.is_none() || client.currently_disconnected().count() != 0 {
+    while accepted.is_none() ||
+        !client_accepted ||
+        client.currently_disconnected().count() != 0 ||
+        server.currently_disconnected().count() != 0
+    {
         assert!(Instant::now() < deadline, "handshake");
         server.poll_with(|e| {
             if let NetworkEvent::Accepted { token: stream, .. } = e {
                 accepted = Some(stream);
             }
         });
-        client.poll_with(|_| {});
+        client.poll_with(|e| client_accepted |= matches!(e, NetworkEvent::Accepted { .. }));
     }
-    Pair { server, client, accepted: accepted.unwrap(), client_token }
+    let (to_client, to_server) = if udp {
+        (Route::Group(server_group), Route::Group(client_group))
+    } else {
+        (Route::Token(accepted.unwrap()), Route::Token(client_token))
+    };
+    Pair { server, client, to_client, to_server }
 }
 
 impl Pair {
     /// Sends `msg` and spins until the echo is back.
     fn round_trip(&mut self, msg: &[u8]) {
-        let Self { server, client, accepted, client_token } = self;
-        client.send_with(*client_token, |b| {
-            b.extend_from_slice(msg);
-        });
+        let Self { server, client, to_client, to_server } = self;
+        send(client, *to_server, msg);
         let mut got = false;
         while !got {
             client.poll_with(|_| {});
             server.poll_with(|e| got |= matches!(e, NetworkEvent::Message { .. }));
         }
-        server.send_with(*accepted, |b| {
-            b.extend_from_slice(msg);
-        });
+        send(server, *to_client, msg);
         got = false;
         while !got {
             server.poll_with(|_| {});
@@ -113,9 +150,7 @@ impl Pair {
         let mut got = 0;
         while got < count {
             while sent < count && sent - got < window {
-                self.client.send_with(self.client_token, |b| {
-                    b.extend_from_slice(msg);
-                });
+                send(&mut self.client, self.to_server, msg);
                 sent += 1;
             }
             self.client.poll_with(|_| {});
@@ -212,8 +247,8 @@ fn bench_rtt(c: &mut Criterion) {
         let msg = vec![0xA5u8; size];
         group.throughput(Throughput::Bytes(2 * size as u64));
         for (name, transport) in transports() {
-            let addr = free_addr();
-            let mut pair = pair(transport, addr, addr);
+            let (addr, back) = (free_addr(), free_addr());
+            let mut pair = pair(transport, addr, addr, (back, back));
             group.bench_function(BenchmarkId::new(name, size_name), |b| {
                 b.iter(|| pair.round_trip(&msg));
             });
@@ -229,8 +264,8 @@ fn bench_throughput(c: &mut Criterion) {
         let msg = vec![0x5Au8; size];
         group.throughput(Throughput::Bytes((BURST * size) as u64));
         for (name, transport) in transports() {
-            let addr = free_addr();
-            let mut pair = pair(transport, addr, addr);
+            let (addr, back) = (free_addr(), free_addr());
+            let mut pair = pair(transport, addr, addr, (back, back));
             // At most 2 MiB in flight: the single-threaded receiver cannot drain
             // while the sender bursts, so stay inside its kernel buffer.
             let window = (2 * 1024 * 1024 / size).clamp(1, BURST);
@@ -248,18 +283,21 @@ fn bench_rtt_loss(c: &mut Criterion) {
     for (size_name, size) in SIZES {
         let msg = vec![0xC3u8; size];
         group.throughput(Throughput::Bytes(2 * size as u64));
-        let server_addr = free_addr();
+        let (server_addr, client_addr) = (free_addr(), free_addr());
         let relay = LossyRelay::start(server_addr, LOSS_ONE_IN);
+        let back_relay = LossyRelay::start(client_addr, LOSS_ONE_IN);
         let mut pair = pair(
             UdpGroupConfig { udp: udp_config(), ..Default::default() }.into(),
             server_addr,
             relay.addr,
+            (client_addr, back_relay.addr),
         );
         group.bench_function(BenchmarkId::new("udp", size_name), |b| {
             b.iter(|| pair.round_trip(&msg));
         });
         drop(pair);
         drop(relay);
+        drop(back_relay);
     }
     group.finish();
 }

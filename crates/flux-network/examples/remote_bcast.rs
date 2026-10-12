@@ -170,7 +170,8 @@ fn send_batch(
     msgs: &[Vec<u8>],
     packed: &mut Vec<u8>,
 ) -> usize {
-    let unicast = tokens.len() == 1;
+    // UDP is one-way and only publishes to the whole group.
+    let unicast = tokens.len() == 1 && tcp();
     match mode() {
         Mode::Loop => {
             let mut r = 0;
