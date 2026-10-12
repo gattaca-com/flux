@@ -58,10 +58,6 @@ required-features = ["tls"]
 
 [[bench]]
 harness = false
-name = "connector"
-
-[[bench]]
-harness = false
 name = "http_client"
 
 [[bench]]

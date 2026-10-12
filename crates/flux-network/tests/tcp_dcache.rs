@@ -35,6 +35,9 @@ struct NetworkTile {
     transport: flux_network::GroupConfig,
     ready: Arc<AtomicBool>,
     bind_addr: SocketAddr,
+    /// UDP is one-way: the tile subscribes to these publishers instead of
+    /// listening.
+    publishers: Vec<SocketAddr>,
     deadline: Instant,
 }
 
@@ -43,7 +46,12 @@ impl Tile<TcpDcacheSpine> for NetworkTile {
         let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
         let mut conn = Network::with_dcache(sp.dcache_ptr());
         let conn_group = conn.add_group(self.transport.clone());
-        conn.listen(conn_group, self.bind_addr).unwrap();
+        if self.publishers.is_empty() {
+            conn.listen(conn_group, self.bind_addr).unwrap();
+        }
+        for &addr in &self.publishers {
+            let _ = conn.connect(conn_group, addr);
+        }
         self.conn = Some(conn);
         self.ready.store(true, Ordering::Release);
         true
@@ -97,26 +105,33 @@ fn dcache_multi_stream_tcp() {
             ..Default::default()
         }
         .into(),
+        false,
     );
 }
 
 #[test]
 fn dcache_multi_stream_udp() {
-    dcache_multi_stream(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() }.into());
+    dcache_multi_stream(
+        UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() }.into(),
+        true,
+    );
 }
 
 /// Two streams into the same dcache-backed spine queue.
 /// Verifies dcache bytes match the queue message (same shmem region).
 #[allow(clippy::significant_drop_tightening)]
-fn dcache_multi_stream(transport: flux_network::GroupConfig) {
+fn dcache_multi_stream(transport: flux_network::GroupConfig, one_way: bool) {
     const MSG_A: &[u8; 8] = b"stream-a";
     const MSG_B: &[u8; 8] = b"stream-b";
 
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let bind_addr = probe.local_addr().unwrap();
-    drop(probe);
+    let free_addr = || {
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        probe.local_addr().unwrap()
+    };
+    let bind_addr = free_addr();
+    let publishers = if one_way { vec![free_addr(), free_addr()] } else { Vec::new() };
 
     let mut spine = TcpDcacheSpine::new_with_base_dir(base, None);
 
@@ -125,24 +140,40 @@ fn dcache_multi_stream(transport: flux_network::GroupConfig) {
 
     let ready_c = ready.clone();
     let client_config = transport.clone();
+    let client_publishers = publishers.clone();
     let client = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready_c.load(Ordering::Acquire) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
-        for msg in [MSG_A, MSG_B] {
+        for (i, msg) in [MSG_A, MSG_B].into_iter().enumerate() {
             let mut conn = Network::default();
             let conn_group = conn.add_group(client_config.clone());
-            let tok = conn.connect(conn_group, bind_addr);
+            let tok = match client_publishers.get(i) {
+                Some(&addr) => {
+                    conn.listen(conn_group, addr).unwrap();
+                    None
+                }
+                None => Some(conn.connect(conn_group, bind_addr)),
+            };
             let mut connected = false;
             let deadline = Instant::now() + Duration::from_secs(5);
             while !connected {
                 assert!(Instant::now() < deadline, "handshake");
-                conn.poll_with(|e| connected |= matches!(e, NetworkEvent::Connected { .. }));
+                conn.poll_with(|e| {
+                    connected |=
+                        matches!(e, NetworkEvent::Connected { .. } | NetworkEvent::Accepted { .. });
+                });
             }
-            assert!(conn.send_with(tok, |buf| {
-                buf.extend_from_slice(msg);
-            }));
+            match tok {
+                Some(tok) => assert!(conn.send_with(tok, |buf| buf.extend_from_slice(msg))),
+                None => {
+                    assert_eq!(
+                        conn.broadcast_with(conn_group, |buf| buf.extend_from_slice(msg)),
+                        1
+                    );
+                }
+            }
             let flush = Instant::now() + Duration::from_millis(100);
             while Instant::now() < flush {
                 conn.poll_with(|_| {});
@@ -159,6 +190,7 @@ fn dcache_multi_stream(transport: flux_network::GroupConfig) {
                 transport,
                 ready: ready.clone(),
                 bind_addr,
+                publishers,
                 deadline: Instant::now() + Duration::from_secs(10),
             },
             &mut scoped,
