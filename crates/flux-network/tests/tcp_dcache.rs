@@ -35,8 +35,6 @@ struct NetworkTile {
     transport: flux_network::GroupConfig,
     ready: Arc<AtomicBool>,
     bind_addr: SocketAddr,
-    /// UDP is one-way: the tile subscribes to these publishers instead of
-    /// listening.
     publishers: Vec<SocketAddr>,
     deadline: Instant,
 }

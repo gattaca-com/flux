@@ -388,16 +388,11 @@ pub enum ReplayPolicy {
     Replay,
 }
 
-/// Settings for one reliable, unordered, one-way UDP group.
+/// Settings for one reliable, unordered, one-way UDP group: listeners
+/// publish, `connect` tokens subscribe.
 ///
-/// Its listeners publish one stream that every subscriber receives byte for
-/// byte; its `connect` tokens subscribe to other publishers and only receive.
-/// Two-way traffic takes a group on each side. A subscriber joins at the live
-/// end of the stream, and one that falls a send window behind is dropped.
-///
-/// On the publisher, a subscriber's on-connect message is delivered right
-/// after its `Accepted`, before any other event, so it can be vetted and
-/// disconnected before the next broadcast reaches it.
+/// A subscriber's on-connect message is delivered right after its
+/// `Accepted`, so it can be disconnected before the next broadcast.
 #[derive(Clone)]
 pub struct UdpGroupConfig {
     pub name: &'static str,
@@ -480,8 +475,8 @@ enum GroupState {
 /// Groups of TCP connections and reliable UDP sessions sharing one poll.
 ///
 /// Message payloads are borrowed for the synchronous callback. UDP delivery is
-/// reliable but unordered within a session; pending UDP messages are discarded
-/// on disconnect.
+/// reliable but unordered; reconnect replay does not provide exactly-once
+/// delivery.
 pub struct Network {
     events: Events,
     core: NetworkCore,
@@ -693,8 +688,6 @@ impl NetworkCore {
             GroupState::Udp(_) => None,
         }
     }
-    /// UDP socket setup failures are logged and return a retired token that
-    /// rejects sends.
     #[must_use]
     pub fn connect(&mut self, group: Group, addr: SocketAddr) -> Token {
         match &mut self.groups[group.0] {
@@ -750,12 +743,10 @@ impl NetworkCore {
         tcp.connect(self.poller.registry(), addr, local_ip, Some(Box::new(tls)), &mut self.tokens)
     }
 
-    /// Returns whether the message was accepted for sending or TCP replay.
-    /// TCP can queue while disconnected when replay is enabled. Unknown or
-    /// draining tokens reject without serializing. Empty/oversized payloads
-    /// reject after the serializer runs. UDP is one-way and has no per-token
-    /// send: it logs an error and returns `false`; publish with
-    /// [`Self::broadcast_with`].
+    /// Returns whether the message was accepted for sending or replay. Unknown,
+    /// draining, or disconnected drop-policy tokens reject without serializing.
+    /// Empty/oversized payloads reject after the serializer runs. Always
+    /// `false` for UDP, which only broadcasts.
     pub fn send_with<F>(&mut self, token: Token, serialise: F) -> bool
     where
         F: FnOnce(&mut PayloadBuf<'_>),
@@ -786,9 +777,9 @@ impl NetworkCore {
             GroupState::Udp(udp) => udp.send_with(token),
         }
     }
-    /// Sends a bounded batch as one TCP write. Invalid payloads are skipped.
-    /// Returns whether any message was accepted. UDP is one-way, as for
-    /// [`Self::send_with`].
+    /// Sends a bounded batch. TCP stages one write. Invalid payloads are
+    /// skipped. Returns whether any message was accepted. Always `false` for
+    /// UDP.
     pub fn send_many_with<I, F>(&mut self, token: Token, items: I, serialise: F) -> bool
     where
         I: IntoIterator,
@@ -808,8 +799,7 @@ impl NetworkCore {
     }
     /// Serializes once for all eligible peers in this group. Returns the number
     /// attempted; a paused peer is excluded. No recipients means no
-    /// serialization. A UDP group publishes to its subscribers; one that
-    /// does not listen logs an error and returns 0.
+    /// serialization.
     pub fn broadcast_with<F>(&mut self, group: Group, serialise: F) -> usize
     where
         F: FnOnce(&mut PayloadBuf<'_>),

@@ -1,28 +1,18 @@
-#![allow(clippy::doc_markdown)]
-//! Two-box send/broadcast benchmark over the real network, UDP or TCP.
+//! Two-box broadcast benchmark, UDP or TCP. Start the receivers first:
 //!
-//! One sender (one box, one core) sends to `clients` receivers (another box,
-//! one core each) and reports the send-call time (wall and CPU share). Each
-//! receiver reports delivered rate, loss, and one-way latency (sender
-//! send-stamp to receiver delivery). TRANSPORT=udp|tcp picks the stack; both
-//! ends must agree on TRANSPORT and MODE.
+//! ```text
+//! remote_bcast receiver <sender_ip> <port> <bind_ip> <core> <secs>
+//! remote_bcast sender   <bind_ip> <port> <clients> <core> <secs>
+//! ```
 //!
-//! One-way latency crosses two machines, so the receiver first measures the
-//! clock offset to the sender with a min-RTT ping-pong (NTP's estimator) on a
-//! side UDP socket and subtracts it; the boxes are only NTP-synced, whose error
-//! is larger than the latency being measured.
+//! Env, same on both ends:
 //!
-//! Scenario knobs (env, same on both ends where they affect the wire):
-//!   TRANSPORT=udp|tcp   MODE=loop|grouped|packed
-//!   BATCH_N=<n>         messages per send-batch (default 100)
-//!   SIZE=<lo>-<hi>      message size range, cycled (default 512-2048)
-//!   PACE_MBPS=<n>       cap offered payload at n MB/s aggregate; unset floods
-//!
-//! Start the receivers first (each on its own core), then the sender:
-//!   remote_bcast receiver <sender_ip> <port> <bind_ip> <core> <secs>
-//!   remote_bcast sender   <bind_ip> <port> <clients> <core> <secs>
-//! Pace below the slowest NIC's line rate to stay lossless. The sender prints
-//! SEND (call time, throughput), each receiver prints RECV (loss, one-way).
+//! ```text
+//! TRANSPORT=udp|tcp   MODE=grouped|packed
+//! BATCH_N=<n>         messages per send call (default 100)
+//! SIZE=<lo>-<hi>      message size range (default 512-2048)
+//! PACE_MBPS=<n>       cap payload at n MB/s aggregate; unset floods
+//! ```
 
 use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
@@ -41,14 +31,12 @@ const PORT_FALLBACK: u16 = 46000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Loop,
     Grouped,
     Packed,
 }
 
 fn mode() -> Mode {
     match std::env::var("MODE").as_deref() {
-        Ok("loop") => Mode::Loop,
         Ok("packed") => Mode::Packed,
         _ => Mode::Grouped,
     }
@@ -60,29 +48,24 @@ fn tcp() -> bool {
 
 fn kind() -> String {
     let m = match mode() {
-        Mode::Loop => "loop",
         Mode::Grouped => "grouped",
         Mode::Packed => "packed",
     };
     format!("{}/{m}", if tcp() { "tcp" } else { "udp" })
 }
 
-/// Wall-clock nanoseconds, NTP-disciplined so comparable across boxes once the
-/// residual offset is removed.
 fn realtime_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
 
-/// This thread's consumed CPU time in nanoseconds, to tell a CPU-bound send
-/// call apart from one waiting in the syscall.
 fn cpu_ns() -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, std::ptr::from_mut(&mut ts)) };
     ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
-/// Pins the current thread to one absolute CPU via `sched_setaffinity`, which
-/// works even when the inherited affinity mask is a single other core.
+/// Unlike `core_affinity`, works when the inherited mask is a single other
+/// core.
 fn pin(core: usize) {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -150,8 +133,6 @@ fn main() {
     }
 }
 
-/// Answers clock-offset probes forever, stamping each reply with the sender's
-/// wall clock. The process exiting ends the thread.
 fn spawn_echo(bind: IpAddr, probe_port: u16) {
     std::thread::spawn(move || {
         let sock = UdpSocket::bind(SocketAddr::new(bind, probe_port)).expect("echo bind");
@@ -162,7 +143,6 @@ fn spawn_echo(bind: IpAddr, probe_port: u16) {
     });
 }
 
-/// Sends one batch per the mode; returns recipients reached by the last call.
 fn send_batch(
     net: &mut Network,
     group: Group,
@@ -170,20 +150,8 @@ fn send_batch(
     msgs: &[Vec<u8>],
     packed: &mut Vec<u8>,
 ) -> usize {
-    // UDP is one-way and only publishes to the whole group.
     let unicast = tokens.len() == 1 && tcp();
     match mode() {
-        Mode::Loop => {
-            let mut r = 0;
-            for m in msgs {
-                r = if unicast {
-                    usize::from(net.send_with(tokens[0], |b| b.extend_from_slice(m)))
-                } else {
-                    net.broadcast_with(group, |b| b.extend_from_slice(m))
-                };
-            }
-            r
-        }
         Mode::Grouped if unicast => {
             usize::from(net.send_many_with(tokens[0], msgs, |b, m| b.extend_from_slice(m)))
         }
@@ -250,8 +218,6 @@ fn run_sender(
     let mut sent = 0u64;
     let mut seq = 0u64;
     let mut short = 0u64;
-    // PACE_MBPS caps offered payload with a token bucket holding one batch; unset
-    // floods.
     let bcast_bytes = msgs.iter().map(Vec::len).sum::<usize>() as f64 * clients as f64;
     let rate =
         std::env::var("PACE_MBPS").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) * 1e6;
@@ -313,8 +279,8 @@ fn report_send(send_ns: &[i64], cpu: i64, sent: u64, short: u64, elapsed: Durati
     );
 }
 
-/// Min-RTT clock-offset estimate to the sender's echo port, in nanoseconds
-/// (receiver clock minus sender clock). Retries until the sender is up.
+/// Receiver clock minus sender clock, from the min-RTT probe (NTP's
+/// estimator): NTP sync alone is coarser than the latency measured.
 fn measure_offset(sender_ip: IpAddr, probe_port: u16) -> i64 {
     let sock = UdpSocket::bind("0.0.0.0:0").expect("probe bind");
     sock.connect(SocketAddr::new(sender_ip, probe_port)).expect("probe connect");
@@ -386,8 +352,7 @@ fn receiver(args: &[String]) {
     report_recv(core, got, bytes, highest, &oneway, started, secs);
 }
 
-/// (seq, send_ts) of each logical message in a delivered payload. A packed
-/// payload holds `[len u16][bytes]` records; otherwise it is one message.
+/// `(seq, send_ts)` of each message in a payload.
 fn records(payload: &[u8], packed: bool) -> Vec<(u64, u64)> {
     if !packed {
         return vec![(le8(payload, 0), le8(payload, 8))];

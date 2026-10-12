@@ -1,7 +1,3 @@
-//! Reliable, unordered, one-way UDP transport for [`crate::Network`]: a
-//! group's listeners publish one stream, the same packets to every
-//! subscriber, and its `connect` tokens subscribe.
-
 use std::{io, net::SocketAddr};
 
 use flux_timing::{Duration, Instant};
@@ -36,8 +32,6 @@ fn send_datagram(socket: &UdpSocket, addr: SocketAddr, bytes: &[u8]) -> SendOutc
     }
 }
 
-/// Session id for a new stream or subscription attempt: mixes the TSC, the
-/// pid and `salt`.
 fn new_session(salt: usize) -> u32 {
     let t = Instant::now().0;
     let mut x = t ^
@@ -56,31 +50,23 @@ fn new_session(salt: usize) -> u32 {
 pub struct UdpConfig {
     /// Should be link MTU - 48 byte
     pub max_datagram_size: usize,
-    /// Packets a publisher holds until every subscriber is done with them.
-    /// Power of two, at least 64. When a message does not fit, every
-    /// subscriber still holding the oldest packet is dropped. There is no
-    /// flow control, so a subscriber's socket buffer should hold a full
-    /// window.
+    /// Packets a publisher holds for its slowest subscriber. Power of two, at
+    /// least 64. There is no flow control, so a subscriber's socket buffer
+    /// should hold a full window.
     pub send_window: usize,
-    /// Packets a subscriber tracks above its ack point. Power of two, at
-    /// least 64. Should be at least the publisher's `send_window`.
+    /// Power of two, at least 64. Should be at least the publisher's
+    /// `send_window`.
     pub recv_window: usize,
     /// Largest message accepted or sent. Must fit in `send_window`.
     pub max_message_size: usize,
     pub initial_rto: Duration,
     pub min_rto: Duration,
     pub max_rto: Duration,
-    /// Idle interval after which a subscriber sends a bare ack, so its
-    /// publisher can tell it is alive and, once restarted, reset it. A
-    /// publisher drops a subscriber silent for the group's `peer_timeout`; a
-    /// subscriber never times out an idle publisher.
+    /// How often an idle subscriber acks. Must be well below the publisher's
+    /// `peer_timeout`.
     pub heartbeat_interval: Duration,
-    /// Off: no retransmits, no per-packet acks; a packet is done once the
-    /// kernel takes it and the receiver drops whatever a lost packet leaves
-    /// incomplete. Acks still flow at `heartbeat_interval`. A
-    /// publisher and its subscribers must agree. Nothing throttles a burst, so
-    /// the receiver's socket buffer must hold the largest one or its overflow
-    /// is loss too.
+    /// Off: no retransmits, a lost packet loses the messages it carries. A
+    /// publisher and its subscribers must agree.
     pub reliable: bool,
 }
 
@@ -122,7 +108,6 @@ impl UdpConfig {
         }
     }
 
-    /// Most packets one message can occupy.
     pub(crate) fn packets_per_message(&self) -> usize {
         self.max_message_size / (self.max_datagram_size - wire::PACKET_HEADER) + 2
     }

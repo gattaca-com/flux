@@ -1,7 +1,3 @@
-//! The publisher's stream: messages cut into packets once and sent byte for
-//! byte to every subscriber. A packet's bytes live in the shared
-//! [`MessageStore`] until every subscriber is done with it.
-
 use std::collections::VecDeque;
 
 use flux_timing::Nanos;
@@ -12,59 +8,8 @@ use super::{
     wire::{self, PACKET_HEADER},
 };
 
-/// Most streams one packet carries spans of; it closes short at this many,
-/// which bounds the slice ring at this multiple of the packet window.
+/// Bounds the slice ring at this multiple of the packet window.
 const MAX_SLICES_PER_PACKET: u16 = 4;
-
-/// Message bytes the stream holds until every packet of them is released.
-pub(crate) struct MessageStore {
-    entries: Vec<Entry>,
-    free: Vec<u32>,
-}
-
-struct Entry {
-    bytes: Vec<u8>,
-    refs: u32,
-}
-
-impl MessageStore {
-    pub(crate) fn new() -> Self {
-        Self { entries: Vec::new(), free: Vec::new() }
-    }
-
-    /// Takes `payload`'s buffer, leaving a recycled one in its place. The
-    /// caller holds one reference and must [`Self::release`] it.
-    pub(crate) fn insert(&mut self, payload: &mut Vec<u8>) -> u32 {
-        if let Some(slot) = self.free.pop() {
-            let e = &mut self.entries[slot as usize];
-            std::mem::swap(&mut e.bytes, payload);
-            payload.clear();
-            e.refs = 1;
-            slot
-        } else {
-            self.entries.push(Entry { bytes: std::mem::take(payload), refs: 1 });
-            (self.entries.len() - 1) as u32
-        }
-    }
-
-    #[inline]
-    fn add_ref(&mut self, slot: u32) {
-        self.entries[slot as usize].refs += 1;
-    }
-
-    pub(crate) fn release(&mut self, slot: u32) {
-        let e = &mut self.entries[slot as usize];
-        e.refs -= 1;
-        if e.refs == 0 {
-            self.free.push(slot);
-        }
-    }
-
-    #[inline]
-    fn bytes(&self, slot: u32) -> &[u8] {
-        &self.entries[slot as usize].bytes
-    }
-}
 
 struct Message {
     slot: u32,
@@ -76,11 +21,10 @@ struct Slice {
     slot: u32,
     offset: u32,
     len: u16,
-    /// 1 + offset within the span of the first record header; 0 without one.
+    /// 1 + offset of the first record header in the span; 0 without one.
     start: u16,
 }
 
-/// Record starts of a stream, walked forward once.
 struct Records<'a> {
     stream: &'a [u8],
     start: usize,
@@ -91,7 +35,7 @@ impl<'a> Records<'a> {
         Self { stream, start: 0 }
     }
 
-    /// The first record start in `pos..end`; calls must not move backwards.
+    /// Calls must not move backwards.
     fn first(&mut self, pos: usize, end: usize) -> Option<usize> {
         while self.start < pos {
             let len = self.stream.get(self.start..).map_or(0, wire::record_len);
@@ -106,15 +50,11 @@ impl<'a> Records<'a> {
 
 #[derive(Clone, Copy, Default)]
 struct Packet {
-    /// Index of its first slice in the slice ring.
-    records: u32,
+    first_slice: u32,
     count: u16,
-    /// Size on the wire.
     bytes: u16,
-    /// 1 + payload offset of the first message header; 0 without one.
     start: u16,
-    /// Stamped when the packet is first staged for anyone, so every copy
-    /// carries the same bytes.
+    /// Stamped at the first staging, so every copy carries the same bytes.
     send_ts: Nanos,
 }
 
@@ -123,16 +63,16 @@ pub(crate) struct Stream {
     datagram_size: usize,
     packets: Box<[Packet]>,
     mask: u64,
-    /// Oldest packet still held.
     base: u64,
-    /// Next packet to build. The last built one stays open for more records
-    /// until it is full, first staged, or a subscriber joins.
     next: u64,
+    /// Packet `next - 1` still takes records.
     open: bool,
     slices: Box<[Slice]>,
     slice_mask: u32,
     slice_next: u32,
     messages: VecDeque<Message>,
+    buffers: Vec<Vec<u8>>,
+    free: Vec<u32>,
 }
 
 impl Stream {
@@ -151,6 +91,8 @@ impl Stream {
             slice_mask: slice_capacity as u32 - 1,
             slice_next: 0,
             messages: VecDeque::new(),
+            buffers: Vec::new(),
+            free: Vec::new(),
         }
     }
 
@@ -164,7 +106,6 @@ impl Stream {
         self.base
     }
 
-    /// The sequence the next packet built gets.
     #[inline]
     pub(crate) fn next(&self) -> u64 {
         self.next
@@ -185,15 +126,12 @@ impl Stream {
         self.packet(seq).bytes
     }
 
-    /// Whether a stream of `len` bytes fits the window as it stands: a
-    /// sliver in the open packet, full packets, a sliver at the end.
+    /// +2: a sliver in the open packet and one at the end.
     pub(crate) fn fits(&self, len: usize) -> bool {
         let room = self.datagram_size - PACKET_HEADER;
         (len / room + 2) as u64 <= self.mask + 1 - (self.next - self.base)
     }
 
-    /// Ends the open packet, so the next record starts a new one. A joining
-    /// subscriber starts at [`Self::next`] after this.
     #[inline]
     pub(crate) fn seal(&mut self) {
         self.open = false;
@@ -202,8 +140,11 @@ impl Stream {
     fn open_packet(&mut self) -> u64 {
         let seq = self.next;
         self.next += 1;
-        *self.packet_mut(seq) =
-            Packet { records: self.slice_next, bytes: PACKET_HEADER as u16, ..Packet::default() };
+        *self.packet_mut(seq) = Packet {
+            first_slice: self.slice_next,
+            bytes: PACKET_HEADER as u16,
+            ..Packet::default()
+        };
         self.open = true;
         seq
     }
@@ -219,13 +160,15 @@ impl Stream {
         packet.bytes += slice.len;
     }
 
-    /// Cuts the stream in `slot` into packets; the caller has checked that
-    /// it [`Self::fits`].
-    pub(crate) fn enqueue(&mut self, store: &mut MessageStore, slot: u32) {
-        let stream = store.bytes(slot);
-        let len = stream.len();
+    /// Takes `payload`'s buffer, leaving a recycled one in its place.
+    pub(crate) fn enqueue(&mut self, payload: &mut Vec<u8>) {
+        let slot = self.free.pop().unwrap_or_else(|| {
+            self.buffers.push(Vec::new());
+            (self.buffers.len() - 1) as u32
+        });
+        let len = payload.len();
         debug_assert!(self.fits(len));
-        let mut records = Records::new(stream);
+        let mut records = Records::new(payload);
         let mut pos = 0usize;
         loop {
             let seq = if self.open { self.next - 1 } else { self.open_packet() };
@@ -245,20 +188,12 @@ impl Stream {
                 break;
             }
         }
-        store.add_ref(slot);
+        std::mem::swap(&mut self.buffers[slot as usize], payload);
+        payload.clear();
         self.messages.push_back(Message { slot, last_packet: self.next - 1 });
     }
 
-    /// Builds packet `seq` into the batch, to `to`. `send_ts` stamps it if
-    /// this is its first staging for anyone.
-    pub(crate) fn put(
-        &mut self,
-        store: &MessageStore,
-        batch: &mut SendBatch,
-        to: &SockAddr,
-        seq: u64,
-        send_ts: Nanos,
-    ) {
+    pub(crate) fn put(&mut self, batch: &mut SendBatch, to: &SockAddr, seq: u64, send_ts: Nanos) {
         let packet = self.packet_mut(seq);
         if packet.send_ts.0 == 0 {
             packet.send_ts = send_ts;
@@ -269,24 +204,23 @@ impl Stream {
         wire::packet_header(&mut header, self.session, seq, packet.send_ts.0, packet.start);
         batch.copy(&header);
         for i in 0..packet.count {
-            let slice = self.slices[((packet.records + u32::from(i)) & self.slice_mask) as usize];
-            let bytes = store.bytes(slice.slot);
+            let slice =
+                self.slices[((packet.first_slice + u32::from(i)) & self.slice_mask) as usize];
+            let bytes = &self.buffers[slice.slot as usize];
             batch.payload(&bytes[slice.offset as usize..][..usize::from(slice.len)]);
         }
         batch.close();
-        // Once on its way to anyone, a packet takes no more records.
+        // Its bytes must stay identical for every subscriber.
         if seq + 1 == self.next {
             self.open = false;
         }
     }
 
-    /// Drops every packet below `base`, which must not move backwards or
-    /// past [`Self::next`].
-    pub(crate) fn release_to(&mut self, base: u64, store: &mut MessageStore) {
+    pub(crate) fn release_to(&mut self, base: u64) {
         debug_assert!(self.base <= base && base <= self.next);
         self.base = base;
         while self.messages.front().is_some_and(|m| m.last_packet < base) {
-            store.release(self.messages.pop_front().unwrap().slot);
+            self.free.push(self.messages.pop_front().unwrap().slot);
         }
     }
 }

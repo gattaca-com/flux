@@ -151,8 +151,6 @@ fn one_external_poll_observes_readiness_and_drives_both_transports() {
         }
         network.post_poll(&mut |event| log.record(&event));
         if !sent && log.accepted.len() == 2 && log.connected.len() == 2 {
-            // UDP is one-way: the publisher broadcasts, the subscriber only
-            // receives.
             let accepted_tcp =
                 log.accepted.iter().find(|(group, _)| *group == groups[0]).unwrap().1;
             assert!(network.send_with(outbound[0], |buf| buf.extend_from_slice(b"request")));

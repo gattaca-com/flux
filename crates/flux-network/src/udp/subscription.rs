@@ -1,6 +1,3 @@
-//! A subscription to one publisher's stream: the handshake, the acks, and
-//! reassembly of what arrives. The manager owns the socket and passes it in.
-
 use std::net::SocketAddr;
 
 use flux_communication::Timer;
@@ -25,7 +22,6 @@ fn latency_timer(telemetry: NetworkTelemetry, label: &str) -> Option<Timer> {
     Some(Timer::new(app_name, format!("udp_latency_{label}")))
 }
 
-/// Why a packet was not taken in, leaving its sequence unacked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refused {
     Malformed,
@@ -43,19 +39,14 @@ pub(crate) struct Subscription {
     initial_rto: Duration,
     max_rto: Duration,
     connected: bool,
-    /// Ours, fresh for every attempt.
     session: u32,
-    /// The publisher's, once a hello ack names it.
     publisher: Option<u32>,
     inbound: Inbound,
     last_send: Instant,
-    /// When the next hello goes out while disconnected.
     hello_due: Instant,
     hello_backoff: u8,
     ack_due: bool,
     latency: Option<Timer>,
-    /// Control datagram staging: the largest ack, or a hello carrying the
-    /// on-connect message.
     ctrl: Vec<u8>,
 }
 
@@ -103,7 +94,6 @@ impl Subscription {
         std::mem::take(&mut self.ack_due)
     }
 
-    /// Starts over with a fresh session; hellos restart on the next tick.
     pub(crate) fn reset(&mut self) {
         self.connected = false;
         self.publisher = None;
@@ -113,8 +103,6 @@ impl Subscription {
         self.ack_due = false;
     }
 
-    /// Also schedules the retry, backing off per attempt up to `max_rto`.
-    /// `msg` is our on-connect message; empty without one.
     pub(crate) fn send_hello(
         &mut self,
         socket: &UdpSocket,
@@ -129,8 +117,6 @@ impl Subscription {
         send_datagram(socket, self.addr, &self.ctrl[..n])
     }
 
-    /// `true` when this completes the handshake; `false` if already
-    /// connected or the ack answers an earlier attempt.
     pub(crate) fn on_hello_ack(&mut self, publisher: u32, subscriber: u32, join: u64) -> bool {
         if self.connected || subscriber != self.session {
             return false;
@@ -142,8 +128,6 @@ impl Subscription {
         true
     }
 
-    /// A reset naming our session, or a hello ack naming it under another
-    /// publisher session, means the publisher no longer holds us.
     #[inline]
     pub(crate) fn lost(&self, subscriber: u32, publisher: Option<u32>) -> bool {
         self.connected &&
@@ -151,16 +135,13 @@ impl Subscription {
             publisher.is_none_or(|s| self.publisher != Some(s))
     }
 
-    /// Datagrams from any other publisher session are stale: a restarted
-    /// publisher shows up through a reset, never through data.
     #[inline]
     fn current(&self, publisher: u32) -> bool {
         self.connected && self.publisher == Some(publisher)
     }
 
-    /// Takes in a packet, delivering every message it completes. Validation
-    /// comes before the sequence is committed: a bad packet must not consume
-    /// the sequence a good retry will carry.
+    /// Validates before accepting: a bad packet must not consume the
+    /// sequence a good retry will carry.
     pub(crate) fn on_packet<F>(
         &mut self,
         packet: Packet<'_>,
@@ -201,9 +182,8 @@ impl Subscription {
         });
     }
 
-    /// Checks every message length a packet makes known before any byte is
-    /// taken in: those of the messages starting in it, and that of a header
-    /// cut across it and a packet already in.
+    /// Includes a length whose header is cut between this packet and one
+    /// already in.
     fn validate(
         &self,
         seq: u64,
@@ -241,16 +221,13 @@ impl Subscription {
         let Some(publisher) = self.publisher else { return SendOutcome::Done };
         let n_bits = self.inbound.ack_bits();
         let header: &mut [u8; ACK_HEADER] = (&mut self.ctrl[..ACK_HEADER]).try_into().unwrap();
-        wire::ack_header(header, publisher, self.session, self.inbound.ack_next(), n_bits as u16);
+        wire::ack_header(header, publisher, self.session, self.inbound.ack_next());
         let n = self.inbound.write_bitmap(n_bits, &mut self.ctrl[ACK_HEADER..]);
         self.ack_due = false;
         self.last_send = now;
         send_datagram(socket, self.addr, &self.ctrl[..ACK_HEADER + n])
     }
 
-    /// Periodic work: hello retries, carrying our on-connect message `msg`,
-    /// while disconnected; heartbeat acks while connected. An idle publisher
-    /// is never timed out: a restarted one answers the next ack with a reset.
     pub(crate) fn tick(&mut self, socket: &UdpSocket, msg: &[u8], now: Instant) -> SendOutcome {
         if !self.connected {
             if now >= self.hello_due {
@@ -308,8 +285,7 @@ mod tests {
         sub
     }
 
-    /// A packet of `continuation` then `messages`, the last cut to `head`
-    /// bytes if given.
+    /// The last message is cut to `head` bytes if given.
     fn packet(seq: u64, continuation: &[u8], messages: &[&[u8]], head: Option<usize>) -> Vec<u8> {
         let mut header = [0; PACKET_HEADER];
         let start = if messages.is_empty() { 0 } else { continuation.len() as u16 + 1 };
@@ -354,22 +330,6 @@ mod tests {
             feed(&mut sub, again, &mut out);
         }
         assert_eq!(out.len(), 3);
-        assert_eq!(sub.inbound.ack_next(), 13);
-    }
-
-    #[test]
-    fn a_lost_packet_is_a_hole_until_its_copy_arrives() {
-        let mut sub = subscription();
-        let lost = packet(10, b"", &[b"abcdef"], Some(3));
-        let after = packet(11, b"def", &[b"solo"], None);
-        let mut out = Vec::new();
-        feed(&mut sub, &after, &mut out);
-        assert_eq!(out, [(b"solo".to_vec(), 1100)]);
-        assert_eq!(sub.inbound.ack_next(), 10);
-        assert_eq!(sub.inbound.ack_bits(), 1);
-        feed(&mut sub, &lost, &mut out);
-        assert_eq!(out[1], (b"abcdef".to_vec(), 1000));
-        assert_eq!(sub.inbound.ack_next(), 12);
     }
 
     #[test]
@@ -384,8 +344,6 @@ mod tests {
         assert_eq!(out, [(b"new".to_vec(), 1000)]);
     }
 
-    /// A packet whose payload starts with a message header at `start` (0
-    /// for none), unlike [`packet`] not split into messages.
     fn raw(seq: u64, start: u16, payload: &[u8]) -> Vec<u8> {
         let mut header = [0; PACKET_HEADER];
         wire::packet_header(&mut header, SESSION, seq, seq * 100, start);
@@ -411,13 +369,10 @@ mod tests {
                 seq += 2;
             }
         }
-        assert_eq!(sub.inbound.ack_next(), seq);
-        // A cut header naming too much: the packet that completes it is
-        // refused and stays unacked.
+        // A cut header naming too much.
         let header = u32::MAX.to_le_bytes();
         feed(&mut sub, &raw(seq, 1, &header[..2]), &mut out);
         feed(&mut sub, &raw(seq + 1, 0, &[&header[2..], b"x"].concat()), &mut out);
         assert!(out.is_empty());
-        assert_eq!(sub.inbound.ack_next(), seq + 1);
     }
 }

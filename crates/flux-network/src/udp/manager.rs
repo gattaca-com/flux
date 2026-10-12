@@ -1,7 +1,3 @@
-//! One UDP group: its listeners publish one stream to every subscriber, and
-//! its `connect` tokens subscribe to other publishers. Data only flows from
-//! a publisher to its subscribers.
-
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -16,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     SendOutcome, new_session, send_datagram,
-    stream::{MessageStore, Stream},
+    stream::Stream,
     subscriber::Subscriber,
     subscription::{Subscription, deliver_message},
     sys::{RecvBatch, SendBatch},
@@ -59,8 +55,6 @@ fn outbound_bind_addr(peer: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Tells the sender of a datagram naming `subscriber` that we hold no
-/// subscriber for it.
 fn send_reset(socket: &UdpSocket, addr: SocketAddr, subscriber: u32) {
     let mut buf = [0; RESET_SIZE];
     wire::reset(&mut buf, subscriber);
@@ -120,17 +114,13 @@ pub(crate) struct UdpManagerState {
 
     sockets: Vec<Endpoint>,
     stream: Stream,
-    store: MessageStore,
     subscribers: Vec<Subscriber>,
-    /// Subscribers dropped within `peer_timeout`, with when: a hello naming
-    /// one is a stale retry, answered with a reset rather than a new
-    /// subscriber.
+    /// A late hello retry from a dropped subscriber gets a reset instead of
+    /// rejoining.
     dropped: Vec<(SocketAddr, u32, Instant)>,
     subscriptions: Vec<Subscription>,
 
-    /// users serialise here. and then it's moved to `MessageStore`
     send_buffer: Vec<u8>,
-    /// Hello ack staging, sized for the on-connect message.
     ctrl: Vec<u8>,
 
     batch: SendBatch,
@@ -165,7 +155,6 @@ impl UdpManagerState {
             config,
             group,
             sockets: Vec::new(),
-            store: MessageStore::new(),
             subscribers: Vec::new(),
             dropped: Vec::new(),
             subscriptions: Vec::new(),
@@ -178,7 +167,6 @@ impl UdpManagerState {
         }
     }
 
-    /// Deregisters every socket before the group is dropped.
     pub(crate) fn close_all(&mut self, registry: &Registry) {
         for endpoint in &mut self.sockets {
             let _ = registry.deregister(&mut endpoint.socket);
@@ -207,7 +195,6 @@ impl UdpManagerState {
         Ok(socket)
     }
 
-    /// Subscribes to the publisher at `addr` from a socket of its own.
     pub(crate) fn connect(
         &mut self,
         registry: &Registry,
@@ -230,7 +217,6 @@ impl UdpManagerState {
         token
     }
 
-    /// Publishes the group's stream on `addr`.
     pub(crate) fn listen(
         &mut self,
         registry: &Registry,
@@ -249,7 +235,6 @@ impl UdpManagerState {
         Ok(token)
     }
 
-    /// Starts subscription `i` over with a fresh session.
     fn resubscribe(&mut self, i: usize, now: Instant) {
         let subscription = &mut self.subscriptions[i];
         if subscription.is_connected() {
@@ -265,7 +250,6 @@ impl UdpManagerState {
         subscription.send_hello(socket, on_connect_msg(&self.config), now);
     }
 
-    /// Lets the stream drop what no subscriber needs any more.
     fn release(&mut self) {
         let base = self
             .subscribers
@@ -274,7 +258,7 @@ impl UdpManagerState {
             .min()
             .unwrap_or_else(|| self.stream.next());
         if base > self.stream.base() {
-            self.stream.release_to(base, &mut self.store);
+            self.stream.release_to(base);
         }
     }
 
@@ -292,9 +276,6 @@ impl UdpManagerState {
         self.remove_subscriber(index);
     }
 
-    /// Drops a subscriber, which learns of it from the reset its next ack
-    /// draws, or restarts a subscription. A listener token is not a session
-    /// and is left alone.
     pub(crate) fn disconnect(&mut self, token: Token) -> bool {
         if let Some(i) = self.subscribers.iter().position(|s| s.token == token) {
             self.drop_subscriber(i);
@@ -307,8 +288,6 @@ impl UdpManagerState {
         true
     }
 
-    /// Drops a subscriber once it has acked everything published so far. A
-    /// subscription has nothing of its own to drain and restarts at once.
     pub(crate) fn disconnect_when_drained(&mut self, token: Token) -> bool {
         if let Some(i) = self.subscribers.iter().position(|s| s.token == token) {
             let end = self.stream.next();
@@ -320,7 +299,6 @@ impl UdpManagerState {
         self.disconnect(token)
     }
 
-    /// Removes a listener and every subscriber that joined through it.
     fn remove_listener(&mut self, registry: &Registry, token: Token) -> bool {
         let Some(k) = self.sockets.iter().position(|s| s.token == token && s.listener) else {
             return false;
@@ -345,7 +323,6 @@ impl UdpManagerState {
         }
     }
 
-    /// One-way: there is no per-token send. Publish with a broadcast.
     pub(crate) fn send_with(&self, token: Token) -> bool {
         error!(group = self.config.name, ?token, "udp is one-way: broadcast on a listening group");
         false
@@ -361,8 +338,6 @@ impl UdpManagerState {
         self.publish(registry)
     }
 
-    /// Serialises every item into one stream, queues it and flushes each
-    /// listener once.
     pub(crate) fn broadcast_many_with<I, F>(
         &mut self,
         registry: &Registry,
@@ -386,8 +361,6 @@ impl UdpManagerState {
         self.publish(registry)
     }
 
-    /// Whether a broadcast has anyone to reach; nothing is serialised
-    /// otherwise.
     fn can_publish(&self) -> bool {
         if !self.sockets.iter().any(|s| s.listener) {
             error!(group = self.config.name, "udp broadcast on a group that does not listen");
@@ -422,9 +395,6 @@ impl UdpManagerState {
         true
     }
 
-    /// Queues the serialised records on the stream and sends them. Makes
-    /// room by dropping every subscriber still holding the oldest packet.
-    /// Returns how many subscribers it was queued for.
     fn publish(&mut self, registry: &Registry) -> usize {
         safe_assert!(!self.send_buffer.is_empty());
         let len = self.send_buffer.len();
@@ -444,9 +414,7 @@ impl UdpManagerState {
             self.send_buffer.clear();
             return 0;
         }
-        let slot = self.store.insert(&mut self.send_buffer);
-        self.stream.enqueue(&mut self.store, slot);
-        self.store.release(slot);
+        self.stream.enqueue(&mut self.send_buffer);
         let recipients = self.subscribers.iter().filter(|s| !s.is_draining()).count();
         let now = Instant::now();
         for k in 0..self.sockets.len() {
@@ -457,9 +425,6 @@ impl UdpManagerState {
         recipients
     }
 
-    /// Sends every due packet of every subscriber on listener `k`, batched
-    /// across subscribers. With `probing`, each may also be resent what its
-    /// timeout allows. Arms WRITABLE if the kernel stopped accepting.
     fn pump(&mut self, registry: &Registry, k: usize, now: Instant, probing: bool) {
         let token = self.sockets[k].token;
         let fd = self.sockets[k].socket.as_raw_fd();
@@ -469,13 +434,8 @@ impl UdpManagerState {
             }
             let mut probes = if probing { self.subscribers[i].probe_budget(now) } else { 0 };
             loop {
-                let packets = self.subscribers[i].stage(
-                    &mut self.stream,
-                    &self.store,
-                    &mut self.batch,
-                    probes,
-                    now,
-                );
+                let packets =
+                    self.subscribers[i].stage(&mut self.stream, &mut self.batch, probes, now);
                 probes = 0;
                 if packets != 0 {
                     self.staged.push(StagedBatch { subscriber: i, packets });
@@ -494,8 +454,7 @@ impl UdpManagerState {
         }
     }
 
-    /// Sends the batch and tells each subscriber what the kernel took.
-    /// `false` if it took less than everything.
+    /// `false` if the kernel took less than everything.
     fn dispatch(&mut self, fd: i32, now: Instant) -> bool {
         let total_packets: usize = self.staged.iter().map(|staged| staged.packets).sum();
         let accepted_packets = match self.batch.send(fd) {
@@ -537,8 +496,6 @@ impl UdpManagerState {
         }
     }
 
-    /// Hello retries, heartbeat acks, subscriber timeouts, drained closes and
-    /// retransmit probes.
     fn tick(&mut self, registry: &Registry, now: Instant) {
         let peer_timeout = self.config.peer_timeout;
         self.dropped.retain(|&(_, _, at)| now.saturating_sub(at) < peer_timeout);
@@ -573,7 +530,6 @@ impl UdpManagerState {
         }
     }
 
-    /// One received datagram on socket `k`.
     #[allow(clippy::too_many_arguments)]
     fn on_datagram<F>(
         &mut self,
@@ -633,7 +589,6 @@ impl UdpManagerState {
         }
     }
 
-    /// A datagram on listener `k`: a subscriber's hello or ack.
     #[allow(clippy::too_many_arguments)]
     fn on_publisher_datagram<F>(
         &mut self,
@@ -651,16 +606,15 @@ impl UdpManagerState {
         let index =
             self.subscribers.iter().position(|s| s.socket_token == socket_token && s.addr == from);
         match datagram {
-            Datagram::Ack { session, subscriber, ack_next, bits, bitmap } => {
+            Datagram::Ack { session, subscriber, ack_next, bitmap } => {
                 let Some(i) = index.filter(|&i| {
                     session == self.stream.session() && self.subscribers[i].session == subscriber
                 }) else {
-                    // A subscriber we dropped, or one from before our restart.
                     send_reset(&self.sockets[k].socket, from, subscriber);
                     return;
                 };
                 let held_oldest = self.subscribers[i].base() == self.stream.base();
-                self.subscribers[i].on_ack(ack_next, u64::from(bits), bitmap, now);
+                self.subscribers[i].on_ack(ack_next, bitmap, now);
                 if self.subscribers[i].drained() {
                     self.drop_subscriber(i);
                 } else if held_oldest {
@@ -690,8 +644,7 @@ impl UdpManagerState {
                     let old = self.remove_subscriber(i);
                     deliver(Event::Disconnected { group: self.group, token: old, peer_addr: from });
                 }
-                // The open packet may already be on its way to others; a
-                // newcomer starts after it.
+                // The open packet may already be on its way to others.
                 self.stream.seal();
                 let join = self.stream.next();
                 let token = tokens.allocate(self.group);
@@ -707,8 +660,6 @@ impl UdpManagerState {
                 self.send_hello_ack(k, from, subscriber, join);
                 info!(addr = %from, "udp subscriber joined");
                 deliver(Event::Accepted { group: self.group, token, peer_addr: from });
-                // Right after `Accepted`, so the caller can vet the subscriber
-                // before its next broadcast.
                 self.deliver_on_connect(token, msg, dcache, deliver);
             }
             Datagram::Packet(_) | Datagram::HelloAck { .. } | Datagram::Reset { .. } => {}
@@ -763,8 +714,6 @@ impl UdpManagerState {
             self.sockets[k].writable_armed = false;
         }
         if self.sockets[k].listener {
-            // Acks just taken in may have exposed holes; packets just queued
-            // behind a full buffer may fit now.
             self.pump(registry, k, now, false);
         } else {
             let entry = &mut self.sockets[k];
@@ -790,8 +739,6 @@ impl UdpManagerState {
         self.config.udp.min_rto / 2
     }
 
-    /// Whether a received on-connect message is one we take; a hello that
-    /// carries a larger one is ignored, so the handshake never completes.
     fn on_connect_fits(&self, msg: &[u8], from: SocketAddr) -> bool {
         let fits = msg.len() <= self.config.udp.max_message_size;
         if !fits {
@@ -800,7 +747,6 @@ impl UdpManagerState {
         fits
     }
 
-    /// Delivers the remote's on-connect message, if it sent one.
     fn deliver_on_connect<F>(
         &self,
         token: Token,
@@ -854,8 +800,6 @@ impl UdpManagerState {
         self.drain_pending_disconnects(deliver)
     }
 
-    /// Permanently removes a subscriber, a subscription, or a listener with
-    /// every subscriber on it.
     pub(crate) fn remove(&mut self, registry: &Registry, token: Token) -> bool {
         if let Some(i) = self.subscribers.iter().position(|s| s.token == token) {
             self.remove_subscriber(i);

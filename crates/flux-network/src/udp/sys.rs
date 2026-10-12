@@ -13,7 +13,6 @@ use super::wire::MAX_DATAGRAM_SIZE;
 
 /// Receive entries per syscall.
 pub(crate) const BATCH: usize = 32;
-/// Datagrams per send batch.
 pub(crate) const SEND_BATCH: usize = 256;
 
 #[cfg(target_os = "linux")]
@@ -118,16 +117,11 @@ fn sendmmsg(fd: RawFd, hdrs: &mut [MMsgHdr]) -> libc::c_int {
     unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, libc::MSG_DONTWAIT) }
 }
 
-/// Shortest run of equal-size datagrams to one destination sent as one
-/// `UDP_SEGMENT` entry; a lone datagram goes out plain. Even a pair is one
-/// skb through the stack, which a 2 KiB broadcast is made of per receiver.
+/// Even a pair saves an skb through the stack.
 const GSO_MIN_SEGMENTS: usize = 2;
 /// `UDP_MAX_SEGMENTS` of the first kernels with `UDP_SEGMENT`.
 const GSO_MAX_SEGMENTS: usize = 64;
-/// Most iovecs one `sendmsg` accepts.
 const UIO_MAXIOV: usize = 1024;
-/// Payloads shorter than this are copied next to their header, so a
-/// datagram of small records is one iovec; longer ones are borrowed.
 const COPY_THRESHOLD: usize = 256;
 
 #[cfg(target_os = "linux")]
@@ -162,7 +156,6 @@ struct Datagram {
     addr: u32,
 }
 
-/// One `sendmmsg` entry: a run of datagrams to one destination.
 #[derive(Clone, Copy)]
 struct Entry {
     first: u32,
@@ -171,21 +164,17 @@ struct Entry {
     segmented: bool,
 }
 
-/// Up to [`SEND_BATCH`] outgoing datagrams built piece by piece.
-///
-/// Headers and small payloads are copied into an arena the batch owns; a
-/// payload of [`COPY_THRESHOLD`] bytes or more is borrowed and must stay
+/// A payload of [`COPY_THRESHOLD`] bytes or more is borrowed and must stay
 /// alive and unmodified until [`Self::send`] returns.
 pub(crate) struct SendBatch {
     datagram_size: usize,
     arena: Box<[u8]>,
     arena_len: usize,
     iovs: Vec<libc::iovec>,
-    /// Whether the last iovec is the arena's tail and can be extended.
+    /// The last iovec is the arena's tail and can be extended.
     arena_tail: bool,
     datagrams: Vec<Datagram>,
     addrs: Vec<SockAddr>,
-    /// Bytes of the datagram being built.
     building: usize,
     entries: Vec<Entry>,
     hdrs: Vec<MMsgHdr>,
@@ -202,7 +191,6 @@ pub(crate) struct SendBatch {
 unsafe impl Send for SendBatch {}
 
 impl SendBatch {
-    /// `datagram_size` bounds every datagram built.
     pub(crate) fn new(datagram_size: usize) -> Self {
         // Two iovecs per borrowed payload plus one for the arena run in
         // between, and a borrowed payload needs COPY_THRESHOLD bytes.
@@ -255,7 +243,6 @@ impl SendBatch {
         self.datagrams.is_empty()
     }
 
-    /// Starts a datagram to `to`; the batch must not be full.
     pub(crate) fn open(&mut self, to: &SockAddr) {
         debug_assert!(!self.is_full());
         match self.addrs.last() {
@@ -272,7 +259,6 @@ impl SendBatch {
         self.building = 0;
     }
 
-    /// Appends bytes the batch copies; headers always go this way.
     pub(crate) fn copy(&mut self, bytes: &[u8]) {
         let start = self.arena_len;
         self.arena[start..start + bytes.len()].copy_from_slice(bytes);
@@ -286,8 +272,6 @@ impl SendBatch {
         }
     }
 
-    /// Appends a payload, borrowing it when it is long enough to be worth
-    /// an iovec of its own.
     #[inline]
     pub(crate) fn payload(&mut self, bytes: &[u8]) {
         if bytes.len() < COPY_THRESHOLD {
@@ -299,7 +283,6 @@ impl SendBatch {
         }
     }
 
-    /// Finishes the datagram being built. Returns its size.
     pub(crate) fn close(&mut self) -> usize {
         debug_assert!(self.building <= self.datagram_size);
         let datagram = self.datagrams.last_mut().unwrap();
@@ -308,10 +291,8 @@ impl SendBatch {
         self.building
     }
 
-    /// Groups the datagrams from `from` on into entries. With `gso`, a run of
-    /// at least [`GSO_MIN_SEGMENTS`] equal-size datagrams to one destination
-    /// (the last may be shorter) becomes segmented entries of near-equal
-    /// length, so capping a long run never strands a short plain tail.
+    /// A long run is split into near-equal entries, so the cap never strands
+    /// a short plain tail.
     fn build_entries(&mut self, from: usize, gso: bool) {
         self.entries.clear();
         let max_segments = GSO_MAX_SEGMENTS.min(MAX_DATAGRAM_SIZE / self.datagram_size).max(1);
@@ -361,7 +342,6 @@ impl SendBatch {
         }
     }
 
-    /// Points one `msghdr` at each entry.
     fn stage(&mut self) {
         let n = self.entries.len();
         self.hdrs.clear();
@@ -388,15 +368,12 @@ impl SendBatch {
         }
     }
 
-    /// Datagrams inside the first `entries` entries.
     #[inline]
     fn datagrams_in(&self, entries: usize) -> usize {
         self.entries[..entries].iter().map(|e| e.count as usize).sum()
     }
 
-    /// Sends the closed datagrams and empties the batch. Returns how many
-    /// the kernel accepted, in order; `WouldBlock` only when it accepted
-    /// none.
+    /// `WouldBlock` only when the kernel accepted none.
     pub(crate) fn send(&mut self, fd: RawFd) -> io::Result<usize> {
         let result = self.send_datagrams(fd);
         self.datagrams.clear();
@@ -412,20 +389,16 @@ impl SendBatch {
         self.stage();
         let sent = sendmmsg(fd, &mut self.hdrs);
         let err = (sent < 0).then(io::Error::last_os_error);
-        // The kernel stops at the first entry it refuses. UDP sends are
-        // atomic, so every accepted entry delivered all its datagrams.
+        // UDP sends are atomic: an accepted entry sent all its datagrams.
         let accepted = usize::try_from(sent).unwrap_or(0);
         let datagrams = self.datagrams_in(accepted);
-        // Route MTU, SG support, checksum offload and memory pressure all
-        // refuse a segmented entry; a full socket buffer refuses plain
-        // datagrams just the same.
+        // Route MTU, SG, checksum offload and memory pressure refuse only
+        // segmented entries.
         let retry = self.entries.get(accepted).is_some_and(|entry| entry.segmented) &&
             err.as_ref().is_none_or(|err| err.kind() != io::ErrorKind::WouldBlock);
         if !retry {
             return err.map_or(Ok(datagrams), Err);
         }
-        // Retry the rest as plain datagrams, which reports the same errno if
-        // it persists.
         let resume = self.entries[accepted].first as usize;
         self.build_entries(resume, false);
         self.stage();
@@ -630,8 +603,6 @@ mod tests {
         (sender, receiver, to)
     }
 
-    /// Builds a datagram of `small` copied pieces followed by one borrowed
-    /// payload of `big` bytes.
     fn build(batch: &mut SendBatch, to: &SockAddr, small: &[&[u8]], big: &[u8]) -> Vec<u8> {
         batch.open(to);
         let mut expect = Vec::new();

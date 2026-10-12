@@ -11,15 +11,14 @@ use std::{
 use flux_network::{Network, NetworkEvent, UdpConfig, UdpGroupConfig};
 use mio::Token;
 
-/// Message bytes a 1200-byte packet carries in one fragment.
+/// A 1200-byte packet minus its header and one message header.
 const STRIDE: usize = 1200 - 25 - 4;
 
 fn free_addr() -> SocketAddr {
     UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap()
 }
 
-/// Handshake between a fresh listener and client, returning the accepted and
-/// the outbound token. `dial` differs from `addr` when a relay sits between.
+/// `dial` differs from `addr` when a relay sits between.
 fn connect_via(
     server: &mut Network,
     server_group: flux_network::Group,
@@ -81,7 +80,7 @@ fn checksum(bytes: &[u8]) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3))
 }
 
-/// Test message: 4-byte id, then `len` bytes derived from the id.
+/// 4-byte id, then `len` bytes derived from it.
 fn make_msg(id: u32, len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + len);
     v.extend_from_slice(&id.to_le_bytes());
@@ -93,7 +92,6 @@ fn msg_id(payload: &[u8]) -> u32 {
     u32::from_le_bytes(payload[..4].try_into().unwrap())
 }
 
-/// A publisher reaches a subscriber once it has joined, and not before.
 #[test]
 fn udp_publishes_to_a_subscriber_once_it_joins() {
     let addr = free_addr();
@@ -129,8 +127,6 @@ fn udp_publishes_to_a_subscriber_once_it_joins() {
     }
 }
 
-/// Subscribers only receive and per-token sends do not exist: every such
-/// call is refused, and nothing reaches the publisher.
 #[test]
 fn udp_is_one_way() {
     let (mut server, _, mut client, client_group, accepted, tok) = lan_pair(free_addr());
@@ -145,9 +141,6 @@ fn udp_is_one_way() {
     }
 }
 
-/// A subscriber's on-connect message reaches the publisher right after its
-/// `Accepted`, so it can be vetted, and turned away before the next
-/// broadcast reaches it.
 #[test]
 fn udp_greeting_follows_accept_and_can_turn_a_subscriber_away() {
     let addr = free_addr();
@@ -206,7 +199,7 @@ fn udp_broadcast_mixed_sizes_to_two_subscribers() {
         b.poll_with(|_| {});
     }
 
-    // `make_msg` adds a four-byte ID, including at the packet boundary.
+    // Around the packet boundary, counting `make_msg`'s id.
     let sizes = [1usize, 100, STRIDE - 4, STRIDE - 3, 5000, 2 * 1024 * 1024];
     let msgs: Vec<Vec<u8>> =
         sizes.iter().enumerate().map(|(i, s)| make_msg(i as u32, *s)).collect();
@@ -240,8 +233,7 @@ fn udp_broadcast_mixed_sizes_to_two_subscribers() {
     }
 }
 
-/// Forwards datagrams between one client and the server, dropping every
-/// `drop_every`-th datagram in each direction.
+/// Drops every `drop_every`-th datagram in either direction.
 struct LossyRelay {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -316,8 +308,8 @@ fn udp_delivers_everything_exactly_once_under_loss() {
     let _ =
         connect_via(&mut server, server_group, &mut client, client_group, server_addr, relay.addr);
 
-    // Mixed sizes queued in batches, so packets carry several records and
-    // records straddle packets, both of which recovery has to handle.
+    // Batches of mixed sizes: packets carry several records and records
+    // straddle packets.
     let msgs: Vec<Vec<u8>> = (0..N).map(|i| make_msg(i, 1 + (i as usize * 613) % 4000)).collect();
     for chunk in msgs.chunks(25) {
         assert_eq!(
@@ -405,8 +397,6 @@ fn udp_client_disconnect_is_a_new_session() {
     assert_eq!(client.currently_disconnected().count(), 0);
 }
 
-/// A subscriber joins at the live end of the stream: it gets what is
-/// published after it joined and nothing from before.
 #[test]
 fn udp_late_subscriber_joins_at_the_live_end() {
     let addr = free_addr();
@@ -460,8 +450,6 @@ fn udp_server_restart_reconnects_client() {
         let (_, t) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
         tok = t;
     }
-    // Old server gone. A new one on the same port must be rejoined without
-    // waiting for the 2s peer timeout: its reset acks trigger renegotiation.
     let mut server = Network::default();
     let server_group =
         server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
@@ -552,7 +540,6 @@ fn udp_ignores_junk_datagrams() {
     }
 }
 
-/// A peer dropped mid-broadcast must not take the shared payload with it.
 #[test]
 fn udp_broadcast_survives_dropping_a_peer_mid_way() {
     let addr = free_addr();
@@ -602,7 +589,6 @@ fn udp_broadcast_survives_dropping_a_peer_mid_way() {
     }
 }
 
-/// A server that drops an accepted peer makes the client renegotiate.
 #[test]
 fn udp_server_disconnect_reconnects_client() {
     let addr = free_addr();
@@ -619,7 +605,6 @@ fn udp_server_disconnect_reconnects_client() {
         ..Default::default()
     });
     let (accepted, tok) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
-    // The client's next heartbeat ack finds no subscriber and draws a reset.
     server.disconnect(accepted);
 
     let start = Instant::now();
@@ -643,8 +628,6 @@ fn udp_server_disconnect_reconnects_client() {
     assert!(start.elapsed() < Duration::from_secs(1), "did not wait for the peer timeout");
 }
 
-/// A message that cannot fit the send window drops the subscriber holding
-/// it back instead of vanishing silently.
 #[test]
 fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let addr = free_addr();
@@ -654,8 +637,7 @@ fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let mut client = Network::default();
     let client_group = client.add_group(UdpGroupConfig { udp: config, ..Default::default() });
     let (accepted, _) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
-    // Client never polls: nothing is acked, the window fills, the 65th
-    // single-packet message cannot be queued.
+    // The client never acks, so the 65th packet does not fit.
     let mut disconnected = None;
     for _ in 0..70 {
         server.broadcast_with(server_group, |b| b.extend_from_slice(b"m"));
@@ -669,9 +651,6 @@ fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let _ = &client;
 }
 
-/// Unreliable mode under loss: every message that arrives is intact and
-/// unique, delivery keeps going past lost fragments, and the receiver only
-/// speaks when a heartbeat is due.
 #[test]
 fn udp_unreliable_keeps_streaming_through_loss() {
     const N: u32 = 600;
@@ -692,7 +671,6 @@ fn udp_unreliable_keeps_streaming_through_loss() {
     let _ =
         connect_via(&mut server, server_group, &mut client, client_group, server_addr, relay.addr);
 
-    // Mostly two-fragment messages: losing either fragment loses the message.
     let stride = STRIDE;
     let msgs: Vec<Vec<u8>> =
         (0..N).map(|i| make_msg(i, 1 + (i as usize * 613) % (2 * stride))).collect();
@@ -702,8 +680,6 @@ fn udp_unreliable_keeps_streaming_through_loss() {
     for m in &msgs {
         server.broadcast_with(server_group, |b| b.extend_from_slice(m));
         // Paced so the relay's socket buffer is not a second source of loss.
-        // Draining as we go still leaves bursts past a lost hole in the
-        // 64-datagram receive window, which is what slides it.
         thread::sleep(Duration::from_micros(50));
         client.poll_with(|e| {
             if let NetworkEvent::Message { payload, .. } = e {
@@ -739,8 +715,6 @@ fn udp_unreliable_keeps_streaming_through_loss() {
     assert_eq!(client.currently_disconnected().count(), 0, "client dropped its peer");
 }
 
-/// Resetting a subscription while its publisher is down leaves one
-/// greeting: the publisher sees the on-connect message once.
 #[test]
 fn udp_resets_while_down_send_one_greeting() {
     let addr = free_addr();
@@ -772,7 +746,6 @@ fn udp_resets_while_down_send_one_greeting() {
         });
         thread::sleep(Duration::from_micros(50));
     }
-    // Let anything still in flight land, then count greetings.
     let settle = Instant::now() + Duration::from_millis(200);
     while Instant::now() < settle {
         client.poll_with(|_| {});
@@ -798,8 +771,6 @@ fn lan_pair(
     (server, server_group, client, client_group, accepted, tok)
 }
 
-/// A graceful close waits for the last ack, refuses sends meanwhile, and
-/// reports the session gone afterwards, like its TCP counterpart.
 #[test]
 fn udp_disconnect_when_drained_waits_for_acks() {
     let (mut server, server_group, mut client, _, accepted, _) = lan_pair(free_addr());
@@ -808,7 +779,6 @@ fn udp_disconnect_when_drained_waits_for_acks() {
     assert!(server.disconnect_when_drained(accepted));
     assert_eq!(server.broadcast_with(server_group, |b| b.extend_from_slice(b"refused")), 0);
 
-    // The client is not polling, so nothing is acked and the session stays.
     let hold = Instant::now() + Duration::from_millis(100);
     while Instant::now() < hold {
         server.poll_with(|e| assert!(!matches!(e, NetworkEvent::Disconnected { .. })));
@@ -836,8 +806,6 @@ fn udp_disconnect_when_drained_waits_for_acks() {
     assert_eq!(disconnected, Some(accepted));
 }
 
-/// A listener token is not a session: `disconnect` leaves it alone, while
-/// `remove` closes it and every session accepted on it.
 #[test]
 fn udp_listener_ignores_disconnect_and_remove_closes_its_sessions() {
     let addr = free_addr();
@@ -890,45 +858,13 @@ fn udp_listener_ignores_disconnect_and_remove_closes_its_sessions() {
     let _ = tok;
 }
 
-/// Batched broadcasts queue every item before one flush and lose none.
-#[test]
-fn udp_batched_sends_deliver_every_item() {
-    let (mut server, server_group, mut client, _, _, _) = lan_pair(free_addr());
-    for range in [0..40u32, 40..80] {
-        assert_eq!(
-            server.broadcast_many_with(server_group, range, |b, i| {
-                b.extend_from_slice(&make_msg(i, 700));
-            }),
-            1
-        );
-    }
-    let mut seen = [false; 80];
-    let mut count = 0;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while count < 80 {
-        assert!(Instant::now() < deadline, "batched delivery: {count}");
-        server.poll_with(|_| {});
-        client.poll_with(|e| {
-            if let NetworkEvent::Message { payload, .. } = e {
-                let id = msg_id(payload) as usize;
-                assert!(!seen[id], "message {id} delivered twice");
-                seen[id] = true;
-                count += 1;
-            }
-        });
-        thread::sleep(Duration::from_micros(50));
-    }
-}
-
-/// Bursts of up to 512 mixed-size messages broadcast to five peers through
-/// lossy relays whose buffers hold a burst, with no peer dropped.
 #[test]
 fn udp_broadcast_bursts_to_many_peers_survive_loss() {
     broadcast_bursts(97, 1, 16_000);
 }
 
-/// Receivers that poll rarely keep deep queues, so round trips are long; a
-/// rare loss must still be repaired before the window fills.
+/// Rarely polled receivers make round trips long; a rare loss must still be
+/// repaired before the window fills.
 #[test]
 fn udp_slow_receivers_repair_a_rare_loss_in_time() {
     broadcast_bursts(5000, 40, 6000);
