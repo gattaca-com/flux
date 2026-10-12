@@ -26,7 +26,6 @@ fn latency_timer(telemetry: NetworkTelemetry, label: &str) -> Option<Timer> {
 enum Refused {
     Malformed,
     TooLarge,
-    ExceedsDcache,
 }
 
 pub(crate) struct Subscription {
@@ -130,9 +129,8 @@ impl Subscription {
 
     #[inline]
     pub(crate) fn lost(&self, subscriber: u32, publisher: Option<u32>) -> bool {
-        self.connected &&
-            subscriber == self.session &&
-            publisher.is_none_or(|s| self.publisher != Some(s))
+        subscriber == self.session &&
+            publisher.is_none_or(|s| self.connected && self.publisher != Some(s))
     }
 
     #[inline]
@@ -156,15 +154,10 @@ impl Subscription {
         }
         let checked =
             packet.split().ok_or(Refused::Malformed).and_then(|(continuation, records)| {
-                self.validate(seq, continuation, records.clone(), dcache)
-                    .map(|()| (continuation, records))
+                self.validate(seq, continuation, records.clone()).map(|()| (continuation, records))
             });
         let (continuation, records) = match checked {
             Ok(split) => split,
-            Err(Refused::ExceedsDcache) => {
-                warn!(%self.addr, "udp message exceeds dcache capacity, not acked");
-                return;
-            }
             Err(why) => {
                 debug!(%self.addr, ?why, seq, "udp packet refused");
                 return;
@@ -184,22 +177,9 @@ impl Subscription {
 
     /// Includes a length whose header is cut between this packet and one
     /// already in.
-    fn validate(
-        &self,
-        seq: u64,
-        continuation: &[u8],
-        records: Records<'_>,
-        dcache: Option<&DCache>,
-    ) -> Result<(), Refused> {
-        let check = |len: usize| {
-            if len > self.max_message_size {
-                return Err(Refused::TooLarge);
-            }
-            if dcache.is_some_and(|dc| len > dc.capacity()) {
-                return Err(Refused::ExceedsDcache);
-            }
-            Ok(())
-        };
+    fn validate(&self, seq: u64, continuation: &[u8], records: Records<'_>) -> Result<(), Refused> {
+        let check =
+            |len: usize| if len > self.max_message_size { Err(Refused::TooLarge) } else { Ok(()) };
         if let Some(len) = self.inbound.waiting_len(seq, continuation) {
             check(len)?;
         }

@@ -48,14 +48,16 @@ fn new_session(salt: usize) -> u32 {
 /// `[min_rto, max_rto]`; `initial_rto` only applies before the first sample.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpConfig {
-    /// Should be link MTU - 48 byte
+    /// Datagram size including the 25-byte packet header: at most the path MTU
+    /// minus the IP and UDP headers, 28 bytes over IPv4 and 48 over IPv6. A
+    /// publisher and its subscribers must agree.
     pub max_datagram_size: usize,
     /// Packets a publisher holds for its slowest subscriber. Power of two, at
     /// least 64. There is no flow control, so a subscriber's socket buffer
     /// should hold a full window.
     pub send_window: usize,
-    /// Power of two, at least 64. Should be at least the publisher's
-    /// `send_window`.
+    /// Packets a subscriber tracks above its ack point. Power of two, at least
+    /// 64. Should be at least the publisher's `send_window`.
     pub recv_window: usize,
     /// Largest message accepted or sent. Must fit in `send_window`.
     pub max_message_size: usize,
@@ -109,7 +111,9 @@ impl UdpConfig {
     }
 
     pub(crate) fn packets_per_message(&self) -> usize {
-        self.max_message_size / (self.max_datagram_size - wire::PACKET_HEADER) + 2
+        (self.max_message_size + wire::MESSAGE_HEADER) /
+            (self.max_datagram_size - wire::PACKET_HEADER) +
+            2
     }
 
     pub(crate) fn validate(&self) {

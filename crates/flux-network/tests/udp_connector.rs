@@ -648,7 +648,28 @@ fn udp_window_exhaustion_disconnects_instead_of_dropping() {
         });
     }
     assert_eq!(disconnected, Some(accepted));
-    let _ = &client;
+
+    // The dropped client resubscribes and gets more than a window.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut rejoined = false;
+    while !rejoined {
+        assert!(Instant::now() < deadline, "resubscribe");
+        client.poll_with(|_| {});
+        server.poll_with(|e| rejoined |= matches!(e, NetworkEvent::Accepted { .. }));
+    }
+    let n = 200;
+    let mut received = 0;
+    for _ in 0..n {
+        assert_eq!(server.broadcast_with(server_group, |b| b.extend_from_slice(b"m")), 1);
+        server.poll_with(|_| {});
+        client.poll_with(|e| received += usize::from(matches!(e, NetworkEvent::Message { .. })));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received < n {
+        assert!(Instant::now() < deadline, "received {received} of {n}");
+        server.poll_with(|_| {});
+        client.poll_with(|e| received += usize::from(matches!(e, NetworkEvent::Message { .. })));
+    }
 }
 
 #[test]

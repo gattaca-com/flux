@@ -398,19 +398,21 @@ impl UdpManagerState {
     fn publish(&mut self, registry: &Registry) -> usize {
         safe_assert!(!self.send_buffer.is_empty());
         let len = self.send_buffer.len();
-        while !self.stream.fits(len) && !self.subscribers.is_empty() {
-            let oldest = self.stream.base();
-            let mut i = self.subscribers.len();
-            while i != 0 {
-                i -= 1;
-                if self.subscribers[i].base() == oldest {
-                    warn!(addr = %self.subscribers[i].addr, "udp subscriber fell a window behind");
-                    self.drop_subscriber(i);
-                }
+        let Some(min_base) = self.stream.min_base(len) else {
+            error!(group = self.config.name, len, "udp broadcast batch exceeds send_window");
+            self.send_buffer.clear();
+            return 0;
+        };
+        let mut i = self.subscribers.len();
+        while i != 0 {
+            i -= 1;
+            if self.subscribers[i].base() < min_base {
+                warn!(addr = %self.subscribers[i].addr, "udp subscriber fell a window behind");
+                self.drop_subscriber(i);
             }
         }
-        if !self.stream.fits(len) {
-            error!(group = self.config.name, len, "udp broadcast batch exceeds send_window");
+        // Enqueued with no one holding it, it would never be released.
+        if self.subscribers.is_empty() {
             self.send_buffer.clear();
             return 0;
         }
@@ -460,7 +462,9 @@ impl UdpManagerState {
         let accepted_packets = match self.batch.send(fd) {
             Ok(k) => k,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
-            // Other errors count as sent so the retransmit path retries.
+            // Other errors count as sent so the retransmit path retries. They are
+            // per destination (route, firewall, path MTU), yet fail the whole
+            // batch, so one bad subscriber also costs the others.
             Err(e) => {
                 debug!(?e, "udp send failed");
                 total_packets

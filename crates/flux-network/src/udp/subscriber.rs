@@ -246,7 +246,7 @@ impl Subscriber {
             self.set_acked(self.base, false);
             self.base += 1;
         }
-        let mut highest = ack_next.checked_sub(1).filter(|&h| h + 1 > self.base);
+        let mut highest = None;
         'words: for (w, chunk) in bitmap.chunks(8).enumerate() {
             let mut word = [0; 8];
             word[..chunk.len()].copy_from_slice(chunk);

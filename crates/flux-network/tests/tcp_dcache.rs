@@ -110,7 +110,11 @@ fn dcache_multi_stream_tcp() {
 #[test]
 fn dcache_multi_stream_udp() {
     dcache_multi_stream(
-        UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() }.into(),
+        UdpGroupConfig {
+            udp: UdpConfig { max_message_size: 64, ..UdpConfig::lan() },
+            ..Default::default()
+        }
+        .into(),
         true,
     );
 }

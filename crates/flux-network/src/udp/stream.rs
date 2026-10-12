@@ -127,9 +127,20 @@ impl Stream {
     }
 
     /// +2: a sliver in the open packet and one at the end.
+    fn packets_for(&self, len: usize) -> u64 {
+        (len / (self.datagram_size - PACKET_HEADER) + 2) as u64
+    }
+
     pub(crate) fn fits(&self, len: usize) -> bool {
-        let room = self.datagram_size - PACKET_HEADER;
-        (len / room + 2) as u64 <= self.mask + 1 - (self.next - self.base)
+        self.packets_for(len) <= self.mask + 1 - (self.next - self.base)
+    }
+
+    /// Lowest base a subscriber may hold for `len` more bytes to fit; `None`
+    /// if they don't fit even an empty window.
+    pub(crate) fn min_base(&self, len: usize) -> Option<u64> {
+        let packets = self.packets_for(len);
+        let capacity = self.mask + 1;
+        (packets <= capacity).then(|| (self.next + packets).saturating_sub(capacity))
     }
 
     #[inline]

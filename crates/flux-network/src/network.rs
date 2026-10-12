@@ -472,11 +472,12 @@ enum GroupState {
     Udp(Box<UdpManager>),
 }
 
-/// Groups of TCP connections and reliable UDP sessions sharing one poll.
+/// Groups of TCP connections and UDP publishers and subscribers sharing one
+/// poll.
 ///
 /// Message payloads are borrowed for the synchronous callback. UDP delivery is
-/// reliable but unordered; reconnect replay does not provide exactly-once
-/// delivery.
+/// unordered, and a resubscribed UDP subscriber joins at the live end. TCP
+/// reconnect replay does not provide exactly-once delivery.
 pub struct Network {
     events: Events,
     core: NetworkCore,
@@ -635,7 +636,15 @@ impl NetworkCore {
                 );
                 GroupState::Tcp(Box::new(TcpManager::new(config, group)))
             }
-            GroupConfig::Udp(config) => GroupState::Udp(Box::new(UdpManager::new(config, group))),
+            GroupConfig::Udp(config) => {
+                assert!(
+                    self.dcache
+                        .as_deref()
+                        .is_none_or(|dc| config.udp.max_message_size <= dc.capacity()),
+                    "udp max_message_size exceeds dcache capacity"
+                );
+                GroupState::Udp(Box::new(UdpManager::new(config, group)))
+            }
         };
         self.groups.push(state);
         group
