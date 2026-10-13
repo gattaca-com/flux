@@ -356,6 +356,10 @@ impl Inbound {
         }
         n_bits.div_ceil(8) as usize
     }
+
+    pub(crate) fn bitmap_capacity(&self) -> usize {
+        self.max_bits.div_ceil(8) as usize
+    }
 }
 
 #[cfg(test)]
