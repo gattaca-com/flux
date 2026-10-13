@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::{Network, NetworkEvent, ReplayPolicy, UdpConfig, UdpGroupConfig};
+use flux_network::{Network, NetworkEvent, UdpConfig, UdpGroupConfig};
 use mio::Token;
 
 fn free_addr() -> SocketAddr {
@@ -91,7 +91,7 @@ fn msg_id(payload: &[u8]) -> u32 {
 }
 
 #[test]
-fn udp_roundtrip_before_handshake_completes() {
+fn udp_roundtrip() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group =
@@ -101,13 +101,22 @@ fn udp_roundtrip_before_handshake_completes() {
     let client_group =
         client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
     let tok = client.connect(client_group, addr);
-    // Queued before the hello ack arrives; must go out once it does.
-    client.send_with(tok, |b| b.extend_from_slice(b"ping"));
-
+    assert!(!client.send_with(tok, |b| b.extend_from_slice(b"early")), "sent before connecting");
     let mut accepted = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.currently_disconnected().count() != 0 {
+        assert!(Instant::now() < deadline, "handshake");
+        server.poll_with(|e| {
+            if let NetworkEvent::Accepted { token, .. } = e {
+                accepted = Some(token);
+            }
+        });
+        client.poll_with(|_| {});
+    }
+    assert!(client.send_with(tok, |b| b.extend_from_slice(b"ping")));
+
     let mut request_seen = false;
     let mut reply_seen = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
     while !reply_seen {
         assert!(Instant::now() < deadline, "roundtrip timed out");
         server.poll_with(|e| match e {
@@ -315,14 +324,17 @@ fn udp_client_disconnect_is_a_new_session() {
 
     client.disconnect(tok);
     assert_eq!(client.currently_disconnected().count(), 1);
-    client.send_with(tok, |b| b.extend_from_slice(b"after"));
 
     let mut events = Vec::new();
     let mut payload_on = None;
     let mut reconnected = 0;
     let mut greeting = false;
+    let mut sent = false;
     let deadline = Instant::now() + Duration::from_secs(5);
     while payload_on.is_none() || reconnected == 0 || !greeting {
+        if !sent && reconnected == 1 {
+            sent = client.send_with(tok, |b| b.extend_from_slice(b"after"));
+        }
         assert!(Instant::now() < deadline, "reconnect");
         server.poll_with(|e| match e {
             NetworkEvent::Disconnected { token, .. } => events.push(("disconnect", token)),
@@ -351,26 +363,23 @@ fn udp_client_disconnect_is_a_new_session() {
     assert_eq!(events[0], ("disconnect", first));
     assert_eq!(events[1].0, "accept");
     assert_ne!(events[1].1, first);
-    assert_eq!(payload_on, Some(events[1].1), "backlog replayed on the new session");
+    assert_eq!(payload_on, Some(events[1].1), "sent on the new session");
     assert_eq!(client.currently_disconnected().count(), 0);
 }
 
 #[test]
-fn udp_drop_backlog_on_disconnect_discards_queued() {
+fn udp_sends_while_reconnecting_are_refused() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group =
         server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
     let mut client = Network::default();
-    let client_group = client.add_group(UdpGroupConfig {
-        udp: UdpConfig::lan(),
-        replay: ReplayPolicy::Drop,
-        ..Default::default()
-    });
+    let client_group =
+        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
     let (_, tok) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
 
     client.disconnect(tok);
-    client.send_with(tok, |b| b.extend_from_slice(b"lost"));
+    assert!(!client.send_with(tok, |b| b.extend_from_slice(b"lost")));
     let mut reconnected = false;
     let mut got = 0;
     let deadline = Instant::now() + Duration::from_millis(500);
@@ -471,39 +480,6 @@ fn udp_peer_timeout_disconnects_silent_client() {
 }
 
 #[test]
-fn udp_backlog_limit_disconnects_non_consuming_peer() {
-    let addr = free_addr();
-    let mut server = Network::default();
-    let server_group = server.add_group(UdpGroupConfig {
-        udp: UdpConfig::lan(),
-        max_backlog_datagrams: Some((8, flux_timing::Duration::from_millis(50))),
-        ..Default::default()
-    });
-    let mut client = Network::default();
-    let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
-    let (accepted, _) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
-    // Client stops polling: nothing gets acked.
-
-    let mut disconnected = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !disconnected {
-        assert!(Instant::now() < deadline, "backlog disconnect");
-        server.send_with(accepted, |b| {
-            b.extend_from_slice(&[0; 1000]);
-        });
-        server.poll_with(|e| {
-            if let NetworkEvent::Disconnected { token, .. } = e {
-                assert_eq!(token, accepted);
-                disconnected = true;
-            }
-        });
-        thread::sleep(Duration::from_millis(1));
-    }
-    let _ = &client;
-}
-
-#[test]
 fn udp_ignores_junk_datagrams() {
     let addr = free_addr();
     let mut server = Network::default();
@@ -538,8 +514,7 @@ fn udp_broadcast_survives_dropping_a_peer_mid_way() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group = server.add_group(UdpGroupConfig {
-        udp: UdpConfig::lan(),
-        max_backlog_datagrams: Some((4, flux_timing::Duration::ZERO)),
+        udp: UdpConfig { send_window: 64, max_message_size: 8192, ..UdpConfig::lan() },
         ..Default::default()
     });
     server.listen(server_group, addr).unwrap();
@@ -558,9 +533,9 @@ fn udp_broadcast_survives_dropping_a_peer_mid_way() {
         stalled.poll_with(|_| {});
         live.poll_with(|_| {});
     }
-    // `stalled` stops polling: its unacked count grows past the backlog limit
-    // while `live` keeps consuming.
-    let msgs: Vec<Vec<u8>> = (0..12).map(|i| make_msg(i, 3000)).collect();
+    // `stalled` stops polling: its send window fills while `live` keeps
+    // consuming.
+    let msgs: Vec<Vec<u8>> = (0..12).map(|i| make_msg(i, 8000)).collect();
     let mut got = Vec::new();
     let mut dropped = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -591,50 +566,6 @@ fn udp_broadcast_survives_dropping_a_peer_mid_way() {
     for (id, sum) in got {
         assert_eq!(sum, checksum(&msgs[id as usize]), "message {id} corrupted");
     }
-}
-
-/// Messages in flight when the session is cut arrive whole under the new
-/// session, however much of them the receiver had already acked.
-#[test]
-fn udp_reconnect_replays_messages_queued_before_disconnect() {
-    let addr = free_addr();
-    let mut server = Network::default();
-    let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
-    let mut client = Network::default();
-    let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
-    let (_, tok) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
-    let big = make_msg(7, 500_000);
-    client.send_with(tok, |b| b.extend_from_slice(&big));
-    client.send_with(tok, |b| b.extend_from_slice(b"small"));
-    // Let some fragments through and get acked, then cut the session. How
-    // much lands first depends on the receive buffer; either message may.
-    let mut got = Vec::new();
-    for _ in 0..3 {
-        client.poll_with(|_| {});
-        server.poll_with(|e| {
-            if let NetworkEvent::Message { payload, .. } = e {
-                got.push(payload.to_vec());
-            }
-        });
-    }
-    client.disconnect(tok);
-
-    // Everything not cumulatively acked is replayed, so the small message may
-    // arrive twice: delivery across a reconnect is at-least-once.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !got.iter().any(|m| m.len() == big.len()) {
-        assert!(Instant::now() < deadline, "replay");
-        server.poll_with(|e| {
-            if let NetworkEvent::Message { payload, .. } = e {
-                got.push(payload.to_vec());
-            }
-        });
-        client.poll_with(|_| {});
-    }
-    assert!(got.iter().any(|m| m == b"small"));
-    assert!(got.iter().any(|m| checksum(m) == checksum(&big)), "big message replayed intact");
 }
 
 /// A server that drops an accepted peer makes the client renegotiate.
@@ -684,14 +615,13 @@ fn udp_server_disconnect_reconnects_client() {
 #[test]
 fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let addr = free_addr();
-    let config = UdpConfig { send_window: 64, max_message_size: 64 * 1171, ..UdpConfig::lan() };
+    let config = UdpConfig { send_window: 64, max_message_size: 4096, ..UdpConfig::lan() };
     let mut server = Network::default();
     let server_group = server.add_group(UdpGroupConfig { udp: config, ..Default::default() });
     let mut client = Network::default();
     let client_group = client.add_group(UdpGroupConfig { udp: config, ..Default::default() });
     let (accepted, _) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
-    // Client never polls: nothing is acked, the window fills, the 65th
-    // single-fragment message cannot be queued.
+    // Client never polls: nothing is acked and the window fills.
     let mut disconnected = None;
     for _ in 0..70 {
         server.send_with(accepted, |b| b.extend_from_slice(b"m"));
@@ -775,101 +705,10 @@ fn udp_unreliable_keeps_streaming_through_loss() {
     assert_eq!(client.currently_disconnected().count(), 0, "client dropped its peer");
 }
 
-fn drain(
-    server: &mut Network,
-    a: &mut Network,
-    got_a: &mut Vec<Vec<u8>>,
-    b: &mut Network,
-    got_b: &mut Vec<Vec<u8>>,
-) {
-    let deadline = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < deadline {
-        server.poll_with(|_| {});
-        a.poll_with(|e| {
-            if let NetworkEvent::Message { payload, .. } = e {
-                got_a.push(payload.to_vec());
-            }
-        });
-        b.poll_with(|e| {
-            if let NetworkEvent::Message { payload, .. } = e {
-                got_b.push(payload.to_vec());
-            }
-        });
-    }
-}
-
+/// Resetting an outbound peer while it connects does not send another
+/// greeting: the remote sees the on-connect message once.
 #[test]
-fn udp_paused_peer_sits_out_broadcasts() {
-    let addr = free_addr();
-    let mut server = Network::default();
-    let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
-    server.listen(server_group, addr).unwrap();
-    let mut a = Network::default();
-    let a_group = a.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
-    let mut b = Network::default();
-    let b_group = b.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut accepted: Vec<Token> = Vec::new();
-    let _ = a.connect(a_group, addr);
-    while accepted.is_empty() {
-        assert!(Instant::now() < deadline, "accept a");
-        server.poll_with(|e| {
-            if let NetworkEvent::Accepted { token: stream, .. } = e {
-                accepted.push(stream);
-            }
-        });
-        a.poll_with(|_| {});
-    }
-    let _ = b.connect(b_group, addr);
-    while accepted.len() < 2 {
-        assert!(Instant::now() < deadline, "accept b");
-        server.poll_with(|e| {
-            if let NetworkEvent::Accepted { token: stream, .. } = e {
-                accepted.push(stream);
-            }
-        });
-        a.poll_with(|_| {});
-        b.poll_with(|_| {});
-    }
-    let (token_a, token_b) = (accepted[0], accepted[1]);
-
-    let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
-    server.broadcast_with(server_group, |buf| buf.extend_from_slice(b"live-1"));
-    drain(&mut server, &mut a, &mut got_a, &mut b, &mut got_b);
-    assert_eq!(got_a, vec![b"live-1".to_vec()]);
-    assert_eq!(got_b, vec![b"live-1".to_vec()]);
-
-    server.pause_broadcast(token_b);
-    assert!(server.is_broadcast_paused(token_b));
-    assert!(!server.is_broadcast_paused(token_a));
-
-    server.broadcast_with(server_group, |buf| buf.extend_from_slice(b"live-2"));
-    server.send_with(token_b, |buf| {
-        buf.extend_from_slice(b"direct");
-    });
-    got_a.clear();
-    got_b.clear();
-    drain(&mut server, &mut a, &mut got_a, &mut b, &mut got_b);
-    assert_eq!(got_a, vec![b"live-2".to_vec()]);
-    assert_eq!(got_b, vec![b"direct".to_vec()]);
-
-    server.resume_broadcast(token_b);
-    assert!(!server.is_broadcast_paused(token_b));
-
-    server.broadcast_with(server_group, |buf| buf.extend_from_slice(b"live-3"));
-    got_a.clear();
-    got_b.clear();
-    drain(&mut server, &mut a, &mut got_a, &mut b, &mut got_b);
-    assert_eq!(got_a, vec![b"live-3".to_vec()]);
-    assert_eq!(got_b, vec![b"live-3".to_vec()]);
-}
-
-/// Resetting an outbound peer while its greeting is still unacked does not
-/// queue another one: the remote sees the on-connect message once.
-#[test]
-fn udp_resets_while_down_queue_one_greeting() {
+fn udp_resets_while_down_send_one_greeting() {
     let addr = free_addr();
     let mut client = Network::default();
     let client_group = client.add_group(UdpGroupConfig {
@@ -882,17 +721,20 @@ fn udp_resets_while_down_queue_one_greeting() {
         client.poll_with(|_| {});
         client.disconnect(tok);
     }
-    client.send_with(tok, |b| b.extend_from_slice(b"after"));
 
     let mut server = Network::default();
     let server_group =
         server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
     server.listen(server_group, addr).unwrap();
     let mut got = Vec::new();
+    let mut sent = false;
     let deadline = Instant::now() + Duration::from_secs(5);
     while !got.contains(&b"after".to_vec()) {
         assert!(Instant::now() < deadline, "delivery");
         client.poll_with(|_| {});
+        if !sent && client.currently_disconnected().count() == 0 {
+            sent = client.send_with(tok, |b| b.extend_from_slice(b"after"));
+        }
         server.poll_with(|e| {
             if let NetworkEvent::Message { payload, .. } = e {
                 got.push(payload.to_vec());
@@ -963,44 +805,6 @@ fn udp_disconnect_when_drained_waits_for_acks() {
     }
     assert!(got, "the queued message was delivered before the close");
     assert_eq!(disconnected, Some(accepted));
-}
-
-/// Clearing the backlog drops what has not started going out and nothing
-/// else; a following send still arrives.
-#[test]
-fn udp_clear_backlog_drops_unsent_messages() {
-    let (mut server, _, mut client, _, _, tok) = lan_pair(free_addr());
-    assert_eq!(client.clear_backlog(tok), 0, "nothing queued on an idle session");
-    // Reset the session: everything queued from now on waits for the redial.
-    client.disconnect(tok);
-    for i in 0..3u32 {
-        assert!(client.send_with(tok, |b| b.extend_from_slice(&make_msg(i, 3000))));
-    }
-    assert_eq!(client.clear_backlog(tok), 3);
-    assert!(client.send_with(tok, |b| b.extend_from_slice(b"after")));
-
-    let mut got = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while got.is_empty() {
-        assert!(Instant::now() < deadline, "delivery after clear");
-        client.poll_with(|_| {});
-        server.poll_with(|e| {
-            if let NetworkEvent::Message { payload, .. } = e {
-                got.push(payload.to_vec());
-            }
-        });
-        thread::sleep(Duration::from_micros(50));
-    }
-    let settle = Instant::now() + Duration::from_millis(200);
-    while Instant::now() < settle {
-        client.poll_with(|_| {});
-        server.poll_with(|e| {
-            if let NetworkEvent::Message { payload, .. } = e {
-                got.push(payload.to_vec());
-            }
-        });
-    }
-    assert_eq!(got, [b"after".to_vec()]);
 }
 
 /// A listener token is not a session: `disconnect` leaves it alone, while

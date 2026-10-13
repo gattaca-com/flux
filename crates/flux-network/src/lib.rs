@@ -1,4 +1,4 @@
-//! TCP and reliable, unordered UDP groups sharing one poll.
+//! TCP and reliable, unordered UDP connections sharing one poll.
 //!
 //! Use [`Network`] for an owned poll or [`NetworkWithExternalPoll`] for an
 //! existing one.

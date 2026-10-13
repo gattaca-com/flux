@@ -294,10 +294,6 @@ impl TcpManager {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.connections.is_empty() && self.listeners.is_empty()
-    }
-
     pub(crate) fn pre_poll<F>(
         &mut self,
         registry: &Registry,

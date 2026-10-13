@@ -328,9 +328,9 @@ pub type NetworkEvent<'a> = Event<&'a [u8]>;
 
 /// A network notification with a borrowed message payload.
 pub enum Event<Payload> {
-    /// A listener established an inbound TCP connection or UDP session.
+    /// A listener established an inbound TCP or UDP connection.
     Accepted { group: Group, token: Token, peer_addr: SocketAddr },
-    /// An outbound TCP connection or UDP session became usable. Emitted once
+    /// An outbound TCP or UDP connection became usable. Emitted once
     /// on initial establishment and each reconnect, before its messages.
     Connected { group: Group, token: Token, peer_addr: SocketAddr },
     /// A complete TCP frame, UDP message, or raw TCP chunk was received.
@@ -338,7 +338,7 @@ pub enum Event<Payload> {
     /// For raw groups, chunks do not preserve message boundaries and `send_ts`
     /// is the local receive time.
     Message { group: Group, token: Token, payload: Payload, send_ts: Nanos },
-    /// A TCP connection closed or a UDP session timed out/reset locally.
+    /// A TCP connection closed or a UDP connection was lost.
     /// A timeout is not proof that the remote process has stopped.
     Disconnected { group: Group, token: Token, peer_addr: SocketAddr },
 }
@@ -371,9 +371,9 @@ impl<P> Event<P> {
     }
 }
 
-/// Whether queued outbound messages survive a lost session.
+/// Whether queued outbound TCP messages survive a lost connection.
 ///
-/// Both group configs default to `Replay`: an outbound endpoint is a durable
+/// TCP groups default to `Replay`: an outbound endpoint is a durable
 /// destination that is only temporarily unreachable. Choose `Drop` explicitly
 /// for request/response protocols and anything else where a message is
 /// worthless once its connection is gone.
@@ -388,7 +388,11 @@ pub enum ReplayPolicy {
     Replay,
 }
 
-/// Settings for one reliable, unordered UDP group.
+/// Settings for a group of two-way, reliable, unordered UDP connections.
+///
+/// A peer's on-connect message is delivered right after its `Accepted` or
+/// `Connected`. A connection that falls a `send_window` behind or goes silent
+/// for `peer_timeout` is lost with whatever was queued on it.
 #[derive(Clone)]
 pub struct UdpGroupConfig {
     pub name: &'static str,
@@ -396,9 +400,6 @@ pub struct UdpGroupConfig {
     pub on_connect_msg: Option<Vec<u8>>,
     pub socket_buf_size: Option<usize>,
     pub peer_timeout: Duration,
-    /// Unacknowledged datagrams and how long the threshold may be exceeded.
-    pub max_backlog_datagrams: Option<(usize, Duration)>,
-    pub replay: ReplayPolicy,
     pub telemetry: NetworkTelemetry,
 }
 
@@ -410,8 +411,6 @@ impl Default for UdpGroupConfig {
             on_connect_msg: None,
             socket_buf_size: None,
             peer_timeout: Duration::from_secs(10),
-            max_backlog_datagrams: None,
-            replay: ReplayPolicy::Replay,
             telemetry: NetworkTelemetry::Disabled,
         }
     }
@@ -473,11 +472,10 @@ enum GroupState {
     Udp(Box<UdpManager>),
 }
 
-/// Groups of TCP connections and reliable UDP sessions sharing one poll.
+/// Groups of TCP and UDP connections sharing one poll.
 ///
 /// Message payloads are borrowed for the synchronous callback. UDP delivery is
-/// reliable but unordered; reconnect replay does not provide exactly-once
-/// delivery.
+/// unordered. TCP reconnect replay does not provide exactly-once delivery.
 pub struct Network {
     events: Events,
     core: NetworkCore,
@@ -508,26 +506,10 @@ impl DerefMut for Network {
 }
 
 impl Network {
-    /// Reads framed payloads directly into this dcache. Drain with
-    /// `poll_with_produce`; raw TCP groups cannot use this receive mode.
-    /// Attach before creating any endpoints or listeners.
-    pub fn with_dcache(mut self, dcache: DCachePtr) -> Self {
-        for group in &self.core.groups {
-            match group {
-                GroupState::Tcp(tcp) => {
-                    assert!(tcp.is_empty(), "attach dcache before creating endpoints");
-                    assert!(
-                        tcp.config.framing == Framing::LengthPrefixed,
-                        "dcache requires framed TCP"
-                    );
-                }
-                GroupState::Udp(udp) => {
-                    assert!(udp.is_empty(), "attach dcache before creating endpoints");
-                }
-            }
-        }
-        self.core.dcache = Some(dcache);
-        self
+    pub fn with_dcache(dcache: DCachePtr) -> Self {
+        let mut network = Self::default();
+        network.core.dcache = Some(dcache);
+        network
     }
 
     fn drive<F>(&mut self, handler: &mut F) -> bool
@@ -652,7 +634,15 @@ impl NetworkCore {
                 );
                 GroupState::Tcp(Box::new(TcpManager::new(config, group)))
             }
-            GroupConfig::Udp(config) => GroupState::Udp(Box::new(UdpManager::new(config, group))),
+            GroupConfig::Udp(config) => {
+                assert!(
+                    self.dcache
+                        .as_deref()
+                        .is_none_or(|dc| config.udp.max_message_size <= dc.capacity()),
+                    "udp max_message_size exceeds dcache capacity"
+                );
+                GroupState::Udp(Box::new(UdpManager::new(config, group)))
+            }
         };
         self.groups.push(state);
         group
@@ -790,17 +780,15 @@ impl NetworkCore {
             GroupState::Tcp(tcp) => {
                 tcp.send_vectored(self.poller.registry(), token, &mut self.tokens, parts)
             }
-            GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, |out| {
-                out.reserve(parts.iter().map(|part| part.len()).sum());
+            GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, |buf| {
                 for part in parts {
-                    out.extend_from_slice(part);
+                    buf.extend_from_slice(part);
                 }
             }),
         }
     }
-    /// Sends a bounded batch. TCP stages one write; UDP retains message
-    /// boundaries. Invalid payloads are skipped. Returns whether any
-    /// message was accepted.
+    /// Sends a bounded batch. TCP stages one write. Invalid payloads are
+    /// skipped. Returns whether any message was accepted.
     pub fn send_many_with<I, F>(&mut self, token: Token, items: I, serialise: F) -> bool
     where
         I: IntoIterator,
@@ -879,11 +867,17 @@ impl NetworkCore {
         }
         removed
     }
+
+    // This broadcast state doesn't belong transport layer. Should be replaced with
+    // something like an extra broadcast variant with filtering using a closure
+    // rather than transport state. For now removing from UDP, it doesn't have
+    // any users of this api. TODO: fix
+
     pub fn pause_broadcast(&mut self, token: Token) {
         if let Some(group) = self.tokens.groups.get(&token).copied() {
             match &mut self.groups[group.0] {
                 GroupState::Tcp(tcp) => tcp.pause_broadcast(token),
-                GroupState::Udp(udp) => udp.pause_broadcast(token),
+                GroupState::Udp(_) => {}
             }
         }
     }
@@ -891,14 +885,14 @@ impl NetworkCore {
         if let Some(group) = self.tokens.groups.get(&token).copied() {
             match &mut self.groups[group.0] {
                 GroupState::Tcp(tcp) => tcp.resume_broadcast(token),
-                GroupState::Udp(udp) => udp.resume_broadcast(token),
+                GroupState::Udp(_) => {}
             }
         }
     }
     pub fn is_broadcast_paused(&self, token: Token) -> bool {
         self.tokens.groups.get(&token).is_some_and(|group| match &self.groups[group.0] {
             GroupState::Tcp(tcp) => tcp.is_broadcast_paused(token),
-            GroupState::Udp(udp) => udp.is_broadcast_paused(token),
+            GroupState::Udp(_) => false,
         })
     }
     /// Drops the messages queued for `token` that have not started going out,
@@ -908,7 +902,7 @@ impl NetworkCore {
         let Some(group) = self.tokens.groups.get(&token).copied() else { return 0 };
         match &mut self.groups[group.0] {
             GroupState::Tcp(tcp) => tcp.clear_backlog(token),
-            GroupState::Udp(udp) => udp.clear_backlog(token),
+            GroupState::Udp(_) => 0,
         }
     }
     /// Bytes accepted for `token` that have not reached its socket yet,
@@ -942,7 +936,7 @@ impl NetworkCore {
         for group in &mut self.groups {
             match group {
                 GroupState::Tcp(tcp) => tcp.force_reconnect(self.poller.registry()),
-                GroupState::Udp(udp) => udp.force_reconnect(self.poller.registry()),
+                GroupState::Udp(udp) => udp.force_reconnect(),
             }
         }
     }
