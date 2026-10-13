@@ -1,4 +1,5 @@
-//! TCP and reliable, unordered UDP connections sharing one poll.
+//! TCP and reliable, unordered UDP connections sharing one poll, and UDP
+//! pub/sub.
 //!
 //! Use [`Network`] for an owned poll or [`NetworkWithExternalPoll`] for an
 //! existing one.
@@ -16,4 +17,4 @@ pub use network::{
     Event, Framing, Group, GroupConfig, Network, NetworkCore, NetworkEvent, NetworkTelemetry,
     NetworkWithExternalPoll, PayloadBuf, ReplayPolicy, TcpGroupConfig, UdpGroupConfig,
 };
-pub use udp::UdpConfig;
+pub use udp::{Publisher, PublisherEvent, Subscriber, SubscriberEvent, UdpConfig};
