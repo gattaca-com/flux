@@ -155,6 +155,13 @@ fn alloy_u256_round_trip() {
 
 #[cfg(feature = "alloy")]
 #[test]
+fn alloy_i256_round_trip() {
+    let arr = [alloy_primitives::I256::MINUS_ONE, alloy_primitives::I256::MIN];
+    assert_eq!(cast_slice::<alloy_primitives::I256>(slice_as_bytes(&arr)).unwrap(), arr);
+}
+
+#[cfg(feature = "alloy")]
+#[test]
 fn alloy_masked_uint_rejects_top_bit() {
     type U255 = alloy_primitives::Uint<255, 4>;
     let mut words = vec![0u64; 4];
