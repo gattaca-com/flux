@@ -388,7 +388,8 @@ pub enum ReplayPolicy {
     Replay,
 }
 
-/// Settings for a group of two-way, reliable, unordered UDP connections.
+/// Settings for a group of two-way, reliable, unordered UDP connections, and
+/// for a [`crate::udp::Publisher`] or [`crate::udp::Subscriber`].
 ///
 /// A peer's on-connect message is delivered right after its `Accepted` or
 /// `Connected`. A connection that falls a `send_window` behind or goes silent

@@ -493,6 +493,8 @@ fn udp_ignores_junk_datagrams() {
     junk.send_to(b"not flux", addr).unwrap();
     junk.send_to(&[0xFF; 1200], addr).unwrap();
     junk.send_to(&[0; 2000], addr).unwrap();
+    // A pub/sub hello, which this listener must not take for its own.
+    junk.send_to(&[b'F', b'P', 0x21, 1, 2, 3, 4], addr).unwrap();
     server.send_with(accepted, |b| b.extend_from_slice(b"ok"));
     let mut got = false;
     let deadline = Instant::now() + Duration::from_secs(5);
