@@ -358,7 +358,7 @@ impl Inbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::udp::wire::{decode_packet, test_packet};
+    use crate::udp_v2::wire::{decode_packet, test_packet};
 
     fn inbound() -> Inbound {
         let mut inbound = Inbound::new(64, 1200, 19, 16 << 20, false);

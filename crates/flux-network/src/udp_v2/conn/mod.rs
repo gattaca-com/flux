@@ -26,7 +26,7 @@ use super::{
     unspecified, validate_group,
     wire::MESSAGE_HEADER,
 };
-use crate::network::{Event, Group, PayloadBuf, RxPayload, Tokens, UdpGroupConfig};
+use crate::network::{Event, Group, PayloadBuf, RxPayload, Tokens, UdpGroupConfigV2};
 
 struct Endpoint {
     socket: Socket,
@@ -63,7 +63,7 @@ impl DerefMut for UdpManager {
 }
 
 impl UdpManager {
-    pub(crate) fn new(config: UdpGroupConfig, group: Group) -> Self {
+    pub(crate) fn new(config: UdpGroupConfigV2, group: Group) -> Self {
         Self {
             recv: RecvBatch::new(config.udp.max_datagram_size),
             state: State::new(config, group),
@@ -85,7 +85,7 @@ impl UdpManager {
 }
 
 pub(crate) struct State {
-    config: UdpGroupConfig,
+    config: UdpGroupConfigV2,
     group: Group,
     endpoints: Vec<Endpoint>,
     peers: Vec<Peer>,
@@ -107,7 +107,7 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn new(config: UdpGroupConfig, group: Group) -> Self {
+    fn new(config: UdpGroupConfigV2, group: Group) -> Self {
         validate_group(&config, HELLO_ACK_SIZE);
         let udp = config.udp;
         Self {
@@ -125,6 +125,14 @@ impl State {
             retired: Vec::new(),
             next_tick: Instant::ZERO,
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.endpoints.is_empty()
+    }
+
+    pub(crate) fn max_message_size(&self) -> usize {
+        self.config.udp.max_message_size
     }
 
     pub(crate) fn close_all(&mut self, registry: &Registry) {

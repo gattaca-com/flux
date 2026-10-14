@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::{Network, NetworkEvent, UdpConfig, UdpGroupConfig};
+use flux_network::{Network, NetworkEvent, UdpConfig, UdpGroupConfig, UdpGroupConfigV2};
 use mio::Token;
 
 fn free_addr() -> SocketAddr {
@@ -95,11 +95,11 @@ fn udp_roundtrip() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     server.listen(server_group, addr).unwrap();
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let tok = client.connect(client_group, addr);
     assert!(!client.send_with(tok, |b| b.extend_from_slice(b"early")), "sent before connecting");
     let mut accepted = None;
@@ -145,17 +145,48 @@ fn udp_roundtrip() {
     }
 }
 
+/// The migration path: one network serves v1 and v2 peers side by side.
+#[test]
+fn udp_v1_and_v2_groups_run_side_by_side() {
+    let mut server = Network::default();
+    let v1 = server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+    let v2 = server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
+    let mut old = Network::default();
+    let old_group = old.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+    let mut new = Network::default();
+    let new_group = new.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
+    let (_, old_token) = connect_pair(&mut server, v1, &mut old, old_group, free_addr());
+    let (_, new_token) = connect_pair(&mut server, v2, &mut new, new_group, free_addr());
+    assert!(old.send_with(old_token, |b| b.extend_from_slice(b"v1")));
+    assert!(new.send_with(new_token, |b| b.extend_from_slice(b"v2")));
+
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.len() < 2 {
+        assert!(Instant::now() < deadline, "got only {got:?}");
+        old.poll_with(|_| {});
+        new.poll_with(|_| {});
+        server.poll_with(|e| {
+            if let NetworkEvent::Message { group, payload, .. } = e {
+                got.push((group, payload.to_vec()));
+            }
+        });
+    }
+    got.sort_by_key(|(group, _)| *group == v2);
+    assert_eq!(got, [(v1, b"v1".to_vec()), (v2, b"v2".to_vec())]);
+}
+
 #[test]
 fn udp_broadcast_mixed_sizes_to_two_subscribers() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     server.listen(server_group, addr).unwrap();
     let mut a = Network::default();
-    let a_group = a.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+    let a_group = a.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let mut b = Network::default();
-    let b_group = b.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+    let b_group = b.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let _ = a.connect(a_group, addr);
     let _ = b.connect(b_group, addr);
     let mut accepted = 0;
@@ -262,10 +293,10 @@ fn udp_delivers_everything_exactly_once_under_loss() {
 
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let (accepted, _) =
         connect_via(&mut server, server_group, &mut client, client_group, server_addr, relay.addr);
 
@@ -312,14 +343,14 @@ fn udp_delivers_everything_exactly_once_under_loss() {
 fn udp_client_disconnect_is_a_new_session() {
     let addr = free_addr();
     let mut server = Network::default();
-    let server_group = server.add_group(UdpGroupConfig {
+    let server_group = server.add_group(UdpGroupConfigV2 {
         udp: UdpConfig::lan(),
         on_connect_msg: Some(b"welcome".to_vec()),
         ..Default::default()
     });
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let (first, tok) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
 
     client.disconnect(tok);
@@ -372,10 +403,10 @@ fn udp_sends_while_reconnecting_are_refused() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let (_, tok) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
 
     client.disconnect(tok);
@@ -403,7 +434,7 @@ fn udp_sends_while_reconnecting_are_refused() {
 fn udp_server_restart_reconnects_client() {
     let addr = free_addr();
     let mut client = Network::default();
-    let client_group = client.add_group(UdpGroupConfig {
+    let client_group = client.add_group(UdpGroupConfigV2 {
         udp: UdpConfig::lan(),
         peer_timeout: flux_timing::Duration::from_millis(2_000),
         ..Default::default()
@@ -412,7 +443,7 @@ fn udp_server_restart_reconnects_client() {
     {
         let mut server = Network::default();
         let server_group =
-            server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+            server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
         let (_, t) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
         tok = t;
     }
@@ -420,7 +451,7 @@ fn udp_server_restart_reconnects_client() {
     // waiting for the 2s peer timeout: its reset acks trigger renegotiation.
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     server.listen(server_group, addr).unwrap();
     let start = Instant::now();
     let mut disconnected = false;
@@ -453,14 +484,14 @@ fn udp_server_restart_reconnects_client() {
 fn udp_peer_timeout_disconnects_silent_client() {
     let addr = free_addr();
     let mut server = Network::default();
-    let server_group = server.add_group(UdpGroupConfig {
+    let server_group = server.add_group(UdpGroupConfigV2 {
         udp: UdpConfig::lan(),
         peer_timeout: flux_timing::Duration::from_millis(300),
         ..Default::default()
     });
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let (accepted, _) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
     drop(client);
 
@@ -484,10 +515,10 @@ fn udp_ignores_junk_datagrams() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let (accepted, _) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
     let junk = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     junk.send_to(b"not flux", addr).unwrap();
@@ -513,16 +544,17 @@ fn udp_ignores_junk_datagrams() {
 fn udp_broadcast_survives_dropping_a_peer_mid_way() {
     let addr = free_addr();
     let mut server = Network::default();
-    let server_group = server.add_group(UdpGroupConfig {
+    let server_group = server.add_group(UdpGroupConfigV2 {
         udp: UdpConfig { send_window: 64, max_message_size: 8192, ..UdpConfig::lan() },
         ..Default::default()
     });
     server.listen(server_group, addr).unwrap();
     let mut stalled = Network::default();
     let stalled_group =
-        stalled.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        stalled.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let mut live = Network::default();
-    let live_group = live.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+    let live_group =
+        live.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let _ = stalled.connect(stalled_group, addr);
     let _ = live.connect(live_group, addr);
     let mut accepted = 0;
@@ -573,13 +605,13 @@ fn udp_broadcast_survives_dropping_a_peer_mid_way() {
 fn udp_server_disconnect_reconnects_client() {
     let addr = free_addr();
     let mut server = Network::default();
-    let server_group = server.add_group(UdpGroupConfig {
+    let server_group = server.add_group(UdpGroupConfigV2 {
         udp: UdpConfig::lan(),
         peer_timeout: flux_timing::Duration::from_millis(5_000),
         ..Default::default()
     });
     let mut client = Network::default();
-    let client_group = client.add_group(UdpGroupConfig {
+    let client_group = client.add_group(UdpGroupConfigV2 {
         udp: UdpConfig::lan(),
         peer_timeout: flux_timing::Duration::from_millis(5_000),
         ..Default::default()
@@ -617,9 +649,9 @@ fn udp_window_exhaustion_disconnects_instead_of_dropping() {
     let addr = free_addr();
     let config = UdpConfig { send_window: 64, max_message_size: 4096, ..UdpConfig::lan() };
     let mut server = Network::default();
-    let server_group = server.add_group(UdpGroupConfig { udp: config, ..Default::default() });
+    let server_group = server.add_group(UdpGroupConfigV2 { udp: config, ..Default::default() });
     let mut client = Network::default();
-    let client_group = client.add_group(UdpGroupConfig { udp: config, ..Default::default() });
+    let client_group = client.add_group(UdpGroupConfigV2 { udp: config, ..Default::default() });
     let (accepted, _) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
     // Client never polls: nothing is acked and the window fills.
     let mut disconnected = None;
@@ -652,9 +684,9 @@ fn udp_unreliable_keeps_streaming_through_loss() {
     let relay = LossyRelay::start(server_addr, 5);
 
     let mut server = Network::default();
-    let server_group = server.add_group(UdpGroupConfig { udp: config, ..Default::default() });
+    let server_group = server.add_group(UdpGroupConfigV2 { udp: config, ..Default::default() });
     let mut client = Network::default();
-    let client_group = client.add_group(UdpGroupConfig { udp: config, ..Default::default() });
+    let client_group = client.add_group(UdpGroupConfigV2 { udp: config, ..Default::default() });
     let (accepted, _) =
         connect_via(&mut server, server_group, &mut client, client_group, server_addr, relay.addr);
 
@@ -711,7 +743,7 @@ fn udp_unreliable_keeps_streaming_through_loss() {
 fn udp_resets_while_down_send_one_greeting() {
     let addr = free_addr();
     let mut client = Network::default();
-    let client_group = client.add_group(UdpGroupConfig {
+    let client_group = client.add_group(UdpGroupConfigV2 {
         udp: UdpConfig::lan(),
         on_connect_msg: Some(b"hello".to_vec()),
         ..Default::default()
@@ -724,7 +756,7 @@ fn udp_resets_while_down_send_one_greeting() {
 
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     server.listen(server_group, addr).unwrap();
     let mut got = Vec::new();
     let mut sent = false;
@@ -761,10 +793,10 @@ fn lan_pair(
 ) -> (Network, flux_network::Group, Network, flux_network::Group, Token, Token) {
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let (accepted, tok) = connect_pair(&mut server, server_group, &mut client, client_group, addr);
     (server, server_group, client, client_group, accepted, tok)
 }
@@ -814,11 +846,11 @@ fn udp_listener_ignores_disconnect_and_remove_closes_its_sessions() {
     let addr = free_addr();
     let mut server = Network::default();
     let server_group =
-        server.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let listener = server.listen(server_group, addr).unwrap();
     let mut client = Network::default();
     let client_group =
-        client.add_group(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() });
+        client.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
     let tok = client.connect(client_group, addr);
     let mut accepted = None;
     let deadline = Instant::now() + Duration::from_secs(5);
