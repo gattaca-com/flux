@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use flux_network::{Framing, TcpGroupConfig, UdpConfig, UdpGroupConfig};
+use flux_network::{Framing, TcpGroupConfig, UdpConfig, UdpGroupConfigV2};
 
 pub const DATAGRAM: usize = 1472; // 1500 MTU - 20 (IP) - 8 (UDP)
 pub const SOCKET_BUF: usize = 32 * 1024 * 1024;
@@ -50,7 +50,7 @@ pub fn tcp_config() -> TcpGroupConfig {
     }
 }
 
-pub fn udp_config() -> UdpGroupConfig {
+pub fn udp_config() -> UdpGroupConfigV2 {
     let udp = UdpConfig {
         max_datagram_size: DATAGRAM,
         max_message_size: 8 << 20,
@@ -58,7 +58,7 @@ pub fn udp_config() -> UdpGroupConfig {
         recv_window: 1 << 15,
         ..UdpConfig::lan()
     };
-    UdpGroupConfig { udp, socket_buf_size: Some(SOCKET_BUF), ..Default::default() }
+    UdpGroupConfigV2 { udp, socket_buf_size: Some(SOCKET_BUF), ..Default::default() }
 }
 
 pub fn init_tracing() {

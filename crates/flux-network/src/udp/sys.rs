@@ -9,11 +9,8 @@ use std::{
     ptr, slice,
 };
 
-use super::wire::MAX_DATAGRAM_SIZE;
-
-/// Receive entries per syscall.
+/// Datagrams per syscall.
 pub(crate) const BATCH: usize = 32;
-pub(crate) const SEND_BATCH: usize = 256;
 
 #[cfg(target_os = "linux")]
 type MMsgHdr = libc::mmsghdr;
@@ -86,12 +83,14 @@ impl SockAddr {
 
     /// Encoded bytes; `new` zero-fills `storage`, so equal addresses are
     /// byte-equal over `len`.
+    #[cfg(target_os = "linux")]
     #[inline]
     fn bytes(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(ptr::from_ref(&self.storage).cast(), self.len as usize) }
     }
 }
 
+#[cfg(target_os = "linux")]
 impl PartialEq for SockAddr {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len && self.bytes() == other.bytes()
@@ -117,12 +116,10 @@ fn sendmmsg(fd: RawFd, hdrs: &mut [MMsgHdr]) -> libc::c_int {
     unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, libc::MSG_DONTWAIT) }
 }
 
-/// Even a pair saves an skb through the stack.
-const GSO_MIN_SEGMENTS: usize = 2;
-/// `UDP_MAX_SEGMENTS` of the first kernels with `UDP_SEGMENT`.
-const GSO_MAX_SEGMENTS: usize = 64;
-const UIO_MAXIOV: usize = 1024;
-const COPY_THRESHOLD: usize = 256;
+/// Shortest run of equal-size datagrams to one peer sent as one `UDP_SEGMENT`
+/// packet; shorter runs go out as plain datagrams.
+#[cfg(target_os = "linux")]
+const GSO_MIN_SEGMENTS: usize = 4;
 
 #[cfg(target_os = "linux")]
 const SEGMENT_CONTROL_SPACE: usize =
@@ -148,68 +145,43 @@ const SEGMENT_CONTROL: SegmentControl = SegmentControl {
     padding: [0; SEGMENT_CONTROL_SPACE - mem::size_of::<libc::cmsghdr>() - 2],
 };
 
-#[derive(Clone, Copy)]
-struct Datagram {
-    iov_start: u32,
-    iov_len: u32,
-    bytes: u32,
-    addr: u32,
-}
-
-#[derive(Clone, Copy)]
-struct Entry {
-    first: u32,
-    count: u32,
-    iov_len: u32,
-    segmented: bool,
-}
-
-/// A payload of [`COPY_THRESHOLD`] bytes or more is borrowed and must stay
+/// Up to [`BATCH`] outgoing datagrams, each a header plus a payload slice.
+///
+/// Destinations are copied in; the slices passed to [`Self::push`] must stay
 /// alive and unmodified until [`Self::send`] returns.
 pub(crate) struct SendBatch {
-    datagram_size: usize,
-    arena: Box<[u8]>,
-    arena_len: usize,
-    iovs: Vec<libc::iovec>,
-    /// The last iovec is the arena's tail and can be extended.
-    arena_tail: bool,
-    datagrams: Vec<Datagram>,
-    addrs: Vec<SockAddr>,
-    building: usize,
-    entries: Vec<Entry>,
-    hdrs: Vec<MMsgHdr>,
+    hdrs: [MMsgHdr; BATCH],
+    iovs: [[libc::iovec; 2]; BATCH],
+    addrs: [SockAddr; BATCH],
+    len: usize,
     /// Kernel accepts `UDP_SEGMENT`; see [`Self::enable_gso`].
     #[cfg(target_os = "linux")]
     gso: bool,
+    /// One `UDP_SEGMENT` cmsg per segmented `hdrs` entry.
     #[cfg(target_os = "linux")]
-    controls: Vec<SegmentControl>,
+    controls: [SegmentControl; BATCH],
+    /// Datagrams carried by each `hdrs` entry of the last send.
+    #[cfg(target_os = "linux")]
+    run_lens: [u8; BATCH],
 }
 
 // SAFETY: the raw pointers inside are written right before each syscall and
 // only read by it; nothing is shared or dereferenced across threads.
-#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for SendBatch {}
 
 impl SendBatch {
-    pub(crate) fn new(datagram_size: usize) -> Self {
-        // Two iovecs per borrowed payload plus one for the arena run in
-        // between, and a borrowed payload needs COPY_THRESHOLD bytes.
-        let iovs_per_datagram = 1 + 2 * datagram_size.div_ceil(COPY_THRESHOLD);
+    pub(crate) fn new() -> Self {
         Self {
-            datagram_size,
-            arena: vec![0; SEND_BATCH * datagram_size].into_boxed_slice(),
-            arena_len: 0,
-            iovs: Vec::with_capacity(SEND_BATCH * iovs_per_datagram),
-            arena_tail: false,
-            datagrams: Vec::with_capacity(SEND_BATCH),
-            addrs: Vec::with_capacity(SEND_BATCH),
-            building: 0,
-            entries: Vec::with_capacity(SEND_BATCH),
-            hdrs: Vec::with_capacity(SEND_BATCH),
+            hdrs: unsafe { mem::zeroed() },
+            iovs: unsafe { mem::zeroed() },
+            addrs: [SockAddr { storage: unsafe { mem::zeroed() }, len: 0 }; BATCH],
+            len: 0,
             #[cfg(target_os = "linux")]
             gso: false,
             #[cfg(target_os = "linux")]
-            controls: Vec::with_capacity(SEND_BATCH),
+            controls: [SEGMENT_CONTROL; BATCH],
+            #[cfg(target_os = "linux")]
+            run_lens: [0; BATCH],
         }
     }
 
@@ -234,193 +206,136 @@ impl SendBatch {
     }
 
     #[inline]
-    pub(crate) fn is_full(&self) -> bool {
-        self.datagrams.len() == SEND_BATCH
+    pub(crate) fn push(&mut self, header: &[u8], payload: &[u8], to: &SockAddr) {
+        let i = self.len;
+        self.iovs[i] = [iovec(header), iovec(payload)];
+        self.addrs[i] = *to;
+        self.hdrs[i].msg_hdr.msg_iovlen = 2;
+        self.len += 1;
     }
 
+    /// Points `hdrs[entry]` at datagram `i` alone.
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.datagrams.is_empty()
+    fn stage_plain(&mut self, entry: usize, i: usize) {
+        let hdr = &mut self.hdrs[entry].msg_hdr;
+        hdr.msg_iov = self.iovs[i].as_mut_ptr();
+        hdr.msg_iovlen = 2;
+        hdr.msg_name = ptr::from_mut(&mut self.addrs[i].storage).cast();
+        hdr.msg_namelen = self.addrs[i].len;
+        hdr.msg_control = ptr::null_mut();
+        hdr.msg_controllen = 0;
     }
 
-    pub(crate) fn open(&mut self, to: &SockAddr) {
-        debug_assert!(!self.is_full());
-        match self.addrs.last() {
-            Some(last) if last == to => {}
-            _ => self.addrs.push(*to),
-        }
-        self.datagrams.push(Datagram {
-            iov_start: self.iovs.len() as u32,
-            iov_len: 0,
-            bytes: 0,
-            addr: (self.addrs.len() - 1) as u32,
-        });
-        self.arena_tail = false;
-        self.building = 0;
-    }
-
-    pub(crate) fn copy(&mut self, bytes: &[u8]) {
-        let start = self.arena_len;
-        self.arena[start..start + bytes.len()].copy_from_slice(bytes);
-        self.arena_len += bytes.len();
-        self.building += bytes.len();
-        if self.arena_tail {
-            self.iovs.last_mut().unwrap().iov_len += bytes.len();
-        } else {
-            self.iovs.push(iovec(&self.arena[start..self.arena_len]));
-            self.arena_tail = true;
-        }
-    }
-
+    /// Points `hdrs[entry]` at datagrams `i..i + run` as one `UDP_SEGMENT`
+    /// packet the kernel splits every `size` bytes.
+    #[cfg(target_os = "linux")]
     #[inline]
-    pub(crate) fn payload(&mut self, bytes: &[u8]) {
-        if bytes.len() < COPY_THRESHOLD {
-            self.copy(bytes);
-        } else {
-            self.iovs.push(iovec(bytes));
-            self.arena_tail = false;
-            self.building += bytes.len();
-        }
+    fn stage_segmented(&mut self, entry: usize, i: usize, run: usize, size: usize) {
+        self.controls[entry].size = size as u16;
+        let hdr = &mut self.hdrs[entry].msg_hdr;
+        hdr.msg_iov = self.iovs[i..].as_mut_ptr().cast();
+        hdr.msg_iovlen = 2 * run;
+        hdr.msg_name = ptr::from_mut(&mut self.addrs[i].storage).cast();
+        hdr.msg_namelen = self.addrs[i].len;
+        hdr.msg_control = ptr::from_mut(&mut self.controls[entry]).cast();
+        hdr.msg_controllen = SEGMENT_CONTROL_SPACE;
     }
 
-    pub(crate) fn close(&mut self) -> usize {
-        debug_assert!(self.building <= self.datagram_size);
-        let datagram = self.datagrams.last_mut().unwrap();
-        datagram.iov_len = self.iovs.len() as u32 - datagram.iov_start;
-        datagram.bytes = self.building as u32;
-        self.building
-    }
-
-    /// A long run is split into near-equal entries, so the cap never strands
-    /// a short plain tail.
-    fn build_entries(&mut self, from: usize, gso: bool) {
-        self.entries.clear();
-        let max_segments = GSO_MAX_SEGMENTS.min(MAX_DATAGRAM_SIZE / self.datagram_size).max(1);
-        let mut s = from;
-        while s < self.datagrams.len() {
-            let first = self.datagrams[s];
-            let mut e = s + 1;
-            let mut iov_len = first.iov_len;
-            while gso && e < self.datagrams.len() {
-                let next = self.datagrams[e];
-                // Only the last of a run may differ in size, and only by
-                // being shorter: the kernel cuts the whole entry at the
-                // first datagram's size.
-                if next.addr != first.addr ||
-                    next.bytes > first.bytes ||
-                    self.datagrams[e - 1].bytes != first.bytes ||
-                    iov_len + next.iov_len > UIO_MAXIOV as u32
-                {
+    /// Stages `n` datagrams as `sendmmsg` entries. Each run of at least
+    /// [`GSO_MIN_SEGMENTS`] equal-size datagrams to one peer (the last may be
+    /// shorter) becomes one segmented entry; every other datagram gets its
+    /// own. Returns the entry count; `run_lens` records datagrams per entry.
+    #[cfg(target_os = "linux")]
+    fn stage_runs(&mut self, n: usize) -> usize {
+        let size_of = |iov: &[libc::iovec; 2]| iov[0].iov_len + iov[1].iov_len;
+        let mut entries = 0;
+        let mut i = 0;
+        while i < n {
+            let size = size_of(&self.iovs[i]);
+            // One packet holds at most this many segments of `size` bytes.
+            let room = if size == 0 { 1 } else { super::wire::MAX_DATAGRAM_SIZE / size };
+            let end = n.min(i + room);
+            let mut j = i + 1;
+            while j < end && self.addrs[j] == self.addrs[i] {
+                let next = size_of(&self.iovs[j]);
+                if next == 0 || next > size {
                     break;
                 }
-                iov_len += next.iov_len;
-                e += 1;
-            }
-            if e - s >= GSO_MIN_SEGMENTS {
-                let parts = (e - s).div_ceil(max_segments);
-                let per = (e - s).div_ceil(parts);
-                for k in (s..e).step_by(per) {
-                    let part = &self.datagrams[k..(k + per).min(e)];
-                    self.entries.push(Entry {
-                        first: k as u32,
-                        count: part.len() as u32,
-                        iov_len: part.iter().map(|d| d.iov_len).sum(),
-                        segmented: true,
-                    });
+                j += 1;
+                if next < size {
+                    break;
                 }
+            }
+            let run = j - i;
+            if run >= GSO_MIN_SEGMENTS {
+                self.stage_segmented(entries, i, run, size);
+                self.run_lens[entries] = run as u8;
+                entries += 1;
             } else {
-                for (k, datagram) in self.datagrams[s..e].iter().enumerate() {
-                    self.entries.push(Entry {
-                        first: (s + k) as u32,
-                        count: 1,
-                        iov_len: datagram.iov_len,
-                        segmented: false,
-                    });
+                for k in i..j {
+                    self.stage_plain(entries, k);
+                    self.run_lens[entries] = 1;
+                    entries += 1;
                 }
             }
-            s = e;
+            i = j;
         }
+        entries
     }
 
-    fn stage(&mut self) {
-        let n = self.entries.len();
-        self.hdrs.clear();
-        self.hdrs.resize(n, unsafe { mem::zeroed() });
+    /// Sends what was pushed and empties the batch. Returns how many datagrams
+    /// the kernel accepted; `WouldBlock` only when it accepted none.
+    pub(crate) fn send(&mut self, fd: RawFd) -> io::Result<usize> {
+        let n = mem::take(&mut self.len);
         #[cfg(target_os = "linux")]
         {
-            self.controls.clear();
-            self.controls.resize(n, SEGMENT_CONTROL);
-        }
-        for (e, entry) in self.entries.iter().enumerate() {
-            let first = self.datagrams[entry.first as usize];
-            let addr = &mut self.addrs[first.addr as usize];
-            let hdr = &mut self.hdrs[e].msg_hdr;
-            hdr.msg_iov = self.iovs[first.iov_start as usize..].as_mut_ptr();
-            hdr.msg_iovlen = entry.iov_len as _;
-            hdr.msg_name = ptr::from_mut(&mut addr.storage).cast();
-            hdr.msg_namelen = addr.len;
-            #[cfg(target_os = "linux")]
-            if entry.segmented {
-                self.controls[e].size = first.bytes as u16;
-                hdr.msg_control = ptr::from_mut(&mut self.controls[e]).cast();
-                hdr.msg_controllen = SEGMENT_CONTROL_SPACE;
-            }
-        }
-    }
-
-    #[inline]
-    fn datagrams_in(&self, entries: usize) -> usize {
-        self.entries[..entries].iter().map(|e| e.count as usize).sum()
-    }
-
-    /// `WouldBlock` only when the kernel accepted none.
-    pub(crate) fn send(&mut self, fd: RawFd) -> io::Result<usize> {
-        let result = self.send_datagrams(fd);
-        self.datagrams.clear();
-        self.addrs.clear();
-        self.iovs.clear();
-        self.arena_len = 0;
-        result
-    }
-
-    #[cfg(target_os = "linux")]
-    fn send_datagrams(&mut self, fd: RawFd) -> io::Result<usize> {
-        self.build_entries(0, self.gso);
-        self.stage();
-        let sent = sendmmsg(fd, &mut self.hdrs);
-        let err = (sent < 0).then(io::Error::last_os_error);
-        // UDP sends are atomic: an accepted entry sent all its datagrams.
-        let accepted = usize::try_from(sent).unwrap_or(0);
-        let datagrams = self.datagrams_in(accepted);
-        // Route MTU, SG, checksum offload and memory pressure refuse only
-        // segmented entries.
-        let retry = self.entries.get(accepted).is_some_and(|entry| entry.segmented) &&
-            err.as_ref().is_none_or(|err| err.kind() != io::ErrorKind::WouldBlock);
-        if !retry {
-            return err.map_or(Ok(datagrams), Err);
-        }
-        let resume = self.entries[accepted].first as usize;
-        self.build_entries(resume, false);
-        self.stage();
-        match sendmmsg(fd, &mut self.hdrs) {
-            sent @ 0.. => Ok(datagrams + sent as usize),
-            _ if datagrams != 0 => Ok(datagrams),
-            _ => Err(io::Error::last_os_error()),
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn send_datagrams(&mut self, fd: RawFd) -> io::Result<usize> {
-        self.build_entries(0, false);
-        self.stage();
-        for i in 0..self.entries.len() {
-            let r = unsafe { libc::sendmsg(fd, &self.hdrs[i].msg_hdr, libc::MSG_DONTWAIT) };
-            if r < 0 {
+            let entries = if self.gso && n >= GSO_MIN_SEGMENTS {
+                self.stage_runs(n)
+            } else {
+                for i in 0..n {
+                    self.stage_plain(i, i);
+                }
+                self.run_lens[..n].fill(1);
+                n
+            };
+            let sent = sendmmsg(fd, &mut self.hdrs[..entries]);
+            // The kernel stops at the first entry it refuses. UDP sends are
+            // atomic, so every accepted entry delivered all its datagrams.
+            let refused = usize::try_from(sent).unwrap_or(0);
+            let start: usize = self.run_lens[..refused].iter().map(|&k| usize::from(k)).sum();
+            if sent < 0 {
                 let err = io::Error::last_os_error();
-                return if i == 0 { Err(err) } else { Ok(i) };
+                // A full socket buffer refuses plain datagrams just the same.
+                if self.run_lens[0] == 1 || err.kind() == io::ErrorKind::WouldBlock {
+                    return Err(err);
+                }
+            } else if refused == entries || self.run_lens[refused] == 1 {
+                return Ok(start);
+            }
+            // Route MTU, SG support, checksum offload and memory pressure all
+            // refuse a segmented entry; retry the rest as plain datagrams,
+            // which reports the same errno if it persists.
+            for i in start..n {
+                self.stage_plain(i, i);
+            }
+            match sendmmsg(fd, &mut self.hdrs[start..n]) {
+                sent @ 0.. => Ok(start + sent as usize),
+                _ if start != 0 => Ok(start),
+                _ => Err(io::Error::last_os_error()),
             }
         }
-        Ok(self.entries.len())
+        #[cfg(not(target_os = "linux"))]
+        {
+            for i in 0..n {
+                self.stage_plain(i, i);
+                let r = unsafe { libc::sendmsg(fd, &self.hdrs[i].msg_hdr, libc::MSG_DONTWAIT) };
+                if r < 0 {
+                    let err = io::Error::last_os_error();
+                    return if i == 0 { Err(err) } else { Ok(i) };
+                }
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -578,6 +493,7 @@ impl RecvBatch {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::{net::UdpSocket, os::fd::AsRawFd, time::Duration};
 
     use super::*;
@@ -595,56 +511,45 @@ mod tests {
         }
     }
 
-    fn pair() -> (UdpSocket, UdpSocket, SockAddr) {
-        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let to = SockAddr::new(receiver.local_addr().unwrap());
-        (sender, receiver, to)
-    }
-
-    fn build(batch: &mut SendBatch, to: &SockAddr, small: &[&[u8]], big: &[u8]) -> Vec<u8> {
-        batch.open(to);
-        let mut expect = Vec::new();
-        for piece in small {
-            batch.copy(piece);
-            expect.extend_from_slice(piece);
-        }
-        if !big.is_empty() {
-            batch.payload(big);
-            expect.extend_from_slice(big);
-        }
-        batch.close();
-        expect
-    }
-
+    #[cfg(target_os = "linux")]
     #[test]
-    fn datagrams_keep_their_bytes_and_order() {
-        let (sender, receiver, to) = pair();
-        let mut batch = SendBatch::new(1200);
-        #[cfg(target_os = "linux")]
-        offload_available(batch.enable_gso(sender.as_raw_fd()));
-        let big = vec![7; 900];
-        let mut expected = Vec::new();
-        for i in 0..6u8 {
-            let (head, tail) = ([i; 25], [i; 200]);
-            let small = [head.as_slice(), b"abc", tail.as_slice()];
-            let big_len = if i == 5 { 100 } else { big.len() };
-            expected.push(build(&mut batch, &to, &small, &big[..big_len]));
-        }
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 6);
-        assert!(batch.is_empty());
-        let mut buf = [0; 2048];
-        for expect in expected {
-            let n = receiver.recv(&mut buf).unwrap();
-            assert_eq!(&buf[..n], &expect[..]);
+    fn segmented_batch_preserves_datagrams() {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            // Hosts without IPv6 loopback only run the v4 case.
+            let sender = match UdpSocket::bind(bind) {
+                Ok(socket) => socket,
+                Err(_) if bind.starts_with('[') => continue,
+                Err(err) => panic!("IPv4 bind failed: {err}"),
+            };
+            let receiver = UdpSocket::bind(bind).unwrap();
+            receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let to = SockAddr::new(receiver.local_addr().unwrap());
+            let mut batch = SendBatch::new();
+            offload_available(batch.enable_gso(sender.as_raw_fd()));
+            let headers: [[u8; 29]; BATCH] = std::array::from_fn(|i| [i as u8; 29]);
+            let payload = [0x5a; 1171];
+            for (i, header) in headers.iter().enumerate() {
+                let len = if i == BATCH - 1 { 17 } else { payload.len() };
+                batch.push(header, &payload[..len], &to);
+            }
+            assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), BATCH);
+            let mut buf = [0; 2048];
+            for (i, header) in headers.iter().enumerate() {
+                let len = if i == BATCH - 1 { 17 } else { payload.len() };
+                let n = receiver.recv(&mut buf).unwrap();
+                assert_eq!(n, header.len() + len);
+                assert_eq!(&buf[..header.len()], header);
+                assert_eq!(&buf[header.len()..n], &payload[..len]);
+            }
         }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn segmentation_falls_back_without_checksums() {
-        let (sender, receiver, to) = pair();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let no_check: libc::c_int = 1;
         assert_eq!(
             unsafe {
@@ -658,25 +563,27 @@ mod tests {
             },
             0
         );
-        let mut batch = SendBatch::new(64);
+        let to = SockAddr::new(receiver.local_addr().unwrap());
+        let mut batch = SendBatch::new();
         if !offload_available(batch.enable_gso(sender.as_raw_fd())) {
             return;
         }
-        for _ in 0..5 {
-            build(&mut batch, &to, &[b"headerpayload"], &[]);
+        for _ in 0..4 {
+            batch.push(b"header", b"payload", &to);
         }
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 5);
+        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
         // Per-socket EIO is not a kernel capability; offload stays enabled.
         assert!(batch.gso);
         let mut buf = [0; 32];
-        for _ in 0..5 {
+        for _ in 0..4 {
             let n = receiver.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"headerpayload");
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn mixed_destinations_keep_their_datagrams() {
+    fn mixed_batch_preserves_destinations_and_lengths() {
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         let receivers =
             [UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap()];
@@ -684,45 +591,25 @@ mod tests {
             receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         }
         let to = receivers.each_ref().map(|r| SockAddr::new(r.local_addr().unwrap()));
-        let mut batch = SendBatch::new(1200);
-        let payloads: [&[u8]; 4] = [b"a", b"bbbb", b"cc", b"ddd"];
-        for (i, payload) in payloads.iter().enumerate() {
-            build(&mut batch, &to[i % 2], &[b"h", payload], &[]);
-        }
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
-        let mut buf = [0; 32];
-        for (i, payload) in payloads.iter().enumerate() {
-            let n = receivers[i % 2].recv(&mut buf).unwrap();
-            assert_eq!(buf[0], b'h');
-            assert_eq!(&buf[1..n], *payload);
-        }
-    }
-
-    /// A short datagram followed by a full one must not become one
-    /// segmented entry: the kernel would cut the full one at the short size.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_short_datagram_never_leads_a_segmented_run() {
-        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let to = SockAddr::new(receiver.local_addr().unwrap());
-        let mut batch = SendBatch::new(1200);
-        if !offload_available(batch.enable_gso(sender.as_raw_fd())) {
-            return;
-        }
-        let short = [1u8; 300];
-        let full = [2u8; 1200];
-        let expect = [
-            build(&mut batch, &to, &[], &short),
-            build(&mut batch, &to, &[], &full),
-            build(&mut batch, &to, &[], &full),
-        ];
-        assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 3);
-        let mut buf = [0; 1500];
-        for e in &expect {
-            let n = receiver.recv(&mut buf).unwrap();
-            assert_eq!(&buf[..n], e.as_slice());
+        for mixed_destinations in [false, true] {
+            let mut batch = SendBatch::new();
+            offload_available(batch.enable_gso(sender.as_raw_fd()));
+            let payloads: [&[u8]; 4] = if mixed_destinations {
+                [b"aaa", b"bbb", b"ccc", b"ddd"]
+            } else {
+                [b"a", b"bbbb", b"cc", b"ddd"]
+            };
+            let destination = |i: usize| if mixed_destinations { i % 2 } else { 0 };
+            for (i, payload) in payloads.iter().enumerate() {
+                batch.push(b"h", payload, &to[destination(i)]);
+            }
+            assert_eq!(batch.send(sender.as_raw_fd()).unwrap(), 4);
+            let mut buf = [0; 32];
+            for (i, payload) in payloads.iter().enumerate() {
+                let n = receivers[destination(i)].recv(&mut buf).unwrap();
+                assert_eq!(buf[0], b'h');
+                assert_eq!(&buf[1..n], *payload);
+            }
         }
     }
 
@@ -740,15 +627,14 @@ mod tests {
                 return;
             }
             let to = SockAddr::new(receiver.local_addr().unwrap());
-            let mut tx = SendBatch::new(1200);
+            let mut tx = SendBatch::new();
             if !offload_available(tx.enable_gso(sender.as_raw_fd())) {
                 return;
             }
-            // Three full datagrams and a short one: one GSO run.
-            let payload = [0x5a; 1200 - 29];
-            let len = |i: usize| if i == 3 { 17 } else { payload.len() };
-            for i in 0..4u8 {
-                build(&mut tx, &to, &[&[i + 1; 29]], &payload[..len(i as usize)]);
+            let headers = [[1; 29], [2; 29], [3; 29], [4; 29]];
+            let payload = [0x5a; 1171];
+            for (i, header) in headers.iter().enumerate() {
+                tx.push(header, &payload[..if i == 3 { 17 } else { 1171 }], &to);
             }
             assert_eq!(tx.send(sender.as_raw_fd()).unwrap(), 4);
             let mut rx = RecvBatch::new(1200);
@@ -760,8 +646,8 @@ mod tests {
                 let (datagrams, from) = rx.datagrams(i).unwrap();
                 assert_eq!(from, sender.local_addr().unwrap());
                 for bytes in datagrams {
-                    assert_eq!(&bytes[..29], &[seen as u8 + 1; 29]);
-                    assert_eq!(&bytes[29..], &payload[..len(seen)]);
+                    assert_eq!(&bytes[..29], &headers[seen]);
+                    assert_eq!(&bytes[29..], &payload[..if seen == 3 { 17 } else { 1171 }]);
                     seen += 1;
                 }
             }

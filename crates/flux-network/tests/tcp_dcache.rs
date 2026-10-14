@@ -15,6 +15,7 @@ use flux::{
 };
 use flux_network::{
     Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, UdpConfig, UdpGroupConfig,
+    UdpGroupConfigV2,
 };
 use spine_derive::from_spine;
 
@@ -41,7 +42,7 @@ struct NetworkTile {
 impl Tile<TcpDcacheSpine> for NetworkTile {
     fn try_init(&mut self, adapter: &mut SpineAdapter<TcpDcacheSpine>) -> bool {
         let sp: &SpineProducerWithDCache<Payload> = adapter.producers.as_ref();
-        let mut conn = Network::with_dcache(sp.dcache_ptr());
+        let mut conn = Network::default().with_dcache(sp.dcache_ptr());
         let conn_group = conn.add_group(self.transport.clone());
         conn.listen(conn_group, self.bind_addr).unwrap();
         self.conn = Some(conn);
@@ -102,8 +103,13 @@ fn dcache_multi_stream_tcp() {
 
 #[test]
 fn dcache_multi_stream_udp() {
+    dcache_multi_stream(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() }.into());
+}
+
+#[test]
+fn dcache_multi_stream_udp_v2() {
     dcache_multi_stream(
-        UdpGroupConfig {
+        UdpGroupConfigV2 {
             udp: UdpConfig { max_message_size: 64, ..UdpConfig::lan() },
             ..Default::default()
         }
@@ -117,6 +123,10 @@ fn dcache_multi_stream_udp() {
 fn dcache_multi_stream(transport: flux_network::GroupConfig) {
     const MSG_A: &[u8; 8] = b"stream-a";
     const MSG_B: &[u8; 8] = b"stream-b";
+    // Each run spins tiles, and two picking the same probed port can't both
+    // listen on it.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();

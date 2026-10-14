@@ -48,7 +48,7 @@ where
 {
     fn try_init(&mut self, adapter: &mut SpineAdapter<S>) -> bool {
         let producers: &SpineProducerWithDCache<IncomingBlob> = adapter.producers.as_ref();
-        let mut driver = Network::with_dcache(producers.dcache_ptr());
+        let mut driver = Network::default().with_dcache(producers.dcache_ptr());
         let group = driver.add_group(TcpGroupConfig {
             socket_buf_size: Some(self.socket_buf_size),
             max_frame_size: u32::MAX as usize,

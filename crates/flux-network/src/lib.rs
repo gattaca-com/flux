@@ -10,10 +10,12 @@ pub mod network;
 mod tcp;
 pub mod tls;
 pub mod udp;
+mod udp_v2;
 
 pub use mio::Token;
 pub use network::{
     Event, Framing, Group, GroupConfig, Network, NetworkCore, NetworkEvent, NetworkTelemetry,
     NetworkWithExternalPoll, PayloadBuf, ReplayPolicy, TcpGroupConfig, UdpGroupConfig,
+    UdpGroupConfigV2,
 };
 pub use udp::UdpConfig;

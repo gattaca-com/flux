@@ -33,7 +33,7 @@
 //! [3..7]    unknown     session
 //! ```
 
-use crate::udp::wire::{self, PREFIX, Packet, u32_at, u64_at};
+use crate::udp_v2::wire::{self, PREFIX, Packet, u32_at, u64_at};
 
 const MAGIC: [u8; 2] = *b"FC";
 

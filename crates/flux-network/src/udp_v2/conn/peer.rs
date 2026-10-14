@@ -7,8 +7,8 @@ use tracing::debug;
 
 use super::wire::{self, ACK_HEADER, RESET_SIZE};
 use crate::{
-    network::UdpGroupConfig,
-    udp::{
+    network::UdpGroupConfigV2,
+    udp_v2::{
         SendOutcome, inbound::Inbound, latency_timer, new_session, outbound::Outbound,
         send_datagram, stream::Stream, wire::Packet,
     },
@@ -57,7 +57,7 @@ impl Peer {
         socket: Token,
         role: Role,
         session: u32,
-        config: &UdpGroupConfig,
+        config: &UdpGroupConfigV2,
         now: Instant,
     ) -> Self {
         let udp = config.udp;
