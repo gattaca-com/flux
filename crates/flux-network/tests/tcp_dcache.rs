@@ -123,6 +123,10 @@ fn dcache_multi_stream_udp_v2() {
 fn dcache_multi_stream(transport: flux_network::GroupConfig) {
     const MSG_A: &[u8; 8] = b"stream-a";
     const MSG_B: &[u8; 8] = b"stream-b";
+    // Each run spins tiles, and two picking the same probed port can't both
+    // listen on it.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
