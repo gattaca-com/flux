@@ -172,3 +172,25 @@ unsafe impl<const BITS: usize, const LIMBS: usize> ByteStable
         u64::from_ne_bytes(limb) & !Self::MASK == 0
     }
 }
+
+// Safety: one `Uint<BITS, LIMBS>` field with no `repr`; matching its size and
+// alignment puts the field at offset 0 with no padding. Its values are the
+// `Uint`'s bits read as two's complement, so validity is the `Uint`'s.
+#[cfg(feature = "alloy")]
+unsafe impl<const BITS: usize, const LIMBS: usize> ByteStable
+    for alloy_primitives::Signed<BITS, LIMBS>
+{
+    const LAYOUT_PROOF: () = {
+        let () = <alloy_primitives::Uint<BITS, LIMBS> as ByteStable>::LAYOUT_PROOF;
+        assert!(
+            mem::size_of::<Self>() == mem::size_of::<alloy_primitives::Uint<BITS, LIMBS>>() &&
+                mem::align_of::<Self>() ==
+                    mem::align_of::<alloy_primitives::Uint<BITS, LIMBS>>()
+        );
+    };
+
+    #[inline]
+    fn is_valid(bytes: &[u8]) -> bool {
+        <alloy_primitives::Uint<BITS, LIMBS> as ByteStable>::is_valid(bytes)
+    }
+}
