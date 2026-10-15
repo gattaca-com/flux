@@ -25,6 +25,7 @@ mod sys;
 mod wire;
 
 pub(crate) use conn::UdpManager;
+pub use outbound::{UdpRetransmit, UdpSend};
 use sys::{RecvBatch, SendBatch};
 
 use crate::{

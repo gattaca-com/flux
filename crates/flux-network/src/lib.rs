@@ -10,7 +10,7 @@ pub mod network;
 mod tcp;
 pub mod tls;
 pub mod udp;
-mod udp_v2;
+pub mod udp_v2;
 
 pub use mio::Token;
 pub use network::{
