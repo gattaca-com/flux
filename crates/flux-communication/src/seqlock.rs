@@ -1,7 +1,7 @@
 use std::{
     cell::UnsafeCell,
     fmt,
-    sync::atomic::{AtomicU64, Ordering, compiler_fence},
+    sync::atomic::{AtomicU64, Ordering, fence},
 };
 
 use crate::error::{EmptyError, ReadError};
@@ -48,10 +48,11 @@ impl<T: Copy> Seqlock<T> {
             return Err(ReadError::Empty);
         }
 
-        compiler_fence(Ordering::AcqRel);
         *result = unsafe { *self.data.get() };
-        compiler_fence(Ordering::AcqRel);
-        let v2 = self.version.load(Ordering::Acquire);
+        // Keeps the data reads before the version re-check. What we ideally want is
+        // a load(Release), but the Release ordering is not available on loads.
+        fence(Ordering::Acquire);
+        let v2 = self.version.load(Ordering::Relaxed);
         if v2 == expected_version { Ok(()) } else { Err(ReadError::SpedPast) }
     }
 
@@ -70,19 +71,17 @@ impl<T: Copy> Seqlock<T> {
             if v1 < 2 {
                 return Err(EmptyError::Empty);
             }
-            compiler_fence(Ordering::AcqRel);
             unsafe {
                 *result = *self.data.get();
             }
-            compiler_fence(Ordering::AcqRel);
-            let v2 = self.version.load(Ordering::Acquire);
+            // Keeps the data reads before the version re-check. What we ideally want is
+            // a load(Release), but the Release ordering is not available on loads.
+            fence(Ordering::Acquire);
+            let v2 = self.version.load(Ordering::Relaxed);
             if v1 == v2 && v1 & 1 == 0 {
                 return Ok(());
             }
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                std::arch::x86_64::_mm_pause();
-            };
+            std::hint::spin_loop();
         }
     }
 
@@ -101,13 +100,12 @@ impl<T: Copy> Seqlock<T> {
         // Increment the sequence number. At this point, the number will be odd,
         // which will force readers to spin until we finish writing.
         let v = self.version.load(Ordering::Relaxed);
-        self.version.store(v.wrapping_add(1), Ordering::Release);
-        compiler_fence(Ordering::AcqRel);
+        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
         // Make sure any writes to the data happen after incrementing the
         // sequence number. What we ideally want is a store(Acquire), but the
         // Acquire ordering is not available on stores.
+        fence(Ordering::Release);
         unsafe { *self.data.get() = *data };
-        compiler_fence(Ordering::AcqRel);
         // unsafe {asm!("sti");}
         self.version.store(v.wrapping_add(2), Ordering::Release);
     }
@@ -115,18 +113,17 @@ impl<T: Copy> Seqlock<T> {
     #[inline(never)]
     pub fn write_unpoison(&self, data: &T) {
         let v = self.version.load(Ordering::Relaxed);
-        self.version.store(v.wrapping_add(v.wrapping_sub(1) & 1), Ordering::Release);
+        self.version.store(v.wrapping_add(v.wrapping_sub(1) & 1), Ordering::Relaxed);
         // Make sure any writes to the data happen after incrementing the
         // sequence number. What we ideally want is a store(Acquire), but the
         // Acquire ordering is not available on stores.
-        compiler_fence(Ordering::AcqRel);
+        fence(Ordering::Release);
         if v > 1 {
             unsafe { *self.data.get() = *data };
         } else {
             unsafe { std::ptr::write(self.data.get(), *data) }
         }
-        compiler_fence(Ordering::AcqRel);
-        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        self.version.store(v.wrapping_add(1), Ordering::Release);
     }
 
     #[inline(never)]
@@ -140,12 +137,12 @@ impl<T: Copy> Seqlock<T> {
         // Make sure any writes to the data happen after incrementing the
         // sequence number. What we ideally want is a store(Acquire), but the
         // Acquire ordering is not available on stores.
+        fence(Ordering::Release);
         if v > 1 {
             unsafe { *self.data.get() = *data };
         } else {
             unsafe { std::ptr::write(self.data.get(), *data) }
         }
-        compiler_fence(Ordering::AcqRel);
         self.version.store(v.wrapping_add(2), Ordering::Release);
     }
 
@@ -165,19 +162,18 @@ impl<T: Copy> Seqlock<T> {
         // Make sure any writes to the data happen after incrementing the
         // sequence number. What we ideally want is a store(Acquire), but the
         // Acquire ordering is not available on stores.
+        fence(Ordering::Release);
         if v > 1 {
             unsafe { *self.data.get() = *data };
         } else {
             unsafe { std::ptr::write(self.data.get(), *data) }
         }
-        compiler_fence(Ordering::AcqRel);
         self.version.store(v.wrapping_add(2), Ordering::Release);
         true
     }
 
     #[inline(never)]
     pub fn reset(&self) {
-        compiler_fence(Ordering::AcqRel);
         self.version.store(0, Ordering::Release);
     }
 
@@ -191,17 +187,15 @@ impl<T: Copy> Seqlock<T> {
             if v1 & 1 != 0 {
                 continue;
             }
-            compiler_fence(Ordering::AcqRel);
             let result = unsafe { *self.data.get() };
-            compiler_fence(Ordering::AcqRel);
-            let v2 = self.version.load(Ordering::Acquire);
+            // Keeps the data reads before the version re-check. What we ideally want is
+            // a load(Release), but the Release ordering is not available on loads.
+            fence(Ordering::Acquire);
+            let v2 = self.version.load(Ordering::Relaxed);
             if v1 == v2 {
                 return Ok((result, v2));
             }
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                std::arch::x86_64::_mm_pause();
-            };
+            std::hint::spin_loop();
         }
     }
 }
