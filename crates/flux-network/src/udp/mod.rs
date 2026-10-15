@@ -24,6 +24,7 @@ mod sys;
 mod wire;
 
 pub(crate) use connector::UdpManager;
+pub use peer::{UdpRetransmit, UdpSend};
 
 /// Tuning for [`crate::UdpGroupConfig`] and [`crate::UdpGroupConfigV2`]. Under
 /// v2 the windows count packets, each of which may carry several messages.

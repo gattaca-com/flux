@@ -76,7 +76,7 @@ fn send_datagram(socket: &UdpSocket, addr: SocketAddr, bytes: &[u8]) -> SendOutc
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct UdpSend {
+pub struct UdpSend {
     pub sent_at: Instant,
     pub bytes: u32,
     pub datagrams: u32,
@@ -84,7 +84,7 @@ pub(crate) struct UdpSend {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct UdpRetransmit {
+pub struct UdpRetransmit {
     pub sent_at: Instant,
     pub bytes: u32,
     pub retries: u8,
