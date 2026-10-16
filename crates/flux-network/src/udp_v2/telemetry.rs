@@ -3,10 +3,14 @@ use std::{
     path::Path,
 };
 
-use flux_communication::queue::{Producer, Queue, QueueType};
+use flux_communication::{
+    ReadError,
+    queue::{ConsumerBare, Producer, Queue, QueueType},
+};
 use flux_timing::{Instant, Nanos};
 use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
 use mio::Token;
+use tracing::warn;
 
 use crate::NetworkTelemetry;
 
@@ -65,15 +69,15 @@ pub struct UdpLatency {
     pub received_at: Nanos,
 }
 
-pub fn sends_queue(group_name: &str) -> String {
+fn sends_queue(group_name: &str) -> String {
     format!("udp_sends_{group_name}")
 }
 
-pub fn retransmits_queue(group_name: &str) -> String {
+fn retransmits_queue(group_name: &str) -> String {
     format!("udp_retransmits_{group_name}")
 }
 
-pub fn latency_queue(group_name: &str) -> String {
+fn latency_queue(group_name: &str) -> String {
     format!("udp_latency_{group_name}")
 }
 
@@ -127,4 +131,70 @@ fn producer<T: Copy>(dir: &Path, name: &str) -> Producer<T> {
     // tiles running the same group share them.
     // TODO: per-core shmem, so each core's writer gets SPMC queues of its own.
     Producer::from(Queue::create_or_open_shared(dir.join(name), QUEUE_SIZE, QueueType::MPMC))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryEvent {
+    Send(UdpSend),
+    Retransmit(UdpRetransmit),
+    Latency(UdpLatency),
+    /// The reader fell behind and missed events.
+    Lapped,
+}
+
+pub struct TelemetryReader {
+    sends: Option<ConsumerBare<UdpSend>>,
+    retransmits: Option<ConsumerBare<UdpRetransmit>>,
+    latency: Option<ConsumerBare<UdpLatency>>,
+}
+
+impl TelemetryReader {
+    pub fn open(app_name: &str, group_name: &str) -> Self {
+        let dir = shmem_dir_queues_with_base(local_share_dir(), app_name);
+        Self {
+            sends: consumer(&dir, &sends_queue(group_name)),
+            retransmits: consumer(&dir, &retransmits_queue(group_name)),
+            latency: consumer(&dir, &latency_queue(group_name)),
+        }
+    }
+
+    pub fn drain(&mut self, mut on_event: impl FnMut(TelemetryEvent)) {
+        drain(&mut self.sends, &mut on_event, TelemetryEvent::Send);
+        drain(&mut self.retransmits, &mut on_event, TelemetryEvent::Retransmit);
+        drain(&mut self.latency, &mut on_event, TelemetryEvent::Latency);
+    }
+}
+
+fn consumer<T: Copy>(dir: &Path, name: &str) -> Option<ConsumerBare<T>> {
+    let file = dir.join(name);
+    match Queue::try_open_shared(&file) {
+        Ok(queue) => {
+            let mut consumer = ConsumerBare::new(queue, "udp_telemetry");
+            consumer.subscribe_broadcast();
+            Some(consumer)
+        }
+        Err(err) => {
+            warn!(?err, file = %file.display(), "no udp telemetry");
+            None
+        }
+    }
+}
+
+fn drain<T: Copy + Default>(
+    consumer: &mut Option<ConsumerBare<T>>,
+    on_event: &mut impl FnMut(TelemetryEvent),
+    wrap: fn(T) -> TelemetryEvent,
+) {
+    let Some(consumer) = consumer else { return };
+    let mut event = T::default();
+    loop {
+        match consumer.try_consume(&mut event) {
+            Ok(()) => on_event(wrap(event)),
+            Err(ReadError::SpedPast) => {
+                on_event(TelemetryEvent::Lapped);
+                consumer.recover_after_error();
+            }
+            Err(ReadError::Empty) => return,
+        }
+    }
 }
