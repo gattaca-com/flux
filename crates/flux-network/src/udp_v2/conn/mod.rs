@@ -23,6 +23,7 @@ use wire::{Datagram, HELLO_ACK_SIZE};
 use super::{
     SendOutcome, Socket, deliver_message, new_session, on_connect_fits, recv_all,
     sys::{RecvBatch, SendBatch},
+    telemetry::Telemetry,
     unspecified, validate_group,
     wire::MESSAGE_HEADER,
 };
@@ -87,6 +88,7 @@ impl UdpManager {
 pub(crate) struct State {
     config: UdpGroupConfigV2,
     group: Group,
+    telemetry: Telemetry,
     endpoints: Vec<Endpoint>,
     peers: Vec<Peer>,
     /// A late hello retry for a dropped connection gets a reset instead of
@@ -113,6 +115,7 @@ impl State {
         Self {
             ctrl: vec![0; udp.max_datagram_size],
             batch: SendBatch::new(udp.max_datagram_size),
+            telemetry: Telemetry::new(config.telemetry, config.name),
             config,
             group,
             endpoints: Vec::new(),
@@ -492,7 +495,7 @@ impl State {
             let take = remaining_packets.min(staged.packets);
             remaining_packets -= take;
             let peer = &mut self.peers[staged.peer];
-            peer.out.commit(&peer.stream, take, now);
+            peer.out.commit(&peer.stream, take, now, &mut self.telemetry);
             if !self.config.udp.reliable {
                 peer.release();
             }
@@ -585,8 +588,8 @@ impl State {
                 }
                 peer.last_recv = now;
                 let token = peer.token;
-                peer.on_packet(packet, &mut |bytes, send_ts| {
-                    deliver_message(&mut None, bytes, send_ts, dcache, &mut |payload, send_ts| {
+                peer.on_packet(packet, &mut self.telemetry, &mut |bytes, send_ts| {
+                    deliver_message(bytes, send_ts, dcache, &mut |payload, send_ts| {
                         deliver(Event::Message { group, token, payload, send_ts });
                     });
                 });
@@ -766,7 +769,7 @@ fn deliver_on_connect<F>(
     if msg.is_empty() {
         return;
     }
-    deliver_message(&mut None, msg, Nanos::now(), dcache, &mut |payload, send_ts| {
+    deliver_message(msg, Nanos::now(), dcache, &mut |payload, send_ts| {
         deliver(Event::Message { group, token, payload, send_ts });
     });
 }
