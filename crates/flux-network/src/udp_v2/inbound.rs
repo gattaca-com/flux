@@ -194,6 +194,9 @@ impl Inbound {
         }
         let (continuation, records) = packet.split().ok_or(Refused::Malformed)?;
         self.validate(seq, continuation, records.clone())?;
+        // TODO: emit duplicates (below `ack_next` or already in) to the
+        // group's telemetry. Against the sender's retransmits they tell
+        // spurious resends (RTO or reorder window too tight) from real loss.
         if self.accept(seq) {
             self.packet(seq, continuation, records, packet.send_ts, deliver);
         }

@@ -1,15 +1,13 @@
 use std::{collections::VecDeque, net::SocketAddr};
 
-use flux_communication::queue::{Producer, Queue, QueueType};
 use flux_timing::{Duration, Instant, Nanos};
-use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
 
 use super::{
     UdpConfig,
     stream::Stream,
     sys::{SendBatch, SockAddr},
+    telemetry::{PeerId, Telemetry, UdpRetransmit, UdpSend},
 };
-use crate::NetworkTelemetry;
 
 const MAX_BACKOFF_SHIFT: u8 = 6;
 /// Most packets one timeout probe resends.
@@ -17,35 +15,6 @@ const MAX_RECOVER: u64 = 64;
 /// One flow does not reorder this far, while the time-based reorder window
 /// grows with queueing delay.
 const FAST_RETRANSMIT_GAP: u64 = 64;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UdpSend {
-    pub sent_at: Instant,
-    pub bytes: u32,
-    pub datagrams: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UdpRetransmit {
-    pub sent_at: Instant,
-    pub bytes: u32,
-    pub retries: u8,
-}
-
-fn telemetry_producer<T: Copy>(
-    telemetry: NetworkTelemetry,
-    kind: &str,
-    label: &str,
-) -> Option<Producer<T>> {
-    const QUEUE_SIZE: usize = 2usize.pow(13);
-    let NetworkTelemetry::Enabled { app_name } = telemetry else { return None };
-    let dir = shmem_dir_queues_with_base(local_share_dir(), app_name);
-    let _ = std::fs::create_dir_all(&dir);
-    let file = dir.join(format!("udp_{kind}_{label}"));
-    Some(Producer::from(Queue::create_or_open_shared(file, QUEUE_SIZE, QueueType::MPMC)))
-}
 
 /// RFC 6298 estimator in clock ticks.
 pub(crate) struct Rto {
@@ -116,18 +85,11 @@ pub(crate) struct Outbound {
     /// Sorted by `seq`.
     resent: Vec<Resent>,
     staged: Vec<u64>,
-    sends: Option<Producer<UdpSend>>,
-    retransmits: Option<Producer<UdpRetransmit>>,
+    peer: PeerId,
 }
 
 impl Outbound {
-    pub(crate) fn new(
-        to: SocketAddr,
-        first: u64,
-        udp: &UdpConfig,
-        telemetry: NetworkTelemetry,
-        label: &str,
-    ) -> Self {
+    pub(crate) fn new(to: SocketAddr, first: u64, udp: &UdpConfig, peer: PeerId) -> Self {
         Self {
             to: SockAddr::new(to),
             reliable: udp.reliable,
@@ -143,8 +105,7 @@ impl Outbound {
             first_sends: VecDeque::new(),
             resent: Vec::new(),
             staged: Vec::new(),
-            sends: telemetry_producer(telemetry, "sends", label),
-            retransmits: telemetry_producer(telemetry, "retransmits", label),
+            peer,
         }
     }
 
@@ -346,7 +307,13 @@ impl Outbound {
         self.staged.len()
     }
 
-    pub(crate) fn commit(&mut self, stream: &Stream, accepted: usize, now: Instant) {
+    pub(crate) fn commit(
+        &mut self,
+        stream: &Stream,
+        accepted: usize,
+        now: Instant,
+        telemetry: &mut Telemetry,
+    ) {
         for &seq in &self.staged[..accepted.min(self.staged.len())] {
             let bytes = u32::from(stream.packet_bytes(seq));
             if seq >= self.next_send {
@@ -354,9 +321,7 @@ impl Outbound {
                 if self.first_sends.back().is_none_or(|&(_, at)| at != now) {
                     self.first_sends.push_back((seq, now));
                 }
-                if let Some(sends) = &mut self.sends {
-                    sends.produce(&UdpSend { sent_at: now, bytes, datagrams: 1 });
-                }
+                telemetry.send(&UdpSend { peer: self.peer, sent_at: now, bytes, datagrams: 1 });
                 continue;
             }
             let retries = match self.resent.binary_search_by_key(&seq, |r| r.seq) {
@@ -371,9 +336,7 @@ impl Outbound {
                     1
                 }
             };
-            if let Some(retransmits) = &mut self.retransmits {
-                retransmits.produce(&UdpRetransmit { sent_at: now, bytes, retries });
-            }
+            telemetry.retransmit(&UdpRetransmit { peer: self.peer, sent_at: now, bytes, retries });
         }
         self.staged.clear();
         // Unreliable: handed to the kernel is as good as acked.
