@@ -25,10 +25,10 @@ mod telemetry;
 mod wire;
 
 pub(crate) use conn::UdpManager;
+use sys::{RecvBatch, SendBatch};
 pub use telemetry::{
     PeerId, UdpLatency, UdpRetransmit, UdpSend, latency_queue, retransmits_queue, sends_queue,
 };
-use sys::{RecvBatch, SendBatch};
 
 use crate::{
     network::{RxPayload, UdpGroupConfigV2, set_socket_buf_size},
