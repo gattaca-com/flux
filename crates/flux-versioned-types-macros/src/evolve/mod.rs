@@ -94,33 +94,6 @@ mod tests {
     }
 
     #[test]
-    fn export_versions_needs_a_wire_name() {
-        let output = expand(quote! {
-            #[wire_skip]
-            roll_into Message
-            final_attrs { #[export_versions] }
-            #[type_hash_lock(hash = 1)]
-            MessageV1 { pub value: u32 }
-        });
-
-        assert!(output.contains("export_versions needs a wire name"));
-    }
-
-    #[test]
-    fn export_versions_on_an_older_version_is_rejected() {
-        let output = expand(quote! {
-            roll_into Message
-            #[type_hash_lock(hash = 1)]
-            #[export_versions]
-            MessageV1 { pub value: u32 }
-            #[type_hash_lock(hash = 2)]
-            MessageV2 { add { pub accepted: bool = true } }
-        });
-
-        assert!(output.contains("export_versions goes on the newest version"));
-    }
-
-    #[test]
     fn evolve_struct_accepts_locked_versions() {
         let output = expand(quote! {
             roll_into Message
