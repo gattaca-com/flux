@@ -51,6 +51,8 @@ pub(super) struct Peer {
     pub(super) ack_due: bool,
     connect_due: Instant,
     connect_backoff: u8,
+    panic_after_unanswered_handshake: Option<Duration>,
+    connect_unanswered: Duration,
     pub(super) close_at: Option<u64>,
     id: PeerId,
 }
@@ -93,6 +95,8 @@ impl Peer {
             ack_due: false,
             connect_due: Instant::ZERO,
             connect_backoff: 0,
+            panic_after_unanswered_handshake: udp.panic_after_unanswered_handshake,
+            connect_unanswered: Duration::ZERO,
             close_at: None,
             id,
         }
@@ -108,6 +112,7 @@ impl Peer {
         self.last_recv = now;
         self.ack_due = false;
         self.connect_backoff = 0;
+        self.connect_unanswered = Duration::ZERO;
         self.close_at = None;
     }
 
@@ -118,6 +123,7 @@ impl Peer {
         self.stream.reset(0);
         self.connect_due = Instant::ZERO;
         self.connect_backoff = 0;
+        self.connect_unanswered = Duration::ZERO;
         self.ack_due = false;
         self.close_at = None;
     }
@@ -207,6 +213,15 @@ impl Peer {
     ) -> SendOutcome {
         if !self.connected {
             if self.role == Role::Initiator && now >= self.connect_due {
+                if let Some(limit) = self.panic_after_unanswered_handshake {
+                    self.connect_unanswered += now.saturating_sub(self.last_send).min(self.max_rto);
+                    assert!(
+                        self.connect_unanswered < limit,
+                        "udp handshake with {} unanswered for {}",
+                        self.addr,
+                        self.connect_unanswered
+                    );
+                }
                 return self.send_hello(socket, ctrl, msg, now);
             }
             return SendOutcome::Done;
