@@ -71,11 +71,16 @@ pub(crate) fn strip_wire_skip(attrs: &[Attribute]) -> Vec<Attribute> {
     attrs.iter().filter(|attr| !attr.path().is_ident("wire_skip")).cloned().collect()
 }
 
+fn is_export_versions(attr: &Attribute) -> bool {
+    attr.path().is_ident("export_versions")
+}
+
 // `#[export_versions]` on the newest version, usually through `final_attrs`,
 // asks for the exported version list; removed before the item is emitted.
 fn take_export_versions(attrs: &mut Vec<Attribute>) -> Option<Attribute> {
-    let at = attrs.iter().position(|attr| attr.path().is_ident("export_versions"))?;
-    Some(attrs.remove(at))
+    let first = attrs.iter().find(|attr| is_export_versions(attr)).cloned();
+    attrs.retain(|attr| !is_export_versions(attr));
+    first
 }
 
 /// `__versions_<wire name>!(path::to::callback, args..)` expands to
@@ -164,14 +169,26 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item: Member>(
     };
     newest.attrs_mut().extend(input.final_attrs.clone());
     let export_versions = take_export_versions(newest.attrs_mut());
-    if let Some(attr) = &export_versions &&
-        (input.roll_into.is_none() || input.wire_skip)
-    {
-        return syn::Error::new_spanned(
-            attr,
-            "export_versions needs roll_into and a wire name, which wire_skip has not",
-        )
-        .to_compile_error();
+    if let Some(attr) = &export_versions {
+        let missing = if input.roll_into.is_none() {
+            Some("export_versions needs roll_into")
+        } else if input.wire_skip {
+            Some("export_versions needs a wire name, which wire_skip removes")
+        } else {
+            None
+        };
+        if let Some(message) = missing {
+            return syn::Error::new_spanned(attr, message).to_compile_error();
+        }
+    }
+    let older = std::iter::once(&input.base as &dyn Named)
+        .chain(input.evolutions.iter().map(|version| version as &dyn Named))
+        .take(input.evolutions.len());
+    for version in older {
+        if let Some(attr) = version.attrs().iter().find(|attr| is_export_versions(attr)) {
+            return syn::Error::new_spanned(attr, "export_versions goes on the newest version")
+                .to_compile_error();
+        }
     }
 
     let versions = std::iter::once(&input.base as &dyn Named)

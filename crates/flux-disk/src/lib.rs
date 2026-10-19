@@ -15,9 +15,9 @@
 //! earlier operation on that file has completed, so a sync covers all earlier
 //! writes and structural changes cannot race them. Truncates, renames, links,
 //! unlinks and directory creations additionally prevent later operations from
-//! starting until they complete. Operations
-//! submitted before the file finished opening are queued and dispatched once
-//! the descriptor is available.
+//! starting until they complete. Operations submitted before the file
+//! finished opening are queued and dispatched once the descriptor is
+//! available.
 
 use std::{
     collections::VecDeque,
