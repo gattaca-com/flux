@@ -103,7 +103,21 @@ mod tests {
             MessageV1 { pub value: u32 }
         });
 
-        assert!(output.contains("export_versions needs roll_into and a wire name"));
+        assert!(output.contains("export_versions needs a wire name"));
+    }
+
+    #[test]
+    fn export_versions_on_an_older_version_is_rejected() {
+        let output = expand(quote! {
+            roll_into Message
+            #[type_hash_lock(hash = 1)]
+            #[export_versions]
+            MessageV1 { pub value: u32 }
+            #[type_hash_lock(hash = 2)]
+            MessageV2 { add { pub accepted: bool = true } }
+        });
+
+        assert!(output.contains("export_versions goes on the newest version"));
     }
 
     #[test]

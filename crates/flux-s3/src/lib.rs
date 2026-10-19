@@ -188,12 +188,11 @@ impl S3 {
         F: for<'r, 'a> FnMut(RequestId, Result<&'r HttpResponse<'a>, Error<'a>>),
     {
         let pool = self.pool.expect("connect before drive");
-        let Self { http, completing, .. } = self;
-        http.drive(net, |event| {
+        self.http.drive(net, |event| {
             if let Some((id, result)) = event.outcome(pool) {
                 let mut result = result.map_err(Error::from).and_then(Error::check);
-                if let Some(at) = completing.iter().position(|&c| c == id) {
-                    completing.swap_remove(at);
+                if let Some(at) = self.completing.iter().position(|&c| c == id) {
+                    self.completing.swap_remove(at);
                     result = result.and_then(Error::check_complete);
                 }
                 handler(id, result);
@@ -295,8 +294,8 @@ impl S3 {
     /// part order, into the object at `key`. S3 can take minutes to answer,
     /// so a request timeout set through [`Self::with_http`] must allow for
     /// it. `NoSuchUpload` means the upload was aborted or has already
-    /// completed, so after a lost connection [`Self::head_object`] tells
-    /// which.
+    /// completed. After a lost connection, [`Self::head_object`] tells which
+    /// only for a key that held no object before, so write to unique keys.
     pub fn complete_multipart_upload<'e>(
         &mut self,
         net: &mut NetworkCore,
