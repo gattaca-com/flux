@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
     Attribute, Expr, Ident, Result,
     parse::{Parse, ParseStream},
@@ -45,6 +45,13 @@ impl<Op> Named for EvolveBlock<Op> {
     }
 }
 
+/// A field or variant of a version, as listed by `#[export_versions]`.
+pub(crate) trait Member {
+    /// Key of the member list in the exported macro.
+    const LIST: &'static str;
+    fn member_name(&self) -> &Ident;
+}
+
 /// Schema-only attributes on fields and variants describe the final,
 /// queryable shape, so they are stripped from every older version's
 /// expansion: only the version carrying the schema derive may name them.
@@ -62,6 +69,46 @@ pub(crate) fn version_wire_skip(attrs: &[Attribute]) -> Option<&Attribute> {
 
 pub(crate) fn strip_wire_skip(attrs: &[Attribute]) -> Vec<Attribute> {
     attrs.iter().filter(|attr| !attr.path().is_ident("wire_skip")).cloned().collect()
+}
+
+// `#[export_versions]` on the newest version, usually through `final_attrs`,
+// asks for the exported version list; removed before the item is emitted.
+fn take_export_versions(attrs: &mut Vec<Attribute>) -> Option<Attribute> {
+    let at = attrs.iter().position(|attr| attr.path().is_ident("export_versions"))?;
+    Some(attrs.remove(at))
+}
+
+/// `__versions_<wire name>!(path::to::callback, args..)` expands to
+/// `callback! { args.. ; name = "..", latest = T, versions = [V1, ..], fields =
+/// [..] }`, `variants` in place of `fields` for an enum. Versions run oldest
+/// first and are bare names, so they resolve where the callback expands;
+/// members are the newest version's, in declaration order.
+fn generate_version_list<Item: Member>(
+    wire_name: &str,
+    versions: &[Ident],
+    members: &[Item],
+) -> TokenStream2 {
+    let suffix: String =
+        wire_name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    let macro_name = format_ident!("__versions_{suffix}");
+    let latest = versions.last().expect("a chain has a version");
+    let list = format_ident!("{}", Item::LIST);
+    let names = members.iter().map(Member::member_name);
+    quote! {
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #macro_name {
+            ($($callback:ident)::+ $(, $($args:tt)*)?) => {
+                $($callback)::+! {
+                    $($($args)*)? ;
+                    name = #wire_name,
+                    latest = #latest,
+                    versions = [#(#versions),*],
+                    #list = [#(#names),*]
+                }
+            };
+        }
+    }
 }
 
 // Reads per-version `#[wire_skip]` markers, reporting redundant markers and
@@ -101,7 +148,7 @@ fn version_skips<B: Named, E: Named>(
     (base, evos)
 }
 
-pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
+pub(crate) fn generate_evolving<B: Named, E: Named, Item: Member>(
     input: &mut EvolveInputGeneric<B, E>,
     generate_base: impl FnOnce(&EvolveInputGeneric<B, E>, bool) -> (TokenStream2, Vec<Item>),
     generate_step: impl Fn(&E, &[Attribute], &[Item], &Ident, bool, bool) -> (TokenStream2, Vec<Item>),
@@ -111,10 +158,20 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
         return syn::Error::new(name.span(), "wire_skip and wire_name are mutually exclusive")
             .to_compile_error();
     }
-    if input.evolutions.is_empty() {
-        input.base.attrs_mut().extend(input.final_attrs.clone());
-    } else if let Some(last) = input.evolutions.last_mut() {
-        last.attrs_mut().extend(input.final_attrs.clone());
+    let newest: &mut dyn Named = match input.evolutions.last_mut() {
+        Some(last) => last,
+        None => &mut input.base,
+    };
+    newest.attrs_mut().extend(input.final_attrs.clone());
+    let export_versions = take_export_versions(newest.attrs_mut());
+    if let Some(attr) = &export_versions &&
+        (input.roll_into.is_none() || input.wire_skip)
+    {
+        return syn::Error::new_spanned(
+            attr,
+            "export_versions needs roll_into and a wire name, which wire_skip has not",
+        )
+        .to_compile_error();
     }
 
     let versions = std::iter::once(&input.base as &dyn Named)
@@ -172,6 +229,11 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
         let mut version_names = vec![input.base.name().clone()];
         for ev in &input.evolutions {
             version_names.push(ev.name().clone());
+        }
+        if export_versions.is_some() {
+            let wire_name =
+                input.wire_name.as_ref().map_or_else(|| roll_name.to_string(), syn::LitStr::value);
+            output.extend(generate_version_list(&wire_name, &version_names, &current));
         }
         let mut skipped = vec![input.wire_skip || base_skipped];
         skipped.extend(evo_skipped.iter().map(|skipped| input.wire_skip || *skipped));

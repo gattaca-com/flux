@@ -52,6 +52,9 @@ use syn::parse_macro_input;
 /// `extra_attrs { ... }` adds attributes to every version after the default
 /// attrs, as in `evolve_struct!`.
 ///
+/// `#[export_versions]` exports the version list as in `evolve_struct!`,
+/// with `variants = [..]` in place of `fields`.
+///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
 /// padding-free `Copy`; it excludes `#[wire_name]`.
 pub fn evolve_enum(input: TokenStream) -> TokenStream {
