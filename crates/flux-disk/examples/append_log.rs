@@ -43,7 +43,8 @@ fn main() {
             DiskEvent::Truncated { .. } |
             DiskEvent::Renamed { .. } |
             DiskEvent::Linked { .. } |
-            DiskEvent::Unlinked { .. } => {
+            DiskEvent::Unlinked { .. } |
+            DiskEvent::DirectoryCreated { .. } => {
                 unreachable!("no reads or structural changes issued in the write phase")
             }
         });
@@ -69,7 +70,8 @@ fn main() {
             DiskEvent::Truncated { .. } |
             DiskEvent::Renamed { .. } |
             DiskEvent::Linked { .. } |
-            DiskEvent::Unlinked { .. } => {
+            DiskEvent::Unlinked { .. } |
+            DiskEvent::DirectoryCreated { .. } => {
                 unreachable!("no writes or syncs issued in the read phase")
             }
         });
