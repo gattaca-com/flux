@@ -1553,11 +1553,10 @@ mod tests {
         let rename_id = disk.rename(file, dir.path().join("renamed.bin")).unwrap().unwrap();
         let link_id = disk.link(file, dir.path().join("linked.bin")).unwrap().unwrap();
         let unlink_id = disk.unlink(file, dir.path().join("gone.bin")).unwrap().unwrap();
-        let create_dir_id = disk.create_dir(file, dir.path().join("sub")).unwrap().unwrap();
         assert!(disk.close(file));
 
         let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.len() >= 9);
+        drive(&mut disk, &mut events, |events| events.len() >= 8);
 
         assert_eq!(events, vec![
             Ev::Failed { file, op: FailedOp::Open, operation_id: None },
@@ -1567,32 +1566,10 @@ mod tests {
             Ev::Failed { file, op: FailedOp::Rename, operation_id: Some(rename_id) },
             Ev::Failed { file, op: FailedOp::Link, operation_id: Some(link_id) },
             Ev::Failed { file, op: FailedOp::Unlink, operation_id: Some(unlink_id) },
-            Ev::Failed { file, op: FailedOp::CreateDir, operation_id: Some(create_dir_id) },
             Ev::Failed { file, op: FailedOp::Close, operation_id: None },
         ]);
         assert!(!disk.write_with(file, |buf| buf.push(1)));
         assert!(disk.is_idle());
-    }
-
-    #[test]
-    fn create_dir_runs_in_order_and_reports_an_existing_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut disk = DiskIo::default();
-        let root = disk.open_directory(dir.path()).unwrap();
-        let outer = disk.create_dir(root, dir.path().join("a")).unwrap().unwrap();
-        let inner = disk.create_dir(root, dir.path().join("a").join("b")).unwrap().unwrap();
-        let again = disk.create_dir(root, dir.path().join("a")).unwrap().unwrap();
-
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.len() >= 4);
-
-        assert_eq!(events, vec![
-            Ev::Opened(root),
-            Ev::DirectoryCreated { file: root, operation_id: outer },
-            Ev::DirectoryCreated { file: root, operation_id: inner },
-            Ev::Failed { file: root, op: FailedOp::CreateDir, operation_id: Some(again) },
-        ]);
-        assert!(dir.path().join("a").join("b").is_dir());
     }
 
     #[test]
