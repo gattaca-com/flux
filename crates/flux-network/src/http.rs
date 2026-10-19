@@ -1175,8 +1175,9 @@ impl HttpNetwork {
     /// [`Self::connect`] or [`Self::connect_tls`]: sends the handshake for
     /// `path`, with up to 16 `headers` such as `Host` or an API key.
     /// [`HttpEvent::WsOpen`] follows, or the connection is dropped and
-    /// redialled, after which the handshake is sent again. Refused for a
-    /// pooled token.
+    /// redialled; the caller sends the handshake again on the next
+    /// [`HttpEvent::Connected`]. No timeout covers the handshake. Refused for
+    /// a pooled token.
     pub fn websocket(
         &mut self,
         net: &mut NetworkCore,
