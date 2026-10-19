@@ -51,6 +51,14 @@ use syn::parse_macro_input;
 /// `extra_attrs { ... }` adds attributes to every version after the default
 /// attrs, so callers can extend the defaults without restating them.
 ///
+/// `#[export_versions]` on the newest version, or in `final_attrs`, needs
+/// `roll_into` and a wire name, and exports `__versions_<wire name>!` with
+/// every character outside `[A-Za-z0-9]` as `_`: `__versions_A_B!(path::cb,
+/// args..)` expands to `path::cb! { args.. ; name = "A.B", latest = T,
+/// versions = [TV1, TV2], fields = [a, b] }`, so another crate can generate
+/// code over the chain. Versions run oldest first as bare names, resolved
+/// where `path::cb!` expands; fields are the newest version's.
+///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
 /// padding-free `Copy`; it excludes `#[wire_name]`.
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
@@ -83,6 +91,19 @@ mod tests {
 
         assert!(output.contains("MessageV2 is missing a type hash lock"));
         assert!(output.contains("#[type_hash_lock(hash = 0)]"));
+    }
+
+    #[test]
+    fn export_versions_needs_a_wire_name() {
+        let output = expand(quote! {
+            #[wire_skip]
+            roll_into Message
+            final_attrs { #[export_versions] }
+            #[type_hash_lock(hash = 1)]
+            MessageV1 { pub value: u32 }
+        });
+
+        assert!(output.contains("export_versions needs roll_into and a wire name"));
     }
 
     #[test]
