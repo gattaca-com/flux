@@ -53,7 +53,7 @@ fn serve(listener: &std::net::TcpListener, response: &'static [u8], stop: &Atomi
     }
 }
 
-fn client_allocs(response: &'static [u8]) -> u64 {
+fn client_allocs(response: &'static [u8], body: &[u8]) -> u64 {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -62,7 +62,7 @@ fn client_allocs(response: &'static [u8]) -> u64 {
         thread::spawn(move || serve(&listener, response, &stop))
     };
     let mut net = Network::default();
-    let mut http = HttpNetwork::default();
+    let mut http = HttpNetwork::default().with_max_body_bytes(4 << 20);
     let pool = http.pool(&mut net, addr, 1);
     let mut counted = 0;
     for i in 0..200 {
@@ -76,7 +76,7 @@ fn client_allocs(response: &'static [u8]) -> u64 {
             });
             http.drive(&mut net, |e| {
                 if let Some((_, Ok(response))) = e.outcome(pool) {
-                    body_ok = response.body == b"hello";
+                    body_ok = response.body == body;
                 }
             });
         }
@@ -92,11 +92,22 @@ fn client_allocs(response: &'static [u8]) -> u64 {
 
 #[test]
 fn warm_pooled_requests_do_not_allocate() {
-    assert_eq!(client_allocs(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"), 0);
+    assert_eq!(client_allocs(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", b"hello"), 0);
 }
 
 #[test]
 fn warm_chunked_responses_do_not_allocate() {
     let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-    assert_eq!(client_allocs(response), 0);
+    assert_eq!(client_allocs(response, b"hello"), 0);
+}
+
+#[test]
+fn warm_large_responses_do_not_allocate() {
+    // Past the size an accepted connection's buffer is released at: a client keeps
+    // its own.
+    let body = vec![7; 2 << 20];
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+    response.extend_from_slice(&body);
+    assert_eq!(client_allocs(response.leak(), &body), 0);
 }

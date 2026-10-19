@@ -257,3 +257,34 @@ fn server_reassembles_fragments_and_closes_on_violations() {
         assert_eq!(read_until(&mut net, &mut http, &mut seen, &mut stream, usize::MAX), close);
     }
 }
+
+#[test]
+fn upgrade_takes_the_body_limit_and_messages_their_own() {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut http =
+        HttpNetwork::default().with_max_body_bytes(1024).with_max_ws_message_bytes(MAX_BODY);
+    http.listen(&mut net, addr).unwrap();
+    let mut seen = Seen::default();
+
+    // An upgrade with a body past the request limit is refused before anyone
+    // authenticates it.
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_nonblocking(true).unwrap();
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Content-Length: 4096\r\n\r\n",
+        )
+        .unwrap();
+    let got = read_until(&mut net, &mut http, &mut seen, &mut stream, usize::MAX);
+    assert!(got.starts_with(b"HTTP/1.1 413"), "{}", String::from_utf8_lossy(&got));
+
+    // Once upgraded, a message past the request limit is taken up to its own.
+    let mut stream = raw_client(&mut net, &mut http, &mut seen, addr);
+    let big = vec![7; 100 * 1024];
+    stream.write_all(&frame(true, 0x2, &big, Some([1, 2, 3, 4]))).unwrap();
+    let echo = frame(true, 0x2, &big, None);
+    assert_eq!(read_until(&mut net, &mut http, &mut seen, &mut stream, echo.len()), echo);
+}
