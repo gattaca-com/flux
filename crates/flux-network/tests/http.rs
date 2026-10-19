@@ -220,6 +220,40 @@ fn connection_close_large_body() {
 }
 
 #[test]
+fn too_many_headers_431() {
+    for (headers, status) in [(64, "200"), (65, "431")] {
+        let (mut net, mut server, addr) = server();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut request = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 1..headers {
+            request.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        request.extend_from_slice(b"Connection: close\r\n\r\n");
+        client.write_all(&request).unwrap();
+        let mut received = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline && !read_available(&mut client, &mut received) {
+            let mut tokens = Vec::new();
+            poll(&mut net, &mut server, |e| {
+                if let HttpEvent::Request { token, .. } = e {
+                    tokens.push(token);
+                }
+            });
+            for token in tokens {
+                server.respond(&mut net, token, 200, &[], b"");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let received = std::str::from_utf8(&received).unwrap();
+        assert!(
+            received.starts_with(&format!("HTTP/1.1 {status}")),
+            "{headers} headers: {received}"
+        );
+    }
+}
+
+#[test]
 fn limits_and_errors() {
     for (request, status) in [
         (b"GET / HTTP/1.1\r\nX: 1234567890123456789012345678901234567890123456789012345678901234\r\n\r\n".as_slice(), 431),
