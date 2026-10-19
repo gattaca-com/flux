@@ -5,8 +5,8 @@
 //! server holding the secret. Point it at `MinIO`, `SeaweedFS`, or a real
 //! bucket by setting `S3_ENDPOINT` (host:port), `S3_ACCESS_KEY`,
 //! `S3_SECRET_KEY`, and `S3_BUCKET`, then run the test with `--ignored`.
-//! Set `S3_TLS=1` for an HTTPS endpoint and `S3_REGION` when it is not
-//! `us-east-1`.
+//! Set `S3_TLS=1` for an HTTPS endpoint, `S3_REGION` when it is not
+//! `us-east-1`, and `S3_SESSION_TOKEN` with temporary credentials.
 
 use std::{
     net::{SocketAddr, ToSocketAddrs},
@@ -15,7 +15,7 @@ use std::{
 };
 
 use flux_network::Network;
-use flux_s3::{Error, RequestId, S3};
+use flux_s3::{Error, RequestId, S3, upload_id};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Exercises segment encoding: a space, a '+', and a '/' separator.
@@ -27,8 +27,12 @@ fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set for this test"))
 }
 
-/// Drives the network until `id` completes, returning its body.
-fn settle(net: &mut Network, s3: &mut S3, id: RequestId) -> Result<Vec<u8>, String> {
+/// Drives the network until `id` completes, returning its body and `ETag`.
+fn settle(
+    net: &mut Network,
+    s3: &mut S3,
+    id: RequestId,
+) -> Result<(Vec<u8>, Option<String>), String> {
     let mut outcome = None;
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline && outcome.is_none() {
@@ -38,7 +42,10 @@ fn settle(net: &mut Network, s3: &mut S3, id: RequestId) -> Result<Vec<u8>, Stri
         s3.drive(net, |done, result| {
             assert_eq!(done, id);
             outcome = Some(match result {
-                Ok(body) => Ok(body.to_vec()),
+                Ok(response) => Ok((
+                    response.body.to_vec(),
+                    response.header("etag").map(|etag| String::from_utf8_lossy(etag).into_owned()),
+                )),
                 Err(Error::Server { status, code, message }) => {
                     Err(format!("{status} {code:?}: {}", String::from_utf8_lossy(message)))
                 }
@@ -50,7 +57,7 @@ fn settle(net: &mut Network, s3: &mut S3, id: RequestId) -> Result<Vec<u8>, Stri
     outcome.expect("the request never completed")
 }
 
-fn ok(net: &mut Network, s3: &mut S3, id: RequestId) -> Vec<u8> {
+fn ok(net: &mut Network, s3: &mut S3, id: RequestId) -> (Vec<u8>, Option<String>) {
     settle(net, s3, id).unwrap_or_else(|error| panic!("{error}"))
 }
 
@@ -75,8 +82,9 @@ fn signed_round_trip() {
         S3::new(addr, 1)
     }
     .with_region(&region)
-    .with_credentials(&var("S3_ACCESS_KEY"), &var("S3_SECRET_KEY"))
     .with_http(|http| http.with_max_body_bytes(8 << 20));
+    let session_token = std::env::var("S3_SESSION_TOKEN").ok();
+    s3.set_credentials(&var("S3_ACCESS_KEY"), &var("S3_SECRET_KEY"), session_token.as_deref());
     s3.connect(&mut net);
 
     let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
@@ -84,10 +92,10 @@ fn signed_round_trip() {
     ok(&mut net, &mut s3, id);
 
     let id = s3.get_object(&mut net, &bucket, KEY).unwrap();
-    assert_eq!(ok(&mut net, &mut s3, id), body);
+    assert_eq!(ok(&mut net, &mut s3, id).0, body);
 
     let id = s3.list_objects(&mut net, &bucket, Some(PREFIX), None).unwrap();
-    let listing = String::from_utf8(ok(&mut net, &mut s3, id)).unwrap();
+    let listing = String::from_utf8(ok(&mut net, &mut s3, id).0).unwrap();
     assert!(listing.contains("nested key+1.bin"), "{listing}");
 
     let id = s3.delete_object(&mut net, &bucket, KEY).unwrap();
@@ -95,5 +103,35 @@ fn signed_round_trip() {
 
     let id = s3.get_object(&mut net, &bucket, KEY).unwrap();
     let error = settle(&mut net, &mut s3, id).expect_err("the deleted object is still readable");
+    assert!(error.starts_with("404 "), "{error}");
+
+    // Parts below 5 MiB are refused, so the first is exactly the minimum.
+    let first: Vec<u8> = (0..5 << 20).map(|i| (i % 253) as u8).collect();
+    let id = s3.create_multipart_upload(&mut net, &bucket, KEY).unwrap();
+    let initiated = ok(&mut net, &mut s3, id).0;
+    let upload = upload_id(&initiated).unwrap().to_owned();
+    let mut etags = Vec::new();
+    for (part_number, part) in [(1, first.as_slice()), (2, body.as_slice())] {
+        let id = s3.upload_part(&mut net, &bucket, KEY, &upload, part_number, part).unwrap();
+        etags.push((part_number, ok(&mut net, &mut s3, id).1.expect("a part has an ETag")));
+    }
+    let parts = etags.iter().map(|(part_number, etag)| (*part_number, etag.as_str()));
+    let id = s3.complete_multipart_upload(&mut net, &bucket, KEY, &upload, parts).unwrap();
+    ok(&mut net, &mut s3, id);
+
+    let id = s3.head_object(&mut net, &bucket, KEY).unwrap();
+    assert!(ok(&mut net, &mut s3, id).1.is_some_and(|etag| etag.ends_with("-2\"")));
+    let id = s3.delete_object(&mut net, &bucket, KEY).unwrap();
+    ok(&mut net, &mut s3, id);
+
+    let id = s3.create_multipart_upload(&mut net, &bucket, KEY).unwrap();
+    let initiated = ok(&mut net, &mut s3, id).0;
+    let upload = upload_id(&initiated).unwrap().to_owned();
+    let id = s3.upload_part(&mut net, &bucket, KEY, &upload, 1, &body).unwrap();
+    ok(&mut net, &mut s3, id);
+    let id = s3.abort_multipart_upload(&mut net, &bucket, KEY, &upload).unwrap();
+    ok(&mut net, &mut s3, id);
+    let id = s3.head_object(&mut net, &bucket, KEY).unwrap();
+    let error = settle(&mut net, &mut s3, id).expect_err("an aborted upload left an object");
     assert!(error.starts_with("404 "), "{error}");
 }
