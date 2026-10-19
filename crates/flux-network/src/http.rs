@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::{
     collections::VecDeque,
     io::{self, IoSlice, Write as _},
+    mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
 };
 
@@ -59,18 +60,25 @@ use crate::{
     websocket::{self, Ws, WsKind},
 };
 
-/// Header slots parsed on the stack, hyper's default limit; a larger
-/// `max_headers` falls back to the heap.
-const STACK_HEADERS: usize = 100;
+/// Header slots parsed on the stack; a larger `max_headers` falls back to the
+/// heap.
+const STACK_HEADERS: usize = 64;
+/// As [`STACK_HEADERS`] for requests, whose slots are not zeroed.
+const REQUEST_STACK_HEADERS: usize = 128;
 /// Request head buffers kept for reuse once their request completes.
 const SPARE_HEADS: usize = 64;
 const MAX_BODY_PARTS: usize = 16;
 
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
+/// An accepted connection's receive buffer, or a reassembled WebSocket
+/// message, grown past this is released once empty, so one large message from
+/// an untrusted peer doesn't pin its size for the connection's lifetime.
+/// Outbound connections keep theirs, so large answers don't reallocate.
+const KEEP_BUF_BYTES: usize = 1024 * 1024;
 
-/// Callers match with a wildcard arm, so adding an event is not a breaking
-/// change.
+/// Callers outside this crate need a wildcard arm, so later events are not a
+/// breaking change.
 #[non_exhaustive]
 pub enum HttpEvent<'a> {
     Accepted {
@@ -220,6 +228,8 @@ struct Conn {
     dirty: bool,
     over_limit: bool,
     last_activity: Instant,
+    /// Unsent bytes at the last idle sweep; less since then counts as activity.
+    unsent: usize,
     role: Role,
     /// Set while a streaming request owns this connection.
     stream: Option<Stream>,
@@ -255,8 +265,14 @@ pub struct HttpNetwork {
     name: &'static str,
     max_head_bytes: usize,
     max_body_bytes: usize,
+    /// `None`: as `max_body_bytes`.
+    max_ws_message_bytes: Option<usize>,
+    /// `None`: a full-size request or message, see `group`.
+    max_send_backlog_bytes: Option<usize>,
     max_headers: usize,
     idle_timeout: Option<Duration>,
+    /// The last idle sweep, which runs about once a second.
+    swept_at: Instant,
     socket_buf_size: Option<usize>,
     listeners: Vec<Token>,
     conns: Vec<Conn>,
@@ -280,8 +296,11 @@ impl Default for HttpNetwork {
             name: "http",
             max_head_bytes: 16 * 1024,
             max_body_bytes: 1024 * 1024,
+            max_ws_message_bytes: None,
+            max_send_backlog_bytes: None,
             max_headers: 64,
             idle_timeout: Some(Duration::from_secs(30)),
+            swept_at: Instant::now(),
             socket_buf_size: None,
             listeners: Vec::new(),
             conns: Vec::new(),
@@ -312,10 +331,27 @@ impl HttpNetwork {
         self.max_head_bytes = max_head_bytes;
         self
     }
-    /// Sets the maximum message body size before rejecting it.
+    /// Sets the maximum message body size before rejecting it. It bounds
+    /// requests, a WebSocket upgrade's included, and WebSocket messages unless
+    /// [`Self::with_max_ws_message_bytes`] sets their own.
     pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.max_body_bytes = max_body_bytes;
+        self
+    }
+    /// Sets the largest WebSocket message, after an upgrade, so a server can
+    /// take large messages while keeping the request bodies it buffers before
+    /// any authentication small.
+    pub fn with_max_ws_message_bytes(mut self, max_ws_message_bytes: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_ws_message_bytes = Some(max_ws_message_bytes);
+        self
+    }
+    /// Sets the unsent bytes past which a connection is dropped, for a server
+    /// whose answers can outgrow the requests it takes.
+    pub fn with_max_send_backlog_bytes(mut self, max_send_backlog_bytes: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_send_backlog_bytes = Some(max_send_backlog_bytes);
         self
     }
     /// Sets the maximum number of request headers accepted.
@@ -330,8 +366,10 @@ impl HttpNetwork {
         self.socket_buf_size = Some(socket_buf_size);
         self
     }
-    /// Sets the idle timeout for accepted connections; outbound endpoints
-    /// remain persistent.
+    /// Sets the idle timeout for accepted connections, but not for one whose
+    /// request awaits its response or an open WebSocket; outbound endpoints
+    /// remain persistent. An answer still leaving counts as activity, so a
+    /// client that stopped reading is closed while a slow one is not.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.idle_timeout = Some(idle_timeout);
@@ -378,15 +416,9 @@ impl HttpNetwork {
         self.max_body_bytes
     }
     fn group(&mut self, net: &mut NetworkCore) -> Group {
-        let Self {
-            group,
-            name,
-            max_head_bytes,
-            max_body_bytes,
-            socket_buf_size,
-            reconnect_interval,
-            ..
-        } = self;
+        let max_body_bytes = self.max_body_bytes.max(self.ws_max());
+        let max_send_backlog_bytes = self.max_send_backlog_bytes;
+        let Self { group, name, max_head_bytes, socket_buf_size, reconnect_interval, .. } = self;
         *group.get_or_insert_with(|| {
             let defaults = TcpGroupConfig::default();
             net.add_group(TcpGroupConfig {
@@ -400,9 +432,9 @@ impl HttpNetwork {
                 // TLS endpoint: a record adds a header and a tag per 16KB.
                 // The margin keeps a full-size request from tripping the cap
                 // on its own overhead.
-                max_backlog_bytes: Some(
-                    max_head_bytes.saturating_add(*max_body_bytes).saturating_add(TLS_MARGIN_BYTES),
-                ),
+                max_backlog_bytes: Some(max_send_backlog_bytes.unwrap_or_else(|| {
+                    max_head_bytes.saturating_add(max_body_bytes).saturating_add(TLS_MARGIN_BYTES)
+                })),
                 backlog_warn_bytes: None,
                 ..Default::default()
             })
@@ -435,6 +467,7 @@ impl HttpNetwork {
                     dirty: false,
                     over_limit: false,
                     last_activity: Instant::now(),
+                    unsent: 0,
                     role: Role::Accepted {
                         state: State::Idle,
                         close: false,
@@ -453,11 +486,13 @@ impl HttpNetwork {
             NetworkEvent::Message { group: event_group, token, payload, .. }
                 if event_group == group =>
             {
-                let limit = self.buffer_limit();
+                let (limit, ws_limit) =
+                    (self.buffer_limit(), self.max_head_bytes.saturating_add(self.ws_max()));
                 if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
                     !conn.role.is_draining() &&
                     !conn.over_limit
                 {
+                    let limit = if conn.ws.is_some() { ws_limit } else { limit };
                     let available = limit.saturating_sub(conn.buf.len());
                     if payload.len() > available {
                         conn.buf.extend_from_slice(&payload[..available]);
@@ -499,18 +534,29 @@ impl HttpNetwork {
                 conn.over_limit = false;
             }
         }
-        if let Some(timeout) = self.idle_timeout {
-            let expired: Vec<_> = self
-                .conns
-                .iter()
-                .filter(|conn| {
-                    // A WebSocket may sit quiet for long; the application pings it if it cares.
-                    matches!(conn.role, Role::Accepted { .. }) &&
-                        conn.ws.is_none() &&
-                        conn.last_activity.elapsed() >= timeout
-                })
-                .map(|conn| conn.token)
-                .collect();
+        if let Some(timeout) = self.idle_timeout &&
+            self.swept_at.elapsed() >= timeout.min(Duration::from_secs(1))
+        {
+            self.swept_at = Instant::now();
+            let mut expired = Vec::new();
+            for conn in &mut self.conns {
+                // A WebSocket may sit quiet for long; the application pings it if it cares.
+                if !matches!(conn.role, Role::Accepted { .. }) || conn.ws.is_some() {
+                    continue
+                }
+                // An answer still leaving is activity; one whose client stopped reading is not.
+                let unsent = net.queued_bytes(conn.token);
+                if unsent < conn.unsent {
+                    conn.last_activity = Instant::now();
+                }
+                conn.unsent = unsent;
+                // A request still owed its response is the application's to time out.
+                if !matches!(conn.role.accepted_state(), State::Pending) &&
+                    conn.last_activity.elapsed() >= timeout
+                {
+                    expired.push(conn.token);
+                }
+            }
             for token in expired {
                 net.disconnect(token);
             }
@@ -613,6 +659,20 @@ impl HttpNetwork {
         } else {
             self.parse_outbound(net, i, handler);
         }
+        let Some(conn) =
+            self.conns.get_mut(i).filter(|conn| matches!(conn.role, Role::Accepted { .. }))
+        else {
+            return
+        };
+        if conn.buf.is_empty() && conn.buf.capacity() > KEEP_BUF_BYTES {
+            conn.buf = Vec::new();
+        }
+        if let Some(ws) = conn.ws.as_mut() &&
+            ws.fragmented.is_none() &&
+            ws.message.capacity() > KEEP_BUF_BYTES
+        {
+            ws.message = Vec::new();
+        }
     }
     pub fn connect(&mut self, net: &mut NetworkCore, addr: SocketAddr) -> Token {
         let group = self.group(net);
@@ -658,6 +718,7 @@ impl HttpNetwork {
             dirty: false,
             over_limit: false,
             last_activity: Instant::now(),
+            unsent: 0,
             role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
             stream: None,
             ws: None,
@@ -730,6 +791,17 @@ impl HttpNetwork {
             next_seq: 0,
         });
         pool
+    }
+    /// Drops every connection, listener and pool but keeps the network's group
+    /// for what opens next: a replaced network leaves its group behind in
+    /// `net`, which never shrinks. Unanswered requests drop without events.
+    pub fn clear(&mut self, net: &mut NetworkCore) {
+        for token in self.listeners.drain(..).chain(self.conns.drain(..).map(|conn| conn.token)) {
+            net.remove(token);
+        }
+        self.pools.clear();
+        self.lifecycle.clear();
+        self.failed.clear();
     }
     /// Removes every listener, connection and outbound endpoint; pending
     /// requests and responses are dropped without events.
@@ -957,6 +1029,9 @@ impl HttpNetwork {
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
     }
+    fn ws_max(&self) -> usize {
+        self.max_ws_message_bytes.unwrap_or(self.max_body_bytes)
+    }
     fn parse_and_emit<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
@@ -966,11 +1041,19 @@ impl HttpNetwork {
         }
         let over_limit = self.conns[i].over_limit;
         let buf = &self.conns[i].buf;
-        let (mut stack_slots, mut heap_slots) =
-            ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
-        let hs = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
-        let mut req = httparse::Request::new(hs);
-        let state = match req.parse(buf) {
+        // Left uninitialised, so a server taking up to this many headers neither zeroes
+        // nor allocates its slots.
+        let mut stack_slots = [MaybeUninit::uninit(); REQUEST_STACK_HEADERS];
+        let mut heap_slots = Vec::new();
+        let mut req = httparse::Request::new(&mut []);
+        let parsed = if let Some(slots) = stack_slots.get_mut(..self.max_headers) {
+            req.parse_with_uninit_headers(buf, slots)
+        } else {
+            heap_slots.resize(self.max_headers, httparse::EMPTY_HEADER);
+            req.headers = &mut heap_slots;
+            req.parse(buf)
+        };
+        let state = match parsed {
             Ok(state) => state,
             // As hyper answers more headers than it takes.
             Err(httparse::Error::TooManyHeaders) => {
@@ -1097,6 +1180,8 @@ impl HttpNetwork {
         let suppress_body =
             self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
+        // The idle timeout runs from the answer, not from a request answered late.
+        self.conns[i].last_activity = Instant::now();
         let ok = net.send_with(token, |out| {
             out.extend_from_slice(b"HTTP/1.1 ");
             write_decimal(out, usize::from(status));
@@ -1282,7 +1367,7 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        let max = self.max_body_bytes;
+        let max = self.ws_max();
         let client = matches!(self.conns[i].role, Role::Outbound { .. });
         let Conn { token, buf, ws, dirty, .. } = &mut self.conns[i];
         let (token, Some(ws)) = (*token, ws.as_mut()) else { return };
