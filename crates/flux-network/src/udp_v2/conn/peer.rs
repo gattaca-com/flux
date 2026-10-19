@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 
-use flux_communication::Timer;
 use flux_timing::{Duration, Instant, Nanos};
 use mio::{Token, net::UdpSocket};
 use tracing::debug;
@@ -9,8 +8,14 @@ use super::wire::{self, ACK_HEADER, RESET_SIZE};
 use crate::{
     network::UdpGroupConfigV2,
     udp_v2::{
-        SendOutcome, inbound::Inbound, latency_timer, new_session, outbound::Outbound,
-        send_datagram, stream::Stream, wire::Packet,
+        SendOutcome,
+        inbound::Inbound,
+        new_session,
+        outbound::Outbound,
+        send_datagram,
+        stream::Stream,
+        telemetry::{PeerId, Telemetry},
+        wire::Packet,
     },
 };
 
@@ -47,7 +52,7 @@ pub(super) struct Peer {
     connect_due: Instant,
     connect_backoff: u8,
     pub(super) close_at: Option<u64>,
-    latency: Option<Timer>,
+    id: PeerId,
 }
 
 impl Peer {
@@ -61,7 +66,7 @@ impl Peer {
         now: Instant,
     ) -> Self {
         let udp = config.udp;
-        let label = format!("{}_{}_{addr}", config.name, token.0);
+        let id = PeerId::new(token, addr);
         Self {
             addr,
             token,
@@ -71,7 +76,7 @@ impl Peer {
             session,
             remote_session: 0,
             stream: Stream::new(&udp, wire::PACKET, 0),
-            out: Outbound::new(addr, 0, &udp, config.telemetry, &label),
+            out: Outbound::new(addr, 0, &udp, id),
             inbound: Inbound::new(
                 udp.recv_window,
                 udp.max_datagram_size,
@@ -89,7 +94,7 @@ impl Peer {
             connect_due: Instant::ZERO,
             connect_backoff: 0,
             close_at: None,
-            latency: latency_timer(config.telemetry, &label),
+            id,
         }
     }
 
@@ -160,12 +165,14 @@ impl Peer {
         send_datagram(socket, self.addr, &ctrl[..n])
     }
 
-    pub(super) fn on_packet(&mut self, packet: Packet<'_>, deliver: &mut dyn FnMut(&[u8], Nanos)) {
-        let latency = &mut self.latency;
+    pub(super) fn on_packet(
+        &mut self,
+        packet: Packet<'_>,
+        telemetry: &mut Telemetry,
+        deliver: &mut dyn FnMut(&[u8], Nanos),
+    ) {
         let received = self.inbound.receive(packet, &mut |bytes, send_ts| {
-            if let Some(t) = latency {
-                t.emit_latency_from_nanos(Nanos(send_ts), Nanos::now());
-            }
+            telemetry.latency(self.id, Nanos(send_ts));
             deliver(bytes, Nanos(send_ts));
         });
         match received {

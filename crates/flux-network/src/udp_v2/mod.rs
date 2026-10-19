@@ -11,7 +11,6 @@ use std::{
     os::fd::AsRawFd,
 };
 
-use flux_communication::Timer;
 use flux_timing::{Instant, Nanos};
 use flux_utils::DCache;
 use mio::{Interest, Registry, Token, net::UdpSocket};
@@ -22,14 +21,14 @@ mod inbound;
 mod outbound;
 mod stream;
 mod sys;
+mod telemetry;
 mod wire;
 
 pub(crate) use conn::UdpManager;
-pub use outbound::{UdpRetransmit, UdpSend};
 use sys::{RecvBatch, SendBatch};
+pub use telemetry::{PeerId, TelemetryEvent, TelemetryReader, UdpLatency, UdpRetransmit, UdpSend};
 
 use crate::{
-    NetworkTelemetry,
     network::{RxPayload, UdpGroupConfigV2, set_socket_buf_size},
     udp::UdpConfig,
 };
@@ -90,14 +89,8 @@ fn validate(udp: &UdpConfig) {
     assert!(udp.min_rto <= udp.max_rto, "udp min_rto exceeds max_rto");
 }
 
-pub(crate) fn latency_timer(telemetry: NetworkTelemetry, label: &str) -> Option<Timer> {
-    let NetworkTelemetry::Enabled { app_name } = telemetry else { return None };
-    Some(Timer::new(app_name, format!("udp_latency_{label}")))
-}
-
 #[inline]
 pub(crate) fn deliver_message<F>(
-    latency: &mut Option<Timer>,
     bytes: &[u8],
     send_ts: Nanos,
     dcache: Option<&DCache>,
@@ -105,9 +98,6 @@ pub(crate) fn deliver_message<F>(
 ) where
     F: FnMut(RxPayload<'_>, Nanos),
 {
-    if let Some(t) = latency {
-        t.emit_latency_from_nanos(send_ts, Nanos::now());
-    }
     match dcache {
         None => deliver(RxPayload::Raw(bytes), send_ts),
         Some(dc) => match dc.write(bytes.len(), |buf| buf.copy_from_slice(bytes)) {
