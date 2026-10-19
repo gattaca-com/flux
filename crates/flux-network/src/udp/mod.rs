@@ -57,6 +57,7 @@ pub struct UdpConfig {
     /// other side can tell it is alive. Peer death is detected by the
     /// connector's user timeout.
     pub heartbeat_interval: Duration,
+    pub panic_after_unanswered_handshake: Option<Duration>,
     /// Off: no retransmits, no per-datagram acks; a datagram is done once the
     /// kernel takes it and the receiver drops whatever a lost fragment leaves
     /// incomplete. Acks still flow at `heartbeat_interval` for liveness. Both
@@ -76,6 +77,7 @@ impl Default for UdpConfig {
             min_rto: Duration::from_micros(500),
             max_rto: Duration::from_secs(1),
             heartbeat_interval: Duration::from_millis(250),
+            panic_after_unanswered_handshake: Some(Duration::from_secs(60)),
             reliable: true,
         }
     }
