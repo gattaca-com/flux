@@ -502,7 +502,6 @@ impl<const N: usize> core::fmt::Display for ArrayStr<N> {
     }
 }
 
-/// Keeps the longest prefix that fits, then errors so formatting stops.
 impl<const N: usize> core::fmt::Write for ArrayStr<N> {
     #[inline]
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
