@@ -502,6 +502,16 @@ impl<const N: usize> core::fmt::Display for ArrayStr<N> {
     }
 }
 
+/// Keeps the longest prefix that fits, then errors so formatting stops.
+impl<const N: usize> core::fmt::Write for ArrayStr<N> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let fits = s.len() <= N - self.len;
+        self.push_str_truncate(s);
+        if fits { Ok(()) } else { Err(core::fmt::Error) }
+    }
+}
+
 impl<const N: usize> core::fmt::Debug for ArrayStr<N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "\"{}\"", self.as_str())
@@ -920,6 +930,16 @@ mod tests {
             let s = ArrayStr::<16>::from_str_truncate("test");
             let formatted = format!("{s}");
             assert_eq!(formatted, "test");
+        }
+
+        #[test]
+        fn write_truncates_on_overflow() {
+            use core::fmt::Write;
+
+            let mut s = ArrayStr::<8>::new();
+            assert!(write!(s, "{}-{}", 12, 34).is_ok());
+            assert!(write!(s, "{}", 56789).is_err());
+            assert_eq!(s.as_str(), "12-34567");
         }
 
         #[test]
