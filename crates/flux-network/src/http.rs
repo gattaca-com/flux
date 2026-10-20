@@ -36,35 +36,50 @@
 //! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
-//! Server-side TLS, HTTP/2, compression, trailer exposure, upgrades, and
-//! `WebSockets` are not supported. Valid response trailers are parsed and
-//! discarded. There is no half-close support. After an error response, the
-//! connection closes without a lingering-close delay. Pipelined requests are
-//! served strictly one at a time per connection.
+//! Server-side TLS, HTTP/2, compression, trailer exposure and upgrades other
+//! than `WebSocket` (see [`HttpNetwork::accept_websocket`] and
+//! [`HttpNetwork::websocket`]) are not supported. Valid response trailers are
+//! parsed and discarded. There is no half-close support. After an error
+//! response, the connection closes without a lingering-close delay. Pipelined
+//! requests are served strictly one at a time per connection.
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
 use std::{
     collections::VecDeque,
     io::{self, IoSlice, Write as _},
+    mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
 };
 
 use flux_timing::{Duration, Instant};
 use mio::Token;
 
-use crate::{Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig};
+use crate::{
+    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
+    websocket::{self, Ws, WsKind},
+};
 
 /// Header slots parsed on the stack; a larger `max_headers` falls back to the
 /// heap.
 const STACK_HEADERS: usize = 64;
+/// As [`STACK_HEADERS`] for requests, whose slots are not zeroed.
+const REQUEST_STACK_HEADERS: usize = 128;
 /// Request head buffers kept for reuse once their request completes.
 const SPARE_HEADS: usize = 64;
 const MAX_BODY_PARTS: usize = 16;
 
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
+/// An accepted connection's receive buffer, or a reassembled WebSocket
+/// message, grown past this is released once empty, so one large message from
+/// an untrusted peer doesn't pin its size for the connection's lifetime.
+/// Outbound connections keep theirs, so large answers don't reallocate.
+const KEEP_BUF_BYTES: usize = 1024 * 1024;
 
+/// Callers outside this crate need a wildcard arm, so later events are not a
+/// breaking change.
+#[non_exhaustive]
 pub enum HttpEvent<'a> {
     Accepted {
         token: Token,
@@ -103,6 +118,23 @@ pub enum HttpEvent<'a> {
     StreamEnd {
         token: Token,
         reason: StreamEnd,
+    },
+    /// A client handshake was answered; the connection now speaks WebSocket.
+    WsOpen {
+        token: Token,
+    },
+    /// A whole text or binary message, or a ping (already answered) or pong,
+    /// borrowed for the callback.
+    WsMessage {
+        token: Token,
+        kind: WsKind,
+        payload: &'a [u8],
+    },
+    /// The peer's close frame: its status code and reason, if any. It is
+    /// already echoed, and the connection drops once that is written.
+    WsClose {
+        token: Token,
+        payload: &'a [u8],
     },
 }
 
@@ -196,9 +228,17 @@ struct Conn {
     dirty: bool,
     over_limit: bool,
     last_activity: Instant,
+    /// Unsent bytes at the last idle sweep; less since then counts as activity.
+    unsent: usize,
     role: Role,
     /// Set while a streaming request owns this connection.
     stream: Option<Stream>,
+    /// Set once the connection speaks WebSocket, or while a client handshake
+    /// waits.
+    ws: Option<Ws>,
+    /// The `Sec-WebSocket-Accept` for the pending request, when it asks to
+    /// upgrade.
+    upgrade: Option<[u8; 28]>,
 }
 
 /// A streaming request; `body` is set once its head has been delivered.
@@ -225,8 +265,14 @@ pub struct HttpNetwork {
     name: &'static str,
     max_head_bytes: usize,
     max_body_bytes: usize,
+    /// `None`: as `max_body_bytes`.
+    max_ws_message_bytes: Option<usize>,
+    /// `None`: a full-size request or message, see `group`.
+    max_send_backlog_bytes: Option<usize>,
     max_headers: usize,
     idle_timeout: Option<Duration>,
+    /// The last idle sweep, which runs about once a second.
+    swept_at: Instant,
     socket_buf_size: Option<usize>,
     listeners: Vec<Token>,
     conns: Vec<Conn>,
@@ -250,8 +296,11 @@ impl Default for HttpNetwork {
             name: "http",
             max_head_bytes: 16 * 1024,
             max_body_bytes: 1024 * 1024,
+            max_ws_message_bytes: None,
+            max_send_backlog_bytes: None,
             max_headers: 64,
             idle_timeout: Some(Duration::from_secs(30)),
+            swept_at: Instant::now(),
             socket_buf_size: None,
             listeners: Vec::new(),
             conns: Vec::new(),
@@ -282,10 +331,27 @@ impl HttpNetwork {
         self.max_head_bytes = max_head_bytes;
         self
     }
-    /// Sets the maximum message body size before rejecting it.
+    /// Sets the maximum message body size before rejecting it. It bounds
+    /// requests, a WebSocket upgrade's included, and WebSocket messages unless
+    /// [`Self::with_max_ws_message_bytes`] sets their own.
     pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.max_body_bytes = max_body_bytes;
+        self
+    }
+    /// Sets the largest WebSocket message, after an upgrade, so a server can
+    /// take large messages while keeping the request bodies it buffers before
+    /// any authentication small.
+    pub fn with_max_ws_message_bytes(mut self, max_ws_message_bytes: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_ws_message_bytes = Some(max_ws_message_bytes);
+        self
+    }
+    /// Sets the unsent bytes past which a connection is dropped, for a server
+    /// whose answers can outgrow the requests it takes.
+    pub fn with_max_send_backlog_bytes(mut self, max_send_backlog_bytes: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_send_backlog_bytes = Some(max_send_backlog_bytes);
         self
     }
     /// Sets the maximum number of request headers accepted.
@@ -300,8 +366,10 @@ impl HttpNetwork {
         self.socket_buf_size = Some(socket_buf_size);
         self
     }
-    /// Sets the idle timeout for accepted connections; outbound endpoints
-    /// remain persistent.
+    /// Sets the idle timeout for accepted connections, but not for one whose
+    /// request awaits its response or an open WebSocket; outbound endpoints
+    /// remain persistent. An answer still leaving counts as activity, so a
+    /// client that stopped reading is closed while a slow one is not.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.idle_timeout = Some(idle_timeout);
@@ -348,15 +416,9 @@ impl HttpNetwork {
         self.max_body_bytes
     }
     fn group(&mut self, net: &mut NetworkCore) -> Group {
-        let Self {
-            group,
-            name,
-            max_head_bytes,
-            max_body_bytes,
-            socket_buf_size,
-            reconnect_interval,
-            ..
-        } = self;
+        let max_body_bytes = self.max_body_bytes.max(self.ws_max());
+        let max_send_backlog_bytes = self.max_send_backlog_bytes;
+        let Self { group, name, max_head_bytes, socket_buf_size, reconnect_interval, .. } = self;
         *group.get_or_insert_with(|| {
             let defaults = TcpGroupConfig::default();
             net.add_group(TcpGroupConfig {
@@ -370,9 +432,9 @@ impl HttpNetwork {
                 // TLS endpoint: a record adds a header and a tag per 16KB.
                 // The margin keeps a full-size request from tripping the cap
                 // on its own overhead.
-                max_backlog_bytes: Some(
-                    max_head_bytes.saturating_add(*max_body_bytes).saturating_add(TLS_MARGIN_BYTES),
-                ),
+                max_backlog_bytes: Some(max_send_backlog_bytes.unwrap_or_else(|| {
+                    max_head_bytes.saturating_add(max_body_bytes).saturating_add(TLS_MARGIN_BYTES)
+                })),
                 backlog_warn_bytes: None,
                 ..Default::default()
             })
@@ -405,6 +467,7 @@ impl HttpNetwork {
                     dirty: false,
                     over_limit: false,
                     last_activity: Instant::now(),
+                    unsent: 0,
                     role: Role::Accepted {
                         state: State::Idle,
                         close: false,
@@ -412,6 +475,8 @@ impl HttpNetwork {
                         head_request: false,
                     },
                     stream: None,
+                    ws: None,
+                    upgrade: None,
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
@@ -421,11 +486,13 @@ impl HttpNetwork {
             NetworkEvent::Message { group: event_group, token, payload, .. }
                 if event_group == group =>
             {
-                let limit = self.buffer_limit();
+                let (limit, ws_limit) =
+                    (self.buffer_limit(), self.max_head_bytes.saturating_add(self.ws_max()));
                 if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
                     !conn.role.is_draining() &&
                     !conn.over_limit
                 {
+                    let limit = if conn.ws.is_some() { ws_limit } else { limit };
                     let available = limit.saturating_sub(conn.buf.len());
                     if payload.len() > available {
                         conn.buf.extend_from_slice(&payload[..available]);
@@ -467,16 +534,29 @@ impl HttpNetwork {
                 conn.over_limit = false;
             }
         }
-        if let Some(timeout) = self.idle_timeout {
-            let expired: Vec<_> = self
-                .conns
-                .iter()
-                .filter(|conn| {
-                    matches!(conn.role, Role::Accepted { .. }) &&
-                        conn.last_activity.elapsed() >= timeout
-                })
-                .map(|conn| conn.token)
-                .collect();
+        if let Some(timeout) = self.idle_timeout &&
+            self.swept_at.elapsed() >= timeout.min(Duration::from_secs(1))
+        {
+            self.swept_at = Instant::now();
+            let mut expired = Vec::new();
+            for conn in &mut self.conns {
+                // A WebSocket may sit quiet for long; the application pings it if it cares.
+                if !matches!(conn.role, Role::Accepted { .. }) || conn.ws.is_some() {
+                    continue
+                }
+                // An answer still leaving is activity; one whose client stopped reading is not.
+                let unsent = net.queued_bytes(conn.token);
+                if unsent < conn.unsent {
+                    conn.last_activity = Instant::now();
+                }
+                conn.unsent = unsent;
+                // A request still owed its response is the application's to time out.
+                if !matches!(conn.role.accepted_state(), State::Pending) &&
+                    conn.last_activity.elapsed() >= timeout
+                {
+                    expired.push(conn.token);
+                }
+            }
             for token in expired {
                 net.disconnect(token);
             }
@@ -533,7 +613,8 @@ impl HttpNetwork {
                         self.conns[i].dirty = false;
                         self.end_stream(i, StreamEnd::Disconnected, handler);
                     } else if matches!(self.conns[i].role, Role::Outbound { .. }) {
-                        let answered = self.parse_eof_outbound(i, handler);
+                        let answered = self.conns[i].ws.take().is_none() &&
+                            self.parse_eof_outbound(i, handler);
                         self.conns[i].buf.clear();
                         self.conns[i].dirty = false;
                         self.conns[i].role.set_outbound_head(None);
@@ -566,12 +647,31 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if matches!(self.conns[i].role, Role::Accepted { .. }) {
+        if let Some(ws) = &self.conns[i].ws {
+            match ws.expect {
+                Some(expect) => self.parse_ws_handshake(net, i, &expect, handler),
+                None => self.parse_ws(net, i, handler),
+            }
+        } else if matches!(self.conns[i].role, Role::Accepted { .. }) {
             self.parse_and_emit(net, i, handler);
         } else if self.conns[i].stream.is_some() {
             self.parse_stream(net, i, handler);
         } else {
             self.parse_outbound(net, i, handler);
+        }
+        let Some(conn) =
+            self.conns.get_mut(i).filter(|conn| matches!(conn.role, Role::Accepted { .. }))
+        else {
+            return
+        };
+        if conn.buf.is_empty() && conn.buf.capacity() > KEEP_BUF_BYTES {
+            conn.buf = Vec::new();
+        }
+        if let Some(ws) = conn.ws.as_mut() &&
+            ws.fragmented.is_none() &&
+            ws.message.capacity() > KEEP_BUF_BYTES
+        {
+            ws.message = Vec::new();
         }
     }
     pub fn connect(&mut self, net: &mut NetworkCore, addr: SocketAddr) -> Token {
@@ -618,8 +718,11 @@ impl HttpNetwork {
             dirty: false,
             over_limit: false,
             last_activity: Instant::now(),
+            unsent: 0,
             role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
             stream: None,
+            ws: None,
+            upgrade: None,
         });
         token
     }
@@ -689,6 +792,17 @@ impl HttpNetwork {
         });
         pool
     }
+    /// Drops every connection, listener and pool but keeps the network's group
+    /// for what opens next: a replaced network leaves its group behind in
+    /// `net`, which never shrinks. Unanswered requests drop without events.
+    pub fn clear(&mut self, net: &mut NetworkCore) {
+        for token in self.listeners.drain(..).chain(self.conns.drain(..).map(|conn| conn.token)) {
+            net.remove(token);
+        }
+        self.pools.clear();
+        self.lifecycle.clear();
+        self.failed.clear();
+    }
     /// Removes every listener, connection and outbound endpoint; pending
     /// requests and responses are dropped without events.
     pub fn close(self, net: &mut NetworkCore) {
@@ -723,8 +837,10 @@ impl HttpNetwork {
         if !valid_request(method, path, headers) || body.len() > self.max_body_bytes {
             return false
         }
-        let Some(c) =
-            self.conns.iter_mut().find(|c| c.token == token && c.role.outbound_head().is_none())
+        let Some(c) = self
+            .conns
+            .iter_mut()
+            .find(|c| c.token == token && c.ws.is_none() && c.role.outbound_head().is_none())
         else {
             return false
         };
@@ -913,6 +1029,9 @@ impl HttpNetwork {
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
     }
+    fn ws_max(&self) -> usize {
+        self.max_ws_message_bytes.unwrap_or(self.max_body_bytes)
+    }
     fn parse_and_emit<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
@@ -922,13 +1041,29 @@ impl HttpNetwork {
         }
         let over_limit = self.conns[i].over_limit;
         let buf = &self.conns[i].buf;
-        let (mut stack_slots, mut heap_slots) =
-            ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
-        let hs = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
-        let mut req = httparse::Request::new(hs);
-        let Ok(state) = req.parse(buf) else {
-            self.error(net, i, 400);
-            return
+        // Left uninitialised, so a server taking up to this many headers neither zeroes
+        // nor allocates its slots.
+        let mut stack_slots = [MaybeUninit::uninit(); REQUEST_STACK_HEADERS];
+        let mut heap_slots = Vec::new();
+        let mut req = httparse::Request::new(&mut []);
+        let parsed = if let Some(slots) = stack_slots.get_mut(..self.max_headers) {
+            req.parse_with_uninit_headers(buf, slots)
+        } else {
+            heap_slots.resize(self.max_headers, httparse::EMPTY_HEADER);
+            req.headers = &mut heap_slots;
+            req.parse(buf)
+        };
+        let state = match parsed {
+            Ok(state) => state,
+            // As hyper answers more headers than it takes.
+            Err(httparse::Error::TooManyHeaders) => {
+                self.error(net, i, 431);
+                return
+            }
+            Err(_) => {
+                self.error(net, i, 400);
+                return
+            }
         };
         let httparse::Status::Complete(head) = state else {
             // A partial parse means every buffered byte is still head bytes.
@@ -990,7 +1125,11 @@ impl HttpNetwork {
             headers: req.headers,
             body: &buf[head..end],
         };
+        let upgrade = request.is_websocket_upgrade().then(|| {
+            websocket::accept_key(request.header("sec-websocket-key").unwrap_or_default())
+        });
         handler(HttpEvent::Request { token, request });
+        self.conns[i].upgrade = upgrade;
         self.conns[i].buf.drain(..end);
         self.conns[i].dirty = !self.conns[i].buf.is_empty();
         self.conns[i].role.set_accepted_state(State::Pending);
@@ -1041,6 +1180,8 @@ impl HttpNetwork {
         let suppress_body =
             self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
+        // The idle timeout runs from the answer, not from a request answered late.
+        self.conns[i].last_activity = Instant::now();
         let ok = net.send_with(token, |out| {
             out.extend_from_slice(b"HTTP/1.1 ");
             write_decimal(out, usize::from(status));
@@ -1085,6 +1226,252 @@ impl HttpNetwork {
             }
         }
         ok
+    }
+    /// Answers a pending WebSocket upgrade request (see
+    /// [`HttpRequest::is_websocket_upgrade`]) with `101`. The connection then
+    /// delivers [`HttpEvent::WsMessage`]s and takes [`Self::ws_send`]; it is
+    /// left out of the idle sweep. `false` when the request did not ask to
+    /// upgrade, so the caller answers it with [`Self::respond`] instead.
+    pub fn accept_websocket(&mut self, net: &mut NetworkCore, token: Token) -> bool {
+        let Some(i) = self.conns.iter().position(|c| {
+            c.token == token &&
+                c.upgrade.is_some() &&
+                matches!(c.role.accepted_state(), State::Pending)
+        }) else {
+            return false
+        };
+        let conn = &mut self.conns[i];
+        let Some(accept) = conn.upgrade.take() else { return false };
+        let ok = net.send_with(token, |out| {
+            out.extend_from_slice(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ",
+            );
+            out.extend_from_slice(&accept);
+            out.extend_from_slice(b"\r\n\r\n");
+        });
+        if ok {
+            conn.role.set_accepted_state(State::Idle);
+            conn.ws = Some(Ws::open(seed(token)));
+            conn.dirty = !conn.buf.is_empty();
+        }
+        ok
+    }
+    /// Opens a WebSocket on a connected outbound endpoint from
+    /// [`Self::connect`] or [`Self::connect_tls`]: sends the handshake for
+    /// `path`, with up to 16 `headers` such as `Host` or an API key.
+    /// [`HttpEvent::WsOpen`] follows, or the connection is dropped and
+    /// redialled; the caller sends the handshake again on the next
+    /// [`HttpEvent::Connected`]. No timeout covers the handshake. Refused for
+    /// a pooled token.
+    pub fn websocket(
+        &mut self,
+        net: &mut NetworkCore,
+        token: Token,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> bool {
+        const STANDARD: usize = 4;
+        if headers.len() > 16 || self.pools.iter().any(|pool| pool.tokens.contains(&token)) {
+            return false
+        }
+        let mut ws = Ws::open(seed(token));
+        let key = websocket::client_key(&mut ws);
+        let Ok(key_str) = std::str::from_utf8(&key) else { return false };
+        let mut all = [("", ""); STANDARD + 16];
+        all[..STANDARD].copy_from_slice(&[
+            ("Upgrade", "websocket"),
+            ("Connection", "Upgrade"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", key_str),
+        ]);
+        all[STANDARD..STANDARD + headers.len()].copy_from_slice(headers);
+        if !self.request(net, token, "GET", path, &all[..STANDARD + headers.len()], &[]) {
+            return false
+        }
+        ws.expect = Some(websocket::accept_key(&key));
+        if let Some(conn) = self.conns.iter_mut().find(|c| c.token == token) {
+            conn.ws = Some(ws);
+        }
+        true
+    }
+    /// Waits for the response to a client handshake: a `101` with the
+    /// expected `accept` opens the WebSocket, anything else drops the
+    /// connection.
+    fn parse_ws_handshake<F>(
+        &mut self,
+        net: &mut NetworkCore,
+        i: usize,
+        accept: &[u8; 28],
+        handler: &mut F,
+    ) where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        self.conns[i].dirty = false;
+        let buf = &self.conns[i].buf;
+        let (mut stack_slots, mut heap_slots) =
+            ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+        let hs = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
+        let mut response = httparse::Response::new(hs);
+        let head = match response.parse(buf) {
+            Ok(httparse::Status::Complete(head)) if head <= self.max_head_bytes => head,
+            Ok(httparse::Status::Partial) if buf.len() <= self.max_head_bytes => return,
+            _ => 0,
+        };
+        if head == 0 || response.code != Some(101) || !websocket_accepted(response.headers, accept)
+        {
+            self.conns[i].ws = None;
+            self.fail_outbound(net, i);
+            return
+        }
+        let token = self.conns[i].token;
+        self.conns[i].buf.drain(..head);
+        self.conns[i].role.set_outbound_head(None);
+        if let Some(ws) = self.conns[i].ws.as_mut() {
+            ws.expect = None;
+        }
+        handler(HttpEvent::WsOpen { token });
+        self.parse_ws(net, i, handler);
+    }
+    /// Sends one unfragmented frame on an open WebSocket. Pings and pongs
+    /// carry at most 125 bytes. `false` when the connection is not open or
+    /// the network refused the bytes.
+    pub fn ws_send(
+        &mut self,
+        net: &mut NetworkCore,
+        token: Token,
+        kind: WsKind,
+        payload: &[u8],
+    ) -> bool {
+        if matches!(kind, WsKind::Ping | WsKind::Pong) && payload.len() > websocket::MAX_CONTROL {
+            return false
+        }
+        let Some(conn) = self.conns.iter_mut().find(|c| c.token == token) else { return false };
+        let client = matches!(conn.role, Role::Outbound { .. });
+        let Some(ws) = conn.ws.as_mut().filter(|ws| ws.is_open()) else { return false };
+        send_frame(net, token, ws, client, kind.opcode(), payload)
+    }
+    /// Sends a close frame with `code` and drops the connection once it is
+    /// written.
+    pub fn ws_close(&mut self, net: &mut NetworkCore, token: Token, code: u16) -> bool {
+        let Some(conn) = self.conns.iter_mut().find(|c| c.token == token) else { return false };
+        let client = matches!(conn.role, Role::Outbound { .. });
+        let Some(ws) = conn.ws.as_mut().filter(|ws| ws.is_open()) else { return false };
+        close_ws(net, token, ws, client, code);
+        true
+    }
+    /// Delivers the WebSocket messages buffered on connection `i`. A message
+    /// in one frame is borrowed from the receive buffer; a fragmented one is
+    /// reassembled in the connection's reused buffer. Pings are answered and
+    /// a close is echoed; a frame no peer may send closes the connection.
+    fn parse_ws<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let max = self.ws_max();
+        let client = matches!(self.conns[i].role, Role::Outbound { .. });
+        let Conn { token, buf, ws, dirty, .. } = &mut self.conns[i];
+        let (token, Some(ws)) = (*token, ws.as_mut()) else { return };
+        *dirty = false;
+        let mut at = 0;
+        // Pings are answered once per read, with the last one's payload (RFC 6455
+        // 5.5.3).
+        let (mut pong, mut pong_len) = ([0; websocket::MAX_CONTROL], None);
+        while !ws.closing {
+            let frame = match websocket::parse_header(&buf[at..]) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(()) => {
+                    close_ws(net, token, ws, client, websocket::CLOSE_PROTOCOL_ERROR);
+                    break
+                }
+            };
+            // Clients mask every frame and servers none.
+            if frame.mask.is_some() == client {
+                close_ws(net, token, ws, client, websocket::CLOSE_PROTOCOL_ERROR);
+                break
+            }
+            if frame.payload_len > max {
+                close_ws(net, token, ws, client, websocket::CLOSE_TOO_BIG);
+                break
+            }
+            let start = at + frame.header_len;
+            let end = start + frame.payload_len;
+            if buf.len() < end {
+                break
+            }
+            at = end;
+            let payload = &mut buf[start..end];
+            if let Some(mask) = frame.mask {
+                websocket::apply_mask(payload, mask);
+            }
+            let kind = match frame.opcode {
+                websocket::OP_PING => {
+                    let len = payload.len().min(websocket::MAX_CONTROL);
+                    pong[..len].copy_from_slice(&payload[..len]);
+                    pong_len = Some(len);
+                    handler(HttpEvent::WsMessage { token, kind: WsKind::Ping, payload });
+                    continue
+                }
+                websocket::OP_PONG => {
+                    handler(HttpEvent::WsMessage { token, kind: WsKind::Pong, payload });
+                    continue
+                }
+                websocket::OP_CLOSE => {
+                    // Echo the peer's status code, then close once it is written.
+                    let code = payload.get(..2).unwrap_or_default();
+                    send_frame(net, token, ws, client, websocket::OP_CLOSE, code);
+                    ws.closing = true;
+                    net.disconnect_when_drained(token);
+                    handler(HttpEvent::WsClose { token, payload });
+                    break
+                }
+                websocket::OP_TEXT => Some(WsKind::Text),
+                websocket::OP_BINARY => Some(WsKind::Binary),
+                _ => None,
+            };
+            let complete = match (kind, ws.fragmented) {
+                // A continuation needs a started message; a new message may not interrupt one.
+                (Some(_), Some(_)) | (None, None) => {
+                    close_ws(net, token, ws, client, websocket::CLOSE_PROTOCOL_ERROR);
+                    break
+                }
+                (Some(kind), None) if frame.fin => {
+                    if kind == WsKind::Text && std::str::from_utf8(payload).is_err() {
+                        close_ws(net, token, ws, client, websocket::CLOSE_INVALID_DATA);
+                        break
+                    }
+                    handler(HttpEvent::WsMessage { token, kind, payload });
+                    continue
+                }
+                (Some(kind), None) => {
+                    ws.fragmented = Some(kind);
+                    ws.message.clear();
+                    ws.message.extend_from_slice(payload);
+                    continue
+                }
+                (None, Some(kind)) => {
+                    if ws.message.len() + payload.len() > max {
+                        close_ws(net, token, ws, client, websocket::CLOSE_TOO_BIG);
+                        break
+                    }
+                    ws.message.extend_from_slice(payload);
+                    if !frame.fin {
+                        continue
+                    }
+                    ws.fragmented = None;
+                    kind
+                }
+            };
+            if complete == WsKind::Text && std::str::from_utf8(&ws.message).is_err() {
+                close_ws(net, token, ws, client, websocket::CLOSE_INVALID_DATA);
+                break
+            }
+            handler(HttpEvent::WsMessage { token, kind: complete, payload: &ws.message });
+        }
+        if let (Some(len), false) = (pong_len, ws.closing) {
+            send_frame(net, token, ws, client, websocket::OP_PONG, &pong[..len]);
+        }
+        buf.drain(..at);
     }
     /// Delivers a streaming response: the head once, then body pieces
     /// borrowed straight out of the receive buffer as they arrive.
@@ -1518,6 +1905,52 @@ fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
                 !n.eq_ignore_ascii_case("transfer-encoding")
         })
 }
+/// Whether a `101` completes a handshake that expects `accept`. No extension
+/// was offered, so a server naming one cannot be understood.
+fn websocket_accepted(headers: &[httparse::Header<'_>], accept: &[u8; 28]) -> bool {
+    has_token(headers, "upgrade", b"websocket") &&
+        has_token(headers, "connection", b"upgrade") &&
+        headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("sec-websocket-accept") && h.value == accept) &&
+        !headers.iter().any(|h| h.name.eq_ignore_ascii_case("sec-websocket-extensions"))
+}
+/// Seeds a connection's mask source; masks need not be cryptographic.
+fn seed(token: Token) -> u64 {
+    flux_timing::Nanos::now().0 ^ (token.0 as u64).rotate_left(32)
+}
+/// Sends one final frame: a server's from `payload` in place, a client's
+/// masked straight into the send buffer.
+fn send_frame(
+    net: &mut NetworkCore,
+    token: Token,
+    ws: &mut Ws,
+    client: bool,
+    opcode: u8,
+    payload: &[u8],
+) -> bool {
+    let mut head = [0; websocket::MAX_HEADER];
+    if !client {
+        let len = websocket::write_header(&mut head, opcode, payload.len(), None);
+        return net.send_parts(token, &head[..len], payload)
+    }
+    let mask = (ws.next_random() as u32).to_ne_bytes();
+    let len = websocket::write_header(&mut head, opcode, payload.len(), Some(mask));
+    net.send_with(token, |out| {
+        out.extend_from_slice(&head[..len]);
+        let start = out.len();
+        out.extend_from_slice(payload);
+        websocket::apply_mask(&mut out.as_mut_slice()[start..], mask);
+    })
+}
+/// Sends a close frame with `code` and drops the connection once it is written.
+fn close_ws(net: &mut NetworkCore, token: Token, ws: &mut Ws, client: bool, code: u16) {
+    if !ws.closing {
+        send_frame(net, token, ws, client, websocket::OP_CLOSE, &code.to_be_bytes());
+        ws.closing = true;
+        net.disconnect_when_drained(token);
+    }
+}
 /// Writes a request head, defaulting `Host` to the endpoint address when the
 /// caller did not supply one.
 fn write_head(
@@ -1708,6 +2141,16 @@ pub struct HttpRequest<'a> {
 impl<'a> HttpRequest<'a> {
     pub fn header(&self, name: &str) -> Option<&'a [u8]> {
         self.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value)
+    }
+
+    /// A WebSocket opening handshake; answer it with
+    /// [`HttpNetwork::accept_websocket`].
+    pub fn is_websocket_upgrade(&self) -> bool {
+        self.method == "GET" &&
+            has_token(self.headers, "upgrade", b"websocket") &&
+            has_token(self.headers, "connection", b"upgrade") &&
+            self.header("sec-websocket-version") == Some(b"13") &&
+            self.header("sec-websocket-key").is_some_and(|key| key.len() == 24)
     }
 }
 pub struct HttpResponse<'a> {
