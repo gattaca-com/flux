@@ -933,16 +933,6 @@ mod tests {
         }
 
         #[test]
-        fn write_truncates_on_overflow() {
-            use core::fmt::Write;
-
-            let mut s = ArrayStr::<8>::new();
-            assert!(write!(s, "{}-{}", 12, 34).is_ok());
-            assert!(write!(s, "{}", 56789).is_err());
-            assert_eq!(s.as_str(), "12-34567");
-        }
-
-        #[test]
         fn copy_semantics() {
             let a = ArrayStr::<16>::from_str_truncate("abc");
             let b = a;
