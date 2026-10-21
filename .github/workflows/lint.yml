@@ -62,5 +62,10 @@ jobs:
         with:
           rustflags: ""
 
+      # UDP tests size socket buffers to hold a full send window; the runner's
+      # default caps them at 208 KB.
+      - name: Allow large socket buffers
+        run: sudo sysctl -w net.core.rmem_max=67108864 net.core.wmem_max=67108864
+
       - name: Run tests
         run: cargo test --workspace --all-features --locked

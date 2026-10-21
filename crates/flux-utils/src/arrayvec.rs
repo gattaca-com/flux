@@ -502,6 +502,15 @@ impl<const N: usize> core::fmt::Display for ArrayStr<N> {
     }
 }
 
+impl<const N: usize> core::fmt::Write for ArrayStr<N> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let fits = s.len() <= N - self.len;
+        self.push_str_truncate(s);
+        if fits { Ok(()) } else { Err(core::fmt::Error) }
+    }
+}
+
 impl<const N: usize> core::fmt::Debug for ArrayStr<N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "\"{}\"", self.as_str())

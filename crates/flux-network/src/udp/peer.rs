@@ -77,7 +77,7 @@ fn send_datagram(socket: &UdpSocket, addr: SocketAddr, bytes: &[u8]) -> SendOutc
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
-pub(crate) struct UdpSend {
+pub struct UdpSend {
     pub sent_at: Instant,
     pub bytes: u32,
     pub datagrams: u32,
@@ -85,7 +85,7 @@ pub(crate) struct UdpSend {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
-pub(crate) struct UdpRetransmit {
+pub struct UdpRetransmit {
     pub sent_at: Instant,
     pub bytes: u32,
     pub retries: u8,
@@ -839,6 +839,7 @@ pub(crate) struct UdpPeer {
     /// When the next hello goes out while disconnected.
     hello_due: Instant,
     hello_backoff: u8,
+    hello_unanswered: Duration,
     ack_due: bool,
     /// Drop the session once every datagram is acked; sends are refused.
     close_when_drained: bool,
@@ -881,6 +882,7 @@ impl UdpPeer {
             last_send: now,
             hello_due: Instant::ZERO,
             hello_backoff: 0,
+            hello_unanswered: Duration::ZERO,
             ack_due: false,
             close_when_drained: false,
             latency: latency_timer(group.telemetry, &label),
@@ -983,6 +985,7 @@ impl UdpPeer {
         }
         self.hello_due = Instant::ZERO;
         self.hello_backoff = 0;
+        self.hello_unanswered = Duration::ZERO;
     }
 
     /// Tells the sender of a datagram under `their_session` that the listener
@@ -1121,6 +1124,7 @@ impl UdpPeer {
         self.connected = true;
         let was = std::mem::replace(&mut self.ever_connected, true);
         self.hello_backoff = 0;
+        self.hello_unanswered = Duration::ZERO;
         Some(was)
     }
 
@@ -1298,6 +1302,16 @@ impl UdpPeer {
     ) -> Result<SendOutcome, ()> {
         if !self.connected {
             if now >= self.hello_due {
+                if let Some(limit) = self.config.panic_after_unanswered_handshake {
+                    self.hello_unanswered +=
+                        now.saturating_sub(self.last_send).min(self.config.max_rto);
+                    assert!(
+                        self.hello_unanswered < limit,
+                        "udp handshake with {} unanswered for {}",
+                        self.addr,
+                        self.hello_unanswered
+                    );
+                }
                 return Ok(self.send_hello(socket, now));
             }
             return Ok(SendOutcome::Done);

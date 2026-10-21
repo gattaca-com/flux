@@ -5,6 +5,7 @@ members = [
   "crates/flux-communication",
   "crates/flux-ctl",
   "crates/flux-disk",
+  "crates/flux-dns",
   "crates/flux-gather",
   "crates/flux-mongo",
   "crates/flux-network",
@@ -32,7 +33,7 @@ license = "Apache-2.0 AND MIT"
 publish = false
 repository = "https://github.com/gattaca-com/flux"
 rust-version = "1.91.0"
-version = "0.7.4"
+version = "0.8.2"
 
 
 [workspace.dependencies]

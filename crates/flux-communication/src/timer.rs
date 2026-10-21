@@ -54,6 +54,13 @@ const QUEUE_SIZE: usize = 2usize.pow(13);
 /// A reusable timing struct that emits timing intervals to queues:
 /// - processing time (local business logic)
 /// - latency (queued / on-the-wire)
+// TODO: every name costs two shmem files that are never unmapped or removed,
+// so names from an unbounded set (one per connection, say) leak memory, and
+// removing them would race readers. Instead, keep all of an app's timers in
+// one shmem region of fixed slots, each a queue with a header naming its
+// writer and when it last wrote. A writer takes the slot holding its name, or
+// one idle past a timeout; readers find timers by scanning slot headers. That
+// keeps per-group samples with a fixed number of files.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Timer {

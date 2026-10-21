@@ -15,6 +15,7 @@ use flux::{
 };
 use flux_network::{
     Network, NetworkEvent, ReplayPolicy, TcpGroupConfig, UdpConfig, UdpGroupConfig,
+    UdpGroupConfigV2,
 };
 use spine_derive::from_spine;
 
@@ -105,12 +106,27 @@ fn dcache_multi_stream_udp() {
     dcache_multi_stream(UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() }.into());
 }
 
+#[test]
+fn dcache_multi_stream_udp_v2() {
+    dcache_multi_stream(
+        UdpGroupConfigV2 {
+            udp: UdpConfig { max_message_size: 64, ..UdpConfig::lan() },
+            ..Default::default()
+        }
+        .into(),
+    );
+}
+
 /// Two streams into the same dcache-backed spine queue.
 /// Verifies dcache bytes match the queue message (same shmem region).
 #[allow(clippy::significant_drop_tightening)]
 fn dcache_multi_stream(transport: flux_network::GroupConfig) {
     const MSG_A: &[u8; 8] = b"stream-a";
     const MSG_B: &[u8; 8] = b"stream-b";
+    // Each run spins tiles, and two picking the same probed port can't both
+    // listen on it.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
@@ -134,9 +150,12 @@ fn dcache_multi_stream(transport: flux_network::GroupConfig) {
             let mut conn = Network::default();
             let conn_group = conn.add_group(client_config.clone());
             let tok = conn.connect(conn_group, bind_addr);
-            conn.send_with(tok, |buf| {
-                buf.extend_from_slice(msg);
-            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while conn.currently_disconnected().count() != 0 {
+                assert!(Instant::now() < deadline, "handshake");
+                conn.poll_with(|_| {});
+            }
+            assert!(conn.send_with(tok, |buf| buf.extend_from_slice(msg)));
             let flush = Instant::now() + Duration::from_millis(100);
             while Instant::now() < flush {
                 conn.poll_with(|_| {});
