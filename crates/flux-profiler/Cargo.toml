@@ -30,6 +30,8 @@ rustc-hash.workspace = true
 serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+type-hash.workspace = true
+type-hash-derive.workspace = true
 
 [features]
 # Compile every `#[timed]` out to a plain function call — zero overhead, no

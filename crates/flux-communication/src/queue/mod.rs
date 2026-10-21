@@ -53,8 +53,15 @@ fn is_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+mod fault;
+mod segment;
+
+pub use fault::{RetiredQueue, retired_queues};
+use flux_timing::Nanos;
 use flux_utils::{ArrayStr, safe_panic};
-use shared_memory::{ShmemConf, ShmemError};
+pub use segment::RETIRE_MAPPED_QUEUES_ENV;
+pub(crate) use segment::create_or_open as create_or_open_segment;
+use type_hash::TypeHash;
 
 use crate::{
     Seqlock,
@@ -78,20 +85,48 @@ pub struct AlignedCursor {
     pub cursor: AtomicUsize,
 }
 
+// Older layouts keep a group label length (<= 64) at the magic's offset, so
+// their segments never validate.
+const QUEUE_MAGIC: u64 = 0xF1C0_9E0E_7A5E_D1D5;
+const HEADER_VERSION: u32 = 1;
+
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct QueueHeader {
     pub queue_type: QueueType,   // 1
-    is_initialized: u8,          // 2
+    is_initialized: AtomicU8,    // 2 — Release-stored once every other field is written
     group_lock: AtomicU8,        // 3  — spinlock protecting group label search/insert
     signal_on_produce: AtomicU8, // 4 — produces wake parked tile threads (`park` feature)
     _pad1: [u8; 4],              // 8
     pub elsize: usize,           // 16
     pub mask: usize,             // 24
-    pub count: AtomicUsize,      /* 32 */
+    pub count: AtomicUsize,      // 32
+    magic: u64,                  // 40
+    type_hash: u64,              // 48
+    created_at_ns: u64,          // 56 — unix epoch
+    header_version: u32,         // 60
+    creator_pid: u32,            /* 64 */
 
     group_labels: [ArrayStr<GROUP_LABEL_LEN>; MAX_GROUPS],
     group_cursors: [AlignedCursor; MAX_GROUPS],
+}
+
+/// Who created a queue segment, and for which element type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueIdentity {
+    pub type_hash: u64,
+    pub creator_pid: u32,
+    pub created_at: Nanos,
+}
+
+impl std::fmt::Display for QueueIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "type hash {:#018x}, created by pid {} at {}",
+            self.type_hash, self.creator_pid, self.created_at
+        )
+    }
 }
 
 #[allow(dead_code)]
@@ -117,19 +152,94 @@ impl QueueHeader {
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.is_initialized == 1
+        self.is_initialized.load(Ordering::Acquire) == 1
     }
 
     pub fn elsize(&self) -> usize {
         self.elsize
     }
 
+    /// `None` for segments without the queue magic.
+    pub fn identity(&self) -> Option<QueueIdentity> {
+        (self.magic == QUEUE_MAGIC).then_some(QueueIdentity {
+            type_hash: self.type_hash,
+            creator_pid: self.creator_pid,
+            created_at: Nanos(self.created_at_ns),
+        })
+    }
+
     pub fn open_shared<S: AsRef<Path>>(path: S) -> Result<&'static mut Self, QueueError> {
-        let path = path.as_ref();
-        let shmem = ShmemConf::new().flink(path).open()?;
-        let ptr = shmem.as_ptr();
-        std::mem::forget(shmem);
-        Ok(Self::from_ptr(ptr))
+        segment::open(path.as_ref(), "QueueHeader", |ptr, len| {
+            let header = Self::from_mapping(ptr, len)?;
+            header.check_layout()?;
+            Ok(header)
+        })
+    }
+
+    /// The header of a mapping of `len` bytes at `ptr`, once its creator
+    /// finished initialising it. Creators initialise under the directory lock
+    /// every opener takes, so an uninitialised header was abandoned.
+    fn from_mapping(ptr: *mut u8, len: usize) -> Result<&'static mut Self, QueueError> {
+        if len < size_of::<Self>() {
+            return Err(QueueError::TooSmall);
+        }
+        let header = Self::from_ptr(ptr);
+        if !header.is_initialized() {
+            return Err(QueueError::UnInitialized);
+        }
+        Ok(header)
+    }
+
+    fn init(&mut self, queue_type: QueueType, len: usize, elsize: usize, type_hash: u64) {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        self.queue_type = queue_type;
+        self.mask = len - 1;
+        self.elsize = elsize;
+        self.count = AtomicUsize::new(0);
+        self.magic = QUEUE_MAGIC;
+        self.header_version = HEADER_VERSION;
+        self.type_hash = type_hash;
+        self.created_at_ns = created_at;
+        self.creator_pid = std::process::id();
+        self.is_initialized.store(1, Ordering::Release);
+    }
+
+    /// Whether the rest of the header has the layout this code reads.
+    fn check_layout(&self) -> Result<(), QueueError> {
+        if self.magic != QUEUE_MAGIC {
+            return Err(QueueError::MissingMagic);
+        }
+        if self.header_version != HEADER_VERSION {
+            return Err(QueueError::HeaderVersionChanged(self.header_version, HEADER_VERSION));
+        }
+        Ok(())
+    }
+
+    /// Checks everything a reader relies on before touching slots, in order:
+    /// magic, header version, element type, element size, length.
+    fn validate(
+        &self,
+        mapped_len: usize,
+        type_hash: u64,
+        elsize: usize,
+        min_len: usize,
+    ) -> Result<(), QueueError> {
+        self.check_layout()?;
+        if self.type_hash != type_hash {
+            return Err(QueueError::TypeHashChanged(self.type_hash, type_hash));
+        }
+        if self.elsize != elsize {
+            return Err(QueueError::ElementSizeChanged(self.elsize, elsize));
+        }
+        if !self.len().is_power_of_two() {
+            return Err(QueueError::LengthNotPowerOfTwo);
+        }
+        if self.len() < min_len || mapped_len < size_of::<Self>() + self.len() * elsize {
+            return Err(QueueError::TooSmall);
+        }
+        Ok(())
     }
 
     /// Acquire `group_lock`, spinning until it is free.
@@ -244,30 +354,6 @@ impl QueueHeader {
     }
 }
 
-pub(crate) fn shmem_map_create_or_open(flink_path: &Path, size: usize) -> (*mut u8, bool, usize) {
-    let _ = std::fs::create_dir_all(flink_path.parent().unwrap());
-    match ShmemConf::new().size(size).flink(flink_path).create() {
-        Ok(shmem) => {
-            let ptr = shmem.as_ptr();
-            std::mem::forget(shmem);
-            (ptr, true, size)
-        }
-        Err(ShmemError::LinkExists) => ShmemConf::new().flink(flink_path).open().map_or_else(
-            |_| {
-                let _ = std::fs::remove_file(flink_path);
-                shmem_map_create_or_open(flink_path, size)
-            },
-            |shmem| {
-                let mapped_size = shmem.len();
-                let ptr = shmem.as_ptr();
-                std::mem::forget(shmem);
-                (ptr, false, mapped_size)
-            },
-        ),
-        Err(e) => panic!("shmem create failed at {}: {e}", flink_path.display()),
-    }
-}
-
 //TODO @lopo: this should in reality really also implement drop and most likely
 // return an Arc instead of &'static or whatever.
 #[repr(C, align(64))]
@@ -290,7 +376,7 @@ impl<T: Copy> InnerQueue<T> {
             );
             // Why real len you may ask. The size of the fat pointer ONLY includes the
             // length of the unsized part of the struct i.e. the buffer.
-            Self::from_uninitialized_ptr(ptr, real_len, queue_type)
+            Self::from_uninitialized_ptr(ptr, real_len, queue_type, 0)
         }
     }
 
@@ -298,33 +384,16 @@ impl<T: Copy> InnerQueue<T> {
         size_of::<QueueHeader>() + len * size_of::<Seqlock<T>>()
     }
 
-    fn from_uninitialized_ptr(ptr: *mut u8, len: usize, queue_type: QueueType) -> *const Self {
+    fn from_uninitialized_ptr(
+        ptr: *mut u8,
+        len: usize,
+        queue_type: QueueType,
+        type_hash: u64,
+    ) -> *const Self {
         unsafe {
             let q = std::ptr::slice_from_raw_parts_mut(ptr, len) as *mut Self;
-            let elsize = size_of::<Seqlock<T>>();
-            let mask = len - 1;
-
-            (*q).header.queue_type = queue_type;
-            (*q).header.mask = mask;
-            (*q).header.elsize = elsize;
-            (*q).header.is_initialized = true as u8;
-            (*q).header.count = AtomicUsize::new(0);
+            (*q).header.init(queue_type, len, size_of::<Seqlock<T>>(), type_hash);
             q
-        }
-    }
-
-    #[allow(dead_code)]
-    fn from_initialized_ptr(ptr: *mut QueueHeader) -> Result<*const Self, QueueError> {
-        unsafe {
-            let len = (*ptr).mask + 1;
-            if !len.is_power_of_two() {
-                return Err(QueueError::LengthNotPowerOfTwo);
-            }
-            if (*ptr).is_initialized != true as u8 {
-                return Err(QueueError::UnInitialized);
-            }
-            // TODO @lopo: I think this is slightly wrong
-            Ok(std::ptr::slice_from_raw_parts_mut(ptr.cast::<Seqlock<T>>(), len) as *const Self)
         }
     }
 
@@ -449,11 +518,11 @@ impl<T: Copy> InnerQueue<T> {
         self.header.signal_on_produce.store(enabled as u8, Ordering::Relaxed);
     }
 
-    fn is_poisoned(&self) -> Option<usize> {
-        // We assume that nothing would take longer than 10 micros to be written.
-        // If it does that means that nothing will actually be written and the queue is
-        // poisoned.
-        const MAX_CHECK_TIME: Duration = Duration::from_micros(10);
+    pub(crate) fn check_poison(&self) -> Result<(), QueueError> {
+        // A slot left odd this long has no live writer. Poison retires the segment
+        // even while other processes map it, so err on the long side; this only
+        // costs time when a slot is odd.
+        const MAX_CHECK_TIME: Duration = Duration::from_millis(100);
         for i in 0..=self.header.mask {
             let lck = self.load(i);
 
@@ -463,85 +532,57 @@ impl<T: Copy> InnerQueue<T> {
             let curt = Instant::now();
             while lck.version() & 1 == 1 {
                 if curt.elapsed() > MAX_CHECK_TIME {
-                    return Some(i);
+                    return Err(QueueError::ElementPoisoned(i));
                 }
             }
-        }
-        None
-    }
-
-    fn validate(&self, len: usize) -> Result<(), QueueError> {
-        let elsize = std::mem::size_of::<Seqlock<T>>();
-        if self.header.len() < len {
-            return Err(QueueError::TooSmall);
-        }
-        if !self.header.len().is_power_of_two() {
-            return Err(QueueError::LengthNotPowerOfTwo);
-        }
-        if self.header.elsize != elsize {
-            return Err(QueueError::ElementSizeChanged(self.header.elsize, elsize));
-        }
-        if let Some(poisoned_element) = self.is_poisoned() {
-            return Err(QueueError::ElementPoisoned(poisoned_element));
         }
         Ok(())
     }
 
-    fn create_or_open_shared<P: AsRef<Path>>(
-        shmem_file: P,
-        mut len: usize,
-        typ: QueueType,
-    ) -> *const Self {
-        len = len.next_power_of_two();
-        let (ptr, is_new, _) = shmem_map_create_or_open(shmem_file.as_ref(), Self::size_of(len));
-        if is_new {
-            return Self::from_uninitialized_ptr(ptr, len, typ);
-        }
-        let Ok(v) = Self::open_initialized(ptr, len).inspect_err(|e| {
-            tracing::error!(
-                "issue with preexisting shmem at {:?}: {e}. Removing and recreating. Should probably upgrade and reattach any other processes.",
-                shmem_file.as_ref()
-            );
-        }) else {
-            let _ = std::fs::remove_file(shmem_file.as_ref());
-            return Self::create_or_open_shared(shmem_file, len, typ);
-        };
-        v
-    }
-
-    fn open_shared<S: AsRef<Path>>(shmem_file: S) -> Result<*const Self, QueueError> {
-        let path = shmem_file.as_ref();
-        if !path.exists() {
-            return Err(QueueError::NonExistingFile);
-        }
-        let shmem = ShmemConf::new().flink(path).open()?;
-        let ptr = shmem.as_ptr();
-        // len=0: skip floor check, still validates elsize + poisoned slots.
-        let opened = Self::open_initialized(ptr, 0);
-        if opened.is_ok() {
-            std::mem::forget(shmem);
-        }
-        opened
-    }
-
-    // Wait for the queue at `ptr` to finish initialising, then validate it.
-    fn open_initialized(ptr: *mut u8, len: usize) -> Result<*const Self, QueueError> {
-        #[allow(clippy::cast_ptr_alignment)]
-        let header = ptr.cast::<QueueHeader>();
-        let mut tries = 0;
-        while unsafe { !(*header).is_initialized() } {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            tries += 1;
-            if tries == 10 {
-                return Err(QueueError::UnInitialized);
-            }
-        }
-        let v = Self::from_initialized_ptr(header)?;
-        unsafe { (&*v).validate(len) }?;
-        Ok(v)
-    }
     pub fn max_writable_msgs_without_speeding_past(&self) -> usize {
         self.header.max_writable_msgs_without_speeding_past()
+    }
+}
+
+impl<T: Copy + TypeHash> InnerQueue<T> {
+    fn create_or_open_shared(shmem_file: &Path, len: usize, typ: QueueType) -> *const Self {
+        let len = len.next_power_of_two();
+        segment::create_or_open(
+            shmem_file,
+            Self::size_of(len),
+            std::any::type_name::<T>(),
+            T::TYPE_HASH,
+            |ptr, mapped_len| Self::open_initialized(ptr, mapped_len, len),
+            |ptr| Self::from_uninitialized_ptr(ptr, len, typ, T::TYPE_HASH),
+        )
+    }
+
+    fn open_shared(shmem_file: &Path) -> Result<*const Self, QueueError> {
+        // min_len 0: any length the creator chose is fine for an attach-only open.
+        segment::open(shmem_file, std::any::type_name::<T>(), |ptr, mapped_len| {
+            Self::open_initialized(ptr, mapped_len, 0)
+        })
+    }
+
+    fn open_initialized(
+        ptr: *mut u8,
+        mapped_len: usize,
+        min_len: usize,
+    ) -> Result<*const Self, QueueError> {
+        let q = Self::open_validated(ptr, mapped_len, min_len)?;
+        unsafe { (*q).check_poison() }?;
+        Ok(q)
+    }
+
+    /// Validates everything but poison, which is checked last.
+    fn open_validated(
+        ptr: *mut u8,
+        mapped_len: usize,
+        min_len: usize,
+    ) -> Result<*const Self, QueueError> {
+        let header = QueueHeader::from_mapping(ptr, mapped_len)?;
+        header.validate(mapped_len, T::TYPE_HASH, size_of::<Seqlock<T>>(), min_len)?;
+        Ok(std::ptr::slice_from_raw_parts_mut(ptr, header.len()) as *const Self)
     }
 }
 
@@ -565,46 +606,9 @@ impl<T: Copy> Queue<T> {
         Self { inner: InnerQueue::new(len, queue_type) }
     }
 
-    pub fn create_or_open_shared<P: AsRef<Path>>(
-        shmem_file: P,
-        len: usize,
-        queue_type: QueueType,
-    ) -> Self {
-        let shmem_file = shmem_file.as_ref();
-        Self { inner: InnerQueue::create_or_open_shared(shmem_file, len, queue_type) }
-    }
-
-    pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
-        let shmem_file = shmem_file.as_ref();
-        Self {
-            inner: InnerQueue::open_shared(shmem_file)
-                .expect("Couldn't open shared queue, was it initialized?"),
-        }
-    }
-
-    /// Open an existing shared-memory queue, returning an error instead of
-    /// panicking if the queue is invalid (e.g. poisoned, wrong element size).
-    pub fn try_open_shared<P: AsRef<Path>>(shmem_file: P) -> Result<Self, QueueError> {
-        let shmem_file = shmem_file.as_ref();
-        Ok(Self { inner: InnerQueue::open_shared(shmem_file)? })
-    }
-
     /// Size in bytes of the queue region for `len` slots
     pub(crate) fn byte_size(len: usize) -> usize {
         InnerQueue::<T>::size_of(len)
-    }
-
-    /// Initialise a new queue at a pre-mapped pointer. The caller owns the
-    /// mapping.
-    pub(crate) fn from_raw_init(ptr: *mut u8, len: usize, typ: QueueType) -> Self {
-        Self { inner: InnerQueue::from_uninitialized_ptr(ptr, len, typ) }
-    }
-
-    /// Open an existing queue at a pre-mapped pointer. Waits for init and
-    /// validates element size + length.
-    pub(crate) fn from_raw_open(ptr: *mut u8, len: usize) -> Result<Self, QueueError> {
-        let inner = InnerQueue::<T>::open_initialized(ptr, len)?;
-        Ok(Self { inner })
     }
 
     fn group_cursor(&self, key: &str) -> *const AtomicUsize {
@@ -634,6 +638,49 @@ impl<T: Copy> Queue<T> {
 
     pub fn active_groups(&self) -> Vec<(&str, usize)> {
         self.header.active_groups()
+    }
+}
+
+impl<T: Copy + TypeHash> Queue<T> {
+    /// Opens the queue at `shmem_file`, creating it if missing. A segment
+    /// whose layout does not match `T` is retired and replaced; see
+    /// [`RETIRE_MAPPED_QUEUES_ENV`] for when that is refused.
+    pub fn create_or_open_shared<P: AsRef<Path>>(
+        shmem_file: P,
+        len: usize,
+        queue_type: QueueType,
+    ) -> Self {
+        Self { inner: InnerQueue::create_or_open_shared(shmem_file.as_ref(), len, queue_type) }
+    }
+
+    pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
+        Self {
+            inner: InnerQueue::open_shared(shmem_file.as_ref())
+                .expect("Couldn't open shared queue, was it initialized?"),
+        }
+    }
+
+    /// Open an existing shared-memory queue, returning an error instead of
+    /// panicking if the queue is invalid (e.g. poisoned, wrong element type).
+    pub fn try_open_shared<P: AsRef<Path>>(shmem_file: P) -> Result<Self, QueueError> {
+        Ok(Self { inner: InnerQueue::open_shared(shmem_file.as_ref())? })
+    }
+
+    /// Initialise a new queue at a pre-mapped pointer. The caller owns the
+    /// mapping.
+    pub(crate) fn from_raw_init(ptr: *mut u8, len: usize, typ: QueueType) -> Self {
+        Self { inner: InnerQueue::from_uninitialized_ptr(ptr, len, typ, T::TYPE_HASH) }
+    }
+
+    /// Open an existing queue at a pre-mapped pointer of `mapped_len` bytes,
+    /// validating that it holds at least `len` slots of `T`. Poison is left to
+    /// [`InnerQueue::check_poison`].
+    pub(crate) fn from_raw_validated(
+        ptr: *mut u8,
+        mapped_len: usize,
+        len: usize,
+    ) -> Result<Self, QueueError> {
+        Ok(Self { inner: InnerQueue::<T>::open_validated(ptr, mapped_len, len)? })
     }
 }
 
@@ -1163,3 +1210,6 @@ mod tests_basic;
 
 #[cfg(test)]
 mod tests_collaborative;
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests_retire;

@@ -18,10 +18,13 @@ rand.workspace = true
 shared_memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+type-hash.workspace = true
+type-hash-derive.workspace = true
 
 [dev-dependencies]
 core_affinity.workspace = true
 hdrhistogram.workspace = true
+signal-hook.workspace = true
 
 [lints]
 workspace = true

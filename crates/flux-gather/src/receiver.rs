@@ -13,7 +13,7 @@ use mio::Token;
 use tracing::warn;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, flux::type_hash_derive::TypeHash)]
 pub struct IncomingBlob {
     pub token: Token,
 }

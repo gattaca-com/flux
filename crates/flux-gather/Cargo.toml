@@ -17,6 +17,7 @@ flux-timing.workspace = true
 flux-versioned-types.workspace = true
 mio.workspace = true
 tracing.workspace = true
+type-hash = { workspace = true, features = ["mio"] }
 
 [dev-dependencies]
 flux-utils.workspace = true
@@ -26,7 +27,8 @@ tempfile.workspace = true
 type-hash-derive.workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["serde"]
+# type-hash: only enables `mio`, so `Token` queues have a `TypeHash`.
+ignored = ["serde", "type-hash"]
 
 [lints]
 workspace = true

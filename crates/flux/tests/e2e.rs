@@ -11,12 +11,13 @@ use flux::{
 use flux_timing::Duration;
 use serde::{Deserialize, Serialize};
 use spine_derive::from_spine;
+use type_hash_derive::TypeHash;
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, TypeHash)]
 #[repr(C)]
 struct TestMsg(u64);
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, TypeHash)]
 #[repr(C)]
 struct OtherTestMsg(u8);
 

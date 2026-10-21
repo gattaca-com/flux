@@ -17,13 +17,14 @@ use flux::{
     spine::{SpineAdapter, SpineQueue},
     spine_derive::from_spine,
     tile::{Tile, TileConfig, TileInfo, attach_tile},
+    type_hash_derive::TypeHash,
 };
 use flux_timing::Duration;
 use serde::{Deserialize, Serialize};
 
 // ── Message types ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, TypeHash)]
 #[repr(C)]
 struct Quote {
     bid: u64,
@@ -35,7 +36,7 @@ impl Persistable for Quote {
     const PERSIST_DIR: &'static str = "quote";
 }
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, TypeHash)]
 #[repr(C)]
 struct Signal {
     value: f64,

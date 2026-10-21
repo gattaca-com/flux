@@ -3,6 +3,7 @@
 
 use std::{collections::VecDeque, io, net::SocketAddr, os::fd::AsRawFd};
 
+use flux::{type_hash::TypeHash, type_hash_derive::TypeHash};
 use flux_communication::{
     Timer,
     queue::{Producer, Queue, QueueType},
@@ -75,7 +76,7 @@ fn send_datagram(socket: &UdpSocket, addr: SocketAddr, bytes: &[u8]) -> SendOutc
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
 pub(crate) struct UdpSend {
     pub sent_at: Instant,
     pub bytes: u32,
@@ -83,7 +84,7 @@ pub(crate) struct UdpSend {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
 pub(crate) struct UdpRetransmit {
     pub sent_at: Instant,
     pub bytes: u32,
@@ -99,7 +100,7 @@ fn latency_timer(telemetry: NetworkTelemetry, label: &str) -> Option<Timer> {
     Some(Timer::new(app_name, format!("udp_latency_{label}")))
 }
 
-fn telemetry_producer<T: Copy>(
+fn telemetry_producer<T: Copy + TypeHash>(
     telemetry: NetworkTelemetry,
     kind: &str,
     label: &str,

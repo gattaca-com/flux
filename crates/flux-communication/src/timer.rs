@@ -7,6 +7,7 @@ use std::{
 
 use flux_timing::{Duration, Instant, InternalMessage, Nanos};
 use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
+use type_hash_derive::TypeHash;
 
 use crate::queue::{Producer, Queue, QueueType};
 
@@ -19,7 +20,7 @@ use crate::queue::{Producer, Queue, QueueType};
 /// `TimingMessage` may be used to display Nano deltas as 2 instants.
 /// Absolute values have no meaning. Only deltas are valid.
 /// Do not compare `TimingMessage` instances against each other.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, TypeHash)]
 #[repr(C)]
 pub struct TimingMessage {
     pub start_t: Instant,

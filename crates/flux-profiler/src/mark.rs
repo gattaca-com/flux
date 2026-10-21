@@ -22,7 +22,7 @@ fn stamped_now() -> u64 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, type_hash_derive::TypeHash)]
 pub struct Mark {
     // id - pointer to the function name in .rodata
     pub id: u64,

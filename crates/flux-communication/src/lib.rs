@@ -23,6 +23,7 @@ use flux_utils::{
 pub use seqlock::Seqlock;
 pub use shmem_data::ShmemData;
 pub use timer::{Timer, TimingMessage};
+use type_hash::TypeHash;
 
 /// Classification of shared-memory segment types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,7 +71,7 @@ pub fn shmem_dir_queues_string_with_base<D: AsRef<Path>, S: AsRef<Path>>(
     shmem_dir_queues_with_base(base_dir, app_name).to_string_lossy().to_string()
 }
 
-pub fn shmem_queue<S: AsRef<Path>, T: Copy>(
+pub fn shmem_queue<S: AsRef<Path>, T: Copy + TypeHash>(
     app_name: S,
     len: usize,
     typ: queue::QueueType,
@@ -78,7 +79,7 @@ pub fn shmem_queue<S: AsRef<Path>, T: Copy>(
     shmem_queue_with_base_dir(local_share_dir(), app_name, len, typ)
 }
 
-pub fn shmem_queue_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy>(
+pub fn shmem_queue_with_base_dir<D: AsRef<Path>, S: AsRef<Path>, T: Copy + TypeHash>(
     base_dir: D,
     app_name: S,
     len: usize,
@@ -110,7 +111,7 @@ pub fn shmem_queue_dcache_with_base_dir<D, S, T>(
 where
     D: AsRef<Path>,
     S: AsRef<Path>,
-    T: Copy,
+    T: Copy + TypeHash,
 {
     assert!(mtu > 0, "mtu must be > 0");
 
@@ -123,39 +124,30 @@ where
     let dcache_cap = DCache::required_capacity(real_len, mtu).next_power_of_two();
     // 64: DCache fixed prefix (reserved + cacheline pad) preceding the data slice.
     let total = queue_bytes_aligned + 64 + dcache_cap;
-
-    let (ptr, is_new, mapped_size) = queue::shmem_map_create_or_open(&flink_path, total);
-
-    if !is_new && mapped_size < total {
-        tracing::error!(
-            "shmem at {flink_path:?} is too small ({mapped_size} < {total}); \
-             mtu or queue_len changed — removing and recreating.",
-        );
-        let _ = std::fs::remove_file(&flink_path);
-        return shmem_queue_dcache_with_base_dir(base_dir, app_name, queue_len, mtu, typ);
-    }
-
-    let q = if is_new {
-        queue::Queue::from_raw_init(ptr, real_len, typ)
+    // macOS reports shm sizes rounded up to a page, so there an mtu change that
+    // stays within the last page goes unnoticed.
+    let segment_size = if cfg!(target_os = "linux") {
+        total
     } else {
-        match queue::Queue::<T>::from_raw_open(ptr, real_len) {
-            Ok(q) if q.n_slots() == real_len => q,
-            Ok(q) => {
-                tracing::error!(
-                    "queue at {flink_path:?} has {} slots, expected {real_len}; \
-                     queue_len changed — removing and recreating.",
-                    q.n_slots()
-                );
-                let _ = std::fs::remove_file(&flink_path);
-                return shmem_queue_dcache_with_base_dir(base_dir, app_name, queue_len, mtu, typ);
-            }
-            Err(e) => {
-                tracing::error!("invalid queue at {:?}: {e}. Removing and recreating.", flink_path);
-                let _ = std::fs::remove_file(&flink_path);
-                return shmem_queue_dcache_with_base_dir(base_dir, app_name, queue_len, mtu, typ);
-            }
-        }
+        total.next_multiple_of(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize)
     };
+
+    let (q, ptr) = queue::create_or_open_segment(
+        &flink_path,
+        total,
+        std::any::type_name::<T>(),
+        T::TYPE_HASH,
+        |ptr, mapped_len| {
+            let q = queue::Queue::<T>::from_raw_validated(ptr, mapped_len, real_len)?;
+            // The dcache offset and capacity derive from the slot count and mtu.
+            if q.n_slots() != real_len || mapped_len != segment_size {
+                return Err(QueueError::SizeChanged(mapped_len, segment_size));
+            }
+            q.check_poison()?;
+            Ok((q, ptr))
+        },
+        |ptr| (queue::Queue::from_raw_init(ptr, real_len, typ), ptr),
+    );
 
     q.set_signal_on_produce(true);
 
