@@ -16,7 +16,7 @@ use std::{
 };
 
 use flux_network::Network;
-use flux_s3::{Error, RequestId, S3, upload_id};
+use flux_s3::{Error, RequestId, S3, next_uploads_after, upload_id, uploads};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Exercises segment encoding: a space, a '+', and a '/' separator.
@@ -132,8 +132,21 @@ fn signed_round_trip() {
     let upload = upload_id(&initiated).unwrap().to_owned();
     let id = s3.upload_part(&mut net, &bucket, &key, &upload, 1, &body).unwrap();
     ok(&mut net, &mut s3, id);
+    let listed = |net: &mut Network, s3: &mut S3, after: Option<(&str, &str)>| {
+        let prefix = format!("{prefix}{PREFIX}");
+        let id = s3.list_multipart_uploads(net, &bucket, Some(&prefix), after).unwrap();
+        let listing = ok(net, s3, id).0;
+        assert_eq!(next_uploads_after(&listing), None);
+        uploads(&listing).any(|(at, id, _)| at == key && id == upload)
+    };
+    assert!(listed(&mut net, &mut s3, None), "an open upload is listed");
+    assert!(
+        !listed(&mut net, &mut s3, Some((&key, &upload))),
+        "a listing starts after its markers"
+    );
     let id = s3.abort_multipart_upload(&mut net, &bucket, &key, &upload).unwrap();
     ok(&mut net, &mut s3, id);
+    assert!(!listed(&mut net, &mut s3, None), "an aborted upload is not listed");
     let id = s3.head_object(&mut net, &bucket, &key).unwrap();
     let error = settle(&mut net, &mut s3, id).expect_err("an aborted upload left an object");
     assert!(error.starts_with("404 "), "{error}");
