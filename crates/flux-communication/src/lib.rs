@@ -132,8 +132,7 @@ where
         total.next_multiple_of(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize)
     };
 
-    let (q, ptr) = queue::create_or_open_segment::<T, _>(
-        &flink_path,
+    let (q, ptr) = queue::Flink(&flink_path).create_or_open::<T, _>(
         total,
         |ptr, mapped_len| {
             let q = queue::Queue::<T>::from_raw_validated(ptr, mapped_len, real_len)?;

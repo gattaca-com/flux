@@ -61,21 +61,6 @@ pub(crate) fn version_wire_skip(attrs: &[Attribute]) -> Option<&Attribute> {
     attrs.iter().find(|attr| attr.path().is_ident("wire_skip"))
 }
 
-// The chain numbers its versions; an explicit `#[type_hash(version = ..)]` or
-// `newer_than` would override that for `TypeHash::VERSION`.
-fn explicit_type_version(attrs: &[Attribute]) -> Option<&Attribute> {
-    attrs.iter().find(|attr| {
-        attr.path().is_ident("type_hash") &&
-            attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated).is_ok_and(
-                |metas| {
-                    metas.iter().any(|meta| {
-                        meta.path().is_ident("version") || meta.path().is_ident("newer_than")
-                    })
-                },
-            )
-    })
-}
-
 pub(crate) fn strip_wire_skip(attrs: &[Attribute]) -> Vec<Attribute> {
     attrs.iter().filter(|attr| !attr.path().is_ident("wire_skip")).cloned().collect()
 }
@@ -117,6 +102,25 @@ fn version_skips<B: Named, E: Named>(
     (base, evos)
 }
 
+impl<B: Named, E: Named> EvolveInputGeneric<B, E> {
+    /// `#[type_hash(version = ..)]` or `newer_than` attributes the user gave
+    /// the chain's versions, which would override the chain's own numbering.
+    fn explicit_type_versions(&self) -> impl Iterator<Item = &Attribute> {
+        let versions =
+            std::iter::once(self.base.attrs()).chain(self.evolutions.iter().map(Named::attrs));
+        std::iter::once(self.default_attrs.as_slice()).chain(versions).flatten().filter(|attr| {
+            attr.path().is_ident("type_hash") &&
+                attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated).is_ok_and(
+                    |metas| {
+                        metas.iter().any(|meta| {
+                            meta.path().is_ident("version") || meta.path().is_ident("newer_than")
+                        })
+                    },
+                )
+        })
+    }
+}
+
 pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     input: &mut EvolveInputGeneric<B, E>,
     generate_base: impl FnOnce(&EvolveInputGeneric<B, E>, bool) -> (TokenStream2, Vec<Item>),
@@ -136,10 +140,7 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     let versions = std::iter::once(&input.base as &dyn Named)
         .chain(input.evolutions.iter().map(|version| version as &dyn Named));
     let mut errors = TokenStream2::new();
-    let explicit = std::iter::once(input.default_attrs.as_slice())
-        .chain(versions.clone().map(Named::attrs))
-        .filter_map(explicit_type_version);
-    for attr in explicit {
+    for attr in input.explicit_type_versions() {
         errors.extend(
             syn::Error::new_spanned(
                 attr,

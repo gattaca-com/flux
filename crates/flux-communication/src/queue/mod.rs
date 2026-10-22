@@ -56,11 +56,11 @@ fn is_pid_alive(pid: u32) -> bool {
 mod fault;
 mod segment;
 
-pub use fault::{RetiredQueue, retired_queues};
+pub use fault::RetiredQueue;
 use flux_timing::Nanos;
 use flux_utils::{ArrayStr, safe_panic};
+pub(crate) use segment::Flink;
 pub use segment::RETIRE_MAPPED_QUEUES_ENV;
-pub(crate) use segment::create_or_open as create_or_open_segment;
 use type_hash::TypeHash;
 
 use crate::{
@@ -217,7 +217,7 @@ impl QueueHeader {
     }
 
     pub fn open_shared<S: AsRef<Path>>(path: S) -> Result<&'static mut Self, QueueError> {
-        segment::open(path.as_ref(), "QueueHeader", |ptr, len| {
+        Flink(path.as_ref()).open("QueueHeader", |ptr, len| {
             let header = Self::from_mapping(ptr, len)?;
             header.check_layout()?;
             Ok(header)
@@ -610,8 +610,7 @@ impl<T: Copy> InnerQueue<T> {
 impl<T: Copy + TypeHash> InnerQueue<T> {
     fn create_or_open_shared(shmem_file: &Path, len: usize, typ: QueueType) -> *const Self {
         let len = len.next_power_of_two();
-        segment::create_or_open::<T, _>(
-            shmem_file,
+        Flink(shmem_file).create_or_open::<T, _>(
             Self::size_of(len),
             |ptr, mapped_len| Self::open_initialized(ptr, mapped_len, len),
             |ptr| Self::from_uninitialized_ptr(ptr, len, typ, T::TYPE_HASH, T::VERSION),
@@ -620,7 +619,7 @@ impl<T: Copy + TypeHash> InnerQueue<T> {
 
     fn open_shared(shmem_file: &Path) -> Result<*const Self, QueueError> {
         // min_len 0: any length the creator chose is fine for an attach-only open.
-        segment::open(shmem_file, std::any::type_name::<T>(), |ptr, mapped_len| {
+        Flink(shmem_file).open(std::any::type_name::<T>(), |ptr, mapped_len| {
             let q = Self::open_initialized(ptr, mapped_len, 0)?;
             unsafe { &(*q).header }.raise_type_version(T::VERSION);
             Ok(q)
