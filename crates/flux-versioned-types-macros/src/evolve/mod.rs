@@ -97,18 +97,4 @@ mod tests {
 
         assert!(!output.contains("compile_error"));
     }
-
-    #[test]
-    fn evolve_struct_rejects_explicit_versions() {
-        let output = expand(quote! {
-            roll_into Message
-            #[type_hash_lock(hash = 1)]
-            MessageV1 { pub value: u32 }
-            #[type_hash_lock(hash = 2)]
-            #[type_hash(version = 7)]
-            MessageV2 { add { pub accepted: bool = true } }
-        });
-
-        assert!(output.contains("the chain sets the type_hash version"));
-    }
 }

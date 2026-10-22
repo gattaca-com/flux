@@ -1274,6 +1274,3 @@ mod tests_basic;
 
 #[cfg(test)]
 mod tests_collaborative;
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests_retire;

@@ -24,7 +24,6 @@ type-hash-derive.workspace = true
 [dev-dependencies]
 core_affinity.workspace = true
 hdrhistogram.workspace = true
-signal-hook.workspace = true
 
 [lints]
 workspace = true

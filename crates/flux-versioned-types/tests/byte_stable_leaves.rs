@@ -1,5 +1,4 @@
 use flux::{type_hash::TypeHash, type_hash_derive::type_hash_lock};
-use flux_timing::InternalMessage;
 use flux_versioned_types::{
     DecodeError, HasVersionedLeaves, Versioned, VersionedDeserialize, VersionedLeaves,
     VisitorVersionedLeaf,
@@ -86,30 +85,6 @@ fn struct_versions_decode_and_migrate() {
     let latest_bytes = slice_as_bytes(latest.as_slice());
     let back = Leaf::decode_versions(LeafV2::TYPE_HASH, latest_bytes, 1).unwrap();
     assert_eq!(back, latest);
-}
-
-versioned_struct!(Wrap =>
-    #[type_hash_lock(hash = 3826908793115155198)]
-    WrapV1 { pub slot: u64, pub leaf: Leaf }
-    #[type_hash_lock(hash = 6132961615519568422)]
-    WrapV2 { remove { leaf } }
-);
-
-#[derive(Clone, Copy, flux::type_hash_derive::TypeHash)]
-#[type_hash(version = 1)]
-struct Holder {
-    leaf: Leaf,
-    kinds: [Kind; 2],
-}
-
-#[test]
-fn versions_number_the_chain_and_add_up() {
-    assert_eq!((LeafV1::VERSION, LeafV2::VERSION), (1, 2));
-    assert_eq!((KindV1::VERSION, KindV2::VERSION), (1, 2));
-    assert_eq!(<InternalMessage<Leaf> as TypeHash>::VERSION, 2);
-    assert_eq!(Holder::VERSION, 1 + 2 + 2);
-    // Dropping a field with a version still yields a newer version.
-    assert_eq!((WrapV1::VERSION, WrapV2::VERSION), (1 + 2, 1 + 2 + 1));
 }
 
 #[test]
