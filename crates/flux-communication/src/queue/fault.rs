@@ -111,6 +111,8 @@ pub(super) fn register(segment: Segment, path: &Path, type_name: &'static str) {
 
 /// Panics if this process already maps `path` for another element type:
 /// two types whose queue names collide would retire each other's segment.
+/// Across processes nothing catches that: their versions get compared, and
+/// the higher one retires the other's segment.
 pub(super) fn check_collision(path: &Path, type_name: &'static str, type_hash: u64) {
     let other = MAPPINGS
         .lock()

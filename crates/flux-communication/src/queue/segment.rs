@@ -6,7 +6,9 @@
 //! object is truncated to zero, then unlinked and replaced. Truncation turns
 //! every remaining access to it into SIGBUS: processes that mapped it through
 //! this module shut down through SIGTERM (see [`super::fault`]), others, such
-//! as older binaries or tools mapping it directly, crash.
+//! as older binaries or tools mapping it directly, crash. While other
+//! processes map a segment, only a newer layout retires it; see
+//! [`may_retire_mapped`].
 //!
 //! Finding other processes' mappings and truncating are Linux only; elsewhere
 //! a mismatched segment is unlinked and replaced while its mappers keep it.
@@ -21,25 +23,35 @@ use std::{
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use shared_memory::{ShmemConf, ShmemError};
+use type_hash::TypeHash;
 
-use super::{QueueHeader, QueueIdentity, fault};
+use super::{LayoutVersion, QueueHeader, QueueIdentity, fault};
 use crate::error::QueueError;
 
-/// Set to `1` to retire a mismatched queue segment that other live processes
-/// still map. Poisoned segments are retired regardless; see
-/// [`may_retire_mapped`].
+/// Set to `1` for one start of a process to let it retire any mismatched queue
+/// segment, as in a rollback; see
+/// [`Queue::create_or_open_shared`](super::Queue::create_or_open_shared).
+///
+/// Left set, it lets an older binary that restarts retire the newer one's
+/// segments again.
 pub const RETIRE_MAPPED_QUEUES_ENV: &str = "FLUX_RETIRE_MAPPED_QUEUES";
 
-/// Retire policy for a segment that other live processes still map. A
-/// poisoned slot means its writer died mid-write and attached readers are
-/// stuck on it, so the next process that opens the queue with
-/// `create_or_open_shared` retires the segment. Any other mismatch is refused
-/// unless [`RETIRE_MAPPED_QUEUES_ENV`] is `1`.
-fn may_retire_mapped(reason: &QueueError) -> bool {
-    matches!(reason, QueueError::ElementPoisoned(_)) ||
+/// How long an open that shut down other processes waits for them to exit.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether to retire a segment that other live processes still map, which
+/// shuts them down. Only a newer [`LayoutVersion`] may: if an equal or older
+/// one could, two binaries restarted by a supervisor would keep retiring each
+/// other's segment. A poisoned slot means its writer died mid-write and
+/// attached readers are stuck on it, so a poisoned segment is retired
+/// regardless.
+fn may_retire_mapped(reason: &QueueError, theirs: LayoutVersion, ours: LayoutVersion) -> bool {
+    ours > theirs ||
+        matches!(reason, QueueError::ElementPoisoned(_)) ||
         std::env::var_os(RETIRE_MAPPED_QUEUES_ENV).is_some_and(|v| v == "1")
 }
 
@@ -113,38 +125,46 @@ impl Drop for Segment {
     }
 }
 
-/// Maps the queue segment at `flink`. An existing segment is accepted when
-/// `open` accepts it and retired otherwise; a missing or retired one is
-/// created and handed to `init` before the directory lock is released.
-pub(crate) fn create_or_open<R>(
+/// Maps the segment at `flink` of a queue of `T`. An existing segment is
+/// accepted when `open` accepts it and retired otherwise; a missing or retired
+/// one is created and handed to `init` before the directory lock is released.
+pub(crate) fn create_or_open<T: TypeHash, R>(
     flink: &Path,
     size: usize,
-    type_name: &'static str,
-    type_hash: u64,
     open: impl FnOnce(*mut u8, usize) -> Result<R, QueueError>,
     init: impl FnOnce(*mut u8) -> R,
 ) -> R {
+    let type_name = std::any::type_name::<T>();
     let dir = dir_of(flink);
     let _ = std::fs::create_dir_all(dir);
-    let _lock =
+    let lock =
         lock_dir(dir).unwrap_or_else(|e| panic!("couldn't lock queue dir {}: {e}", dir.display()));
     // Under the lock: registration happens under it too.
-    fault::check_collision(flink, type_name, type_hash);
+    fault::check_collision(flink, type_name, T::TYPE_HASH);
 
     let existing = map_existing(flink)
         .unwrap_or_else(|e| panic!("couldn't open queue segment {}: {e}", flink.display()));
+    let mut shut_down = None;
     match existing {
         Existing::Missing => {}
         Existing::Stale(os_id) => remove_stale(flink, &os_id),
         Existing::Mapped(os_id, segment) => match open(segment.ptr, segment.len) {
             Ok(queue) => {
+                // Only once `open` accepted it: a rejected segment keeps the version a
+                // retire compares against.
+                QueueHeader::from_ptr(segment.ptr).raise_type_version(T::VERSION);
                 fault::register(segment, flink, type_name);
                 return queue;
             }
             Err(reason) => {
                 let previous = segment.identity();
+                let theirs = LayoutVersion::of_mapping(segment.ptr, segment.len);
                 // Unmap before truncating: this process must never touch the old object again.
-                retire(flink, &os_id, &segment.into_file(), previous, &reason, type_hash);
+                let object = segment.into_file();
+                let ours = LayoutVersion::of::<T>();
+                if retire(flink, &os_id, &object, previous, &reason, theirs, ours) {
+                    shut_down = Some(object);
+                }
             }
         },
     }
@@ -152,7 +172,31 @@ pub(crate) fn create_or_open<R>(
     let segment = create(flink, size);
     let queue = init(segment.ptr);
     fault::register(segment, flink, type_name);
+    drop(lock);
+    if let Some(object) = shut_down {
+        wait_for_exit(flink, &object);
+    }
     queue
+}
+
+/// Waits for the processes a retire shut down to exit: until then they still
+/// map the other queues this process is about to open, which it may not be
+/// allowed to replace. Their registered mappings hold a shared `flock` on the
+/// old object until they exit. Runs without the directory lock, which their
+/// shutdown may need.
+fn wait_for_exit(flink: &Path, object: &File) {
+    let deadline = Instant::now() + SHUTDOWN_WAIT;
+    while unsafe { libc::flock(object.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if Instant::now() > deadline {
+            tracing::warn!(
+                "processes that mapped the old segment of queue {} are still running \
+                 {SHUTDOWN_WAIT:?} after it was replaced",
+                flink.display()
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Maps an existing queue segment without ever creating or retiring one.
@@ -258,14 +302,16 @@ fn remove_flink(flink: &Path) {
     }
 }
 
+/// Returns whether that shut down processes still mapping the segment.
 fn retire(
     flink: &Path,
     os_id: &str,
     object: &File,
     previous: Option<QueueIdentity>,
     reason: &QueueError,
-    type_hash: u64,
-) {
+    theirs: LayoutVersion,
+    ours: LayoutVersion,
+) -> bool {
     let mappers = mappers_of(os_id).unwrap_or_else(|e| {
         panic!("couldn't look for processes mapping queue {}: {e}", flink.display())
     });
@@ -281,11 +327,21 @@ fn retire(
     let mapped = !mappers.is_empty() ||
         (unsafe { libc::flock(object.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 &&
             io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK));
+    let advice = if theirs.header == ours.header {
+        format!(
+            "; if this build is the newer one, raise its element type version above {}: add a \
+             version to its chain, or raise its #[type_hash(version = N)]",
+            theirs.element
+        )
+    } else {
+        String::new()
+    };
     assert!(
-        !mapped || may_retire_mapped(reason),
-        "refusing to replace queue {} ({reason}): still mapped by {}. Stop those processes, or \
-         set {RETIRE_MAPPED_QUEUES_ENV}=1 to replace it anyway; processes that opened it through \
-         flux then shut down through SIGTERM, others crash with SIGBUS",
+        !mapped || may_retire_mapped(reason, theirs, ours),
+        "refusing to replace queue {} ({reason}): it is still mapped by {}, and this process's \
+         layout ({ours}) is not newer than the queue's ({theirs}). Stop those processes{advice}; \
+         or start this process once with {RETIRE_MAPPED_QUEUES_ENV}=1 to replace it anyway, \
+         which shuts them down",
         flink.display(),
         describe(&mappers)
     );
@@ -304,16 +360,18 @@ fn retire(
     if mapped {
         tracing::warn!(
             "replacing queue {} ({reason}) and shutting down {}, which still mapped it; old \
-             segment: {previous}; new type hash {type_hash:#018x}",
+             segment: {previous}; new layout: {ours}",
             flink.display(),
             describe(&mappers)
         );
     } else {
         tracing::warn!(
-            "replacing queue {} ({reason}); old segment: {previous}; new type hash {type_hash:#018x}",
+            "replacing queue {} ({reason}); old segment: {previous}; new layout: {ours}",
             flink.display()
         );
     }
+    // Only the truncation shuts them down.
+    mapped && cfg!(target_os = "linux")
 }
 
 struct Mapper {

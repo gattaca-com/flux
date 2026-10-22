@@ -556,6 +556,7 @@ impl<T: TypeHash + Copy, const N: usize> TypeHash for ArrayVec<T, N> {
         h = hash_layout_of::<Self>(h);
         h
     };
+    const VERSION: u32 = T::VERSION;
 }
 
 impl<const N: usize> TypeHash for ArrayStr<N> {

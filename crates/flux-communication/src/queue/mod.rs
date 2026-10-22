@@ -2,12 +2,12 @@ use std::{
     alloc::Layout,
     borrow::Borrow,
     collections::HashMap,
-    mem::size_of,
+    mem::{offset_of, size_of},
     ops::Deref,
     path::Path,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -86,7 +86,8 @@ pub struct AlignedCursor {
 }
 
 // Older layouts keep a group label length (<= 64) at the magic's offset, so
-// their segments never validate.
+// their segments never validate. Every later header version keeps `magic` and
+// `header_version` at their offsets: `LayoutVersion` orders segments by them.
 const QUEUE_MAGIC: u64 = 0xF1C0_9E0E_7A5E_D1D5;
 const HEADER_VERSION: u32 = 1;
 
@@ -97,7 +98,7 @@ pub struct QueueHeader {
     is_initialized: AtomicU8,    // 2 — Release-stored once every other field is written
     group_lock: AtomicU8,        // 3  — spinlock protecting group label search/insert
     signal_on_produce: AtomicU8, // 4 — produces wake parked tile threads (`park` feature)
-    _pad1: [u8; 4],              // 8
+    type_version: AtomicU32,     // 8 — highest `TypeHash::VERSION` among openers
     pub elsize: usize,           // 16
     pub mask: usize,             // 24
     pub count: AtomicUsize,      // 32
@@ -115,6 +116,7 @@ pub struct QueueHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueIdentity {
     pub type_hash: u64,
+    pub type_version: u32,
     pub creator_pid: u32,
     pub created_at: Nanos,
 }
@@ -123,9 +125,54 @@ impl std::fmt::Display for QueueIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "type hash {:#018x}, created by pid {} at {}",
-            self.type_hash, self.creator_pid, self.created_at
+            "type hash {:#018x} version {}, created by pid {} at {}",
+            self.type_hash, self.type_version, self.creator_pid, self.created_at
         )
+    }
+}
+
+/// Orders queue segment layouts: while other processes map a segment, only a
+/// newer layout replaces it. Header layouts come first; element type versions
+/// only compare within one header layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct LayoutVersion {
+    header: u32,
+    element: u32,
+}
+
+impl LayoutVersion {
+    const fn of<T: TypeHash>() -> Self {
+        Self { header: HEADER_VERSION, element: T::VERSION }
+    }
+
+    /// Of the `len` bytes mapped at `ptr`, whatever their header version: zero
+    /// for the parts this code cannot read.
+    // Mappings are page-aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    fn of_mapping(ptr: *const u8, len: usize) -> Self {
+        if len < offset_of!(QueueHeader, header_version) + size_of::<u32>() {
+            return Self::default();
+        }
+        let magic = unsafe { ptr.add(offset_of!(QueueHeader, magic)).cast::<u64>().read() };
+        if magic != QUEUE_MAGIC {
+            return Self::default();
+        }
+        let header =
+            unsafe { ptr.add(offset_of!(QueueHeader, header_version)).cast::<u32>().read() };
+        let element = if header == HEADER_VERSION {
+            let version =
+                unsafe { &*ptr.add(offset_of!(QueueHeader, type_version)).cast::<AtomicU32>() };
+            version.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        Self { header, element }
+    }
+}
+
+impl std::fmt::Display for LayoutVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "header version {}, element type version {}", self.header, self.element)
     }
 }
 
@@ -159,10 +206,11 @@ impl QueueHeader {
         self.elsize
     }
 
-    /// `None` for segments without the queue magic.
+    /// `None` for segments whose header layout differs from this code's.
     pub fn identity(&self) -> Option<QueueIdentity> {
-        (self.magic == QUEUE_MAGIC).then_some(QueueIdentity {
+        self.check_layout().is_ok().then_some(QueueIdentity {
             type_hash: self.type_hash,
+            type_version: self.type_version.load(Ordering::Relaxed),
             creator_pid: self.creator_pid,
             created_at: Nanos(self.created_at_ns),
         })
@@ -190,7 +238,14 @@ impl QueueHeader {
         Ok(header)
     }
 
-    fn init(&mut self, queue_type: QueueType, len: usize, elsize: usize, type_hash: u64) {
+    fn init(
+        &mut self,
+        queue_type: QueueType,
+        len: usize,
+        elsize: usize,
+        type_hash: u64,
+        type_version: u32,
+    ) {
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
@@ -201,9 +256,16 @@ impl QueueHeader {
         self.magic = QUEUE_MAGIC;
         self.header_version = HEADER_VERSION;
         self.type_hash = type_hash;
+        self.type_version = AtomicU32::new(type_version);
         self.created_at_ns = created_at;
         self.creator_pid = std::process::id();
         self.is_initialized.store(1, Ordering::Release);
+    }
+
+    /// Records that an element type of `version` with this segment's layout
+    /// opened it.
+    fn raise_type_version(&self, version: u32) {
+        self.type_version.fetch_max(version, Ordering::Relaxed);
     }
 
     /// Whether the rest of the header has the layout this code reads.
@@ -376,7 +438,7 @@ impl<T: Copy> InnerQueue<T> {
             );
             // Why real len you may ask. The size of the fat pointer ONLY includes the
             // length of the unsized part of the struct i.e. the buffer.
-            Self::from_uninitialized_ptr(ptr, real_len, queue_type, 0)
+            Self::from_uninitialized_ptr(ptr, real_len, queue_type, 0, 0)
         }
     }
 
@@ -389,10 +451,11 @@ impl<T: Copy> InnerQueue<T> {
         len: usize,
         queue_type: QueueType,
         type_hash: u64,
+        type_version: u32,
     ) -> *const Self {
         unsafe {
             let q = std::ptr::slice_from_raw_parts_mut(ptr, len) as *mut Self;
-            (*q).header.init(queue_type, len, size_of::<Seqlock<T>>(), type_hash);
+            (*q).header.init(queue_type, len, size_of::<Seqlock<T>>(), type_hash, type_version);
             q
         }
     }
@@ -547,20 +610,20 @@ impl<T: Copy> InnerQueue<T> {
 impl<T: Copy + TypeHash> InnerQueue<T> {
     fn create_or_open_shared(shmem_file: &Path, len: usize, typ: QueueType) -> *const Self {
         let len = len.next_power_of_two();
-        segment::create_or_open(
+        segment::create_or_open::<T, _>(
             shmem_file,
             Self::size_of(len),
-            std::any::type_name::<T>(),
-            T::TYPE_HASH,
             |ptr, mapped_len| Self::open_initialized(ptr, mapped_len, len),
-            |ptr| Self::from_uninitialized_ptr(ptr, len, typ, T::TYPE_HASH),
+            |ptr| Self::from_uninitialized_ptr(ptr, len, typ, T::TYPE_HASH, T::VERSION),
         )
     }
 
     fn open_shared(shmem_file: &Path) -> Result<*const Self, QueueError> {
         // min_len 0: any length the creator chose is fine for an attach-only open.
         segment::open(shmem_file, std::any::type_name::<T>(), |ptr, mapped_len| {
-            Self::open_initialized(ptr, mapped_len, 0)
+            let q = Self::open_initialized(ptr, mapped_len, 0)?;
+            unsafe { &(*q).header }.raise_type_version(T::VERSION);
+            Ok(q)
         })
     }
 
@@ -643,8 +706,10 @@ impl<T: Copy> Queue<T> {
 
 impl<T: Copy + TypeHash> Queue<T> {
     /// Opens the queue at `shmem_file`, creating it if missing. A segment
-    /// whose layout does not match `T` is retired and replaced; see
-    /// [`RETIRE_MAPPED_QUEUES_ENV`] for when that is refused.
+    /// whose layout does not match `T` is retired and replaced. While other
+    /// processes map it, only a newer header layout or [`TypeHash::VERSION`]
+    /// of `T` retires it, or a poisoned slot, which means its writer died
+    /// mid-write; see [`RETIRE_MAPPED_QUEUES_ENV`].
     pub fn create_or_open_shared<P: AsRef<Path>>(
         shmem_file: P,
         len: usize,
@@ -669,7 +734,7 @@ impl<T: Copy + TypeHash> Queue<T> {
     /// Initialise a new queue at a pre-mapped pointer. The caller owns the
     /// mapping.
     pub(crate) fn from_raw_init(ptr: *mut u8, len: usize, typ: QueueType) -> Self {
-        Self { inner: InnerQueue::from_uninitialized_ptr(ptr, len, typ, T::TYPE_HASH) }
+        Self { inner: InnerQueue::from_uninitialized_ptr(ptr, len, typ, T::TYPE_HASH, T::VERSION) }
     }
 
     /// Open an existing queue at a pre-mapped pointer of `mapped_len` bytes,

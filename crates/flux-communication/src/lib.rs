@@ -132,11 +132,9 @@ where
         total.next_multiple_of(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize)
     };
 
-    let (q, ptr) = queue::create_or_open_segment(
+    let (q, ptr) = queue::create_or_open_segment::<T, _>(
         &flink_path,
         total,
-        std::any::type_name::<T>(),
-        T::TYPE_HASH,
         |ptr, mapped_len| {
             let q = queue::Queue::<T>::from_raw_validated(ptr, mapped_len, real_len)?;
             // The dcache offset and capacity derive from the slot count and mtu.
