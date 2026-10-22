@@ -31,9 +31,10 @@
 //! ```
 //!
 //! # Limitations
-//! HTTP/1.1 and HTTP/1.0 responses are supported. Request bodies require
-//! `Content-Length`; chunked requests are rejected with `501`. Response bodies
-//! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
+//! HTTP/1.1 and HTTP/1.0 responses are supported. Request bodies may use
+//! `Content-Length` or chunked transfer coding, delivered whole; other
+//! transfer codings get `501`. Response bodies may use `Content-Length`,
+//! chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
 //! Server-side TLS, HTTP/2, compression, trailer exposure and upgrades other
@@ -68,6 +69,8 @@ const REQUEST_STACK_HEADERS: usize = 128;
 /// Request head buffers kept for reuse once their request completes.
 const SPARE_HEADS: usize = 64;
 const MAX_BODY_PARTS: usize = 16;
+/// A chunk-size line, its extensions included; a longer one is refused.
+const MAX_CHUNK_LINE: usize = 1024;
 
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
@@ -239,6 +242,9 @@ struct Conn {
     /// The `Sec-WebSocket-Accept` for the pending request, when it asks to
     /// upgrade.
     upgrade: Option<[u8; 28]>,
+    /// How far a chunked request body is scanned: past its last whole chunk,
+    /// and the body bytes before it.
+    chunk_scan: (usize, usize),
 }
 
 /// A streaming request; `body` is set once its head has been delivered.
@@ -286,7 +292,7 @@ pub struct HttpNetwork {
     tls_config: Option<Arc<crate::tls::ClientConfig>>,
     failed: Vec<(RequestId, Failure)>,
     spare_heads: Vec<Vec<u8>>,
-    /// Decoded body of the chunked response being delivered.
+    /// Decoded body of the chunked request or response being delivered.
     chunked_body: Vec<u8>,
 }
 impl Default for HttpNetwork {
@@ -477,6 +483,7 @@ impl HttpNetwork {
                     stream: None,
                     ws: None,
                     upgrade: None,
+                    chunk_scan: (0, 0),
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
@@ -723,6 +730,7 @@ impl HttpNetwork {
             stream: None,
             ws: None,
             upgrade: None,
+            chunk_scan: (0, 0),
         });
         token
     }
@@ -1086,34 +1094,32 @@ impl HttpNetwork {
             self.error(net, i, 400);
             return
         };
-        if req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("transfer-encoding")) {
-            self.error(net, i, 501);
-            return
-        }
-        if len > self.max_body_bytes {
-            self.error(net, i, 413);
-            return
-        }
-        let Some(end) = head.checked_add(len) else {
-            self.error(net, i, 413);
-            return
-        };
-        if buf.len() < end {
-            if over_limit {
-                self.error(net, i, 413);
+        let chunked = req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+        let mut scan = self.conns[i].chunk_scan;
+        let end = match Self::request_end(
+            req.headers,
+            chunked,
+            req.version,
+            buf,
+            head,
+            len,
+            self.max_body_bytes,
+            self.max_headers,
+            &mut scan,
+            &mut self.chunked_body,
+        ) {
+            Ok(end) => end,
+            Err(status) => {
+                self.error(net, i, status);
                 return
             }
-            if has_token(req.headers, "expect", b"100-continue") &&
-                !self.conns[i].role.accepted_continued()
-            {
-                let token = self.conns[i].token;
-                if net.send_with(token, |out| write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap())
-                {
-                    self.conns[i].role.set_accepted_continued(true);
-                }
-            }
+        };
+        let Some(end) = end else {
+            let expects = has_token(req.headers, "expect", b"100-continue");
+            self.conns[i].chunk_scan = scan;
+            self.await_body(net, i, over_limit, expects);
             return
-        }
+        };
         let close = req.version == Some(0) && !has_token(req.headers, "connection", b"keep-alive") ||
             has_token(req.headers, "connection", b"close");
         let token = self.conns[i].token;
@@ -1123,19 +1129,84 @@ impl HttpNetwork {
             path: req.path.unwrap_or(""),
             version: req.version.unwrap_or(1),
             headers: req.headers,
-            body: &buf[head..end],
+            body: if chunked { &self.chunked_body } else { &buf[head..end] },
         };
         let upgrade = request.is_websocket_upgrade().then(|| {
             websocket::accept_key(request.header("sec-websocket-key").unwrap_or_default())
         });
         handler(HttpEvent::Request { token, request });
+        if self.chunked_body.capacity() > KEEP_BUF_BYTES {
+            self.chunked_body = Vec::new();
+        }
         self.conns[i].upgrade = upgrade;
+        self.conns[i].chunk_scan = (0, 0);
         self.conns[i].buf.drain(..end);
         self.conns[i].dirty = !self.conns[i].buf.is_empty();
         self.conns[i].role.set_accepted_state(State::Pending);
         self.conns[i].role.set_accepted_close(close);
         self.conns[i].role.set_accepted_continued(false);
         self.conns[i].role.set_accepted_head_request(head_request);
+    }
+    /// Where a request whose head ends at `head` ends, once its body is all
+    /// in; a body with a `Transfer-Encoding` (`chunked`) is decoded into
+    /// `chunked_body`. Only `chunked` is understood, and a length beside it
+    /// is refused: the two could frame the message differently. `Err` is the
+    /// status to refuse it with.
+    #[allow(clippy::too_many_arguments)]
+    fn request_end(
+        headers: &[httparse::Header<'_>],
+        chunked: bool,
+        version: Option<u8>,
+        buf: &[u8],
+        head: usize,
+        len: usize,
+        max_body_bytes: usize,
+        max_headers: usize,
+        scan: &mut (usize, usize),
+        chunked_body: &mut Vec<u8>,
+    ) -> Result<Option<usize>, u16> {
+        if !chunked {
+            if len > max_body_bytes {
+                return Err(413)
+            }
+            let end = head.checked_add(len).ok_or(413u16)?;
+            return Ok((buf.len() >= end).then_some(end))
+        }
+        // HTTP/1.0 has no transfer codings.
+        if version == Some(0) {
+            return Err(400)
+        }
+        match transfer_chunked(headers) {
+            Some(true)
+                if !headers.iter().any(|h| h.name.eq_ignore_ascii_case("content-length")) => {}
+            Some(true) => return Err(400),
+            _ => return Err(501),
+        }
+        Self::decode_chunked(buf, head, max_body_bytes, max_headers, Some(scan), chunked_body)
+            .map_err(|error| match error {
+                ChunkError::TooLarge => 413,
+                ChunkError::Malformed => 400,
+            })
+    }
+    /// A request whose body is not all in: refused past the buffer limit,
+    /// else told to go on when it expects `100 Continue`.
+    fn await_body(
+        &mut self,
+        net: &mut NetworkCore,
+        i: usize,
+        over_limit: bool,
+        expects_continue: bool,
+    ) {
+        if over_limit {
+            self.error(net, i, 413);
+            return
+        }
+        if expects_continue && !self.conns[i].role.accepted_continued() {
+            let token = self.conns[i].token;
+            if net.send_with(token, |out| write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap()) {
+                self.conns[i].role.set_accepted_continued(true);
+            }
+        }
     }
     fn error(&mut self, net: &mut NetworkCore, i: usize, status: u16) {
         self.conns[i].role.set_accepted_state(State::Pending);
@@ -1692,11 +1763,12 @@ impl HttpNetwork {
                     head,
                     self.max_body_bytes,
                     self.max_headers,
+                    None,
                     &mut self.chunked_body,
                 ) {
                     Ok(Some(consumed)) => (consumed, true),
                     Ok(None) => return,
-                    Err(()) => {
+                    Err(_) => {
                         self.fail_outbound(net, i);
                         return
                     }
@@ -1788,80 +1860,145 @@ impl HttpNetwork {
         true
     }
     /// Decodes the complete chunked body starting at `start` into `body`,
-    /// returning the offset just past it.
+    /// returning the offset just past it. A request passes its `scan`: how far
+    /// its incomplete body was checked, so the next read goes on from there,
+    /// and its chunks are framed as hyper frames them. A response is read from
+    /// the start each time, with httparse's leniency.
     fn decode_chunked(
         bytes: &[u8],
         start: usize,
         max_body_bytes: usize,
         max_headers: usize,
+        scan: Option<&mut (usize, usize)>,
         body: &mut Vec<u8>,
-    ) -> Result<Option<usize>, ()> {
+    ) -> Result<Option<usize>, ChunkError> {
+        use ChunkError::Malformed;
         let bytes = &bytes[start..];
-        let Some((end, body_len)) = Self::chunked_end(bytes, max_body_bytes, max_headers)? else {
+        let strict = scan.is_some();
+        let mut from_start = (0, 0);
+        let scan = scan.unwrap_or(&mut from_start);
+        let Some((end, body_len)) =
+            Self::chunked_end(bytes, max_body_bytes, max_headers, strict, scan)?
+        else {
             return Ok(None)
         };
+        *scan = (0, 0);
         body.clear();
         body.reserve(body_len);
         let mut at = 0;
         while at < end {
-            let httparse::Status::Complete((consumed, size)) =
-                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
-            else {
-                return Err(())
+            let Some((consumed, size)) = chunk_size(&bytes[at..], strict)? else {
+                return Err(Malformed)
             };
-            at = at.checked_add(consumed).ok_or(())?;
-            let size = usize::try_from(size).map_err(|_| ())?;
+            at = at.checked_add(consumed).ok_or(Malformed)?;
             if size == 0 {
-                return start.checked_add(end).map(Some).ok_or(())
+                return start.checked_add(end).map(Some).ok_or(Malformed)
             }
             body.extend_from_slice(&bytes[at..at + size]);
-            at = at.checked_add(size + 2).ok_or(())?;
+            at = at.checked_add(size + 2).ok_or(Malformed)?;
         }
-        Err(())
+        Err(Malformed)
     }
+    /// Where a chunked body ends and its length, once it is all in. `scan`
+    /// says where to start, and is moved past each whole chunk.
     fn chunked_end(
         bytes: &[u8],
         max_body_bytes: usize,
         max_headers: usize,
-    ) -> Result<Option<(usize, usize)>, ()> {
-        let mut at = 0;
-        let mut body_len = 0;
+        strict: bool,
+        scan: &mut (usize, usize),
+    ) -> Result<Option<(usize, usize)>, ChunkError> {
+        use ChunkError::Malformed;
+        let (mut at, mut body_len) = *scan;
         loop {
-            let httparse::Status::Complete((consumed, size)) =
-                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
+            let Some((consumed, size)) = chunk_size(bytes.get(at..).unwrap_or_default(), strict)?
             else {
                 return Ok(None)
             };
-            let size = usize::try_from(size).map_err(|_| ())?;
             if size > max_body_bytes.saturating_sub(body_len) {
-                return Err(())
+                return Err(ChunkError::TooLarge)
             }
-            at = at.checked_add(consumed).ok_or(())?;
+            at = at.checked_add(consumed).ok_or(Malformed)?;
             if size == 0 {
+                // A request's trailers are read on the stack: past its slots they are
+                // refused.
                 let (mut stack_slots, mut heap_slots) =
                     ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+                let max_headers = if strict { max_headers.min(STACK_HEADERS) } else { max_headers };
                 let headers = header_slots(&mut stack_slots, &mut heap_slots, max_headers);
                 let httparse::Status::Complete((consumed, _)) =
-                    httparse::parse_headers(&bytes[at..], headers).map_err(|_| ())?
+                    httparse::parse_headers(&bytes[at..], headers).map_err(|_| Malformed)?
                 else {
                     return Ok(None)
                 };
-                let end = at.checked_add(consumed).ok_or(())?;
+                let end = at.checked_add(consumed).ok_or(Malformed)?;
                 if !crlf_only(&bytes[at..end]) {
-                    return Err(())
+                    return Err(Malformed)
                 }
                 return Ok(Some((end, body_len)))
             }
             let Some(chunk_end) = at.checked_add(size).and_then(|at| at.checked_add(2)) else {
-                return Err(())
+                return Err(Malformed)
             };
-            if bytes.len() < chunk_end || &bytes[at + size..chunk_end] != b"\r\n" {
+            // The data's CRLF, as much of it as is in: a request's must be right,
+            // a response waits for it.
+            let crlf = bytes.get(at + size..chunk_end.min(bytes.len())).unwrap_or_default();
+            if strict && crlf != &b"\r\n"[..crlf.len()] {
+                return Err(Malformed)
+            }
+            if bytes.len() < chunk_end || crlf != b"\r\n" {
                 return Ok(None)
             }
             body_len += size;
             at = chunk_end;
+            *scan = (at, body_len);
         }
     }
+}
+
+/// A chunk-size line: its length and the size. `strict`: one to 16 hex
+/// digits, extensions of visible ASCII within [`MAX_CHUNK_LINE`] bytes, and
+/// CRLF; else httparse's reading.
+fn chunk_size(bytes: &[u8], strict: bool) -> Result<Option<(usize, usize)>, ChunkError> {
+    use ChunkError::Malformed;
+    if !strict {
+        return match httparse::parse_chunk_size(bytes).map_err(|_| Malformed)? {
+            httparse::Status::Complete((consumed, size)) => {
+                Ok(Some((consumed, usize::try_from(size).map_err(|_| Malformed)?)))
+            }
+            httparse::Status::Partial => Ok(None),
+        }
+    }
+    let Some(lf) = bytes.iter().take(MAX_CHUNK_LINE).position(|&b| b == b'\n') else {
+        return if bytes.len() >= MAX_CHUNK_LINE { Err(Malformed) } else { Ok(None) }
+    };
+    if lf == 0 || bytes[lf - 1] != b'\r' {
+        return Err(Malformed)
+    }
+    let line = &bytes[..lf - 1];
+    let digits = line.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+    let extensions = &line[digits..];
+    if digits == 0 ||
+        digits > 16 ||
+        !(extensions.is_empty() || matches!(extensions[0], b';' | b' ' | b'\t')) ||
+        !extensions.iter().all(|&b| b == b'\t' || (b' '..=b'~').contains(&b))
+    {
+        return Err(Malformed)
+    }
+    let size = std::str::from_utf8(&line[..digits])
+        .ok()
+        .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+        .and_then(|size| usize::try_from(size).ok())
+        .ok_or(Malformed)?;
+    Ok(Some((lf + 1, size)))
+}
+
+/// Why a chunked body was refused.
+#[derive(Clone, Copy)]
+enum ChunkError {
+    Malformed,
+    /// Past the body limit.
+    TooLarge,
 }
 
 fn crlf_only(bytes: &[u8]) -> bool {
