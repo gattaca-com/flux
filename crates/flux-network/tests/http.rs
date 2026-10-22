@@ -270,7 +270,14 @@ fn limits_and_errors() {
         (b"GET / HTTP/1.1\r\nX: 1234567890123456789012345678901234567890123456789012345678901234\r\n\r\n".as_slice(), 431),
         (b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n".as_slice(), 413),
         (b"nope\r\n\r\n".as_slice(), 400),
-        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(), 501),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(), 501),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n".as_slice(), 413),
+        // Chunk framing hyper refuses: no CRLF after the data, an empty size line, a bare LF,
+        // and transfer codings on HTTP/1.0.
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nab\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\na\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(), 400),
     ] {
         let addr = unused_addr();
         let mut net = Network::default();
@@ -618,7 +625,7 @@ fn smuggling_rejected() {
         (
             b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
                 .as_slice(),
-            501,
+            400,
             false,
         ),
     ] {
@@ -953,6 +960,44 @@ fn pending_buffer_cap_disconnects() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(closed);
+}
+
+#[test]
+fn chunked_request_bodies() {
+    let (mut net, mut server, addr) = server();
+    // Split mid-chunk, then a plain request pipelined behind it.
+    let parts: [&[u8]; 2] = [
+        b"POST /one HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n\x00\n",
+        b"\xff\r\n2;ext=1\r\nab\r\n0\r\nTrailer: t\r\n\r\nPOST /two HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\ntwo",
+    ];
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut replies = Vec::new();
+    let mut received = Vec::new();
+    let mut sent = 0;
+    while Instant::now() < deadline && replies.len() < 2 {
+        if sent < parts.len() {
+            client.write_all(parts[sent]).unwrap();
+            sent += 1;
+        }
+        let mut pending = Vec::new();
+        poll(&mut net, &mut server, |event| {
+            if let HttpEvent::Request { token, request } = event {
+                pending.push((token, request.path.to_owned(), request.body.to_vec()));
+            }
+        });
+        for (token, path, body) in pending {
+            assert!(server.respond(&mut net, token, 200, &[], &body));
+            replies.push((path, body));
+        }
+        read_available(&mut client, &mut received);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(replies, [
+        ("/one".to_owned(), b"\x00\n\xffab".to_vec()),
+        ("/two".to_owned(), b"two".to_vec())
+    ]);
 }
 
 #[test]
