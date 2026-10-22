@@ -10,13 +10,14 @@
 //!
 //! Operations on one file run concurrently, except [`DiskIo::sync_all`],
 //! [`DiskIo::sync_data`], [`DiskIo::truncate`], [`DiskIo::rename`],
-//! [`DiskIo::link`], [`DiskIo::unlink`] and [`DiskIo::close`], which act as
-//! barriers: they start only after every earlier operation on that file has
-//! completed, so a sync covers all earlier writes and structural changes
-//! cannot race them. Truncates, renames, links and unlinks additionally
-//! prevent later operations from starting until they complete. Operations
-//! submitted before the file finished opening are queued and dispatched once
-//! the descriptor is available.
+//! [`DiskIo::link`], [`DiskIo::unlink`], [`DiskIo::create_dir`] and
+//! [`DiskIo::close`], which act as barriers: they start only after every
+//! earlier operation on that file has completed, so a sync covers all earlier
+//! writes and structural changes cannot race them. Truncates, renames, links,
+//! unlinks and directory creations additionally prevent later operations from
+//! starting until they complete. Operations submitted before the file
+//! finished opening are queued and dispatched once the descriptor is
+//! available.
 
 use std::{
     collections::VecDeque,
@@ -205,6 +206,7 @@ pub enum FailedOp {
     Rename,
     Link,
     Unlink,
+    CreateDir,
     Close,
 }
 
@@ -230,6 +232,8 @@ pub enum DiskEvent<'a> {
     Linked { file: FileToken, operation_id: OperationId },
     /// The name given to [`DiskIo::unlink`] is gone.
     Unlinked { file: FileToken, operation_id: OperationId },
+    /// The directory given to [`DiskIo::create_dir`] exists.
+    DirectoryCreated { file: FileToken, operation_id: OperationId },
     /// The file was closed and its token retired.
     Closed { file: FileToken },
     /// An operation failed. `Failed { op: FailedOp::Open, .. }` retires the
@@ -249,6 +253,7 @@ enum PendingOp {
     Rename { destination: CString, destination_path: PathBuf, operation_id: OperationId },
     Link { destination: CString, destination_path: PathBuf, operation_id: OperationId },
     Unlink { path: CString, operation_id: OperationId },
+    CreateDir { path: CString, operation_id: OperationId },
     Close,
 }
 
@@ -295,6 +300,10 @@ enum InFlightOp {
         operation_id: OperationId,
     },
     Unlink {
+        path: CString,
+        operation_id: OperationId,
+    },
+    CreateDir {
         path: CString,
         operation_id: OperationId,
     },
@@ -584,6 +593,26 @@ impl DiskIo {
         Ok(self.enqueue_operation(file, |operation_id| PendingOp::Unlink { path, operation_id }))
     }
 
+    /// Queues creating the directory `path`, like [`std::fs::create_dir`],
+    /// after all earlier operations on `file` and before later ones; `file`
+    /// only orders it, so a directory opened with [`Self::open_directory`]
+    /// serves. Fails with `EEXIST` when the name is taken. Parents are not
+    /// created: queue one call per missing level, outermost first. Needs
+    /// Linux 5.15.
+    ///
+    /// Returns an ID echoed by its completion or failure event, or `None` for
+    /// unknown or closing tokens. A path containing a nul byte returns an
+    /// error without queueing an operation.
+    pub fn create_dir<P: AsRef<Path>>(
+        &mut self,
+        file: FileToken,
+        path: P,
+    ) -> io::Result<Option<OperationId>> {
+        let path = CString::new(path.as_ref().as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))?;
+        Ok(self.enqueue_operation(file, |operation_id| PendingOp::CreateDir { path, operation_id }))
+    }
+
     /// Queues a full-integrity `fsync` barrier, the durability of
     /// [`std::fs::File::sync_all`]: it starts only after every earlier
     /// operation on this file completed, and later operations start only
@@ -731,6 +760,7 @@ impl DiskIo {
                     PendingOp::Rename { .. } |
                     PendingOp::Link { .. } |
                     PendingOp::Unlink { .. } |
+                    PendingOp::CreateDir { .. } |
                     PendingOp::Close => file.fd.is_some() && file.in_flight == 0,
                 };
                 if !ready {
@@ -751,7 +781,8 @@ impl DiskIo {
             PendingOp::Truncate { .. } |
                 PendingOp::Rename { .. } |
                 PendingOp::Link { .. } |
-                PendingOp::Unlink { .. }
+                PendingOp::Unlink { .. } |
+                PendingOp::CreateDir { .. }
         );
         let op = match op {
             PendingOp::Open { path, flags, mode } => InFlightOp::Open { path, flags, mode },
@@ -783,6 +814,9 @@ impl DiskIo {
                 InFlightOp::Link { source, destination, destination_path, operation_id }
             }
             PendingOp::Unlink { path, operation_id } => InFlightOp::Unlink { path, operation_id },
+            PendingOp::CreateDir { path, operation_id } => {
+                InFlightOp::CreateDir { path, operation_id }
+            }
             PendingOp::Close => InFlightOp::Close,
         };
         let slot = self.alloc_slot(InFlight { file: token, op });
@@ -862,6 +896,9 @@ impl DiskIo {
             .build(),
             InFlightOp::Unlink { path, .. } => {
                 opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).build()
+            }
+            InFlightOp::CreateDir { path, .. } => {
+                opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).mode(0o777).build()
             }
             InFlightOp::Close => {
                 let fd = fd.expect("close dispatched without an open fd");
@@ -972,7 +1009,10 @@ impl DiskIo {
                     handler(DiskEvent::Truncated { file: token, len, operation_id });
                 }
             }
-            InFlightOp::Rename { .. } | InFlightOp::Link { .. } | InFlightOp::Unlink { .. } => {
+            InFlightOp::Rename { .. } |
+            InFlightOp::Link { .. } |
+            InFlightOp::Unlink { .. } |
+            InFlightOp::CreateDir { .. } => {
                 self.complete_name_op(slot, file_index, entry.op, result, handler);
             }
             InFlightOp::Close => {
@@ -1022,7 +1062,15 @@ impl DiskIo {
             InFlightOp::Unlink { operation_id, .. } => {
                 (FailedOp::Unlink, operation_id, None, DiskEvent::Unlinked { file, operation_id })
             }
-            _ => unreachable!("complete_name_op only receives renames, links and unlinks"),
+            InFlightOp::CreateDir { operation_id, .. } => {
+                (FailedOp::CreateDir, operation_id, None, DiskEvent::DirectoryCreated {
+                    file,
+                    operation_id,
+                })
+            }
+            _ => unreachable!(
+                "complete_name_op only receives renames, links, unlinks and directory creations"
+            ),
         };
         if result < 0 {
             let error = io::Error::from_raw_os_error(-result);
@@ -1228,6 +1276,9 @@ impl DiskIo {
                 PendingOp::Rename { operation_id, .. } => (FailedOp::Rename, Some(operation_id)),
                 PendingOp::Link { operation_id, .. } => (FailedOp::Link, Some(operation_id)),
                 PendingOp::Unlink { operation_id, .. } => (FailedOp::Unlink, Some(operation_id)),
+                PendingOp::CreateDir { operation_id, .. } => {
+                    (FailedOp::CreateDir, Some(operation_id))
+                }
                 PendingOp::Close => (FailedOp::Close, None),
             };
             let error = io::Error::from_raw_os_error(libc::EBADF);
@@ -1320,6 +1371,7 @@ mod tests {
         Renamed { file: FileToken, operation_id: OperationId },
         Linked { file: FileToken, operation_id: OperationId },
         Unlinked { file: FileToken, operation_id: OperationId },
+        DirectoryCreated { file: FileToken, operation_id: OperationId },
         Closed(FileToken),
         Failed { file: FileToken, op: FailedOp, operation_id: Option<OperationId> },
     }
@@ -1339,6 +1391,9 @@ mod tests {
                 DiskEvent::Renamed { file, operation_id } => Self::Renamed { file, operation_id },
                 DiskEvent::Linked { file, operation_id } => Self::Linked { file, operation_id },
                 DiskEvent::Unlinked { file, operation_id } => Self::Unlinked { file, operation_id },
+                DiskEvent::DirectoryCreated { file, operation_id } => {
+                    Self::DirectoryCreated { file, operation_id }
+                }
                 DiskEvent::Closed { file } => Self::Closed(file),
                 DiskEvent::Failed { file, op, operation_id, .. } => {
                     Self::Failed { file, op, operation_id }

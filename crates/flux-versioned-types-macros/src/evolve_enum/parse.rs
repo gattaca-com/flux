@@ -74,6 +74,14 @@ pub(crate) struct EnumVariant {
     pub from_converter: Option<Expr>,
 }
 
+impl crate::shared::Member for EnumVariant {
+    const LIST: &'static str = "variants";
+
+    fn member_name(&self) -> &Ident {
+        &self.name
+    }
+}
+
 impl Parse for EnumVariant {
     fn parse(input: ParseStream) -> Result<Self> {
         let attrs = input.call(Attribute::parse_outer)?;
