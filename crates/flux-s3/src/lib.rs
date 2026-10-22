@@ -1,7 +1,8 @@
 //! `S3` over an [`HttpNetwork`] pool.
 //!
 //! [`S3::put_object`], [`S3::get_object`], [`S3::head_object`],
-//! [`S3::delete_object`], [`S3::list_objects`] and the multipart calls queue
+//! [`S3::delete_object`], [`S3::list_objects`], [`S3::list_multipart_uploads`]
+//! and the multipart calls queue
 //! path-style requests and return a [`RequestId`]; [`S3::connect`] opens the
 //! pool, [`S3::on_event`] claims this client's network events, and
 //! [`S3::drive`] sends what is queued and delivers each outcome. Every
@@ -86,8 +87,36 @@ pub fn upload_id(body: &[u8]) -> Option<&str> {
     element(body, "UploadId")
 }
 
+/// Each upload in a [`S3::list_multipart_uploads`] response: its key, as S3
+/// escapes it in XML, its id, and when it was initiated
+/// (`2026-10-22T11:04:12.000Z`).
+pub fn uploads(body: &[u8]) -> impl Iterator<Item = (&str, &str, &str)> {
+    let mut rest = body;
+    std::iter::from_fn(move || {
+        let (upload, end) = element_at(rest, "Upload")?;
+        rest = &rest[end..];
+        let upload = upload.as_bytes();
+        Some((element(upload, "Key")?, element(upload, "UploadId")?, element(upload, "Initiated")?))
+    })
+}
+
+/// The `after` markers for the next page of a truncated
+/// [`S3::list_multipart_uploads`] response; `None` on the last page.
+pub fn next_uploads_after(body: &[u8]) -> Option<(&str, &str)> {
+    if element(body, "IsTruncated")? != "true" {
+        return None;
+    }
+    Some((element(body, "NextKeyMarker")?, element(body, "NextUploadIdMarker")?))
+}
+
 /// The text of the first `<tag>` element in `body`.
 fn element<'b>(body: &'b [u8], tag: &str) -> Option<&'b str> {
+    element_at(body, tag).map(|(text, _)| text)
+}
+
+/// The text of the first `<tag>` element in `body`, and where its closing
+/// tag ends.
+fn element_at<'b>(body: &'b [u8], tag: &str) -> Option<(&'b str, usize)> {
     let tag = tag.as_bytes();
     let opens = |at: &[u8]| {
         at.len() > tag.len() + 1 &&
@@ -102,7 +131,8 @@ fn element<'b>(body: &'b [u8], tag: &str) -> Option<&'b str> {
             rest[i + 2..].starts_with(tag) &&
             rest.get(i + 2 + tag.len()) == Some(&b'>')
     })?;
-    std::str::from_utf8(&rest[..end]).ok()
+    let text = std::str::from_utf8(&rest[..end]).ok()?;
+    Some((text, start + end + tag.len() + 3))
 }
 
 pub struct S3 {
@@ -259,6 +289,22 @@ impl S3 {
         let query = list_query(prefix, continuation_token);
         self.queue(net, "GET", &resource, &query, &[])
     }
+    /// Sends a `ListMultipartUploads` of `bucket`: uploads started and
+    /// neither completed nor aborted, which [`uploads`] reads from the raw
+    /// XML. A truncated listing continues from [`next_uploads_after`], passed
+    /// back as `after`.
+    pub fn list_multipart_uploads(
+        &mut self,
+        net: &mut NetworkCore,
+        bucket: &str,
+        prefix: Option<&str>,
+        after: Option<(&str, &str)>,
+    ) -> Option<RequestId> {
+        let mut resource = String::from("/");
+        resource.push_str(bucket);
+        let query = uploads_query(prefix, after);
+        self.queue(net, "GET", &resource, &query, &[])
+    }
     /// Starts a multipart upload to `bucket/key`; [`upload_id`] reads the
     /// upload's id from the response body. Nothing is visible at `key` until
     /// the upload completes.
@@ -398,5 +444,27 @@ fn list_query(prefix: Option<&str>, continuation_token: Option<&str>) -> String 
         query.push_str("&prefix=");
         sigv4::encode(&mut query, prefix);
     }
+    query
+}
+
+/// `ListMultipartUploads` parameters, written in the name order `SigV4` signs.
+fn uploads_query(prefix: Option<&str>, after: Option<(&str, &str)>) -> String {
+    let mut query = String::new();
+    if let Some((key, _)) = after {
+        query.push_str("key-marker=");
+        sigv4::encode(&mut query, key);
+        query.push('&');
+    }
+    if let Some(prefix) = prefix {
+        query.push_str("prefix=");
+        sigv4::encode(&mut query, prefix);
+        query.push('&');
+    }
+    if let Some((_, upload_id)) = after {
+        query.push_str("upload-id-marker=");
+        sigv4::encode(&mut query, upload_id);
+        query.push('&');
+    }
+    query.push_str("uploads=");
     query
 }
