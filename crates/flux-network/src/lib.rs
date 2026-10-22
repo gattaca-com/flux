@@ -11,6 +11,7 @@ mod tcp;
 pub mod tls;
 pub mod udp;
 pub mod udp_v2;
+pub mod websocket;
 
 pub use mio::Token;
 pub use network::{

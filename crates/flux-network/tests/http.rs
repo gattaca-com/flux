@@ -220,12 +220,64 @@ fn connection_close_large_body() {
 }
 
 #[test]
+fn too_many_headers_431() {
+    // The default, a limit parsed on the stack, and one past it on the heap.
+    for (max, headers, status) in [
+        (64, 64, "200"),
+        (64, 65, "431"),
+        (100, 100, "200"),
+        (100, 101, "431"),
+        (200, 200, "200"),
+        (200, 201, "431"),
+    ] {
+        let addr = unused_addr();
+        let mut net = Network::default();
+        let mut server = HttpNetwork::default().with_max_headers(max);
+        server.listen(&mut net, addr).unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut request = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 1..headers {
+            request.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        request.extend_from_slice(b"Connection: close\r\n\r\n");
+        client.write_all(&request).unwrap();
+        let mut received = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline && !read_available(&mut client, &mut received) {
+            let mut tokens = Vec::new();
+            poll(&mut net, &mut server, |e| {
+                if let HttpEvent::Request { token, .. } = e {
+                    tokens.push(token);
+                }
+            });
+            for token in tokens {
+                server.respond(&mut net, token, 200, &[], b"");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let received = std::str::from_utf8(&received).unwrap();
+        assert!(
+            received.starts_with(&format!("HTTP/1.1 {status}")),
+            "{headers} headers: {received}"
+        );
+    }
+}
+
+#[test]
 fn limits_and_errors() {
     for (request, status) in [
         (b"GET / HTTP/1.1\r\nX: 1234567890123456789012345678901234567890123456789012345678901234\r\n\r\n".as_slice(), 431),
         (b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n".as_slice(), 413),
         (b"nope\r\n\r\n".as_slice(), 400),
-        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(), 501),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(), 501),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n".as_slice(), 413),
+        // Chunk framing hyper refuses: no CRLF after the data, an empty size line, a bare LF,
+        // and transfer codings on HTTP/1.0.
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nab\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\na\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(), 400),
     ] {
         let addr = unused_addr();
         let mut net = Network::default();
@@ -347,6 +399,48 @@ fn client_server_roundtrip() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(bodies, [b"hello".to_vec(), Vec::new()]);
+}
+
+#[test]
+fn cleared_client_connects_again() {
+    let (mut net, mut server, addr) = server();
+    let mut client = HttpNetwork::default();
+    let mut token = client.connect(&mut net, addr);
+    let mut answers = 0;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && answers < 2 {
+        net.poll_with(|e| {
+            if !server.on_event(&e) {
+                client.on_event(&e);
+            }
+        });
+        let mut replies = Vec::new();
+        server.drive(&mut net, |e| {
+            if let HttpEvent::Request { token, .. } = e {
+                replies.push(token);
+            }
+        });
+        for token in replies {
+            server.respond(&mut net, token, 200, &[], b"ok");
+        }
+        let (mut connected, mut answered) = (false, false);
+        client.drive(&mut net, |e| match e {
+            HttpEvent::Connected { .. } => connected = true,
+            HttpEvent::Response { .. } => answered = true,
+            _ => {}
+        });
+        if connected {
+            assert!(client.request(&mut net, token, "GET", "/", &[], b""));
+        }
+        if answered {
+            answers += 1;
+            // The same network, cleared, takes a new endpoint on its group.
+            client.clear(&mut net);
+            token = client.connect(&mut net, addr);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(answers, 2);
 }
 
 #[test]
@@ -531,7 +625,7 @@ fn smuggling_rejected() {
         (
             b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
                 .as_slice(),
-            501,
+            400,
             false,
         ),
     ] {
@@ -721,6 +815,127 @@ fn idle_timeout_disconnects() {
 }
 
 #[test]
+fn idle_timeout_spares_a_request_awaiting_its_response() {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default().with_idle_timeout(Duration::from_millis(200).into());
+    server.listen(&mut net, addr).unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    // Answered only after twice the idle timeout, as a slow upstream would.
+    let (mut pending, mut answer_at) = (None, None);
+    let deadline = Instant::now() + TIMEOUT;
+    let mut response = Vec::new();
+    while Instant::now() < deadline && response_len(&response).is_none() {
+        poll(&mut net, &mut server, |event| {
+            if let HttpEvent::Request { token, .. } = event {
+                pending = Some(token);
+                answer_at = Some(Instant::now() + Duration::from_millis(400));
+            }
+        });
+        if let (Some(token), Some(at)) = (pending, answer_at) &&
+            Instant::now() >= at
+        {
+            assert!(server.respond(&mut net, token, 200, &[], b"ok"));
+            pending = None;
+        }
+        assert!(
+            !read_available(&mut client, &mut response),
+            "closed while the request was pending"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(response_len(&response).is_some());
+    let answered = Instant::now();
+    let deadline = answered + Duration::from_secs(2);
+    let mut closed = false;
+    while Instant::now() < deadline && !closed {
+        poll(&mut net, &mut server, |_| {});
+        closed = read_available(&mut client, &mut response);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(closed, "idle after its response");
+    // The idle time runs from the answer, not from the request.
+    assert!(
+        answered.elapsed() >= Duration::from_millis(150),
+        "closed {:?} after its answer",
+        answered.elapsed()
+    );
+}
+
+/// Serves one `GET` answered with `len` bytes on a 200 ms idle timeout; `read`
+/// takes up to that many bytes from the client every 20 ms, until the end of
+/// the stream. Returns the body bytes the client read and whether the server
+/// dropped the connection.
+fn large_answer_to(len: usize, read: usize) -> (usize, bool) {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default()
+        .with_idle_timeout(Duration::from_millis(200).into())
+        .with_max_send_backlog_bytes(2 * len);
+    server.listen(&mut net, addr).unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let body = vec![7; len];
+    let (mut received, mut dropped, mut buf) = (0, false, vec![0; 64 * 1024]);
+    let deadline = Instant::now() + TIMEOUT;
+    let (mut ended, mut head) = (false, Vec::new());
+    while Instant::now() < deadline && !ended && !(dropped && read == 0) {
+        let mut requests = Vec::new();
+        poll(&mut net, &mut server, |event| match event {
+            HttpEvent::Request { token, .. } => requests.push(token),
+            HttpEvent::Disconnected { .. } => dropped = true,
+            _ => {}
+        });
+        for token in requests {
+            assert!(server.respond(&mut net, token, 200, &[], &body));
+        }
+        let mut taken = 0;
+        while taken < read {
+            match client.read(&mut buf[..(read - taken).min(64 * 1024)]) {
+                Ok(0) => {
+                    ended = true;
+                    break
+                }
+                Ok(n) => {
+                    if response_len(&head).is_none() && head.len() < 1024 {
+                        head.extend_from_slice(&buf[..n.min(1024 - head.len())]);
+                    }
+                    taken += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    ended = true;
+                    break
+                }
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+        received += taken;
+        thread::sleep(Duration::from_millis(20));
+    }
+    let head_len = head.windows(4).position(|b| b == b"\r\n\r\n").map_or(0, |end| end + 4);
+    (received.saturating_sub(head_len), dropped)
+}
+
+#[test]
+fn idle_timeout_closes_a_client_that_stopped_reading() {
+    let (_, dropped) = large_answer_to(32 << 20, 0);
+    assert!(dropped, "a client that never reads holds its answer's backlog");
+}
+
+#[test]
+fn idle_timeout_spares_a_client_still_reading() {
+    // About 1.3 s of reading, several idle timeouts, to the end of the stream:
+    // closing once flux has nothing left to send still delivers what the kernel
+    // holds.
+    let (body, _) = large_answer_to(16 << 20, 256 * 1024);
+    assert_eq!(body, 16 << 20);
+}
+
+#[test]
 fn pending_buffer_cap_disconnects() {
     let addr = unused_addr();
     let mut net = Network::default();
@@ -745,6 +960,44 @@ fn pending_buffer_cap_disconnects() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(closed);
+}
+
+#[test]
+fn chunked_request_bodies() {
+    let (mut net, mut server, addr) = server();
+    // Split mid-chunk, then a plain request pipelined behind it.
+    let parts: [&[u8]; 2] = [
+        b"POST /one HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n\x00\n",
+        b"\xff\r\n2;ext=1\r\nab\r\n0\r\nTrailer: t\r\n\r\nPOST /two HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\ntwo",
+    ];
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut replies = Vec::new();
+    let mut received = Vec::new();
+    let mut sent = 0;
+    while Instant::now() < deadline && replies.len() < 2 {
+        if sent < parts.len() {
+            client.write_all(parts[sent]).unwrap();
+            sent += 1;
+        }
+        let mut pending = Vec::new();
+        poll(&mut net, &mut server, |event| {
+            if let HttpEvent::Request { token, request } = event {
+                pending.push((token, request.path.to_owned(), request.body.to_vec()));
+            }
+        });
+        for (token, path, body) in pending {
+            assert!(server.respond(&mut net, token, 200, &[], &body));
+            replies.push((path, body));
+        }
+        read_available(&mut client, &mut received);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(replies, [
+        ("/one".to_owned(), b"\x00\n\xffab".to_vec()),
+        ("/two".to_owned(), b"two".to_vec())
+    ]);
 }
 
 #[test]
