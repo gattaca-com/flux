@@ -17,14 +17,6 @@ pub trait TypeHash {
     /// Set automatically by the derive macro; manual impls can leave the
     /// default.
     const TYPE_NAME: &'static str = "";
-    /// Orders the layouts of one type: a newer layout must have a higher
-    /// version, and the version must never drop between releases. The derive
-    /// adds `#[type_hash(version = N)]` (default 0) to the versions of all
-    /// fields, so raising any part's version raises it, and removing a field
-    /// lowers it by that field's version: raise `N` by more than that.
-    /// `#[type_hash(newer_than = T)]` makes it at least `T::VERSION + 1`;
-    /// flux-versioned-types chains set `newer_than` to the preceding version.
-    const VERSION: u32 = 0;
 }
 
 /// Const FNV-1a 64-bit over bytes.
@@ -100,7 +92,6 @@ impl<T: TypeHash, const N: usize> TypeHash for [T; N] {
         h = hash_layout_of::<[T; N]>(h);
         h
     };
-    const VERSION: u32 = T::VERSION;
 }
 
 impl<T: TypeHash> TypeHash for Option<T> {
@@ -111,7 +102,6 @@ impl<T: TypeHash> TypeHash for Option<T> {
         h = hash_layout_of::<Self>(h);
         h
     };
-    const VERSION: u32 = T::VERSION;
 }
 
 impl TypeHash for &[u8] {
@@ -144,7 +134,6 @@ mod std_impls {
             h = hash_layout_of::<Self>(h);
             h
         };
-        const VERSION: u32 = T::VERSION;
     }
 }
 

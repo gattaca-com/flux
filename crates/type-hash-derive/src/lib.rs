@@ -2,8 +2,8 @@ use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use quote::{ToTokens, quote, quote_spanned};
 use syn::{
-    Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Fields, Lit, LitInt, LitStr, Meta,
-    MetaNameValue, parse_macro_input, punctuated::Punctuated, token::Where,
+    Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Fields, Lit, Meta, MetaNameValue,
+    parse_macro_input, punctuated::Punctuated, token::Where,
 };
 
 fn runtime_crate_path() -> proc_macro2::TokenStream {
@@ -20,68 +20,48 @@ fn runtime_crate_path() -> proc_macro2::TokenStream {
     }
 }
 
-/// The struct/enum-level `#[type_hash(..)]` keys.
-#[derive(Default)]
-struct TypeAttrs {
-    /// `skip_typename_on_derive`: the generated impl sets
-    /// `DERIVE_USES_TYPENAME = false`.
-    skip_typename: bool,
-    /// `name = ".."`: hashed instead of the struct/enum identifier.
-    name: Option<String>,
-    /// `version = N`.
-    version: u32,
-    /// `newer_than = T`.
-    newer_than: Option<syn::Type>,
+/// Check for `#[type_hash(skip_typename_on_derive)]` on a struct/enum.
+/// When present, the generated impl sets `DERIVE_USES_TYPENAME = false`.
+fn has_type_hash_skip_typename(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("type_hash") {
+            return false;
+        }
+        let Meta::List(list) = &attr.meta else { return false };
+        let Ok(metas) = list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
+            return false;
+        };
+        metas.iter().any(|m| matches!(m, Meta::Path(p) if p.is_ident("skip_typename_on_derive")))
+    })
 }
 
-impl TypeAttrs {
-    fn parse(attrs: &[Attribute]) -> Result<Self, syn::Error> {
-        let mut this = Self::default();
-        let mut version = None;
-        for attr in attrs.iter().filter(|attr| attr.path().is_ident("type_hash")) {
-            attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("skip_typename_on_derive") {
-                    this.skip_typename = true;
-                } else if meta.path.is_ident("name") {
-                    this.name = Some(meta.value()?.parse::<LitStr>()?.value());
-                } else if meta.path.is_ident("version") {
-                    let value = meta.value()?.parse::<LitInt>()?.base10_parse()?;
-                    if version.replace(value).is_some() {
-                        return Err(meta.error("duplicate type_hash version"));
-                    }
-                } else if meta.path.is_ident("newer_than") {
-                    if this.newer_than.replace(meta.value()?.parse()?).is_some() {
-                        return Err(meta.error("duplicate type_hash newer_than"));
-                    }
-                } else {
-                    return Err(meta.error(
-                        "expected name = \"..\", skip_typename_on_derive, version = N or \
-                         newer_than = T",
-                    ));
-                }
-                Ok(())
-            })?;
+/// Extract `#[type_hash(name = "...")]` from struct/enum-level attributes.
+/// When present, the given name is used instead of the struct/enum identifier
+/// in the hash computation.
+fn type_hash_name_override(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("type_hash") {
+            continue;
         }
-        this.version = version.unwrap_or(0);
-        Ok(this)
+        let Meta::List(list) = &attr.meta else { continue };
+        let Ok(metas) = list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
+            continue;
+        };
+        for meta in metas {
+            if let Meta::NameValue(MetaNameValue { path, value, .. }) = meta {
+                if path.is_ident("name") {
+                    if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = value {
+                        return Some(s.value());
+                    }
+                }
+            }
+        }
     }
-
-    /// `version` plus the versions of the fields, and at least
-    /// `newer_than::VERSION + 1`.
-    fn version_expr(
-        &self,
-        th: &proc_macro2::TokenStream,
-        field_versions: &[proc_macro2::TokenStream],
-    ) -> proc_macro2::TokenStream {
-        let version = self.version;
-        let sum = quote! { #version #(.saturating_add(#field_versions))* };
-        let Some(older) = &self.newer_than else { return sum };
-        quote! {{
-            let sum = #sum;
-            let floor = <#older as #th::TypeHash>::VERSION.saturating_add(1);
-            if sum > floor { sum } else { floor }
-        }}
-    }
+    None
 }
 
 fn type_hash_literal(attrs: &[Attribute]) -> Result<Option<String>, syn::Error> {
@@ -207,15 +187,13 @@ fn derive_for_enum(
     en: &DataEnum,
 ) -> Result<proc_macro2::TokenStream, syn::Error> {
     let name = &input.ident;
-    let type_attrs = TypeAttrs::parse(&input.attrs)?;
-    let skip_typename = type_attrs.skip_typename;
-    let name_override = type_attrs.name.clone();
+    let skip_typename = has_type_hash_skip_typename(&input.attrs);
+    let name_override = type_hash_name_override(&input.attrs);
     let generics = input.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let mut steps: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut lock_checks = Vec::new();
-    let mut field_versions = Vec::new();
     let th = runtime_crate_path();
     let name_expr = name_token_expr(name_override.as_ref(), name);
     let use_array_diagnostic = generics.params.is_empty();
@@ -303,7 +281,6 @@ fn derive_for_enum(
                             &mut where_clause.cloned(),
                             syn::parse_quote!(#ty: #th::TypeHash),
                         );
-                        field_versions.push(quote! { <#ty as #th::TypeHash>::VERSION });
                         let typename_hash = emit_typename_hash(&th, ty);
                         variant_steps.push(quote! {
                             h = #th::fnv1a64_str(h, #idx_str);
@@ -351,7 +328,6 @@ fn derive_for_enum(
                             &mut where_clause.cloned(),
                             syn::parse_quote!(#ty: #th::TypeHash),
                         );
-                        field_versions.push(quote! { <#ty as #th::TypeHash>::VERSION });
                         let typename_hash = emit_typename_hash(&th, ty);
                         variant_steps.push(quote! {
                             h = #th::fnv1a64_str(h, #f_name);
@@ -409,12 +385,10 @@ fn derive_for_enum(
     let where_clause_tokens = where_clause;
 
     let has_name_override = name_override.is_some();
-    let version_expr = type_attrs.version_expr(&th, &field_versions);
     Ok(quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
             const DERIVE_USES_TYPENAME: bool = #has_name_override || !#skip_typename;
             const TYPE_NAME: &'static str = #name_expr;
-            const VERSION: u32 = #version_expr;
 
             const TYPE_HASH: u64 = {
                     #(#lock_checks)*
@@ -454,7 +428,7 @@ pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
 
     let expanded = match &input.data {
         Data::Struct(s) => derive_for_struct(&input, s),
-        Data::Enum(e) => derive_for_enum(&input, e).unwrap_or_else(syn::Error::into_compile_error),
+        Data::Enum(e) => derive_for_enum(&input, e).unwrap().to_token_stream(),
         Data::Union(_) => {
             return syn::Error::new_spanned(
                 &input.ident,
@@ -470,19 +444,14 @@ pub fn derive_type_struct_hash(input: TokenStream) -> TokenStream {
 #[allow(clippy::too_many_lines)]
 fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::TokenStream {
     let name = &input.ident;
-    let type_attrs = match TypeAttrs::parse(&input.attrs) {
-        Ok(type_attrs) => type_attrs,
-        Err(e) => return e.to_compile_error(),
-    };
-    let skip_typename = type_attrs.skip_typename;
-    let name_override = type_attrs.name.clone();
+    let skip_typename = has_type_hash_skip_typename(&input.attrs);
+    let name_override = type_hash_name_override(&input.attrs);
     let generics = input.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let mut where_clause = where_clause.cloned();
     // We support named structs and tuple structs.
     // Unit structs hash just the struct layout.
     let mut field_steps = Vec::new();
-    let mut field_versions = Vec::new();
     let th = runtime_crate_path();
 
     match &data.fields {
@@ -539,7 +508,6 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                         .predicates
                         .push(pred);
 
-                    field_versions.push(quote! { <#ty as #th::TypeHash>::VERSION });
                     let typename_hash = emit_typename_hash(&th, ty);
                     field_steps.push(quote! {
                         h = #th::fnv1a64_str(h, #field_name_str);
@@ -573,7 +541,6 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
                     .predicates
                     .push(pred);
 
-                field_versions.push(quote! { <#ty as #th::TypeHash>::VERSION });
                 let typename_hash = emit_typename_hash(&th, ty);
                 field_steps.push(quote! {
                     h = #th::fnv1a64_str(h, #field_name_str);
@@ -600,12 +567,10 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> proc_macro2::Tok
     // original) regardless of `skip_typename_on_derive`.
     let name_expr = name_token_expr(name_override.as_ref(), name);
     let has_name_override = name_override.is_some();
-    let version_expr = type_attrs.version_expr(&th, &field_versions);
     let expanded = quote! {
         impl #impl_generics #th::TypeHash for #name #ty_generics #where_clause_tokens {
             const DERIVE_USES_TYPENAME: bool = #has_name_override || !#skip_typename;
             const TYPE_NAME: &'static str = #name_expr;
-            const VERSION: u32 = #version_expr;
 
             const TYPE_HASH: u64 = {
 

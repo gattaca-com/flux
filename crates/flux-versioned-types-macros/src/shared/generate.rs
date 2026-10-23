@@ -1,9 +1,8 @@
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, Expr, Ident, Meta, Result, Token,
+    Attribute, Expr, Ident, Result,
     parse::{Parse, ParseStream},
-    punctuated::Punctuated,
 };
 
 use super::parse::{BaseBlock, EvolveBlock, EvolveInputGeneric};
@@ -102,25 +101,6 @@ fn version_skips<B: Named, E: Named>(
     (base, evos)
 }
 
-impl<B: Named, E: Named> EvolveInputGeneric<B, E> {
-    /// `#[type_hash(version = ..)]` or `newer_than` attributes the user gave
-    /// the chain's versions, which would override the chain's own numbering.
-    fn explicit_type_versions(&self) -> impl Iterator<Item = &Attribute> {
-        let versions =
-            std::iter::once(self.base.attrs()).chain(self.evolutions.iter().map(Named::attrs));
-        std::iter::once(self.default_attrs.as_slice()).chain(versions).flatten().filter(|attr| {
-            attr.path().is_ident("type_hash") &&
-                attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated).is_ok_and(
-                    |metas| {
-                        metas.iter().any(|meta| {
-                            meta.path().is_ident("version") || meta.path().is_ident("newer_than")
-                        })
-                    },
-                )
-        })
-    }
-}
-
 pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     input: &mut EvolveInputGeneric<B, E>,
     generate_base: impl FnOnce(&EvolveInputGeneric<B, E>, bool) -> (TokenStream2, Vec<Item>),
@@ -140,15 +120,6 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     let versions = std::iter::once(&input.base as &dyn Named)
         .chain(input.evolutions.iter().map(|version| version as &dyn Named));
     let mut errors = TokenStream2::new();
-    for attr in input.explicit_type_versions() {
-        errors.extend(
-            syn::Error::new_spanned(
-                attr,
-                "the chain sets the type_hash version of its versions; remove this",
-            )
-            .to_compile_error(),
-        );
-    }
     for version in versions {
         let has_lock = version.attrs().iter().any(|attr| {
             attr.path().segments.last().is_some_and(|segment| segment.ident == "type_hash_lock")
@@ -176,17 +147,6 @@ pub(crate) fn generate_evolving<B: Named, E: Named, Item>(
     for ev in &mut input.evolutions {
         let kept = strip_wire_skip(ev.attrs());
         *ev.attrs_mut() = kept;
-    }
-    // Numbers the chain for `TypeHash::VERSION`, which orders its layouts, so
-    // removing old versions from a chain lowers it. Each version is newer than
-    // the one before even when it drops a field that has a version.
-    let mut older = input.base.name().clone();
-    input.base.attrs_mut().push(syn::parse_quote!(#[type_hash(version = 1)]));
-    for (number, version) in (2u32..).zip(&mut input.evolutions) {
-        version.attrs_mut().push(syn::parse_quote!(
-            #[type_hash(version = #number, newer_than = #older)]
-        ));
-        older = version.name().clone();
     }
 
     let (base_output, mut current) = generate_base(input, input.wire_skip || base_skipped);

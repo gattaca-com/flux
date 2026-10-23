@@ -690,15 +690,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::flux::core_affinity::set_for_current(*::flux::core_affinity::get_core_ids().unwrap().last().unwrap());
                 });
                 ::flux::tracing::info!("Finished…");
-                // A retired queue stopped this process through SIGTERM; exit non-zero so
-                // supervisors see the failure.
-                let retired = ::flux::communication::queue::RetiredQueue::all();
-                if !retired.is_empty() {
-                    for queue in &retired {
-                        ::flux::tracing::error!("{queue}");
-                    }
-                    ::std::process::exit(1);
-                }
             }
 
             #[::flux::tracing::instrument(skip_all, fields(system = "Spine"))]
