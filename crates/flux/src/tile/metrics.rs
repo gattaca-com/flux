@@ -2,6 +2,7 @@ use std::{fmt::Display, path::Path};
 
 use flux_communication::shmem_dir_queues_string_with_base;
 use flux_timing::{IngestionTime, Instant, Nanos, global_clock_not_mocked};
+use type_hash_derive::TypeHash;
 
 use crate::communication::queue::{Producer, Queue, QueueType};
 
@@ -9,7 +10,7 @@ const QUEUE_SIZE: usize = 4096;
 const SAMPLE_WINDOW: u32 = 1024;
 
 /// Aggregated loop metrics over a sampling window
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, TypeHash)]
 #[repr(C)]
 #[cfg_attr(feature = "wincode", derive(wincode_derive::SchemaRead, wincode_derive::SchemaWrite))]
 pub struct TileSample {

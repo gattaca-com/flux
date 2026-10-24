@@ -14,7 +14,7 @@ use std::{
     time::{Duration as StdDuration, Instant as StdInstant},
 };
 
-use flux::tile::metrics::TileSample;
+use flux::{tile::metrics::TileSample, type_hash::TypeHash};
 use flux_communication::{
     QueueError, ReadError, ShmemKind, TimingMessage,
     queue::{Consumer, Queue},
@@ -154,7 +154,7 @@ struct Tracked<T: 'static + Copy> {
     invalid: usize,
 }
 
-impl<T: 'static + Copy> Tracked<T> {
+impl<T: 'static + Copy + TypeHash> Tracked<T> {
     fn open(name: &str, kind: Kind, flink: &Path) -> Result<Self, QueueError> {
         let queue = Queue::<T>::try_open_shared(flink)?;
         let writes_at_attach = queue.count();

@@ -12,7 +12,7 @@ use super::{
     perf::{PerfSample, Schema},
 };
 
-pub(super) trait RingEntry: Copy + Default {
+pub(super) trait RingEntry: Copy + Default + type_hash::TypeHash {
     const PREFIX: &'static str;
 }
 

@@ -27,6 +27,7 @@ use std::{
     time::Duration,
 };
 
+use flux::type_hash_derive::TypeHash;
 use flux_communication::{
     ShmemData, cleanup_shmem,
     queue::{Consumer, Producer, Queue, QueueHeader, QueueType},
@@ -34,7 +35,7 @@ use flux_communication::{
 };
 use flux_utils::directories::{local_share_dir, shmem_dir_with_base};
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, TypeHash)]
 #[repr(C)]
 struct Quote {
     bid: u64,
@@ -44,7 +45,7 @@ struct Quote {
     sequence: u64,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, TypeHash)]
 #[repr(C)]
 struct Trade {
     price: u64,
@@ -53,7 +54,7 @@ struct Trade {
     id: u64,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, TypeHash)]
 #[repr(C)]
 struct OrderEvent {
     order_id: u64,

@@ -3,6 +3,7 @@
 //! Run with:
 //!   cargo run --example demo -p flux-ctl
 
+use flux::type_hash_derive::TypeHash;
 use flux_communication::{
     ShmemData,
     queue::{Producer, Queue, QueueType},
@@ -12,7 +13,7 @@ use flux_ctl::discovery::scan_base_dir;
 use flux_utils::directories::local_share_dir;
 
 /// Example message types
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, TypeHash)]
 #[repr(C)]
 struct PriceUpdate {
     price: u64,
@@ -20,7 +21,7 @@ struct PriceUpdate {
     timestamp: u64,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, TypeHash)]
 #[repr(C)]
 struct OrderFill {
     order_id: u64,

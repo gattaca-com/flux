@@ -23,6 +23,12 @@ pub enum QueueError {
     UnInitialized,
     #[error("Queue length not power of two")]
     LengthNotPowerOfTwo,
+    #[error("Segment has no queue header magic (not a queue, or created before queue identity)")]
+    MissingMagic,
+    #[error("Queue header version changed from {0} to {1}")]
+    HeaderVersionChanged(u32, u32),
+    #[error("Element type hash changed from {0:#018x} to {1:#018x}")]
+    TypeHashChanged(u64, u64),
     #[error(
         "Element size changed from {0} to {1}. Need to reinit the queue after detaching processes"
     )]
@@ -33,6 +39,8 @@ pub enum QueueError {
     NonExistingFile,
     #[error("Preexisting shared memory too small")]
     TooSmall,
+    #[error("Segment is {0} bytes, expected {1}")]
+    SizeChanged(usize, usize),
     #[error("Shmem error")]
     ShmemError(#[from] ShmemError),
 }

@@ -19,7 +19,7 @@ use flux_network::{
 };
 use spine_derive::from_spine;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, flux::type_hash_derive::TypeHash)]
 #[repr(C)]
 struct Payload([u8; 8]);
 

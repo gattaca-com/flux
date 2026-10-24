@@ -33,7 +33,7 @@ pub struct DCacheQueueParams {
 
 /// Wire type for dcache-backed queues. Internal to the spine; users see `T`
 /// and `&[u8]` at consume sites.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, type_hash_derive::TypeHash)]
 pub struct DCacheMsg<T> {
     pub data: T,
     dref: DCacheRef,
