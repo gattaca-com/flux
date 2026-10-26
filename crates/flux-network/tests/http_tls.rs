@@ -162,13 +162,17 @@ fn tls_client(
 #[test]
 fn tls_listener_rotates_config_without_dropping_connections() {
     let (old_server, old_client) = tls_pair();
-    let (new_server, new_client) = tls_pair();
+    // The rotated listener configures no ALPN, so a client that sends none
+    // is served.
+    let (mut new_server, mut new_client) = tls_pair();
+    new_server.alpn_protocols.clear();
+    new_client.alpn_protocols.clear();
     let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
     let mut net = Network::default();
     let mut http = HttpNetwork::default();
-    let mut no_alpn = old_server.clone();
-    no_alpn.alpn_protocols.clear();
-    assert!(http.listen_tls(&mut net, addr, Arc::new(no_alpn)).is_err());
+    let mut h2 = old_server.clone();
+    h2.alpn_protocols = vec![b"h2".to_vec()];
+    assert!(http.listen_tls(&mut net, addr, Arc::new(h2)).is_err());
     let listener = http.listen_tls(&mut net, addr, Arc::new(old_server)).unwrap();
 
     let deadline = Instant::now() + TIMEOUT;

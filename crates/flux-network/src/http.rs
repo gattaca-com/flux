@@ -384,9 +384,10 @@ impl HttpNetwork {
         Ok(())
     }
     /// Accepts TLS on `addr`; requests arrive as from [`Self::listen`]. The
-    /// configuration must advertise only `http/1.1`, and peers that
-    /// negotiate no ALPN are disconnected. Returns the listener token for
-    /// [`Self::set_tls_config`].
+    /// configuration may advertise only `http/1.1`. With no ALPN configured,
+    /// every peer speaks HTTP/1.1, including those that send none; with
+    /// `http/1.1` configured, peers that negotiate no ALPN are disconnected.
+    /// Returns the listener token for [`Self::set_tls_config`].
     #[cfg(feature = "tls")]
     pub fn listen_tls(
         &mut self,
@@ -410,6 +411,9 @@ impl HttpNetwork {
         config: Arc<crate::tls::ServerConfig>,
     ) -> io::Result<()> {
         check_alpn(&config)?;
+        if !self.listeners.contains(&listener) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not an HTTP listener"));
+        }
         net.set_tls_config(listener, config)
     }
     /// Immediately disconnects an accepted client.
@@ -1754,10 +1758,10 @@ impl<'a> HttpResponse<'a> {
 
 #[cfg(feature = "tls")]
 fn check_alpn(config: &crate::tls::ServerConfig) -> io::Result<()> {
-    if config.alpn_protocols.len() != 1 || config.alpn_protocols[0] != b"http/1.1" {
+    if config.alpn_protocols.iter().any(|protocol| protocol != b"http/1.1") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "HTTP TLS requires only http/1.1 ALPN",
+            "HTTP TLS supports only http/1.1 ALPN",
         ));
     }
     Ok(())
