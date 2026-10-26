@@ -57,7 +57,9 @@ use syn::parse_macro_input;
 /// args..)` expands to `path::cb! { args.. ; name = "A.B", latest = T,
 /// versions = [TV1, TV2], fields = [a, b] }`, so another crate can generate
 /// code over the chain. Versions run oldest first as bare names, resolved
-/// where `path::cb!` expands; fields are the newest version's.
+/// where `path::cb!` expands; fields are the newest version's. Wire names that
+/// differ only outside `[A-Za-z0-9]`, such as `A.B` and `A_B`, export the same
+/// macro and fail as a duplicate `#[macro_export]`.
 ///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
 /// padding-free `Copy`; it excludes `#[wire_name]`.
