@@ -441,6 +441,27 @@ impl TcpManager {
         Ok(token)
     }
 
+    #[cfg(feature = "tls")]
+    pub(crate) fn set_tls_config(
+        &mut self,
+        token: Token,
+        config: std::sync::Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<()> {
+        if config.max_early_data_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS listeners need no early data",
+            ));
+        }
+        let Some(tls) =
+            self.listeners.iter_mut().find(|l| l.token == token).and_then(|l| l.tls.as_mut())
+        else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a TLS listener"));
+        };
+        *tls = config;
+        Ok(())
+    }
+
     /// Queued wire bytes, or `None` if `token` cannot take writes yet.
     pub(crate) fn pending_write_bytes(&self, token: Token) -> Option<usize> {
         let index = self.sendable_index(token)?;

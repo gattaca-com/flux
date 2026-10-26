@@ -99,45 +99,51 @@ fn tls_pool_round_trips_big_bodies() {
     drop(done_tx);
 }
 
-#[test]
-fn tls_listener_serves_keepalive_requests() {
+/// Server config for a fresh self-signed `localhost` cert, and a client
+/// trusting only it.
+fn tls_pair() -> (ServerConfig, ClientConfig) {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let cert_der = key.cert.der().clone();
-    let mut server_config =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert_der.clone()],
-                PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
-            )
-            .unwrap();
-    let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
-    let mut net = Network::default();
-    let mut http = HttpNetwork::default();
-    assert!(http.listen_tls(&mut net, addr, Arc::new(server_config.clone())).is_err());
-    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    http.listen_tls(&mut net, addr, Arc::new(server_config)).unwrap();
-
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut server = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert_der.clone()],
+            PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+    server.alpn_protocols = vec![b"http/1.1".to_vec()];
     let mut roots = RootCertStore::empty();
     roots.add_parsable_certificates(vec![cert_der]);
-    let mut client_config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-    client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let client = thread::spawn(move || {
+    let mut client = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client.alpn_protocols = vec![b"http/1.1".to_vec()];
+    (server, client)
+}
+
+/// Sends one keep-alive request per path, each after a message on `go`;
+/// returns the responses. The server echoes the path as the body.
+fn tls_client(
+    addr: std::net::SocketAddr,
+    config: ClientConfig,
+    paths: &'static [&'static str],
+    go: std::sync::mpsc::Receiver<()>,
+) -> thread::JoinHandle<Vec<Vec<u8>>> {
+    thread::spawn(move || {
         let mut sock = std::net::TcpStream::connect(addr).unwrap();
         sock.set_read_timeout(Some(TIMEOUT)).unwrap();
         let mut conn =
-            rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+            rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap())
                 .unwrap();
         let mut tls = rustls::Stream::new(&mut conn, &mut sock);
         let mut responses = Vec::new();
-        for path in ["/one", "/two"] {
+        for path in paths {
+            go.recv().unwrap();
             write!(tls, "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody")
                 .unwrap();
             tls.flush().unwrap();
@@ -150,34 +156,60 @@ fn tls_listener_serves_keepalive_requests() {
             responses.push(response);
         }
         responses
-    });
+    })
+}
+
+#[test]
+fn tls_listener_rotates_config_without_dropping_connections() {
+    let (old_server, old_client) = tls_pair();
+    let (new_server, new_client) = tls_pair();
+    let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+    let mut net = Network::default();
+    let mut http = HttpNetwork::default();
+    let mut no_alpn = old_server.clone();
+    no_alpn.alpn_protocols.clear();
+    assert!(http.listen_tls(&mut net, addr, Arc::new(no_alpn)).is_err());
+    let listener = http.listen_tls(&mut net, addr, Arc::new(old_server)).unwrap();
 
     let deadline = Instant::now() + TIMEOUT;
     let mut served = 0;
-    while Instant::now() < deadline && served < 2 {
-        let mut replies = Vec::new();
-        net.poll_with(|event| {
-            http.on_event(&event);
-        });
-        http.drive(&mut net, |event| {
-            if let HttpEvent::Request { token, request } = event {
-                assert_eq!(request.body, b"body");
-                replies.push((token, request.path.to_owned()));
+    let mut serve = |net: &mut Network, http: &mut HttpNetwork, until: usize| {
+        while Instant::now() < deadline && served < until {
+            let mut replies = Vec::new();
+            net.poll_with(|event| {
+                http.on_event(&event);
+            });
+            http.drive(net, |event| {
+                if let HttpEvent::Request { token, request } = event {
+                    assert_eq!(request.body, b"body");
+                    replies.push((token, request.path.to_owned()));
+                }
+            });
+            for (token, path) in replies {
+                assert!(http.respond(net, token, 200, &[], path.as_bytes()));
+                served += 1;
             }
-        });
-        for (token, path) in replies {
-            assert!(http.respond(&mut net, token, 200, &[], path.as_bytes()));
-            served += 1;
         }
-    }
-    assert_eq!(served, 2);
-    while !client.is_finished() && Instant::now() < deadline {
+        assert_eq!(served, until);
+    };
+
+    let (old_go, go) = std::sync::mpsc::channel();
+    let old = tls_client(addr, old_client, &["/one", "/two"], go);
+    old_go.send(()).unwrap();
+    serve(&mut net, &mut http, 1);
+    http.set_tls_config(&mut net, listener, Arc::new(new_server)).unwrap();
+    old_go.send(()).unwrap();
+    let (new_go, go) = std::sync::mpsc::channel();
+    let new = tls_client(addr, new_client, &["/three"], go);
+    new_go.send(()).unwrap();
+    serve(&mut net, &mut http, 3);
+    while !(old.is_finished() && new.is_finished()) && Instant::now() < deadline {
         net.poll_with(|event| {
             http.on_event(&event);
         });
         http.drive(&mut net, |_| {});
     }
-    for response in client.join().unwrap() {
+    for response in old.join().unwrap().into_iter().chain(new.join().unwrap()) {
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     }
 }

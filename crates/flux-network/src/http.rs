@@ -385,23 +385,32 @@ impl HttpNetwork {
     }
     /// Accepts TLS on `addr`; requests arrive as from [`Self::listen`]. The
     /// configuration must advertise only `http/1.1`, and peers that
-    /// negotiate no ALPN are disconnected.
+    /// negotiate no ALPN are disconnected. Returns the listener token for
+    /// [`Self::set_tls_config`].
     #[cfg(feature = "tls")]
     pub fn listen_tls(
         &mut self,
         net: &mut NetworkCore,
         addr: SocketAddr,
         config: Arc<crate::tls::ServerConfig>,
-    ) -> io::Result<()> {
-        if config.alpn_protocols.len() != 1 || config.alpn_protocols[0] != b"http/1.1" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "HTTP TLS requires only http/1.1 ALPN",
-            ));
-        }
+    ) -> io::Result<Token> {
+        check_alpn(&config)?;
         let group = self.group(net);
-        self.listeners.push(net.listen_tls(group, addr, config)?);
-        Ok(())
+        let token = net.listen_tls(group, addr, config)?;
+        self.listeners.push(token);
+        Ok(token)
+    }
+    /// Replaces a TLS listener's config, e.g. to rotate its certificate.
+    /// Connections already accepted are unaffected.
+    #[cfg(feature = "tls")]
+    pub fn set_tls_config(
+        &mut self,
+        net: &mut NetworkCore,
+        listener: Token,
+        config: Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<()> {
+        check_alpn(&config)?;
+        net.set_tls_config(listener, config)
     }
     /// Immediately disconnects an accepted client.
     pub fn disconnect(&mut self, net: &mut NetworkCore, token: Token) -> bool {
@@ -1741,6 +1750,17 @@ impl<'a> HttpResponse<'a> {
     pub fn header(&self, name: &str) -> Option<&'a [u8]> {
         self.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value)
     }
+}
+
+#[cfg(feature = "tls")]
+fn check_alpn(config: &crate::tls::ServerConfig) -> io::Result<()> {
+    if config.alpn_protocols.len() != 1 || config.alpn_protocols[0] != b"http/1.1" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP TLS requires only http/1.1 ALPN",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
