@@ -1,4 +1,4 @@
-//! End-to-end TLS behaviour for outbound HTTP pools.
+//! End-to-end TLS behaviour for HTTP pools and listeners.
 
 use std::{
     io::{Read, Write},
@@ -97,4 +97,87 @@ fn tls_pool_round_trips_big_bodies() {
     assert_eq!(bodies, [expected.clone(), expected]);
     assert_eq!(disconnects, 0);
     drop(done_tx);
+}
+
+#[test]
+fn tls_listener_serves_keepalive_requests() {
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_der = key.cert.der().clone();
+    let mut server_config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert_der.clone()],
+                PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+    let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+    let mut net = Network::default();
+    let mut http = HttpNetwork::default();
+    assert!(http.listen_tls(&mut net, addr, Arc::new(server_config.clone())).is_err());
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    http.listen_tls(&mut net, addr, Arc::new(server_config)).unwrap();
+
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(vec![cert_der]);
+    let mut client_config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let client = thread::spawn(move || {
+        let mut sock = std::net::TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut conn =
+            rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+                .unwrap();
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+        let mut responses = Vec::new();
+        for path in ["/one", "/two"] {
+            write!(tls, "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody")
+                .unwrap();
+            tls.flush().unwrap();
+            let mut response = Vec::new();
+            let mut byte = [0u8; 1];
+            while !response.ends_with(path.as_bytes()) {
+                tls.read_exact(&mut byte).unwrap();
+                response.push(byte[0]);
+            }
+            responses.push(response);
+        }
+        responses
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut served = 0;
+    while Instant::now() < deadline && served < 2 {
+        let mut replies = Vec::new();
+        net.poll_with(|event| {
+            http.on_event(&event);
+        });
+        http.drive(&mut net, |event| {
+            if let HttpEvent::Request { token, request } = event {
+                assert_eq!(request.body, b"body");
+                replies.push((token, request.path.to_owned()));
+            }
+        });
+        for (token, path) in replies {
+            assert!(http.respond(&mut net, token, 200, &[], path.as_bytes()));
+            served += 1;
+        }
+    }
+    assert_eq!(served, 2);
+    while !client.is_finished() && Instant::now() < deadline {
+        net.poll_with(|event| {
+            http.on_event(&event);
+        });
+        http.drive(&mut net, |_| {});
+    }
+    for response in client.join().unwrap() {
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    }
 }

@@ -36,11 +36,11 @@
 //! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
-//! Server-side TLS, HTTP/2, compression, trailer exposure, upgrades, and
-//! `WebSockets` are not supported. Valid response trailers are parsed and
-//! discarded. There is no half-close support. After an error response, the
-//! connection closes without a lingering-close delay. Pipelined requests are
-//! served strictly one at a time per connection.
+//! HTTP/2, compression, trailer exposure, upgrades, and `WebSockets` are not
+//! supported. Valid response trailers are parsed and discarded. There is no
+//! half-close support. After an error response, the connection closes without
+//! a lingering-close delay. Pipelined requests are served strictly one at a
+//! time per connection.
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -381,6 +381,26 @@ impl HttpNetwork {
     pub fn listen(&mut self, net: &mut NetworkCore, addr: SocketAddr) -> io::Result<()> {
         let group = self.group(net);
         self.listeners.push(net.listen(group, addr)?);
+        Ok(())
+    }
+    /// Accepts TLS on `addr`; requests arrive as from [`Self::listen`]. The
+    /// configuration must advertise only `http/1.1`, and peers that
+    /// negotiate no ALPN are disconnected.
+    #[cfg(feature = "tls")]
+    pub fn listen_tls(
+        &mut self,
+        net: &mut NetworkCore,
+        addr: SocketAddr,
+        config: Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<()> {
+        if config.alpn_protocols.len() != 1 || config.alpn_protocols[0] != b"http/1.1" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTP TLS requires only http/1.1 ALPN",
+            ));
+        }
+        let group = self.group(net);
+        self.listeners.push(net.listen_tls(group, addr, config)?);
         Ok(())
     }
     /// Immediately disconnects an accepted client.
