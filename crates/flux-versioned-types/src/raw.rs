@@ -106,8 +106,7 @@ impl Scratch {
     }
 
     /// A scratch that shrinks back to the median of its recent fills once a
-    /// burst has passed, as [`TruncatingVec`] does. Each fill starts zeroed,
-    /// so bytes from an earlier fill are not kept.
+    /// burst has passed, as [`TruncatingVec`] does.
     pub fn truncating() -> Self {
         Self { truncating: true, ..Self::default() }
     }
@@ -115,11 +114,8 @@ impl Scratch {
     pub fn resize(&mut self, len: usize) {
         let words = len.div_ceil(LEAF_ALIGN_MAX);
         if self.truncating {
-            self.refill(words);
-            self.len = len;
-            return;
-        }
-        if words > self.words.len() {
+            self.words.refill(words, 0);
+        } else if words > self.words.len() {
             self.words.resize(words, 0);
         }
         let old = self.len;
@@ -137,16 +133,10 @@ impl Scratch {
         &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..self.len]
     }
 
-    /// Clearing records the last fill's length, which may shrink the buffer.
-    fn refill(&mut self, words: usize) {
-        self.words.clear();
-        self.words.resize(words, 0);
-    }
-
     fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
         let words = len.div_ceil(LEAF_ALIGN_MAX);
         if self.truncating {
-            self.refill(words);
+            self.words.refill(words, 0);
         } else if words > self.words.len() {
             self.words.resize(words, 0);
         }
