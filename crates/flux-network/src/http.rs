@@ -383,11 +383,10 @@ impl HttpNetwork {
         self.listeners.push(net.listen(group, addr)?);
         Ok(())
     }
-    /// Accepts TLS on `addr`; requests arrive as from [`Self::listen`]. The
-    /// configuration may advertise only `http/1.1`. With no ALPN configured,
-    /// every peer speaks HTTP/1.1, including those that send none; with
-    /// `http/1.1` configured, peers that negotiate no ALPN are disconnected.
-    /// Returns the listener token for [`Self::set_tls_config`].
+    /// Serves HTTP/1.1 over TLS on `addr`; requests arrive as from
+    /// [`Self::listen`]. `alpn_protocols` must be empty or `http/1.1`. A
+    /// non-empty list disconnects peers that negotiate no ALPN. The returned
+    /// token is for [`Self::set_tls_config`].
     #[cfg(feature = "tls")]
     pub fn listen_tls(
         &mut self,
