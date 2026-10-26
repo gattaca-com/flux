@@ -116,7 +116,15 @@ impl Signer {
         let mut canonical = format!("{method}\n{resource}\n{query}\n");
         let mut names = String::new();
         for (name, value) in &*signed {
-            writeln!(canonical, "{name}:{}", value.trim()).unwrap();
+            // SigV4 trims a value and turns each run of spaces in it into one.
+            write!(canonical, "{name}:").unwrap();
+            for (i, word) in value.split_ascii_whitespace().enumerate() {
+                if i > 0 {
+                    canonical.push(' ');
+                }
+                canonical.push_str(word);
+            }
+            canonical.push('\n');
             if !names.is_empty() {
                 names.push(';');
             }
