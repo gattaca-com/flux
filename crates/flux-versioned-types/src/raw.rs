@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use byte_stable::ByteStable;
 use flux_timing::{IngestionTime, InternalMessage, Nanos};
-use flux_utils::ArrayStr;
+use flux_utils::{ArrayStr, TruncatingVec};
 
 use crate::{
     blob::TrackingTimestampWire,
@@ -93,8 +93,10 @@ impl std::error::Error for DecodeError {}
 /// 16-byte aligned byte buffer so decoded leaves cast directly.
 #[derive(Default)]
 pub struct Scratch {
-    words: Vec<u128>,
+    words: TruncatingVec<u128>,
     len: usize,
+    /// Each fill starts afresh, so the buffer shrinks back after a burst.
+    truncating: bool,
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
 }
 
@@ -103,8 +105,20 @@ impl Scratch {
         Self::default()
     }
 
+    /// A scratch that shrinks back to the median of its recent fills once a
+    /// burst has passed, as [`TruncatingVec`] does. Each fill starts zeroed,
+    /// so bytes from an earlier fill are not kept.
+    pub fn truncating() -> Self {
+        Self { truncating: true, ..Self::default() }
+    }
+
     pub fn resize(&mut self, len: usize) {
         let words = len.div_ceil(LEAF_ALIGN_MAX);
+        if self.truncating {
+            self.refill(words);
+            self.len = len;
+            return;
+        }
         if words > self.words.len() {
             self.words.resize(words, 0);
         }
@@ -123,9 +137,17 @@ impl Scratch {
         &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..self.len]
     }
 
+    /// Clearing records the last fill's length, which may shrink the buffer.
+    fn refill(&mut self, words: usize) {
+        self.words.clear();
+        self.words.resize(words, 0);
+    }
+
     fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
         let words = len.div_ceil(LEAF_ALIGN_MAX);
-        if words > self.words.len() {
+        if self.truncating {
+            self.refill(words);
+        } else if words > self.words.len() {
             self.words.resize(words, 0);
         }
         if self.decompressor.is_none() {
