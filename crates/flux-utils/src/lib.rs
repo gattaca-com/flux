@@ -5,6 +5,7 @@ pub mod directories;
 mod namespace;
 mod shared_vector;
 mod thread;
+pub mod truncating_vec;
 mod vsync;
 
 pub use arrayvec::{ArrayStr, ArrayVec};
@@ -12,4 +13,5 @@ pub use dcache::{DCache, DCacheError, DCachePtr, DCacheRef};
 pub use namespace::{ShortTypename, short_typename};
 pub use shared_vector::SharedVector;
 pub use thread::{ThreadNiceness, get_tid, thread_boot, try_thread_boot};
+pub use truncating_vec::TruncatingVec;
 pub use vsync::vsync;
