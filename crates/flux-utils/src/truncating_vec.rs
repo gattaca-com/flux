@@ -53,6 +53,19 @@ impl<T> TruncatingVec<T> {
         }
     }
 
+    /// Moves the buffer out, as for an I/O call that takes ownership of it;
+    /// [`Self::restore`] puts it back.
+    pub fn lend(&mut self) -> Vec<T> {
+        std::mem::take(&mut self.vec)
+    }
+
+    /// Puts back a buffer from [`Self::lend`] and clears it, recording its
+    /// length as [`Self::clear`] does.
+    pub fn restore(&mut self, vec: Vec<T>) {
+        self.vec = vec;
+        self.clear();
+    }
+
     #[inline]
     pub fn push(&mut self, value: T) {
         self.vec.push(value);
