@@ -32,25 +32,45 @@ impl<T> TruncatingVec<T> {
     }
 
     pub fn clear(&mut self) {
+        let median = self.record(self.vec.len());
+        self.vec.clear();
+        if self.vec.capacity() > 2 * median {
+            self.vec.shrink_to(median);
+        }
+    }
+
+    /// Starts a fill of `len` elements: records the last fill's length and
+    /// shrinks as [`Self::clear`] does, but keeps the elements up to `len`
+    /// unless it shrank, writing `value` only where the buffer grows.
+    pub fn refill(&mut self, len: usize, value: T)
+    where
+        T: Clone,
+    {
+        let median = self.record(self.vec.len());
+        if self.vec.capacity() > 2 * median {
+            self.vec.clear();
+            self.vec.shrink_to(median);
+        }
+        self.vec.resize(len, value);
+    }
+
+    /// Records a fill of `len` and returns the upper median of the recent
+    /// fills.
+    fn record(&mut self, len: usize) -> usize {
         if self.lens.len() == self.history {
             self.lens.pop_front();
         }
-        self.lens.push_back(self.vec.len());
-        self.vec.clear();
+        self.lens.push_back(len);
         // Counting instead of sorting a copy needs no scratch buffer.
         let mid = self.lens.len() / 2;
-        let median = self
-            .lens
+        self.lens
             .iter()
             .copied()
             .find(|&len| {
                 let below = self.lens.iter().filter(|&&l| l < len).count();
                 below <= mid && mid < below + self.lens.iter().filter(|&&l| l == len).count()
             })
-            .expect("a length was just recorded");
-        if self.vec.capacity() > 2 * median {
-            self.vec.shrink_to(median);
-        }
+            .expect("a length was just recorded")
     }
 
     /// Moves the buffer out, as for an I/O call that takes ownership of it;
