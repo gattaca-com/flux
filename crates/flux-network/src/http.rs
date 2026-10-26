@@ -36,11 +36,11 @@
 //! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
-//! Server-side TLS, HTTP/2, compression, trailer exposure, upgrades, and
-//! `WebSockets` are not supported. Valid response trailers are parsed and
-//! discarded. There is no half-close support. After an error response, the
-//! connection closes without a lingering-close delay. Pipelined requests are
-//! served strictly one at a time per connection.
+//! HTTP/2, compression, trailer exposure, upgrades, and `WebSockets` are not
+//! supported. Valid response trailers are parsed and discarded. There is no
+//! half-close support. After an error response, the connection closes without
+//! a lingering-close delay. Pipelined requests are served strictly one at a
+//! time per connection.
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -382,6 +382,38 @@ impl HttpNetwork {
         let group = self.group(net);
         self.listeners.push(net.listen(group, addr)?);
         Ok(())
+    }
+    /// Serves HTTP/1.1 over TLS on `addr`; requests arrive as from
+    /// [`Self::listen`]. `alpn_protocols` must be empty or `http/1.1`. A
+    /// non-empty list disconnects peers that negotiate no ALPN. The returned
+    /// token is for [`Self::set_tls_config`].
+    #[cfg(feature = "tls")]
+    pub fn listen_tls(
+        &mut self,
+        net: &mut NetworkCore,
+        addr: SocketAddr,
+        config: Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<Token> {
+        check_alpn(&config)?;
+        let group = self.group(net);
+        let token = net.listen_tls(group, addr, config)?;
+        self.listeners.push(token);
+        Ok(token)
+    }
+    /// Replaces a TLS listener's config, e.g. to rotate its certificate.
+    /// Connections already accepted are unaffected.
+    #[cfg(feature = "tls")]
+    pub fn set_tls_config(
+        &mut self,
+        net: &mut NetworkCore,
+        listener: Token,
+        config: Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<()> {
+        check_alpn(&config)?;
+        if !self.listeners.contains(&listener) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not an HTTP listener"));
+        }
+        net.set_tls_config(listener, config)
     }
     /// Immediately disconnects an accepted client.
     pub fn disconnect(&mut self, net: &mut NetworkCore, token: Token) -> bool {
@@ -1721,6 +1753,17 @@ impl<'a> HttpResponse<'a> {
     pub fn header(&self, name: &str) -> Option<&'a [u8]> {
         self.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value)
     }
+}
+
+#[cfg(feature = "tls")]
+fn check_alpn(config: &crate::tls::ServerConfig) -> io::Result<()> {
+    if config.alpn_protocols.iter().any(|protocol| protocol != b"http/1.1") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP TLS supports only http/1.1 ALPN",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -752,6 +752,19 @@ impl NetworkCore {
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS requires a TCP group")),
         }
     }
+    /// Replaces the config of a listener from [`Self::listen_tls`]. Applies
+    /// to sockets accepted after the call; established sessions keep theirs.
+    #[cfg(feature = "tls")]
+    pub fn set_tls_config(
+        &mut self,
+        listener: Token,
+        config: std::sync::Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<()> {
+        match self.tokens.groups.get(&listener).and_then(|group| self.groups.get_mut(group.0)) {
+            Some(GroupState::Tcp(tcp)) => tcp.set_tls_config(listener, config),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a TLS listener")),
+        }
+    }
 
     /// Bytes queued behind the socket for a TCP connection, or `None` if it
     /// cannot take writes (unknown, UDP, closing, or mid TLS handshake). Lets a
