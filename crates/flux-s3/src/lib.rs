@@ -90,18 +90,29 @@ pub fn upload_id(body: &[u8]) -> Option<&str> {
 /// Each upload in a [`S3::list_multipart_uploads`] response: its key, as S3
 /// escapes it in XML, its id, and when it was initiated
 /// (`2026-10-22T11:04:12.000Z`).
+///
+/// An upload missing any of the three is skipped.
 pub fn uploads(body: &[u8]) -> impl Iterator<Item = (&str, &str, &str)> {
     let mut rest = body;
     std::iter::from_fn(move || {
-        let (upload, end) = element_at(rest, "Upload")?;
-        rest = &rest[end..];
-        let upload = upload.as_bytes();
-        Some((element(upload, "Key")?, element(upload, "UploadId")?, element(upload, "Initiated")?))
+        loop {
+            let (upload, end) = element_at(rest, "Upload")?;
+            rest = &rest[end..];
+            let upload = upload.as_bytes();
+            let fields =
+                (element(upload, "Key"), element(upload, "UploadId"), element(upload, "Initiated"));
+            if let (Some(key), Some(id), Some(initiated)) = fields {
+                return Some((key, id, initiated));
+            }
+        }
     })
 }
 
 /// The `after` markers for the next page of a truncated
 /// [`S3::list_multipart_uploads`] response; `None` on the last page.
+///
+/// The key is escaped as in [`uploads`]; unescape it before passing it back
+/// for keys that can hold `&`, `<`, `>`, `'` or `"`.
 pub fn next_uploads_after(body: &[u8]) -> Option<(&str, &str)> {
     if element(body, "IsTruncated")? != "true" {
         return None;

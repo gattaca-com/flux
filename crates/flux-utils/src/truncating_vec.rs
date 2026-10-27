@@ -4,20 +4,19 @@ use std::{
     vec,
 };
 
-/// How many lengths a [`Default`] buffer remembers: ten slots when it is
-/// cleared once per slot.
+/// How many lengths a [`Default`] buffer remembers.
 pub const DEFAULT_HISTORY: usize = 10;
 
 /// A reused buffer that gives back a burst's allocation.
 ///
-/// Each [`clear`](Self::clear) records the length it cleared. Once capacity
-/// exceeds twice the upper median of the last `history` lengths, it shrinks to
-/// that median; the slack stops a buffer that swings around its median from
-/// reallocating on every fill.
+/// Each [`clear`](Self::clear), [`refill`](Self::refill) and
+/// [`restore`](Self::restore) records the length of the fill it ends. Once
+/// capacity exceeds twice the upper median of the last `history` lengths, it
+/// shrinks to that median; the slack stops a buffer that swings around its
+/// median from reallocating on every fill.
 ///
-/// Only `clear` records a length. The slice is exposed mutably but the `Vec`
-/// is not, so refills go through `clear`; `truncate` and `drain` trim within a
-/// fill.
+/// The slice is exposed mutably but the `Vec` is not, so every fill ends
+/// through one of those three; `truncate` and `drain` trim within a fill.
 #[derive(Clone, Debug)]
 pub struct TruncatingVec<T> {
     vec: Vec<T>,
@@ -40,16 +39,17 @@ impl<T> TruncatingVec<T> {
     }
 
     /// Starts a fill of `len` elements: records the last fill's length and
-    /// shrinks as [`Self::clear`] does, but keeps the elements up to `len`
-    /// unless it shrank, writing `value` only where the buffer grows.
+    /// shrinks as [`Self::clear`] does, but never below `len`, and keeps the
+    /// elements up to `len` unless it shrank, writing `value` only where the
+    /// buffer grows.
     pub fn refill(&mut self, len: usize, value: T)
     where
         T: Clone,
     {
-        let median = self.record(self.vec.len());
-        if self.vec.capacity() > 2 * median {
+        let keep = self.record(self.vec.len()).max(len);
+        if self.vec.capacity() > 2 * keep {
             self.vec.clear();
-            self.vec.shrink_to(median);
+            self.vec.shrink_to(keep);
         }
         self.vec.resize(len, value);
     }

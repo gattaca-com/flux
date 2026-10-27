@@ -1426,8 +1426,9 @@ impl DiskIo {
             self.pending_count -= 1;
             let error = io::Error::from_raw_os_error(libc::EBADF);
             let (failed, operation_id) = match op {
-                PendingOp::Read { offset, buf: Some(buf), .. } |
-                PendingOp::ReadToEnd { offset, buf: Some(buf) } => {
+                PendingOp::Read { offset, buf: Some(mut buf), .. } |
+                PendingOp::ReadToEnd { offset, buf: Some(mut buf) } => {
+                    buf.clear();
                     let error = Some(error);
                     handler(DiskEvent::ReadOwned { file: token, offset, buf, eof: false, error });
                     continue;
