@@ -25,6 +25,10 @@ const INITIAL_LISTENER_CAPACITY: usize = 2;
 const INITIAL_RX_BUFFER_SIZE: usize = 32 * 1024;
 const INITIAL_SEND_BUFFER_SIZE: usize = 32 * 1024;
 const BACKLOG_WARNING_INTERVAL_SECS: u64 = 10;
+/// Pause before accepting again after an accept error such as descriptor
+/// exhaustion. Connections still queued in the kernel would otherwise wait
+/// for the next one to arrive, as listener readiness is edge-triggered.
+const ACCEPT_RETRY_MILLIS: u64 = 100;
 
 pub const DEFAULT_TCP_USER_TIMEOUT_MS: u32 = 10_000;
 const DEFAULT_TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 5;
@@ -142,6 +146,9 @@ struct Listener {
     /// Connections accepted since this poll's `pre_poll`, across its
     /// `pre_poll` and readiness phases.
     accepts_this_poll: usize,
+    /// After an accept error, when to try again; `accept_deferred` is set
+    /// meanwhile.
+    retry_at: Option<Instant>,
     #[cfg(feature = "tls")]
     tls: Option<std::sync::Arc<crate::tls::ServerConfig>>,
 }
@@ -313,9 +320,12 @@ impl TcpManager {
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let mut work = self.drain_pending_disconnects(handler);
+        let now = Instant::now();
         for index in 0..self.listeners.len() {
             self.listeners[index].accepts_this_poll = 0;
-            if self.listeners[index].accept_deferred {
+            if self.listeners[index].accept_deferred &&
+                self.listeners[index].retry_at.is_none_or(|at| now >= at)
+            {
                 work = true;
                 self.accept_connections(registry, index, tokens, dcache, handler);
             }
@@ -329,8 +339,27 @@ impl TcpManager {
         work
     }
 
+    /// Whether a listener has connections to accept on the next poll.
     pub(crate) fn has_deferred_accepts(&self) -> bool {
-        self.listeners.iter().any(|listener| listener.accept_deferred)
+        let now = Instant::now();
+        self.listeners.iter().any(|listener| {
+            listener.accept_deferred && listener.retry_at.is_none_or(|at| now >= at)
+        })
+    }
+
+    /// Time until a listener retries after an accept error.
+    pub(crate) fn accept_retry_in(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.listeners
+            .iter()
+            .filter_map(|listener| listener.retry_at)
+            .map(|at| at.saturating_sub(now))
+            .min()
+    }
+
+    pub(crate) fn listener_addr(&self, token: Token) -> Option<SocketAddr> {
+        let listener = self.listeners.iter().find(|listener| listener.token == token)?;
+        listener.socket.local_addr().ok()
     }
 
     /// Stops or restarts reading from a connected socket; see
@@ -437,6 +466,7 @@ impl TcpManager {
             socket,
             accept_deferred: false,
             accepts_this_poll: 0,
+            retry_at: None,
             #[cfg(feature = "tls")]
             tls: None,
         });
@@ -737,6 +767,7 @@ impl TcpManager {
         let group = self.group;
         let max_accepts = self.config.max_accepts_per_poll.unwrap_or(usize::MAX);
         self.listeners[listener_index].accept_deferred = false;
+        self.listeners[listener_index].retry_at = None;
         loop {
             if self.listeners[listener_index].accepts_this_poll == max_accepts {
                 self.listeners[listener_index].accept_deferred = true;
@@ -746,9 +777,21 @@ impl TcpManager {
             let (mut socket, peer_addr) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                // The connection was gone before it was accepted; the rest of
+                // the queue is unaffected.
+                Err(err) if err.kind() == io::ErrorKind::ConnectionAborted => continue,
                 Err(err) => {
-                    warn!(?err, group = self.config.name, "tcp accept failed");
-                    break;
+                    // For example, out of descriptors. Edge-triggered
+                    // readiness would not report the connections still
+                    // queued, so retry them shortly rather than when the
+                    // next one arrives.
+                    warn!(?err, group = self.config.name, "tcp accept failed; retrying");
+                    let listener = &mut self.listeners[listener_index];
+                    listener.accept_deferred = true;
+                    listener.retry_at =
+                        Some(Instant::now() + Duration::from_millis(ACCEPT_RETRY_MILLIS));
+                    return;
                 }
             };
             self.listeners[listener_index].accepts_this_poll += 1;

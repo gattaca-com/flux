@@ -760,6 +760,16 @@ impl NetworkCore {
         }
     }
 
+    /// The local address of a listener, for example to learn the port chosen
+    /// for a listener bound to port 0.
+    pub fn listener_addr(&self, token: Token) -> Option<SocketAddr> {
+        let group = self.route(token)?;
+        match &self.groups[group.0] {
+            GroupState::Tcp(tcp) => tcp.listener_addr(token),
+            GroupState::Udp(_) | GroupState::UdpV2(_) => None,
+        }
+    }
+
     /// Stops reading from a TCP connection until [`Self::resume_reading`].
     /// What the peer sends meanwhile stays in the kernel, whose receive
     /// window then pushes back on the peer, so an owner that cannot take
@@ -1198,11 +1208,14 @@ impl NetworkWithExternalPoll {
             .iter()
             .map(|group| match group {
                 GroupState::Tcp(tcp) if tcp.has_deferred_accepts() => Duration::ZERO,
-                GroupState::Tcp(tcp) => {
-                    tcp.config.reconnect_interval.min(tcp.config.handshake_timeout).min(
+                GroupState::Tcp(tcp) => tcp
+                    .config
+                    .reconnect_interval
+                    .min(tcp.config.handshake_timeout)
+                    .min(
                         tcp.config.max_backlog_frames.map_or(Duration::MAX, |(_, timeout)| timeout),
                     )
-                }
+                    .min(tcp.accept_retry_in().unwrap_or(Duration::MAX)),
                 GroupState::Udp(udp) => udp.tick_interval(),
                 GroupState::UdpV2(udp) => udp.tick_interval(),
             })

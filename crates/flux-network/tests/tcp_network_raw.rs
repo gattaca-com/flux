@@ -438,6 +438,16 @@ fn poll_until(
 }
 
 #[test]
+fn listener_addr_reports_the_bound_port() {
+    let mut network = Network::default();
+    let group = network.add_group(raw_group("raw-server"));
+    let listener = network.listen(group, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let addr = network.listener_addr(listener).unwrap();
+    assert_ne!(addr.port(), 0);
+    std::net::TcpStream::connect(addr).unwrap();
+}
+
+#[test]
 fn paused_reading_leaves_bytes_in_the_kernel_until_resumed() {
     let addr = unused_addr();
     let mut network = Network::default();
