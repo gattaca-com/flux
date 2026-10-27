@@ -19,7 +19,7 @@
 
 pub mod sigv4;
 
-use std::net::SocketAddr;
+use std::{borrow::Cow, net::SocketAddr};
 
 pub use flux_network::http::{HttpResponse, RequestId};
 use flux_network::{
@@ -64,9 +64,9 @@ impl<'a> Error<'a> {
     }
 
     /// A complete that fails after S3 has sent `200 OK` reports the error
-    /// in the body.
+    /// in the body, and one cut off before its result has no `<ETag>`.
     fn check_complete<'r>(response: &'r HttpResponse<'a>) -> Result<&'r HttpResponse<'a>, Self> {
-        if element(response.body, "Error").is_none() {
+        if element(response.body, "ETag").is_some() {
             return Ok(response);
         }
         Err(Self::Server {
@@ -82,17 +82,18 @@ fn error_code(body: &[u8]) -> Option<&str> {
     element(body, "Code")
 }
 
-/// The `<UploadId>` of a [`S3::create_multipart_upload`] response.
-pub fn upload_id(body: &[u8]) -> Option<&str> {
-    element(body, "UploadId")
+/// The `<UploadId>` of a [`S3::create_multipart_upload`] response,
+/// unescaped.
+pub fn upload_id(body: &[u8]) -> Option<Cow<'_, str>> {
+    text(body, "UploadId")
 }
 
-/// Each upload in a [`S3::list_multipart_uploads`] response: its key, as S3
-/// escapes it in XML, its id, and when it was initiated
+/// Each upload in a [`S3::list_multipart_uploads`] response: its key and id,
+/// unescaped so they can be passed back to S3, and when it was initiated
 /// (`2026-10-22T11:04:12.000Z`).
 ///
 /// An upload missing any of the three is skipped.
-pub fn uploads(body: &[u8]) -> impl Iterator<Item = (&str, &str, &str)> {
+pub fn uploads(body: &[u8]) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>, &str)> {
     let mut rest = body;
     std::iter::from_fn(move || {
         loop {
@@ -100,7 +101,7 @@ pub fn uploads(body: &[u8]) -> impl Iterator<Item = (&str, &str, &str)> {
             rest = &rest[end..];
             let upload = upload.as_bytes();
             let fields =
-                (element(upload, "Key"), element(upload, "UploadId"), element(upload, "Initiated"));
+                (text(upload, "Key"), text(upload, "UploadId"), element(upload, "Initiated"));
             if let (Some(key), Some(id), Some(initiated)) = fields {
                 return Some((key, id, initiated));
             }
@@ -109,20 +110,51 @@ pub fn uploads(body: &[u8]) -> impl Iterator<Item = (&str, &str, &str)> {
 }
 
 /// The `after` markers for the next page of a truncated
-/// [`S3::list_multipart_uploads`] response; `None` on the last page.
-///
-/// The key is escaped as in [`uploads`]; unescape it before passing it back
-/// for keys that can hold `&`, `<`, `>`, `'` or `"`.
-pub fn next_uploads_after(body: &[u8]) -> Option<(&str, &str)> {
+/// [`S3::list_multipart_uploads`] response, unescaped; `None` on the last
+/// page.
+pub fn next_uploads_after(body: &[u8]) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
     if element(body, "IsTruncated")? != "true" {
         return None;
     }
-    Some((element(body, "NextKeyMarker")?, element(body, "NextUploadIdMarker")?))
+    Some((text(body, "NextKeyMarker")?, text(body, "NextUploadIdMarker")?))
 }
 
 /// The text of the first `<tag>` element in `body`.
 fn element<'b>(body: &'b [u8], tag: &str) -> Option<&'b str> {
     element_at(body, tag).map(|(text, _)| text)
+}
+
+/// The text of the first `<tag>` element in `body` with its character
+/// references replaced; borrowed when it has none.
+fn text<'b>(body: &'b [u8], tag: &str) -> Option<Cow<'b, str>> {
+    let text = element(body, tag)?;
+    if !text.contains('&') {
+        return Some(Cow::Borrowed(text));
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let end = at + rest[at..].find(';')?;
+        out.push(match &rest[at + 1..end] {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            reference => {
+                let code = reference.strip_prefix('#')?;
+                let code = match code.strip_prefix('x') {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                    None => code.parse().ok()?,
+                };
+                char::from_u32(code)?
+            }
+        });
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(Cow::Owned(out))
 }
 
 /// The text of the first `<tag>` element in `body`, and where its closing
@@ -478,4 +510,50 @@ fn uploads_query(prefix: Option<&str>, after: Option<(&str, &str)>) -> String {
     }
     query.push_str("uploads=");
     query
+}
+
+#[cfg(test)]
+mod tests {
+    use flux_network::http::HttpResponse;
+
+    use super::{Error, next_uploads_after, uploads};
+
+    /// S3 escapes keys in XML, AWS with named entities and `MinIO` with
+    /// numeric ones; S3 needs them raw when they come back as markers.
+    #[test]
+    fn listings_unescape_keys_and_markers() {
+        let body = b"<IsTruncated>true</IsTruncated>\
+            <Upload><Key>a&amp;b&#34;c&#x27;</Key><UploadId>u1</UploadId>\
+            <Initiated>t</Initiated></Upload>\
+            <NextKeyMarker>a&amp;b</NextKeyMarker><NextUploadIdMarker>u1</NextUploadIdMarker>";
+        let listed: Vec<_> = uploads(body).collect();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((&*listed[0].0, &*listed[0].1), ("a&b\"c'", "u1"));
+        let (key, id) = next_uploads_after(body).unwrap();
+        assert_eq!((&*key, &*id), ("a&b", "u1"));
+    }
+
+    /// A complete counts only with its result's `ETag`: S3 sends `200 OK`
+    /// before it commits, and AWS puts an `xmlns` on the result element.
+    #[test]
+    fn a_complete_succeeds_only_with_its_result() {
+        let response = |body: &'static [u8]| HttpResponse {
+            version: 1,
+            status: 200,
+            reason: "OK",
+            headers: &[],
+            body,
+        };
+        let done = response(
+            b"<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <ETag>\"e-2\"</ETag></CompleteMultipartUploadResult>",
+        );
+        assert!(Error::check_complete(&done).is_ok());
+        assert!(Error::check_complete(&response(b"  \n ")).is_err());
+        let failed = response(b" <Error><Code>InternalError</Code></Error>");
+        assert!(matches!(
+            Error::check_complete(&failed),
+            Err(Error::Server { code: Some("InternalError"), .. })
+        ));
+    }
 }

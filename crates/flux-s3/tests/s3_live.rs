@@ -112,7 +112,7 @@ fn signed_round_trip() {
     let first: Vec<u8> = (0..5 << 20).map(|i| (i % 253) as u8).collect();
     let id = s3.create_multipart_upload(&mut net, &bucket, &key).unwrap();
     let initiated = ok(&mut net, &mut s3, id).0;
-    let upload = upload_id(&initiated).unwrap().to_owned();
+    let upload = upload_id(&initiated).unwrap().into_owned();
     let mut etags = Vec::new();
     for (part_number, part) in [(1, first.as_slice()), (2, body.as_slice())] {
         let id = s3.upload_part(&mut net, &bucket, &key, &upload, part_number, part).unwrap();
@@ -129,7 +129,7 @@ fn signed_round_trip() {
 
     let id = s3.create_multipart_upload(&mut net, &bucket, &key).unwrap();
     let initiated = ok(&mut net, &mut s3, id).0;
-    let upload = upload_id(&initiated).unwrap().to_owned();
+    let upload = upload_id(&initiated).unwrap().into_owned();
     let id = s3.upload_part(&mut net, &bucket, &key, &upload, 1, &body).unwrap();
     ok(&mut net, &mut s3, id);
     let listed = |net: &mut Network, s3: &mut S3, after: Option<(&str, &str)>| {

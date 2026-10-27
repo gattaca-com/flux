@@ -80,7 +80,9 @@ impl Signer {
     /// Signs one request; `date` is `YYYYMMDDTHHMMSSZ`, `resource` the path
     /// without its query, `query` the sorted `name=value` pairs, `headers`
     /// further headers to sign, with lowercase names, that the caller also
-    /// sends. Returns the `Authorization` value and the payload hash for
+    /// sends. Their names must be unique and must not be `host` or
+    /// `x-amz-*` names the signer adds; join repeated values with commas.
+    /// Returns the `Authorization` value and the payload hash for
     /// `x-amz-content-sha256`.
     pub fn sign(
         &self,
@@ -113,6 +115,7 @@ impl Signer {
         }
         let signed = &mut signed[..len];
         signed.sort_unstable_by_key(|(name, _)| *name);
+        debug_assert!(signed.windows(2).all(|pair| pair[0].0 != pair[1].0), "unique names");
         let mut canonical = format!("{method}\n{resource}\n{query}\n");
         let mut names = String::new();
         for (name, value) in &*signed {
