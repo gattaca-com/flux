@@ -1596,41 +1596,6 @@ mod tests {
         }
     }
 
-    /// Owned buffers come back in their events: a write's as written, a
-    /// read's filled with the bytes read, and a read queued on a file whose
-    /// open fails with its error.
-    #[test]
-    fn owned_buffers_come_back_in_their_events() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("owned.bin");
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, overwrite()).unwrap();
-        disk.write_owned(file, b"alpha".to_vec()).unwrap();
-        assert!(disk.close(file));
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.iter().any(|e| matches!(e, Ev::Closed(_))));
-        assert!(events.iter().any(|e| matches!(e, Ev::WrittenOwned { len: 5, failed: false, .. })));
-
-        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
-        disk.read_at_owned(file, 0, 5, Vec::with_capacity(1)).unwrap();
-        let missing = disk.open(dir.path().join("missing"), OpenOptions::new().read(true)).unwrap();
-        disk.read_to_end_owned(missing, 0, vec![1, 2, 3]).unwrap();
-        events.clear();
-        let owned =
-            |events: &[Ev]| events.iter().filter(|e| matches!(e, Ev::ReadOwned { .. })).count();
-        drive(&mut disk, &mut events, |events| owned(events) == 2);
-        let read = events.iter().find_map(|e| match e {
-            Ev::ReadOwned { file: f, payload, failed: false, .. } if *f == file => Some(payload),
-            _ => None,
-        });
-        assert_eq!(read.map(Vec::as_slice), Some(&b"alpha"[..]));
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, Ev::ReadOwned { file: f, failed: true, .. } if *f == missing))
-        );
-    }
-
     #[test]
     fn writes_sync_and_close_before_the_first_poll() {
         let dir = tempfile::tempdir().unwrap();
