@@ -244,6 +244,50 @@ fn limits_and_errors() {
     }
 }
 
+/// Sends `request` and returns everything received until the server closes.
+fn exchange(
+    net: &mut Network,
+    server: &mut HttpNetwork,
+    addr: SocketAddr,
+    request: &[u8],
+) -> Vec<u8> {
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(request).unwrap();
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !read_available(&mut client, &mut received) {
+        poll(net, server, |_| {});
+        thread::sleep(Duration::from_millis(1));
+    }
+    received
+}
+
+#[test]
+fn configured_ceiling_and_oversized_head_status() {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default()
+        .with_max_head_bytes(64)
+        .with_max_body_bytes(8)
+        .with_max_content_length(16)
+        .with_oversized_head_status(400);
+    server.listen(&mut net, addr).unwrap();
+    for (request, status) in [
+        // Above the body limit but within the ceiling: still 413.
+        (b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n".as_slice(), "413"),
+        // Above the ceiling: invalid framing.
+        (b"POST / HTTP/1.1\r\nContent-Length: 17\r\n\r\n".as_slice(), "400"),
+        (b"POST / HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n".as_slice(), "400"),
+        (format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(80)).as_bytes(), "400"),
+    ] {
+        let received = exchange(&mut net, &mut server, addr, request);
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.starts_with(&format!("HTTP/1.1 {status} ")), "{text}");
+        assert!(text.contains("Connection: close\r\n"), "{text}");
+    }
+}
+
 #[test]
 fn caller_connection_close_header_sent() {
     let (mut net, mut server, addr) = server();
@@ -523,17 +567,34 @@ fn smuggling_rejected() {
             400,
             false,
         ),
+        // Equal duplicates too: another parser may not merge them.
         (
             b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx".as_slice(),
-            200,
-            true,
+            400,
+            false,
+        ),
+        (b"POST / HTTP/1.1\r\nContent-Length: 1, 1\r\n\r\nx".as_slice(), 400, false),
+        (b"POST / HTTP/1.1\r\nContent-Length: +1\r\n\r\nx".as_slice(), 400, false),
+        (
+            b"POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999999\r\n\r\n".as_slice(),
+            400,
+            false,
         ),
         (
             b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
                 .as_slice(),
-            501,
+            400,
             false,
         ),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(), 400, false),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n".as_slice(), 400, false),
+        (
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
+            400,
+            false,
+        ),
+        (b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(), 400, false),
     ] {
         let (mut net, mut server, addr) = server();
         let mut client = std::net::TcpStream::connect(addr).unwrap();

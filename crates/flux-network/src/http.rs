@@ -226,6 +226,10 @@ pub struct HttpNetwork {
     max_head_bytes: usize,
     max_body_bytes: usize,
     max_headers: usize,
+    /// Declared request lengths above this are invalid framing (`400`).
+    max_content_length: usize,
+    /// Status for a request head over `max_head_bytes`.
+    oversized_head_status: u16,
     idle_timeout: Option<Duration>,
     socket_buf_size: Option<usize>,
     listeners: Vec<Token>,
@@ -251,6 +255,8 @@ impl Default for HttpNetwork {
             max_head_bytes: 16 * 1024,
             max_body_bytes: 1024 * 1024,
             max_headers: 64,
+            max_content_length: usize::MAX,
+            oversized_head_status: 431,
             idle_timeout: Some(Duration::from_secs(30)),
             socket_buf_size: None,
             listeners: Vec::new(),
@@ -292,6 +298,23 @@ impl HttpNetwork {
     pub fn with_max_headers(mut self, max_headers: usize) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.max_headers = max_headers;
+        self
+    }
+    /// Treats a request whose declared `Content-Length` exceeds `max` as
+    /// invalid framing: it is answered `400` and the connection closes,
+    /// whatever `max_body_bytes` would have said. Without it, a length above
+    /// `max_body_bytes` is answered `413`.
+    pub fn with_max_content_length(mut self, max: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_content_length = max;
+        self
+    }
+    /// Sets the status for a request head larger than `max_head_bytes`;
+    /// `431` by default. Some deployments answer every malformed head `400`.
+    pub fn with_oversized_head_status(mut self, status: u16) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        assert!((400..=499).contains(&status), "oversized head status must be a 4xx");
+        self.oversized_head_status = status;
         self
     }
     /// Sets the TCP socket buffer size.
@@ -935,7 +958,7 @@ impl HttpNetwork {
             if !crlf_only(buf) {
                 self.error(net, i, 400);
             } else if over_limit || buf.len() > self.max_head_bytes {
-                self.error(net, i, 431);
+                self.error(net, i, self.oversized_head_status);
             }
             return
         };
@@ -944,17 +967,20 @@ impl HttpNetwork {
             return
         }
         if head > self.max_head_bytes {
-            self.error(net, i, 431);
+            self.error(net, i, self.oversized_head_status);
             return
         }
-        let Some(len) = request_content_length(req.headers) else {
-            self.error(net, i, 400);
-            return
+        let len = match request_framing(req.headers, req.version, self.max_content_length) {
+            Some(RequestFraming::Length(len)) => len,
+            Some(RequestFraming::Chunked) => {
+                self.error(net, i, 501);
+                return
+            }
+            None => {
+                self.error(net, i, 400);
+                return
+            }
         };
-        if req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("transfer-encoding")) {
-            self.error(net, i, 501);
-            return
-        }
         if len > self.max_body_bytes {
             self.error(net, i, 413);
             return
@@ -1480,19 +1506,51 @@ impl HttpNetwork {
 fn crlf_only(bytes: &[u8]) -> bool {
     bytes.iter().enumerate().all(|(i, b)| *b != b'\n' || i > 0 && bytes[i - 1] == b'\r')
 }
-fn request_content_length(headers: &[httparse::Header<'_>]) -> Option<usize> {
+/// How a request's body is delimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestFraming {
+    Length(usize),
+    Chunked,
+}
+/// The body framing of a request, or `None` when it is ambiguous or
+/// unsupported. Framing that two parsers could read differently is a
+/// request-smuggling vector, so only these are accepted: no framing headers,
+/// exactly one `Content-Length` of plain decimal digits no larger than
+/// `max_length`, or exactly one `Transfer-Encoding: chunked` without a
+/// `Content-Length` on HTTP/1.1. Repeated lengths are rejected even when
+/// equal, as are list values, other or stacked codings, and chunked
+/// HTTP/1.0 requests.
+fn request_framing(
+    headers: &[httparse::Header<'_>],
+    version: Option<u8>,
+    max_length: usize,
+) -> Option<RequestFraming> {
     let mut length = None;
-    for header in headers.iter().filter(|h| h.name.eq_ignore_ascii_case("content-length")) {
-        let value = std::str::from_utf8(header.value).ok()?;
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return None
-        }
-        let parsed = value.parse().ok()?;
-        if length.replace(parsed).is_some_and(|previous| previous != parsed) {
-            return None
+    let mut chunked = false;
+    for header in headers {
+        if header.name.eq_ignore_ascii_case("content-length") {
+            let value = header.value;
+            if length.is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return None
+            }
+            // Parsing fails rather than wraps above `usize::MAX`.
+            let parsed: usize = std::str::from_utf8(value).ok()?.parse().ok()?;
+            if parsed > max_length {
+                return None
+            }
+            length = Some(parsed);
+        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !header.value.trim_ascii().eq_ignore_ascii_case(b"chunked") {
+                return None
+            }
+            chunked = true;
         }
     }
-    Some(length.unwrap_or(0))
+    match (length, chunked) {
+        (None, true) if version == Some(1) => Some(RequestFraming::Chunked),
+        (_, true) => None,
+        (length, false) => Some(RequestFraming::Length(length.unwrap_or(0))),
+    }
 }
 fn has_token(headers: &[httparse::Header<'_>], name: &str, value: &[u8]) -> bool {
     headers
