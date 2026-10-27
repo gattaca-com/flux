@@ -63,6 +63,7 @@ use std::{
 
 use flux_timing::{Duration, Instant};
 use mio::Token;
+use rustc_hash::FxHashMap;
 
 use crate::{Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig};
 
@@ -79,6 +80,8 @@ const MAX_CHUNK_LINE: usize = 4096;
 /// completes, so an idle connection does not keep its largest request's
 /// memory.
 const RETAINED_BUFFER_BYTES: usize = 64 * 1024;
+/// Interval between idle sweeps of accepted connections.
+const SWEEP_MILLIS: u64 = 20;
 /// Piece of an owned response body handed to the socket at a time; more is
 /// handed over only while less than this is queued there.
 pub const OUT_CHUNK_BYTES: usize = 256 * 1024;
@@ -381,6 +384,10 @@ pub struct HttpNetwork {
     socket_buf_size: Option<usize>,
     listeners: Vec<Token>,
     conns: Vec<Conn>,
+    /// Index of each connection in `conns`.
+    index: FxHashMap<Token, usize>,
+    /// When idle connections were last swept.
+    swept: Instant,
     lifecycle: Vec<Lifecycle>,
     pools: Vec<Pool>,
     max_queued_bytes: usize,
@@ -413,6 +420,8 @@ impl Default for HttpNetwork {
             socket_buf_size: None,
             listeners: Vec::new(),
             conns: Vec::new(),
+            index: FxHashMap::default(),
+            swept: Instant::now(),
             lifecycle: Vec::new(),
             pools: Vec::new(),
             max_queued_bytes: usize::MAX,
@@ -601,6 +610,20 @@ impl HttpNetwork {
         self.listeners.push(net.listen(group, addr)?);
         Ok(())
     }
+    fn position(&self, token: Token) -> Option<usize> {
+        self.index.get(&token).copied()
+    }
+    fn push_conn(&mut self, conn: Conn) {
+        self.index.insert(conn.token, self.conns.len());
+        self.conns.push(conn);
+    }
+    fn remove_conn(&mut self, i: usize) {
+        let removed = self.conns.swap_remove(i);
+        self.index.remove(&removed.token);
+        if let Some(moved) = self.conns.get(i) {
+            self.index.insert(moved.token, i);
+        }
+    }
     /// The address of the first listener, for example to learn the port
     /// chosen for a listener bound to port 0.
     pub fn local_addr(&self, net: &NetworkCore) -> Option<SocketAddr> {
@@ -609,9 +632,7 @@ impl HttpNetwork {
     /// Immediately disconnects an accepted client.
     pub fn disconnect(&mut self, net: &mut NetworkCore, token: Token) -> bool {
         self.group.is_some() &&
-            self.conns
-                .iter()
-                .any(|conn| conn.token == token && matches!(conn.role, Role::Accepted(_))) &&
+            self.position(token).is_some_and(|i| matches!(self.conns[i].role, Role::Accepted(_))) &&
             net.disconnect(token)
     }
     /// Takes in one network event; returns whether it belonged to this
@@ -622,7 +643,7 @@ impl HttpNetwork {
             NetworkEvent::Accepted { group: event_group, token, peer_addr }
                 if event_group == group =>
             {
-                self.conns.push(Conn {
+                self.push_conn(Conn {
                     token,
                     buf: Vec::new(),
                     dirty: false,
@@ -643,13 +664,13 @@ impl HttpNetwork {
                 if payload.is_empty() {
                     // The peer finished sending (half-close, request-head
                     // mode only).
-                    if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
+                    if let Some(conn) = self.position(token).map(|i| &mut self.conns[i]) &&
                         let Some(accepted) = conn.role.accepted_mut()
                     {
                         accepted.peer_closed = true;
                         conn.dirty = true;
                     }
-                } else if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
+                } else if let Some(conn) = self.position(token).map(|i| &mut self.conns[i]) &&
                     !conn.role.is_draining() &&
                     !conn.over_limit
                 {
@@ -755,9 +776,10 @@ impl HttpNetwork {
     /// [`HttpEvent::RequestBodyFailed`] from a later drive. Returns `false`
     /// unless `token` has a request head awaiting this call.
     pub fn read_body(&mut self, net: &mut NetworkCore, token: Token) -> bool {
-        let Some(i) = self.conns.iter().position(|conn| {
-            conn.token == token && conn.role.accepted().is_some_and(|a| a.state == State::Head)
-        }) else {
+        let Some(i) = self
+            .position(token)
+            .filter(|&i| self.conns[i].role.accepted().is_some_and(|a| a.state == State::Head))
+        else {
             return false
         };
         let Some(accepted) = self.conns[i].role.accepted_mut() else { return false };
@@ -776,7 +798,7 @@ impl HttpNetwork {
     /// application can compare successive values to bound how slowly a body
     /// may arrive.
     pub fn body_received(&self, token: Token) -> Option<usize> {
-        let conn = self.conns.iter().find(|conn| conn.token == token)?;
+        let conn = &self.conns[self.position(token)?];
         let accepted = conn.role.accepted()?;
         if accepted.state != State::Reading {
             return None
@@ -788,8 +810,14 @@ impl HttpNetwork {
         }
     }
     /// Closes connections that sat idle too long, and unfinished discards.
+    /// Runs at most every `SWEEP_MILLIS`, so a drive stays cheap with many
+    /// idle connections.
     fn sweep_accepted(&mut self, net: &mut NetworkCore) {
         let now = Instant::now();
+        if now.saturating_sub(self.swept) < Duration::from_millis(SWEEP_MILLIS) {
+            return
+        }
+        self.swept = now;
         for conn in &mut self.conns {
             let token = conn.token;
             let Role::Accepted(accepted) = &mut conn.role else { continue };
@@ -824,7 +852,7 @@ impl HttpNetwork {
             }
             Lifecycle::Connected(token, None) => handler(HttpEvent::Connected { token }),
             Lifecycle::Disconnected(token) => {
-                if let Some(i) = self.conns.iter().position(|conn| conn.token == token) {
+                if let Some(i) = self.position(token) {
                     if self.conns[i].dirty {
                         self.parse_connection(net, i, handler);
                     }
@@ -845,7 +873,7 @@ impl HttpNetwork {
                             }
                         }
                     } else {
-                        self.conns.remove(i);
+                        self.remove_conn(i);
                     }
                 }
                 handler(HttpEvent::Disconnected { token });
@@ -912,7 +940,7 @@ impl HttpNetwork {
         self.track_outbound(token, addr)
     }
     fn track_outbound(&mut self, token: Token, addr: SocketAddr) -> Token {
-        self.conns.push(Conn {
+        self.push_conn(Conn {
             token,
             buf: Vec::new(),
             dirty: false,
@@ -998,16 +1026,14 @@ impl HttpNetwork {
     }
     /// Permanently removes an outbound endpoint and stops it reconnecting.
     pub fn remove(&mut self, net: &mut NetworkCore, token: Token) -> bool {
+        let Some(i) = self.position(token) else { return false };
         if self.group.is_none() ||
-            !self
-                .conns
-                .iter()
-                .any(|conn| conn.token == token && matches!(conn.role, Role::Outbound { .. })) ||
+            !matches!(self.conns[i].role, Role::Outbound { .. }) ||
             !net.remove(token)
         {
             return false
         }
-        self.conns.retain(|conn| conn.token != token);
+        self.remove_conn(i);
         true
     }
     /// Sends one request on an outbound endpoint.
@@ -1023,11 +1049,12 @@ impl HttpNetwork {
         if !valid_request(method, path, headers) || body.len() > self.max_body_bytes {
             return false
         }
-        let Some(c) =
-            self.conns.iter_mut().find(|c| c.token == token && c.role.outbound_head().is_none())
+        let Some(i) =
+            self.position(token).filter(|&i| self.conns[i].role.outbound_head().is_none())
         else {
             return false
         };
+        let c = &mut self.conns[i];
         let Role::Outbound { addr, .. } = &c.role else { return false };
         let addr = *addr;
         let sent = net.send_with(token, |out| {
@@ -1066,7 +1093,7 @@ impl HttpNetwork {
         if !self.request(net, token, method, path, headers, &[]) {
             return false
         }
-        if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) {
+        if let Some(conn) = self.position(token).map(|i| &mut self.conns[i]) {
             conn.stream = Some(Stream { body: None });
         }
         true
@@ -1168,10 +1195,8 @@ impl HttpNetwork {
         parts[1..=body.len()].copy_from_slice(body);
         let parts = &parts[..=body.len()];
         self.pools[p].tokens.iter().find_map(|&token| {
-            let i = self
-                .conns
-                .iter()
-                .position(|c| c.token == token && c.role.outbound_head().is_none())?;
+            let i =
+                self.position(token).filter(|&i| self.conns[i].role.outbound_head().is_none())?;
             net.send_vectored(token, parts).then_some(i)
         })
     }
@@ -1629,7 +1654,7 @@ impl HttpNetwork {
     /// unsent, bounded by the idle timeout). An application can compare
     /// successive values to bound how slowly a response may be read.
     pub fn response_pending(&self, net: &NetworkCore, token: Token) -> Option<usize> {
-        let conn = self.conns.iter().find(|conn| conn.token == token)?;
+        let conn = &self.conns[self.position(token)?];
         let out = conn.role.accepted()?.out.as_ref()?;
         Some(out.body.len() - out.sent + net.queued_bytes(token))
     }
@@ -1641,11 +1666,11 @@ impl HttpNetwork {
         headers: &[(&str, &str)],
         body: ResponseBody<'_>,
     ) -> bool {
-        let Some(i) = self.conns.iter().position(|c| {
-            c.token == token &&
-                c.role.accepted().is_some_and(|a| {
-                    matches!(a.state, State::Pending | State::Head | State::Reading)
-                })
+        let Some(i) = self.position(token).filter(|&i| {
+            self.conns[i]
+                .role
+                .accepted()
+                .is_some_and(|a| matches!(a.state, State::Pending | State::Head | State::Reading))
         }) else {
             return false
         };

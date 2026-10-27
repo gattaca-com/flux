@@ -487,3 +487,45 @@ fn a_stalled_reader_of_an_owned_response_is_swept() {
     server.until_closed(&mut client, &mut received);
     assert!(received.len() < 8 << 20);
 }
+
+#[test]
+fn many_idle_keepalive_connections_cost_no_latency() {
+    // Ten thousand would need a raised descriptor limit; this many stays
+    // under the usual soft limit of 1024 with both ends in one process.
+    const IDLE: usize = 400;
+    let mut server = Server::new(|http| http);
+    let mut idle = Vec::new();
+    for _ in 0..IDLE {
+        let mut client = server.connect();
+        client.write_all(b"GET /warm HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        idle.push(client);
+    }
+    // Each answers once, then idles with its connection kept alive.
+    let mut answered = 0;
+    let deadline = Instant::now() + TIMEOUT;
+    while answered < IDLE {
+        assert!(Instant::now() < deadline, "{answered} answered");
+        for seen in server.step() {
+            let Seen::Request(token, ..) = seen else { panic!("{seen:?}") };
+            assert!(server.http.respond(&mut server.net, token, 200, &[], b"warm"));
+            answered += 1;
+        }
+    }
+    let mut client = server.connect();
+    let mut received = Vec::new();
+    let started = Instant::now();
+    client.write_all(b"GET /now HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let Seen::Request(token, path, _) = server.next(&mut client, &mut received) else { panic!() };
+    assert_eq!(path, "/now");
+    assert!(server.http.respond(&mut server.net, token, 200, &[], b"now"));
+    server.until_responses(&mut client, &mut received, 1);
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    // The idle connections are all still open and usable.
+    for client in &mut idle[..10] {
+        let mut received = Vec::new();
+        assert!(!read_available(client, &mut received));
+        client.write_all(b"GET /again HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let Seen::Request(token, ..) = server.next(client, &mut received) else { panic!() };
+        assert!(server.http.respond(&mut server.net, token, 200, &[], b"again"));
+    }
+}
