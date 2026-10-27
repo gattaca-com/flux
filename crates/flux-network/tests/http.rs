@@ -225,7 +225,8 @@ fn limits_and_errors() {
         (b"GET / HTTP/1.1\r\nX: 1234567890123456789012345678901234567890123456789012345678901234\r\n\r\n".as_slice(), 431),
         (b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n".as_slice(), 413),
         (b"nope\r\n\r\n".as_slice(), 400),
-        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(), 501),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n".as_slice(), 413),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nx\r\n".as_slice(), 400),
     ] {
         let addr = unused_addr();
         let mut net = Network::default();
@@ -286,6 +287,121 @@ fn configured_ceiling_and_oversized_head_status() {
         assert!(text.starts_with(&format!("HTTP/1.1 {status} ")), "{text}");
         assert!(text.contains("Connection: close\r\n"), "{text}");
     }
+}
+
+/// Serves requests on `client` with each request's path and body echoed
+/// back, until `responses` complete responses have arrived or the server
+/// closes. Returns the echoed paths and bodies and the raw bytes received.
+fn echo_chunks(
+    net: &mut Network,
+    server: &mut HttpNetwork,
+    client: &mut std::net::TcpStream,
+    pieces: &[&[u8]],
+    responses: usize,
+) -> (Vec<(String, Vec<u8>)>, Vec<u8>) {
+    let mut requests = Vec::new();
+    let mut received = Vec::new();
+    let mut pieces = pieces.iter();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && requests.len() < responses {
+        if let Some(piece) = pieces.next() {
+            client.write_all(piece).unwrap();
+        }
+        let mut replies = Vec::new();
+        poll(net, server, |event| {
+            if let HttpEvent::Request { token, request } = event {
+                requests.push((request.path.to_owned(), request.body.to_vec()));
+                replies.push((token, request.body.to_vec()));
+            }
+        });
+        for (token, body) in replies {
+            assert!(server.respond(net, token, 200, &[], &body));
+        }
+        if read_available(client, &mut received) {
+            break
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    (requests, received)
+}
+
+#[test]
+fn chunked_request_bodies_are_decoded() {
+    let (mut net, mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    // Split mid-size-line, mid-data and mid-CRLF, with extensions and a
+    // trailer, then a pipelined request on the same connection.
+    let pieces: [&[u8]; 6] = [
+        b"POST /chunked HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: Chunked\r\n\r\n",
+        b"5;ext=1\r\nhel",
+        b"lo\r",
+        b"\nd",
+        b"\r\n\x00\nbinary\xffdata\r\n0\r\nX-Trailer: t\r\n\r\n",
+        b"POST /plain HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nok",
+    ];
+    let (requests, _) = echo_chunks(&mut net, &mut server, &mut client, &pieces, 2);
+    assert_eq!(requests, [
+        ("/chunked".to_owned(), b"hello\x00\nbinary\xffdata".to_vec()),
+        ("/plain".to_owned(), b"ok".to_vec()),
+    ]);
+}
+
+#[test]
+fn chunked_request_with_expect_gets_continue() {
+    let (mut net, mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client
+        .write_all(
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
+        )
+        .unwrap();
+    let mut received = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !received.ends_with(b"\r\n\r\n") {
+        poll(&mut net, &mut server, |_| {});
+        read_available(&mut client, &mut received);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(received, b"HTTP/1.1 100 Continue\r\n\r\n");
+    let (requests, _) =
+        echo_chunks(&mut net, &mut server, &mut client, &[b"3\r\nabc\r\n0\r\n\r\n"], 1);
+    assert_eq!(requests, [("/".to_owned(), b"abc".to_vec())]);
+}
+
+#[test]
+fn malformed_chunked_body_closes_without_serving_what_follows() {
+    for body in [
+        // Not chunk framing at all: a smuggled request in place of a body.
+        b"GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+        b"3\r\nabcX\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n",
+        b"3 \r\nabc\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n",
+    ] {
+        let (mut net, mut server, addr) = server();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let head = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let (requests, received) =
+            echo_chunks(&mut net, &mut server, &mut client, &[head, body], usize::MAX);
+        assert!(requests.is_empty(), "{requests:?}");
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.starts_with("HTTP/1.1 400 "), "{text}");
+        assert_eq!(text.matches("HTTP/1.1").count(), 1, "{text}");
+    }
+}
+
+#[test]
+fn endless_chunk_size_line_is_refused_early() {
+    let (mut net, mut server, addr) = server();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let digits = vec![b'1'; 64 * 1024];
+    let head = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let (requests, received) =
+        echo_chunks(&mut net, &mut server, &mut client, &[head, &digits], usize::MAX);
+    assert!(requests.is_empty());
+    assert!(received.starts_with(b"HTTP/1.1 400 "));
 }
 
 #[test]

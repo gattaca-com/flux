@@ -31,10 +31,15 @@
 //! ```
 //!
 //! # Limitations
-//! HTTP/1.1 and HTTP/1.0 responses are supported. Request bodies require
-//! `Content-Length`; chunked requests are rejected with `501`. Response bodies
-//! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
-//! `Expect: 100-continue` is handled automatically.
+//! HTTP/1.1 and HTTP/1.0 responses are supported. Request bodies may use one
+//! `Content-Length` or, on HTTP/1.1, `Transfer-Encoding: chunked`; any other
+//! or ambiguous framing is answered `400` and closes the connection. Chunked
+//! bodies are decoded strictly and incrementally: chunk sizes are checked
+//! against `max_body_bytes` before their data, size lines and trailers are
+//! bounded, the raw bytes beneath the decoder are capped, and trailers are
+//! validated and dropped. Response bodies may use `Content-Length`, chunked
+//! transfer coding, or EOF delimiting. `Expect: 100-continue` is handled
+//! automatically.
 //!
 //! Server-side TLS, HTTP/2, compression, trailer exposure, upgrades, and
 //! `WebSockets` are not supported. Valid response trailers are parsed and
@@ -46,7 +51,7 @@
 use std::sync::Arc;
 use std::{
     collections::VecDeque,
-    io::{self, IoSlice, Write as _},
+    io::{self, IoSlice},
     net::{IpAddr, SocketAddr},
 };
 
@@ -61,6 +66,13 @@ const STACK_HEADERS: usize = 64;
 /// Request head buffers kept for reuse once their request completes.
 const SPARE_HEADS: usize = 64;
 const MAX_BODY_PARTS: usize = 16;
+/// Longest chunk-size line, extensions included. The size itself is at most
+/// 16 hex digits; real clients send no extensions.
+const MAX_CHUNK_LINE: usize = 4096;
+/// Per-request buffers larger than this are released when their request
+/// completes, so an idle connection does not keep its largest request's
+/// memory.
+const RETAINED_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
@@ -169,19 +181,60 @@ struct Pool {
     queued_bytes: usize,
     next_seq: u64,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
+    /// Waiting for a request head.
     Idle,
+    /// Receiving the body of a request whose head has been parsed.
+    Reading,
+    /// The request was delivered; waiting for [`HttpNetwork::respond`].
     Pending,
+    /// Closing once the last response is written.
     Draining,
 }
+/// An accepted connection's request in progress.
+// Independent request properties, not states of one value.
+#[allow(clippy::struct_excessive_bools)]
+struct Accepted {
+    state: State,
+    close: bool,
+    continued: bool,
+    head_request: bool,
+    /// Whether the request asked for `100 Continue` before sending its body.
+    expect: bool,
+    /// The head of the request whose body is being read, kept until the
+    /// whole request is delivered.
+    head: Vec<u8>,
+    /// What remains of the body being read.
+    body: Option<BodyReader>,
+    /// The decoded chunked body read so far.
+    decoded: Vec<u8>,
+}
+impl Accepted {
+    fn new() -> Self {
+        Self {
+            state: State::Idle,
+            close: false,
+            continued: false,
+            head_request: false,
+            expect: false,
+            head: Vec::new(),
+            body: None,
+            decoded: Vec::new(),
+        }
+    }
+}
+/// The body of a request being read.
+struct BodyReader {
+    framing: BodyFraming,
+    /// Bytes consumed from the connection for this body, framing included.
+    raw: usize,
+}
+enum BodyFraming {
+    Chunked(ChunkDecoder),
+}
 enum Role {
-    Accepted {
-        state: State,
-        close: bool,
-        continued: bool,
-        head_request: bool,
-    },
+    Accepted(Box<Accepted>),
     /// `in_flight_head` is `Some` while a request is awaiting its response,
     /// carrying whether that request was a `HEAD`.
     Outbound {
@@ -411,7 +464,7 @@ impl HttpNetwork {
         self.group.is_some() &&
             self.conns
                 .iter()
-                .any(|conn| conn.token == token && matches!(conn.role, Role::Accepted { .. })) &&
+                .any(|conn| conn.token == token && matches!(conn.role, Role::Accepted(_))) &&
             net.disconnect(token)
     }
     /// Takes in one network event; returns whether it belonged to this
@@ -428,12 +481,7 @@ impl HttpNetwork {
                     dirty: false,
                     over_limit: false,
                     last_activity: Instant::now(),
-                    role: Role::Accepted {
-                        state: State::Idle,
-                        close: false,
-                        continued: false,
-                        head_request: false,
-                    },
+                    role: Role::Accepted(Box::new(Accepted::new())),
                     stream: None,
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
@@ -495,7 +543,7 @@ impl HttpNetwork {
                 .conns
                 .iter()
                 .filter(|conn| {
-                    matches!(conn.role, Role::Accepted { .. }) &&
+                    matches!(conn.role, Role::Accepted(_)) &&
                         conn.last_activity.elapsed() >= timeout
                 })
                 .map(|conn| conn.token)
@@ -589,7 +637,7 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if matches!(self.conns[i].role, Role::Accepted { .. }) {
+        if matches!(self.conns[i].role, Role::Accepted(_)) {
             self.parse_and_emit(net, i, handler);
         } else if self.conns[i].stream.is_some() {
             self.parse_stream(net, i, handler);
@@ -940,9 +988,16 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if !matches!(self.conns[i].role.accepted_state_mut(), State::Idle) {
-            return
+        match self.conns[i].role.accepted().map(|a| a.state) {
+            Some(State::Idle) => self.parse_head(net, i, handler),
+            Some(State::Reading) => self.read_body_step(net, i, handler),
+            _ => {}
         }
+    }
+    fn parse_head<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
         let over_limit = self.conns[i].over_limit;
         let buf = &self.conns[i].buf;
         let (mut stack_slots, mut heap_slots) =
@@ -970,14 +1025,34 @@ impl HttpNetwork {
             self.error(net, i, self.oversized_head_status);
             return
         }
-        let len = match request_framing(req.headers, req.version, self.max_content_length) {
-            Some(RequestFraming::Length(len)) => len,
-            Some(RequestFraming::Chunked) => {
-                self.error(net, i, 501);
-                return
-            }
-            None => {
-                self.error(net, i, 400);
+        let Some(framing) = request_framing(req.headers, req.version, self.max_content_length)
+        else {
+            self.error(net, i, 400);
+            return
+        };
+        let close = req.version == Some(0) && !has_token(req.headers, "connection", b"keep-alive") ||
+            has_token(req.headers, "connection", b"close");
+        let expect = has_token(req.headers, "expect", b"100-continue");
+        let head_request = req.method == Some("HEAD");
+        let len = match framing {
+            RequestFraming::Length(len) => len,
+            RequestFraming::Chunked => {
+                // The head is kept aside while the body is decoded, so the
+                // connection buffer only ever holds undecoded chunk bytes.
+                let conn = &mut self.conns[i];
+                let Role::Accepted(accepted) = &mut conn.role else { return };
+                accepted.head.clear();
+                accepted.head.extend_from_slice(&conn.buf[..head]);
+                accepted.decoded.clear();
+                accepted.body =
+                    Some(BodyReader { framing: BodyFraming::Chunked(ChunkDecoder::new()), raw: 0 });
+                accepted.state = State::Reading;
+                accepted.close = close;
+                accepted.expect = expect;
+                accepted.continued = false;
+                accepted.head_request = head_request;
+                conn.buf.drain(..head);
+                self.read_body_step(net, i, handler);
                 return
             }
         };
@@ -994,21 +1069,12 @@ impl HttpNetwork {
                 self.error(net, i, 413);
                 return
             }
-            if has_token(req.headers, "expect", b"100-continue") &&
-                !self.conns[i].role.accepted_continued()
-            {
-                let token = self.conns[i].token;
-                if net.send_with(token, |out| write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap())
-                {
-                    self.conns[i].role.set_accepted_continued(true);
-                }
+            if expect && !self.conns[i].role.accepted().is_some_and(|a| a.continued) {
+                self.send_continue(net, i);
             }
             return
         }
-        let close = req.version == Some(0) && !has_token(req.headers, "connection", b"keep-alive") ||
-            has_token(req.headers, "connection", b"close");
         let token = self.conns[i].token;
-        let head_request = req.method == Some("HEAD");
         let request = HttpRequest {
             method: req.method.unwrap_or(""),
             path: req.path.unwrap_or(""),
@@ -1019,14 +1085,112 @@ impl HttpNetwork {
         handler(HttpEvent::Request { token, request });
         self.conns[i].buf.drain(..end);
         self.conns[i].dirty = !self.conns[i].buf.is_empty();
-        self.conns[i].role.set_accepted_state(State::Pending);
-        self.conns[i].role.set_accepted_close(close);
-        self.conns[i].role.set_accepted_continued(false);
-        self.conns[i].role.set_accepted_head_request(head_request);
+        if let Some(accepted) = self.conns[i].role.accepted_mut() {
+            accepted.state = State::Pending;
+            accepted.close = close;
+            accepted.continued = false;
+            accepted.head_request = head_request;
+        }
+    }
+    fn send_continue(&mut self, net: &mut NetworkCore, i: usize) {
+        let token = self.conns[i].token;
+        if net.send_with(token, |out| out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n")) &&
+            let Some(accepted) = self.conns[i].role.accepted_mut()
+        {
+            accepted.continued = true;
+        }
+    }
+    /// Decodes what has arrived of the body being read, and delivers the
+    /// request once all of it is here.
+    fn read_body_step<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let raw_limit = self.chunked_raw_limit();
+        let limits = ChunkLimits {
+            decoded: self.max_body_bytes as u64,
+            trailer_bytes: self.max_head_bytes,
+            trailers: self.max_headers,
+        };
+        let conn = &mut self.conns[i];
+        let Role::Accepted(accepted) = &mut conn.role else { return };
+        let Some(reader) = accepted.body.as_mut() else { return };
+        let outcome = match &mut reader.framing {
+            BodyFraming::Chunked(decoder) => {
+                match decoder.decode(&conn.buf, Some(&mut accepted.decoded), &limits) {
+                    Ok(consumed) => {
+                        conn.buf.drain(..consumed);
+                        reader.raw += consumed;
+                        if reader.raw > raw_limit {
+                            Err(BodyError::TooLarge)
+                        } else {
+                            Ok(decoder.is_done())
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match outcome {
+            Ok(false) => {
+                if conn.over_limit {
+                    self.error(net, i, 413);
+                } else if accepted.expect && !accepted.continued {
+                    self.send_continue(net, i);
+                }
+            }
+            Ok(true) => self.deliver_buffered_head(i, handler),
+            Err(BodyError::TooLarge) => self.error(net, i, 413),
+            Err(_) => self.error(net, i, 400),
+        }
+    }
+    /// Delivers the request whose head was kept aside, with its decoded body.
+    fn deliver_buffered_head<F>(&mut self, i: usize, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let token = self.conns[i].token;
+        let max_headers = self.max_headers;
+        let conn = &mut self.conns[i];
+        let Role::Accepted(accepted) = &mut conn.role else { return };
+        {
+            let (mut stack_slots, mut heap_slots) =
+                ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+            let hs = header_slots(&mut stack_slots, &mut heap_slots, max_headers);
+            let mut req = httparse::Request::new(hs);
+            // The head parsed before it was kept, so it parses again.
+            if !matches!(req.parse(&accepted.head), Ok(httparse::Status::Complete(_))) {
+                return
+            }
+            let request = HttpRequest {
+                method: req.method.unwrap_or(""),
+                path: req.path.unwrap_or(""),
+                version: req.version.unwrap_or(1),
+                headers: req.headers,
+                body: &accepted.decoded,
+            };
+            handler(HttpEvent::Request { token, request });
+        }
+        accepted.body = None;
+        accepted.state = State::Pending;
+        accepted.continued = false;
+        accepted.head.clear();
+        recycle_buffer(&mut accepted.decoded);
+        conn.dirty = !conn.buf.is_empty();
+    }
+    /// Raw bytes a chunked body may take from the connection, framing
+    /// included. Framing costs at least five bytes per chunk, so this allows
+    /// a full-size body in chunks of a few bytes while bounding a stream of
+    /// tiny or empty-data chunks.
+    fn chunked_raw_limit(&self) -> usize {
+        self.max_body_bytes.saturating_mul(2).saturating_add(self.max_head_bytes)
     }
     fn error(&mut self, net: &mut NetworkCore, i: usize, status: u16) {
-        self.conns[i].role.set_accepted_state(State::Pending);
-        self.conns[i].role.set_accepted_close(true);
+        if let Some(accepted) = self.conns[i].role.accepted_mut() {
+            accepted.state = State::Pending;
+            accepted.close = true;
+            accepted.body = None;
+        }
         let token = self.conns[i].token;
         let _ = self.respond(net, token, status, &[], &[]);
     }
@@ -1043,11 +1207,9 @@ impl HttpNetwork {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        let Some(i) = self
-            .conns
-            .iter()
-            .position(|c| c.token == token && matches!(c.role.accepted_state(), State::Pending))
-        else {
+        let Some(i) = self.conns.iter().position(|c| {
+            c.token == token && c.role.accepted().is_some_and(|a| a.state == State::Pending)
+        }) else {
             return false
         };
         if !(200..=599).contains(&status) ||
@@ -1063,9 +1225,9 @@ impl HttpNetwork {
         let caller_close = headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case("connection") && has_value_token(v.as_bytes(), b"close")
         });
-        let close = self.conns[i].role.accepted_close() || caller_close;
-        let suppress_body =
-            self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
+        let Some(accepted) = self.conns[i].role.accepted() else { return false };
+        let close = accepted.close || caller_close;
+        let suppress_body = accepted.head_request || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
         let ok = net.send_with(token, |out| {
             out.extend_from_slice(b"HTTP/1.1 ");
@@ -1101,11 +1263,9 @@ impl HttpNetwork {
         });
         if ok {
             self.conns[i].dirty = !close && !self.conns[i].buf.is_empty();
-            self.conns[i].role.set_accepted_state(if close {
-                State::Draining
-            } else {
-                State::Idle
-            });
+            if let Some(accepted) = self.conns[i].role.accepted_mut() {
+                accepted.state = if close { State::Draining } else { State::Idle };
+            }
             if close {
                 net.disconnect_when_drained(token);
             }
@@ -1629,55 +1789,28 @@ impl Role {
     fn take_in_flight(&mut self) -> Option<InFlight> {
         match self {
             Self::Outbound { in_flight, .. } => in_flight.take(),
-            Self::Accepted { .. } => None,
+            Self::Accepted(_) => None,
         }
     }
-    fn accepted_state(&self) -> State {
+    fn accepted(&self) -> Option<&Accepted> {
         match self {
-            Self::Accepted { state, .. } => *state,
-            Self::Outbound { .. } => State::Draining,
+            Self::Accepted(accepted) => Some(accepted),
+            Self::Outbound { .. } => None,
         }
     }
-    fn accepted_state_mut(&mut self) -> &mut State {
+    fn accepted_mut(&mut self) -> Option<&mut Accepted> {
         match self {
-            Self::Accepted { state, .. } => state,
-            Self::Outbound { .. } => panic!("accepted role"),
+            Self::Accepted(accepted) => Some(accepted),
+            Self::Outbound { .. } => None,
         }
     }
     fn is_draining(&self) -> bool {
-        matches!(self, Self::Accepted { state: State::Draining, .. })
-    }
-    fn set_accepted_state(&mut self, state: State) {
-        *self.accepted_state_mut() = state;
-    }
-    fn accepted_close(&self) -> bool {
-        matches!(self, Self::Accepted { close: true, .. })
-    }
-    fn set_accepted_close(&mut self, close: bool) {
-        if let Self::Accepted { close: current, .. } = self {
-            *current = close;
-        }
-    }
-    fn accepted_continued(&self) -> bool {
-        matches!(self, Self::Accepted { continued: true, .. })
-    }
-    fn set_accepted_continued(&mut self, continued: bool) {
-        if let Self::Accepted { continued: current, .. } = self {
-            *current = continued;
-        }
-    }
-    fn accepted_head_request(&self) -> bool {
-        matches!(self, Self::Accepted { head_request: true, .. })
-    }
-    fn set_accepted_head_request(&mut self, head_request: bool) {
-        if let Self::Accepted { head_request: current, .. } = self {
-            *current = head_request;
-        }
+        self.accepted().is_some_and(|accepted| accepted.state == State::Draining)
     }
     fn outbound_head(&self) -> Option<bool> {
         match self {
             Self::Outbound { in_flight_head, .. } => *in_flight_head,
-            Self::Accepted { .. } => None,
+            Self::Accepted(_) => None,
         }
     }
     fn set_outbound_head(&mut self, head_request: Option<bool>) {
@@ -1733,6 +1866,206 @@ fn transfer_chunked(headers: &[httparse::Header<'_>]) -> Option<bool> {
     Some(found)
 }
 
+/// Why a request body could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyError {
+    /// The body exceeds `max_body_bytes`, or its chunk framing exceeds the
+    /// raw-byte bound beneath the decoder.
+    TooLarge,
+    /// Invalid chunk framing. Where the next request would start is unknown,
+    /// so the connection cannot be reused.
+    Malformed,
+    /// The peer finished sending before the end of the body.
+    Incomplete,
+}
+
+/// Bounds for [`ChunkDecoder::decode`].
+struct ChunkLimits {
+    /// Decoded bytes allowed in total.
+    decoded: u64,
+    /// Trailer section size, its final empty line included.
+    trailer_bytes: usize,
+    /// Trailer fields allowed.
+    trailers: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkState {
+    /// Expecting a chunk-size line.
+    Size,
+    /// Data bytes still to come in the current chunk.
+    Data(u64),
+    /// Expecting the CRLF that ends a chunk's data.
+    DataEnd,
+    /// After the last chunk: trailer fields until an empty line.
+    Trailers {
+        fields: usize,
+        bytes: usize,
+    },
+    Done,
+}
+
+/// An incremental decoder for a chunked request body (RFC 9112 section 7.1).
+///
+/// It consumes only complete syntax elements, so callers can drop consumed
+/// input and keep at most one partial line, which is bounded. A chunk's size
+/// is checked against the decoded limit before any of its data is accepted,
+/// and nothing is ever allocated from a declared size: data is copied only
+/// as it arrives.
+struct ChunkDecoder {
+    state: ChunkState,
+    decoded: u64,
+}
+
+impl ChunkDecoder {
+    fn new() -> Self {
+        Self { state: ChunkState::Size, decoded: 0 }
+    }
+
+    fn is_done(&self) -> bool {
+        self.state == ChunkState::Done
+    }
+
+    /// Decodes what `input` holds, appending chunk data to `out` (or
+    /// discarding it), and returns how many bytes were consumed.
+    fn decode(
+        &mut self,
+        input: &[u8],
+        mut out: Option<&mut Vec<u8>>,
+        limits: &ChunkLimits,
+    ) -> Result<usize, BodyError> {
+        let mut at = 0;
+        loop {
+            match self.state {
+                ChunkState::Done => return Ok(at),
+                ChunkState::Size => {
+                    let Some(line) = take_line(&input[at..], MAX_CHUNK_LINE)? else {
+                        return Ok(at)
+                    };
+                    let size = parse_chunk_size(line).ok_or(BodyError::Malformed)?;
+                    at += line.len() + 2;
+                    if size == 0 {
+                        self.state = ChunkState::Trailers { fields: 0, bytes: 0 };
+                    } else if size > limits.decoded.saturating_sub(self.decoded) {
+                        return Err(BodyError::TooLarge)
+                    } else {
+                        self.state = ChunkState::Data(size);
+                    }
+                }
+                ChunkState::Data(remaining) => {
+                    let available = (input.len() - at) as u64;
+                    if available == 0 {
+                        return Ok(at)
+                    }
+                    let take = remaining.min(available);
+                    // `take` is at most what `input` holds, so it fits.
+                    let end = at + take as usize;
+                    if let Some(out) = out.as_deref_mut() {
+                        out.extend_from_slice(&input[at..end]);
+                    }
+                    at = end;
+                    self.decoded += take;
+                    self.state = if take == remaining {
+                        ChunkState::DataEnd
+                    } else {
+                        ChunkState::Data(remaining - take)
+                    };
+                }
+                ChunkState::DataEnd => match &input[at..] {
+                    [b'\r', b'\n', ..] => {
+                        at += 2;
+                        self.state = ChunkState::Size;
+                    }
+                    [] | [b'\r'] => return Ok(at),
+                    _ => return Err(BodyError::Malformed),
+                },
+                ChunkState::Trailers { fields, bytes } => {
+                    let room = limits.trailer_bytes.saturating_sub(bytes);
+                    let Some(line) = take_line(&input[at..], room)? else { return Ok(at) };
+                    at += line.len() + 2;
+                    if line.is_empty() {
+                        self.state = ChunkState::Done;
+                    } else if fields < limits.trailers && valid_field_line(line) {
+                        // Trailers are validated and dropped, never exposed.
+                        self.state = ChunkState::Trailers {
+                            fields: fields + 1,
+                            bytes: bytes + line.len() + 2,
+                        };
+                    } else {
+                        return Err(BodyError::Malformed)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The CRLF-terminated line at the start of `input`, without its CRLF, or
+/// `None` while it is incomplete. Bare CR or LF, and lines longer than `max`,
+/// are malformed; only the first `max + 2` bytes are ever scanned.
+fn take_line(input: &[u8], max: usize) -> Result<Option<&[u8]>, BodyError> {
+    let longest = max.saturating_add(1);
+    let window = &input[..input.len().min(longest.saturating_add(1))];
+    let Some(lf) = window.iter().position(|&b| b == b'\n') else {
+        // Without a LF in reach, the line is already longer than `max`.
+        if window.len() > longest {
+            return Err(BodyError::Malformed)
+        }
+        return match window.iter().position(|&b| b == b'\r') {
+            Some(cr) if cr + 1 != window.len() => Err(BodyError::Malformed),
+            _ => Ok(None),
+        }
+    };
+    if lf == 0 || window[lf - 1] != b'\r' {
+        return Err(BodyError::Malformed)
+    }
+    let line = &window[..lf - 1];
+    if line.contains(&b'\r') {
+        return Err(BodyError::Malformed)
+    }
+    Ok(Some(line))
+}
+
+/// `chunk-size [ chunk-ext ]`: one to sixteen hex digits, optionally followed
+/// by extensions (ignored) that start with `;` after optional blanks and
+/// contain no control characters other than HTAB.
+fn parse_chunk_size(line: &[u8]) -> Option<u64> {
+    let digits = line.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+    if digits == 0 || digits > 16 {
+        return None
+    }
+    let size = u64::from_str_radix(std::str::from_utf8(&line[..digits]).ok()?, 16).ok()?;
+    let extension = &line[digits..];
+    let blanks = extension.iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+    match &extension[blanks..] {
+        [] if blanks == 0 => Some(size),
+        [b';', rest @ ..] if rest.iter().all(|&b| field_value_byte(b)) => Some(size),
+        _ => None,
+    }
+}
+
+/// A trailer field line: a token name, a colon, and a field value.
+fn valid_field_line(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|&b| b == b':') else { return false };
+    let (name, value) = (&line[..colon], &line[colon + 1..]);
+    !name.is_empty() &&
+        name.iter().all(|&b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) &&
+        value.iter().all(|&b| field_value_byte(b))
+}
+
+fn field_value_byte(b: u8) -> bool {
+    b == b'\t' || (b' '..=b'~').contains(&b) || b >= 0x80
+}
+
+/// Clears a per-request buffer, releasing it if it grew large.
+fn recycle_buffer(buf: &mut Vec<u8>) {
+    if buf.capacity() > RETAINED_BUFFER_BYTES {
+        *buf = Vec::new();
+    } else {
+        buf.clear();
+    }
+}
+
 /// HTTP reason phrase for common status codes.
 pub fn reason_phrase(status: u16) -> &'static str {
     match status {
@@ -1783,7 +2116,109 @@ impl<'a> HttpResponse<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::HttpRequest;
+    use super::{BodyError, ChunkDecoder, ChunkLimits, HttpRequest};
+
+    const LIMITS: ChunkLimits = ChunkLimits { decoded: 1024, trailer_bytes: 256, trailers: 4 };
+
+    /// Feeds `input` in pieces of `step` bytes, as a connection buffer would
+    /// receive it, keeping only what the decoder has not consumed.
+    fn decode_in_steps(input: &[u8], step: usize) -> Result<(Vec<u8>, usize), BodyError> {
+        let mut decoder = ChunkDecoder::new();
+        let (mut buffer, mut out, mut fed) = (Vec::new(), Vec::new(), 0);
+        while !decoder.is_done() {
+            if fed == input.len() {
+                return Err(BodyError::Incomplete)
+            }
+            let next = (fed + step).min(input.len());
+            buffer.extend_from_slice(&input[fed..next]);
+            fed = next;
+            let consumed = decoder.decode(&buffer, Some(&mut out), &LIMITS)?;
+            buffer.drain(..consumed);
+        }
+        Ok((out, buffer.len() + input.len() - fed))
+    }
+
+    #[test]
+    fn chunked_bodies_decode_however_they_are_split() {
+        let body = b"5\r\nhello\r\n6;name=value; flag\r\n world\r\nA \t;x\r\n0123456789\r\n0\r\nX-Sum: 1\r\n\r\nNEXT";
+        for step in [1, 2, 3, 7, body.len()] {
+            let (out, left) = decode_in_steps(body, step).unwrap();
+            assert_eq!(out, b"hello world0123456789", "step {step}");
+            assert_eq!(left, 4, "the next request stays unconsumed (step {step})");
+        }
+    }
+
+    #[test]
+    fn chunked_framing_errors_are_malformed() {
+        for body in [
+            b"\r\n".as_slice(),
+            b"x\r\n",
+            b"-1\r\n",
+            b"+1\r\nx\r\n0\r\n\r\n",
+            b" 1\r\nx\r\n0\r\n\r\n",
+            b"1 \r\nx\r\n0\r\n\r\n",
+            b"1\nx\r\n0\r\n\r\n",
+            b"1\rx\r\n",
+            b"1;\x00\r\nx\r\n",
+            b"10000000000000000\r\n",
+            b"1\r\nxy\r\n",
+            b"1\r\nx\n0\r\n\r\n",
+            b"0\r\nno colon\r\n\r\n",
+            b"0\r\nBad Name: x\r\n\r\n",
+            b"0\r\nX: \x01\r\n\r\n",
+            b"0\r\nX: 1\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        ] {
+            for step in [1, body.len()] {
+                assert_eq!(
+                    decode_in_steps(body, step),
+                    Err(BodyError::Malformed),
+                    "{:?} step {step}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_lines_and_trailers_are_bounded() {
+        // An endless size line fails once it passes the line limit, without
+        // waiting for a CR.
+        let digits = vec![b'1'; super::MAX_CHUNK_LINE + 2];
+        let mut decoder = ChunkDecoder::new();
+        assert_eq!(decoder.decode(&digits, None, &LIMITS), Err(BodyError::Malformed));
+        let mut decoder = ChunkDecoder::new();
+        assert_eq!(decoder.decode(&digits[..super::MAX_CHUNK_LINE], None, &LIMITS), Ok(0));
+        // Seventeen digits are too many even when the line is short.
+        assert_eq!(decode_in_steps(b"00000000000000001\r\n", 1), Err(BodyError::Malformed));
+        // Trailer count and size.
+        let many = b"0\r\nA: 1\r\nB: 1\r\nC: 1\r\nD: 1\r\nE: 1\r\n\r\n";
+        assert_eq!(decode_in_steps(many, 3), Err(BodyError::Malformed));
+        let long = format!("0\r\nA: {}\r\n\r\n", "v".repeat(300));
+        assert_eq!(decode_in_steps(long.as_bytes(), 5), Err(BodyError::Malformed));
+    }
+
+    #[test]
+    fn chunk_sizes_are_checked_before_their_data() {
+        // The largest possible size is refused from its line alone; nothing
+        // is reserved for it.
+        let mut decoder = ChunkDecoder::new();
+        let mut out = Vec::new();
+        assert_eq!(
+            decoder.decode(b"ffffffffffffffff\r\n", Some(&mut out), &LIMITS),
+            Err(BodyError::TooLarge)
+        );
+        assert_eq!(out.capacity(), 0);
+        // The limit applies to the sum of the chunks.
+        let body = format!("200\r\n{0}\r\n200\r\n{0}\r\n1\r\nx\r\n0\r\n\r\n", "a".repeat(512));
+        assert_eq!(decode_in_steps(body.as_bytes(), 100), Err(BodyError::TooLarge));
+        let exact = format!("200\r\n{0}\r\n200\r\n{0}\r\n0\r\n\r\n", "a".repeat(512));
+        assert_eq!(decode_in_steps(exact.as_bytes(), 100).unwrap().0.len(), 1024);
+        // Discarding decodes without keeping data.
+        let mut decoder = ChunkDecoder::new();
+        assert_eq!(decoder.decode(exact.as_bytes(), None, &LIMITS), Ok(exact.len()));
+        assert!(decoder.is_done());
+    }
 
     #[test]
     fn header_lookup_is_case_insensitive() {
