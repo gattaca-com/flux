@@ -251,6 +251,10 @@ impl TcpManager {
             );
         }
         assert!(config.max_accepts_per_poll != Some(0), "max_accepts_per_poll must be nonzero");
+        assert!(
+            !config.half_close || config.framing == Framing::Raw,
+            "half_close requires raw TCP"
+        );
         if let Some(max) = config.max_backlog_bytes {
             assert!(max > 0, "max_backlog_bytes must be nonzero");
             if let Some(warn) = config.backlog_warn_bytes {
@@ -327,6 +331,26 @@ impl TcpManager {
 
     pub(crate) fn has_deferred_accepts(&self) -> bool {
         self.listeners.iter().any(|listener| listener.accept_deferred)
+    }
+
+    /// Stops or restarts reading from a connected socket; see
+    /// `NetworkCore::pause_reading`.
+    pub(crate) fn set_read_paused(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        paused: bool,
+        tokens: &mut Tokens,
+    ) -> bool {
+        let Some(index) = self.index_of(token) else { return false };
+        let ConnectionState::Connected(stream) = &mut self.connections[index].state else {
+            return false;
+        };
+        if stream.set_read_paused(registry, paused) == StreamState::Disconnected {
+            self.disconnect_index(registry, index, true, tokens);
+            return false;
+        }
+        true
     }
 
     pub(crate) fn post_poll<F>(&mut self, handler: &mut F) -> bool
@@ -761,6 +785,7 @@ impl TcpManager {
                 );
                 let mut stream =
                     FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
+                stream.half_close = config.half_close;
                 if let Some(message) = config.on_connect_msg.as_deref() {
                     let header = (config.framing == Framing::LengthPrefixed).then(|| {
                         let mut header = [0; FRAME_HEADER_SIZE];
@@ -1735,6 +1760,8 @@ impl ByteQueue {
     }
 }
 
+// Independent stream conditions, not states of one value.
+#[allow(clippy::struct_excessive_bools)]
 struct FramedStream {
     socket: mio::net::TcpStream,
     token: Token,
@@ -1742,6 +1769,16 @@ struct FramedStream {
     rx_buffer: RxBuffer,
     send_queue: ByteQueue,
     writable_armed: bool,
+    /// The owner asked to stop reading; see `NetworkCore::pause_reading`.
+    read_paused: bool,
+    /// The peer finished sending on a half-close connection.
+    read_closed: bool,
+    /// Report end of input as an empty message instead of disconnecting.
+    half_close: bool,
+    /// Whether the socket is registered with the poll. A socket with neither
+    /// readable nor writable interest is deregistered, as mio cannot register
+    /// an empty interest.
+    registered: bool,
     direct_rx: Option<DirectRx>,
 }
 
@@ -1766,6 +1803,10 @@ impl FramedStream {
                 ..ByteQueue::default()
             },
             writable_armed: false,
+            read_paused: false,
+            read_closed: false,
+            half_close: false,
+            registered: true,
             direct_rx: direct.then(DirectRx::default),
         }
     }
@@ -1784,7 +1825,7 @@ impl FramedStream {
     where
         F: for<'a> FnMut(Option<RxPayload<'a>>, Nanos),
     {
-        if event.is_readable() {
+        if event.is_readable() && self.reading() {
             if config.framing == Framing::Raw {
                 // An empty buffer reads as a closed peer. Raw reads at most
                 // `max_frame_size` at a time.
@@ -1795,6 +1836,17 @@ impl FramedStream {
                 }
                 loop {
                     match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
+                        Ok(0) if self.half_close => {
+                            // The peer finished sending but may still read:
+                            // stop reading and report the end of input as an
+                            // empty message, leaving the close to the owner.
+                            self.read_closed = true;
+                            if self.update_interest(registry) == StreamState::Disconnected {
+                                return StreamState::Disconnected;
+                            }
+                            on_message(Some(RxPayload::Raw(&[])), Nanos::now());
+                            break;
+                        }
                         Ok(0) => return StreamState::Disconnected,
                         Ok(read) => {
                             if tls.is_some() &&
@@ -1928,10 +1980,53 @@ impl FramedStream {
         if event.is_writable() && self.drain_queue(registry, config) == StreamState::Disconnected {
             return StreamState::Disconnected;
         }
-        if event.is_error() || event.is_read_closed() || event.is_write_closed() {
+        // A half-close connection learns of the peer's end of input from its
+        // read returning 0, above; a paused one learns of it once resumed.
+        if event.is_error() ||
+            (event.is_read_closed() && !self.half_close) ||
+            event.is_write_closed()
+        {
             return StreamState::Disconnected;
         }
         StreamState::Alive
+    }
+
+    fn reading(&self) -> bool {
+        !self.read_paused && !self.read_closed
+    }
+
+    /// Registers the socket for what it currently waits on: reads unless
+    /// paused or closed, writes while bytes are queued.
+    fn update_interest(&mut self, registry: &Registry) -> StreamState {
+        let interest = match (self.reading(), self.writable_armed) {
+            (true, true) => Some(Interest::READABLE | Interest::WRITABLE),
+            (true, false) => Some(Interest::READABLE),
+            (false, true) => Some(Interest::WRITABLE),
+            (false, false) => None,
+        };
+        let result = match (interest, self.registered) {
+            (Some(interest), true) => registry.reregister(&mut self.socket, self.token, interest),
+            (Some(interest), false) => registry.register(&mut self.socket, self.token, interest),
+            (None, true) => registry.deregister(&mut self.socket),
+            (None, false) => Ok(()),
+        };
+        if let Err(err) = result {
+            debug!(?err, %self.peer_addr, "couldn't update tcp stream interest");
+            return StreamState::Disconnected;
+        }
+        self.registered = interest.is_some();
+        StreamState::Alive
+    }
+
+    /// Stops or restarts reading. Data the peer sends meanwhile waits in the
+    /// kernel, whose receive window then pushes back on the peer. Resuming
+    /// re-arms readiness, so bytes that arrived while paused are reported.
+    fn set_read_paused(&mut self, registry: &Registry, paused: bool) -> StreamState {
+        if self.read_paused == paused {
+            return StreamState::Alive;
+        }
+        self.read_paused = paused;
+        self.update_interest(registry)
     }
 
     fn announce_tls<F>(
@@ -2115,12 +2210,8 @@ impl FramedStream {
         }
         self.send_queue.maybe_warn(config, self.token, self.peer_addr);
         if self.send_queue.is_empty() && self.writable_armed {
-            if let Err(err) = registry.reregister(&mut self.socket, self.token, Interest::READABLE)
-            {
-                debug!(?err, %self.peer_addr, "couldn't disarm writable interest");
-                return StreamState::Disconnected;
-            }
             self.writable_armed = false;
+            return self.update_interest(registry);
         }
         StreamState::Alive
     }
@@ -2129,20 +2220,19 @@ impl FramedStream {
         if self.writable_armed {
             return StreamState::Alive;
         }
-        if let Err(err) = registry.reregister(
-            &mut self.socket,
-            self.token,
-            Interest::READABLE | Interest::WRITABLE,
-        ) {
-            debug!(?err, %self.peer_addr, "couldn't arm writable interest");
+        self.writable_armed = true;
+        if self.update_interest(registry) == StreamState::Disconnected {
+            self.writable_armed = false;
             return StreamState::Disconnected;
         }
-        self.writable_armed = true;
         StreamState::Alive
     }
 
     fn close(&mut self, registry: &Registry) {
-        let _ = registry.deregister(&mut self.socket);
+        if self.registered {
+            let _ = registry.deregister(&mut self.socket);
+            self.registered = false;
+        }
         let _ = self.socket.shutdown(Shutdown::Both);
     }
 }

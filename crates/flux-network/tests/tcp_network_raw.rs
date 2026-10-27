@@ -415,3 +415,80 @@ fn raw_send_parts_keeps_order_through_backlog() {
 
     assert!(received == expected, "received {} of {} bytes", received.len(), expected.len());
 }
+
+/// Polls until `done` holds or the deadline passes, collecting the payloads
+/// and disconnects reported for accepted connections.
+fn poll_until(
+    network: &mut Network,
+    received: &mut Vec<u8>,
+    ended: &mut bool,
+    accepted: &mut Option<flux_network::Token>,
+    mut done: impl FnMut(&[u8], bool) -> bool,
+) {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !done(received, *ended) {
+        network.poll_with(|event| match event {
+            NetworkEvent::Accepted { token, .. } => *accepted = Some(token),
+            NetworkEvent::Message { payload: [], .. } => *ended = true,
+            NetworkEvent::Message { payload, .. } => received.extend_from_slice(payload),
+            _ => {}
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn paused_reading_leaves_bytes_in_the_kernel_until_resumed() {
+    let addr = unused_addr();
+    let mut network = Network::default();
+    let group = network.add_group(raw_group("raw-server"));
+    network.listen(group, addr).unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    let (mut received, mut ended, mut accepted) = (Vec::new(), false, None);
+    client.write_all(b"first").unwrap();
+    poll_until(&mut network, &mut received, &mut ended, &mut accepted, |r, _| r == b"first");
+    assert_eq!(received, b"first");
+    let token = accepted.unwrap();
+
+    assert!(network.pause_reading(token));
+    client.write_all(b"second").unwrap();
+    let until = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < until {
+        poll_until(&mut network, &mut received, &mut ended, &mut accepted, |_, _| true);
+        network.poll_with(|_| {});
+    }
+    assert_eq!(received, b"first", "a paused connection must not be read");
+    // Writes continue while reading is paused.
+    assert!(network.send_with(token, |buf| buf.extend_from_slice(b"reply")));
+    let mut reply = [0; 5];
+    client.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"reply");
+
+    assert!(network.resume_reading(token));
+    poll_until(&mut network, &mut received, &mut ended, &mut accepted, |r, _| r.len() == 11);
+    assert_eq!(received, b"firstsecond");
+    assert!(!network.pause_reading(flux_network::Token(usize::MAX - 1)));
+}
+
+#[test]
+fn half_close_reports_end_of_input_and_keeps_writing() {
+    let addr = unused_addr();
+    let mut network = Network::default();
+    let group = network.add_group(TcpGroupConfig { half_close: true, ..raw_group("raw-server") });
+    network.listen(group, addr).unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    let (mut received, mut ended, mut accepted) = (Vec::new(), false, None);
+    client.write_all(b"request").unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    poll_until(&mut network, &mut received, &mut ended, &mut accepted, |_, ended| ended);
+    assert!(ended, "end of input is reported as an empty message");
+    assert_eq!(received, b"request");
+    let token = accepted.unwrap();
+    // The connection stays open for the reply, then closes on request.
+    assert!(network.send_with(token, |buf| buf.extend_from_slice(b"response")));
+    assert!(network.disconnect_when_drained(token));
+    let mut reply = Vec::new();
+    client.set_read_timeout(Some(TIMEOUT)).unwrap();
+    client.read_to_end(&mut reply).unwrap();
+    assert_eq!(reply, b"response");
+}

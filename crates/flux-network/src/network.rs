@@ -283,6 +283,12 @@ pub struct TcpGroupConfig {
     /// the kernel and are accepted on later polls, so a burst of connections
     /// can't stall one poll. `None` accepts until the queue is empty.
     pub max_accepts_per_poll: Option<usize>,
+    /// Keep accepted connections open after the peer finishes sending, so a
+    /// response can still be written to a peer that shut down its sending
+    /// side. The end of input is delivered as an empty [`Event::Message`]
+    /// and reading stops; the owner decides when to disconnect. Requires
+    /// [`Framing::Raw`]. Outbound connections are unaffected.
+    pub half_close: bool,
 }
 
 impl Default for TcpGroupConfig {
@@ -306,6 +312,7 @@ impl Default for TcpGroupConfig {
             replay: ReplayPolicy::Replay,
             max_backlog_frames: None,
             max_accepts_per_poll: None,
+            half_close: false,
         }
     }
 }
@@ -750,6 +757,32 @@ impl NetworkCore {
                 tcp.listen_tls(self.poller.registry(), addr, &mut self.tokens, config)
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS requires a TCP group")),
+        }
+    }
+
+    /// Stops reading from a TCP connection until [`Self::resume_reading`].
+    /// What the peer sends meanwhile stays in the kernel, whose receive
+    /// window then pushes back on the peer, so an owner that cannot take
+    /// more input yet need not buffer it. Writes continue. A paused socket
+    /// does not notice the peer closing until it is resumed or written to.
+    /// Returns `false` for an unknown, UDP, or unconnected token.
+    pub fn pause_reading(&mut self, token: Token) -> bool {
+        self.set_read_paused(token, true)
+    }
+
+    /// Restarts reading after [`Self::pause_reading`]. Bytes that arrived
+    /// meanwhile are reported by the next poll.
+    pub fn resume_reading(&mut self, token: Token) -> bool {
+        self.set_read_paused(token, false)
+    }
+
+    fn set_read_paused(&mut self, token: Token, paused: bool) -> bool {
+        let Some(group) = self.tokens.groups.get(&token).copied() else { return false };
+        match &mut self.groups[group.0] {
+            GroupState::Tcp(tcp) => {
+                tcp.set_read_paused(self.poller.registry(), token, paused, &mut self.tokens)
+            }
+            GroupState::Udp(_) | GroupState::UdpV2(_) => false,
         }
     }
 
