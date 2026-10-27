@@ -41,11 +41,17 @@
 //! transfer coding, or EOF delimiting. `Expect: 100-continue` is handled
 //! automatically.
 //!
+//! [`HttpNetwork::with_request_heads`] delivers request heads before their
+//! bodies, reads a body only when asked, pauses reading connections whose
+//! input is not wanted (backpressure through the kernel's receive window),
+//! and answers clients that have half-closed.
+//!
 //! Server-side TLS, HTTP/2, compression, trailer exposure, upgrades, and
-//! `WebSockets` are not supported. Valid response trailers are parsed and
-//! discarded. There is no half-close support. After an error response, the
-//! connection closes without a lingering-close delay. Pipelined requests are
-//! served strictly one at a time per connection.
+//! `WebSockets` are not supported. Valid response and request trailers are
+//! parsed and discarded. Half-close is supported only in request-head mode.
+//! After an error response, the connection closes without a lingering-close
+//! delay. Pipelined requests are served strictly one at a time per
+//! connection.
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -94,6 +100,27 @@ pub enum HttpEvent<'a> {
         token: Token,
         request: HttpRequest<'a>,
     },
+    /// With [`HttpNetwork::with_request_heads`], the head of a request that
+    /// has a body, before any of the body is read. Answer it with
+    /// [`HttpNetwork::respond`], or ask for the body with
+    /// [`HttpNetwork::read_body`]. `request.body` is empty.
+    RequestHead {
+        token: Token,
+        request: HttpRequest<'a>,
+        body: RequestBody,
+    },
+    /// The whole body asked for with [`HttpNetwork::read_body`]; the request
+    /// now awaits [`HttpNetwork::respond`].
+    RequestBody {
+        token: Token,
+        body: &'a [u8],
+    },
+    /// The body asked for could not be read. The request still awaits
+    /// [`HttpNetwork::respond`], after which the connection closes.
+    RequestBodyFailed {
+        token: Token,
+        error: BodyError,
+    },
     Disconnected {
         token: Token,
     },
@@ -116,6 +143,18 @@ pub enum HttpEvent<'a> {
         token: Token,
         reason: StreamEnd,
     },
+}
+
+/// How the body of a request delivered as [`HttpEvent::RequestHead`] is
+/// framed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestBody {
+    /// A `Content-Length` body of this many bytes, possibly more than
+    /// `max_body_bytes` (up to `max_content_length`): such a body fails with
+    /// [`BodyError::TooLarge`] if read.
+    Length(usize),
+    /// A chunked body of unknown length.
+    Chunked,
 }
 
 /// Why a streaming response stopped.
@@ -185,6 +224,8 @@ struct Pool {
 enum State {
     /// Waiting for a request head.
     Idle,
+    /// A request head was delivered and its body not asked for yet.
+    Head,
     /// Receiving the body of a request whose head has been parsed.
     Reading,
     /// The request was delivered; waiting for [`HttpNetwork::respond`].
@@ -209,6 +250,18 @@ struct Accepted {
     body: Option<BodyReader>,
     /// The decoded chunked body read so far.
     decoded: Vec<u8>,
+    /// The body in `body` belongs to a request already answered early: it is
+    /// read and dropped, so the connection can serve its next request.
+    discard: bool,
+    /// When a discard that has not finished closes the connection.
+    discard_deadline: Option<Instant>,
+    /// Whether reading the socket is paused (request-head mode only).
+    paused: bool,
+    /// The peer shut down its sending side (request-head mode only).
+    peer_closed: bool,
+    /// Bytes queued at the socket when last checked, to notice a peer still
+    /// reading its response.
+    last_queued: usize,
 }
 impl Accepted {
     fn new() -> Self {
@@ -221,6 +274,11 @@ impl Accepted {
             head: Vec::new(),
             body: None,
             decoded: Vec::new(),
+            discard: false,
+            discard_deadline: None,
+            paused: false,
+            peer_closed: false,
+            last_queued: 0,
         }
     }
 }
@@ -231,6 +289,8 @@ struct BodyReader {
     raw: usize,
 }
 enum BodyFraming {
+    /// Bytes still owed by `Content-Length`.
+    Length(usize),
     Chunked(ChunkDecoder),
 }
 enum Role {
@@ -283,6 +343,12 @@ pub struct HttpNetwork {
     max_content_length: usize,
     /// Status for a request head over `max_head_bytes`.
     oversized_head_status: u16,
+    /// Deliver request heads before bodies; see `with_request_heads`.
+    request_heads: bool,
+    /// Largest unread body dropped to keep a connection after an early
+    /// response, and how long that may take.
+    max_drain_bytes: Option<usize>,
+    drain_timeout: Duration,
     idle_timeout: Option<Duration>,
     socket_buf_size: Option<usize>,
     listeners: Vec<Token>,
@@ -310,6 +376,9 @@ impl Default for HttpNetwork {
             max_headers: 64,
             max_content_length: usize::MAX,
             oversized_head_status: 431,
+            request_heads: false,
+            max_drain_bytes: None,
+            drain_timeout: Duration::from_secs(30),
             idle_timeout: Some(Duration::from_secs(30)),
             socket_buf_size: None,
             listeners: Vec::new(),
@@ -370,14 +439,54 @@ impl HttpNetwork {
         self.oversized_head_status = status;
         self
     }
+    /// Delivers each request with a body as [`HttpEvent::RequestHead`] once
+    /// its head is parsed, before the body is read, so the application can
+    /// answer it (for example `401`) without receiving the body, or ask for
+    /// the body with [`Self::read_body`]. Requests without a body still
+    /// arrive as [`HttpEvent::Request`].
+    ///
+    /// In this mode reading a connection is paused whenever the server is
+    /// not waiting for its input (a request is being handled, or its body
+    /// has not been asked for), so the kernel's receive window, not a
+    /// userspace buffer, holds back a peer that sends ahead. `100 Continue`
+    /// is sent only when the body is asked for. A peer that shuts down its
+    /// sending side can still be answered.
+    ///
+    /// Answering before the body is read drops the body to keep the
+    /// connection when that is safe and bounded (see
+    /// [`Self::with_max_drain_bytes`]) and closes it otherwise. Body reads
+    /// have no deadline here: the application bounds them, for example with
+    /// [`Self::body_received`].
+    pub fn with_request_heads(mut self) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.request_heads = true;
+        self
+    }
+    /// Largest unread body that is read and dropped after an early response
+    /// to keep the connection; a larger one closes it. Defaults to
+    /// `max_body_bytes`. Applies with [`Self::with_request_heads`].
+    pub fn with_max_drain_bytes(mut self, max_drain_bytes: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_drain_bytes = Some(max_drain_bytes);
+        self
+    }
+    /// How long dropping an unread body may take before the connection is
+    /// closed instead; 30 seconds by default.
+    pub fn with_drain_timeout(mut self, drain_timeout: Duration) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.drain_timeout = drain_timeout;
+        self
+    }
     /// Sets the TCP socket buffer size.
     pub fn with_socket_buf_size(mut self, socket_buf_size: usize) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.socket_buf_size = Some(socket_buf_size);
         self
     }
-    /// Sets the idle timeout for accepted connections; outbound endpoints
-    /// remain persistent.
+    /// Sets the idle timeout for accepted connections: one that is waiting
+    /// for a request, or closing, and has neither received bytes nor had its
+    /// response read for this long is closed. Connections whose request the
+    /// application holds are exempt. Outbound endpoints remain persistent.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.idle_timeout = Some(idle_timeout);
@@ -431,6 +540,7 @@ impl HttpNetwork {
             max_body_bytes,
             socket_buf_size,
             reconnect_interval,
+            request_heads,
             ..
         } = self;
         *group.get_or_insert_with(|| {
@@ -450,6 +560,7 @@ impl HttpNetwork {
                     max_head_bytes.saturating_add(*max_body_bytes).saturating_add(TLS_MARGIN_BYTES),
                 ),
                 backlog_warn_bytes: None,
+                half_close: *request_heads,
                 ..Default::default()
             })
         })
@@ -458,6 +569,11 @@ impl HttpNetwork {
         let group = self.group(net);
         self.listeners.push(net.listen(group, addr)?);
         Ok(())
+    }
+    /// The address of the first listener, for example to learn the port
+    /// chosen for a listener bound to port 0.
+    pub fn local_addr(&self, net: &NetworkCore) -> Option<SocketAddr> {
+        self.listeners.first().and_then(|token| net.listener_addr(*token))
     }
     /// Immediately disconnects an accepted client.
     pub fn disconnect(&mut self, net: &mut NetworkCore, token: Token) -> bool {
@@ -493,7 +609,16 @@ impl HttpNetwork {
                 if event_group == group =>
             {
                 let limit = self.buffer_limit();
-                if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
+                if payload.is_empty() {
+                    // The peer finished sending (half-close, request-head
+                    // mode only).
+                    if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
+                        let Some(accepted) = conn.role.accepted_mut()
+                    {
+                        accepted.peer_closed = true;
+                        conn.dirty = true;
+                    }
+                } else if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
                     !conn.role.is_draining() &&
                     !conn.over_limit
                 {
@@ -538,20 +663,7 @@ impl HttpNetwork {
                 conn.over_limit = false;
             }
         }
-        if let Some(timeout) = self.idle_timeout {
-            let expired: Vec<_> = self
-                .conns
-                .iter()
-                .filter(|conn| {
-                    matches!(conn.role, Role::Accepted(_)) &&
-                        conn.last_activity.elapsed() >= timeout
-                })
-                .map(|conn| conn.token)
-                .collect();
-            for token in expired {
-                net.disconnect(token);
-            }
-        }
+        self.sweep_accepted(net);
         if let Some(timeout) = self.stream_idle_timeout {
             for i in 0..self.conns.len() {
                 if self.stream_body(i).is_some() && self.conns[i].last_activity.elapsed() >= timeout
@@ -584,6 +696,87 @@ impl HttpNetwork {
             handler(HttpEvent::Failed { id, reason });
         }
         self.dispatch(net);
+        if self.request_heads {
+            self.update_reading(net);
+        }
+    }
+    /// Whether [`Self::drive`] has work without new network events, for
+    /// example after [`Self::read_body`] found the body already buffered or a
+    /// response freed a connection with a pipelined request. An event loop
+    /// that blocks in its poll should drive again first.
+    pub fn needs_drive(&self) -> bool {
+        !self.lifecycle.is_empty() ||
+            self.conns.iter().any(|conn| {
+                conn.dirty &&
+                    (matches!(conn.role, Role::Accepted(_)) ||
+                        conn.stream.is_some() ||
+                        conn.role.outbound_head().is_some())
+            })
+    }
+    /// Asks for the body of a request delivered as
+    /// [`HttpEvent::RequestHead`]. Sends `100 Continue` if the client asked
+    /// for it; the body arrives as [`HttpEvent::RequestBody`] or
+    /// [`HttpEvent::RequestBodyFailed`] from a later drive. Returns `false`
+    /// unless `token` has a request head awaiting this call.
+    pub fn read_body(&mut self, net: &mut NetworkCore, token: Token) -> bool {
+        let Some(i) = self.conns.iter().position(|conn| {
+            conn.token == token && conn.role.accepted().is_some_and(|a| a.state == State::Head)
+        }) else {
+            return false
+        };
+        let Some(accepted) = self.conns[i].role.accepted_mut() else { return false };
+        accepted.state = State::Reading;
+        if accepted.expect && !accepted.continued {
+            self.send_continue(net, i);
+        }
+        self.conns[i].dirty = true;
+        // Resumed now, not at the next drive: the body may still be in the
+        // kernel, and nothing else would wake the poll.
+        sync_reading(net, &mut self.conns[i]);
+        true
+    }
+    /// Raw bytes of the body being read for `token` that have arrived so
+    /// far, framing included, while [`Self::read_body`] is in progress. An
+    /// application can compare successive values to bound how slowly a body
+    /// may arrive.
+    pub fn body_received(&self, token: Token) -> Option<usize> {
+        let conn = self.conns.iter().find(|conn| conn.token == token)?;
+        let accepted = conn.role.accepted()?;
+        if accepted.state != State::Reading {
+            return None
+        }
+        let reader = accepted.body.as_ref()?;
+        match &reader.framing {
+            BodyFraming::Length(length) => Some(conn.buf.len().min(*length)),
+            BodyFraming::Chunked(_) => Some(reader.raw + conn.buf.len()),
+        }
+    }
+    /// Closes connections that sat idle too long, and unfinished discards.
+    fn sweep_accepted(&mut self, net: &mut NetworkCore) {
+        let now = Instant::now();
+        for conn in &mut self.conns {
+            let token = conn.token;
+            let Role::Accepted(accepted) = &mut conn.role else { continue };
+            // A peer reading its response is not idle.
+            let queued = net.queued_bytes(token);
+            if queued < accepted.last_queued {
+                conn.last_activity = now;
+            }
+            accepted.last_queued = queued;
+            let idle = matches!(accepted.state, State::Idle | State::Draining) &&
+                self.idle_timeout.is_some_and(|timeout| conn.last_activity.elapsed() >= timeout);
+            let overdue = accepted.discard &&
+                accepted.discard_deadline.is_some_and(|deadline| now >= deadline);
+            if idle || overdue {
+                net.disconnect(token);
+            }
+        }
+    }
+    /// Reads only connections whose input the server is waiting for.
+    fn update_reading(&mut self, net: &mut NetworkCore) {
+        for conn in &mut self.conns {
+            sync_reading(net, conn);
+        }
     }
     fn emit_lifecycle<F>(&mut self, net: &mut NetworkCore, event: Lifecycle, handler: &mut F)
     where
@@ -988,12 +1181,100 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        match self.conns[i].role.accepted().map(|a| a.state) {
-            Some(State::Idle) => self.parse_head(net, i, handler),
-            Some(State::Reading) => self.read_body_step(net, i, handler),
+        // Set again by new input, or by a response that frees the
+        // connection for a request already buffered.
+        self.conns[i].dirty = false;
+        let Some(accepted) = self.conns[i].role.accepted() else { return };
+        if accepted.discard && !self.discard_step(net, i) {
+            return
+        }
+        match self.conns[i].role.accepted().map(|a| (a.state, a.peer_closed)) {
+            Some((State::Idle, false)) => self.parse_head(net, i, handler),
+            Some((State::Idle, true)) => {
+                // Nothing more will arrive: serve a complete request that is
+                // already here, and otherwise close.
+                if self.complete_head_buffered(i) {
+                    self.parse_head(net, i, handler);
+                } else {
+                    self.close_now(net, i);
+                }
+            }
+            Some((State::Reading, _)) => self.read_body_step(net, i, handler),
             _ => {}
         }
     }
+    fn complete_head_buffered(&self, i: usize) -> bool {
+        let (mut stack_slots, mut heap_slots) =
+            ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
+        let hs = header_slots(&mut stack_slots, &mut heap_slots, self.max_headers);
+        matches!(
+            httparse::Request::new(hs).parse(&self.conns[i].buf),
+            Ok(httparse::Status::Complete(_))
+        )
+    }
+    /// Closes once what is queued has been written.
+    fn close_now(&mut self, net: &mut NetworkCore, i: usize) {
+        if let Some(accepted) = self.conns[i].role.accepted_mut() {
+            accepted.state = State::Draining;
+            accepted.discard = false;
+            accepted.body = None;
+        }
+        self.conns[i].dirty = false;
+        net.disconnect_when_drained(self.conns[i].token);
+    }
+    /// Drops what has arrived of a body answered early. Returns whether it
+    /// is finished, so the next request can be parsed.
+    fn discard_step(&mut self, net: &mut NetworkCore, i: usize) -> bool {
+        let max_drain = self.max_drain_bytes();
+        let limits = ChunkLimits {
+            decoded: u64::MAX,
+            trailer_bytes: self.max_head_bytes,
+            trailers: self.max_headers,
+        };
+        let conn = &mut self.conns[i];
+        let Role::Accepted(accepted) = &mut conn.role else { return false };
+        let Some(reader) = accepted.body.as_mut() else {
+            accepted.discard = false;
+            return true
+        };
+        let finished = match &mut reader.framing {
+            BodyFraming::Length(remaining) => {
+                let take = (*remaining).min(conn.buf.len());
+                conn.buf.drain(..take);
+                *remaining -= take;
+                reader.raw += take;
+                Ok(*remaining == 0)
+            }
+            BodyFraming::Chunked(decoder) => match decoder.decode(&conn.buf, None, &limits) {
+                Ok(consumed) => {
+                    conn.buf.drain(..consumed);
+                    reader.raw += consumed;
+                    if reader.raw > max_drain { Err(()) } else { Ok(decoder.is_done()) }
+                }
+                Err(_) => Err(()),
+            },
+        };
+        match finished {
+            Ok(true) => {
+                accepted.discard = false;
+                accepted.discard_deadline = None;
+                accepted.body = None;
+                true
+            }
+            Ok(false) if !accepted.peer_closed => false,
+            // Where the next request starts is unknown, or will never be.
+            _ => {
+                self.close_now(net, i);
+                false
+            }
+        }
+    }
+    fn max_drain_bytes(&self) -> usize {
+        self.max_drain_bytes.unwrap_or(self.max_body_bytes)
+    }
+    // One pass from bytes to a delivered request; splitting it would only
+    // move the parsed head's borrows around.
+    #[allow(clippy::too_many_lines)]
     fn parse_head<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
@@ -1030,28 +1311,43 @@ impl HttpNetwork {
             self.error(net, i, 400);
             return
         };
+        let peer_closed = self.conns[i].role.accepted().is_some_and(|a| a.peer_closed);
         let close = req.version == Some(0) && !has_token(req.headers, "connection", b"keep-alive") ||
-            has_token(req.headers, "connection", b"close");
+            has_token(req.headers, "connection", b"close") ||
+            peer_closed;
         let expect = has_token(req.headers, "expect", b"100-continue");
         let head_request = req.method == Some("HEAD");
+        if self.request_heads && framing != RequestFraming::Length(0) {
+            let (body, reader) = match framing {
+                RequestFraming::Length(len) => (RequestBody::Length(len), BodyFraming::Length(len)),
+                RequestFraming::Chunked => {
+                    (RequestBody::Chunked, BodyFraming::Chunked(ChunkDecoder::new()))
+                }
+            };
+            let token = self.conns[i].token;
+            let request = HttpRequest {
+                method: req.method.unwrap_or(""),
+                path: req.path.unwrap_or(""),
+                version: req.version.unwrap_or(1),
+                headers: req.headers,
+                body: &[],
+            };
+            handler(HttpEvent::RequestHead { token, request, body });
+            self.start_body(i, head, reader, State::Head, [close, expect, head_request]);
+            return
+        }
         let len = match framing {
             RequestFraming::Length(len) => len,
             RequestFraming::Chunked => {
                 // The head is kept aside while the body is decoded, so the
                 // connection buffer only ever holds undecoded chunk bytes.
                 let conn = &mut self.conns[i];
-                let Role::Accepted(accepted) = &mut conn.role else { return };
-                accepted.head.clear();
-                accepted.head.extend_from_slice(&conn.buf[..head]);
-                accepted.decoded.clear();
-                accepted.body =
-                    Some(BodyReader { framing: BodyFraming::Chunked(ChunkDecoder::new()), raw: 0 });
-                accepted.state = State::Reading;
-                accepted.close = close;
-                accepted.expect = expect;
-                accepted.continued = false;
-                accepted.head_request = head_request;
-                conn.buf.drain(..head);
+                if let Some(accepted) = conn.role.accepted_mut() {
+                    accepted.head.clear();
+                    accepted.head.extend_from_slice(&conn.buf[..head]);
+                }
+                let decoder = BodyFraming::Chunked(ChunkDecoder::new());
+                self.start_body(i, head, decoder, State::Reading, [close, expect, head_request]);
                 self.read_body_step(net, i, handler);
                 return
             }
@@ -1084,10 +1380,31 @@ impl HttpNetwork {
         };
         handler(HttpEvent::Request { token, request });
         self.conns[i].buf.drain(..end);
-        self.conns[i].dirty = !self.conns[i].buf.is_empty();
         if let Some(accepted) = self.conns[i].role.accepted_mut() {
             accepted.state = State::Pending;
             accepted.close = close;
+            accepted.continued = false;
+            accepted.head_request = head_request;
+        }
+    }
+    /// Moves past a parsed head to its body, in `state`. `flags` are the
+    /// request's close, expect and head-request properties.
+    fn start_body(
+        &mut self,
+        i: usize,
+        head: usize,
+        framing: BodyFraming,
+        state: State,
+        [close, expect, head_request]: [bool; 3],
+    ) {
+        let conn = &mut self.conns[i];
+        conn.buf.drain(..head);
+        if let Some(accepted) = conn.role.accepted_mut() {
+            accepted.state = state;
+            accepted.body = Some(BodyReader { framing, raw: 0 });
+            accepted.decoded.clear();
+            accepted.close = close;
+            accepted.expect = expect;
             accepted.continued = false;
             accepted.head_request = head_request;
         }
@@ -1112,10 +1429,13 @@ impl HttpNetwork {
             trailer_bytes: self.max_head_bytes,
             trailers: self.max_headers,
         };
+        let max_body_bytes = self.max_body_bytes;
         let conn = &mut self.conns[i];
         let Role::Accepted(accepted) = &mut conn.role else { return };
         let Some(reader) = accepted.body.as_mut() else { return };
         let outcome = match &mut reader.framing {
+            BodyFraming::Length(length) if *length > max_body_bytes => Err(BodyError::TooLarge),
+            BodyFraming::Length(length) => Ok(conn.buf.len() >= *length),
             BodyFraming::Chunked(decoder) => {
                 match decoder.decode(&conn.buf, Some(&mut accepted.decoded), &limits) {
                     Ok(consumed) => {
@@ -1131,6 +1451,13 @@ impl HttpNetwork {
                 }
             }
         };
+        let outcome = match outcome {
+            Ok(false) if accepted.peer_closed => Err(BodyError::Incomplete),
+            outcome => outcome,
+        };
+        if self.request_heads {
+            return self.finish_body_read(i, outcome, handler)
+        }
         match outcome {
             Ok(false) => {
                 if conn.over_limit {
@@ -1143,6 +1470,36 @@ impl HttpNetwork {
             Err(BodyError::TooLarge) => self.error(net, i, 413),
             Err(_) => self.error(net, i, 400),
         }
+    }
+    /// Reports the outcome of a body read asked for in request-head mode.
+    fn finish_body_read<F>(&mut self, i: usize, outcome: Result<bool, BodyError>, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let token = self.conns[i].token;
+        let conn = &mut self.conns[i];
+        let Role::Accepted(accepted) = &mut conn.role else { return };
+        match outcome {
+            Ok(false) => return,
+            Ok(true) => {
+                if let Some(BodyReader { framing: BodyFraming::Length(length), .. }) = accepted.body
+                {
+                    handler(HttpEvent::RequestBody { token, body: &conn.buf[..length] });
+                    conn.buf.drain(..length);
+                } else {
+                    handler(HttpEvent::RequestBody { token, body: &accepted.decoded });
+                }
+            }
+            Err(error) => {
+                handler(HttpEvent::RequestBodyFailed { token, error });
+                // The rest of the body is unread or unreadable.
+                accepted.close = true;
+            }
+        }
+        accepted.body = None;
+        accepted.state = State::Pending;
+        recycle_buffer(&mut accepted.decoded);
+        conn.dirty = false;
     }
     /// Delivers the request whose head was kept aside, with its decoded body.
     fn deliver_buffered_head<F>(&mut self, i: usize, handler: &mut F)
@@ -1176,7 +1533,6 @@ impl HttpNetwork {
         accepted.continued = false;
         accepted.head.clear();
         recycle_buffer(&mut accepted.decoded);
-        conn.dirty = !conn.buf.is_empty();
     }
     /// Raw bytes a chunked body may take from the connection, framing
     /// included. Framing costs at least five bytes per chunk, so this allows
@@ -1208,7 +1564,10 @@ impl HttpNetwork {
         body: &[u8],
     ) -> bool {
         let Some(i) = self.conns.iter().position(|c| {
-            c.token == token && c.role.accepted().is_some_and(|a| a.state == State::Pending)
+            c.token == token &&
+                c.role.accepted().is_some_and(|a| {
+                    matches!(a.state, State::Pending | State::Head | State::Reading)
+                })
         }) else {
             return false
         };
@@ -1225,8 +1584,23 @@ impl HttpNetwork {
         let caller_close = headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case("connection") && has_value_token(v.as_bytes(), b"close")
         });
+        let max_drain = self.max_drain_bytes();
         let Some(accepted) = self.conns[i].role.accepted() else { return false };
-        let close = accepted.close || caller_close;
+        // Answered before its body was read: drop the body to keep the
+        // connection if that is bounded and the client will send it (it
+        // may wait for a `100 Continue` that now never comes); else close.
+        let unread = accepted.body.as_ref().filter(|_| accepted.state != State::Pending);
+        let discard = unread.is_some_and(|reader| {
+            !accepted.close &&
+                !caller_close &&
+                !accepted.peer_closed &&
+                (!accepted.expect || accepted.continued) &&
+                match reader.framing {
+                    BodyFraming::Length(remaining) => remaining <= max_drain,
+                    BodyFraming::Chunked(_) => reader.raw <= max_drain,
+                }
+        });
+        let close = accepted.close || caller_close || (unread.is_some() && !discard);
         let suppress_body = accepted.head_request || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
         let ok = net.send_with(token, |out| {
@@ -1263,11 +1637,22 @@ impl HttpNetwork {
         });
         if ok {
             self.conns[i].dirty = !close && !self.conns[i].buf.is_empty();
+            self.conns[i].last_activity = Instant::now();
+            let drain_timeout = self.drain_timeout;
             if let Some(accepted) = self.conns[i].role.accepted_mut() {
                 accepted.state = if close { State::Draining } else { State::Idle };
+                if discard {
+                    accepted.discard = true;
+                    accepted.discard_deadline = Some(Instant::now() + drain_timeout);
+                } else {
+                    accepted.body = None;
+                }
             }
             if close {
                 net.disconnect_when_drained(token);
+            } else if self.request_heads {
+                // A pipelined request may wait in the kernel.
+                sync_reading(net, &mut self.conns[i]);
             }
         }
         ok
@@ -1663,6 +2048,23 @@ impl HttpNetwork {
     }
 }
 
+/// Pauses or resumes reading an accepted connection in request-head mode to
+/// match whether its input is wanted now.
+fn sync_reading(net: &mut NetworkCore, conn: &mut Conn) {
+    let Role::Accepted(accepted) = &mut conn.role else { return };
+    let wanted = accepted.discard ||
+        match accepted.state {
+            State::Idle | State::Reading => true,
+            State::Head | State::Pending | State::Draining => false,
+        };
+    if wanted == accepted.paused {
+        let changed =
+            if wanted { net.resume_reading(conn.token) } else { net.pause_reading(conn.token) };
+        if changed {
+            accepted.paused = !wanted;
+        }
+    }
+}
 fn crlf_only(bytes: &[u8]) -> bool {
     bytes.iter().enumerate().all(|(i, b)| *b != b'\n' || i > 0 && bytes[i - 1] == b'\r')
 }
