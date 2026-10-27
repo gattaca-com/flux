@@ -44,7 +44,7 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
         });
         s3.drive(&mut net, |id, result| {
             outcomes.push((id, match result {
-                Ok(body) => Ok(body.to_vec()),
+                Ok(response) => Ok(response.body.to_vec()),
                 Err(Error::Server { status, code, message }) => {
                     Err((status, code.map(str::to_owned), message.to_vec()))
                 }

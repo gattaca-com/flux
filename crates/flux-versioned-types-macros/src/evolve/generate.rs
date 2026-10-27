@@ -13,6 +13,14 @@ pub(crate) struct FieldInfo {
     pub ty: Type,
 }
 
+impl crate::shared::Member for FieldInfo {
+    const LIST: &'static str = "fields";
+
+    fn member_name(&self) -> &Ident {
+        &self.name
+    }
+}
+
 impl FieldInfo {
     pub fn from_struct_field(f: &StructField) -> Self {
         Self { attrs: f.attrs.clone(), vis: f.vis.clone(), name: f.name.clone(), ty: f.ty.clone() }

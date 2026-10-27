@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use byte_stable::ByteStable;
 use flux_timing::{IngestionTime, InternalMessage, Nanos};
-use flux_utils::ArrayStr;
+use flux_utils::{ArrayStr, TruncatingVec};
 
 use crate::{
     blob::TrackingTimestampWire,
@@ -93,8 +93,10 @@ impl std::error::Error for DecodeError {}
 /// 16-byte aligned byte buffer so decoded leaves cast directly.
 #[derive(Default)]
 pub struct Scratch {
-    words: Vec<u128>,
+    words: TruncatingVec<u128>,
     len: usize,
+    /// Each fill starts afresh, so the buffer shrinks back after a burst.
+    truncating: bool,
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
 }
 
@@ -103,9 +105,17 @@ impl Scratch {
         Self::default()
     }
 
+    /// A scratch that shrinks back to the median of its recent fills once a
+    /// burst has passed, as [`TruncatingVec`] does.
+    pub fn truncating() -> Self {
+        Self { truncating: true, ..Self::default() }
+    }
+
     pub fn resize(&mut self, len: usize) {
         let words = len.div_ceil(LEAF_ALIGN_MAX);
-        if words > self.words.len() {
+        if self.truncating {
+            self.words.refill(words, 0);
+        } else if words > self.words.len() {
             self.words.resize(words, 0);
         }
         let old = self.len;
@@ -125,7 +135,9 @@ impl Scratch {
 
     fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
         let words = len.div_ceil(LEAF_ALIGN_MAX);
-        if words > self.words.len() {
+        if self.truncating {
+            self.words.refill(words, 0);
+        } else if words > self.words.len() {
             self.words.resize(words, 0);
         }
         if self.decompressor.is_none() {

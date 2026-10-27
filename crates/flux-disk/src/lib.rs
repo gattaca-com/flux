@@ -10,13 +10,14 @@
 //!
 //! Operations on one file run concurrently, except [`DiskIo::sync_all`],
 //! [`DiskIo::sync_data`], [`DiskIo::truncate`], [`DiskIo::rename`],
-//! [`DiskIo::link`], [`DiskIo::unlink`] and [`DiskIo::close`], which act as
-//! barriers: they start only after every earlier operation on that file has
-//! completed, so a sync covers all earlier writes and structural changes
-//! cannot race them. Truncates, renames, links and unlinks additionally
-//! prevent later operations from starting until they complete. Operations
-//! submitted before the file finished opening are queued and dispatched once
-//! the descriptor is available.
+//! [`DiskIo::link`], [`DiskIo::unlink`], [`DiskIo::create_dir`] and
+//! [`DiskIo::close`], which act as barriers: they start only after every
+//! earlier operation on that file has completed, so a sync covers all earlier
+//! writes and structural changes cannot race them. Truncates, renames, links,
+//! unlinks and directory creations additionally prevent later operations from
+//! starting until they complete. Operations submitted before the file
+//! finished opening are queued and dispatched once the descriptor is
+//! available.
 
 use std::{
     collections::VecDeque,
@@ -205,6 +206,7 @@ pub enum FailedOp {
     Rename,
     Link,
     Unlink,
+    CreateDir,
     Close,
 }
 
@@ -218,6 +220,13 @@ pub enum DiskEvent<'a> {
     Read { file: FileToken, offset: u64, payload: &'a [u8], eof: bool },
     /// A write was fully applied at `offset`.
     Written { file: FileToken, offset: u64, len: usize },
+    /// A read queued with a caller's buffer finished, or failed with `error`.
+    /// `buf` holds the bytes read and comes back either way; `eof` is as for
+    /// [`DiskEvent::Read`].
+    ReadOwned { file: FileToken, offset: u64, buf: Vec<u8>, eof: bool, error: Option<io::Error> },
+    /// A write queued with a caller's buffer was fully applied at `offset`, or
+    /// failed with `error`. `buf` comes back either way.
+    WrittenOwned { file: FileToken, offset: u64, buf: Vec<u8>, error: Option<io::Error> },
     /// A [`DiskIo::sync_all`] or [`DiskIo::sync_data`] barrier finished;
     /// every
     /// write submitted before it is durable.
@@ -230,6 +239,8 @@ pub enum DiskEvent<'a> {
     Linked { file: FileToken, operation_id: OperationId },
     /// The name given to [`DiskIo::unlink`] is gone.
     Unlinked { file: FileToken, operation_id: OperationId },
+    /// The directory given to [`DiskIo::create_dir`] exists.
+    DirectoryCreated { file: FileToken, operation_id: OperationId },
     /// The file was closed and its token retired.
     Closed { file: FileToken },
     /// An operation failed. `Failed { op: FailedOp::Open, .. }` retires the
@@ -240,15 +251,54 @@ pub enum DiskEvent<'a> {
 }
 
 enum PendingOp {
-    Open { path: CString, flags: i32, mode: libc::mode_t },
-    Read { offset: u64, len: usize, to_end: bool },
-    ReadToEnd { offset: u64 },
-    Write { buf: Vec<u8>, offset: u64 },
-    Sync { data_only: bool, operation_id: OperationId },
-    Truncate { len: u64, operation_id: OperationId },
-    Rename { destination: CString, destination_path: PathBuf, operation_id: OperationId },
-    Link { destination: CString, destination_path: PathBuf, operation_id: OperationId },
-    Unlink { path: CString, operation_id: OperationId },
+    Open {
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
+    },
+    /// `buf` is the caller's for an owned read; a pooled read takes one at
+    /// dispatch.
+    Read {
+        offset: u64,
+        len: usize,
+        to_end: bool,
+        buf: Option<Vec<u8>>,
+    },
+    ReadToEnd {
+        offset: u64,
+        buf: Option<Vec<u8>>,
+    },
+    Write {
+        buf: Vec<u8>,
+        offset: u64,
+        owned: bool,
+    },
+    Sync {
+        data_only: bool,
+        operation_id: OperationId,
+    },
+    Truncate {
+        len: u64,
+        operation_id: OperationId,
+    },
+    Rename {
+        destination: CString,
+        destination_path: PathBuf,
+        operation_id: OperationId,
+    },
+    Link {
+        destination: CString,
+        destination_path: PathBuf,
+        operation_id: OperationId,
+    },
+    Unlink {
+        path: CString,
+        operation_id: OperationId,
+    },
+    CreateDir {
+        path: CString,
+        operation_id: OperationId,
+    },
     Close,
 }
 
@@ -264,15 +314,18 @@ enum InFlightOp {
         wanted: usize,
         have: usize,
         to_end: bool,
+        owned: bool,
     },
     Statx {
         offset: u64,
         statx: Box<MaybeUninit<libc::statx>>,
+        buf: Option<Vec<u8>>,
     },
     Write {
         buf: Vec<u8>,
         offset: u64,
         written: usize,
+        owned: bool,
     },
     Sync {
         data_only: bool,
@@ -295,6 +348,10 @@ enum InFlightOp {
         operation_id: OperationId,
     },
     Unlink {
+        path: CString,
+        operation_id: OperationId,
+    },
+    CreateDir {
         path: CString,
         operation_id: OperationId,
     },
@@ -432,7 +489,7 @@ impl DiskIo {
             return false;
         }
         let Some(state) = self.usable_file_mut(file) else { return false };
-        state.queue.push_back(PendingOp::Read { offset, len, to_end: false });
+        state.queue.push_back(PendingOp::Read { offset, len, to_end: false, buf: None });
         self.note_enqueued();
         true
     }
@@ -445,9 +502,44 @@ impl DiskIo {
     /// Returns `false` for unknown or closing tokens.
     pub fn read_to_end(&mut self, file: FileToken, offset: u64) -> bool {
         let Some(state) = self.usable_file_mut(file) else { return false };
-        state.queue.push_back(PendingOp::ReadToEnd { offset });
+        state.queue.push_back(PendingOp::ReadToEnd { offset, buf: None });
         self.note_enqueued();
         true
+    }
+
+    /// Like [`Self::read_at`], into `buf` after clearing it: the read never
+    /// touches the buffer pool and `buf` comes back in
+    /// [`DiskEvent::ReadOwned`]. Hands `buf` back for empty reads and unknown
+    /// or closing tokens.
+    pub fn read_at_owned(
+        &mut self,
+        file: FileToken,
+        offset: u64,
+        len: usize,
+        buf: Vec<u8>,
+    ) -> Result<(), Vec<u8>> {
+        if len == 0 {
+            return Err(buf);
+        }
+        let Some(state) = self.usable_file_mut(file) else { return Err(buf) };
+        state.queue.push_back(PendingOp::Read { offset, len, to_end: false, buf: Some(buf) });
+        self.note_enqueued();
+        Ok(())
+    }
+
+    /// Like [`Self::read_to_end`], into `buf` after clearing it; `buf` comes
+    /// back in [`DiskEvent::ReadOwned`]. Hands `buf` back for unknown or
+    /// closing tokens.
+    pub fn read_to_end_owned(
+        &mut self,
+        file: FileToken,
+        offset: u64,
+        buf: Vec<u8>,
+    ) -> Result<(), Vec<u8>> {
+        let Some(state) = self.usable_file_mut(file) else { return Err(buf) };
+        state.queue.push_back(PendingOp::ReadToEnd { offset, buf: Some(buf) });
+        self.note_enqueued();
+        Ok(())
     }
 
     /// Serializes one payload and queues it for writing at the file's append
@@ -470,7 +562,7 @@ impl DiskIo {
         let state = self.usable_file_mut(file).expect("file was just found");
         let offset = state.write_cursor;
         state.write_cursor += len;
-        state.queue.push_back(PendingOp::Write { buf, offset });
+        state.queue.push_back(PendingOp::Write { buf, offset, owned: false });
         self.note_enqueued();
         true
     }
@@ -494,9 +586,43 @@ impl DiskIo {
             return false;
         }
         let state = self.usable_file_mut(file).expect("file was just found");
-        state.queue.push_back(PendingOp::Write { buf, offset });
+        state.queue.push_back(PendingOp::Write { buf, offset, owned: false });
         self.note_enqueued();
         true
+    }
+
+    /// Like [`Self::write_with`], writing the caller's `buf` at the append
+    /// cursor; `buf` never enters the buffer pool and comes back in
+    /// [`DiskEvent::WrittenOwned`]. Hands `buf` back when it is empty or the
+    /// token is unknown or closing.
+    pub fn write_owned(&mut self, file: FileToken, buf: Vec<u8>) -> Result<(), Vec<u8>> {
+        if buf.is_empty() {
+            return Err(buf);
+        }
+        let Some(state) = self.usable_file_mut(file) else { return Err(buf) };
+        let offset = state.write_cursor;
+        state.write_cursor += buf.len() as u64;
+        state.queue.push_back(PendingOp::Write { buf, offset, owned: true });
+        self.note_enqueued();
+        Ok(())
+    }
+
+    /// Like [`Self::write_at_with`], writing the caller's `buf` at `offset`;
+    /// `buf` comes back in [`DiskEvent::WrittenOwned`]. Hands `buf` back when
+    /// it is empty or the token is unknown or closing.
+    pub fn write_at_owned(
+        &mut self,
+        file: FileToken,
+        offset: u64,
+        buf: Vec<u8>,
+    ) -> Result<(), Vec<u8>> {
+        if buf.is_empty() {
+            return Err(buf);
+        }
+        let Some(state) = self.usable_file_mut(file) else { return Err(buf) };
+        state.queue.push_back(PendingOp::Write { buf, offset, owned: true });
+        self.note_enqueued();
+        Ok(())
     }
 
     /// Moves the append cursor used by [`DiskIo::write_with`], e.g. to the
@@ -582,6 +708,26 @@ impl DiskIo {
         let path = CString::new(path.as_ref().as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))?;
         Ok(self.enqueue_operation(file, |operation_id| PendingOp::Unlink { path, operation_id }))
+    }
+
+    /// Queues creating the directory `path`, like [`std::fs::create_dir`],
+    /// after all earlier operations on `file` and before later ones; `file`
+    /// only orders it, so a directory opened with [`Self::open_directory`]
+    /// serves. Fails with `EEXIST` when the name is taken. Parents are not
+    /// created: queue one call per missing level, outermost first. Needs
+    /// Linux 5.15.
+    ///
+    /// Returns an ID echoed by its completion or failure event, or `None` for
+    /// unknown or closing tokens. A path containing a nul byte returns an
+    /// error without queueing an operation.
+    pub fn create_dir<P: AsRef<Path>>(
+        &mut self,
+        file: FileToken,
+        path: P,
+    ) -> io::Result<Option<OperationId>> {
+        let path = CString::new(path.as_ref().as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))?;
+        Ok(self.enqueue_operation(file, |operation_id| PendingOp::CreateDir { path, operation_id }))
     }
 
     /// Queues a full-integrity `fsync` barrier, the durability of
@@ -731,6 +877,7 @@ impl DiskIo {
                     PendingOp::Rename { .. } |
                     PendingOp::Link { .. } |
                     PendingOp::Unlink { .. } |
+                    PendingOp::CreateDir { .. } |
                     PendingOp::Close => file.fd.is_some() && file.in_flight == 0,
                 };
                 if !ready {
@@ -751,21 +898,25 @@ impl DiskIo {
             PendingOp::Truncate { .. } |
                 PendingOp::Rename { .. } |
                 PendingOp::Link { .. } |
-                PendingOp::Unlink { .. }
+                PendingOp::Unlink { .. } |
+                PendingOp::CreateDir { .. }
         );
         let op = match op {
             PendingOp::Open { path, flags, mode } => InFlightOp::Open { path, flags, mode },
-            PendingOp::Read { offset, len, to_end } => InFlightOp::Read {
-                buf: self.take_buffer_with_capacity(len),
+            PendingOp::Read { offset, len, to_end, buf } => InFlightOp::Read {
+                owned: buf.is_some(),
+                buf: self.read_buffer(buf, len),
                 offset,
                 wanted: len,
                 have: 0,
                 to_end,
             },
-            PendingOp::ReadToEnd { offset } => {
-                InFlightOp::Statx { offset, statx: Box::new(MaybeUninit::uninit()) }
+            PendingOp::ReadToEnd { offset, buf } => {
+                InFlightOp::Statx { offset, statx: Box::new(MaybeUninit::uninit()), buf }
             }
-            PendingOp::Write { buf, offset } => InFlightOp::Write { buf, offset, written: 0 },
+            PendingOp::Write { buf, offset, owned } => {
+                InFlightOp::Write { buf, offset, written: 0, owned }
+            }
             PendingOp::Sync { data_only, operation_id } => {
                 InFlightOp::Sync { data_only, operation_id }
             }
@@ -783,6 +934,9 @@ impl DiskIo {
                 InFlightOp::Link { source, destination, destination_path, operation_id }
             }
             PendingOp::Unlink { path, operation_id } => InFlightOp::Unlink { path, operation_id },
+            PendingOp::CreateDir { path, operation_id } => {
+                InFlightOp::CreateDir { path, operation_id }
+            }
             PendingOp::Close => InFlightOp::Close,
         };
         let slot = self.alloc_slot(InFlight { file: token, op });
@@ -823,7 +977,7 @@ impl DiskIo {
                 .mask(libc::STATX_SIZE)
                 .build()
             }
-            InFlightOp::Write { buf, offset, written } => {
+            InFlightOp::Write { buf, offset, written, .. } => {
                 let fd = fd.expect("write dispatched without an open fd");
                 let chunk = (buf.len() - *written).min(MAX_OP_BYTES) as u32;
                 // SAFETY: `written < buf.len()`, so the pointer stays inside
@@ -862,6 +1016,9 @@ impl DiskIo {
             .build(),
             InFlightOp::Unlink { path, .. } => {
                 opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).build()
+            }
+            InFlightOp::CreateDir { path, .. } => {
+                opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).mode(0o777).build()
             }
             InFlightOp::Close => {
                 let fd = fd.expect("close dispatched without an open fd");
@@ -941,8 +1098,8 @@ impl DiskIo {
             InFlightOp::Read { .. } | InFlightOp::Write { .. } => {
                 self.complete_transfer(user_data, file_index, entry.op, result, handler);
             }
-            InFlightOp::Statx { offset, statx } => {
-                self.complete_statx(user_data, file_index, offset, statx, result);
+            InFlightOp::Statx { offset, statx, buf } => {
+                self.complete_statx(user_data, file_index, offset, statx, buf, result);
             }
             InFlightOp::Sync { operation_id, .. } => {
                 self.finish_op(slot, file_index);
@@ -972,7 +1129,10 @@ impl DiskIo {
                     handler(DiskEvent::Truncated { file: token, len, operation_id });
                 }
             }
-            InFlightOp::Rename { .. } | InFlightOp::Link { .. } | InFlightOp::Unlink { .. } => {
+            InFlightOp::Rename { .. } |
+            InFlightOp::Link { .. } |
+            InFlightOp::Unlink { .. } |
+            InFlightOp::CreateDir { .. } => {
                 self.complete_name_op(slot, file_index, entry.op, result, handler);
             }
             InFlightOp::Close => {
@@ -1022,7 +1182,15 @@ impl DiskIo {
             InFlightOp::Unlink { operation_id, .. } => {
                 (FailedOp::Unlink, operation_id, None, DiskEvent::Unlinked { file, operation_id })
             }
-            _ => unreachable!("complete_name_op only receives renames, links and unlinks"),
+            InFlightOp::CreateDir { operation_id, .. } => {
+                (FailedOp::CreateDir, operation_id, None, DiskEvent::DirectoryCreated {
+                    file,
+                    operation_id,
+                })
+            }
+            _ => unreachable!(
+                "complete_name_op only receives renames, links, unlinks and directory creations"
+            ),
         };
         if result < 0 {
             let error = io::Error::from_raw_os_error(-result);
@@ -1073,6 +1241,7 @@ impl DiskIo {
         file_index: usize,
         offset: u64,
         statx: Box<MaybeUninit<libc::statx>>,
+        buf: Option<Vec<u8>>,
         result: i32,
     ) {
         let len = if result == 0 {
@@ -1082,7 +1251,7 @@ impl DiskIo {
         } else {
             None
         };
-        self.start_read_to_end(user_data, file_index, offset, len);
+        self.start_read_to_end(user_data, file_index, offset, len, buf);
     }
 
     fn start_read_to_end(
@@ -1091,6 +1260,7 @@ impl DiskIo {
         file_index: usize,
         offset: u64,
         file_len: Option<u64>,
+        buf: Option<Vec<u8>>,
     ) {
         let wanted = Self::read_to_end_len(file_len, offset);
         let token = self.files[file_index].token;
@@ -1098,7 +1268,8 @@ impl DiskIo {
         self.slab[slot] = Some(InFlight {
             file: token,
             op: InFlightOp::Read {
-                buf: self.take_buffer_with_capacity(wanted),
+                owned: buf.is_some(),
+                buf: self.read_buffer(buf, wanted),
                 offset,
                 wanted,
                 have: 0,
@@ -1106,6 +1277,19 @@ impl DiskIo {
             },
         });
         self.push_slot(user_data);
+    }
+
+    /// The caller's buffer, cleared, else one from the pool; either with room
+    /// for `len`.
+    fn read_buffer(&mut self, owned: Option<Vec<u8>>, len: usize) -> Vec<u8> {
+        owned.map_or_else(
+            || self.take_buffer_with_capacity(len),
+            |mut buf| {
+                buf.clear();
+                buf.reserve(len);
+                buf
+            },
+        )
     }
 
     fn read_to_end_len(file_len: Option<u64>, offset: u64) -> usize {
@@ -1131,10 +1315,21 @@ impl DiskIo {
         let slot = user_data as usize;
         let token = self.files[file_index].token;
         match op {
-            InFlightOp::Read { mut buf, offset, mut wanted, have, to_end } => {
+            InFlightOp::Read { mut buf, offset, mut wanted, have, to_end, owned } => {
                 if result < 0 {
                     self.finish_op(slot, file_index);
                     let error = io::Error::from_raw_os_error(-result);
+                    if owned {
+                        let error = Some(error);
+                        handler(DiskEvent::ReadOwned {
+                            file: token,
+                            offset,
+                            buf,
+                            eof: false,
+                            error,
+                        });
+                        return;
+                    }
                     let op = FailedOp::Read { offset, len: wanted };
                     handler(DiskEvent::Failed { file: token, op, operation_id: None, error });
                     self.recycle(buf);
@@ -1148,6 +1343,16 @@ impl DiskIo {
                 if result == 0 || (have >= wanted && !to_end) {
                     self.finish_op(slot, file_index);
                     let eof = result == 0;
+                    if owned {
+                        handler(DiskEvent::ReadOwned {
+                            file: token,
+                            offset,
+                            buf,
+                            eof,
+                            error: None,
+                        });
+                        return;
+                    }
                     handler(DiskEvent::Read { file: token, offset, payload: &buf[..have], eof });
                     self.recycle(buf);
                 } else {
@@ -1159,12 +1364,12 @@ impl DiskIo {
                     }
                     self.slab[slot] = Some(InFlight {
                         file: token,
-                        op: InFlightOp::Read { buf, offset, wanted, have, to_end },
+                        op: InFlightOp::Read { buf, offset, wanted, have, to_end, owned },
                     });
                     self.push_slot(user_data);
                 }
             }
-            InFlightOp::Write { buf, offset, written } => {
+            InFlightOp::Write { buf, offset, written, owned } => {
                 if result <= 0 {
                     self.finish_op(slot, file_index);
                     let error = if result == 0 {
@@ -1172,6 +1377,11 @@ impl DiskIo {
                     } else {
                         io::Error::from_raw_os_error(-result)
                     };
+                    if owned {
+                        let error = Some(error);
+                        handler(DiskEvent::WrittenOwned { file: token, offset, buf, error });
+                        return;
+                    }
                     let op = FailedOp::Write { offset, len: buf.len() };
                     handler(DiskEvent::Failed { file: token, op, operation_id: None, error });
                     self.recycle(buf);
@@ -1180,12 +1390,16 @@ impl DiskIo {
                 let written = written + result as usize;
                 if written >= buf.len() {
                     self.finish_op(slot, file_index);
+                    if owned {
+                        handler(DiskEvent::WrittenOwned { file: token, offset, buf, error: None });
+                        return;
+                    }
                     handler(DiskEvent::Written { file: token, offset, len: buf.len() });
                     self.recycle(buf);
                 } else {
                     self.slab[slot] = Some(InFlight {
                         file: token,
-                        op: InFlightOp::Write { buf, offset, written },
+                        op: InFlightOp::Write { buf, offset, written, owned },
                     });
                     self.push_slot(user_data);
                 }
@@ -1210,13 +1424,26 @@ impl DiskIo {
         let token = self.files[file_index].token;
         while let Some(op) = self.files[file_index].queue.pop_front() {
             self.pending_count -= 1;
+            let error = io::Error::from_raw_os_error(libc::EBADF);
             let (failed, operation_id) = match op {
+                PendingOp::Read { offset, buf: Some(mut buf), .. } |
+                PendingOp::ReadToEnd { offset, buf: Some(mut buf) } => {
+                    buf.clear();
+                    let error = Some(error);
+                    handler(DiskEvent::ReadOwned { file: token, offset, buf, eof: false, error });
+                    continue;
+                }
+                PendingOp::Write { buf, offset, owned: true } => {
+                    let error = Some(error);
+                    handler(DiskEvent::WrittenOwned { file: token, offset, buf, error });
+                    continue;
+                }
                 PendingOp::Open { .. } => (FailedOp::Open, None),
                 PendingOp::Read { offset, len, .. } => (FailedOp::Read { offset, len }, None),
-                PendingOp::ReadToEnd { offset } => {
+                PendingOp::ReadToEnd { offset, .. } => {
                     (FailedOp::Read { offset, len: READ_TO_END_CHUNK }, None)
                 }
-                PendingOp::Write { buf, offset } => {
+                PendingOp::Write { buf, offset, .. } => {
                     let len = buf.len();
                     self.recycle(buf);
                     (FailedOp::Write { offset, len }, None)
@@ -1228,9 +1455,11 @@ impl DiskIo {
                 PendingOp::Rename { operation_id, .. } => (FailedOp::Rename, Some(operation_id)),
                 PendingOp::Link { operation_id, .. } => (FailedOp::Link, Some(operation_id)),
                 PendingOp::Unlink { operation_id, .. } => (FailedOp::Unlink, Some(operation_id)),
+                PendingOp::CreateDir { operation_id, .. } => {
+                    (FailedOp::CreateDir, Some(operation_id))
+                }
                 PendingOp::Close => (FailedOp::Close, None),
             };
-            let error = io::Error::from_raw_os_error(libc::EBADF);
             handler(DiskEvent::Failed { file: token, op: failed, operation_id, error });
         }
     }
@@ -1315,11 +1544,14 @@ mod tests {
         Opened(FileToken),
         Read { file: FileToken, offset: u64, payload: Vec<u8>, eof: bool },
         Written { file: FileToken, offset: u64, len: usize },
+        ReadOwned { file: FileToken, offset: u64, payload: Vec<u8>, eof: bool, failed: bool },
+        WrittenOwned { file: FileToken, offset: u64, len: usize, failed: bool },
         Synced(FileToken, OperationId),
         Truncated { file: FileToken, len: u64, operation_id: OperationId },
         Renamed { file: FileToken, operation_id: OperationId },
         Linked { file: FileToken, operation_id: OperationId },
         Unlinked { file: FileToken, operation_id: OperationId },
+        DirectoryCreated { file: FileToken, operation_id: OperationId },
         Closed(FileToken),
         Failed { file: FileToken, op: FailedOp, operation_id: Option<OperationId> },
     }
@@ -1332,6 +1564,12 @@ mod tests {
                     Self::Read { file, offset, payload: payload.to_vec(), eof }
                 }
                 DiskEvent::Written { file, offset, len } => Self::Written { file, offset, len },
+                DiskEvent::ReadOwned { file, offset, buf, eof, error } => {
+                    Self::ReadOwned { file, offset, payload: buf, eof, failed: error.is_some() }
+                }
+                DiskEvent::WrittenOwned { file, offset, buf, error } => {
+                    Self::WrittenOwned { file, offset, len: buf.len(), failed: error.is_some() }
+                }
                 DiskEvent::Synced { file, operation_id } => Self::Synced(file, operation_id),
                 DiskEvent::Truncated { file, len, operation_id } => {
                     Self::Truncated { file, len, operation_id }
@@ -1339,6 +1577,9 @@ mod tests {
                 DiskEvent::Renamed { file, operation_id } => Self::Renamed { file, operation_id },
                 DiskEvent::Linked { file, operation_id } => Self::Linked { file, operation_id },
                 DiskEvent::Unlinked { file, operation_id } => Self::Unlinked { file, operation_id },
+                DiskEvent::DirectoryCreated { file, operation_id } => {
+                    Self::DirectoryCreated { file, operation_id }
+                }
                 DiskEvent::Closed { file } => Self::Closed(file),
                 DiskEvent::Failed { file, op, operation_id, .. } => {
                     Self::Failed { file, op, operation_id }
@@ -1461,7 +1702,7 @@ mod tests {
         disk.in_flight_count = 1;
 
         // Start from a deliberately stale size captured before the file grew.
-        disk.start_read_to_end(0, 0, 0, Some(READ_TO_END_CHUNK as u64));
+        disk.start_read_to_end(0, 0, 0, Some(READ_TO_END_CHUNK as u64), None);
 
         let mut events = Vec::new();
         drive(&mut disk, &mut events, |events| {

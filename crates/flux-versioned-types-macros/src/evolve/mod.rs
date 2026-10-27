@@ -51,6 +51,18 @@ use syn::parse_macro_input;
 /// `extra_attrs { ... }` adds attributes to every version after the default
 /// attrs, so callers can extend the defaults without restating them.
 ///
+/// `#[export_versions]` on the newest version, or in `final_attrs`, needs
+/// `roll_into` and excludes `#[wire_skip]`. It exports
+/// `__versions_<wire name>!`, the wire name defaulting to the `roll_into`
+/// name, with every character outside `[A-Za-z0-9]` as `_`:
+/// `__versions_A_B!(path::cb, args..)` expands to `path::cb! { args.. ; name =
+/// "A.B", latest = T, versions = [TV1, TV2], fields = [a, b] }`, so another
+/// crate can generate code over the chain. The callback path cannot start
+/// with `::`. Versions run oldest first as bare names, resolved
+/// where `path::cb!` expands; fields are the newest version's. Wire names that
+/// differ only outside `[A-Za-z0-9]`, such as `A.B` and `A_B`, export the same
+/// macro and fail as a duplicate `#[macro_export]`.
+///
 /// `#[wire_skip]` keeps the bincode codec only, for types that cannot be
 /// padding-free `Copy`; it excludes `#[wire_name]`.
 pub fn evolve_struct(input: TokenStream) -> TokenStream {
