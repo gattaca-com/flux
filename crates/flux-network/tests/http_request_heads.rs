@@ -419,3 +419,71 @@ fn reading_pauses_while_a_request_is_held() {
     }
     assert_eq!(responses(&received)[0], (200, b"first".to_vec()));
 }
+
+#[test]
+fn owned_responses_stream_with_a_bounded_queue_and_keep_order() {
+    let mut server = Server::new(|http| http);
+    let mut client = server.connect();
+    let mut received = Vec::new();
+    let body: Vec<u8> = (0..32 * 1024 * 1024).map(|i: u32| (i % 251) as u8).collect();
+    // A pipelined HEAD and GET wait behind the large response.
+    client
+        .write_all(
+            b"GET /large HTTP/1.1\r\nHost: x\r\n\r\nHEAD /head HTTP/1.1\r\nHost: x\r\n\r\nGET /small HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .unwrap();
+    let Seen::Request(token, ..) = server.next(&mut client, &mut received) else { panic!() };
+    assert!(server.http.respond_owned(&mut server.net, token, 200, &[], body.clone()));
+    // Nothing is read for a while: the response waits in the server, not in
+    // its socket queue.
+    let until = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < until {
+        assert_eq!(server.step(), []);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let pending = server.http.response_pending(&server.net, token).unwrap();
+    assert!(pending > 16 * 1024 * 1024, "{pending}");
+    assert!(server.net.queued_bytes(token) <= 2 * flux_network::http::OUT_CHUNK_BYTES + 1024);
+    // Read it all; the pipelined requests follow in order. HEAD gets the
+    // length of the body it would have had, and no body.
+    let head = |length: usize| {
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: keep-alive\r\n\r\n")
+            .into_bytes()
+    };
+    let expected = [head(body.len()), body, head(5), head(5), b"small".to_vec()].concat();
+    let mut paths = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while received.len() < expected.len() {
+        assert!(Instant::now() < deadline, "{} bytes", received.len());
+        read_available(&mut client, &mut received);
+        assert!(server.net.queued_bytes(token) <= 2 * flux_network::http::OUT_CHUNK_BYTES + 1024);
+        for seen in server.step() {
+            let Seen::Request(token, path, _) = seen else { panic!("{seen:?}") };
+            paths.push(path);
+            assert!(server.http.respond_owned(&mut server.net, token, 200, &[], b"small".to_vec()));
+        }
+    }
+    assert_eq!(paths, ["/head", "/small"]);
+    assert_eq!(server.http.response_pending(&server.net, token), None);
+    assert!(received == expected, "responses differ");
+}
+
+#[test]
+fn a_stalled_reader_of_an_owned_response_is_swept() {
+    let mut server = Server::new(|http| {
+        http.with_idle_timeout(Duration::from_millis(100).into()).with_socket_buf_size(16 * 1024)
+    });
+    let mut client = server.connect();
+    let mut received = Vec::new();
+    client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let Seen::Request(token, ..) = server.next(&mut client, &mut received) else { panic!() };
+    assert!(server.http.respond_owned(&mut server.net, token, 200, &[], vec![7; 8 << 20]));
+    let deadline = Instant::now() + TIMEOUT;
+    while server.http.response_pending(&server.net, token).is_some() {
+        assert!(Instant::now() < deadline, "the stalled response was never dropped");
+        assert_eq!(server.step(), []);
+        thread::sleep(Duration::from_millis(1));
+    }
+    server.until_closed(&mut client, &mut received);
+    assert!(received.len() < 8 << 20);
+}

@@ -79,6 +79,9 @@ const MAX_CHUNK_LINE: usize = 4096;
 /// completes, so an idle connection does not keep its largest request's
 /// memory.
 const RETAINED_BUFFER_BYTES: usize = 64 * 1024;
+/// Piece of an owned response body handed to the socket at a time; more is
+/// handed over only while less than this is queued there.
+pub const OUT_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Record overhead allowance on top of a full-size request; see `group`.
 const TLS_MARGIN_BYTES: usize = 64 * 1024;
@@ -230,6 +233,8 @@ enum State {
     Reading,
     /// The request was delivered; waiting for [`HttpNetwork::respond`].
     Pending,
+    /// An owned response body is being handed to the socket.
+    Writing,
     /// Closing once the last response is written.
     Draining,
 }
@@ -262,6 +267,28 @@ struct Accepted {
     /// Bytes queued at the socket when last checked, to notice a peer still
     /// reading its response.
     last_queued: usize,
+    /// The rest of an owned response body.
+    out: Option<OutBody>,
+}
+/// An owned response body being handed to the socket.
+struct OutBody {
+    body: Vec<u8>,
+    /// Bytes handed over so far.
+    sent: usize,
+    /// Whether the connection closes after it.
+    close: bool,
+}
+enum ResponseBody<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+impl ResponseBody<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(body) => body.len(),
+            Self::Owned(body) => body.len(),
+        }
+    }
 }
 impl Accepted {
     fn new() -> Self {
@@ -279,6 +306,7 @@ impl Accepted {
             paused: false,
             peer_closed: false,
             last_queued: 0,
+            out: None,
         }
     }
 }
@@ -363,6 +391,8 @@ pub struct HttpNetwork {
     tls_config: Option<Arc<crate::tls::ClientConfig>>,
     failed: Vec<(RequestId, Failure)>,
     spare_heads: Vec<Vec<u8>>,
+    /// Scratch for the head of an owned response.
+    response_head: Vec<u8>,
     /// Decoded body of the chunked response being delivered.
     chunked_body: Vec<u8>,
 }
@@ -393,6 +423,7 @@ impl Default for HttpNetwork {
             tls_config: None,
             failed: Vec::new(),
             spare_heads: Vec::new(),
+            response_head: Vec::new(),
             chunked_body: Vec::new(),
         }
     }
@@ -657,6 +688,11 @@ impl HttpNetwork {
             self.emit_lifecycle(net, event, &mut handler);
         }
         self.parse_dirty(net, &mut handler);
+        for i in 0..self.conns.len() {
+            if self.conns[i].role.accepted().is_some_and(|a| a.out.is_some()) {
+                self.pump(net, i);
+            }
+        }
         for conn in &mut self.conns {
             if conn.over_limit && !conn.role.is_draining() {
                 net.disconnect(conn.token);
@@ -763,7 +799,7 @@ impl HttpNetwork {
                 conn.last_activity = now;
             }
             accepted.last_queued = queued;
-            let idle = matches!(accepted.state, State::Idle | State::Draining) &&
+            let idle = matches!(accepted.state, State::Idle | State::Writing | State::Draining) &&
                 self.idle_timeout.is_some_and(|timeout| conn.last_activity.elapsed() >= timeout);
             let overdue = accepted.discard &&
                 accepted.discard_deadline.is_some_and(|deadline| now >= deadline);
@@ -1554,7 +1590,12 @@ impl HttpNetwork {
     /// queued.
     ///
     /// Call this after the drive that delivered the request, or from a later
-    /// one. Each call completes exactly one request for `token`.
+    /// one. Each call completes exactly one request for `token`. In
+    /// request-head mode it may also answer a request whose body has not
+    /// been read; see [`Self::with_request_heads`].
+    ///
+    /// The body is copied into the connection's send queue. For large
+    /// bodies use [`Self::respond_owned`].
     pub fn respond(
         &mut self,
         net: &mut NetworkCore,
@@ -1562,6 +1603,43 @@ impl HttpNetwork {
         status: u16,
         headers: &[(&str, &str)],
         body: &[u8],
+    ) -> bool {
+        self.respond_with(net, token, status, headers, ResponseBody::Borrowed(body))
+    }
+    /// Like [`Self::respond`], but takes the body and hands it to the socket
+    /// in pieces as the peer reads, keeping at most about
+    /// `2 * OUT_CHUNK_BYTES` of it queued at a time, so a large response to
+    /// a slow reader costs its own memory and no copy of it. The connection
+    /// serves its next request once the whole body has been handed over;
+    /// [`Self::response_pending`] reports what is left meanwhile.
+    pub fn respond_owned(
+        &mut self,
+        net: &mut NetworkCore,
+        token: Token,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> bool {
+        self.respond_with(net, token, status, headers, ResponseBody::Owned(body))
+    }
+    /// Bytes of the response being written for `token` that the peer has
+    /// not taken yet, those queued at the socket included, while a body
+    /// given to [`Self::respond_owned`] is still being handed over; `None`
+    /// once it all has been (at most a socket queue's worth may then remain
+    /// unsent, bounded by the idle timeout). An application can compare
+    /// successive values to bound how slowly a response may be read.
+    pub fn response_pending(&self, net: &NetworkCore, token: Token) -> Option<usize> {
+        let conn = self.conns.iter().find(|conn| conn.token == token)?;
+        let out = conn.role.accepted()?.out.as_ref()?;
+        Some(out.body.len() - out.sent + net.queued_bytes(token))
+    }
+    fn respond_with(
+        &mut self,
+        net: &mut NetworkCore,
+        token: Token,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: ResponseBody<'_>,
     ) -> bool {
         let Some(i) = self.conns.iter().position(|c| {
             c.token == token &&
@@ -1602,60 +1680,92 @@ impl HttpNetwork {
         });
         let close = accepted.close || caller_close || (unread.is_some() && !discard);
         let suppress_body = accepted.head_request || matches!(status, 100..=199 | 204 | 304);
-        let include_length = !matches!(status, 100..=199 | 204);
-        let ok = net.send_with(token, |out| {
-            out.extend_from_slice(b"HTTP/1.1 ");
-            write_decimal(out, usize::from(status));
-            out.extend_from_slice(b" ");
-            out.extend_from_slice(reason_phrase(status).as_bytes());
-            out.extend_from_slice(b"\r\n");
-            // Caller Connection headers only feed the close decision; exactly
-            // one canonical Connection header is always written below.
-            for (n, v) in headers {
-                if n.eq_ignore_ascii_case("connection") {
-                    continue
-                }
-                out.extend_from_slice(n.as_bytes());
-                out.extend_from_slice(b": ");
-                out.extend_from_slice(v.as_bytes());
-                out.extend_from_slice(b"\r\n");
+        let length = (!matches!(status, 100..=199 | 204)).then_some(body.len());
+        let (ok, rest) = match body {
+            ResponseBody::Borrowed(body) => {
+                let ok = net.send_with(token, |out| {
+                    write_response_head(out, status, headers, length, close);
+                    if !suppress_body {
+                        out.extend_from_slice(body);
+                    }
+                });
+                (ok, None)
             }
-            if include_length {
-                out.extend_from_slice(b"Content-Length: ");
-                write_decimal(out, body.len());
-                out.extend_from_slice(b"\r\n");
+            ResponseBody::Owned(body) => {
+                let mut head = std::mem::take(&mut self.response_head);
+                head.clear();
+                write_response_head(&mut head, status, headers, length, close);
+                let first = if suppress_body { 0 } else { body.len().min(OUT_CHUNK_BYTES) };
+                let ok = net.send_parts(token, &head, &body[..first]);
+                self.response_head = head;
+                let rest = (!suppress_body && first < body.len()).then_some(OutBody {
+                    body,
+                    sent: first,
+                    close,
+                });
+                (ok, rest)
             }
-            out.extend_from_slice(if close {
-                b"Connection: close\r\n"
+        };
+        if !ok {
+            return false
+        }
+        self.conns[i].last_activity = Instant::now();
+        let drain_timeout = self.drain_timeout;
+        if let Some(accepted) = self.conns[i].role.accepted_mut() {
+            if discard {
+                accepted.discard = true;
+                accepted.discard_deadline = Some(Instant::now() + drain_timeout);
             } else {
-                b"Connection: keep-alive\r\n"
-            });
-            out.extend_from_slice(b"\r\n");
-            if !suppress_body {
-                out.extend_from_slice(body);
+                accepted.body = None;
             }
-        });
-        if ok {
-            self.conns[i].dirty = !close && !self.conns[i].buf.is_empty();
-            self.conns[i].last_activity = Instant::now();
-            let drain_timeout = self.drain_timeout;
-            if let Some(accepted) = self.conns[i].role.accepted_mut() {
-                accepted.state = if close { State::Draining } else { State::Idle };
-                if discard {
-                    accepted.discard = true;
-                    accepted.discard_deadline = Some(Instant::now() + drain_timeout);
-                } else {
-                    accepted.body = None;
+            if let Some(rest) = rest {
+                accepted.state = State::Writing;
+                accepted.out = Some(rest);
+                self.pump(net, i);
+                if self.request_heads {
+                    sync_reading(net, &mut self.conns[i]);
                 }
-            }
-            if close {
-                net.disconnect_when_drained(token);
-            } else if self.request_heads {
-                // A pipelined request may wait in the kernel.
-                sync_reading(net, &mut self.conns[i]);
+                return true
             }
         }
-        ok
+        self.response_done(net, i, close);
+        true
+    }
+    /// Hands more of an owned response body to the socket while little is
+    /// queued there, and finishes the response once all of it has been.
+    fn pump(&mut self, net: &mut NetworkCore, i: usize) {
+        let token = self.conns[i].token;
+        let Some(accepted) = self.conns[i].role.accepted_mut() else { return };
+        let Some(out) = accepted.out.as_mut() else { return };
+        while out.sent < out.body.len() && net.queued_bytes(token) < OUT_CHUNK_BYTES {
+            let end = out.body.len().min(out.sent + OUT_CHUNK_BYTES);
+            if !net.send_parts(token, &[], &out.body[out.sent..end]) {
+                // The connection is gone; its disconnect cleans up.
+                return
+            }
+            out.sent = end;
+        }
+        if out.sent == out.body.len() {
+            let close = out.close;
+            accepted.out = None;
+            self.response_done(net, i, close);
+        }
+    }
+    /// The response has been handed to the socket: close, or wait for the
+    /// next request.
+    fn response_done(&mut self, net: &mut NetworkCore, i: usize, close: bool) {
+        let token = self.conns[i].token;
+        let conn = &mut self.conns[i];
+        conn.dirty = !close && !conn.buf.is_empty();
+        if let Some(accepted) = conn.role.accepted_mut() {
+            accepted.state = if close { State::Draining } else { State::Idle };
+        }
+        if close {
+            net.disconnect_when_drained(token);
+        } else if self.request_heads {
+            // A pipelined request may wait in the kernel.
+            sync_reading(net, &mut self.conns[i]);
+        }
     }
     /// Delivers a streaming response: the head once, then body pieces
     /// borrowed straight out of the receive buffer as they arrive.
@@ -2048,6 +2158,38 @@ impl HttpNetwork {
     }
 }
 
+/// Writes a response's status line and headers. Caller `Connection` headers
+/// only feed the close decision; exactly one canonical `Connection` header is
+/// written.
+fn write_response_head(
+    out: &mut impl io::Write,
+    status: u16,
+    headers: &[(&str, &str)],
+    length: Option<usize>,
+    close: bool,
+) {
+    out.write_all(b"HTTP/1.1 ").unwrap();
+    write_decimal(out, usize::from(status));
+    out.write_all(b" ").unwrap();
+    out.write_all(reason_phrase(status).as_bytes()).unwrap();
+    out.write_all(b"\r\n").unwrap();
+    for (n, v) in headers {
+        if n.eq_ignore_ascii_case("connection") {
+            continue
+        }
+        for part in [n.as_bytes(), b": ", v.as_bytes(), b"\r\n"] {
+            out.write_all(part).unwrap();
+        }
+    }
+    if let Some(length) = length {
+        out.write_all(b"Content-Length: ").unwrap();
+        write_decimal(out, length);
+        out.write_all(b"\r\n").unwrap();
+    }
+    let connection: &[u8] =
+        if close { b"Connection: close\r\n\r\n" } else { b"Connection: keep-alive\r\n\r\n" };
+    out.write_all(connection).unwrap();
+}
 /// Pauses or resumes reading an accepted connection in request-head mode to
 /// match whether its input is wanted now.
 fn sync_reading(net: &mut NetworkCore, conn: &mut Conn) {
@@ -2055,7 +2197,7 @@ fn sync_reading(net: &mut NetworkCore, conn: &mut Conn) {
     let wanted = accepted.discard ||
         match accepted.state {
             State::Idle | State::Reading => true,
-            State::Head | State::Pending | State::Draining => false,
+            State::Head | State::Pending | State::Writing | State::Draining => false,
         };
     if wanted == accepted.paused {
         let changed =
