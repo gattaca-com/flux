@@ -51,7 +51,7 @@ versioned_struct!(SlotEnd =>
     SlotEndV1 { pub slot: u64 }
 );
 
-#[derive(Clone, Copy, Debug, VersionedLeaves)]
+#[derive(Clone, Copy, Debug, VersionedLeaves, type_hash_derive::TypeHash)]
 enum Telemetry {
     Price(Price),
     Fill(Fill),

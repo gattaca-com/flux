@@ -151,6 +151,20 @@ mod uuid_impls {
     }
 }
 
+#[cfg(feature = "mio")]
+mod mio_impls {
+    use super::{TypeHash, fnv1a64_str, hash_layout_of};
+
+    impl TypeHash for mio::Token {
+        const TYPE_HASH: u64 = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            h = fnv1a64_str(h, "Token");
+            h = hash_layout_of::<Self>(h);
+            h
+        };
+    }
+}
+
 #[cfg(feature = "alloy")]
 mod alloy_impls {
     use super::{TypeHash, fnv1a64_str, hash_layout_of, hash_u64};

@@ -13,8 +13,9 @@ use flux_timing::Duration;
 use flux_utils::directories::{shmem_dir_data_with_base, shmem_dir_queues_with_base};
 use serde::{Deserialize, Serialize};
 use spine_derive::from_spine;
+use type_hash_derive::TypeHash;
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, TypeHash)]
 #[repr(C)]
 struct MsgA(u64);
 
@@ -22,7 +23,7 @@ impl Persistable for MsgA {
     const PERSIST_DIR: &'static str = "msg_a";
 }
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, TypeHash)]
 #[repr(C)]
 struct MsgB(u8);
 

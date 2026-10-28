@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, type_hash_derive::TypeHash)]
 pub struct DCacheRef {
     pub offset: usize,
     pub len: usize,

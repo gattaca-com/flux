@@ -1695,6 +1695,8 @@ dependencies = [
  "shared_memory",
  "thiserror 1.0.69",
  "tracing",
+ "type-hash",
+ "type-hash-derive",
 ]
 
 [[package]]
@@ -1754,6 +1756,7 @@ dependencies = [
  "spine-derive",
  "tempfile",
  "tracing",
+ "type-hash",
  "type-hash-derive",
 ]
 
@@ -1834,6 +1837,8 @@ dependencies = [
  "serde",
  "tracing",
  "tracing-subscriber",
+ "type-hash",
+ "type-hash-derive",
 ]
 
 [[package]]
@@ -1918,6 +1923,7 @@ dependencies = [
  "tinyvec",
  "tracing",
  "type-hash",
+ "type-hash-derive",
  "wincode",
 ]
 
@@ -4712,6 +4718,7 @@ name = "type-hash"
 version = "0.9.0"
 dependencies = [
  "alloy-primitives",
+ "mio",
  "uuid",
 ]
 

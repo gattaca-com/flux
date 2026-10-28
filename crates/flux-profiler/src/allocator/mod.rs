@@ -10,7 +10,9 @@ pub(super) use counting::read;
 /// The allocation analogue of `PerfSample`: two monotonic per-thread byte
 /// counts.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, type_hash_derive::TypeHash,
+)]
 pub struct AllocSample {
     pub allocated: u64,
     pub freed: u64,

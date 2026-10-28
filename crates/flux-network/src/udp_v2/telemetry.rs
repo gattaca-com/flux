@@ -3,6 +3,7 @@ use std::{
     path::Path,
 };
 
+use flux::{type_hash::TypeHash, type_hash_derive::TypeHash};
 use flux_communication::{
     ReadError,
     queue::{ConsumerBare, Producer, Queue, QueueType},
@@ -17,7 +18,7 @@ use crate::NetworkTelemetry;
 const QUEUE_SIZE: usize = 2usize.pow(15);
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
 pub struct PeerId {
     pub token: u64,
     /// IPv4 addresses are stored mapped.
@@ -44,7 +45,7 @@ impl PeerId {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
 pub struct UdpSend {
     pub peer: PeerId,
     pub sent_at: Instant,
@@ -53,7 +54,7 @@ pub struct UdpSend {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
 pub struct UdpRetransmit {
     pub peer: PeerId,
     pub sent_at: Instant,
@@ -62,7 +63,7 @@ pub struct UdpRetransmit {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
 pub struct UdpLatency {
     pub peer: PeerId,
     pub sent_at: Nanos,
@@ -125,7 +126,7 @@ impl Telemetry {
     }
 }
 
-fn producer<T: Copy>(dir: &Path, name: &str) -> Producer<T> {
+fn producer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Producer<T> {
     // Most apps poll the network from one tile, so a single producer would
     // do, but nothing guarantees that while queues are named per group: two
     // tiles running the same group share them.
@@ -165,7 +166,7 @@ impl TelemetryReader {
     }
 }
 
-fn consumer<T: Copy>(dir: &Path, name: &str) -> Option<ConsumerBare<T>> {
+fn consumer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Option<ConsumerBare<T>> {
     let file = dir.join(name);
     match Queue::try_open_shared(&file) {
         Ok(queue) => {
