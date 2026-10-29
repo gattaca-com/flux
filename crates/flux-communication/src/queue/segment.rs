@@ -3,8 +3,9 @@
 //! Every open of a queue directory's flinks holds an exclusive `flock` on the
 //! directory, so validation, replacement and creation never interleave across
 //! processes or threads. A segment that fails validation is unlinked and
-//! replaced, unless other processes still map it: replacing it would cut them
-//! off from the queue, so the open panics and names them instead.
+//! replaced. Other processes that still map it keep using the old segment, cut
+//! off from the queue, unless [`MappedQueueReplacement::Panic`] is set: then
+//! the open panics and names them instead.
 //!
 //! Finding the processes that map a segment needs `/proc` and locks on shm
 //! objects, which only Linux has; elsewhere a mismatched segment is replaced
@@ -21,12 +22,41 @@ use std::{
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use shared_memory::{ShmemConf, ShmemError};
 
 use super::{QueueHeader, QueueIdentity};
 use crate::error::QueueError;
+
+/// What opening a queue does with a segment that fails validation while other
+/// processes still map it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MappedQueueReplacement {
+    /// Replace it and log the processes left on the old segment.
+    #[default]
+    Replace = 0,
+    /// Panic, naming the processes that map it.
+    Panic = 1,
+}
+
+static MAPPED_QUEUE_REPLACEMENT: AtomicU8 = AtomicU8::new(MappedQueueReplacement::Replace as u8);
+
+/// Sets, for this whole process, what opening a queue does with a segment that
+/// fails validation while other processes still map it.
+pub fn set_mapped_queue_replacement(replacement: MappedQueueReplacement) {
+    MAPPED_QUEUE_REPLACEMENT.store(replacement as u8, Ordering::Relaxed);
+}
+
+fn mapped_queue_replacement() -> MappedQueueReplacement {
+    if MAPPED_QUEUE_REPLACEMENT.load(Ordering::Relaxed) == MappedQueueReplacement::Panic as u8 {
+        MappedQueueReplacement::Panic
+    } else {
+        MappedQueueReplacement::Replace
+    }
+}
 
 /// The file naming the shm object behind a queue.
 #[derive(Clone, Copy)]
@@ -214,33 +244,51 @@ impl Segment {
     }
 
     /// Unlinks this segment, which `flink` names as the object `os_id`, so a
-    /// new one can take its place. Panics, naming them, while other processes
-    /// map it: they would keep using the old segment, cut off from the queue.
+    /// new one can take its place. Other processes that map it keep using the
+    /// old segment, cut off from the queue; with
+    /// [`MappedQueueReplacement::Panic`] this panics and names them instead.
     fn remove<T>(self, flink: Flink, os_id: &str, reason: &QueueError) {
         let previous =
             self.identity().map_or_else(|| "no queue identity".to_owned(), |p| p.to_string());
         // Unmapped first, so the scan only finds other mappings.
         let object = self.into_file();
-        let mappers = Mappers::of(os_id)
-            .unwrap_or_else(|e| panic!("couldn't look for processes mapping queue {flink}: {e}"));
-        // Kept mappings hold a shared flock on their object (see `Segment::keep`),
-        // which also reveals processes whose maps are unreadable. Off Linux shm
-        // objects cannot be locked.
-        let locked_by_others =
-            unsafe { libc::flock(object.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 && {
-                let e = io::Error::last_os_error();
-                match e.raw_os_error() {
-                    Some(libc::EWOULDBLOCK) => true,
-                    Some(libc::ENOTSUP) => false,
-                    _ => panic!("couldn't check queue {flink} for other mappers: {e}"),
+        let mapped_by_others = Mappers::of(os_id).and_then(|mappers| {
+            // Kept mappings hold a shared flock on their object (see `Segment::keep`),
+            // which also reveals processes whose maps are unreadable. Off Linux shm
+            // objects cannot be locked.
+            let locked_by_others =
+                unsafe { libc::flock(object.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 && {
+                    let e = io::Error::last_os_error();
+                    match e.raw_os_error() {
+                        Some(libc::EWOULDBLOCK) => true,
+                        Some(libc::ENOTSUP) => false,
+                        _ => return Err(e),
+                    }
+                };
+            Ok((!mappers.0.is_empty() || locked_by_others).then_some(mappers))
+        });
+        let replacement = mapped_queue_replacement();
+        match mapped_by_others {
+            Ok(None) => {}
+            Ok(Some(mappers)) => match replacement {
+                MappedQueueReplacement::Panic => panic!(
+                    "can't replace queue {flink} for {} ({reason}): it is still mapped by \
+                     {mappers}. Stop them first. The queue's segment has {previous}",
+                    std::any::type_name::<T>()
+                ),
+                MappedQueueReplacement::Replace => tracing::warn!(
+                    "queue {flink} is still mapped by {mappers}, left on its old segment"
+                ),
+            },
+            Err(e) => match replacement {
+                MappedQueueReplacement::Panic => {
+                    panic!("couldn't look for processes mapping queue {flink}: {e}")
                 }
-            };
-        assert!(
-            mappers.0.is_empty() && !locked_by_others,
-            "can't replace queue {flink} for {} ({reason}): it is still mapped by {mappers}. \
-             Stop them first. The queue's segment has {previous}",
-            std::any::type_name::<T>()
-        );
+                MappedQueueReplacement::Replace => {
+                    tracing::warn!("couldn't look for processes mapping queue {flink}: {e}");
+                }
+            },
+        }
         flink.unlink(os_id);
         tracing::warn!("replacing queue {flink} ({reason}); old segment: {previous}");
     }
