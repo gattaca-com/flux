@@ -203,6 +203,29 @@ fn leaf_impl(last: &Ident, name_tokens: &TokenStream2) -> TokenStream2 {
                     None
                 }
             }
+            fn decompress_blob(
+                blob: &::flux_versioned_types::Blob,
+                payload: &mut ::flux_versioned_types::Scratch,
+            ) -> Option<::core::result::Result<(), ::flux_versioned_types::DecodeError>> {
+                if blob.type_name() == #name_tokens && blob.is::<Self>() {
+                    Some(blob.decompress_payload::<Self>(payload))
+                } else {
+                    None
+                }
+            }
+            fn decode_blob_range_into<F: FnMut(::flux::timing::InternalMessage<Self>)>(
+                blob: &::flux_versioned_types::Blob,
+                payload: &::flux_versioned_types::Scratch,
+                start: usize,
+                n: usize,
+                f: F,
+            ) -> Option<::core::result::Result<(), ::flux_versioned_types::DecodeError>> {
+                if blob.type_name() == #name_tokens && blob.is::<Self>() {
+                    Some(blob.decode_range_into::<Self, F>(payload, start, n, f))
+                } else {
+                    None
+                }
+            }
         }
     }
 }

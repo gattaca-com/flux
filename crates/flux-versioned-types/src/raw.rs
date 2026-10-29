@@ -277,12 +277,66 @@ impl Blob {
     pub fn decode_into<U: Versioned, T: Versioned, F: FnMut(InternalMessage<T>)>(
         &self,
         scratch: &mut Scratch,
-        mut f: F,
+        f: F,
     ) -> Result<U, DecodeError> {
         if !self.is::<T>() {
             return Err(DecodeError::UnknownTypeHash(self.header.type_hash));
         }
         let meta = self.user_metadata::<U>()?;
+        self.decompress_payload::<T>(scratch)?;
+        self.decode_range_into(scratch, 0, self.header.n_messages as usize, f)?;
+        Ok(meta)
+    }
+
+    /// Decompresses the messages into `payload` once, for
+    /// [`decode_range_into`](Self::decode_range_into) to decode a few at a
+    /// time.
+    pub fn decompress_payload<T: Versioned>(
+        &self,
+        payload: &mut Scratch,
+    ) -> Result<(), DecodeError> {
+        let layout = self.layout::<T>()?;
+        payload.decompress(self.compressed(), layout.len)
+    }
+
+    /// Messages `start..start + n`, from the `payload`
+    /// [`decompress_payload`](Self::decompress_payload) filled. Nothing reaches
+    /// `f` on error.
+    pub fn decode_range_into<T: Versioned, F: FnMut(InternalMessage<T>)>(
+        &self,
+        payload: &Scratch,
+        start: usize,
+        n: usize,
+        mut f: F,
+    ) -> Result<(), DecodeError> {
+        let layout = self.layout::<T>()?;
+        let total = self.header.n_messages as usize;
+        let bytes = payload.as_bytes();
+        if bytes.len() != layout.len {
+            return Err(DecodeError::LengthMismatch { expected: layout.len, got: bytes.len() });
+        }
+        let Some(end) = start.checked_add(n).filter(|&end| end <= total) else {
+            return Err(DecodeError::TooShort { needed: start.saturating_add(n), got: total });
+        };
+        let (ts_bytes, rest) = bytes.split_at(layout.ts_len);
+        let leaf_bytes = &rest[layout.leaf_off - layout.ts_len..]
+            [start * layout.leaf_size..end * layout.leaf_size];
+        let ts = size_of::<TrackingTimestampWire>();
+        let mut stamps = ref_timestamps(&ts_bytes[start * ts..end * ts], n)?.iter();
+        let now = IngestionTime::now();
+        T::decode_versions_each(self.header.type_hash, leaf_bytes, n, |leaf| {
+            if let Some(stamp) = stamps.next() {
+                f(InternalMessage::new(stamp.to_tracking_timestamp_at(now), leaf));
+            }
+        })
+    }
+
+    /// Where the timestamps and leaves sit in the decompressed messages,
+    /// checked against the header.
+    fn layout<T: Versioned>(&self) -> Result<Layout, DecodeError> {
+        if !self.is::<T>() {
+            return Err(DecodeError::UnknownTypeHash(self.header.type_hash));
+        }
         // Untrusted header: pin `decompressed_len` before allocating.
         let n = u64::from(self.header.n_messages);
         let leaf_size = T::version_size(self.header.type_hash)
@@ -299,20 +353,20 @@ impl Blob {
                 got: usize::try_from(self.header.decompressed_len).unwrap_or(usize::MAX),
             });
         }
-        scratch.decompress(self.compressed(), expected as usize)?;
-        let bytes = scratch.as_bytes();
-        let (ts_bytes, rest) = bytes.split_at(ts_len as usize);
-        let leaf_bytes = &rest[leaf_off as usize - ts_len as usize..];
-        let stamps = ref_timestamps(ts_bytes, n as usize)?;
-        let mut stamps = stamps.iter();
-        let now = IngestionTime::now();
-        T::decode_versions_each(self.header.type_hash, leaf_bytes, n as usize, |leaf| {
-            if let Some(stamp) = stamps.next() {
-                f(InternalMessage::new(stamp.to_tracking_timestamp_at(now), leaf));
-            }
-        })?;
-        Ok(meta)
+        Ok(Layout {
+            ts_len: ts_len as usize,
+            leaf_off: leaf_off as usize,
+            leaf_size: leaf_size as usize,
+            len: expected as usize,
+        })
     }
+}
+
+struct Layout {
+    ts_len: usize,
+    leaf_off: usize,
+    leaf_size: usize,
+    len: usize,
 }
 
 fn ref_timestamps(bytes: &[u8], n: usize) -> Result<&[TrackingTimestampWire], DecodeError> {

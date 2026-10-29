@@ -42,6 +42,33 @@ impl Kept<'_> {
             }
         }
     }
+
+    fn decompress_step(&self) -> Tokens {
+        let ty = self.ty;
+        quote! {
+            if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decompress_blob(
+                blob,
+                payload,
+            ) {
+                return Some(found);
+            }
+        }
+    }
+
+    fn decode_range_step(&self) -> Tokens {
+        let (v, ty) = (self.variant, self.ty);
+        quote! {
+            if let Some(found) = <#ty as ::flux_versioned_types::HasVersionedLeaves>::decode_blob_range_into(
+                blob,
+                payload,
+                start,
+                n,
+                |msg| f(msg.map(Self::#v)),
+            ) {
+                return Some(found);
+            }
+        }
+    }
 }
 
 fn parse_variants(data: &syn::DataEnum) -> syn::Result<(Vec<Kept<'_>>, Vec<Skipped<'_>>)> {
@@ -114,6 +141,8 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
         quote! { #names.len() }
     });
     let decode_steps = kept.iter().map(Kept::decode_step);
+    let decompress_steps = kept.iter().map(Kept::decompress_step);
+    let decode_range_steps = kept.iter().map(Kept::decode_range_step);
     // `From` only for field types that appear once; a repeated type has no
     // single variant to map to.
     let type_key = |ty: &syn::Type| quote! { #ty }.to_string();
@@ -174,6 +203,21 @@ fn generate(input: &DeriveInput) -> syn::Result<Tokens> {
                 mut f: F,
             ) -> Option<::core::result::Result<U, ::flux_versioned_types::DecodeError>> {
                 #(#decode_steps)*
+                None
+            }
+            fn decompress_blob(blob: &::flux_versioned_types::Blob, payload: &mut ::flux_versioned_types::Scratch)
+                -> Option<::core::result::Result<(), ::flux_versioned_types::DecodeError>> {
+                #(#decompress_steps)*
+                None
+            }
+            fn decode_blob_range_into<F: FnMut(::flux::timing::InternalMessage<Self>)>(
+                blob: &::flux_versioned_types::Blob,
+                payload: &::flux_versioned_types::Scratch,
+                start: usize,
+                n: usize,
+                mut f: F,
+            ) -> Option<::core::result::Result<(), ::flux_versioned_types::DecodeError>> {
+                #(#decode_range_steps)*
                 None
             }
         }
