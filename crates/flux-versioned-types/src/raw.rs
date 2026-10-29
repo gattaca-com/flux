@@ -321,7 +321,8 @@ impl Blob {
         let (ts_bytes, rest) = bytes.split_at(layout.ts_len);
         let leaf_bytes = &rest[layout.leaf_off - layout.ts_len..]
             [start * layout.leaf_size..end * layout.leaf_size];
-        let mut stamps = ref_timestamps(ts_bytes, total)?[start..end].iter();
+        let ts = size_of::<TrackingTimestampWire>();
+        let mut stamps = ref_timestamps(&ts_bytes[start * ts..end * ts], n)?.iter();
         let now = IngestionTime::now();
         T::decode_versions_each(self.header.type_hash, leaf_bytes, n, |leaf| {
             if let Some(stamp) = stamps.next() {
