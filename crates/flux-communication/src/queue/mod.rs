@@ -58,6 +58,7 @@ mod segment;
 use flux_timing::Nanos;
 use flux_utils::{ArrayStr, safe_panic};
 pub(crate) use segment::Flink;
+pub use segment::{MappedQueueReplacement, set_mapped_queue_replacement};
 use type_hash::TypeHash;
 
 use crate::{
