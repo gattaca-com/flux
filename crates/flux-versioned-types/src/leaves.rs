@@ -72,6 +72,21 @@ pub trait HasVersionedLeaves: Copy {
             meta
         }))
     }
+
+    /// Decompresses `blob`'s messages into `payload` for
+    /// [`decode_blob_range_into`](Self::decode_blob_range_into); `None` as for
+    /// [`decode_blob`](Self::decode_blob).
+    fn decompress_blob(blob: &Blob, payload: &mut Scratch) -> Option<Result<(), DecodeError>>;
+
+    /// Messages `start..start + n` of `blob`, from the `payload`
+    /// [`decompress_blob`](Self::decompress_blob) filled.
+    fn decode_blob_range_into<F: FnMut(InternalMessage<Self>)>(
+        blob: &Blob,
+        payload: &Scratch,
+        start: usize,
+        n: usize,
+        f: F,
+    ) -> Option<Result<(), DecodeError>>;
 }
 
 pub const fn concat_names<const N: usize>(parts: &[&'static [&'static str]]) -> [&'static str; N] {
