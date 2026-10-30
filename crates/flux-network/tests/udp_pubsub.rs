@@ -697,6 +697,71 @@ fn udp_disconnect_when_drained_waits_for_acks() {
 }
 
 #[test]
+fn udp_a_draining_subscriber_gets_nothing_newer() {
+    let addr = free_addr();
+    let mut server = Publisher::new(lan());
+    let mut draining = Subscriber::new(lan());
+    let mut live = Subscriber::new(lan());
+    let (drained, _) = subscribe_pair(&mut server, &mut draining, addr);
+    let live_token = live.subscribe(addr).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !live.is_subscribed(live_token) {
+        assert!(Instant::now() < deadline, "second subscriber");
+        server.poll_with(|_| {});
+        live.poll_with(|_| {});
+    }
+    assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"old")), 2);
+    assert!(server.disconnect_when_drained(drained));
+    assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"new")), 1);
+
+    let mut from_draining = Vec::new();
+    let mut from_live = Vec::new();
+    let mut unsubscribed = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !unsubscribed || from_live.len() < 2 {
+        assert!(Instant::now() < deadline, "drain with a live subscriber");
+        draining.poll_with(messages(&mut from_draining));
+        live.poll_with(messages(&mut from_live));
+        server.poll_with(|e| unsubscribed |= matches!(e, PublisherEvent::Unsubscribed { .. }));
+        thread::sleep(Duration::from_micros(50));
+    }
+    assert_eq!(from_draining, [b"old".to_vec()]);
+    assert_eq!(from_live, [b"old".to_vec(), b"new".to_vec()]);
+}
+
+#[test]
+fn udp_an_exhausted_token_range_refuses_subscribers() {
+    let addr = free_addr();
+    let mut poll = mio::Poll::new().unwrap();
+    let mut events = mio::Events::with_capacity(64);
+    // The listener and one subscriber.
+    let mut server =
+        Publisher::with_external_poll(lan(), poll.registry().try_clone().unwrap(), 0..2);
+    server.listen(addr).unwrap();
+    let mut first = Subscriber::new(lan());
+    let mut second = Subscriber::new(lan());
+    let first_token = first.subscribe(addr).unwrap();
+    let second_token = second.subscribe(addr).unwrap();
+    let mut joined = 0;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let mut on_server = |e: PublisherEvent<'_>| {
+            joined += usize::from(matches!(e, PublisherEvent::Subscribed { .. }));
+        };
+        server.pre_poll(&mut on_server);
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(1))).unwrap();
+        for event in &events {
+            server.handle_event(event, &mut on_server);
+        }
+        server.post_poll(&mut on_server);
+        first.poll_with(|_| {});
+        second.poll_with(|_| {});
+    }
+    assert_eq!(joined, 1);
+    assert_ne!(first.is_subscribed(first_token), second.is_subscribed(second_token));
+}
+
+#[test]
 fn udp_listener_ignores_disconnect_and_remove_drops_its_subscribers() {
     let addr = free_addr();
     let mut server = Publisher::new(lan());

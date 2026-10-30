@@ -89,12 +89,16 @@ impl Subscription {
     }
 
     fn send_hello(&mut self, msg: &[u8], now: Instant) -> SendOutcome {
-        let interval = (self.initial_rto.0 << self.hello_backoff.min(6)).min(self.max_rto.0);
-        self.hello_due = now + Duration(interval);
-        self.hello_backoff = self.hello_backoff.saturating_add(1);
         let n = wire::hello(&mut self.ctrl, self.session, msg);
         self.last_send = now;
-        send_datagram(&self.socket.udp, self.addr, &self.ctrl[..n])
+        let outcome = send_datagram(&self.socket.udp, self.addr, &self.ctrl[..n]);
+        // Not sent: retried on the next tick.
+        if outcome == SendOutcome::Done {
+            let interval = (self.initial_rto.0 << self.hello_backoff.min(6)).min(self.max_rto.0);
+            self.hello_due = now + Duration(interval);
+            self.hello_backoff = self.hello_backoff.saturating_add(1);
+        }
+        outcome
     }
 
     fn on_hello_ack(&mut self, publisher: u32, subscriber: u32, join: u64) -> bool {
@@ -140,9 +144,10 @@ impl Subscription {
         let header: &mut [u8; ACK_HEADER] = (&mut self.ctrl[..ACK_HEADER]).try_into().unwrap();
         wire::ack_header(header, publisher, self.session, self.inbound.ack_next());
         let n = self.inbound.write_bitmap(n_bits, &mut self.ctrl[ACK_HEADER..]);
-        self.ack_due = false;
         self.last_send = now;
-        send_datagram(&self.socket.udp, self.addr, &self.ctrl[..ACK_HEADER + n])
+        let outcome = send_datagram(&self.socket.udp, self.addr, &self.ctrl[..ACK_HEADER + n]);
+        self.ack_due = outcome == SendOutcome::WouldBlock;
+        outcome
     }
 
     fn tick(&mut self, msg: &[u8], now: Instant) -> SendOutcome {
@@ -188,7 +193,7 @@ impl SubscriberState {
     }
 
     pub(super) fn subscribe(&mut self, registry: &Registry, addr: SocketAddr) -> io::Result<Token> {
-        let token = self.tokens.allocate();
+        let token = self.tokens.allocate().ok_or_else(super::token_range_exhausted)?;
         let socket =
             Socket::open(registry, unspecified(addr), token, None, self.config.socket_buf_size)?;
         let mut subscription = Subscription::new(addr, socket, &self.config);
@@ -308,9 +313,7 @@ impl SubscriberState {
         if event.is_writable() {
             subscription.socket.on_writable();
         }
-        if std::mem::take(&mut subscription.ack_due) &&
-            subscription.send_ack(now) == SendOutcome::WouldBlock
-        {
+        if subscription.ack_due && subscription.send_ack(now) == SendOutcome::WouldBlock {
             subscription.socket.arm_writable(registry);
         }
         if event.is_writable() {

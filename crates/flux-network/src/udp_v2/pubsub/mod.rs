@@ -58,11 +58,17 @@ impl TokenRange {
         Self { next: range.start, end: range.end }
     }
 
-    pub(crate) fn allocate(&mut self) -> Token {
-        assert!(self.next < self.end, "udp token range exhausted");
+    pub(crate) fn allocate(&mut self) -> Option<Token> {
+        if self.next == self.end {
+            return None;
+        }
         self.next += 1;
-        Token(self.next - 1)
+        Some(Token(self.next - 1))
     }
+}
+
+fn token_range_exhausted() -> io::Error {
+    io::Error::other("udp token range exhausted")
 }
 
 enum Poller {

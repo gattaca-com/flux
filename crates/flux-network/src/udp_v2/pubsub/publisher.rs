@@ -106,7 +106,7 @@ impl PublisherState {
     }
 
     pub(super) fn listen(&mut self, registry: &Registry, addr: SocketAddr) -> io::Result<Token> {
-        let token = self.tokens.allocate();
+        let token = self.tokens.allocate().ok_or_else(super::token_range_exhausted)?;
         let socket = Socket::open(
             registry,
             addr,
@@ -146,6 +146,8 @@ impl PublisherState {
 
     pub(super) fn disconnect_when_drained(&mut self, token: Token) -> bool {
         let Some(i) = self.recipients.iter().position(|r| r.token == token) else { return false };
+        // Newer messages must not join a packet it still gets.
+        self.stream.seal();
         self.recipients[i].close_at = Some(self.stream.next());
         if self.recipients[i].drained() {
             self.drop_recipient(i);
@@ -250,13 +252,13 @@ impl PublisherState {
                 self.drop_recipient(i);
             }
         }
-        // Enqueued with no one holding it, it would never be released.
-        if self.recipients.is_empty() {
+        let recipients = self.recipients.iter().filter(|r| !r.is_draining()).count();
+        // Also, enqueued with no one holding it, it would never be released.
+        if recipients == 0 {
             self.send_buffer.clear();
             return 0;
         }
         self.stream.enqueue(&mut self.send_buffer);
-        let recipients = self.recipients.iter().filter(|r| !r.is_draining()).count();
         let now = Instant::now();
         for k in 0..self.listeners.len() {
             self.pump(registry, k, now, false);
@@ -273,8 +275,10 @@ impl PublisherState {
             }
             let mut probes = if probing { self.recipients[i].out.probe_budget(now) } else { 0 };
             loop {
+                let recipient = &mut self.recipients[i];
+                let until = recipient.close_at.unwrap_or(u64::MAX);
                 let packets =
-                    self.recipients[i].out.stage(&mut self.stream, &mut self.batch, probes, now);
+                    recipient.out.stage(&mut self.stream, &mut self.batch, probes, until, now);
                 probes = 0;
                 if packets != 0 {
                     self.staged.push(Staged { recipient: i, packets });
@@ -393,14 +397,20 @@ impl PublisherState {
                     self.send_reset(k, from, subscriber);
                     return;
                 }
+                if let Some(i) = index &&
+                    self.recipients[i].session == subscriber
+                {
+                    // A retry: the hello ack was lost or is still on its way.
+                    self.recipients[i].last_recv = now;
+                    let join = self.recipients[i].join;
+                    self.send_hello_ack(k, from, subscriber, join);
+                    return;
+                }
+                let Some(token) = self.tokens.allocate() else {
+                    warn!(addr = %from, "udp token range exhausted, subscriber refused");
+                    return;
+                };
                 if let Some(i) = index {
-                    if self.recipients[i].session == subscriber {
-                        // A retry: the hello ack was lost or is still on its way.
-                        self.recipients[i].last_recv = now;
-                        let join = self.recipients[i].join;
-                        self.send_hello_ack(k, from, subscriber, join);
-                        return;
-                    }
                     let old = self.recipients[i].token;
                     self.remove_recipient(i);
                     deliver(PublisherEvent::Unsubscribed { token: old, peer_addr: from });
@@ -408,7 +418,6 @@ impl PublisherState {
                 // The open packet may already be on its way to others.
                 self.stream.seal();
                 let join = self.stream.next();
-                let token = self.tokens.allocate();
                 self.recipients.push(Recipient {
                     addr: from,
                     token,

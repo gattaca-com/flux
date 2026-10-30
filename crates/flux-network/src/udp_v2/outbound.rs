@@ -275,11 +275,13 @@ impl Outbound {
         probes
     }
 
+    /// First sends stop at `until`.
     pub(crate) fn stage(
         &mut self,
         stream: &mut Stream,
         batch: &mut SendBatch,
         mut probes: u64,
+        until: u64,
         now: Instant,
     ) -> usize {
         debug_assert!(self.staged.is_empty());
@@ -299,7 +301,7 @@ impl Outbound {
             seq += 1;
         }
         let mut seq = self.next_send;
-        while seq < stream.next() && !batch.is_full() {
+        while seq < until.min(stream.next()) && !batch.is_full() {
             stream.put(batch, &self.to, seq, send_ts);
             self.staged.push(seq);
             seq += 1;

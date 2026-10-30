@@ -463,7 +463,8 @@ impl State {
             let mut probes = if probing { peer.out.probe_budget(now) } else { 0 };
             loop {
                 let peer = &mut self.peers[i];
-                let packets = peer.out.stage(&mut peer.stream, &mut self.batch, probes, now);
+                let packets =
+                    peer.out.stage(&mut peer.stream, &mut self.batch, probes, u64::MAX, now);
                 probes = 0;
                 if packets != 0 {
                     self.staged.push(Staged { peer: i, packets });
