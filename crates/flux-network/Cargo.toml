@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+base64.workspace = true
 byte-stable.workspace = true
 bytes.workspace = true
 flux.workspace = true
@@ -19,9 +20,11 @@ http.workspace = true
 httparse.workspace = true
 libc.workspace = true
 mio.workspace = true
+rand.workspace = true
 rustc-hash.workspace = true
 rustls = { workspace = true, optional = true }
 serde.workspace = true
+sha1.workspace = true
 tracing.workspace = true
 webpki-roots = { workspace = true, optional = true }
 wincode = { workspace = true, optional = true }

@@ -192,6 +192,10 @@ mod enabled {
             }
             self.fill(socket, buf)
         }
+        /// Whether decrypted bytes wait for the next [`Self::read_plain`].
+        pub fn has_plain(&self) -> bool {
+            self.served < self.plain.len()
+        }
         /// Pulls socket reads through the session until it yields plaintext,
         /// decrypting straight into `buf` and spilling only what will not fit.
         fn fill<R: io::Read>(&mut self, socket: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -285,6 +289,9 @@ mod disabled {
             _socket: &mut R,
             _buf: &mut [u8],
         ) -> io::Result<usize> {
+            unreachable!("the tls feature is off, so no session exists")
+        }
+        pub fn has_plain(&self) -> bool {
             unreachable!("the tls feature is off, so no session exists")
         }
     }

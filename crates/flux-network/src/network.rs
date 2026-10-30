@@ -283,6 +283,10 @@ pub struct TcpGroupConfig {
     /// the kernel and are accepted on later polls, so a burst of connections
     /// can't stall one poll. `None` accepts until the queue is empty.
     pub max_accepts_per_poll: Option<usize>,
+    /// For [`Framing::Raw`]: a poll stops reading a connection once it has
+    /// read more than this from it, and a later poll reads the rest, so a
+    /// fast peer can't hold one poll. `None` reads until the socket is empty.
+    pub max_read_bytes_per_poll: Option<usize>,
 }
 
 impl Default for TcpGroupConfig {
@@ -306,6 +310,7 @@ impl Default for TcpGroupConfig {
             replay: ReplayPolicy::Replay,
             max_backlog_frames: None,
             max_accepts_per_poll: None,
+            max_read_bytes_per_poll: None,
         }
     }
 }

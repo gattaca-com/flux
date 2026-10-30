@@ -532,6 +532,24 @@ impl ClickHouse {
             ..Default::default()
         });
         self.group = Some(group);
+        self.dial(net, group);
+    }
+
+    /// Redials every connection at `addr`. Queued requests go out on the new
+    /// connections; those in flight fail with [`Error::Disconnected`].
+    pub fn move_to(&mut self, net: &mut NetworkCore, addr: SocketAddr) {
+        self.addr = addr;
+        let Some(group) = self.group else { return };
+        for conn in self.conns.drain(..) {
+            if let Some(id) = conn.in_flight() {
+                self.outcomes.push((id, Err(Error::Disconnected)));
+            }
+            net.remove(conn.token);
+        }
+        self.dial(net, group);
+    }
+
+    fn dial(&mut self, net: &mut NetworkCore, group: Group) {
         for _ in 0..self.connections {
             let token = net.connect(group, self.addr);
             self.conns.push(Conn {
