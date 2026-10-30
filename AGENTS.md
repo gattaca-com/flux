@@ -92,6 +92,21 @@ It catches Rust public API breakage under a compatible bump. It cannot detect
 behavioral, wire-format, persistence-format, configuration, or CLI breakage,
 so those changes still require an intentionally incompatible version bump.
 
+### Versioning every change
+
+Apply the version policy to every change, not only at release time. Before a
+change is committed or merged, decide whether it breaks compatibility and put
+the result in the same commit or pull request:
+
+- Breaking change: if `workspace.package.version` on `main` is still
+  compatible with the latest release tag, bump it across the breaking
+  boundary, for example `0.9.0` to `0.10.0`. If `main` already carries an
+  unreleased breaking bump, do not bump again.
+- Compatible change: no version change is required.
+- State in the commit message or PR description whether the change is
+  breaking, and what breaks: API, behavior, wire or persistence format,
+  configuration, or CLI.
+
 ### Release process
 
 Follow [creating a version tag](README.md#creating-a-version-tag) in the README.
