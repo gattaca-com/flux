@@ -748,6 +748,134 @@ fn pending_buffer_cap_disconnects() {
 }
 
 #[test]
+fn chunked_request_bodies() {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default().with_chunked_requests();
+    server.listen(&mut net, addr).unwrap();
+    // Split mid-chunk, then a plain request pipelined behind it.
+    let parts: [&[u8]; 2] = [
+        b"POST /one HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n\x00\n",
+        b"\xff\r\n2;ext=1\r\nab\r\n0\r\nTrailer: t\r\n\r\nPOST /two HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\ntwo",
+    ];
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut replies = Vec::new();
+    let mut received = Vec::new();
+    let mut sent = 0;
+    while Instant::now() < deadline && replies.len() < 2 {
+        if sent < parts.len() {
+            client.write_all(parts[sent]).unwrap();
+            sent += 1;
+        }
+        let mut pending = Vec::new();
+        poll(&mut net, &mut server, |event| match event {
+            HttpEvent::Request { token, request } => {
+                pending.push((token, request.path.to_owned(), request.body.to_vec()));
+            }
+            HttpEvent::RequestHead { .. } => panic!("request heads are opt-in"),
+            _ => {}
+        });
+        for (token, path, body) in pending {
+            assert!(server.respond(&mut net, token, 200, &[], &body));
+            replies.push((path, body));
+        }
+        read_available(&mut client, &mut received);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(replies, [
+        ("/one".to_owned(), b"\x00\n\xffab".to_vec()),
+        ("/two".to_owned(), b"two".to_vec())
+    ]);
+}
+
+#[test]
+fn chunked_request_errors() {
+    for (request, status) in [
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n".as_slice(), 413),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(), 501),
+        // No CRLF after the data, a bare LF, a length beside the coding, and codings on HTTP/1.0.
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nab\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\na\r\n".as_slice(), 400),
+        (
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+                .as_slice(),
+            400,
+        ),
+        (b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(), 400),
+    ] {
+        let addr = unused_addr();
+        let mut net = Network::default();
+        let mut server = HttpNetwork::default().with_max_body_bytes(8).with_chunked_requests();
+        server.listen(&mut net, addr).unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(request).unwrap();
+        let mut received = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline && !read_available(&mut client, &mut received) {
+            poll(&mut net, &mut server, |_| {});
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(std::str::from_utf8(&received).unwrap().starts_with(&format!("HTTP/1.1 {status}")));
+    }
+}
+
+#[test]
+fn request_heads_come_before_their_bodies() {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default().with_request_heads();
+    server.listen(&mut net, addr).unwrap();
+    let kept: [&[u8]; 4] =
+        [b"POST /kept HTTP/1.1\r\nHo", b"st: x\r\nContent-", b"Length: 6\r\n\r\nab", b"cdef"];
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    let mut refused = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    refused.set_nonblocking(true).unwrap();
+    refused
+        .write_all(b"POST /refused HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n")
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut events = Vec::new();
+    let (mut received, mut refusal) = (Vec::new(), Vec::new());
+    let (mut sent, mut closed) = (0, false);
+    while Instant::now() < deadline && !(closed && response_len(&received).is_some()) {
+        if sent < kept.len() {
+            client.write_all(kept[sent]).unwrap();
+            sent += 1;
+        }
+        let mut answers = Vec::new();
+        poll(&mut net, &mut server, |event| match event {
+            HttpEvent::RequestHead { token, request } => {
+                events.push(format!("head {}", request.path));
+                if request.path == "/refused" {
+                    answers.push((token, 401, Vec::new()));
+                }
+            }
+            HttpEvent::Request { token, request } => {
+                events.push(format!("request {}", request.path));
+                answers.push((token, 200, request.body.to_vec()));
+            }
+            _ => {}
+        });
+        for (token, status, body) in answers {
+            assert!(server.respond(&mut net, token, status, &[], &body));
+        }
+        read_available(&mut client, &mut received);
+        closed |= read_available(&mut refused, &mut refusal);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(events.iter().filter(|e| *e == "head /refused").count(), 1);
+    events.retain(|e| e != "head /refused");
+    assert_eq!(events, ["head /kept", "request /kept"]);
+    assert!(refusal.starts_with(b"HTTP/1.1 401 "), "{}", String::from_utf8_lossy(&refusal));
+    assert!(closed, "a refused head closes its connection");
+    assert!(received.ends_with(b"abcdef"));
+}
+
+#[test]
 fn pipelined_binary_bodies() {
     let (mut net, mut server, addr) = server();
     let first = b"\x00\n\xffone";

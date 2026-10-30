@@ -1814,27 +1814,13 @@ impl FramedStream {
                         .bytes
                         .resize(INITIAL_RX_BUFFER_SIZE.min(config.max_frame_size), 0);
                 }
-                loop {
-                    match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
-                        Ok(0) => return StreamState::Disconnected,
-                        Ok(read) => {
-                            if tls.is_some() &&
-                                self.announce_tls(registry, config, timers, tls, on_message) ==
-                                    StreamState::Disconnected
-                            {
-                                return StreamState::Disconnected;
-                            }
-                            on_message(
-                                Some(RxPayload::Raw(&self.rx_buffer.bytes[..read])),
-                                Nanos::now(),
-                            );
-                        }
-                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(err) => {
-                            debug!(?err, %self.peer_addr, "tcp raw read failed");
-                            return StreamState::Disconnected;
-                        }
-                    }
+                let state = if config.max_read_bytes_per_poll.is_some() {
+                    self.read_raw::<true, _>(registry, event, config, timers, tls, on_message)
+                } else {
+                    self.read_raw::<false, _>(registry, event, config, timers, tls, on_message)
+                };
+                if state == StreamState::Disconnected {
+                    return StreamState::Disconnected;
                 }
             } else if self.direct_rx.is_some() {
                 loop {
@@ -1953,6 +1939,48 @@ impl FramedStream {
             return StreamState::Disconnected;
         }
         StreamState::Alive
+    }
+
+    fn read_raw<const BUDGETED: bool, F>(
+        &mut self,
+        registry: &Registry,
+        event: &MioEvent,
+        config: &TcpGroupConfig,
+        timers: &mut Option<NetworkTimers>,
+        tls: &mut Option<Box<Session>>,
+        on_message: &mut F,
+    ) -> StreamState
+    where
+        F: for<'a> FnMut(Option<RxPayload<'a>>, Nanos),
+    {
+        let max_read = config.max_read_bytes_per_poll.unwrap_or(usize::MAX);
+        let mut read_total = 0usize;
+        loop {
+            match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
+                Ok(0) => return StreamState::Disconnected,
+                Ok(read) => {
+                    if tls.is_some() &&
+                        self.announce_tls(registry, config, timers, tls, on_message) ==
+                            StreamState::Disconnected
+                    {
+                        return StreamState::Disconnected;
+                    }
+                    on_message(Some(RxPayload::Raw(&self.rx_buffer.bytes[..read])), Nanos::now());
+                    if BUDGETED {
+                        read_total = read_total.saturating_add(read);
+                        if read_total > max_read && self.defer_read(registry, event, tls.as_deref())
+                        {
+                            return StreamState::Alive
+                        }
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return StreamState::Alive,
+                Err(err) => {
+                    debug!(?err, %self.peer_addr, "tcp raw read failed");
+                    return StreamState::Disconnected;
+                }
+            }
+        }
     }
 
     fn announce_tls<F>(
@@ -2144,6 +2172,24 @@ impl FramedStream {
             self.writable_armed = false;
         }
         StreamState::Alive
+    }
+
+    /// Re-arms an edge-triggered socket so the next poll reads the rest; a
+    /// closing socket, or TLS holding plaintext, is read out now.
+    fn defer_read(&mut self, registry: &Registry, event: &MioEvent, tls: Option<&Session>) -> bool {
+        if event.is_error() ||
+            event.is_read_closed() ||
+            event.is_write_closed() ||
+            tls.is_some_and(Session::has_plain)
+        {
+            return false;
+        }
+        let interest = if self.writable_armed {
+            Interest::READABLE | Interest::WRITABLE
+        } else {
+            Interest::READABLE
+        };
+        registry.reregister(&mut self.socket, self.token, interest).is_ok()
     }
 
     fn arm_writable(&mut self, registry: &Registry) -> StreamState {
