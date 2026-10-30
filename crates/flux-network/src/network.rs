@@ -422,6 +422,9 @@ impl Default for UdpGroupConfig {
 /// wire v2, which packs messages into shared datagrams. Doesn't interoperate
 /// with [`UdpGroupConfig`] (v1) peers.
 ///
+/// Also configures a [`crate::udp_v2::Publisher`] or
+/// [`crate::udp_v2::Subscriber`].
+///
 /// A peer's on-connect message is delivered right after its `Accepted` or
 /// `Connected`. A connection that falls a `send_window` behind or goes silent
 /// for `peer_timeout` is lost with whatever was queued on it.

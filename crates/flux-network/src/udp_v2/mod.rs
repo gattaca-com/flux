@@ -2,7 +2,10 @@
 //! v2. Doesn't interoperate with [`crate::udp`] (v1); both run side by side
 //! until every peer is on v2.
 //!
-//! Messages are packed into a stream of packets, so a lost packet delays only
+//! One-way streams run from a [`Publisher`] to its [`Subscriber`]s, with
+//! their own wire and state machine.
+//!
+//! Both pack messages into a stream of packets, so a lost packet delays only
 //! the messages it carries.
 
 use std::{
@@ -19,12 +22,14 @@ use tracing::{debug, warn};
 mod conn;
 mod inbound;
 mod outbound;
+mod pubsub;
 mod stream;
 mod sys;
 mod telemetry;
 mod wire;
 
 pub(crate) use conn::UdpManager;
+pub use pubsub::{Publisher, PublisherEvent, Subscriber, SubscriberEvent};
 use sys::{RecvBatch, SendBatch};
 pub use telemetry::{PeerId, TelemetryEvent, TelemetryReader, UdpLatency, UdpRetransmit, UdpSend};
 
@@ -125,7 +130,7 @@ impl Socket {
         registry: &Registry,
         bind: SocketAddr,
         token: Token,
-        batch: &mut SendBatch,
+        gso: Option<&mut SendBatch>,
         buf_size: Option<usize>,
     ) -> io::Result<Self> {
         let mut socket = UdpSocket::bind(bind)?;
@@ -134,7 +139,9 @@ impl Socket {
             debug!(?err, "UDP GRO unavailable");
         }
         #[cfg(target_os = "linux")]
-        if let Err(err) = batch.enable_gso(socket.as_raw_fd()) {
+        if let Some(batch) = gso &&
+            let Err(err) = batch.enable_gso(socket.as_raw_fd())
+        {
             debug!(?err, "UDP GSO unavailable");
         }
         if let Some(size) = buf_size {

@@ -99,6 +99,11 @@ impl Stream {
         }
     }
 
+    #[inline]
+    pub(crate) fn session(&self) -> u32 {
+        self.session
+    }
+
     /// Drops everything and starts over at seq 0.
     pub(crate) fn reset(&mut self, session: u32) {
         self.release_to(self.next);
@@ -142,12 +147,17 @@ impl Stream {
         self.packets_for(len) <= self.mask + 1 - (self.next - self.base)
     }
 
-    /// Lowest base a receiver may hold for `len` more bytes to fit; `None`
+    /// Lowest base a subscriber may hold for `len` more bytes to fit; `None`
     /// if they don't fit even an empty window.
     pub(crate) fn min_base(&self, len: usize) -> Option<u64> {
         let packets = self.packets_for(len);
         let capacity = self.mask + 1;
         (packets <= capacity).then(|| (self.next + packets).saturating_sub(capacity))
+    }
+
+    #[inline]
+    pub(crate) fn seal(&mut self) {
+        self.open = false;
     }
 
     fn open_packet(&mut self) -> u64 {

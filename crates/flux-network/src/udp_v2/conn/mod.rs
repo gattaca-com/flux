@@ -155,7 +155,7 @@ impl State {
             registry,
             unspecified(addr),
             token,
-            &mut self.batch,
+            Some(&mut self.batch),
             self.config.socket_buf_size,
         ) {
             Ok(socket) => socket,
@@ -182,7 +182,13 @@ impl State {
         tokens: &mut Tokens,
     ) -> io::Result<Token> {
         let token = tokens.allocate(self.group);
-        match Socket::open(registry, addr, token, &mut self.batch, self.config.socket_buf_size) {
+        match Socket::open(
+            registry,
+            addr,
+            token,
+            Some(&mut self.batch),
+            self.config.socket_buf_size,
+        ) {
             Ok(socket) => {
                 self.endpoints.push(Endpoint { socket, listener: true });
                 Ok(token)
@@ -333,7 +339,7 @@ impl State {
     }
 
     // Copies into every connection's stream. Fan-out most likely wants a
-    // one-to-many protocol instead, which sends the same bytes to all, but
+    // pubsub `Publisher` instead, which sends the same bytes to all, but
     // maybe not.
     pub(crate) fn broadcast_with<F>(&mut self, registry: &Registry, serialise: F) -> usize
     where
@@ -457,7 +463,8 @@ impl State {
             let mut probes = if probing { peer.out.probe_budget(now) } else { 0 };
             loop {
                 let peer = &mut self.peers[i];
-                let packets = peer.out.stage(&mut peer.stream, &mut self.batch, probes, now);
+                let packets =
+                    peer.out.stage(&mut peer.stream, &mut self.batch, probes, u64::MAX, now);
                 probes = 0;
                 if packets != 0 {
                     self.staged.push(Staged { peer: i, packets });
