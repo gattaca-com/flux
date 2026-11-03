@@ -925,6 +925,76 @@ fn close_removes_listeners_too() {
 }
 
 #[test]
+fn shutdown_answers_open_requests() {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut net = Network::default();
+    // Small buffers keep most of a response queued, as in
+    // `connection_close_large_body`.
+    let mut server = HttpNetwork::default().with_socket_buf_size(1024);
+    server.listen_on(&mut net, listener).unwrap();
+    let body = vec![7; 1024 * 1024];
+    let answer = |net: &mut Network, server: &mut HttpNetwork| {
+        let mut replies = Vec::new();
+        poll(net, server, |event| {
+            if let HttpEvent::Request { token, .. } = event {
+                replies.push(token);
+            }
+        });
+        for &token in &replies {
+            assert!(server.respond(net, token, 200, &[], &body));
+        }
+        replies.len()
+    };
+    let deadline = Instant::now() + TIMEOUT;
+
+    // Answered and idle, its response still queued: closed by the shutdown
+    // once the response is out.
+    let mut answered = std::net::TcpStream::connect(addr).unwrap();
+    answered.set_nonblocking(true).unwrap();
+    answered.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    while Instant::now() < deadline && answer(&mut net, &mut server) == 0 {
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Not answered yet: kept open for its first request.
+    let mut fresh = std::net::TcpStream::connect(addr).unwrap();
+    fresh.set_nonblocking(true).unwrap();
+    while Instant::now() < deadline && server.accepted() < 2 {
+        answer(&mut net, &mut server);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(server.accepted(), 2);
+
+    server.shutdown(&mut net);
+    assert!(std::net::TcpStream::connect(addr).is_err(), "refused once the listener is gone");
+    let mut bytes = Vec::new();
+    let mut closed = false;
+    while Instant::now() < deadline && !closed {
+        answer(&mut net, &mut server);
+        closed = read_available(&mut answered, &mut bytes);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(closed);
+    assert_eq!(response_len(&bytes), Some(bytes.len()), "the whole response, then the close");
+    assert_eq!(server.accepted(), 1);
+
+    fresh.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut bytes = Vec::new();
+    let mut closed = false;
+    while Instant::now() < deadline && (!closed || server.accepted() != 0) {
+        answer(&mut net, &mut server);
+        closed |= read_available(&mut fresh, &mut bytes);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let head = bytes.windows(4).position(|b| b == b"\r\n\r\n").expect("a response head");
+    let head = std::str::from_utf8(&bytes[..head]).unwrap();
+    assert!(head.contains("Connection: close"), "{head}");
+    assert_eq!(response_len(&bytes), Some(bytes.len()));
+    assert!(closed);
+    assert_eq!(server.accepted(), 0);
+}
+
+#[test]
 fn pool_from_sends_from_local_ip() {
     let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
     let (mut net, mut server, addr) = server();

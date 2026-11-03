@@ -398,11 +398,14 @@ impl TcpManager {
     pub(crate) fn listen(
         &mut self,
         registry: &Registry,
-        addr: SocketAddr,
+        at: ListenAt,
         tokens: &mut Tokens,
     ) -> io::Result<Token> {
         let group = self.group;
-        let mut socket = bind_listener(addr, &self.config)?;
+        let mut socket = match at {
+            ListenAt::Addr(addr) => bind_listener(addr, &self.config)?,
+            ListenAt::Socket(listener) => adopt_listener(listener, &self.config)?,
+        };
         let token = tokens.allocate(group);
         if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
             tokens.retire(token);
@@ -423,7 +426,7 @@ impl TcpManager {
     pub(crate) fn listen_tls(
         &mut self,
         registry: &Registry,
-        addr: SocketAddr,
+        at: ListenAt,
         tokens: &mut Tokens,
         config: std::sync::Arc<crate::tls::ServerConfig>,
     ) -> io::Result<Token> {
@@ -436,7 +439,7 @@ impl TcpManager {
                 "TLS listeners need no early data, no connect message and byte backlog limits",
             ));
         }
-        let token = self.listen(registry, addr, tokens)?;
+        let token = self.listen(registry, at, tokens)?;
         self.listeners.last_mut().unwrap().tls = Some(config);
         Ok(token)
     }
@@ -1353,6 +1356,15 @@ impl TcpManager {
     }
 }
 
+/// Where a listener's socket comes from.
+pub(crate) enum ListenAt {
+    /// A new socket bound to the address.
+    Addr(SocketAddr),
+    /// A socket already bound and listening, such as one a service manager
+    /// kept across a restart.
+    Socket(std::net::TcpListener),
+}
+
 fn bind_listener(addr: SocketAddr, config: &TcpGroupConfig) -> io::Result<TcpListener> {
     let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     let fd = unsafe {
@@ -1389,11 +1401,41 @@ fn bind_listener(addr: SocketAddr, config: &TcpGroupConfig) -> io::Result<TcpLis
             return Err(io::Error::last_os_error());
         }
     }
+    configure_listener(&listener, config)?;
+    let (storage, len) = sockaddr(addr);
+    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Match mio's kernel-capped listener backlog on Linux.
+    if unsafe { libc::listen(fd, -1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(TcpListener::from_std(listener))
+}
+
+/// Takes over a socket that is already bound and listening. It gets the
+/// group's options and backlog as from `bind_listener`, except
+/// `SO_REUSEPORT`, which only takes effect before bind.
+fn adopt_listener(
+    listener: std::net::TcpListener,
+    config: &TcpGroupConfig,
+) -> io::Result<TcpListener> {
+    listener.set_nonblocking(true)?;
+    configure_listener(&listener, config)?;
+    // Linux applies a repeated listen() to the backlog of a listening socket.
+    if unsafe { libc::listen(listener.as_raw_fd(), -1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(TcpListener::from_std(listener))
+}
+
+fn configure_listener(listener: &std::net::TcpListener, config: &TcpGroupConfig) -> io::Result<()> {
     // Accepted sockets inherit these options, and the receive window
     // negotiated before accept(), so they are set once here, not per accept.
     if let Some(size) = config.socket_buf_size {
-        set_socket_buf_size(&listener, size);
+        set_socket_buf_size(listener, size);
     }
+    let enable: libc::c_int = 1;
     if config.nodelay &&
         unsafe {
             libc::setsockopt(
@@ -1408,18 +1450,10 @@ fn bind_listener(addr: SocketAddr, config: &TcpGroupConfig) -> io::Result<TcpLis
         return Err(io::Error::last_os_error());
     }
     if config.keepalive {
-        set_keepalive(&listener)?;
+        set_keepalive(listener)?;
     }
-    set_user_timeout(&listener, config.user_timeout_ms);
-    let (storage, len) = sockaddr(addr);
-    if unsafe { libc::bind(fd, ptr::from_ref(&storage).cast(), len) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Match mio's kernel-capped listener backlog on Linux.
-    if unsafe { libc::listen(fd, -1) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(TcpListener::from_std(listener))
+    set_user_timeout(listener, config.user_timeout_ms);
+    Ok(())
 }
 
 /// Starts a nonblocking connect to `peer_addr` from `local_ip` and an
