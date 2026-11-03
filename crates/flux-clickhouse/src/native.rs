@@ -41,17 +41,30 @@ pub(crate) fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 const COMPRESS_METHOD_LZ4: u8 = 0x82;
+const COMPRESS_METHOD_ZSTD: u8 = 0x90;
 const CHECKSUM_LEN: usize = 16;
 /// The compressed envelope header: the method byte, the envelope size
 /// including the header, and the decompressed size.
 const COMPRESSED_HEADER_LEN: usize = 9;
 
+/// The codec this client compresses its blocks with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Codec {
+    Lz4,
+    Zstd(i32),
+}
+
 /// Wraps `raw` in one compressed envelope: the checksum over the header and
-/// the payload, then the header, then the `LZ4` payload.
-pub(crate) fn compress_block(raw: &[u8]) -> Vec<u8> {
-    let payload = lz4_flex::block::compress(raw);
+/// the payload, then the header, then the payload.
+pub(crate) fn compress_block(raw: &[u8], codec: Codec) -> Vec<u8> {
+    let (method, payload) = match codec {
+        Codec::Lz4 => (COMPRESS_METHOD_LZ4, lz4_flex::block::compress(raw)),
+        Codec::Zstd(level) => {
+            (COMPRESS_METHOD_ZSTD, zstd::bulk::compress(raw, level).expect("zstd compression"))
+        }
+    };
     let mut envelope = Vec::with_capacity(COMPRESSED_HEADER_LEN + payload.len());
-    envelope.push(COMPRESS_METHOD_LZ4);
+    envelope.push(method);
     envelope.extend_from_slice(&((COMPRESSED_HEADER_LEN + payload.len()) as u32).to_le_bytes());
     envelope.extend_from_slice(&(raw.len() as u32).to_le_bytes());
     envelope.extend_from_slice(&payload);
@@ -61,12 +74,13 @@ pub(crate) fn compress_block(raw: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reads one compressed envelope, verifying the checksum before anything is
-/// trusted. `budget` caps the declared size before it is allocated; breaching
-/// it sets [`Cursor::too_large`] rather than `invalid`.
+/// Reads one compressed envelope in either codec, verifying the checksum
+/// before anything is trusted. `budget` caps the declared size before it is
+/// allocated; breaching it sets [`Cursor::too_large`] rather than `invalid`.
 pub(crate) fn read_compressed(cursor: &mut Cursor<'_>, budget: usize) -> Option<Vec<u8>> {
     let wire = cursor.bytes(CHECKSUM_LEN)?;
-    if cursor.u8()? != COMPRESS_METHOD_LZ4 {
+    let method = cursor.u8()?;
+    if method != COMPRESS_METHOD_LZ4 && method != COMPRESS_METHOD_ZSTD {
         return cursor.fail("unknown compression method")
     }
     let compressed = cursor.u32()? as usize;
@@ -80,14 +94,19 @@ pub(crate) fn read_compressed(cursor: &mut Cursor<'_>, budget: usize) -> Option<
     }
     let payload = cursor.bytes(payload_len)?;
     let mut envelope = Vec::with_capacity(compressed);
-    envelope.push(COMPRESS_METHOD_LZ4);
+    envelope.push(method);
     envelope.extend_from_slice(&(compressed as u32).to_le_bytes());
     envelope.extend_from_slice(&(original as u32).to_le_bytes());
     envelope.extend_from_slice(payload);
     if wire != checksum(&envelope) {
         return cursor.fail("compressed block failed its checksum")
     }
-    if let Ok(raw) = lz4_flex::block::decompress(payload, original) {
+    let raw = if method == COMPRESS_METHOD_LZ4 {
+        lz4_flex::block::decompress(payload, original).ok()
+    } else {
+        zstd::bulk::decompress(payload, original).ok().filter(|raw| raw.len() == original)
+    };
+    if let Some(raw) = raw {
         return Some(raw)
     }
     cursor.fail("compressed block does not decompress")
@@ -104,9 +123,9 @@ fn checksum(envelope: &[u8]) -> [u8; CHECKSUM_LEN] {
 }
 
 /// Appends `raw` as one block, compressed when the query negotiated it.
-pub(crate) fn push_block(out: &mut Vec<u8>, raw: &[u8], compressed: bool) {
-    if compressed {
-        out.extend_from_slice(&compress_block(raw));
+pub(crate) fn push_block(out: &mut Vec<u8>, raw: &[u8], codec: Option<Codec>) {
+    if let Some(codec) = codec {
+        out.extend_from_slice(&compress_block(raw, codec));
     } else {
         out.extend_from_slice(raw);
     }
