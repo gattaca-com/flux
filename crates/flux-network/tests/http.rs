@@ -721,6 +721,52 @@ fn idle_timeout_disconnects() {
 }
 
 #[test]
+fn idle_timeout_spares_pending_request() {
+    let addr = unused_addr();
+    let idle = Duration::from_millis(200);
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default().with_idle_timeout(idle.into());
+    server.listen(&mut net, addr).unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+
+    // Every request is answered: other local processes may probe the port.
+    let mut pending = Vec::new();
+    let mut response = Vec::new();
+    let held_until = Instant::now() + 2 * idle;
+    while Instant::now() < held_until {
+        poll(&mut net, &mut server, |event| {
+            if let HttpEvent::Request { token, .. } = event {
+                pending.push(token);
+            }
+        });
+        assert!(!read_available(&mut client, &mut response), "closed while answering");
+        thread::sleep(Duration::from_millis(1));
+    }
+    for token in pending {
+        server.respond(&mut net, token, 200, &[], b"late");
+    }
+
+    let quiet_until = Instant::now() + idle / 2;
+    while Instant::now() < quiet_until {
+        poll(&mut net, &mut server, |_| {});
+        assert!(!read_available(&mut client, &mut response), "closed before an idle period");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(response.ends_with(b"late"));
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut closed = false;
+    while Instant::now() < deadline && !closed {
+        poll(&mut net, &mut server, |_| {});
+        closed = read_available(&mut client, &mut response);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(closed);
+}
+
+#[test]
 fn pending_buffer_cap_disconnects() {
     let addr = unused_addr();
     let mut net = Network::default();
