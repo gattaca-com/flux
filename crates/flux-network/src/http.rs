@@ -446,21 +446,23 @@ impl HttpNetwork {
     }
     /// Stops serving without cutting off a request. Removes the listeners,
     /// and closes every accepted connection that has written a response and
-    /// has no further request bytes. Every later response closes its
-    /// connection once written. A connection that has not written a response
-    /// yet stays open, since its client may still be sending its first
-    /// request. [`Self::accepted`] reaches zero once every client has been
-    /// answered. Drive the network until then, or until a deadline.
+    /// has no further request bytes, once that response has gone out. Every
+    /// later response closes its connection once written. A connection that has
+    /// not written a response yet stays open, since its client may still be
+    /// sending its first request. [`Self::accepted`] reaches zero once
+    /// every client has been answered. Drive the network until then, or
+    /// until a deadline.
     pub fn shutdown(&mut self, net: &mut NetworkCore) {
         self.shutting_down = true;
         for token in self.listeners.drain(..) {
             net.remove(token);
         }
-        for conn in &self.conns {
+        for conn in &mut self.conns {
             if let Role::Accepted { state: State::Idle, answered: true, .. } = conn.role &&
                 conn.buf.is_empty()
             {
-                net.disconnect(conn.token);
+                conn.role.set_accepted_state(State::Draining);
+                net.disconnect_when_drained(conn.token);
             }
         }
     }
