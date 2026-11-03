@@ -10,7 +10,10 @@ use std::{
 use bytes::{BufMut, BytesMut};
 use flux_timing::Nanos;
 
-use super::{Code, GrpcConfig, GrpcServer, MessageDecoder, Request, Response, Route, Status};
+use super::{
+    ClientEvent, Code, GrpcClient, GrpcClientConfig, GrpcConfig, GrpcServer, MessageDecoder,
+    Request, Response, Route, Status,
+};
 use crate::{
     Network, PayloadBuf,
     http2::{self, Decoder, Payload, encode_frame, flags, hpack, kind},
@@ -291,6 +294,44 @@ fn unary_calls_reply_and_reject() {
 
     assert_eq!(client.stream(5)[0].field(":status"), Some("415"));
     assert_eq!(client.stream(7)[0].field("grpc-status"), Some("13"));
+}
+
+#[test]
+fn client_calls_reply_and_finish_with_their_status() {
+    let mut harness = Harness::new(GrpcConfig::default());
+    let mut net = Network::default();
+    let mut client = GrpcClient::new(&mut net, GrpcClientConfig::default()).unwrap();
+    let channel = client.connect(&mut net, harness.addr, "localhost");
+    let mut metadata = http::HeaderMap::new();
+    metadata.insert("authorization", http::HeaderValue::from_static("Bearer token"));
+    let unary = client.rpc(channel, "/test.Echo/Unary", &metadata).unwrap();
+    let missing = client.rpc(channel, "/test.Echo/Missing", &metadata).unwrap();
+    // Past the initial window, so the request waits for the server's credit.
+    let large = vec![7; 200_000];
+
+    let (mut calls, mut messages, mut finished) = (None, Vec::new(), Vec::new());
+    let end = Instant::now() + TIMEOUT;
+    while finished.len() < 3 {
+        assert!(Instant::now() < end, "timed out; finished {finished:?}");
+        harness.server.poll(&mut harness.net, echo);
+        let mut connected = false;
+        client.poll(&mut net, |event| match event {
+            ClientEvent::Connected(_) => connected = true,
+            ClientEvent::Message { call, message } => messages.push((call, message.to_vec())),
+            ClientEvent::Finished { call, status } => finished.push((call, status)),
+            ClientEvent::Disconnected(_) => panic!("disconnected"),
+        });
+        if connected {
+            let mut call = |rpc, message| client.call(rpc, message).unwrap();
+            calls = Some([call(&unary, &b"hi"[..]), call(&missing, b""), call(&unary, &large)]);
+        }
+    }
+    let [hi, unknown, large_call] = calls.unwrap();
+    assert_eq!(messages, [(hi, b"hi".to_vec()), (large_call, large)]);
+    let status = |call| finished.iter().find(|(c, _)| *c == call).map(|(_, s)| s.clone());
+    assert_eq!(status(hi), Some(Status::ok()));
+    assert_eq!(status(large_call), Some(Status::ok()));
+    assert_eq!(status(unknown), Some(Status::new(Code::Unimplemented, "unknown method")));
 }
 
 #[test]

@@ -12,9 +12,9 @@ use super::{
 };
 
 pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const INITIAL_WINDOW: i64 = 65_535;
-const MAX_WINDOW: i64 = 0x7fff_ffff;
-const MAX_HEADER_FIELDS: usize = 256;
+pub(super) const INITIAL_WINDOW: i64 = 65_535;
+pub(super) const MAX_WINDOW: i64 = 0x7fff_ffff;
+pub(super) const MAX_HEADER_FIELDS: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Http2Config {
@@ -902,7 +902,7 @@ fn request_head(headers: &[hpack::Header]) -> Result<RequestHead<'_>, Error> {
     })
 }
 
-fn regular_headers(headers: &[hpack::Header]) -> Result<Fields<'_>, Error> {
+pub(super) fn regular_headers(headers: &[hpack::Header]) -> Result<Fields<'_>, Error> {
     if !headers.iter().all(|header| matches!(header, hpack::Header::Field { .. })) {
         return Err(Error::Protocol);
     }
@@ -911,7 +911,9 @@ fn regular_headers(headers: &[hpack::Header]) -> Result<Fields<'_>, Error> {
     Ok(fields)
 }
 
-fn validate_fields<'a>(fields: impl Iterator<Item = (&'a str, &'a [u8])>) -> Result<(), Error> {
+pub(super) fn validate_fields<'a>(
+    fields: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> Result<(), Error> {
     for (name, value) in fields {
         if matches!(
             name,
@@ -927,11 +929,13 @@ fn validate_fields<'a>(fields: impl Iterator<Item = (&'a str, &'a [u8])>) -> Res
     Ok(())
 }
 
-fn map_fields(fields: &HeaderMap) -> impl Iterator<Item = (&str, &[u8])> {
+pub(super) fn map_fields(fields: &HeaderMap) -> impl Iterator<Item = (&str, &[u8])> {
     fields.iter().map(|(name, value)| (name.as_str(), value.as_bytes()))
 }
 
-fn content_length<'a>(values: impl Iterator<Item = &'a [u8]>) -> Result<Option<u64>, Error> {
+pub(super) fn content_length<'a>(
+    values: impl Iterator<Item = &'a [u8]>,
+) -> Result<Option<u64>, Error> {
     let mut length = None;
     for value in values {
         if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {

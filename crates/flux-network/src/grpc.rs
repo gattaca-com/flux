@@ -1,4 +1,5 @@
-//! Caller-driven gRPC server for unary and server-streaming methods.
+//! Caller-driven gRPC server and client for unary and server-streaming
+//! methods.
 //!
 //! [`GrpcServer`] runs on a Flux [`Network`](crate::Network) group: forward its
 //! events, then call [`GrpcServer::drive`] each iteration. The route callback
@@ -16,19 +17,53 @@
 //! Client-streaming, bidirectional calls, compression and `grpc-timeout`
 //! enforcement are not supported.
 //!
+//! [`GrpcClient`] calls servers over channels it redials on its own Flux
+//! network group, driven the same way. Its events report each response
+//! message and the final [`Status`] of every call.
+//!
 //! Wire format: <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>.
 
+mod client;
 mod server;
 #[cfg(test)]
 mod tests;
 use std::{borrow::Cow, fmt, net::SocketAddr};
 
 use bytes::BytesMut;
+pub use client::{Call, Channel, ClientEvent, GrpcClient, GrpcClientConfig, Rpc};
 use flux_timing::{Duration, IngestionTime};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 pub use server::{Closed, GrpcConfig, GrpcServer, Route};
 
-use crate::http2::{Fields, RequestHead};
+use crate::http2::{self, FRAME_HEADER_LEN, Fields, RequestHead};
+
+/// Output waits in HTTP/2 while TCP holds this many unsent bytes, so slow
+/// peers are bounded by the HTTP/2 send buffer and per-call buffers.
+const TCP_BACKLOG: usize = 64 * 1024;
+/// An incomplete frame is retained between reads; anything longer than the
+/// largest frame we advertise is a protocol error.
+const MAX_PARTIAL_INPUT: usize = http2::DEFAULT_MAX_FRAME_SIZE as usize + FRAME_HEADER_LEN;
+
+fn prefix(length: usize) -> [u8; 5] {
+    let length = u32::try_from(length).expect("gRPC messages are below 4 GiB");
+    let mut prefix = [0; 5];
+    prefix[1..].copy_from_slice(&length.to_be_bytes());
+    prefix
+}
+
+/// Bytes still needed to complete the frame that starts `input`. Leftover
+/// input always starts at a frame: HTTP/2 consumes partial prefaces itself.
+fn missing(input: &[u8]) -> Result<usize, http2::Error> {
+    let Some(header) = input.get(..FRAME_HEADER_LEN) else {
+        return Ok(FRAME_HEADER_LEN - input.len());
+    };
+    let frame = FRAME_HEADER_LEN +
+        (usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]));
+    if frame > MAX_PARTIAL_INPUT {
+        return Err(http2::Error::FrameSize);
+    }
+    Ok(frame - input.len())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
