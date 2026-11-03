@@ -305,7 +305,9 @@ impl HttpNetwork {
         self
     }
     /// Sets the idle timeout for accepted connections; outbound endpoints
-    /// remain persistent.
+    /// remain persistent. A connection whose request awaits
+    /// [`Self::respond`] is not idle, and its idle time restarts at the
+    /// response.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.idle_timeout = Some(idle_timeout);
@@ -561,6 +563,7 @@ impl HttpNetwork {
                 .iter()
                 .filter(|conn| {
                     matches!(conn.role, Role::Accepted { .. }) &&
+                        !matches!(conn.role.accepted_state(), State::Pending) &&
                         conn.last_activity.elapsed() >= timeout
                 })
                 .map(|conn| conn.token)
@@ -1162,6 +1165,7 @@ impl HttpNetwork {
             }
         });
         if ok {
+            self.conns[i].last_activity = Instant::now();
             self.conns[i].role.set_accepted_answered();
             self.conns[i].dirty = !close && !self.conns[i].buf.is_empty();
             self.conns[i].role.set_accepted_state(if close {
