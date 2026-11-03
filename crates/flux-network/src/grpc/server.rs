@@ -7,20 +7,14 @@ use mio::Token;
 use rustc_hash::FxHashMap;
 
 use super::{
-    Code, MessageDecoder, Metadata, Request, Response, Status, Stream, add_response_headers,
-    parse_request, response_headers,
+    Code, MessageDecoder, Metadata, Request, Response, Status, Stream, TCP_BACKLOG,
+    add_response_headers, missing, parse_request, prefix, response_headers,
 };
 use crate::{
     Framing, Group, NetworkCore, NetworkEvent, PayloadBuf, ReplayPolicy, TcpGroupConfig,
-    http2::{self, FRAME_HEADER_LEN, SendError},
+    http2::{self, SendError},
 };
 
-/// Output waits in HTTP/2 while TCP holds this many unsent bytes, so slow
-/// peers are bounded by the HTTP/2 send buffer and per-call buffers.
-const TCP_BACKLOG: usize = 64 * 1024;
-/// An incomplete frame is retained between reads; anything longer than the
-/// largest frame we advertise is a protocol error.
-const MAX_PARTIAL_INPUT: usize = http2::DEFAULT_MAX_FRAME_SIZE as usize + FRAME_HEADER_LEN;
 /// `RST_STREAM` code for a call the server cannot complete.
 const INTERNAL_ERROR: u32 = 2;
 
@@ -81,13 +75,6 @@ impl fmt::Display for Closed {
 }
 
 impl std::error::Error for Closed {}
-
-fn prefix(length: usize) -> [u8; 5] {
-    let length = u32::try_from(length).expect("gRPC messages are below 4 GiB");
-    let mut prefix = [0; 5];
-    prefix[1..].copy_from_slice(&length.to_be_bytes());
-    prefix
-}
 
 #[allow(clippy::struct_excessive_bools)]
 struct Call {
@@ -363,20 +350,6 @@ fn recycle(mut call: Call, free: &mut Vec<Call>, config: &GrpcConfig) {
         call.shrink(config.pooled_buffer);
         free.push(call);
     }
-}
-
-/// Bytes still needed to complete the frame that starts `input`. Leftover
-/// input always starts at a frame: HTTP/2 consumes partial prefaces itself.
-fn missing(input: &[u8]) -> Result<usize, http2::Error> {
-    let Some(header) = input.get(..FRAME_HEADER_LEN) else {
-        return Ok(FRAME_HEADER_LEN - input.len());
-    };
-    let frame = FRAME_HEADER_LEN +
-        (usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]));
-    if frame > MAX_PARTIAL_INPUT {
-        return Err(http2::Error::FrameSize);
-    }
-    Ok(frame - input.len())
 }
 
 /// Returns every call of a closing connection to the pool.

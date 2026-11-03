@@ -6,13 +6,16 @@
 //! - fan-out: a timestamped 1 KiB message published to N subscribers at rising
 //!   rates, until deliveries fall behind the offered rate.
 //! - allocations made by the server thread, per call or per delivery.
+//! - client: flux `GrpcClient` against a tonic client, each on one core, both
+//!   calling the flux server. Allocations are the client thread's.
 //!
 //! tonic runs on a single-thread runtime. Its fan-out is measured twice:
 //! "idiomatic" broadcasts an owned `Vec<u8>` that each subscriber clones and
 //! encodes; "shared" broadcasts `Bytes`, so tonic only frames it.
 //!
-//! Run: `cargo bench -p flux-network --bench grpc_tonic -- [unary|fanout]`.
-//! Cores: `BENCH_SERVER_CPU` (default 2), `BENCH_CLIENT_CPUS` (default 4-15).
+//! Run: `cargo bench -p flux-network --bench grpc_tonic --
+//! [unary|fanout|client]`. Cores: `BENCH_SERVER_CPU` (default 2),
+//! `BENCH_CLIENT_CPUS` (default 4-15).
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -34,10 +37,12 @@ use std::{
 use bytes::{Buf, BufMut, Bytes};
 use flux_network::{
     Network,
-    grpc::{GrpcConfig, GrpcServer, Response},
+    grpc::{
+        ClientEvent, Code, GrpcClient, GrpcClientConfig, GrpcConfig, GrpcServer, Response, Rpc,
+    },
 };
 use hdrhistogram::Histogram;
-use http::uri::PathAndQuery;
+use http::{HeaderMap, uri::PathAndQuery};
 use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tonic::{
@@ -240,7 +245,7 @@ impl Drop for Running {
     }
 }
 
-fn start(kind: Kind, cpu: core_affinity::CoreId) -> Running {
+fn start(kind: Kind, cpu: core_affinity::CoreId, count: bool) -> Running {
     let addr = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
     let per_ms = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -249,7 +254,7 @@ fn start(kind: Kind, cpu: core_affinity::CoreId) -> Running {
         let (per_ms, stop) = (per_ms.clone(), stop.clone());
         move || {
             core_affinity::set_for_current(cpu);
-            COUNTING.set(true);
+            COUNTING.set(count);
             match kind {
                 Kind::Flux => serve_flux(addr, &per_ms, &stop, &ready_tx),
                 Kind::TonicShared => serve_tonic::<Bytes>(addr, per_ms, stop, ready_tx),
@@ -521,6 +526,140 @@ async fn fanout(server: &Running, subscribers: usize, connections: usize) -> Vec
     points
 }
 
+/// A flux client on its own network with `connections` connected channels.
+fn flux_client(addr: SocketAddr, connections: usize) -> (Network, GrpcClient, Vec<Rpc>) {
+    let mut net = Network::default();
+    let mut client = GrpcClient::new(&mut net, GrpcClientConfig::default()).unwrap();
+    let channels: Vec<_> =
+        (0..connections).map(|_| client.connect(&mut net, addr, "localhost")).collect();
+    let mut connected = 0;
+    while connected < connections {
+        client.poll(&mut net, |event| {
+            connected += usize::from(matches!(event, ClientEvent::Connected(_)));
+        });
+    }
+    let rpcs = channels.iter().map(|&c| client.rpc(c, UNARY, &HeaderMap::new()).unwrap()).collect();
+    (net, client, rpcs)
+}
+
+fn flux_client_latency(addr: SocketAddr) -> Histogram<u64> {
+    let (mut net, mut client, rpcs) = flux_client(addr, 1);
+    let body = vec![1; REQUEST_BYTES];
+    let mut latency = histogram();
+    for i in 0..22_000 {
+        let start = Instant::now();
+        client.call(&rpcs[0], &body).unwrap();
+        client.drive(&mut net);
+        let mut done = false;
+        while !done {
+            client.poll(&mut net, |event| {
+                if let ClientEvent::Finished { status, .. } = event {
+                    assert_eq!(status.code, Code::Ok);
+                    done = true;
+                }
+            });
+        }
+        if i >= 2_000 {
+            latency.record(start.elapsed().as_nanos() as u64).unwrap();
+        }
+    }
+    latency
+}
+
+/// Calls per second and client allocations per call, with `in_flight` calls
+/// per connection.
+fn flux_client_throughput(addr: SocketAddr, connections: usize, in_flight: usize) -> (f64, f64) {
+    let (mut net, mut client, rpcs) = flux_client(addr, connections);
+    let body = vec![1; REQUEST_BYTES];
+    for rpc in &rpcs {
+        for _ in 0..in_flight {
+            client.call(rpc, &body).unwrap();
+        }
+    }
+    let start = Instant::now() + Duration::from_secs(1);
+    let measure = Duration::from_secs(3);
+    let end = start + measure;
+    let (mut calls, mut before) = (0u64, None);
+    let mut finished = vec![0; connections];
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        if before.is_none() && now >= start {
+            before = Some(ALLOCATIONS.load(Relaxed));
+        }
+        client.poll(&mut net, |event| {
+            if let ClientEvent::Finished { call, status } = event {
+                assert_eq!(status.code, Code::Ok);
+                finished[rpcs.iter().position(|r| r.channel() == call.channel()).unwrap()] += 1;
+                calls += u64::from(before.is_some());
+            }
+        });
+        for (rpc, n) in rpcs.iter().zip(&mut finished) {
+            for _ in 0..std::mem::take(n) {
+                client.call(rpc, &body).unwrap();
+            }
+        }
+        client.drive(&mut net);
+    }
+    let allocations = ALLOCATIONS.load(Relaxed) - before.unwrap();
+    (calls as f64 / measure.as_secs_f64(), allocations as f64 / calls as f64)
+}
+
+/// Runs `f` on a thread pinned to `cpu` whose allocations are counted.
+fn on_core<T: Send + 'static>(
+    cpu: core_affinity::CoreId,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    thread::spawn(move || {
+        core_affinity::set_for_current(cpu);
+        COUNTING.set(true);
+        f()
+    })
+    .join()
+    .unwrap()
+}
+
+/// Latency, then (calls/s, allocs/call) on 1 and 8 connections.
+type Row = (Histogram<u64>, (f64, f64), (f64, f64));
+
+fn client(server_cpu: core_affinity::CoreId, cpu: core_affinity::CoreId) {
+    println!("\n## Client: 4 KiB request, 16-byte reply, flux server, client on one core\n");
+    println!(
+        "| client | p50 µs | p99 µs | p99.9 µs | 1 conn × 32 calls/s | 8 conns × 32 calls/s | allocs/call |"
+    );
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let server = start(Kind::Flux, server_cpu, false);
+    let addr = server.addr;
+    let flux: Row = on_core(cpu, move || {
+        (
+            flux_client_latency(addr),
+            flux_client_throughput(addr, 1, 32),
+            flux_client_throughput(addr, 8, 32),
+        )
+    });
+    let tonic: Row = on_core(cpu, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        (
+            runtime.block_on(unary_latency(addr)),
+            runtime.block_on(unary_throughput(addr, 1, 32)),
+            runtime.block_on(unary_throughput(addr, 8, 32)),
+        )
+    });
+    for (name, (latency, one, eight)) in [("flux", flux), ("tonic", tonic)] {
+        println!(
+            "| {name} | {} | {} | {} | {:.0} | {:.0} | {:.1} |",
+            us(latency.value_at_quantile(0.5)),
+            us(latency.value_at_quantile(0.99)),
+            us(latency.value_at_quantile(0.999)),
+            one.0,
+            eight.0,
+            eight.1,
+        );
+    }
+}
+
 fn parse_cpus(spec: &str) -> Vec<core_affinity::CoreId> {
     spec.split(',')
         .flat_map(|part| match part.split_once('-') {
@@ -551,7 +690,7 @@ fn main() {
         );
         println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
         for kind in [Kind::Flux, Kind::TonicShared] {
-            let server = start(kind, server_cpu);
+            let server = start(kind, server_cpu, true);
             let runtime = client_runtime(&client_cpus);
             let latency = runtime.block_on(unary_latency(server.addr));
             let (one, _) = runtime.block_on(unary_throughput(server.addr, 1, 32));
@@ -570,6 +709,10 @@ fn main() {
         }
     }
 
+    if run("client") {
+        client(server_cpu, client_cpus[0]);
+    }
+
     if run("fanout") {
         for (subscribers, connections) in [(1, 1), (64, 8), (512, 8)] {
             println!(
@@ -578,7 +721,7 @@ fn main() {
             println!("| server | offered/s | delivered/s | p50 µs | p99 µs | allocs/delivery | |");
             println!("| --- | ---: | ---: | ---: | ---: | ---: | --- |");
             for kind in [Kind::Flux, Kind::TonicShared, Kind::TonicIdiomatic] {
-                let server = start(kind, server_cpu);
+                let server = start(kind, server_cpu, true);
                 let runtime = client_runtime(&client_cpus);
                 for point in runtime.block_on(fanout(&server, subscribers, connections)) {
                     if point.delivered == 0.0 {

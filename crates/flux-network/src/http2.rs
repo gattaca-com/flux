@@ -1,9 +1,11 @@
-//! HTTP/2 frames and a synchronous server connection over caller-owned buffers.
+//! HTTP/2 frames and synchronous server and client connections over
+//! caller-owned buffers.
 //!
-//! [`ServerConnection`] handles the HTTP/2 preface, HPACK, stream state, and
-//! flow control. It performs no I/O. The low-level [`Decoder`] returns borrowed
-//! frames.
+//! [`ServerConnection`] and [`ClientConnection`] handle the HTTP/2 preface,
+//! HPACK, stream state, and flow control. They perform no I/O. The low-level
+//! [`Decoder`] returns borrowed frames.
 
+mod client;
 mod connection;
 #[allow(clippy::all, clippy::pedantic, clippy::nursery, dead_code)]
 #[rustfmt::skip]
@@ -11,6 +13,7 @@ pub(crate) mod hpack;
 
 use std::fmt;
 
+pub use client::{ClientConnection, ClientEvent, RequestHeaders};
 pub use connection::{
     CLIENT_PREFACE, Event, Fields, Http2Config, RequestHead, SendError, ServerConnection,
 };
