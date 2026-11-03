@@ -181,6 +181,7 @@ enum Role {
         close: bool,
         continued: bool,
         head_request: bool,
+        answered: bool,
     },
     /// `in_flight_head` is `Some` while a request is awaiting its response,
     /// carrying whether that request was a `HEAD`.
@@ -238,6 +239,8 @@ pub struct HttpNetwork {
     reconnect_interval: Option<Duration>,
     #[cfg(feature = "tls")]
     tls_config: Option<Arc<crate::tls::ClientConfig>>,
+    /// Set by [`Self::shutdown`]: every response then closes its connection.
+    shutting_down: bool,
     failed: Vec<(RequestId, Failure)>,
     spare_heads: Vec<Vec<u8>>,
     /// Decoded body of the chunked response being delivered.
@@ -263,6 +266,7 @@ impl Default for HttpNetwork {
             reconnect_interval: None,
             #[cfg(feature = "tls")]
             tls_config: None,
+            shutting_down: false,
             failed: Vec::new(),
             spare_heads: Vec::new(),
             chunked_body: Vec::new(),
@@ -383,6 +387,17 @@ impl HttpNetwork {
         self.listeners.push(net.listen(group, addr)?);
         Ok(())
     }
+    /// [`Self::listen`] on a socket that is already bound and listening, such
+    /// as one a service manager kept across a restart.
+    pub fn listen_on(
+        &mut self,
+        net: &mut NetworkCore,
+        listener: std::net::TcpListener,
+    ) -> io::Result<()> {
+        let group = self.group(net);
+        self.listeners.push(net.listen_on(group, listener)?);
+        Ok(())
+    }
     /// Serves HTTP/1.1 over TLS on `addr`; requests arrive as from
     /// [`Self::listen`]. `alpn_protocols` must be empty or `http/1.1`. A
     /// non-empty list disconnects peers that negotiate no ALPN. The returned
@@ -400,6 +415,20 @@ impl HttpNetwork {
         self.listeners.push(token);
         Ok(token)
     }
+    /// [`Self::listen_tls`] on a socket that is already bound and listening.
+    #[cfg(feature = "tls")]
+    pub fn listen_tls_on(
+        &mut self,
+        net: &mut NetworkCore,
+        listener: std::net::TcpListener,
+        config: Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<Token> {
+        check_alpn(&config)?;
+        let group = self.group(net);
+        let token = net.listen_tls_on(group, listener, config)?;
+        self.listeners.push(token);
+        Ok(token)
+    }
     /// Replaces a TLS listener's config, e.g. to rotate its certificate.
     /// Connections already accepted are unaffected.
     #[cfg(feature = "tls")]
@@ -414,6 +443,30 @@ impl HttpNetwork {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not an HTTP listener"));
         }
         net.set_tls_config(listener, config)
+    }
+    /// Stops serving without cutting off a request. Removes the listeners,
+    /// and closes every accepted connection that has written a response and
+    /// has no further request bytes. Every later response closes its
+    /// connection once written. A connection that has not written a response
+    /// yet stays open, since its client may still be sending its first
+    /// request. [`Self::accepted`] reaches zero once every client has been
+    /// answered. Drive the network until then, or until a deadline.
+    pub fn shutdown(&mut self, net: &mut NetworkCore) {
+        self.shutting_down = true;
+        for token in self.listeners.drain(..) {
+            net.remove(token);
+        }
+        for conn in &self.conns {
+            if let Role::Accepted { state: State::Idle, answered: true, .. } = conn.role &&
+                conn.buf.is_empty()
+            {
+                net.disconnect(conn.token);
+            }
+        }
+    }
+    /// Accepted connections not yet closed.
+    pub fn accepted(&self) -> usize {
+        self.conns.iter().filter(|conn| matches!(conn.role, Role::Accepted { .. })).count()
     }
     /// Immediately disconnects an accepted client.
     pub fn disconnect(&mut self, net: &mut NetworkCore, token: Token) -> bool {
@@ -442,6 +495,7 @@ impl HttpNetwork {
                         close: false,
                         continued: false,
                         head_request: false,
+                        answered: false,
                     },
                     stream: None,
                 });
@@ -1069,7 +1123,7 @@ impl HttpNetwork {
         let caller_close = headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case("connection") && has_value_token(v.as_bytes(), b"close")
         });
-        let close = self.conns[i].role.accepted_close() || caller_close;
+        let close = self.conns[i].role.accepted_close() || caller_close || self.shutting_down;
         let suppress_body =
             self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
@@ -1106,6 +1160,7 @@ impl HttpNetwork {
             }
         });
         if ok {
+            self.conns[i].role.set_accepted_answered();
             self.conns[i].dirty = !close && !self.conns[i].buf.is_empty();
             self.conns[i].role.set_accepted_state(if close {
                 State::Draining
@@ -1630,6 +1685,11 @@ impl Role {
     fn set_accepted_close(&mut self, close: bool) {
         if let Self::Accepted { close: current, .. } = self {
             *current = close;
+        }
+    }
+    fn set_accepted_answered(&mut self) {
+        if let Self::Accepted { answered, .. } = self {
+            *answered = true;
         }
     }
     fn accepted_continued(&self) -> bool {

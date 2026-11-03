@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 use tracing::warn;
 
 use crate::{
-    tcp::{DEFAULT_TCP_USER_TIMEOUT_MS, TcpManager},
+    tcp::{DEFAULT_TCP_USER_TIMEOUT_MS, ListenAt, TcpManager},
     tls::Session,
     udp::{UdpConfig, UdpManager},
     udp_v2::UdpManager as UdpManagerV2,
@@ -721,7 +721,7 @@ impl NetworkCore {
     pub fn listen(&mut self, group: Group, addr: SocketAddr) -> io::Result<Token> {
         match self.groups.get_mut(group.0) {
             Some(GroupState::Tcp(tcp)) => {
-                tcp.listen(self.poller.registry(), addr, &mut self.tokens)
+                tcp.listen(self.poller.registry(), ListenAt::Addr(addr), &mut self.tokens)
             }
             Some(GroupState::Udp(udp)) => {
                 udp.listen(self.poller.registry(), addr, &mut self.tokens)
@@ -730,6 +730,20 @@ impl NetworkCore {
                 udp.listen(self.poller.registry(), addr, &mut self.tokens)
             }
             None => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown group")),
+        }
+    }
+    /// [`Self::listen`] on a socket that is already bound and listening, such
+    /// as one a service manager kept across a restart. TCP groups only.
+    pub fn listen_on(
+        &mut self,
+        group: Group,
+        listener: std::net::TcpListener,
+    ) -> io::Result<Token> {
+        match self.groups.get_mut(group.0) {
+            Some(GroupState::Tcp(tcp)) => {
+                tcp.listen(self.poller.registry(), ListenAt::Socket(listener), &mut self.tokens)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "requires a TCP group")),
         }
     }
     /// Registers an outbound endpoint and starts establishment. Its token
@@ -749,9 +763,30 @@ impl NetworkCore {
         config: std::sync::Arc<crate::tls::ServerConfig>,
     ) -> io::Result<Token> {
         match self.groups.get_mut(group.0) {
-            Some(GroupState::Tcp(tcp)) => {
-                tcp.listen_tls(self.poller.registry(), addr, &mut self.tokens, config)
-            }
+            Some(GroupState::Tcp(tcp)) => tcp.listen_tls(
+                self.poller.registry(),
+                ListenAt::Addr(addr),
+                &mut self.tokens,
+                config,
+            ),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS requires a TCP group")),
+        }
+    }
+    /// [`Self::listen_tls`] on a socket that is already bound and listening.
+    #[cfg(feature = "tls")]
+    pub fn listen_tls_on(
+        &mut self,
+        group: Group,
+        listener: std::net::TcpListener,
+        config: std::sync::Arc<crate::tls::ServerConfig>,
+    ) -> io::Result<Token> {
+        match self.groups.get_mut(group.0) {
+            Some(GroupState::Tcp(tcp)) => tcp.listen_tls(
+                self.poller.registry(),
+                ListenAt::Socket(listener),
+                &mut self.tokens,
+                config,
+            ),
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS requires a TCP group")),
         }
     }
