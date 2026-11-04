@@ -1778,6 +1778,7 @@ dependencies = [
 name = "flux-network"
 version = "0.10.0"
 dependencies = [
+ "base64 0.22.1",
  "byte-stable",
  "bytes",
  "core_affinity",
@@ -1791,10 +1792,12 @@ dependencies = [
  "httparse",
  "libc",
  "mio",
+ "rand 0.9.2",
  "rcgen",
  "rustc-hash",
  "rustls",
  "serde",
+ "sha1",
  "spine-derive",
  "tempfile",
  "tokio",
@@ -4047,6 +4050,17 @@ dependencies = [
  "serde_core",
  "serde_json",
  "time",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]
