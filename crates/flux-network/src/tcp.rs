@@ -228,6 +228,8 @@ pub(crate) struct TcpManager {
     pending_disconnects: Vec<PendingDisconnect>,
     send_buffer: Vec<u8>,
     tls_buffer: Vec<u8>,
+    /// See [`crate::NetworkCore::set_max_read_bytes_per_poll`].
+    pub(crate) max_read_bytes_per_poll: usize,
 }
 
 impl TcpManager {
@@ -279,6 +281,7 @@ impl TcpManager {
             pending_disconnects: Vec::with_capacity(INITIAL_CONNECTION_CAPACITY),
             send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
             tls_buffer: Vec::new(),
+            max_read_bytes_per_poll: usize::MAX,
         }
     }
 
@@ -855,7 +858,7 @@ impl TcpManager {
 
         let group = self.group;
         let peer_addr = self.connections[index].peer_addr;
-        let config = &self.config;
+        let (config, max_read) = (&self.config, self.max_read_bytes_per_poll);
         let (state, queue_empty) = {
             let connection = &mut self.connections[index];
             let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
@@ -863,6 +866,7 @@ impl TcpManager {
                 registry,
                 event,
                 config,
+                max_read,
                 &mut connection.timers,
                 &mut connection.tls,
                 dcache,
@@ -1840,6 +1844,7 @@ impl FramedStream {
         registry: &Registry,
         event: &MioEvent,
         config: &TcpGroupConfig,
+        max_read: usize,
         timers: &mut Option<NetworkTimers>,
         tls: &mut Option<Box<Session>>,
         dcache: Option<&DCache>,
@@ -1857,6 +1862,7 @@ impl FramedStream {
                         .bytes
                         .resize(INITIAL_RX_BUFFER_SIZE.min(config.max_frame_size), 0);
                 }
+                let mut budget = max_read;
                 loop {
                     match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer.bytes) {
                         Ok(0) => return StreamState::Disconnected,
@@ -1871,6 +1877,10 @@ impl FramedStream {
                                 Some(RxPayload::Raw(&self.rx_buffer.bytes[..read])),
                                 Nanos::now(),
                             );
+                            budget = budget.saturating_sub(read);
+                            if budget == 0 && self.defer_read(registry, event, tls.as_deref()) {
+                                break;
+                            }
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                         Err(err) => {
@@ -2187,6 +2197,24 @@ impl FramedStream {
             self.writable_armed = false;
         }
         StreamState::Alive
+    }
+
+    /// Re-arms the edge-triggered socket so the next poll reads the rest; a
+    /// closing socket, or TLS holding plaintext, is read out now.
+    fn defer_read(&mut self, registry: &Registry, event: &MioEvent, tls: Option<&Session>) -> bool {
+        if event.is_error() ||
+            event.is_read_closed() ||
+            event.is_write_closed() ||
+            tls.is_some_and(Session::has_plain)
+        {
+            return false;
+        }
+        let interest = if self.writable_armed {
+            Interest::READABLE | Interest::WRITABLE
+        } else {
+            Interest::READABLE
+        };
+        registry.reregister(&mut self.socket, self.token, interest).is_ok()
     }
 
     fn arm_writable(&mut self, registry: &Registry) -> StreamState {

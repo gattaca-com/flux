@@ -849,6 +849,14 @@ impl NetworkCore {
         }
     }
 
+    /// Bounds how much a poll reads from each connection of a raw TCP group;
+    /// a later poll reads the rest. Unset, a poll reads until the socket is
+    /// empty. Panics for a UDP group.
+    pub fn set_max_read_bytes_per_poll(&mut self, group: Group, max_read_bytes: usize) {
+        let GroupState::Tcp(tcp) = &mut self.groups[group.0] else { panic!("not a TCP group") };
+        tcp.max_read_bytes_per_poll = max_read_bytes.max(1);
+    }
+
     /// Bytes queued behind the socket for a TCP connection, or `None` if it
     /// cannot take writes (unknown, UDP, closing, or mid TLS handshake). Lets a
     /// producer keep its own backlog instead of growing this one.
