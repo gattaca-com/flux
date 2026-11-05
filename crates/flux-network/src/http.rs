@@ -1011,6 +1011,7 @@ impl HttpNetwork {
         if !matches!(self.conns[i].role.accepted_state_mut(), State::Idle) {
             return
         }
+        self.conns[i].dirty = false;
         let over_limit = self.conns[i].over_limit;
         let buf = &self.conns[i].buf;
         let (mut stack_slots, mut heap_slots) =
