@@ -70,14 +70,17 @@ pub struct UdpLatency {
     pub received_at: Nanos,
 }
 
-/// A publisher's ping to a subscriber and the ack answering it, on the
-/// publisher's clock.
+/// A round trip on the sender's clock: from sending a packet, or a
+/// publisher's ping, to processing the ack that covers it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
 pub struct UdpRtt {
     pub peer: PeerId,
     pub sent_at: Instant,
     pub received_at: Instant,
+    /// A ping's round trip, rather than a data packet's, which also counts
+    /// the queueing and processing before the receiver acks.
+    pub ping: bool,
 }
 
 fn sends_queue(group_name: &str) -> String {
@@ -142,9 +145,9 @@ impl Telemetry {
     }
 
     #[inline]
-    pub(crate) fn rtt(&mut self, peer: PeerId, sent_at: Instant, received_at: Instant) {
+    pub(crate) fn rtt(&mut self, event: &UdpRtt) {
         if let Some(rtt) = &mut self.rtt {
-            rtt.produce(&UdpRtt { peer, sent_at, received_at });
+            rtt.produce(event);
         }
     }
 }

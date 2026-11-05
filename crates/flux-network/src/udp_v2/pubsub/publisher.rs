@@ -17,7 +17,7 @@ use crate::{
         recv_all, send_datagram,
         stream::Stream,
         sys::{RecvBatch, SendBatch},
-        telemetry::{PeerId, Telemetry},
+        telemetry::{PeerId, Telemetry, UdpRtt},
         wire::MESSAGE_HEADER,
     },
 };
@@ -396,11 +396,15 @@ impl PublisherState {
                 let recipient = &mut self.recipients[i];
                 recipient.last_recv = now;
                 if echo_ts != 0 {
-                    let peer = PeerId::new(recipient.token, recipient.addr);
-                    self.telemetry.rtt(peer, Instant(echo_ts), now);
+                    self.telemetry.rtt(&UdpRtt {
+                        peer: PeerId::new(recipient.token, recipient.addr),
+                        sent_at: Instant(echo_ts),
+                        received_at: now,
+                        ping: true,
+                    });
                 }
                 let held_oldest = recipient.base() == self.stream.base();
-                recipient.out.on_ack(ack_next, bitmap, now);
+                recipient.out.on_ack(ack_next, bitmap, now, &mut self.telemetry);
                 if recipient.drained() {
                     self.drop_recipient(i);
                 } else if held_oldest {
