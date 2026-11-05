@@ -27,6 +27,7 @@ struct Subscription {
     socket: Socket,
     reliable: bool,
     heartbeat_interval: Duration,
+    peer_timeout: Duration,
     initial_rto: Duration,
     max_rto: Duration,
     connected: bool,
@@ -34,9 +35,13 @@ struct Subscription {
     publisher: Option<u32>,
     inbound: Inbound,
     last_send: Instant,
+    /// Last packet or ping from its publisher.
+    last_recv: Instant,
     hello_due: Instant,
     hello_backoff: u8,
     ack_due: bool,
+    /// The ts of a ping not yet answered, 0 if none.
+    echo_ts: u64,
     id: PeerId,
     ctrl: Vec<u8>,
 }
@@ -59,6 +64,7 @@ impl Subscription {
             socket,
             reliable: udp.reliable,
             heartbeat_interval: udp.heartbeat_interval,
+            peer_timeout: config.peer_timeout,
             initial_rto: udp.initial_rto,
             max_rto: udp.max_rto,
             connected: false,
@@ -66,9 +72,11 @@ impl Subscription {
             publisher: None,
             inbound,
             last_send: Instant::now(),
+            last_recv: Instant::ZERO,
             hello_due: Instant::ZERO,
             hello_backoff: 0,
             ack_due: false,
+            echo_ts: 0,
             id: PeerId::new(token, addr),
             ctrl: vec![0; ctrl_len],
         }
@@ -86,6 +94,7 @@ impl Subscription {
         self.hello_due = Instant::ZERO;
         self.hello_backoff = 0;
         self.ack_due = false;
+        self.echo_ts = 0;
     }
 
     fn send_hello(&mut self, msg: &[u8], now: Instant) -> SendOutcome {
@@ -101,11 +110,12 @@ impl Subscription {
         outcome
     }
 
-    fn on_hello_ack(&mut self, publisher: u32, subscriber: u32, join: u64) -> bool {
+    fn on_hello_ack(&mut self, publisher: u32, subscriber: u32, join: u64, now: Instant) -> bool {
         if self.connected || subscriber != self.session {
             return false;
         }
         self.publisher = Some(publisher);
+        self.last_recv = now;
         self.inbound.reset(join);
         self.connected = true;
         self.hello_backoff = 0;
@@ -121,12 +131,14 @@ impl Subscription {
     fn on_packet(
         &mut self,
         packet: Packet<'_>,
+        now: Instant,
         telemetry: &mut Telemetry,
         deliver: &mut dyn FnMut(&[u8], Nanos),
     ) {
         if !self.connected || self.publisher != Some(packet.session) {
             return;
         }
+        self.last_recv = now;
         let id = self.id;
         let received = self.inbound.receive(packet, &mut |bytes, send_ts| {
             telemetry.latency(id, Nanos(send_ts));
@@ -138,15 +150,31 @@ impl Subscription {
         }
     }
 
+    fn on_ping(&mut self, publisher: u32, ts: u64, now: Instant) {
+        if !self.connected || self.publisher != Some(publisher) {
+            return;
+        }
+        self.last_recv = now;
+        self.echo_ts = ts;
+        self.ack_due = true;
+    }
+
+    fn timed_out(&self, now: Instant) -> bool {
+        self.connected && now.saturating_sub(self.last_recv) >= self.peer_timeout
+    }
+
     fn send_ack(&mut self, now: Instant) -> SendOutcome {
         let Some(publisher) = self.publisher else { return SendOutcome::Done };
         let n_bits = self.inbound.ack_bits();
         let header: &mut [u8; ACK_HEADER] = (&mut self.ctrl[..ACK_HEADER]).try_into().unwrap();
-        wire::ack_header(header, publisher, self.session, self.inbound.ack_next());
+        wire::ack_header(header, publisher, self.session, self.inbound.ack_next(), self.echo_ts);
         let n = self.inbound.write_bitmap(n_bits, &mut self.ctrl[ACK_HEADER..]);
         self.last_send = now;
         let outcome = send_datagram(&self.socket.udp, self.addr, &self.ctrl[..ACK_HEADER + n]);
         self.ack_due = outcome == SendOutcome::WouldBlock;
+        if outcome == SendOutcome::Done {
+            self.echo_ts = 0;
+        }
         outcome
     }
 
@@ -157,7 +185,11 @@ impl Subscription {
             }
             return SendOutcome::Done;
         }
-        if self.ack_due || now.saturating_sub(self.last_send) >= self.heartbeat_interval {
+        // The publisher pings, so the subscriber only speaks up once two are
+        // missed: a restarted publisher answers that ack with a reset.
+        let quiet = now.saturating_sub(self.last_recv) >= self.heartbeat_interval * 2 &&
+            now.saturating_sub(self.last_send) >= self.heartbeat_interval;
+        if self.ack_due || quiet {
             return self.send_ack(now);
         }
         SendOutcome::Done
@@ -235,8 +267,14 @@ impl SubscriberState {
     }
 
     fn tick(&mut self, registry: &Registry, now: Instant) {
-        let msg = self.config.on_connect_msg.as_deref().unwrap_or_default();
-        for subscription in &mut self.subscriptions {
+        for i in 0..self.subscriptions.len() {
+            if self.subscriptions[i].timed_out(now) {
+                warn!(addr = %self.subscriptions[i].addr, "udp publisher timed out, resubscribing");
+                self.restart(i, now);
+                continue;
+            }
+            let msg = self.config.on_connect_msg.as_deref().unwrap_or_default();
+            let subscription = &mut self.subscriptions[i];
             if subscription.tick(msg, now) == SendOutcome::WouldBlock {
                 subscription.socket.arm_writable(registry);
             }
@@ -262,6 +300,7 @@ impl SubscriberState {
             Datagram::Packet(packet) => {
                 self.subscriptions[i].on_packet(
                     packet,
+                    now,
                     &mut self.telemetry,
                     &mut |payload, send_ts| {
                         deliver(SubscriberEvent::Message { token, payload, send_ts });
@@ -275,7 +314,7 @@ impl SubscriberState {
                 if self.subscriptions[i].lost(subscriber, Some(publisher)) {
                     warn!(addr = %from, "udp publisher lost our subscription, resubscribing");
                     self.restart(i, now);
-                } else if self.subscriptions[i].on_hello_ack(publisher, subscriber, join) {
+                } else if self.subscriptions[i].on_hello_ack(publisher, subscriber, join, now) {
                     // A resubscribe can complete before post_poll drains the old unsubscribe.
                     self.drain_unsubscribed(deliver);
                     debug!(addr = %from, "udp subscribed");
@@ -288,6 +327,7 @@ impl SubscriberState {
                     self.restart(i, now);
                 }
             }
+            Datagram::Ping { publisher, ts } => self.subscriptions[i].on_ping(publisher, ts, now),
             Datagram::Ack { .. } | Datagram::Hello { .. } => {}
         }
     }

@@ -441,6 +441,43 @@ fn udp_peer_timeout_drops_a_silent_subscriber() {
 }
 
 #[test]
+fn udp_peer_timeout_resubscribes_from_a_dead_publisher() {
+    let addr = free_addr();
+    let mut server = Publisher::new(lan());
+    let mut client = Subscriber::new(UdpGroupConfigV2 {
+        peer_timeout: flux_timing::Duration::from_millis(300),
+        ..lan()
+    });
+    let (_, tok) = subscribe_pair(&mut server, &mut client, addr);
+
+    // Pings alone keep an idle subscription alive.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(600) {
+        server.poll_with(|_| {});
+        client.poll_with(|e| assert!(!matches!(e, SubscriberEvent::Unsubscribed { .. })));
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(server);
+
+    let mut unsubscribed = None;
+    let start = Instant::now();
+    while unsubscribed.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5), "publisher timeout");
+        client.poll_with(|e| {
+            if let SubscriberEvent::Unsubscribed { token, .. } = e {
+                unsubscribed = Some(token);
+            }
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(unsubscribed, Some(tok));
+    // The last ping may have landed up to a heartbeat before the drop.
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+    assert!(!client.is_subscribed(tok));
+}
+
+#[test]
 fn udp_ignores_junk_datagrams() {
     let addr = free_addr();
     let (mut server, mut client, _, _) = lan_pair(addr);

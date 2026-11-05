@@ -29,6 +29,7 @@ struct Recipient {
     session: u32,
     join: u64,
     last_recv: Instant,
+    last_ping: Instant,
     close_at: Option<u64>,
     out: Outbound,
 }
@@ -343,8 +344,25 @@ impl PublisherState {
                 self.drop_recipient(i);
             }
         }
+        self.ping(now);
         for k in 0..self.listeners.len() {
             self.pump(registry, k, now, true);
+        }
+    }
+
+    fn ping(&mut self, now: Instant) {
+        let heartbeat = self.config.udp.heartbeat_interval;
+        let ping = wire::ping(self.stream.session(), now.0);
+        for recipient in &mut self.recipients {
+            if now.saturating_sub(recipient.last_ping) < heartbeat {
+                continue;
+            }
+            let Some(listener) = self.listeners.iter().find(|l| l.token == recipient.listener)
+            else {
+                continue;
+            };
+            recipient.last_ping = now;
+            send_datagram(&listener.udp, recipient.addr, &ping);
         }
     }
 
@@ -368,7 +386,7 @@ impl PublisherState {
         let listener = self.listeners[k].token;
         let index = self.recipients.iter().position(|r| r.listener == listener && r.addr == from);
         match datagram {
-            Datagram::Ack { publisher, subscriber, ack_next, bitmap } => {
+            Datagram::Ack { publisher, subscriber, ack_next, echo_ts, bitmap } => {
                 let Some(i) = index.filter(|&i| {
                     publisher == self.stream.session() && self.recipients[i].session == subscriber
                 }) else {
@@ -377,6 +395,10 @@ impl PublisherState {
                 };
                 let recipient = &mut self.recipients[i];
                 recipient.last_recv = now;
+                if echo_ts != 0 {
+                    let peer = PeerId::new(recipient.token, recipient.addr);
+                    self.telemetry.rtt(peer, Instant(echo_ts), now);
+                }
                 let held_oldest = recipient.base() == self.stream.base();
                 recipient.out.on_ack(ack_next, bitmap, now);
                 if recipient.drained() {
@@ -425,6 +447,7 @@ impl PublisherState {
                     session: subscriber,
                     join,
                     last_recv: now,
+                    last_ping: now,
                     close_at: None,
                     out: Outbound::new(from, join, &self.config.udp, PeerId::new(token, from)),
                 });
@@ -432,7 +455,10 @@ impl PublisherState {
                 info!(addr = %from, "udp subscriber joined");
                 deliver(PublisherEvent::Subscribed { token, peer_addr: from, msg });
             }
-            Datagram::Packet(_) | Datagram::HelloAck { .. } | Datagram::Reset { .. } => {}
+            Datagram::Packet(_) |
+            Datagram::HelloAck { .. } |
+            Datagram::Reset { .. } |
+            Datagram::Ping { .. } => {}
         }
     }
 

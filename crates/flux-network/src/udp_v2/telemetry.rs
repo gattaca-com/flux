@@ -70,6 +70,16 @@ pub struct UdpLatency {
     pub received_at: Nanos,
 }
 
+/// A publisher's ping to a subscriber and the ack answering it, on the
+/// publisher's clock.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
+pub struct UdpRtt {
+    pub peer: PeerId,
+    pub sent_at: Instant,
+    pub received_at: Instant,
+}
+
 fn sends_queue(group_name: &str) -> String {
     format!("udp_sends_{group_name}")
 }
@@ -82,18 +92,23 @@ fn latency_queue(group_name: &str) -> String {
     format!("udp_latency_{group_name}")
 }
 
+fn rtt_queue(group_name: &str) -> String {
+    format!("udp_rtt_{group_name}")
+}
+
 pub(crate) struct Telemetry {
     sends: Option<Producer<UdpSend>>,
     retransmits: Option<Producer<UdpRetransmit>>,
     // TODO: a `Timer` here, once timers stop costing two shmem files per name
     // (see the TODO on `flux_communication::Timer`).
     latency: Option<Producer<UdpLatency>>,
+    rtt: Option<Producer<UdpRtt>>,
 }
 
 impl Telemetry {
     pub(crate) fn new(telemetry: NetworkTelemetry, group_name: &str) -> Self {
         let NetworkTelemetry::Enabled { app_name } = telemetry else {
-            return Self { sends: None, retransmits: None, latency: None };
+            return Self { sends: None, retransmits: None, latency: None, rtt: None };
         };
         let dir = shmem_dir_queues_with_base(local_share_dir(), app_name);
         let _ = std::fs::create_dir_all(&dir);
@@ -101,6 +116,7 @@ impl Telemetry {
             sends: Some(producer(&dir, &sends_queue(group_name))),
             retransmits: Some(producer(&dir, &retransmits_queue(group_name))),
             latency: Some(producer(&dir, &latency_queue(group_name))),
+            rtt: Some(producer(&dir, &rtt_queue(group_name))),
         }
     }
 
@@ -124,6 +140,13 @@ impl Telemetry {
             latency.produce(&UdpLatency { peer, sent_at, received_at: Nanos::now() });
         }
     }
+
+    #[inline]
+    pub(crate) fn rtt(&mut self, peer: PeerId, sent_at: Instant, received_at: Instant) {
+        if let Some(rtt) = &mut self.rtt {
+            rtt.produce(&UdpRtt { peer, sent_at, received_at });
+        }
+    }
 }
 
 fn producer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Producer<T> {
@@ -135,10 +158,12 @@ fn producer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Producer<T> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TelemetryEvent {
     Send(UdpSend),
     Retransmit(UdpRetransmit),
     Latency(UdpLatency),
+    Rtt(UdpRtt),
     /// The reader fell behind and missed events.
     Lapped,
 }
@@ -147,6 +172,7 @@ pub struct TelemetryReader {
     sends: Option<ConsumerBare<UdpSend>>,
     retransmits: Option<ConsumerBare<UdpRetransmit>>,
     latency: Option<ConsumerBare<UdpLatency>>,
+    rtt: Option<ConsumerBare<UdpRtt>>,
 }
 
 impl TelemetryReader {
@@ -156,6 +182,7 @@ impl TelemetryReader {
             sends: consumer(&dir, &sends_queue(group_name)),
             retransmits: consumer(&dir, &retransmits_queue(group_name)),
             latency: consumer(&dir, &latency_queue(group_name)),
+            rtt: consumer(&dir, &rtt_queue(group_name)),
         }
     }
 
@@ -163,6 +190,7 @@ impl TelemetryReader {
         drain(&mut self.sends, &mut on_event, TelemetryEvent::Send);
         drain(&mut self.retransmits, &mut on_event, TelemetryEvent::Retransmit);
         drain(&mut self.latency, &mut on_event, TelemetryEvent::Latency);
+        drain(&mut self.rtt, &mut on_event, TelemetryEvent::Rtt);
     }
 }
 

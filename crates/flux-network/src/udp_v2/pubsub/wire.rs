@@ -24,10 +24,15 @@
 //! [3..7]    publisher   session
 //! [7..11]   subscriber  session
 //! [11..19]  ack_next    everything below arrived
-//! [19..]    bitmap      bit i (LSB first) set: ack_next + 1 + i arrived
+//! [19..27]  echo_ts     ts of the ping this ack answers; 0 if none
+//! [27..]    bitmap      bit i (LSB first) set: ack_next + 1 + i arrived
 //!
 //! reset (5)
 //! [3..7]    subscriber  session
+//!
+//! ping (6), the same to every subscriber
+//! [3..7]    publisher   session
+//! [7..15]   ts          the publisher's clock, echoed by the ack
 //! ```
 
 use crate::udp_v2::wire::{self, PREFIX, Packet, u32_at, u64_at};
@@ -35,10 +40,11 @@ use crate::udp_v2::wire::{self, PREFIX, Packet, u32_at, u64_at};
 const MAGIC: [u8; 2] = *b"FP";
 
 pub(crate) const PACKET: [u8; PREFIX] = wire::prefix(MAGIC, Kind::Packet as u8);
-pub(crate) const ACK_HEADER: usize = PREFIX + 4 + 4 + 8;
+pub(crate) const ACK_HEADER: usize = PREFIX + 4 + 4 + 8 + 8;
 pub(crate) const HELLO_SIZE: usize = PREFIX + 4;
 pub(crate) const HELLO_ACK_SIZE: usize = PREFIX + 4 + 4 + 8;
 pub(crate) const RESET_SIZE: usize = PREFIX + 4;
+pub(crate) const PING_SIZE: usize = PREFIX + 4 + 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -48,6 +54,7 @@ enum Kind {
     Packet = 3,
     Ack = 4,
     Reset = 5,
+    Ping = 6,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,8 +62,9 @@ pub(crate) enum Datagram<'a> {
     Hello { subscriber: u32, msg: &'a [u8] },
     HelloAck { publisher: u32, subscriber: u32, join: u64, msg: &'a [u8] },
     Packet(Packet<'a>),
-    Ack { publisher: u32, subscriber: u32, ack_next: u64, bitmap: &'a [u8] },
+    Ack { publisher: u32, subscriber: u32, ack_next: u64, echo_ts: u64, bitmap: &'a [u8] },
     Reset { subscriber: u32 },
+    Ping { publisher: u32, ts: u64 },
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram<'_>> {
@@ -73,9 +81,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram<'_>> {
             publisher: u32_at(bytes, 3),
             subscriber: u32_at(bytes, 7),
             ack_next: u64_at(bytes, 11),
+            echo_ts: u64_at(bytes, 19),
             bitmap: &bytes[ACK_HEADER..],
         }),
         5 => Some(Datagram::Reset { subscriber: u32_at(bytes, 3) }),
+        6 if bytes.len() >= PING_SIZE => {
+            Some(Datagram::Ping { publisher: u32_at(bytes, 3), ts: u64_at(bytes, 7) })
+        }
         _ => None,
     }
 }
@@ -90,11 +102,13 @@ pub(crate) fn ack_header(
     publisher: u32,
     subscriber: u32,
     ack_next: u64,
+    echo_ts: u64,
 ) {
     prefix(buf, Kind::Ack);
     buf[3..7].copy_from_slice(&publisher.to_le_bytes());
     buf[7..11].copy_from_slice(&subscriber.to_le_bytes());
     buf[11..19].copy_from_slice(&ack_next.to_le_bytes());
+    buf[19..27].copy_from_slice(&echo_ts.to_le_bytes());
 }
 
 pub(crate) fn hello(buf: &mut [u8], subscriber: u32, msg: &[u8]) -> usize {
@@ -122,4 +136,12 @@ pub(crate) fn hello_ack(
 pub(crate) fn reset(buf: &mut [u8; RESET_SIZE], subscriber: u32) {
     prefix(buf, Kind::Reset);
     buf[3..7].copy_from_slice(&subscriber.to_le_bytes());
+}
+
+pub(crate) fn ping(publisher: u32, ts: u64) -> [u8; PING_SIZE] {
+    let mut buf = [0; PING_SIZE];
+    prefix(&mut buf, Kind::Ping);
+    buf[3..7].copy_from_slice(&publisher.to_le_bytes());
+    buf[7..15].copy_from_slice(&ts.to_le_bytes());
+    buf
 }

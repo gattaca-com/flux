@@ -1,8 +1,10 @@
 //! One-way UDP: a [`Publisher`] sends one stream, the same bytes to every
 //! [`Subscriber`], which joins at its live end. A subscriber that falls a
 //! `send_window` behind or goes silent for `peer_timeout` is dropped, and
-//! resubscribes at the live end once it hears of it. A subscriber never times
-//! out its publisher.
+//! resubscribes at the live end once it hears of it. The publisher pings
+//! every subscriber each `heartbeat_interval` and records the round trip in
+//! telemetry; a subscriber that hears neither packets nor pings for
+//! `peer_timeout` resubscribes.
 //!
 //! Both own a poll by default. To share one with a
 //! [`crate::NetworkWithExternalPoll`] or each other, build them with
@@ -41,8 +43,8 @@ pub enum SubscriberEvent<'a> {
     /// Joined the stream at its live end, with the publisher's on-connect
     /// message, empty without one.
     Subscribed { token: Token, peer_addr: SocketAddr, msg: &'a [u8] },
-    /// The publisher dropped the subscription, or it was resubscribed
-    /// locally. It resubscribes on its own.
+    /// The publisher dropped the subscription or went silent, or it was
+    /// resubscribed locally. It resubscribes on its own.
     Unsubscribed { token: Token, peer_addr: SocketAddr },
     /// Messages arrive unordered.
     Message { token: Token, payload: &'a [u8], send_ts: Nanos },

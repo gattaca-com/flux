@@ -31,7 +31,9 @@ mod wire;
 pub(crate) use conn::UdpManager;
 pub use pubsub::{Publisher, PublisherEvent, Subscriber, SubscriberEvent};
 use sys::{RecvBatch, SendBatch};
-pub use telemetry::{PeerId, TelemetryEvent, TelemetryReader, UdpLatency, UdpRetransmit, UdpSend};
+pub use telemetry::{
+    PeerId, TelemetryEvent, TelemetryReader, UdpLatency, UdpRetransmit, UdpRtt, UdpSend,
+};
 
 use crate::{
     network::{RxPayload, UdpGroupConfigV2, set_socket_buf_size},
@@ -222,6 +224,11 @@ pub(crate) fn recv_all(
 pub(crate) fn validate_group(config: &UdpGroupConfigV2, handshake: usize) {
     let udp = config.udp;
     validate(&udp);
+    // Room for a lost heartbeat before an idle peer times out.
+    assert!(
+        config.peer_timeout > udp.heartbeat_interval * 2,
+        "udp peer_timeout must exceed twice heartbeat_interval"
+    );
     if let Some(msg) = &config.on_connect_msg {
         assert!(!msg.is_empty(), "udp on_connect_msg must be nonempty");
         assert!(msg.len() <= udp.max_message_size, "udp on_connect_msg exceeds max_message_size");

@@ -55,7 +55,8 @@ pub struct UdpConfig {
     pub max_rto: Duration,
     /// Idle interval after which a connected peer sends a bare ack so the
     /// other side can tell it is alive. Peer death is detected by the
-    /// connector's user timeout.
+    /// connector's user timeout. A v2 publisher pings each subscriber at this
+    /// interval instead.
     pub heartbeat_interval: Duration,
     pub panic_after_unanswered_handshake: Option<Duration>,
     /// Off: no retransmits, no per-datagram acks; a datagram is done once the
