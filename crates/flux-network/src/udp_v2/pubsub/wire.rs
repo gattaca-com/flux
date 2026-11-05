@@ -28,6 +28,11 @@
 //!
 //! reset (5)
 //! [3..7]    subscriber  session
+//!
+//! ping (6), publisher to subscriber, and its pong (7) back
+//! [3..7]    publisher   session
+//! [7..11]   subscriber  session
+//! [11..19]  ts          the publisher's clock, echoed by the pong
 //! ```
 
 use crate::udp_v2::wire::{self, PREFIX, Packet, u32_at, u64_at};
@@ -39,6 +44,7 @@ pub(crate) const ACK_HEADER: usize = PREFIX + 4 + 4 + 8;
 pub(crate) const HELLO_SIZE: usize = PREFIX + 4;
 pub(crate) const HELLO_ACK_SIZE: usize = PREFIX + 4 + 4 + 8;
 pub(crate) const RESET_SIZE: usize = PREFIX + 4;
+pub(crate) const PING_SIZE: usize = PREFIX + 4 + 4 + 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -48,6 +54,8 @@ enum Kind {
     Packet = 3,
     Ack = 4,
     Reset = 5,
+    Ping = 6,
+    Pong = 7,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +65,8 @@ pub(crate) enum Datagram<'a> {
     Packet(Packet<'a>),
     Ack { publisher: u32, subscriber: u32, ack_next: u64, bitmap: &'a [u8] },
     Reset { subscriber: u32 },
+    Ping { publisher: u32, subscriber: u32, ts: u64 },
+    Pong { publisher: u32, subscriber: u32, ts: u64 },
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram<'_>> {
@@ -76,6 +86,16 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram<'_>> {
             bitmap: &bytes[ACK_HEADER..],
         }),
         5 => Some(Datagram::Reset { subscriber: u32_at(bytes, 3) }),
+        6 if bytes.len() >= PING_SIZE => Some(Datagram::Ping {
+            publisher: u32_at(bytes, 3),
+            subscriber: u32_at(bytes, 7),
+            ts: u64_at(bytes, 11),
+        }),
+        7 if bytes.len() >= PING_SIZE => Some(Datagram::Pong {
+            publisher: u32_at(bytes, 3),
+            subscriber: u32_at(bytes, 7),
+            ts: u64_at(bytes, 11),
+        }),
         _ => None,
     }
 }
@@ -122,4 +142,21 @@ pub(crate) fn hello_ack(
 pub(crate) fn reset(buf: &mut [u8; RESET_SIZE], subscriber: u32) {
     prefix(buf, Kind::Reset);
     buf[3..7].copy_from_slice(&subscriber.to_le_bytes());
+}
+
+fn ping_or_pong(kind: Kind, publisher: u32, subscriber: u32, ts: u64) -> [u8; PING_SIZE] {
+    let mut buf = [0; PING_SIZE];
+    prefix(&mut buf, kind);
+    buf[3..7].copy_from_slice(&publisher.to_le_bytes());
+    buf[7..11].copy_from_slice(&subscriber.to_le_bytes());
+    buf[11..19].copy_from_slice(&ts.to_le_bytes());
+    buf
+}
+
+pub(crate) fn ping(publisher: u32, subscriber: u32, ts: u64) -> [u8; PING_SIZE] {
+    ping_or_pong(Kind::Ping, publisher, subscriber, ts)
+}
+
+pub(crate) fn pong(publisher: u32, subscriber: u32, ts: u64) -> [u8; PING_SIZE] {
+    ping_or_pong(Kind::Pong, publisher, subscriber, ts)
 }

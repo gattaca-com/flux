@@ -31,7 +31,9 @@ mod wire;
 pub(crate) use conn::UdpManager;
 pub use pubsub::{Publisher, PublisherEvent, Subscriber, SubscriberEvent};
 use sys::{RecvBatch, SendBatch};
-pub use telemetry::{PeerId, TelemetryEvent, TelemetryReader, UdpLatency, UdpRetransmit, UdpSend};
+pub use telemetry::{
+    PeerId, TelemetryEvent, TelemetryReader, UdpLatency, UdpRetransmit, UdpRtt, UdpSend,
+};
 
 use crate::{
     network::{RxPayload, UdpGroupConfigV2, set_socket_buf_size},

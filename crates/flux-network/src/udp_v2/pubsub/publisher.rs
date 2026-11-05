@@ -29,6 +29,7 @@ struct Recipient {
     session: u32,
     join: u64,
     last_recv: Instant,
+    last_ping: Instant,
     close_at: Option<u64>,
     out: Outbound,
 }
@@ -343,8 +344,26 @@ impl PublisherState {
                 self.drop_recipient(i);
             }
         }
+        self.ping(now);
         for k in 0..self.listeners.len() {
             self.pump(registry, k, now, true);
+        }
+    }
+
+    fn ping(&mut self, now: Instant) {
+        let heartbeat = self.config.udp.heartbeat_interval;
+        let publisher = self.stream.session();
+        for recipient in &mut self.recipients {
+            if now.saturating_sub(recipient.last_ping) < heartbeat {
+                continue;
+            }
+            let Some(listener) = self.listeners.iter().find(|l| l.token == recipient.listener)
+            else {
+                continue;
+            };
+            recipient.last_ping = now;
+            let ping = wire::ping(publisher, recipient.session, now.0);
+            send_datagram(&listener.udp, recipient.addr, &ping);
         }
     }
 
@@ -384,6 +403,17 @@ impl PublisherState {
                 } else if held_oldest {
                     self.release();
                 }
+            }
+            Datagram::Pong { publisher, subscriber, ts } => {
+                let Some(i) = index.filter(|&i| {
+                    publisher == self.stream.session() && self.recipients[i].session == subscriber
+                }) else {
+                    return;
+                };
+                let recipient = &mut self.recipients[i];
+                recipient.last_recv = now;
+                let peer = PeerId::new(recipient.token, recipient.addr);
+                self.telemetry.rtt(peer, Instant(ts), now);
             }
             Datagram::Hello { subscriber, msg } => {
                 if !crate::udp_v2::on_connect_fits(&self.config, msg, from) {
@@ -425,6 +455,7 @@ impl PublisherState {
                     session: subscriber,
                     join,
                     last_recv: now,
+                    last_ping: now,
                     close_at: None,
                     out: Outbound::new(from, join, &self.config.udp, PeerId::new(token, from)),
                 });
@@ -432,7 +463,10 @@ impl PublisherState {
                 info!(addr = %from, "udp subscriber joined");
                 deliver(PublisherEvent::Subscribed { token, peer_addr: from, msg });
             }
-            Datagram::Packet(_) | Datagram::HelloAck { .. } | Datagram::Reset { .. } => {}
+            Datagram::Packet(_) |
+            Datagram::HelloAck { .. } |
+            Datagram::Reset { .. } |
+            Datagram::Ping { .. } => {}
         }
     }
 
