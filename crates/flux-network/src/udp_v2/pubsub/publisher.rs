@@ -352,7 +352,7 @@ impl PublisherState {
 
     fn ping(&mut self, now: Instant) {
         let heartbeat = self.config.udp.heartbeat_interval;
-        let publisher = self.stream.session();
+        let ping = wire::ping(self.stream.session(), now.0);
         for recipient in &mut self.recipients {
             if now.saturating_sub(recipient.last_ping) < heartbeat {
                 continue;
@@ -362,7 +362,6 @@ impl PublisherState {
                 continue;
             };
             recipient.last_ping = now;
-            let ping = wire::ping(publisher, recipient.session, now.0);
             send_datagram(&listener.udp, recipient.addr, &ping);
         }
     }
@@ -387,7 +386,7 @@ impl PublisherState {
         let listener = self.listeners[k].token;
         let index = self.recipients.iter().position(|r| r.listener == listener && r.addr == from);
         match datagram {
-            Datagram::Ack { publisher, subscriber, ack_next, bitmap } => {
+            Datagram::Ack { publisher, subscriber, ack_next, echo_ts, bitmap } => {
                 let Some(i) = index.filter(|&i| {
                     publisher == self.stream.session() && self.recipients[i].session == subscriber
                 }) else {
@@ -396,6 +395,10 @@ impl PublisherState {
                 };
                 let recipient = &mut self.recipients[i];
                 recipient.last_recv = now;
+                if echo_ts != 0 {
+                    let peer = PeerId::new(recipient.token, recipient.addr);
+                    self.telemetry.rtt(peer, Instant(echo_ts), now);
+                }
                 let held_oldest = recipient.base() == self.stream.base();
                 recipient.out.on_ack(ack_next, bitmap, now);
                 if recipient.drained() {
@@ -403,17 +406,6 @@ impl PublisherState {
                 } else if held_oldest {
                     self.release();
                 }
-            }
-            Datagram::Pong { publisher, subscriber, ts } => {
-                let Some(i) = index.filter(|&i| {
-                    publisher == self.stream.session() && self.recipients[i].session == subscriber
-                }) else {
-                    return;
-                };
-                let recipient = &mut self.recipients[i];
-                recipient.last_recv = now;
-                let peer = PeerId::new(recipient.token, recipient.addr);
-                self.telemetry.rtt(peer, Instant(ts), now);
             }
             Datagram::Hello { subscriber, msg } => {
                 if !crate::udp_v2::on_connect_fits(&self.config, msg, from) {

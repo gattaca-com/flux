@@ -40,6 +40,8 @@ struct Subscription {
     hello_due: Instant,
     hello_backoff: u8,
     ack_due: bool,
+    /// The ts of a ping not yet answered, 0 if none.
+    echo_ts: u64,
     id: PeerId,
     ctrl: Vec<u8>,
 }
@@ -74,6 +76,7 @@ impl Subscription {
             hello_due: Instant::ZERO,
             hello_backoff: 0,
             ack_due: false,
+            echo_ts: 0,
             id: PeerId::new(token, addr),
             ctrl: vec![0; ctrl_len],
         }
@@ -91,6 +94,7 @@ impl Subscription {
         self.hello_due = Instant::ZERO;
         self.hello_backoff = 0;
         self.ack_due = false;
+        self.echo_ts = 0;
     }
 
     fn send_hello(&mut self, msg: &[u8], now: Instant) -> SendOutcome {
@@ -146,13 +150,13 @@ impl Subscription {
         }
     }
 
-    fn on_ping(&mut self, publisher: u32, subscriber: u32, ts: u64, now: Instant) {
-        if !self.connected || self.publisher != Some(publisher) || subscriber != self.session {
+    fn on_ping(&mut self, publisher: u32, ts: u64, now: Instant) {
+        if !self.connected || self.publisher != Some(publisher) {
             return;
         }
         self.last_recv = now;
-        // A pong that would block is dropped; the next ping asks again.
-        send_datagram(&self.socket.udp, self.addr, &wire::pong(publisher, subscriber, ts));
+        self.echo_ts = ts;
+        self.ack_due = true;
     }
 
     fn timed_out(&self, now: Instant) -> bool {
@@ -163,11 +167,14 @@ impl Subscription {
         let Some(publisher) = self.publisher else { return SendOutcome::Done };
         let n_bits = self.inbound.ack_bits();
         let header: &mut [u8; ACK_HEADER] = (&mut self.ctrl[..ACK_HEADER]).try_into().unwrap();
-        wire::ack_header(header, publisher, self.session, self.inbound.ack_next());
+        wire::ack_header(header, publisher, self.session, self.inbound.ack_next(), self.echo_ts);
         let n = self.inbound.write_bitmap(n_bits, &mut self.ctrl[ACK_HEADER..]);
         self.last_send = now;
         let outcome = send_datagram(&self.socket.udp, self.addr, &self.ctrl[..ACK_HEADER + n]);
         self.ack_due = outcome == SendOutcome::WouldBlock;
+        if outcome == SendOutcome::Done {
+            self.echo_ts = 0;
+        }
         outcome
     }
 
@@ -320,10 +327,8 @@ impl SubscriberState {
                     self.restart(i, now);
                 }
             }
-            Datagram::Ping { publisher, subscriber, ts } => {
-                self.subscriptions[i].on_ping(publisher, subscriber, ts, now);
-            }
-            Datagram::Ack { .. } | Datagram::Hello { .. } | Datagram::Pong { .. } => {}
+            Datagram::Ping { publisher, ts } => self.subscriptions[i].on_ping(publisher, ts, now),
+            Datagram::Ack { .. } | Datagram::Hello { .. } => {}
         }
     }
 

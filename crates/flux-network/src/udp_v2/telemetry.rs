@@ -70,7 +70,7 @@ pub struct UdpLatency {
     pub received_at: Nanos,
 }
 
-/// A publisher's ping to a subscriber and the pong back, on the
+/// A publisher's ping to a subscriber and the ack answering it, on the
 /// publisher's clock.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
