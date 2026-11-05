@@ -611,7 +611,7 @@ impl State {
                     return;
                 }
                 peer.last_recv = now;
-                peer.out.on_ack(ack_next, bitmap, now);
+                peer.out.on_ack(ack_next, bitmap, now, &mut self.telemetry);
                 peer.release();
                 if peer.drained() {
                     self.lose(i, now);

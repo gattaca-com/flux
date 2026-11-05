@@ -6,7 +6,7 @@ use super::{
     UdpConfig,
     stream::Stream,
     sys::{SendBatch, SockAddr},
-    telemetry::{PeerId, Telemetry, UdpRetransmit, UdpSend},
+    telemetry::{PeerId, Telemetry, UdpRetransmit, UdpRtt, UdpSend},
 };
 
 const MAX_BACKOFF_SHIFT: u8 = 6;
@@ -172,7 +172,13 @@ impl Outbound {
         self.resent.drain(..below);
     }
 
-    pub(crate) fn on_ack(&mut self, ack_next: u64, bitmap: &[u8], now: Instant) {
+    pub(crate) fn on_ack(
+        &mut self,
+        ack_next: u64,
+        bitmap: &[u8],
+        now: Instant,
+        telemetry: &mut Telemetry,
+    ) {
         if !self.reliable || ack_next > self.next_send {
             return;
         }
@@ -226,7 +232,9 @@ impl Outbound {
             self.highest_acked = Some(self.highest_acked.map_or(h, |old| old.max(h)));
         }
         if let Some(seq) = newest {
-            self.rto.sample(now.saturating_sub(self.sent_at(seq)));
+            let sent_at = self.sent_at(seq);
+            self.rto.sample(now.saturating_sub(sent_at));
+            telemetry.rtt(&UdpRtt { peer: self.peer, sent_at, received_at: now, ping: false });
         }
         self.prune();
     }
