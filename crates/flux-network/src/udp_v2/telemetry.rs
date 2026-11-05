@@ -163,6 +163,7 @@ pub enum TelemetryEvent {
     Send(UdpSend),
     Retransmit(UdpRetransmit),
     Latency(UdpLatency),
+    Rtt(UdpRtt),
     /// The reader fell behind and missed events.
     Lapped,
 }
@@ -189,23 +190,7 @@ impl TelemetryReader {
         drain(&mut self.sends, &mut on_event, TelemetryEvent::Send);
         drain(&mut self.retransmits, &mut on_event, TelemetryEvent::Retransmit);
         drain(&mut self.latency, &mut on_event, TelemetryEvent::Latency);
-    }
-
-    /// Publisher round trips, which `drain` doesn't carry. Samples a slow
-    /// reader was lapped on are skipped.
-    pub fn drain_rtt(&mut self, mut on_rtt: impl FnMut(UdpRtt)) {
-        let Some(consumer) = &mut self.rtt else { return };
-        let mut event = UdpRtt::default();
-        loop {
-            match consumer.try_consume(&mut event) {
-                Ok(()) => on_rtt(event),
-                Err(ReadError::SpedPast) => {
-                    warn!("udp rtt telemetry reader lapped");
-                    consumer.recover_after_error();
-                }
-                Err(ReadError::Empty) => return,
-            }
-        }
+        drain(&mut self.rtt, &mut on_event, TelemetryEvent::Rtt);
     }
 }
 
