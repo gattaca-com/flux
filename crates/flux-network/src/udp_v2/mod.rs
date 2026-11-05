@@ -2,8 +2,8 @@
 //! v2. Doesn't interoperate with [`crate::udp`] (v1); both run side by side
 //! until every peer is on v2.
 //!
-//! One-way streams run from a [`Publisher`] to its [`Subscriber`]s, with
-//! their own wire and state machine.
+//! One-way streams run from a publisher group to its subscribers, with their
+//! own wire and state machine; see [`crate::GroupConfig::UdpPublisher`].
 //!
 //! Both pack messages into a stream of packets, so a lost packet delays only
 //! the messages it carries.
@@ -29,14 +29,14 @@ mod telemetry;
 mod wire;
 
 pub(crate) use conn::UdpManager;
-pub use pubsub::{Publisher, PublisherEvent, Subscriber, SubscriberEvent};
+pub(crate) use pubsub::PubSubGroup;
 use sys::{RecvBatch, SendBatch};
 pub use telemetry::{
     PeerId, TelemetryEvent, TelemetryReader, UdpLatency, UdpRetransmit, UdpRtt, UdpSend,
 };
 
 use crate::{
-    network::{RxPayload, UdpGroupConfigV2, set_socket_buf_size},
+    network::{Event, Group, RxPayload, UdpGroupConfigV2, set_socket_buf_size},
     udp::UdpConfig,
 };
 
@@ -112,6 +112,24 @@ pub(crate) fn deliver_message<F>(
             Err(e) => warn!("dcache write failed: {e}"),
         },
     }
+}
+
+/// Delivers a peer's on-connect message, if it sent one.
+pub(crate) fn deliver_on_connect<F>(
+    group: Group,
+    token: Token,
+    msg: &[u8],
+    dcache: Option<&DCache>,
+    deliver: &mut F,
+) where
+    F: for<'a> FnMut(Event<RxPayload<'a>>),
+{
+    if msg.is_empty() {
+        return;
+    }
+    deliver_message(msg, Nanos::now(), dcache, &mut |payload, send_ts| {
+        deliver(Event::Message { group, token, payload, send_ts });
+    });
 }
 
 pub(crate) fn unspecified(peer: SocketAddr) -> SocketAddr {

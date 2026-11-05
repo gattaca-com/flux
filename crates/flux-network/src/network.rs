@@ -17,7 +17,7 @@ use crate::{
     tcp::{DEFAULT_TCP_USER_TIMEOUT_MS, ListenAt, TcpManager},
     tls::Session,
     udp::{UdpConfig, UdpManager},
-    udp_v2::UdpManager as UdpManagerV2,
+    udp_v2::{PubSubGroup, UdpManager as UdpManagerV2},
 };
 
 /// Controls emission of network latency and alloc telemetry.
@@ -422,8 +422,8 @@ impl Default for UdpGroupConfig {
 /// wire v2, which packs messages into shared datagrams. Doesn't interoperate
 /// with [`UdpGroupConfig`] (v1) peers.
 ///
-/// Also configures a [`crate::udp_v2::Publisher`] or
-/// [`crate::udp_v2::Subscriber`].
+/// Also configures a [`GroupConfig::UdpPublisher`] or
+/// [`GroupConfig::UdpSubscriber`] group.
 ///
 /// A peer's on-connect message is delivered right after its `Accepted` or
 /// `Connected`. A connection that falls a `send_window` behind or goes silent
@@ -453,10 +453,21 @@ impl Default for UdpGroupConfigV2 {
 
 /// A group fixes its transport and configuration for its lifetime.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum GroupConfig {
     Tcp(TcpGroupConfig),
     Udp(UdpGroupConfig),
     UdpV2(UdpGroupConfigV2),
+    /// Sends one stream to every subscriber of its listeners. A subscriber
+    /// that joins is `Accepted`, and one that leaves, times out or falls a
+    /// `send_window` behind is `Disconnected`. It listens and broadcasts, and
+    /// takes no per-token sends.
+    UdpPublisher(UdpGroupConfigV2),
+    /// Subscribes to publishers' streams, joining at their live end.
+    /// `connect` subscribes. A joined subscription is `Connected`, and a lost
+    /// one is `Disconnected` until it rejoins on its own; `disconnect` leaves
+    /// and rejoins. It neither listens nor sends.
+    UdpSubscriber(UdpGroupConfigV2),
 }
 
 impl GroupConfig {
@@ -465,7 +476,9 @@ impl GroupConfig {
         match &mut self {
             Self::Tcp(config) => config.socket_buf_size = Some(bytes),
             Self::Udp(config) => config.socket_buf_size = Some(bytes),
-            Self::UdpV2(config) => config.socket_buf_size = Some(bytes),
+            Self::UdpV2(config) | Self::UdpPublisher(config) | Self::UdpSubscriber(config) => {
+                config.socket_buf_size = Some(bytes);
+            }
         }
         self
     }
@@ -513,6 +526,7 @@ enum GroupState {
     Tcp(Box<TcpManager>),
     Udp(Box<UdpManager>),
     UdpV2(Box<UdpManagerV2>),
+    PubSub(Box<PubSubGroup>),
 }
 
 /// Groups of TCP connections and reliable UDP sessions sharing one poll.
@@ -570,6 +584,13 @@ impl Network {
                     assert!(udp.is_empty(), "attach dcache before creating endpoints");
                     assert!(
                         udp.max_message_size() <= dcache.capacity(),
+                        "udp max_message_size exceeds dcache capacity"
+                    );
+                }
+                GroupState::PubSub(pubsub) => {
+                    assert!(pubsub.is_empty(), "attach dcache before creating endpoints");
+                    assert!(
+                        pubsub.max_message_size() <= dcache.capacity(),
                         "udp max_message_size exceeds dcache capacity"
                     );
                 }
@@ -690,6 +711,13 @@ impl NetworkCore {
         }
     }
 
+    fn assert_fits_dcache(&self, config: &UdpGroupConfigV2) {
+        assert!(
+            self.dcache.as_deref().is_none_or(|dc| config.udp.max_message_size <= dc.capacity()),
+            "udp max_message_size exceeds dcache capacity"
+        );
+    }
+
     #[must_use = "the group handle identifies listeners and outbound endpoints"]
     pub fn add_group(&mut self, config: impl Into<GroupConfig>) -> Group {
         let group = Group(self.groups.len());
@@ -703,13 +731,16 @@ impl NetworkCore {
             }
             GroupConfig::Udp(config) => GroupState::Udp(Box::new(UdpManager::new(config, group))),
             GroupConfig::UdpV2(config) => {
-                assert!(
-                    self.dcache
-                        .as_deref()
-                        .is_none_or(|dc| config.udp.max_message_size <= dc.capacity()),
-                    "udp max_message_size exceeds dcache capacity"
-                );
+                self.assert_fits_dcache(&config);
                 GroupState::UdpV2(Box::new(UdpManagerV2::new(config, group)))
+            }
+            GroupConfig::UdpPublisher(config) => {
+                self.assert_fits_dcache(&config);
+                GroupState::PubSub(Box::new(PubSubGroup::publisher(config, group)))
+            }
+            GroupConfig::UdpSubscriber(config) => {
+                self.assert_fits_dcache(&config);
+                GroupState::PubSub(Box::new(PubSubGroup::subscriber(config, group)))
             }
         };
         self.groups.push(state);
@@ -728,6 +759,9 @@ impl NetworkCore {
             }
             Some(GroupState::UdpV2(udp)) => {
                 udp.listen(self.poller.registry(), addr, &mut self.tokens)
+            }
+            Some(GroupState::PubSub(pubsub)) => {
+                pubsub.listen(self.poller.registry(), addr, &mut self.tokens)
             }
             None => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown group")),
         }
@@ -811,7 +845,7 @@ impl NetworkCore {
         let group = self.route(token)?;
         match &self.groups[group.0] {
             GroupState::Tcp(tcp) => tcp.pending_write_bytes(token),
-            GroupState::Udp(_) | GroupState::UdpV2(_) => None,
+            GroupState::Udp(_) | GroupState::UdpV2(_) | GroupState::PubSub(_) => None,
         }
     }
     #[must_use]
@@ -822,6 +856,9 @@ impl NetworkCore {
             }
             GroupState::Udp(udp) => udp.connect(self.poller.registry(), addr, &mut self.tokens),
             GroupState::UdpV2(udp) => udp.connect(self.poller.registry(), addr, &mut self.tokens),
+            GroupState::PubSub(pubsub) => {
+                pubsub.connect(self.poller.registry(), addr, &mut self.tokens)
+            }
         }
     }
     /// Like [`Self::connect`], but every dial binds `local_ip` as the source
@@ -884,6 +921,7 @@ impl NetworkCore {
             }
             GroupState::Udp(udp) => udp.send_with(self.poller.registry(), token, serialise),
             GroupState::UdpV2(udp) => udp.send_with(self.poller.registry(), token, serialise),
+            GroupState::PubSub(_) => false,
         }
     }
     /// Sends `head` then `body` as one message. A plain TCP connection
@@ -912,6 +950,7 @@ impl NetworkCore {
                     buf.extend_from_slice(part);
                 }
             }),
+            GroupState::PubSub(_) => false,
         }
     }
     /// Sends a bounded batch. TCP stages one write; UDP retains message
@@ -937,6 +976,7 @@ impl NetworkCore {
             GroupState::UdpV2(udp) => {
                 udp.send_many_with(self.poller.registry(), token, items, serialise)
             }
+            GroupState::PubSub(_) => false,
         }
     }
     /// Serializes once for all eligible peers in this group. Returns the number
@@ -952,6 +992,7 @@ impl NetworkCore {
             }
             GroupState::Udp(udp) => udp.broadcast_with(self.poller.registry(), serialise),
             GroupState::UdpV2(udp) => udp.broadcast_with(self.poller.registry(), serialise),
+            GroupState::PubSub(pubsub) => pubsub.broadcast_with(self.poller.registry(), serialise),
         }
     }
     pub fn broadcast_many_with<I, F>(&mut self, group: Group, items: I, serialise: F) -> usize
@@ -969,6 +1010,9 @@ impl NetworkCore {
             GroupState::UdpV2(udp) => {
                 udp.broadcast_many_with(self.poller.registry(), items, serialise)
             }
+            GroupState::PubSub(pubsub) => {
+                pubsub.broadcast_many_with(self.poller.registry(), items, serialise)
+            }
         }
     }
     pub fn disconnect(&mut self, token: Token) -> bool {
@@ -977,6 +1021,7 @@ impl NetworkCore {
             GroupState::Tcp(tcp) => tcp.disconnect(self.poller.registry(), token, &mut self.tokens),
             GroupState::Udp(udp) => udp.disconnect(token),
             GroupState::UdpV2(udp) => udp.disconnect(token),
+            GroupState::PubSub(pubsub) => pubsub.disconnect(token),
         }
     }
     /// Closes the connection or session once everything queued for it has
@@ -990,6 +1035,7 @@ impl NetworkCore {
             }
             GroupState::Udp(udp) => udp.disconnect_when_drained(token),
             GroupState::UdpV2(udp) => udp.disconnect_when_drained(token),
+            GroupState::PubSub(pubsub) => pubsub.disconnect_when_drained(token),
         }
     }
     /// Permanently removes an endpoint or listener.
@@ -999,6 +1045,7 @@ impl NetworkCore {
             GroupState::Tcp(tcp) => tcp.remove(self.poller.registry(), token),
             GroupState::Udp(udp) => udp.remove(self.poller.registry(), token),
             GroupState::UdpV2(udp) => udp.remove(self.poller.registry(), token),
+            GroupState::PubSub(pubsub) => pubsub.remove(self.poller.registry(), token),
         };
         if removed {
             self.tokens.retire(token);
@@ -1010,7 +1057,7 @@ impl NetworkCore {
             match &mut self.groups[group.0] {
                 GroupState::Tcp(tcp) => tcp.pause_broadcast(token),
                 GroupState::Udp(udp) => udp.pause_broadcast(token),
-                GroupState::UdpV2(_) => {}
+                GroupState::UdpV2(_) | GroupState::PubSub(_) => {}
             }
         }
     }
@@ -1019,7 +1066,7 @@ impl NetworkCore {
             match &mut self.groups[group.0] {
                 GroupState::Tcp(tcp) => tcp.resume_broadcast(token),
                 GroupState::Udp(udp) => udp.resume_broadcast(token),
-                GroupState::UdpV2(_) => {}
+                GroupState::UdpV2(_) | GroupState::PubSub(_) => {}
             }
         }
     }
@@ -1027,7 +1074,7 @@ impl NetworkCore {
         self.tokens.groups.get(&token).is_some_and(|group| match &self.groups[group.0] {
             GroupState::Tcp(tcp) => tcp.is_broadcast_paused(token),
             GroupState::Udp(udp) => udp.is_broadcast_paused(token),
-            GroupState::UdpV2(_) => false,
+            GroupState::UdpV2(_) | GroupState::PubSub(_) => false,
         })
     }
     /// Drops the messages queued for `token` that have not started going out,
@@ -1038,7 +1085,7 @@ impl NetworkCore {
         match &mut self.groups[group.0] {
             GroupState::Tcp(tcp) => tcp.clear_backlog(token),
             GroupState::Udp(udp) => udp.clear_backlog(token),
-            GroupState::UdpV2(_) => 0,
+            GroupState::UdpV2(_) | GroupState::PubSub(_) => 0,
         }
     }
     /// Bytes accepted for `token` that have not reached its socket yet,
@@ -1047,7 +1094,7 @@ impl NetworkCore {
         let Some(group) = self.tokens.groups.get(&token).copied() else { return 0 };
         match &self.groups[group.0] {
             GroupState::Tcp(tcp) => tcp.queued_bytes(token),
-            GroupState::Udp(_) | GroupState::UdpV2(_) => 0,
+            GroupState::Udp(_) | GroupState::UdpV2(_) | GroupState::PubSub(_) => 0,
         }
     }
     pub fn currently_disconnected(&self) -> impl Iterator<Item = Token> + '_ {
@@ -1055,7 +1102,7 @@ impl NetworkCore {
             .iter()
             .filter_map(|group| match group {
                 GroupState::Tcp(tcp) => Some(tcp.currently_disconnected()),
-                GroupState::Udp(_) | GroupState::UdpV2(_) => None,
+                GroupState::Udp(_) | GroupState::UdpV2(_) | GroupState::PubSub(_) => None,
             })
             .flatten()
             .chain(
@@ -1063,7 +1110,7 @@ impl NetworkCore {
                     .iter()
                     .filter_map(|group| match group {
                         GroupState::Udp(udp) => Some(udp.currently_disconnected()),
-                        GroupState::Tcp(_) | GroupState::UdpV2(_) => None,
+                        GroupState::Tcp(_) | GroupState::UdpV2(_) | GroupState::PubSub(_) => None,
                     })
                     .flatten(),
             )
@@ -1072,7 +1119,16 @@ impl NetworkCore {
                     .iter()
                     .filter_map(|group| match group {
                         GroupState::UdpV2(udp) => Some(udp.currently_disconnected()),
-                        GroupState::Tcp(_) | GroupState::Udp(_) => None,
+                        GroupState::Tcp(_) | GroupState::Udp(_) | GroupState::PubSub(_) => None,
+                    })
+                    .flatten(),
+            )
+            .chain(
+                self.groups
+                    .iter()
+                    .filter_map(|group| match group {
+                        GroupState::PubSub(pubsub) => Some(pubsub.currently_disconnected()),
+                        GroupState::Tcp(_) | GroupState::Udp(_) | GroupState::UdpV2(_) => None,
                     })
                     .flatten(),
             )
@@ -1083,6 +1139,7 @@ impl NetworkCore {
                 GroupState::Tcp(tcp) => tcp.force_reconnect(self.poller.registry()),
                 GroupState::Udp(udp) => udp.force_reconnect(self.poller.registry()),
                 GroupState::UdpV2(udp) => udp.force_reconnect(),
+                GroupState::PubSub(pubsub) => pubsub.force_reconnect(),
             }
         }
     }
@@ -1094,6 +1151,7 @@ impl NetworkCore {
                 }
                 GroupState::Udp(udp) => udp.disconnect_outbound(),
                 GroupState::UdpV2(udp) => udp.disconnect_outbound(),
+                GroupState::PubSub(pubsub) => pubsub.disconnect_outbound(),
             }
         }
     }
@@ -1113,6 +1171,7 @@ impl NetworkCore {
                 ),
                 GroupState::Udp(udp) => udp.pre_poll(self.poller.registry(), handler),
                 GroupState::UdpV2(udp) => udp.pre_poll(self.poller.registry(), handler),
+                GroupState::PubSub(pubsub) => pubsub.pre_poll(self.poller.registry(), handler),
             };
         }
         work
@@ -1127,6 +1186,7 @@ impl NetworkCore {
                 GroupState::Tcp(tcp) => tcp.post_poll(handler),
                 GroupState::Udp(udp) => udp.post_poll(&mut self.tokens, handler),
                 GroupState::UdpV2(udp) => udp.post_poll(&mut self.tokens, handler),
+                GroupState::PubSub(pubsub) => pubsub.post_poll(&mut self.tokens, handler),
             };
         }
         work
@@ -1164,6 +1224,15 @@ impl NetworkCore {
                     handler,
                 );
             }
+            GroupState::PubSub(pubsub) => {
+                pubsub.handle_event(
+                    self.poller.registry(),
+                    event,
+                    &mut self.tokens,
+                    self.dcache.as_deref(),
+                    handler,
+                );
+            }
         }
     }
 }
@@ -1176,6 +1245,7 @@ impl Drop for NetworkCore {
                 GroupState::Tcp(tcp) => tcp.close_all(registry),
                 GroupState::Udp(udp) => udp.close_all(registry),
                 GroupState::UdpV2(udp) => udp.close_all(registry),
+                GroupState::PubSub(pubsub) => pubsub.close_all(registry),
             }
         }
     }
@@ -1223,6 +1293,7 @@ impl NetworkWithExternalPoll {
                 }
                 GroupState::Udp(udp) => udp.tick_interval(),
                 GroupState::UdpV2(udp) => udp.tick_interval(),
+                GroupState::PubSub(pubsub) => pubsub.tick_interval(),
             })
             .min()
             .unwrap_or_else(|| Duration::from_secs(1))
