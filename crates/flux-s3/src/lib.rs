@@ -29,6 +29,46 @@ use flux_network::{
 
 const RETRIES: u8 = 3;
 
+/// Per-object settings for [`S3::put_object_with_options`] and
+/// [`S3::create_multipart_upload_with_options`].
+///
+/// Unset fields leave S3's defaults and bucket policy in effect.
+/// S3 validates supported values and
+/// permissions; S3-compatible endpoints may support only a subset.
+///
+/// ```
+/// use flux_s3::UploadOptions;
+///
+/// let options = UploadOptions {
+///     storage_class: Some("INTELLIGENT_TIERING"),
+///     content_type: Some("application/octet-stream"),
+///     tags: &[("dataset", "events")],
+///     ..UploadOptions::default()
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UploadOptions<'a> {
+    /// The S3 storage class, such as `STANDARD`, `STANDARD_IA`, or
+    /// `INTELLIGENT_TIERING`. Omission uses S3's default storage class.
+    pub storage_class: Option<&'a str>,
+    pub content_type: Option<&'a str>,
+    /// Unencoded keys and values; encoded as the `x-amz-tagging` header.
+    pub tags: &'a [(&'a str, &'a str)],
+    pub encryption: Option<ServerSideEncryption<'a>>,
+}
+
+/// Encryption applied when S3 creates the object, not to individual parts.
+#[derive(Clone, Copy, Debug)]
+pub enum ServerSideEncryption<'a> {
+    S3,
+    Kms {
+        /// Omission selects the AWS-managed `aws/s3` key.
+        key_id: Option<&'a str>,
+        /// Omission leaves the bucket's S3 Bucket Key setting in effect.
+        bucket_key_enabled: Option<bool>,
+    },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<'a> {
     /// Non-2xx status with the S3 `<Code>` and body.
@@ -289,6 +329,18 @@ impl S3 {
     ) -> Option<RequestId> {
         self.queue(net, "PUT", &object_resource(bucket, key), "", body)
     }
+    /// Like [`Self::put_object`], with per-object settings. Options are
+    /// copied into the queued request and need not outlive this call.
+    pub fn put_object_with_options(
+        &mut self,
+        net: &mut NetworkCore,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        options: &UploadOptions<'_>,
+    ) -> Option<RequestId> {
+        self.queue_with_options(net, "PUT", &object_resource(bucket, key), "", body, options)
+    }
     /// Sends a GET of `bucket/key`.
     pub fn get_object(
         &mut self,
@@ -358,6 +410,25 @@ impl S3 {
         key: &str,
     ) -> Option<RequestId> {
         self.queue(net, "POST", &object_resource(bucket, key), "uploads=", &[])
+    }
+    /// Like [`Self::create_multipart_upload`], with settings for the final
+    /// object. Options are copied into this request; do not resend them on
+    /// [`Self::upload_part`] or [`Self::complete_multipart_upload`].
+    pub fn create_multipart_upload_with_options(
+        &mut self,
+        net: &mut NetworkCore,
+        bucket: &str,
+        key: &str,
+        options: &UploadOptions<'_>,
+    ) -> Option<RequestId> {
+        self.queue_with_options(
+            net,
+            "POST",
+            &object_resource(bucket, key),
+            "uploads=",
+            &[],
+            options,
+        )
     }
     /// Uploads part `part_number` (1 to 10000) of an upload; its `ETag`
     /// response header goes to [`Self::complete_multipart_upload`]. Every
@@ -429,30 +500,73 @@ impl S3 {
         query: &str,
         body: &[u8],
     ) -> Option<RequestId> {
+        self.queue_with_options(net, method, resource, query, body, &UploadOptions::default())
+    }
+    fn queue_with_options(
+        &mut self,
+        net: &mut NetworkCore,
+        method: &str,
+        resource: &str,
+        query: &str,
+        body: &[u8],
+        options: &UploadOptions<'_>,
+    ) -> Option<RequestId> {
+        let mut tagging = String::new();
+        for (key, value) in options.tags {
+            if !tagging.is_empty() {
+                tagging.push('&');
+            }
+            sigv4::encode(&mut tagging, key);
+            tagging.push('=');
+            sigv4::encode(&mut tagging, value);
+        }
+        let (encryption, key_id, bucket_key) = match options.encryption {
+            None => (None, None, None),
+            Some(ServerSideEncryption::S3) => (Some("AES256"), None, None),
+            Some(ServerSideEncryption::Kms { key_id, bucket_key_enabled }) => (
+                Some("aws:kms"),
+                key_id,
+                bucket_key_enabled.map(|enabled| if enabled { "true" } else { "false" }),
+            ),
+        };
+        let mut headers = [("", ""); 11];
+        let mut len = 0;
+        for (name, value) in [
+            ("x-amz-storage-class", options.storage_class),
+            ("content-type", options.content_type),
+            ("x-amz-tagging", (!tagging.is_empty()).then_some(tagging.as_str())),
+            ("x-amz-server-side-encryption", encryption),
+            ("x-amz-server-side-encryption-aws-kms-key-id", key_id),
+            ("x-amz-server-side-encryption-bucket-key-enabled", bucket_key),
+        ] {
+            if let Some(value) = value {
+                headers[len] = (name, value);
+                len += 1;
+            }
+        }
         let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let (authorization, payload) = self.signer.sign(method, resource, query, &date, &[], body);
+        let (authorization, payload) =
+            self.signer.sign(method, resource, query, &date, &headers[..len], body);
         let mut path = resource.to_owned();
         if !query.is_empty() {
             path.push('?');
             path.push_str(query);
         }
         let pool = self.pool.expect("connect before queueing requests");
-        let Self { http, signer, .. } = self;
-        let mut headers = [
+        for header in [
             ("X-Amz-Date", date.as_str()),
             ("Authorization", authorization.as_str()),
             ("X-Amz-Content-Sha256", payload.as_str()),
-            ("Host", signer.host()),
-            ("X-Amz-Security-Token", ""),
-        ];
-        let len = match signer.session_token() {
-            Some(token) => {
-                headers[4].1 = token;
-                headers.len()
-            }
-            None => headers.len() - 1,
-        };
-        http.send(net, pool, method, &path, &headers[..len], body, RETRIES)
+            ("Host", self.signer.host()),
+        ] {
+            headers[len] = header;
+            len += 1;
+        }
+        if let Some(token) = self.signer.session_token() {
+            headers[len] = ("X-Amz-Security-Token", token);
+            len += 1;
+        }
+        self.http.send(net, pool, method, &path, &headers[..len], body, RETRIES)
     }
 }
 
