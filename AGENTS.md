@@ -12,6 +12,26 @@ Success means the smallest complete change that solves the requested problem and
 - Measure performance-sensitive changes when practical. State when measurement is not possible.
 - Stop when the requested outcome is complete. Report unrelated issues instead of fixing them.
 
+## Framework conventions
+
+- Protocol clients (`flux-clickhouse`, `flux-postgres`) take the caller's `NetworkCore` so every client shares one poll. They never own a hidden network or `mio::Poll`. A client owns its batching, request tracking, pooling, encoding, and lifecycle, and stays synchronous, non-blocking, and caller-driven.
+- Tiles coordinate by message passing, never through `Mutex`-shared coordinators. Never store a `SpineAdapter` in a struct; pass the `&mut SpineAdapter` from `loop_body` down.
+- Keep core modules unconditional unless feature-gating is strongly justified.
+- `TileConfig::new` pins one core. Multi-core pinning is only for background tiles (`background_on_cores`).
+- With the `park` feature, `TileConfig::new` and `with_park()` tiles park; `background*` tiles never do. A parked tile wakes only on spine producer signals, so tiles polling sockets, disk, or timers must not park.
+- Never block on DNS in a tile loop. Resolve with the non-blocking `flux-dns` `Resolver` and pass `SocketAddr`s to `Network`.
+- New code uses zero-copy `Blob`/`ByteStable` encoding, never a serde codec. The bincode types (`VersionedBlob`, `TelemetryWire`, `VersionedDeserialize`, `versioned_deserialize_vec`, `VersionedPersistable`) are legacy; keep them until downstream users migrate, then remove them and the dependency in one change.
+- `flux-gather` is a library of composable parts (`BlobShipper`, `BlobIo`, `BlobReader`, `BlobReceiver`/`BlobConsumer`), not a service. Callers own metadata and flush policy; `#[queue(gather)]` only marks queues.
+- A versioned leaf's identity is its wire name plus type hash, never the type hash alone: the same leaf type can be reachable through different family paths. `versioned_telemetry!(T, persist = "Name")` defines the canonical name. Adding a variant with a new leaf is wire-compatible; renaming or removing a wire name breaks compatibility.
+- Frozen versions are immutable. Evolve a type with a new version locked by `#[type_hash_lock(hash = ...)]`.
+
+## Framework pitfalls
+
+- Broadcast consumers attach at the live tail on their first read. In tests, call `subscribe_broadcast()` before producing, or earlier messages are silently skipped.
+- Broadcast cursors are shared per consumer label: consumers with the same label compete for messages. Give each independent reader a unique label.
+- Zero-sized leaves carry no payload. Take the message count from the blob header's `n_messages`, never from payload length.
+- Real S3 requires a signed `x-amz-content-sha256` header on every request, including `GET`. S3-compatible test servers do not, so they will not catch its absence.
+
 ## Build and lint
 
 ```bash
