@@ -312,10 +312,14 @@ fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
         let mut tls = rustls::Stream::new(&mut conn, &mut sock);
         let mut client = ClientConnection::new(Http2Config::default()).unwrap();
         let mut bodies = std::collections::BTreeMap::new();
+        // Split cookies, and a `host` that `:authority` overrides.
+        let mut fields = HeaderMap::new();
+        for (name, value) in [("cookie", "a=1"), ("cookie", "b=2"), ("host", "elsewhere")] {
+            fields.append(name, value.parse().unwrap());
+        }
         for path in ["/one", "/two"] {
             let head =
-                RequestHeaders::new(Method::POST, "https", "localhost", path, &HeaderMap::new())
-                    .unwrap();
+                RequestHeaders::new(Method::POST, "https", "localhost", path, &fields).unwrap();
             let id = client.send_headers(&head, false).unwrap();
             client.send_data(id, &[b'x'; 1000], true).unwrap();
             bodies.insert(id, (path, Vec::new(), false));
@@ -362,6 +366,10 @@ fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
             if let HttpEvent::Request { token, request } = event {
                 let body: &[u8] = if request.version == 2 { &[b'x'; 1000] } else { b"body" };
                 assert_eq!(request.body, body);
+                if request.version == 2 {
+                    assert_eq!(request.header("cookie"), Some(&b"a=1; b=2"[..]));
+                    assert_eq!(request.header("host"), Some(&b"localhost"[..]));
+                }
                 replies.push((token, request.stream, request.version, request.path.to_owned()));
             }
         });
@@ -369,7 +377,9 @@ fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
         for (token, stream, version, path) in replies.into_iter().rev() {
             // Larger than HTTP/2's send buffer.
             let body = if path == "/two" { vec![b'y'; 600_000] } else { path.into_bytes() };
-            assert!(http.respond_to(&mut net, token, stream, 200, &[], &body));
+            // HTTP/1 framing a shared handler may send.
+            let headers = [("Keep-Alive", "timeout=5"), ("Content-Type", " text/plain ")];
+            assert!(http.respond_to(&mut net, token, stream, 200, &headers, &body));
             versions.push(version);
         }
     }

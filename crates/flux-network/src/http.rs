@@ -371,9 +371,14 @@ impl HttpNetwork {
         self.tls_config = Some(config);
         self
     }
-    /// Serves HTTP/2 to accepted clients that open with its preface, over
-    /// TLS as negotiated with ALPN `h2` or over plain TCP with prior
-    /// knowledge. Panics if `config` is invalid.
+    /// Serves HTTP/2 to accepted clients that open with its preface, on plain
+    /// and TLS listeners alike. TLS clients send it after negotiating ALPN
+    /// `h2`, which the listener's config must offer.
+    ///
+    /// Each connection buffers up to `max_concurrent_streams` request bodies
+    /// of `max_body_bytes`. A header list over `max_header_list_size` closes
+    /// the connection instead of answering 431. Panics if `config` is
+    /// invalid.
     pub fn with_http2(mut self, config: Http2Config) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         ServerConnection::new(config).expect("valid HTTP/2 configuration");
@@ -1181,7 +1186,7 @@ impl HttpNetwork {
         if *shutting_down {
             http2.go_away();
         }
-        http2.deliver(spare_streams, |request| handler(HttpEvent::Request { token, request }));
+        http2.deliver(|request| handler(HttpEvent::Request { token, request }));
         http2.pump(spare_streams);
         http2.flush(net, token);
         // Retried every drive until written.
@@ -1230,7 +1235,7 @@ impl HttpNetwork {
         };
         let Some(http2) = conn.http2.as_deref_mut() else { return false };
         let ok = http2.respond(stream, status, &self.http2_fields, body, &mut self.spare_streams);
-        if self.shutting_down || headers.iter().any(|(n, v)| is_close(n, v)) {
+        if self.shutting_down || (ok && headers.iter().any(|(n, v)| is_close(n, v))) {
             http2.go_away();
         }
         http2.flush(net, token);
@@ -1761,11 +1766,19 @@ fn opens_http2(buffered: &[u8], payload: &[u8]) -> bool {
 fn is_close(name: &str, value: &str) -> bool {
     name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")
 }
-/// Fills `fields` with `headers` but `Connection`, which HTTP/2 forbids.
-/// Keeps `fields` when they already match, so a repeated set costs no
-/// allocation.
+/// Fills `fields` with `headers` as HTTP/2 carries them: without the
+/// connection-specific fields it forbids, and with values trimmed of the
+/// whitespace HTTP/1 ignores. Keeps `fields` when they already match, so a
+/// repeated set costs no allocation. False, leaving the stream unanswered,
+/// for a header HTTP/2 cannot carry.
 fn set_fields(fields: &mut HeaderMap, headers: &[(&str, &str)]) -> bool {
-    let wanted = || headers.iter().filter(|(n, _)| !n.eq_ignore_ascii_case("connection"));
+    const HOP_BY_HOP: [&str; 5] = ["connection", "keep-alive", "proxy-connection", "upgrade", "te"];
+    let wanted = || {
+        headers
+            .iter()
+            .filter(|(n, _)| !HOP_BY_HOP.iter().any(|hop| n.eq_ignore_ascii_case(hop)))
+            .map(|(n, v)| (*n, v.trim_matches([' ', '\t'])))
+    };
     if fields.len() == wanted().count() &&
         fields.iter().zip(wanted()).all(|((name, value), (n, v))| {
             name.as_str().eq_ignore_ascii_case(n) && value.as_bytes() == v.as_bytes()

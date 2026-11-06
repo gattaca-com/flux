@@ -47,6 +47,9 @@ pub(super) struct Stream {
     recv_open: bool,
     /// Answered with this status instead of being delivered.
     reject: Option<u16>,
+    /// `RST_STREAM` code still to send. Until it goes out, HTTP/2 keeps the
+    /// stream and credits its DATA to it.
+    reset: Option<u32>,
 }
 
 impl Stream {
@@ -93,9 +96,22 @@ impl Http2Conn {
                 {
                     push(&mut stream.head, part);
                 }
-                for (name, value) in head.fields.iter() {
+                for (name, value) in head.fields.iter().filter(|(name, _)| *name != "cookie") {
                     push(&mut stream.head, name.as_bytes());
                     push(&mut stream.head, value);
+                    stream.fields += 1;
+                }
+                // Split cookies are joined as HTTP/1 sends them.
+                let mut cookies = head.fields.get_all("cookie").peekable();
+                if cookies.peek().is_some() {
+                    push(&mut stream.head, b"cookie");
+                    for (at, value) in cookies.enumerate() {
+                        if at != 0 {
+                            stream.head.extend_from_slice(b"; ");
+                        }
+                        stream.head.extend_from_slice(value);
+                    }
+                    stream.head.push(0);
                     stream.fields += 1;
                 }
                 if std::str::from_utf8(path).is_err() {
@@ -140,20 +156,14 @@ impl Http2Conn {
     }
 
     /// Answers rejected streams, then hands every complete request to `emit`.
-    pub(super) fn deliver(
-        &mut self,
-        spare: &mut Vec<Stream>,
-        mut emit: impl FnMut(HttpRequest<'_>),
-    ) {
+    pub(super) fn deliver(&mut self, mut emit: impl FnMut(HttpRequest<'_>)) {
         let mut at = 0;
         while at < self.streams.len() {
             if self.streams[at].phase == Phase::Receiving &&
                 let Some(status) = self.streams[at].reject
             {
                 let status = StatusCode::from_u16(status).expect("valid status");
-                if !self.answer(at, status, &HeaderMap::new(), &[], spare) {
-                    continue
-                }
+                self.answer(at, status, &HeaderMap::new(), &[]);
             }
             at += 1;
         }
@@ -170,15 +180,16 @@ impl Http2Conn {
                 ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
             let headers = header_slots(&mut stack_slots, &mut heap_slots, stream.fields + 1);
             let mut len = 0;
-            let mut host = false;
             while let (Some(name), Some(value)) = (parts.next(), parts.next()) {
                 let name = std::str::from_utf8(name).unwrap_or("");
-                host |= name == "host";
+                // `:authority` takes precedence over `Host`.
+                if name == "host" && !authority.is_empty() {
+                    continue
+                }
                 headers[len] = httparse::Header { name, value };
                 len += 1;
             }
-            // `:authority` stands in for `Host`.
-            if !host && !authority.is_empty() {
+            if !authority.is_empty() {
                 headers[len] = httparse::Header { name: "host", value: authority };
                 len += 1;
             }
@@ -208,21 +219,14 @@ impl Http2Conn {
         else {
             return false
         };
-        let answered = self.answer(at, status, fields, body, spare);
+        let answered = self.answer(at, status, fields, body);
         self.pump(spare);
         answered
     }
 
     /// Sends what flow control allows and queues the rest for [`Self::pump`].
-    /// False if the stream had to be reset; it is gone then.
-    fn answer(
-        &mut self,
-        at: usize,
-        status: StatusCode,
-        fields: &HeaderMap,
-        body: &[u8],
-        spare: &mut Vec<Stream>,
-    ) -> bool {
+    /// False if the stream has to be reset instead.
+    fn answer(&mut self, at: usize, status: StatusCode, fields: &HeaderMap, body: &[u8]) -> bool {
         let stream = &mut self.streams[at];
         let bodyless = stream.is_head_request() || matches!(status.as_u16(), 204 | 304);
         let end = bodyless || body.is_empty();
@@ -233,24 +237,31 @@ impl Http2Conn {
                 sent => sent,
             };
         }
+        stream.phase = Phase::Sending;
         let Ok(sent) = sent else {
-            let _ = self.h2.reset(stream.id, INTERNAL_ERROR);
-            recycle(self.streams.swap_remove(at), spare);
+            stream.reset = Some(INTERNAL_ERROR);
             return false
         };
-        stream.phase = Phase::Sending;
         if !end {
             stream.out.extend_from_slice(&body[sent..]);
         }
         true
     }
 
-    /// Returns DATA credit and sends queued response bytes; recycles streams
-    /// whose response is complete.
+    /// Returns DATA credit, sends queued response bytes and resets; recycles
+    /// streams that are done.
     pub(super) fn pump(&mut self, spare: &mut Vec<Stream>) {
         let mut at = 0;
         while at < self.streams.len() {
             let stream = &mut self.streams[at];
+            if let Some(code) = stream.reset {
+                if self.h2.reset(stream.id, code) == Err(SendError::WouldBlock) {
+                    at += 1;
+                } else {
+                    recycle(self.streams.swap_remove(at), spare);
+                }
+                continue
+            }
             if stream.credit != 0 &&
                 self.h2.release_capacity(stream.id, stream.credit) != Err(SendError::WouldBlock)
             {
@@ -262,16 +273,20 @@ impl Http2Conn {
                     Ok(sent) => stream.offset += sent,
                     Err(SendError::WouldBlock) => done = false,
                     Err(_) => {
-                        let _ = self.h2.reset(stream.id, INTERNAL_ERROR);
-                        stream.offset = stream.out.len();
+                        stream.reset = Some(INTERNAL_ERROR);
+                        break
                     }
                 }
             }
+            if stream.reset.is_some() {
+                continue
+            }
             if done && stream.credit == 0 {
                 if stream.recv_open {
-                    let _ = self.h2.reset(stream.id, NO_ERROR);
+                    stream.reset = Some(NO_ERROR);
+                } else {
+                    recycle(self.streams.swap_remove(at), spare);
                 }
-                recycle(self.streams.swap_remove(at), spare);
             } else {
                 at += 1;
             }
@@ -292,11 +307,12 @@ impl Http2Conn {
         }
     }
 
-    /// Frames, response bytes or DATA credit wait to go out.
+    /// Frames, response bytes, resets or DATA credit wait to go out.
     pub(super) fn has_output(&self) -> bool {
         !self.h2.output().is_empty() ||
             self.streams.iter().any(|stream| {
                 stream.credit != 0 ||
+                    stream.reset.is_some() ||
                     (stream.phase == Phase::Sending && stream.offset < stream.out.len())
             })
     }
