@@ -59,7 +59,8 @@ mod enabled {
         server: Option<ServerName<'static>>,
         config: Option<Arc<ClientConfig>>,
         conn: Option<Connection>,
-        /// Servers advertising ALPN reject peers that negotiate none.
+        /// Servers advertising ALPN without `http/1.1` reject peers that
+        /// negotiate none.
         require_alpn: bool,
         started: Option<Instant>,
         /// Whether the connection has been reported once. Accepted sockets
@@ -93,7 +94,10 @@ mod enabled {
         /// Server side of an accepted socket; the handshake starts with the
         /// peer's first flight.
         pub(crate) fn accept(config: Arc<ServerConfig>) -> Result<Self, rustls::Error> {
-            let require_alpn = !config.alpn_protocols.is_empty();
+            // A peer offering no ALPN speaks HTTP/1.1, since HTTP/2 over TLS
+            // requires `h2`.
+            let require_alpn = !config.alpn_protocols.is_empty() &&
+                !config.alpn_protocols.iter().any(|protocol| protocol == b"http/1.1");
             let mut conn = ServerConnection::new(config)?;
             conn.set_buffer_limit(None);
             Ok(Self {
