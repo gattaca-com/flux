@@ -8,7 +8,7 @@ use flux_network::{
     Network,
     http::{HttpEvent, HttpNetwork},
 };
-use flux_s3::{Error, S3};
+use flux_s3::{Error, S3, ServerSideEncryption, UploadOptions};
 
 const NOT_FOUND: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>nope</Message></Error>"#;
 const LIST: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Contents><Key>a/b</Key></Contents></ListBucketResult>"#;
@@ -107,4 +107,142 @@ fn objects_round_trip_put_is_retried_and_errors_map() {
             .iter()
             .any(|request| request.1 == "/bucket?continuation-token=t%2F0&list-type=2&prefix=a%2Fb")
     );
+}
+
+#[test]
+fn upload_options_are_signed_for_put_and_multipart_and_survive_retry() {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default();
+    server.listen(&mut net, addr).unwrap();
+    let mut s3 = S3::new(addr, 1);
+    s3.set_credentials("access", "secret", Some("session"));
+    s3.connect(&mut net);
+    let options = UploadOptions {
+        storage_class: Some("INTELLIGENT_TIERING"),
+        content_type: Some("application/octet-stream"),
+        tags: &[("data set", "a/b+&=雪"), ("empty", "")],
+        encryption: Some(ServerSideEncryption::Kms {
+            key_id: Some("arn:aws:kms:us-east-1:123456789012:key/example"),
+            bucket_key_enabled: Some(true),
+        }),
+    };
+    s3.put_object_with_options(&mut net, "bucket", "put", b"hello", &options).unwrap();
+    s3.create_multipart_upload_with_options(&mut net, "bucket", "multipart", &options).unwrap();
+    s3.put_object_with_options(&mut net, "bucket", "sse-s3", b"hello", &UploadOptions {
+        encryption: Some(ServerSideEncryption::S3),
+        ..UploadOptions::default()
+    })
+    .unwrap();
+    let kms_defaults = UploadOptions {
+        encryption: Some(ServerSideEncryption::Kms {
+            key_id: None,
+            bucket_key_enabled: Some(false),
+        }),
+        ..UploadOptions::default()
+    };
+    s3.create_multipart_upload_with_options(&mut net, "bucket", "kms-default-key", &kms_defaults)
+        .unwrap();
+    s3.put_object_with_options(&mut net, "bucket", "defaults", b"hello", &UploadOptions::default())
+        .unwrap();
+    s3.create_multipart_upload(&mut net, "bucket", "defaults").unwrap();
+    let mut requests = Vec::new();
+    let mut completed = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && completed < 6 {
+        net.poll_with(|event| {
+            if !s3.on_event(&event) {
+                server.on_event(&event);
+            }
+        });
+        s3.drive(&mut net, |_, result| {
+            result.unwrap();
+            completed += 1;
+        });
+        let mut replies = Vec::new();
+        server.drive(&mut net, |event| {
+            if let HttpEvent::Request { token, request } = event {
+                let authorization =
+                    std::str::from_utf8(request.header("authorization").unwrap()).unwrap();
+                let signed = authorization
+                    .split("SignedHeaders=")
+                    .nth(1)
+                    .unwrap()
+                    .split(',')
+                    .next()
+                    .unwrap();
+                let mut headers: Vec<_> = request
+                    .headers
+                    .iter()
+                    .filter(|header| header.name != "Authorization")
+                    .map(|header| (header.name.to_ascii_lowercase(), header.value.to_vec()))
+                    .collect();
+                headers.sort();
+                let option_headers: Vec<_> = headers
+                    .iter()
+                    .filter(|(name, _)| name == "content-type" || name.starts_with("x-amz-"))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                let mut signed_headers: Vec<_> = signed.split(';').collect();
+                signed_headers.retain(|name| *name != "host");
+                assert_eq!(signed_headers, option_headers);
+                assert_eq!(request.header("x-amz-security-token"), Some(b"session".as_slice()));
+                requests.push((request.method.to_owned(), request.path.to_owned(), headers));
+                replies.push((token, requests.len() == 1));
+            }
+        });
+        for (token, disconnect) in replies {
+            if disconnect {
+                server.disconnect(&mut net, token);
+            } else {
+                server.respond(&mut net, token, 200, &[], b"");
+            }
+        }
+        thread::yield_now();
+    }
+    assert_eq!(completed, 6);
+    assert_eq!(requests.len(), 7);
+    assert_eq!(requests[0], requests[1]);
+    for (method, path, headers) in &requests {
+        assert_upload_options(method, path, headers);
+    }
+}
+
+fn assert_upload_options(method: &str, path: &str, headers: &[(String, Vec<u8>)]) {
+    let expected = [
+        ("content-type", "application/octet-stream"),
+        ("x-amz-server-side-encryption", "aws:kms"),
+        (
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "arn:aws:kms:us-east-1:123456789012:key/example",
+        ),
+        ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
+        ("x-amz-storage-class", "INTELLIGENT_TIERING"),
+        ("x-amz-tagging", "data%20set=a%2Fb%2B%26%3D%E9%9B%AA&empty="),
+    ];
+    let options: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| {
+            name == "content-type" ||
+                name == "x-amz-storage-class" ||
+                name == "x-amz-tagging" ||
+                name.starts_with("x-amz-server-side-encryption")
+        })
+        .map(|(name, value)| (name.as_str(), std::str::from_utf8(value).unwrap()))
+        .collect();
+    match path {
+        "/bucket/put" | "/bucket/multipart?uploads=" => {
+            assert_eq!(method, if path == "/bucket/put" { "PUT" } else { "POST" });
+            assert_eq!(options, expected);
+        }
+        "/bucket/sse-s3" => assert_eq!(options, [("x-amz-server-side-encryption", "AES256")]),
+        "/bucket/kms-default-key?uploads=" => assert_eq!(options, [
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-bucket-key-enabled", "false"),
+        ]),
+        "/bucket/defaults" | "/bucket/defaults?uploads=" => assert!(options.is_empty()),
+        other => panic!("unexpected path {other}"),
+    }
 }
