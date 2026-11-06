@@ -283,3 +283,97 @@ fn tls_listener_serves_after_bytes_follow_close_notify() {
     assert!(served.join().unwrap());
     drop(sock);
 }
+
+#[test]
+fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
+    use flux_network::http2::{ClientConnection, ClientEvent, Http2Config, RequestHeaders};
+    use http::{HeaderMap, Method};
+
+    let (mut server_config, mut h2_config) = tls_pair();
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let mut h1_config = h2_config.clone();
+    h2_config.alpn_protocols = vec![b"h2".to_vec()];
+    h1_config.alpn_protocols.clear();
+    let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+    let mut net = Network::default();
+    let mut http = HttpNetwork::default().with_http2(Http2Config::default());
+    http.listen_tls(&mut net, addr, Arc::new(server_config)).unwrap();
+
+    let h2 = thread::spawn(move || {
+        let mut sock = std::net::TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut conn =
+            rustls::ClientConnection::new(Arc::new(h2_config), "localhost".try_into().unwrap())
+                .unwrap();
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+        let mut client = ClientConnection::new(Http2Config::default()).unwrap();
+        let mut bodies = std::collections::BTreeMap::new();
+        for path in ["/one", "/two"] {
+            let head =
+                RequestHeaders::new(Method::POST, "https", "localhost", path, &HeaderMap::new())
+                    .unwrap();
+            let id = client.send_headers(&head, false).unwrap();
+            client.send_data(id, b"body", true).unwrap();
+            bodies.insert(id, (path, Vec::new(), false));
+        }
+        let mut input = Vec::new();
+        while bodies.values().any(|(_, _, done)| !done) {
+            tls.write_all(client.output()).unwrap();
+            client.consume_output(client.output().len());
+            tls.flush().unwrap();
+            let mut chunk = [0; 4096];
+            let read = tls.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "server closed the connection");
+            input.extend_from_slice(&chunk[..read]);
+            let consumed = client
+                .receive(&input, |event| match event {
+                    ClientEvent::Response { stream_id, status, .. } => {
+                        assert_eq!(status, 200, "stream {stream_id}");
+                    }
+                    ClientEvent::Data { stream_id, data, end_stream } => {
+                        let (_, body, done) = bodies.get_mut(&stream_id).unwrap();
+                        body.extend_from_slice(data);
+                        *done = end_stream;
+                    }
+                    ClientEvent::Reset { stream_id, .. } => panic!("stream {stream_id} reset"),
+                    _ => {}
+                })
+                .unwrap();
+            input.drain(..consumed);
+        }
+        bodies.into_values().map(|(path, body, _)| (path, body)).collect::<Vec<_>>()
+    });
+    let (h1_go, go) = std::sync::mpsc::channel();
+    let h1 = tls_client(addr, h1_config, &["/three"], go);
+    h1_go.send(()).unwrap();
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut versions = Vec::new();
+    while Instant::now() < deadline && versions.len() < 3 {
+        let mut replies = Vec::new();
+        net.poll_with(|event| {
+            http.on_event(&event);
+        });
+        http.drive(&mut net, |event| {
+            if let HttpEvent::Request { token, request } = event {
+                assert_eq!(request.body, b"body");
+                replies.push((token, request.stream, request.version, request.path.to_owned()));
+            }
+        });
+        // Requests that arrive together are answered out of order.
+        for (token, stream, version, path) in replies.into_iter().rev() {
+            assert!(http.respond_to(&mut net, token, stream, 200, &[], path.as_bytes()));
+            versions.push(version);
+        }
+    }
+    while !(h1.is_finished() && h2.is_finished()) && Instant::now() < deadline {
+        net.poll_with(|event| {
+            http.on_event(&event);
+        });
+        http.drive(&mut net, |_| {});
+    }
+    versions.sort_unstable();
+    assert_eq!(versions, [1, 2, 2]);
+    assert_eq!(h2.join().unwrap(), [("/one", b"/one".to_vec()), ("/two", b"/two".to_vec())]);
+    assert!(h1.join().unwrap()[0].starts_with(b"HTTP/1.1 200 OK\r\n"));
+}

@@ -36,11 +36,17 @@
 //! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
-//! HTTP/2, compression, trailer exposure, upgrades, and `WebSockets` are not
+//! With [`HttpNetwork::with_http2`], accepted connections that open with the
+//! HTTP/2 preface are served HTTP/2, one request per stream, answered with
+//! [`HttpNetwork::respond_to`]. Outbound requests remain HTTP/1.1.
+//!
+//! Compression, trailer exposure, upgrades, and `WebSockets` are not
 //! supported. Valid response trailers are parsed and discarded. There is no
 //! half-close support. After an error response, the connection closes without
-//! a lingering-close delay. Pipelined requests are served strictly one at a
-//! time per connection.
+//! a lingering-close delay. Pipelined HTTP/1 requests are served strictly one
+//! at a time per connection.
+
+mod h2;
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -51,9 +57,14 @@ use std::{
 };
 
 use flux_timing::{Duration, Instant};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use mio::Token;
 
-use crate::{Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig};
+use self::h2::{Http2Conn, Limits};
+use crate::{
+    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
+    http2::{CLIENT_PREFACE, Http2Config, ServerConnection},
+};
 
 /// Header slots parsed on the stack; a larger `max_headers` falls back to the
 /// heap.
@@ -200,6 +211,8 @@ struct Conn {
     role: Role,
     /// Set while a streaming request owns this connection.
     stream: Option<Stream>,
+    /// Set once an accepted connection opens with the HTTP/2 preface.
+    http2: Option<Box<Http2Conn>>,
 }
 
 /// A streaming request; `body` is set once its head has been delivered.
@@ -245,6 +258,11 @@ pub struct HttpNetwork {
     spare_heads: Vec<Vec<u8>>,
     /// Decoded body of the chunked response being delivered.
     chunked_body: Vec<u8>,
+    http2: Option<Http2Config>,
+    /// Fields of the last HTTP/2 response, reused while callers send the same
+    /// headers.
+    http2_fields: HeaderMap,
+    spare_streams: Vec<h2::Stream>,
 }
 impl Default for HttpNetwork {
     fn default() -> Self {
@@ -270,6 +288,9 @@ impl Default for HttpNetwork {
             failed: Vec::new(),
             spare_heads: Vec::new(),
             chunked_body: Vec::new(),
+            http2: None,
+            http2_fields: HeaderMap::new(),
+            spare_streams: Vec::new(),
         }
     }
 }
@@ -350,6 +371,15 @@ impl HttpNetwork {
         self.tls_config = Some(config);
         self
     }
+    /// Serves HTTP/2 to accepted clients that open with its preface, over
+    /// TLS as negotiated with ALPN `h2` or over plain TCP with prior
+    /// knowledge. Panics if `config` is invalid.
+    pub fn with_http2(mut self, config: Http2Config) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        ServerConnection::new(config).expect("valid HTTP/2 configuration");
+        self.http2 = Some(config);
+        self
+    }
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
     }
@@ -400,10 +430,10 @@ impl HttpNetwork {
         self.listeners.push(net.listen_on(group, listener)?);
         Ok(())
     }
-    /// Serves HTTP/1.1 over TLS on `addr`; requests arrive as from
-    /// [`Self::listen`]. `alpn_protocols` must be empty or `http/1.1`. A
-    /// non-empty list disconnects peers that negotiate no ALPN. The returned
-    /// token is for [`Self::set_tls_config`].
+    /// Serves HTTP over TLS on `addr`; requests arrive as from
+    /// [`Self::listen`]. `alpn_protocols` may hold `http/1.1`, and `h2` with
+    /// [`Self::with_http2`]. A list without `http/1.1` disconnects peers that
+    /// negotiate no ALPN. The returned token is for [`Self::set_tls_config`].
     #[cfg(feature = "tls")]
     pub fn listen_tls(
         &mut self,
@@ -411,7 +441,7 @@ impl HttpNetwork {
         addr: SocketAddr,
         config: Arc<crate::tls::ServerConfig>,
     ) -> io::Result<Token> {
-        check_alpn(&config)?;
+        check_alpn(&config, self.http2.is_some())?;
         let group = self.group(net);
         let token = net.listen_tls(group, addr, config)?;
         self.listeners.push(token);
@@ -425,7 +455,7 @@ impl HttpNetwork {
         listener: std::net::TcpListener,
         config: Arc<crate::tls::ServerConfig>,
     ) -> io::Result<Token> {
-        check_alpn(&config)?;
+        check_alpn(&config, self.http2.is_some())?;
         let group = self.group(net);
         let token = net.listen_tls_on(group, listener, config)?;
         self.listeners.push(token);
@@ -440,7 +470,7 @@ impl HttpNetwork {
         listener: Token,
         config: Arc<crate::tls::ServerConfig>,
     ) -> io::Result<()> {
-        check_alpn(&config)?;
+        check_alpn(&config, self.http2.is_some())?;
         if !self.listeners.contains(&listener) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not an HTTP listener"));
         }
@@ -460,6 +490,15 @@ impl HttpNetwork {
             net.remove(token);
         }
         for conn in &mut self.conns {
+            if let Some(http2) = conn.http2.as_deref_mut() {
+                http2.go_away();
+                http2.flush(net, conn.token);
+                if http2.finished() {
+                    conn.role.set_accepted_state(State::Draining);
+                    net.disconnect_when_drained(conn.token);
+                }
+                continue
+            }
             if let Role::Accepted { state: State::Idle, answered: true, .. } = conn.role &&
                 conn.buf.is_empty()
             {
@@ -502,6 +541,7 @@ impl HttpNetwork {
                         answered: false,
                     },
                     stream: None,
+                    http2: None,
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
@@ -564,6 +604,7 @@ impl HttpNetwork {
                 .filter(|conn| {
                     matches!(conn.role, Role::Accepted { .. }) &&
                         !matches!(conn.role.accepted_state(), State::Pending) &&
+                        conn.http2.as_ref().is_none_or(|http2| http2.is_idle()) &&
                         conn.last_activity.elapsed() >= timeout
                 })
                 .map(|conn| conn.token)
@@ -657,7 +698,9 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if matches!(self.conns[i].role, Role::Accepted { .. }) {
+        if self.conns[i].http2.is_some() {
+            self.parse_http2(net, i, handler);
+        } else if matches!(self.conns[i].role, Role::Accepted { .. }) {
             self.parse_and_emit(net, i, handler);
         } else if self.conns[i].stream.is_some() {
             self.parse_stream(net, i, handler);
@@ -711,6 +754,7 @@ impl HttpNetwork {
             last_activity: Instant::now(),
             role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
             stream: None,
+            http2: None,
         });
         token
     }
@@ -1011,6 +1055,21 @@ impl HttpNetwork {
         if !matches!(self.conns[i].role.accepted_state_mut(), State::Idle) {
             return
         }
+        if let Some(config) = self.http2 &&
+            !self.conns[i].role.accepted_answered()
+        {
+            let buf = &self.conns[i].buf;
+            let len = buf.len().min(CLIENT_PREFACE.len());
+            if buf[..len] == CLIENT_PREFACE[..len] {
+                if len == CLIENT_PREFACE.len() {
+                    self.conns[i].http2 = Some(Box::new(Http2Conn::new(config)));
+                    self.parse_http2(net, i, handler);
+                } else {
+                    self.conns[i].dirty = false;
+                }
+                return
+            }
+        }
         self.conns[i].dirty = false;
         let over_limit = self.conns[i].over_limit;
         let buf = &self.conns[i].buf;
@@ -1081,6 +1140,7 @@ impl HttpNetwork {
             version: req.version.unwrap_or(1),
             headers: req.headers,
             body: &buf[head..end],
+            stream: 0,
         };
         handler(HttpEvent::Request { token, request });
         self.conns[i].buf.drain(..end);
@@ -1090,17 +1150,86 @@ impl HttpNetwork {
         self.conns[i].role.set_accepted_continued(false);
         self.conns[i].role.set_accepted_head_request(head_request);
     }
+    fn parse_http2<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
+    where
+        F: for<'a> FnMut(HttpEvent<'a>),
+    {
+        let limits = Limits {
+            headers: self.max_headers,
+            head_bytes: self.max_head_bytes,
+            body_bytes: self.max_body_bytes,
+        };
+        let Self { conns, spare_streams, shutting_down, .. } = self;
+        let conn = &mut conns[i];
+        conn.dirty = false;
+        let token = conn.token;
+        let Some(http2) = conn.http2.as_deref_mut() else { return };
+        match http2.receive(&conn.buf, &limits, spare_streams) {
+            Ok(consumed) => drop(conn.buf.drain(..consumed)),
+            Err(_) => conn.buf.clear(),
+        }
+        if *shutting_down {
+            http2.go_away();
+        }
+        http2.deliver(spare_streams, |request| handler(HttpEvent::Request { token, request }));
+        http2.pump(spare_streams);
+        http2.flush(net, token);
+        if http2.finished() {
+            conn.role.set_accepted_state(State::Draining);
+            net.disconnect_when_drained(token);
+        }
+    }
     fn error(&mut self, net: &mut NetworkCore, i: usize, status: u16) {
         self.conns[i].role.set_accepted_state(State::Pending);
         self.conns[i].role.set_accepted_close(true);
         let token = self.conns[i].token;
         let _ = self.respond(net, token, status, &[], &[]);
     }
-    /// Sends the response for a pending request and returns whether it was
-    /// queued.
+    /// [`Self::respond`] for the request on `stream`, from
+    /// [`HttpRequest::stream`]. An HTTP/2 response omits `Connection`; one
+    /// with `close` sends GOAWAY, and the connection closes once its other
+    /// streams are answered.
+    pub fn respond_to(
+        &mut self,
+        net: &mut NetworkCore,
+        token: Token,
+        stream: u32,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> bool {
+        if stream == 0 {
+            return self.respond(net, token, status, headers, body)
+        }
+        let Ok(status) = StatusCode::from_u16(status) else { return false };
+        if !valid_response(status.as_u16(), headers) || !set_fields(&mut self.http2_fields, headers)
+        {
+            return false
+        }
+        let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) else {
+            return false
+        };
+        let Some(http2) = conn.http2.as_deref_mut() else { return false };
+        let ok = http2.respond(stream, status, &self.http2_fields, body, &mut self.spare_streams);
+        if self.shutting_down || headers.iter().any(|(n, v)| is_close(n, v)) {
+            http2.go_away();
+        }
+        http2.flush(net, token);
+        if ok {
+            conn.last_activity = Instant::now();
+        }
+        if http2.finished() {
+            conn.role.set_accepted_state(State::Draining);
+            net.disconnect_when_drained(token);
+        }
+        ok
+    }
+    /// Sends the response for a pending HTTP/1 request and returns whether it
+    /// was queued.
     ///
     /// Call this after the drive that delivered the request, or from a later
-    /// one. Each call completes exactly one request for `token`.
+    /// one. Each call completes exactly one request for `token`. HTTP/2
+    /// requests need [`Self::respond_to`].
     pub fn respond(
         &mut self,
         net: &mut NetworkCore,
@@ -1116,19 +1245,10 @@ impl HttpNetwork {
         else {
             return false
         };
-        if !(200..=599).contains(&status) ||
-            headers.iter().any(|(n, v)| {
-                !valid_token(n) ||
-                    v.contains(['\r', '\n']) ||
-                    n.eq_ignore_ascii_case("content-length") ||
-                    n.eq_ignore_ascii_case("transfer-encoding")
-            })
-        {
+        if !valid_response(status, headers) {
             return false
         }
-        let caller_close = headers.iter().any(|(n, v)| {
-            n.eq_ignore_ascii_case("connection") && has_value_token(v.as_bytes(), b"close")
-        });
+        let caller_close = headers.iter().any(|(n, v)| is_close(n, v));
         let close = self.conns[i].role.accepted_close() || caller_close || self.shutting_down;
         let suppress_body =
             self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
@@ -1601,6 +1721,42 @@ fn valid_token(value: &str) -> bool {
     !value.is_empty() &&
         value.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
+fn valid_response(status: u16, headers: &[(&str, &str)]) -> bool {
+    (200..=599).contains(&status) &&
+        headers.iter().all(|(n, v)| {
+            valid_token(n) &&
+                !v.contains(['\r', '\n']) &&
+                !n.eq_ignore_ascii_case("content-length") &&
+                !n.eq_ignore_ascii_case("transfer-encoding")
+        })
+}
+fn is_close(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")
+}
+/// Fills `fields` with `headers` but `Connection`, which HTTP/2 forbids.
+/// Keeps `fields` when they already match, so a repeated set costs no
+/// allocation.
+fn set_fields(fields: &mut HeaderMap, headers: &[(&str, &str)]) -> bool {
+    let wanted = || headers.iter().filter(|(n, _)| !n.eq_ignore_ascii_case("connection"));
+    if fields.len() == wanted().count() &&
+        fields.iter().zip(wanted()).all(|((name, value), (n, v))| {
+            name.as_str().eq_ignore_ascii_case(n) && value.as_bytes() == v.as_bytes()
+        })
+    {
+        return true
+    }
+    fields.clear();
+    for (n, v) in wanted() {
+        let (Ok(name), Ok(value)) =
+            (HeaderName::from_bytes(n.as_bytes()), HeaderValue::from_bytes(v.as_bytes()))
+        else {
+            fields.clear();
+            return false
+        };
+        fields.append(name, value);
+    }
+    true
+}
 fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
     valid_token(method) &&
         !path.is_empty() &&
@@ -1693,6 +1849,9 @@ impl Role {
         if let Self::Accepted { close: current, .. } = self {
             *current = close;
         }
+    }
+    fn accepted_answered(&self) -> bool {
+        matches!(self, Self::Accepted { answered: true, .. })
     }
     fn set_accepted_answered(&mut self) {
         if let Self::Accepted { answered, .. } = self {
@@ -1800,9 +1959,13 @@ pub fn reason_phrase(status: u16) -> &'static str {
 pub struct HttpRequest<'a> {
     pub method: &'a str,
     pub path: &'a str,
+    /// 0 for HTTP/1.0, 1 for HTTP/1.1, 2 for HTTP/2.
     pub version: u8,
+    /// HTTP/2 names are lowercase, and `:authority` appears as `host`.
     pub headers: &'a [httparse::Header<'a>],
     pub body: &'a [u8],
+    /// The HTTP/2 stream for [`HttpNetwork::respond_to`]; 0 for HTTP/1.
+    pub stream: u32,
 }
 impl<'a> HttpRequest<'a> {
     pub fn header(&self, name: &str) -> Option<&'a [u8]> {
@@ -1823,11 +1986,15 @@ impl<'a> HttpResponse<'a> {
 }
 
 #[cfg(feature = "tls")]
-fn check_alpn(config: &crate::tls::ServerConfig) -> io::Result<()> {
-    if config.alpn_protocols.iter().any(|protocol| protocol != b"http/1.1") {
+fn check_alpn(config: &crate::tls::ServerConfig, http2: bool) -> io::Result<()> {
+    if config
+        .alpn_protocols
+        .iter()
+        .any(|protocol| protocol != b"http/1.1" && !(http2 && protocol == b"h2"))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "HTTP TLS supports only http/1.1 ALPN",
+            "HTTP TLS supports http/1.1 ALPN, and h2 with HTTP/2 enabled",
         ));
     }
     Ok(())
@@ -1840,8 +2007,14 @@ mod tests {
     #[test]
     fn header_lookup_is_case_insensitive() {
         let headers = [httparse::Header { name: "Content-Type", value: b"text/plain" }];
-        let request =
-            HttpRequest { method: "GET", path: "/", version: 1, headers: &headers, body: &[] };
+        let request = HttpRequest {
+            method: "GET",
+            path: "/",
+            version: 1,
+            headers: &headers,
+            body: &[],
+            stream: 0,
+        };
         assert_eq!(request.header("content-type"), Some(&b"text/plain"[..]));
     }
 }
