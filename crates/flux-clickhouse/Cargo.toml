@@ -18,6 +18,7 @@ flux-network.workspace = true
 flux-timing.workspace = true
 lz4_flex.workspace = true
 serde.workspace = true
+zstd.workspace = true
 
 clap = { workspace = true, optional = true }
 clickhouse = { workspace = true, optional = true }

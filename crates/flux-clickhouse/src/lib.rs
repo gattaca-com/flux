@@ -31,7 +31,7 @@ use std::{
 use flux_network::{
     Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token,
 };
-use native::{BlockResume, Cursor, push_block, put_string, put_uvarint, read_compressed};
+use native::{BlockResume, Codec, Cursor, push_block, put_string, put_uvarint, read_compressed};
 pub use native::{Column, Output};
 use serde::Serialize;
 
@@ -221,7 +221,7 @@ struct InFlight {
     data: Option<Vec<u8>>,
     output: Output,
     bytes: usize,
-    compressed: bool,
+    codec: Option<Codec>,
     started: Instant,
 }
 
@@ -280,7 +280,7 @@ impl Conn {
                     return self.fatal(Error::TooLarge)
                 }
                 if let Some(data) = flight.data.take() {
-                    let compressed = flight.compressed;
+                    let codec = flight.codec;
                     let mut raw = Vec::with_capacity(data.len() + 64);
                     if let Err(reason) = Output::write_rowbinary(&block.columns, &data, &mut raw) {
                         return self.fatal(Error::Protocol(reason))
@@ -288,12 +288,12 @@ impl Conn {
                     let mut packet = Vec::with_capacity(raw.len() + 64);
                     put_uvarint(&mut packet, CLIENT_DATA);
                     put_string(&mut packet, b"");
-                    push_block(&mut packet, &raw, compressed);
+                    push_block(&mut packet, &raw, codec);
                     put_uvarint(&mut packet, CLIENT_DATA);
                     put_string(&mut packet, b"");
                     raw.clear();
                     Output::write_empty(&mut raw);
-                    push_block(&mut packet, &raw, compressed);
+                    push_block(&mut packet, &raw, codec);
                     self.outbox.extend_from_slice(&packet);
                     return None
                 }
@@ -331,7 +331,7 @@ pub struct ClickHouse {
     connections: usize,
     max_output_bytes: usize,
     max_queued_bytes: usize,
-    compression: bool,
+    compression: Option<Codec>,
     request_timeout: Option<Duration>,
     group: Option<Group>,
     conns: Vec<Conn>,
@@ -353,7 +353,7 @@ impl ClickHouse {
             connections,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
-            compression: false,
+            compression: None,
             request_timeout: None,
             group: None,
             conns: Vec::new(),
@@ -405,7 +405,16 @@ impl ClickHouse {
     /// Off unless enabled.
     pub fn with_compression(mut self) -> Self {
         assert!(self.group.is_none(), "configure before connect");
-        self.compression = true;
+        self.compression = Some(Codec::Lz4);
+        self
+    }
+
+    /// Compresses blocks both ways with `ZSTD` at `level`, trading more CPU
+    /// than `LZ4` for fewer wire bytes. Each query asks the server to reply
+    /// in `ZSTD` at the same level.
+    pub fn with_zstd_compression(mut self, level: i32) -> Self {
+        assert!(self.group.is_none(), "configure before connect");
+        self.compression = Some(Codec::Zstd(level));
         self
     }
 
@@ -507,9 +516,26 @@ impl ClickHouse {
             out.push(0);
             put_string(&mut out, value.as_bytes());
         }
+        // Newer servers default to `ZSTD`, so the reply codec is always named.
+        if let Some(codec) = self.compression {
+            put_string(&mut out, b"network_compression_method");
+            out.push(0);
+            match codec {
+                Codec::Lz4 => put_string(&mut out, b"LZ4"),
+                Codec::Zstd(level) => {
+                    put_string(&mut out, b"ZSTD");
+                    put_string(&mut out, b"network_zstd_compression_level");
+                    out.push(0);
+                    put_string(&mut out, level.to_string().as_bytes());
+                }
+            }
+        }
         put_string(&mut out, b"");
         put_uvarint(&mut out, STATE_COMPLETE);
-        put_uvarint(&mut out, if self.compression { COMPRESS_ENABLE } else { COMPRESS_DISABLE });
+        put_uvarint(
+            &mut out,
+            if self.compression.is_some() { COMPRESS_ENABLE } else { COMPRESS_DISABLE },
+        );
         put_string(&mut out, sql.as_bytes());
         put_uvarint(&mut out, CLIENT_DATA);
         put_string(&mut out, b"");
@@ -592,7 +618,7 @@ impl ClickHouse {
                 data: request.data,
                 output: Output::default(),
                 bytes: 0,
-                compressed: self.compression,
+                codec: self.compression,
                 started: Instant::now(),
             });
         }
@@ -643,7 +669,8 @@ impl ClickHouse {
                     return true;
                 }
                 conn.rx.extend_from_slice(payload);
-                let compressed = matches!(&conn.state, State::Busy(flight) if flight.compressed);
+                let compressed =
+                    matches!(&conn.state, State::Busy(flight) if flight.codec.is_some());
                 let mut outcome = None;
                 if conn.rx.len() - conn.rx_start > max_output_bytes {
                     outcome = conn.fatal(Error::TooLarge);
