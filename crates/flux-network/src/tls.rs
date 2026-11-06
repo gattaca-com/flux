@@ -213,7 +213,11 @@ mod enabled {
                 let mut pending = &cipher[..read];
                 let mut filled = 0;
                 while !pending.is_empty() {
-                    conn.read_tls(&mut pending)?;
+                    // Zero only once the peer's close_notify is processed:
+                    // rustls then takes no more bytes and ignores the rest.
+                    if conn.read_tls(&mut pending)? == 0 {
+                        return Ok(filled)
+                    }
                     conn.process_new_packets().map_err(io::Error::other)?;
                     if *require_alpn && !conn.is_handshaking() && conn.alpn_protocol().is_none() {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS requires ALPN"));
