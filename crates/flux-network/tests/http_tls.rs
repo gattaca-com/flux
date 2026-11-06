@@ -217,3 +217,69 @@ fn tls_listener_rotates_config_without_dropping_connections() {
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     }
 }
+
+#[test]
+fn tls_listener_serves_after_bytes_follow_close_notify() {
+    let (server_config, client_config) = tls_pair();
+    let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+    // Served on its own thread so a stuck read fails the client's timeout
+    // instead of hanging the test.
+    let (listening_tx, listening) = std::sync::mpsc::channel();
+    let served = thread::spawn(move || {
+        let mut net = Network::default();
+        let mut http = HttpNetwork::default();
+        http.listen_tls(&mut net, addr, Arc::new(server_config)).unwrap();
+        listening_tx.send(()).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        let mut served = false;
+        while Instant::now() < deadline && !served {
+            let mut replies = Vec::new();
+            net.poll_with(|event| {
+                http.on_event(&event);
+            });
+            http.drive(&mut net, |event| {
+                if let HttpEvent::Request { token, request } = event {
+                    replies.push((token, request.path.to_owned()));
+                }
+            });
+            for (token, path) in replies {
+                served = http.respond(&mut net, token, 200, &[], path.as_bytes());
+            }
+        }
+        // Lets the client read the response before the listener closes.
+        for _ in 0..100 {
+            net.poll_with(|event| {
+                http.on_event(&event);
+            });
+            http.drive(&mut net, |_| {});
+            thread::sleep(Duration::from_millis(1));
+        }
+        served
+    });
+
+    listening.recv().unwrap();
+    // More bytes after the alert than rustls takes in one `read_tls`, all in
+    // one socket read.
+    let mut sock = std::net::TcpStream::connect(addr).unwrap();
+    let mut conn = rustls::ClientConnection::new(
+        Arc::new(client_config.clone()),
+        "localhost".try_into().unwrap(),
+    )
+    .unwrap();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock).unwrap();
+    }
+    conn.send_close_notify();
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+    bytes.resize(bytes.len() + 8 * 1024, 0);
+    sock.write_all(&bytes).unwrap();
+
+    let (go_tx, go) = std::sync::mpsc::channel();
+    let next = tls_client(addr, client_config, &["/next"], go);
+    go_tx.send(()).unwrap();
+    let responses = next.join().unwrap();
+    assert!(responses[0].starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(served.join().unwrap());
+    drop(sock);
+}
