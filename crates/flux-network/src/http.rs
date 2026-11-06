@@ -481,7 +481,9 @@ impl HttpNetwork {
     /// has no further request bytes, once that response has gone out. Every
     /// later response closes its connection once written. A connection that has
     /// not written a response yet stays open, since its client may still be
-    /// sending its first request. [`Self::accepted`] reaches zero once
+    /// sending its first request. An HTTP/2 connection is sent GOAWAY and
+    /// closes once its open streams are answered; its client retries later
+    /// requests on a new connection. [`Self::accepted`] reaches zero once
     /// every client has been answered. Drive the network until then, or
     /// until a deadline.
     pub fn shutdown(&mut self, net: &mut NetworkCore) {
@@ -493,6 +495,7 @@ impl HttpNetwork {
             if let Some(http2) = conn.http2.as_deref_mut() {
                 http2.go_away();
                 http2.flush(net, conn.token);
+                conn.dirty |= http2.has_output();
                 if http2.finished() {
                     conn.role.set_accepted_state(State::Draining);
                     net.disconnect_when_drained(conn.token);
@@ -552,10 +555,35 @@ impl HttpNetwork {
                 if event_group == group =>
             {
                 let limit = self.buffer_limit();
-                if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
+                let limits = self.http2_limits();
+                let Self { conns, http2: config, spare_streams, .. } = self;
+                if let Some(conn) = conns.iter_mut().find(|conn| conn.token == token) &&
                     !conn.role.is_draining() &&
                     !conn.over_limit
                 {
+                    conn.dirty = true;
+                    conn.last_activity = Instant::now();
+                    if conn.http2.is_none() &&
+                        let Some(config) = *config &&
+                        matches!(conn.role, Role::Accepted {
+                            state: State::Idle,
+                            answered: false,
+                            ..
+                        }) &&
+                        opens_http2(&conn.buf, payload)
+                    {
+                        conn.http2 = Some(Box::new(Http2Conn::new(config)));
+                    }
+                    if let Some(http2) = conn.http2.as_deref_mut() {
+                        // Decoded as it arrives, so the buffer holds at most
+                        // one partial frame whatever the request limits.
+                        conn.buf.extend_from_slice(payload);
+                        match http2.receive(&conn.buf, &limits, spare_streams) {
+                            Ok(consumed) => drop(conn.buf.drain(..consumed)),
+                            Err(_) => conn.buf.clear(),
+                        }
+                        return true
+                    }
                     let available = limit.saturating_sub(conn.buf.len());
                     if payload.len() > available {
                         conn.buf.extend_from_slice(&payload[..available]);
@@ -563,8 +591,6 @@ impl HttpNetwork {
                     } else {
                         conn.buf.extend_from_slice(payload);
                     }
-                    conn.dirty = true;
-                    conn.last_activity = Instant::now();
                 }
             }
             NetworkEvent::Disconnected { group: event_group, token, .. }
@@ -1055,20 +1081,14 @@ impl HttpNetwork {
         if !matches!(self.conns[i].role.accepted_state_mut(), State::Idle) {
             return
         }
-        if let Some(config) = self.http2 &&
-            !self.conns[i].role.accepted_answered()
+        // The rest of an HTTP/2 preface may follow.
+        if self.http2.is_some() &&
+            !self.conns[i].role.accepted_answered() &&
+            self.conns[i].buf.len() < CLIENT_PREFACE.len() &&
+            CLIENT_PREFACE.starts_with(&self.conns[i].buf)
         {
-            let buf = &self.conns[i].buf;
-            let len = buf.len().min(CLIENT_PREFACE.len());
-            if buf[..len] == CLIENT_PREFACE[..len] {
-                if len == CLIENT_PREFACE.len() {
-                    self.conns[i].http2 = Some(Box::new(Http2Conn::new(config)));
-                    self.parse_http2(net, i, handler);
-                } else {
-                    self.conns[i].dirty = false;
-                }
-                return
-            }
+            self.conns[i].dirty = false;
+            return
         }
         self.conns[i].dirty = false;
         let over_limit = self.conns[i].over_limit;
@@ -1154,29 +1174,28 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        let limits = Limits {
-            headers: self.max_headers,
-            head_bytes: self.max_head_bytes,
-            body_bytes: self.max_body_bytes,
-        };
         let Self { conns, spare_streams, shutting_down, .. } = self;
         let conn = &mut conns[i];
-        conn.dirty = false;
         let token = conn.token;
         let Some(http2) = conn.http2.as_deref_mut() else { return };
-        match http2.receive(&conn.buf, &limits, spare_streams) {
-            Ok(consumed) => drop(conn.buf.drain(..consumed)),
-            Err(_) => conn.buf.clear(),
-        }
         if *shutting_down {
             http2.go_away();
         }
         http2.deliver(spare_streams, |request| handler(HttpEvent::Request { token, request }));
         http2.pump(spare_streams);
         http2.flush(net, token);
+        // Retried every drive until written.
+        conn.dirty = http2.has_output();
         if http2.finished() {
             conn.role.set_accepted_state(State::Draining);
             net.disconnect_when_drained(token);
+        }
+    }
+    fn http2_limits(&self) -> Limits {
+        Limits {
+            headers: self.max_headers,
+            head_bytes: self.max_head_bytes,
+            body_bytes: self.max_body_bytes,
         }
     }
     fn error(&mut self, net: &mut NetworkCore, i: usize, status: u16) {
@@ -1215,6 +1234,7 @@ impl HttpNetwork {
             http2.go_away();
         }
         http2.flush(net, token);
+        conn.dirty |= http2.has_output();
         if ok {
             conn.last_activity = Instant::now();
         }
@@ -1729,6 +1749,14 @@ fn valid_response(status: u16, headers: &[(&str, &str)]) -> bool {
                 !n.eq_ignore_ascii_case("content-length") &&
                 !n.eq_ignore_ascii_case("transfer-encoding")
         })
+}
+/// Whether `buffered` then `payload` begin with the whole HTTP/2 preface.
+fn opens_http2(buffered: &[u8], payload: &[u8]) -> bool {
+    let len = CLIENT_PREFACE.len();
+    let split = buffered.len().min(len);
+    buffered.len() + payload.len() >= len &&
+        buffered[..split] == CLIENT_PREFACE[..split] &&
+        payload[..len - split] == CLIENT_PREFACE[split..]
 }
 fn is_close(name: &str, value: &str) -> bool {
     name.eq_ignore_ascii_case("connection") && has_value_token(value.as_bytes(), b"close")

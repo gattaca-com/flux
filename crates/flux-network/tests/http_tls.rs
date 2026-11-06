@@ -296,7 +296,11 @@ fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
     h1_config.alpn_protocols.clear();
     let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
     let mut net = Network::default();
-    let mut http = HttpNetwork::default().with_http2(Http2Config::default());
+    // Both HTTP/2 requests fit the limits, though not together.
+    let mut http = HttpNetwork::default()
+        .with_max_head_bytes(1024)
+        .with_max_body_bytes(1024)
+        .with_http2(Http2Config::default());
     http.listen_tls(&mut net, addr, Arc::new(server_config)).unwrap();
 
     let h2 = thread::spawn(move || {
@@ -313,7 +317,7 @@ fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
                 RequestHeaders::new(Method::POST, "https", "localhost", path, &HeaderMap::new())
                     .unwrap();
             let id = client.send_headers(&head, false).unwrap();
-            client.send_data(id, b"body", true).unwrap();
+            client.send_data(id, &[b'x'; 1000], true).unwrap();
             bodies.insert(id, (path, Vec::new(), false));
         }
         let mut input = Vec::new();
@@ -356,13 +360,16 @@ fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
         });
         http.drive(&mut net, |event| {
             if let HttpEvent::Request { token, request } = event {
-                assert_eq!(request.body, b"body");
+                let body: &[u8] = if request.version == 2 { &[b'x'; 1000] } else { b"body" };
+                assert_eq!(request.body, body);
                 replies.push((token, request.stream, request.version, request.path.to_owned()));
             }
         });
         // Requests that arrive together are answered out of order.
         for (token, stream, version, path) in replies.into_iter().rev() {
-            assert!(http.respond_to(&mut net, token, stream, 200, &[], path.as_bytes()));
+            // Larger than HTTP/2's send buffer.
+            let body = if path == "/two" { vec![b'y'; 600_000] } else { path.into_bytes() };
+            assert!(http.respond_to(&mut net, token, stream, 200, &[], &body));
             versions.push(version);
         }
     }
@@ -374,6 +381,6 @@ fn tls_listener_serves_http2_streams_and_http1_without_alpn() {
     }
     versions.sort_unstable();
     assert_eq!(versions, [1, 2, 2]);
-    assert_eq!(h2.join().unwrap(), [("/one", b"/one".to_vec()), ("/two", b"/two".to_vec())]);
+    assert_eq!(h2.join().unwrap(), [("/one", b"/one".to_vec()), ("/two", vec![b'y'; 600_000])]);
     assert!(h1.join().unwrap()[0].starts_with(b"HTTP/1.1 200 OK\r\n"));
 }

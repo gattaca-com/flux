@@ -17,6 +17,9 @@ const NO_ERROR: u32 = 0;
 const INTERNAL_ERROR: u32 = 2;
 /// Recycled streams drop buffers that grew past this.
 const SPARE_CAPACITY: usize = 16 * 1024;
+/// Unsent bytes TCP holds per connection: half the group backlog cap's
+/// margin over the request limits, so TLS record overhead fits too.
+const TCP_BACKLOG: usize = super::TLS_MARGIN_BYTES / 2;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Phase {
@@ -279,23 +282,34 @@ impl Http2Conn {
         let _ = self.h2.go_away();
     }
 
-    /// Writes queued frames to `token`.
+    /// Writes queued frames to `token` up to [`TCP_BACKLOG`] unsent.
     pub(super) fn flush(&mut self, net: &mut NetworkCore, token: Token) {
+        let Some(queued) = net.pending_write_bytes(token) else { return };
         let output = self.h2.output();
-        let len = output.len();
-        if len != 0 && net.send_with(token, |out| out.extend_from_slice(output)) {
+        let len = output.len().min(TCP_BACKLOG.saturating_sub(queued));
+        if len != 0 && net.send_with(token, |out| out.extend_from_slice(&output[..len])) {
             self.h2.consume_output(len);
         }
     }
 
-    /// No request awaits a response or is still arriving.
-    pub(super) fn is_idle(&self) -> bool {
-        self.streams.is_empty()
+    /// Frames, response bytes or DATA credit wait to go out.
+    pub(super) fn has_output(&self) -> bool {
+        !self.h2.output().is_empty() ||
+            self.streams.iter().any(|stream| {
+                stream.credit != 0 ||
+                    (stream.phase == Phase::Sending && stream.offset < stream.out.len())
+            })
     }
 
-    /// The connection should close once its output is written.
+    /// No request awaits its response.
+    pub(super) fn is_idle(&self) -> bool {
+        !self.streams.iter().any(|stream| stream.phase == Phase::Delivered)
+    }
+
+    /// Every frame is written and the connection should close.
     pub(super) fn finished(&self) -> bool {
-        self.failed || (self.h2.is_draining() && self.streams.is_empty())
+        self.h2.output().is_empty() &&
+            (self.failed || (self.h2.is_draining() && self.streams.is_empty()))
     }
 }
 
