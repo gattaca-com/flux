@@ -1,17 +1,15 @@
-use std::{io, net::SocketAddr};
+use std::net::SocketAddr;
 
 use flux_timing::{Duration, Instant, Nanos};
+use flux_utils::DCache;
 use mio::{Registry, Token, event::Event as MioEvent};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
-use super::{
-    SubscriberEvent, TokenRange,
-    wire::{self, ACK_HEADER, Datagram, HELLO_SIZE},
-};
+use super::wire::{self, ACK_HEADER, Datagram, HELLO_SIZE};
 use crate::{
-    network::UdpGroupConfigV2,
+    network::{Event, Group, RxPayload, Tokens, UdpGroupConfigV2},
     udp_v2::{
-        SendOutcome, Socket,
+        SendOutcome, Socket, deliver_message, deliver_on_connect,
         inbound::Inbound,
         new_session, recv_all, send_datagram,
         sys::RecvBatch,
@@ -198,7 +196,7 @@ impl Subscription {
 
 pub(super) struct SubscriberState {
     config: UdpGroupConfigV2,
-    pub(super) tokens: TokenRange,
+    group: Group,
     subscriptions: Vec<Subscription>,
     unsubscribed: Vec<(Token, SocketAddr)>,
     telemetry: Telemetry,
@@ -206,12 +204,12 @@ pub(super) struct SubscriberState {
 }
 
 impl SubscriberState {
-    pub(super) fn new(config: UdpGroupConfigV2, tokens: TokenRange) -> Self {
+    pub(super) fn new(config: UdpGroupConfigV2, group: Group) -> Self {
         crate::udp_v2::validate_group(&config, HELLO_SIZE);
         Self {
             telemetry: Telemetry::new(config.telemetry, config.name),
             config,
-            tokens,
+            group,
             subscriptions: Vec::new(),
             unsubscribed: Vec::new(),
             next_tick: Instant::ZERO,
@@ -224,19 +222,60 @@ impl SubscriberState {
         }
     }
 
-    pub(super) fn subscribe(&mut self, registry: &Registry, addr: SocketAddr) -> io::Result<Token> {
-        let token = self.tokens.allocate().ok_or_else(super::token_range_exhausted)?;
-        let socket =
-            Socket::open(registry, unspecified(addr), token, None, self.config.socket_buf_size)?;
+    pub(super) fn is_empty(&self) -> bool {
+        self.subscriptions.is_empty()
+    }
+
+    /// A token whose socket couldn't open is returned retired, like a
+    /// two-way connection's.
+    pub(super) fn subscribe(
+        &mut self,
+        registry: &Registry,
+        addr: SocketAddr,
+        tokens: &mut Tokens,
+    ) -> Token {
+        let token = tokens.allocate(self.group);
+        let socket = match Socket::open(
+            registry,
+            unspecified(addr),
+            token,
+            None,
+            self.config.socket_buf_size,
+        ) {
+            Ok(socket) => socket,
+            Err(err) => {
+                error!(?err, %addr, ?token, "couldn't open udp socket");
+                tokens.retire(token);
+                return token;
+            }
+        };
         let mut subscription = Subscription::new(addr, socket, &self.config);
         let msg = self.config.on_connect_msg.as_deref().unwrap_or_default();
         subscription.send_hello(msg, Instant::now());
         self.subscriptions.push(subscription);
-        Ok(token)
+        token
     }
 
-    pub(super) fn is_subscribed(&self, token: Token) -> bool {
-        self.subscriptions.iter().any(|s| s.token() == token && s.connected)
+    /// Subscriptions waiting for their publisher to answer.
+    pub(super) fn waiting(&self) -> impl Iterator<Item = Token> + '_ {
+        self.subscriptions.iter().filter(|s| !s.connected).map(Subscription::token)
+    }
+
+    /// Sends the waiting subscriptions' hellos on the next tick, skipping
+    /// their backoff.
+    pub(super) fn retry_now(&mut self) {
+        for subscription in self.subscriptions.iter_mut().filter(|s| !s.connected) {
+            subscription.hello_due = Instant::ZERO;
+            subscription.hello_backoff = 0;
+        }
+        self.next_tick = Instant::ZERO;
+    }
+
+    pub(super) fn resubscribe_all(&mut self) {
+        let now = Instant::now();
+        for i in 0..self.subscriptions.len() {
+            self.restart(i, now);
+        }
     }
 
     fn restart(&mut self, i: usize, now: Instant) {
@@ -287,14 +326,16 @@ impl SubscriberState {
         bytes: &[u8],
         from: SocketAddr,
         now: Instant,
+        dcache: Option<&DCache>,
         deliver: &mut F,
     ) where
-        F: FnMut(SubscriberEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let Some(datagram) = wire::decode(bytes) else { return };
         if self.subscriptions[i].addr != from {
             return;
         }
+        let group = self.group;
         let token = self.subscriptions[i].token();
         match datagram {
             Datagram::Packet(packet) => {
@@ -302,8 +343,10 @@ impl SubscriberState {
                     packet,
                     now,
                     &mut self.telemetry,
-                    &mut |payload, send_ts| {
-                        deliver(SubscriberEvent::Message { token, payload, send_ts });
+                    &mut |bytes, send_ts| {
+                        deliver_message(bytes, send_ts, dcache, &mut |payload, send_ts| {
+                            deliver(Event::Message { group, token, payload, send_ts });
+                        });
                     },
                 );
             }
@@ -318,7 +361,8 @@ impl SubscriberState {
                     // A resubscribe can complete before post_poll drains the old unsubscribe.
                     self.drain_unsubscribed(deliver);
                     debug!(addr = %from, "udp subscribed");
-                    deliver(SubscriberEvent::Subscribed { token, peer_addr: from, msg });
+                    deliver(Event::Connected { group, token, peer_addr: from });
+                    deliver_on_connect(group, token, msg, dcache, deliver);
                 }
             }
             Datagram::Reset { subscriber } => {
@@ -337,9 +381,10 @@ impl SubscriberState {
         recv: &mut RecvBatch,
         registry: &Registry,
         event: &MioEvent,
+        dcache: Option<&DCache>,
         deliver: &mut F,
     ) where
-        F: FnMut(SubscriberEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let Some(i) = self.subscriptions.iter().position(|s| s.token() == event.token()) else {
             return;
@@ -347,7 +392,9 @@ impl SubscriberState {
         let now = Instant::now();
         if event.is_readable() {
             let fd = self.subscriptions[i].socket.fd();
-            recv_all(fd, recv, |bytes, from| self.on_datagram(i, bytes, from, now, deliver));
+            recv_all(fd, recv, |bytes, from| {
+                self.on_datagram(i, bytes, from, now, dcache, deliver);
+            });
         }
         let subscription = &mut self.subscriptions[i];
         if event.is_writable() {
@@ -367,18 +414,19 @@ impl SubscriberState {
 
     fn drain_unsubscribed<F>(&mut self, deliver: &mut F) -> bool
     where
-        F: FnMut(SubscriberEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let had = !self.unsubscribed.is_empty();
+        let group = self.group;
         for (token, peer_addr) in self.unsubscribed.drain(..) {
-            deliver(SubscriberEvent::Unsubscribed { token, peer_addr });
+            deliver(Event::Disconnected { group, token, peer_addr });
         }
         had
     }
 
     pub(super) fn pre_poll<F>(&mut self, registry: &Registry, deliver: &mut F) -> bool
     where
-        F: FnMut(SubscriberEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let work = self.drain_unsubscribed(deliver);
         let now = Instant::now();
@@ -391,7 +439,7 @@ impl SubscriberState {
 
     pub(super) fn post_poll<F>(&mut self, deliver: &mut F) -> bool
     where
-        F: FnMut(SubscriberEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         self.drain_unsubscribed(deliver)
     }

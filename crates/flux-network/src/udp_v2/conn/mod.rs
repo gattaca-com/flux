@@ -9,7 +9,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use flux_timing::{Duration, Instant, Nanos};
+use flux_timing::{Duration, Instant};
 use flux_utils::DCache;
 use mio::{Registry, Token, event::Event as MioEvent};
 use tracing::{debug, error, info, warn};
@@ -21,7 +21,8 @@ use peer::{Peer, Role, send_reset};
 use wire::{Datagram, HELLO_ACK_SIZE};
 
 use super::{
-    SendOutcome, Socket, deliver_message, new_session, on_connect_fits, recv_all,
+    SendOutcome, Socket, deliver_message, deliver_on_connect, new_session, on_connect_fits,
+    recv_all,
     sys::{RecvBatch, SendBatch},
     telemetry::Telemetry,
     unspecified, validate_group,
@@ -339,7 +340,7 @@ impl State {
     }
 
     // Copies into every connection's stream. Fan-out most likely wants a
-    // pubsub `Publisher` instead, which sends the same bytes to all, but
+    // publisher group instead, which sends the same bytes to all, but
     // maybe not.
     pub(crate) fn broadcast_with<F>(&mut self, registry: &Registry, serialise: F) -> usize
     where
@@ -762,21 +763,4 @@ impl State {
         }
         self.drain_pending_disconnects(deliver)
     }
-}
-
-fn deliver_on_connect<F>(
-    group: Group,
-    token: Token,
-    msg: &[u8],
-    dcache: Option<&DCache>,
-    deliver: &mut F,
-) where
-    F: for<'a> FnMut(Event<RxPayload<'a>>),
-{
-    if msg.is_empty() {
-        return;
-    }
-    deliver_message(msg, Nanos::now(), dcache, &mut |payload, send_ts| {
-        deliver(Event::Message { group, token, payload, send_ts });
-    });
 }
