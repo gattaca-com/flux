@@ -168,10 +168,12 @@ struct Queued {
     head: Vec<u8>,
     body: Vec<u8>,
     retries: u8,
+    enqueued_at: Instant,
 }
 struct InFlight {
     queued: Queued,
     sent_at: Instant,
+    timed_out: bool,
 }
 struct Pool {
     addr: SocketAddr,
@@ -345,6 +347,9 @@ impl HttpNetwork {
         self.max_queued_bytes = max_queued_bytes;
         self
     }
+    /// Bounds pooled requests from enqueue through response, including
+    /// reconnects and retries. Expired requests emit [`HttpEvent::Failed`]
+    /// with [`Failure::TimedOut`].
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.request_timeout = Some(request_timeout);
@@ -653,29 +658,37 @@ impl HttpNetwork {
             }
         }
         if let Some(timeout) = self.request_timeout {
+            let now = Instant::now();
             for i in 0..self.conns.len() {
                 // A stream outlives request deadlines once its head lands.
                 if self.stream_body(i).is_some() {
                     continue
                 }
-                let Role::Outbound { in_flight: Some(in_flight), .. } = &self.conns[i].role else {
+                let Role::Outbound { in_flight: Some(in_flight), .. } = &mut self.conns[i].role
+                else {
                     continue
                 };
-                if in_flight.sent_at.elapsed() < timeout {
+                if !in_flight.timed_out &&
+                    now.elapsed_since(in_flight.queued.enqueued_at) >= timeout
+                {
+                    in_flight.timed_out = true;
+                    self.failed.push((in_flight.queued.id, Failure::TimedOut));
+                }
+                // Drain a late response before reusing HTTP/1's connection.
+                if now.elapsed_since(in_flight.sent_at) < timeout {
                     continue
                 }
                 if let Some(in_flight) = self.conns[i].role.take_in_flight() {
-                    self.failed.push((in_flight.queued.id, Failure::TimedOut));
                     self.recycle(in_flight.queued);
                 }
                 self.conns[i].role.set_outbound_head(None);
                 net.disconnect(self.conns[i].token);
             }
         }
+        self.dispatch(net);
         for (id, reason) in std::mem::take(&mut self.failed) {
             handler(HttpEvent::Failed { id, reason });
         }
-        self.dispatch(net);
     }
     fn emit_lifecycle<F>(&mut self, net: &mut NetworkCore, event: Lifecycle, handler: &mut F)
     where
@@ -701,7 +714,7 @@ impl HttpNetwork {
                         self.conns[i].dirty = false;
                         self.conns[i].role.set_outbound_head(None);
                         if let Some(in_flight) = self.conns[i].role.take_in_flight() {
-                            if answered {
+                            if answered || in_flight.timed_out {
                                 self.recycle(in_flight.queued);
                             } else {
                                 self.requeue_or_fail(in_flight.queued);
@@ -977,6 +990,8 @@ impl HttpNetwork {
             return None
         }
         let p = pool.0 as usize;
+        let enqueued_at = self.request_timeout.map_or(Instant::ZERO, |_| Instant::now());
+        self.expire_queued(p, enqueued_at);
         let head_request = method.eq_ignore_ascii_case("HEAD");
         let id = RequestId { pool, seq: self.pools[p].next_seq };
         let mut head = self.spare_heads.pop().unwrap_or_else(|| Vec::with_capacity(512));
@@ -986,7 +1001,14 @@ impl HttpNetwork {
             let Some(i) = self.write_idle(net, p, &head, body)
         {
             self.pools[p].next_seq += 1;
-            self.start(i, Queued { id, head_request, head, body: Vec::new(), retries });
+            self.start(i, Queued {
+                id,
+                head_request,
+                head,
+                body: Vec::new(),
+                retries,
+                enqueued_at,
+            });
             return Some(id)
         }
         let pending = &mut self.pools[p];
@@ -1001,13 +1023,36 @@ impl HttpNetwork {
         for part in body {
             owned_body.extend_from_slice(part);
         }
-        pending.queue.push_back(Queued { id, head_request, head, body: owned_body, retries });
+        pending.queue.push_back(Queued {
+            id,
+            head_request,
+            head,
+            body: owned_body,
+            retries,
+            enqueued_at,
+        });
         self.dispatch_pool(net, p);
         Some(id)
     }
     fn dispatch(&mut self, net: &mut NetworkCore) {
         for p in 0..self.pools.len() {
+            if self.request_timeout.is_some() && !self.pools[p].queue.is_empty() {
+                self.expire_queued(p, Instant::now());
+            }
             self.dispatch_pool(net, p);
+        }
+    }
+    fn expire_queued(&mut self, p: usize, now: Instant) {
+        let Some(timeout) = self.request_timeout else { return };
+        while self.pools[p]
+            .queue
+            .front()
+            .is_some_and(|queued| now.elapsed_since(queued.enqueued_at) >= timeout)
+        {
+            let queued = self.pools[p].queue.pop_front().unwrap();
+            self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
+            self.failed.push((queued.id, Failure::TimedOut));
+            self.recycle(queued);
         }
     }
     fn dispatch_pool(&mut self, net: &mut NetworkCore, p: usize) {
@@ -1044,7 +1089,7 @@ impl HttpNetwork {
     fn start(&mut self, i: usize, queued: Queued) {
         self.conns[i].role.set_outbound_head(Some(queued.head_request));
         if let Role::Outbound { in_flight, .. } = &mut self.conns[i].role {
-            *in_flight = Some(InFlight { queued, sent_at: Instant::now() });
+            *in_flight = Some(InFlight { queued, sent_at: Instant::now(), timed_out: false });
         }
     }
     fn requeue_or_fail(&mut self, mut queued: Queued) {
@@ -1056,7 +1101,12 @@ impl HttpNetwork {
         queued.retries -= 1;
         let pool = &mut self.pools[queued.id.pool.0 as usize];
         pool.queued_bytes += queued.head.len() + queued.body.len();
-        pool.queue.push_front(queued);
+        if self.request_timeout.is_some() {
+            let at = pool.queue.partition_point(|q| q.enqueued_at <= queued.enqueued_at);
+            pool.queue.insert(at, queued);
+        } else {
+            pool.queue.push_front(queued);
+        }
     }
     fn complete_in_flight(&mut self, i: usize) {
         if let Some(done) = self.conns[i].role.take_in_flight() {
@@ -1855,7 +1905,9 @@ fn write_decimal(out: &mut impl io::Write, mut n: usize) {
 impl Role {
     fn in_flight_id(&self) -> Option<RequestId> {
         match self {
-            Self::Outbound { in_flight: Some(in_flight), .. } => Some(in_flight.queued.id),
+            Self::Outbound { in_flight: Some(in_flight), .. } if !in_flight.timed_out => {
+                Some(in_flight.queued.id)
+            }
             _ => None,
         }
     }
