@@ -47,3 +47,53 @@ fn delivers_one_event() {
     let want = [("open".to_owned(), Vec::new()), ("head".to_owned(), b"{\"slot\":1}".to_vec())];
     assert_eq!(seen, want);
 }
+
+#[test]
+fn oversized_event_ends_stream() {
+    let limit = 64;
+    let mut at_limit = b"data: ".to_vec();
+    at_limit.extend(std::iter::repeat_n(b'a', limit));
+    at_limit.extend_from_slice(b"\n\n");
+    let event = ("message".to_owned(), vec![b'a'; limit]);
+    let unterminated_line = [b"data: ".as_slice(), &[b'b'; 58], &[b'b'; 64]].concat();
+    let endless_data = b"data: 0123456789\n".repeat(9);
+    for overflow in [unterminated_line, endless_data] {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = [at_limit.clone(), overflow].concat();
+        let peer = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut request = [0u8; 1024];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            for chunk in body.chunks(limit) {
+                socket.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).unwrap();
+                socket.write_all(chunk).unwrap();
+                socket.write_all(b"\r\n").unwrap();
+            }
+            while matches!(socket.read(&mut request), Ok(n) if n > 0) {}
+        });
+
+        let mut net = Network::default();
+        let mut sse = Sse::new(addr, "/").with_http(|http| http.with_max_body_bytes(limit));
+        sse.connect(&mut net);
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && seen.last() != Some(&("gap".to_owned(), Vec::new())) {
+            net.poll_with(|event| {
+                sse.on_event(&event);
+            });
+            sse.drive(&mut net, |event| match event {
+                SseEvent::Open => seen.push(("open".to_owned(), Vec::new())),
+                SseEvent::Message { kind, data } => seen.push((kind.to_owned(), data.to_vec())),
+                SseEvent::Gap => seen.push(("gap".to_owned(), Vec::new())),
+                SseEvent::Status(_) => {}
+            });
+            thread::sleep(Duration::from_millis(1));
+        }
+        let want = [("open".to_owned(), Vec::new()), event.clone(), ("gap".to_owned(), Vec::new())];
+        assert_eq!(seen, want);
+        peer.join().unwrap();
+    }
+}
