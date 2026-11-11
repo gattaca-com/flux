@@ -130,11 +130,11 @@ impl<T: Copy> InnerSeqlockArray<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.header.bufsize
+        self.buffer.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.header.bufsize == 0
+        self.buffer.is_empty()
     }
 
     pub fn version(&self, pos: usize) -> u64 {
@@ -179,10 +179,26 @@ impl<T: Copy> InnerSeqlockArray<T> {
         if !path.exists() {
             return Err(QueueError::NonExistingFile);
         }
-        let header = ArrayHeader::open_shared(shmem_file.as_ref())?;
+        let shmem = ShmemConf::new().flink(path).open()?;
+        if shmem.len() < std::mem::size_of::<ArrayHeader>() {
+            return Err(QueueError::TooSmall);
+        }
+        let header = ArrayHeader::from_ptr(shmem.as_ptr());
         if !header.is_initialized() {
             return Err(QueueError::UnInitialized);
         }
+        let elsize = std::mem::size_of::<Seqlock<T>>();
+        if header.elsize != elsize {
+            return Err(QueueError::ElementSizeChanged(header.elsize, elsize));
+        }
+        let required = header
+            .bufsize
+            .checked_mul(elsize)
+            .and_then(|n| n.checked_add(std::mem::size_of::<ArrayHeader>()));
+        if required.is_none_or(|required| shmem.len() < required) {
+            return Err(QueueError::TooSmall);
+        }
+        std::mem::forget(shmem);
         Ok(Self::from_initialized_ptr(header))
     }
 
@@ -266,5 +282,26 @@ impl<T: Copy + Default> Iterator for VectorIterator<'_, T> {
             self.next_id = self.next_id.wrapping_add(1);
             Some(out.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArrayHeader, SeqlockArray};
+    use crate::QueueError;
+
+    #[test]
+    fn open_rejects_mismatched_element_size_or_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("array");
+        SeqlockArray::<u64>::create_or_open_shared(&path, 4).unwrap();
+        assert!(SeqlockArray::<u64>::open_shared(&path).is_ok());
+        assert!(matches!(
+            SeqlockArray::<[u64; 16]>::open_shared(&path),
+            Err(QueueError::ElementSizeChanged(..))
+        ));
+        ArrayHeader::open_shared(&path).unwrap().bufsize = 1 << 20;
+        assert!(matches!(SeqlockArray::<u64>::open_shared(&path), Err(QueueError::TooSmall)));
+        crate::cleanup_flink(&path).unwrap();
     }
 }

@@ -52,7 +52,7 @@ impl<T> ShmemData<T> {
                 Ok(Self { inner })
             }
             Err(ShmemError::LinkExists) => {
-                let Ok(shmem) = ShmemConf::new().flink(&shmem_file).open().inspect_err(|e| {
+                let Ok(mut shmem) = ShmemConf::new().flink(&shmem_file).open().inspect_err(|e| {
                     tracing::warn!(
                         "couldn't open shmem file {}, removing and retrying: {e}",
                         shmem_file.display()
@@ -61,6 +61,25 @@ impl<T> ShmemData<T> {
                     let _ = std::fs::remove_file(&shmem_file);
                     return Self::open_or_init_with_base_dir(dir, app_name, init_f);
                 };
+
+                // `<`: some platforms round segment sizes up to a page.
+                if shmem.len() < std::mem::size_of::<T>() {
+                    tracing::warn!(
+                        "shmem file {} maps {} bytes, {} needs {}, removing and recreating",
+                        shmem_file.display(),
+                        shmem.len(),
+                        std::any::type_name::<T>(),
+                        std::mem::size_of::<T>()
+                    );
+                    // Dropping an owned mapping unlinks the segment and its link file.
+                    shmem.set_owner(true);
+                    drop(shmem);
+                    // A link that could not be removed would make the retry loop forever.
+                    if shmem_file.exists() {
+                        return Err(ShmemError::LinkExists);
+                    }
+                    return Self::open_or_init_with_base_dir(dir, app_name, init_f);
+                }
 
                 let inner = Self::shmem_ptr(shmem);
 
@@ -126,5 +145,30 @@ impl<T> DerefMut for ShmemData<T> {
 impl<T> AsRef<T> for ShmemData<T> {
     fn as_ref(&self) -> &T {
         unsafe { self.inner.as_ref() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShmemData;
+
+    mod small {
+        pub struct Blob(pub u64);
+    }
+    mod large {
+        pub struct Blob(pub [u64; 64]);
+    }
+
+    #[test]
+    fn reopening_as_a_larger_type_replaces_the_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let small =
+            ShmemData::open_or_init_with_base_dir(dir.path(), "app", || small::Blob(1)).unwrap();
+        assert_eq!(small.0, 1);
+        let large =
+            ShmemData::open_or_init_with_base_dir(dir.path(), "app", || large::Blob([7; 64]))
+                .unwrap();
+        assert_eq!(large.0, [7; 64]);
+        crate::cleanup_shmem(dir.path());
     }
 }

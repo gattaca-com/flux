@@ -24,6 +24,7 @@ type-hash-derive.workspace = true
 [dev-dependencies]
 core_affinity.workspace = true
 hdrhistogram.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
