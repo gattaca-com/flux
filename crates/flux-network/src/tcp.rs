@@ -1853,6 +1853,8 @@ impl FramedStream {
     where
         F: for<'a> FnMut(Option<RxPayload<'a>>, Nanos),
     {
+        // A raw read past the budget leaves the rest, and any close, to the next poll.
+        let mut deferred = false;
         if event.is_readable() {
             if config.framing == Framing::Raw {
                 // An empty buffer reads as a closed peer. Raw reads at most
@@ -1879,6 +1881,7 @@ impl FramedStream {
                             );
                             budget = budget.saturating_sub(read);
                             if budget == 0 && self.defer_read(registry, event, tls.as_deref()) {
+                                deferred = true;
                                 break;
                             }
                         }
@@ -2002,7 +2005,7 @@ impl FramedStream {
         if event.is_writable() && self.drain_queue(registry, config) == StreamState::Disconnected {
             return StreamState::Disconnected;
         }
-        if event.is_error() || event.is_read_closed() || event.is_write_closed() {
+        if event.is_error() || !deferred && (event.is_read_closed() || event.is_write_closed()) {
             return StreamState::Disconnected;
         }
         StreamState::Alive
@@ -2199,14 +2202,11 @@ impl FramedStream {
         StreamState::Alive
     }
 
-    /// Re-arms the edge-triggered socket so the next poll reads the rest; a
-    /// closing socket, or TLS holding plaintext, is read out now.
+    /// Re-arms the edge-triggered socket so the next poll reads the rest, and
+    /// sees a pending close again; a failed socket, or TLS holding plaintext,
+    /// is read out now.
     fn defer_read(&mut self, registry: &Registry, event: &MioEvent, tls: Option<&Session>) -> bool {
-        if event.is_error() ||
-            event.is_read_closed() ||
-            event.is_write_closed() ||
-            tls.is_some_and(Session::has_plain)
-        {
+        if event.is_error() || tls.is_some_and(Session::has_plain) {
             return false;
         }
         let interest = if self.writable_armed {

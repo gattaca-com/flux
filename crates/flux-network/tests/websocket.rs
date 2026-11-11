@@ -6,6 +6,7 @@ use std::{
 
 use flux_network::{
     Network, Token,
+    http::HttpRequest,
     websocket::{WsEvent, WsKind, WsNetwork, is_upgrade},
 };
 
@@ -262,4 +263,74 @@ fn reads_a_continuous_writer_a_poll_at_a_time() {
     }
     assert!(seen.disconnected.is_empty());
     drop(writer.join().unwrap());
+}
+
+#[test]
+fn delivers_a_burst_sent_just_before_a_half_close() {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut ws = WsNetwork::default().with_max_head_bytes(1024).with_max_message_bytes(4096);
+    ws.listen(&mut net, addr).unwrap();
+    let mut seen = Seen::default();
+    let mut stream = raw_client(&mut net, &mut ws, &mut seen, addr);
+    let message = frame(true, 0x2, &[7; 1000], Some([1, 2, 3, 4]));
+    let count = 2000;
+    stream.set_nonblocking(false).unwrap();
+    let writer = std::thread::spawn(move || {
+        stream.write_all(&message.repeat(count)).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        stream
+    });
+    // Reading keeps up for a while, which grows the receive buffer; then the
+    // rest and the FIN queue behind it while nothing reads, past what one poll
+    // may hold.
+    let (mut paused, deadline) = (false, Instant::now() + TIMEOUT);
+    while seen.disconnected.is_empty() {
+        assert!(Instant::now() < deadline, "timed out after {} messages", seen.messages.len());
+        if !paused && seen.messages.len() >= 200 {
+            paused = true;
+            let wait = Instant::now() + Duration::from_secs(2);
+            while !writer.is_finished() && Instant::now() < wait {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        poll(&mut net, &mut ws, &mut seen);
+    }
+    assert_eq!(seen.messages.len(), count);
+    assert!(seen.messages.iter().all(|(_, _, payload)| payload == &[7; 1000]));
+    drop(writer.join().unwrap());
+}
+
+#[test]
+fn is_upgrade_takes_only_rfc_6455_opening_handshakes() {
+    let upgrade = |version: u8, skip: &str, extra: &[(&str, &str)]| {
+        let headers: Vec<_> = [
+            ("Host", "x"),
+            ("Upgrade", "websocket"),
+            ("Connection", "Upgrade"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ]
+        .iter()
+        .filter(|(name, _)| *name != skip)
+        .chain(extra)
+        .map(|&(name, value)| httparse::Header { name, value: value.as_bytes() })
+        .collect();
+        let request = HttpRequest {
+            method: "GET",
+            path: "/",
+            version,
+            headers: &headers,
+            body: &[],
+            stream: 0,
+        };
+        is_upgrade(&request)
+    };
+    assert!(upgrade(1, "", &[]));
+    assert!(upgrade(1, "", &[("Content-Length", "0")]));
+    assert!(!upgrade(0, "", &[]));
+    assert!(!upgrade(1, "Host", &[]));
+    assert!(!upgrade(1, "Sec-WebSocket-Key", &[("Sec-WebSocket-Key", "!!!!!!!!!!!!!!!!!!!!!!==")]));
+    assert!(!upgrade(1, "", &[("Content-Length", "0"), ("Content-Length", "100")]));
+    assert!(!upgrade(1, "", &[("Transfer-Encoding", "chunked")]));
 }
