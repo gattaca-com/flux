@@ -785,6 +785,9 @@ impl TcpManager {
                 );
                 let mut stream =
                     FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
+                if tls.is_some() {
+                    stream.send_queue.framed = false;
+                }
                 if let Some(message) = config.on_connect_msg.as_deref() {
                     let header = (config.framing == Framing::LengthPrefixed).then(|| {
                         let mut header = [0; FRAME_HEADER_SIZE];
