@@ -11,8 +11,8 @@ struct Partial {
     header: [u8; MESSAGE_HEADER],
     header_len: usize,
     total: usize,
-    received: usize,
-    /// Reused; the message is `buf[..total]`.
+    /// Reused, and grown only by bytes that arrived: a claimed `total`
+    /// alone commits no memory.
     buf: Vec<u8>,
     expect: u64,
     send_ts: u64,
@@ -34,14 +34,10 @@ impl Partial {
             if self.total > max_len {
                 return None;
             }
-            if self.buf.len() < self.total {
-                self.buf.resize(self.total, 0);
-            }
         }
-        let n = (self.total - self.received).min(bytes.len());
-        self.buf[self.received..][..n].copy_from_slice(&bytes[..n]);
-        self.received += n;
-        Some(self.received == self.total)
+        let n = (self.total - self.buf.len()).min(bytes.len());
+        self.buf.extend_from_slice(&bytes[..n]);
+        Some(self.buf.len() == self.total)
     }
 }
 
@@ -167,9 +163,22 @@ impl Inbound {
             }
         }
         self.ack_next = ack_next;
+        self.reclaim();
+    }
+
+    #[inline]
+    fn received(&self, seq: u64) -> bool {
+        seq < self.ack_next || self.bit(seq)
+    }
+
+    /// Drops partials waiting on a packet already in, which can never
+    /// complete them: a peer that cuts a continuation short of its message
+    /// and starts another can leave two waiting on one packet, and only one
+    /// is fed.
+    fn reclaim(&mut self) {
         let mut i = 0;
         while i < self.partials.len() {
-            if self.partials[i].expect < ack_next {
+            if self.received(self.partials[i].expect) {
                 let dead = self.partials.swap_remove(i);
                 self.spare.push(dead);
             } else {
@@ -268,7 +277,7 @@ impl Inbound {
         }
         let done = self.partials.swap_remove(i);
         if complete.is_some() {
-            deliver(&done.buf[..done.total], done.send_ts);
+            deliver(&done.buf, done.send_ts);
         }
         self.spare.push(done);
         true
@@ -279,6 +288,11 @@ impl Inbound {
             let seq = self.partials[i].expect;
             let slot = (seq & self.mask) as usize;
             if self.stash[slot].seq != Some(seq) {
+                // In with nothing stashed: it carried no continuation.
+                if self.received(seq) {
+                    let dead = self.partials.swap_remove(i);
+                    self.spare.push(dead);
+                }
                 return;
             }
             self.stash[slot].seq = None;
@@ -292,18 +306,18 @@ impl Inbound {
     }
 
     fn start(&mut self, head: &[u8], expect: u64, send_ts: u64) -> Option<usize> {
+        self.reclaim();
         let mut partial = self.spare.pop().unwrap_or(Partial {
             header: [0; MESSAGE_HEADER],
             header_len: 0,
             total: 0,
-            received: 0,
             buf: Vec::new(),
             expect: 0,
             send_ts: 0,
         });
         partial.header_len = 0;
         partial.total = 0;
-        partial.received = 0;
+        partial.buf.clear();
         partial.expect = expect;
         partial.send_ts = send_ts;
         if partial.append(head, self.max_len) != Some(false) {
@@ -441,6 +455,33 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_claimed_length_is_not_allocated_before_its_bytes_arrive() {
+        let mut inbound = inbound();
+        let mut out = Vec::new();
+        let head = [&(16u32 << 20).to_le_bytes()[..], b"x"].concat();
+        feed(&mut inbound, &test_packet(7, 10, 0, 1, &head), &mut out);
+        assert_eq!(inbound.partials.len(), 1);
+        assert!(inbound.partials[0].buf.capacity() < 1 << 20);
+    }
+
+    #[test]
+    fn a_partial_left_waiting_on_a_packet_already_in_is_dropped() {
+        let mut inbound = inbound();
+        let mut out = Vec::new();
+        feed(&mut inbound, &packet(11, b"", &[b"x"], None), &mut out);
+        feed(&mut inbound, &packet(10, b"", &[b"abcdef"], Some(2)), &mut out);
+        assert!(inbound.partials.is_empty());
+        // A continuation cut short of its message, then a new head: two
+        // partials wait on 14 and only one is fed.
+        feed(&mut inbound, &packet(12, b"", &[&[0; 8]], Some(2)), &mut out);
+        feed(&mut inbound, &packet(13, &[0; 2], &[&[0; 8]], Some(2)), &mut out);
+        feed(&mut inbound, &packet(14, &[0; 6], &[], None), &mut out);
+        feed(&mut inbound, &packet(15, b"", &[b"abcdef"], Some(2)), &mut out);
+        assert_eq!(inbound.partials.len(), 1);
+        assert_eq!(inbound.partials[0].expect, 16);
     }
 
     #[test]
