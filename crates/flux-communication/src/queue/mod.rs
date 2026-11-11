@@ -216,7 +216,7 @@ impl QueueHeader {
     }
 
     /// Checks everything a reader relies on before touching slots, in order:
-    /// magic, header version, element type, element size, length.
+    /// magic, header version, queue type, element type, element size, length.
     fn validate(
         &self,
         mapped_len: usize,
@@ -225,6 +225,14 @@ impl QueueHeader {
         min_len: usize,
     ) -> Result<(), QueueError> {
         self.check_layout()?;
+        // Read as a byte: the segment may hold a value that is no `QueueType`.
+        let queue_type = unsafe { (&raw const self.queue_type).cast::<u8>().read() };
+        if ![QueueType::Unknown, QueueType::MPMC, QueueType::SPMC]
+            .into_iter()
+            .any(|t| t as u8 == queue_type)
+        {
+            return Err(QueueError::UnInitialized);
+        }
         if self.type_hash != type_hash {
             return Err(QueueError::TypeHashChanged(self.type_hash, type_hash));
         }
@@ -234,7 +242,9 @@ impl QueueHeader {
         if !self.len().is_power_of_two() {
             return Err(QueueError::LengthNotPowerOfTwo);
         }
-        if self.len() < min_len || mapped_len < size_of::<Self>() + self.len() * elsize {
+        let required =
+            self.len().checked_mul(elsize).and_then(|n| n.checked_add(size_of::<Self>()));
+        if self.len() < min_len || required.is_none_or(|required| mapped_len < required) {
             return Err(QueueError::TooSmall);
         }
         Ok(())
