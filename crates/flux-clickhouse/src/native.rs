@@ -7,6 +7,10 @@ const LOW_CARDINALITY_VERSION: u64 = 1;
 const NEEDS_GLOBAL_DICTIONARY: u64 = 1 << 8;
 const HAS_ADDITIONAL_KEYS: u64 = 1 << 9;
 const NEEDS_DICTIONARY_UPDATE: u64 = 1 << 10;
+/// The server's own limit on a `FixedString` width.
+const MAX_FIXED_STRING_WIDTH: usize = 0xFF_FFFF;
+/// Deepest type nesting accepted; every walk over a type recurses per level.
+const MAX_TYPE_DEPTH: usize = 32;
 
 /// One column of a native block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,32 +223,45 @@ enum Type {
 
 impl Type {
     fn parse(name: &str) -> Option<Self> {
+        Self::parse_nested(name, 0)
+    }
+
+    fn parse_nested(name: &str, depth: usize) -> Option<Self> {
+        if depth > MAX_TYPE_DEPTH {
+            return None
+        }
+        let depth = depth + 1;
         let name = name.trim();
         if let Some(args) = Self::args(name, "Nullable") {
-            return Some(Self::Nullable(Box::new(Self::parse(args)?)))
+            return Some(Self::Nullable(Box::new(Self::parse_nested(args, depth)?)))
         }
         if let Some(args) = Self::args(name, "Array") {
-            return Some(Self::Array(Box::new(Self::parse(args)?)))
+            return Some(Self::Array(Box::new(Self::parse_nested(args, depth)?)))
         }
         if let Some(args) = Self::args(name, "LowCardinality") {
-            return Some(Self::LowCardinality(Box::new(Self::parse(args)?)))
+            return Some(Self::LowCardinality(Box::new(Self::parse_nested(args, depth)?)))
         }
         if let Some(args) = Self::args(name, "Tuple") {
             return Some(Self::Tuple(
                 Self::split(args)
                     .iter()
-                    .map(|arg| Self::parse_field(arg))
+                    .map(|arg| Self::parse_field(arg, depth))
                     .collect::<Option<_>>()?,
             ))
         }
         // A map is laid out like the array of pairs it is.
         if let Some(args) = Self::args(name, "Map") {
             let [key, value] = Self::split(args)[..] else { return None };
-            let pair = Self::Tuple(vec![Self::parse(key)?, Self::parse(value)?]);
+            let pair = Self::Tuple(vec![
+                Self::parse_nested(key, depth)?,
+                Self::parse_nested(value, depth)?,
+            ]);
             return Some(Self::Array(Box::new(pair)))
         }
+        // A zero width would let a column of any row count consume no input.
         if let Some(len) = Self::args(name, "FixedString") {
-            return Some(Self::Fixed(len.trim().parse().ok()?))
+            let width = len.trim().parse().ok()?;
+            return (1..=MAX_FIXED_STRING_WIDTH).contains(&width).then_some(Self::Fixed(width))
         }
         if let Some(args) = Self::args(name, "Decimal") {
             let precision: u32 = Self::split(args).first()?.parse().ok()?;
@@ -271,8 +288,18 @@ impl Type {
     }
 
     /// A tuple field, which may carry a name before its type.
-    fn parse_field(field: &str) -> Option<Self> {
-        Self::parse(field).or_else(|| Self::parse(field.split_once(' ')?.1))
+    fn parse_field(field: &str, depth: usize) -> Option<Self> {
+        Self::parse_nested(field, depth).or_else(|| {
+            let (name, ty) = field.split_once(' ')?;
+            // Only a quoted name holds a parenthesis, and a field starting with
+            // a backtick fails the direct parse at once; reparsing a type from
+            // its first space would walk the same nesting again, doubling work
+            // per level.
+            if name.contains('(') && !name.starts_with('`') {
+                return None
+            }
+            Self::parse_nested(ty, depth)
+        })
     }
 
     /// The arguments of `Name(...)`, if that is what this type is.
@@ -406,6 +433,12 @@ impl Type {
 
     /// Reads a whole column, returning each row's value in `RowBinary` form.
     fn read_column(&self, cursor: &mut Cursor<'_>, rows: usize) -> Option<Vec<Vec<u8>>> {
+        // Every row of every type takes at least one byte, so a larger count
+        // cannot be satisfied by what has arrived; checking before allocating
+        // keeps a forged count from sizing buffers.
+        if rows > cursor.remaining() {
+            return None
+        }
         match self {
             Self::Fixed(width) => {
                 (0..rows).map(|_| cursor.bytes(*width).map(<[u8]>::to_vec)).collect()
@@ -553,6 +586,11 @@ impl BlockResume {
         }
         let column_count = cursor.uvarint()? as usize;
         let row_count = cursor.uvarint()? as usize;
+        // Each column takes at least one byte per row, which bounds the cells
+        // allocated below by the bytes that have arrived.
+        if column_count.saturating_mul(row_count.max(1)).max(row_count) > cursor.remaining() {
+            return None
+        }
         Some(Self {
             columns: Vec::with_capacity(column_count),
             rows: vec![Vec::with_capacity(column_count); row_count],
@@ -795,5 +833,57 @@ mod tests {
         let decoded = Output::read_resume(&mut cursor, &mut None).unwrap();
         assert_eq!(decoded, Output { columns, rows: cells });
         assert_eq!(cursor.remaining(), 0);
+    }
+
+    fn block(column_count: u64, row_count: u64, type_name: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        Output::write_info(&mut out);
+        put_uvarint(&mut out, column_count);
+        put_uvarint(&mut out, row_count);
+        put_string(&mut out, b"x");
+        put_string(&mut out, type_name.as_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> (Option<Output>, Option<&'static str>) {
+        let mut cursor = Cursor::new(bytes);
+        let output = Output::read_resume(&mut cursor, &mut None);
+        (output, cursor.invalid)
+    }
+
+    #[test]
+    fn huge_block_counts_wait_for_data() {
+        assert_eq!(decode(&block(1 << 62, 1 << 62, "UInt8", &[])), (None, None));
+    }
+
+    #[test]
+    fn oversized_array_total_waits_for_data() {
+        let data = (1u64 << 40).to_le_bytes();
+        assert_eq!(decode(&block(1, 1, "Array(Tuple(UInt8))", &data)), (None, None));
+    }
+
+    #[test]
+    fn zero_width_fixed_string_is_rejected() {
+        let data = (1u64 << 40).to_le_bytes();
+        assert_eq!(
+            decode(&block(1, 1, "Array(FixedString(0))", &data)),
+            (None, Some("server sent a column type this client cannot decode"))
+        );
+    }
+
+    #[test]
+    fn over_deep_type_is_rejected() {
+        let nested = |depth| format!("{}UInt8{}", "Array(".repeat(depth), ")".repeat(depth));
+        assert_eq!(Type::parse(&nested(100_000)), None);
+        assert!(Type::parse(&nested(MAX_TYPE_DEPTH)).is_some());
+    }
+
+    #[test]
+    fn unparseable_named_tuples_fail_promptly() {
+        let depth = MAX_TYPE_DEPTH;
+        let name = format!("{}x{}", "Tuple(Tuple(a ".repeat(depth), "))".repeat(depth));
+        assert_eq!(Type::parse(&name), None);
+        assert!(Type::parse("Tuple(`a(b)` UInt8)").is_some());
     }
 }
