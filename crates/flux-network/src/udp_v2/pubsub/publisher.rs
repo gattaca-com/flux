@@ -32,6 +32,11 @@ struct Recipient {
 }
 
 impl Recipient {
+    /// Unmeasured last.
+    fn nearness(&self) -> u64 {
+        self.out.srtt().map_or(u64::MAX, |rtt| rtt.0)
+    }
+
     #[inline]
     fn base(&self) -> u64 {
         self.out.base()
@@ -360,6 +365,13 @@ impl PublisherState {
                 warn!(addr = %recipient.addr, "udp subscriber timed out");
                 self.drop_recipient(i);
             }
+        }
+        // A pump stages one recipient's packets after another on one socket,
+        // so in a burst the last recipient waits for all the others'. Nearest
+        // first keeps a colocated subscriber from queueing behind far ones,
+        // whose own path dwarfs the wait.
+        if !self.recipients.is_sorted_by_key(Recipient::nearness) {
+            self.recipients.sort_by_key(Recipient::nearness);
         }
         self.ping(now);
         for k in 0..self.listeners.len() {
