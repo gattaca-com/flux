@@ -768,7 +768,13 @@ impl TcpManager {
             let tls = None;
             let (token, stream, timers, group_name) = {
                 let config = &self.config;
-                let token = tokens.allocate(group);
+                // Any peer can connect, so running out refuses one instead of
+                // panicking.
+                let Some(token) = tokens.try_allocate(group) else {
+                    warn!(%peer_addr, "network token range exhausted, connection refused");
+                    let _ = socket.shutdown(Shutdown::Both);
+                    continue;
+                };
                 if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
                     warn!(?err, %peer_addr, "couldn't register accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);

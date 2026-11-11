@@ -644,7 +644,12 @@ impl UdpManager {
     ) where
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
-        let token = tokens.allocate(self.group);
+        // Any sender can open sessions, so running out refuses one instead
+        // of panicking.
+        let Some(token) = tokens.try_allocate(self.group) else {
+            warn!(addr = %dgram.from, "network token range exhausted, client refused");
+            return;
+        };
         let entry = &self.sockets[k];
         let mut peer =
             UdpPeer::new(dgram.from, token, entry.token, new_session(token.0), &self.config);

@@ -668,7 +668,12 @@ impl State {
             let old = self.remove_acceptor(i, now);
             deliver(Event::Disconnected { group, token: old, peer_addr: from });
         }
-        let token = tokens.allocate(group);
+        // Any sender can open sessions, so running out refuses one instead
+        // of panicking.
+        let Some(token) = tokens.try_allocate(group) else {
+            warn!(addr = %from, "network token range exhausted, peer refused");
+            return;
+        };
         let mut session = new_session(token.0);
         while session == 0 ||
             self.peers.iter().any(|p| p.socket == listener && p.session == session)
