@@ -453,7 +453,12 @@ impl PublisherState {
                     self.send_hello_ack(k, from, subscriber, join);
                     return;
                 }
-                let token = tokens.allocate(group);
+                // Any sender can open sessions, so running out refuses one
+                // instead of panicking.
+                let Some(token) = tokens.try_allocate(group) else {
+                    warn!(addr = %from, "network token range exhausted, subscriber refused");
+                    return;
+                };
                 if let Some(i) = index {
                     let old = self.recipients[i].token;
                     self.remove_recipient(i);

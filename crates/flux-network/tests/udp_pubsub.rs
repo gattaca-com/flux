@@ -11,7 +11,8 @@ use std::{
 };
 
 use flux_network::{
-    Group, GroupConfig, Network, NetworkEvent, PayloadBuf, UdpConfig, UdpGroupConfigV2,
+    Group, GroupConfig, Network, NetworkEvent, NetworkWithExternalPoll, PayloadBuf, UdpConfig,
+    UdpGroupConfigV2,
 };
 use mio::Token;
 
@@ -900,6 +901,37 @@ fn udp_a_draining_subscriber_gets_nothing_newer() {
     }
     assert_eq!(from_draining, [b"old".to_vec()]);
     assert_eq!(from_live, [b"old".to_vec(), b"new".to_vec()]);
+}
+
+#[test]
+fn udp_an_exhausted_token_range_refuses_subscribers() {
+    let addr = free_addr();
+    let mut poll = mio::Poll::new().unwrap();
+    let mut events = mio::Events::with_capacity(64);
+    // The listener and one subscriber.
+    let mut net = NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 0..2);
+    let publisher = net.add_group(GroupConfig::UdpPublisher(lan()));
+    net.listen(publisher, addr).unwrap();
+    let mut first = Subscriber::new(lan());
+    let mut second = Subscriber::new(lan());
+    let first_token = first.subscribe(addr);
+    let second_token = second.subscribe(addr);
+    let mut joined = 0;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let mut on_server =
+            |e: NetworkEvent<'_>| joined += usize::from(matches!(e, NetworkEvent::Accepted { .. }));
+        net.pre_poll(&mut on_server);
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(1))).unwrap();
+        for event in &events {
+            net.handle_event(event, &mut on_server);
+        }
+        net.post_poll(&mut on_server);
+        first.poll_with(|_| {});
+        second.poll_with(|_| {});
+    }
+    assert_eq!(joined, 1);
+    assert_ne!(first.is_subscribed(first_token), second.is_subscribed(second_token));
 }
 
 #[test]

@@ -511,11 +511,17 @@ impl Tokens {
         Self { next: range.start, range, groups: FxHashMap::default() }
     }
     pub(crate) fn allocate(&mut self, group: Group) -> Token {
-        assert!(self.next < self.range.end, "network token range {:?} exhausted", self.range);
+        self.try_allocate(group)
+            .unwrap_or_else(|| panic!("network token range {:?} exhausted", self.range))
+    }
+    pub(crate) fn try_allocate(&mut self, group: Group) -> Option<Token> {
+        if self.next >= self.range.end {
+            return None;
+        }
         let token = Token(self.next);
         self.next += 1;
         self.groups.insert(token, group);
-        token
+        Some(token)
     }
     pub(crate) fn retire(&mut self, token: Token) {
         self.groups.remove(&token);
