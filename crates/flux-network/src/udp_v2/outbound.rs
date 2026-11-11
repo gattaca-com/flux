@@ -179,6 +179,11 @@ impl Outbound {
         self.rto.sample(rtt);
     }
 
+    /// The smoothed round trip, once one has been measured.
+    pub(crate) fn srtt(&self) -> Option<Duration> {
+        self.rto.srtt.map(Duration)
+    }
+
     pub(crate) fn on_ack(
         &mut self,
         ack_next: u64,

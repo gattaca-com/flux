@@ -32,6 +32,17 @@ struct Recipient {
 }
 
 impl Recipient {
+    /// Coarse, so round-trip jitter doesn't reorder subscribers: colocated,
+    /// regional, far, then unmeasured.
+    fn tier(&self) -> u8 {
+        match self.out.srtt() {
+            Some(rtt) if rtt.0 < Duration::from_millis(1).0 => 0,
+            Some(rtt) if rtt.0 < Duration::from_millis(20).0 => 1,
+            Some(_) => 2,
+            None => 3,
+        }
+    }
+
     #[inline]
     fn base(&self) -> u64 {
         self.out.base()
@@ -72,6 +83,7 @@ pub(super) struct PublisherState {
     retired: Vec<Token>,
     telemetry: Telemetry,
     next_tick: Instant,
+    next_rotation: Instant,
 }
 
 fn on_connect_msg(config: &UdpGroupConfigV2) -> &[u8] {
@@ -97,6 +109,7 @@ impl PublisherState {
             unsubscribed: Vec::new(),
             retired: Vec::new(),
             next_tick: Instant::ZERO,
+            next_rotation: Instant::ZERO,
         }
     }
 
@@ -360,6 +373,19 @@ impl PublisherState {
                 warn!(addr = %recipient.addr, "udp subscriber timed out");
                 self.drop_recipient(i);
             }
+        }
+        // A pump stages one recipient's packets after another on one socket,
+        // so in a burst the last recipient waits for all the others'. Nearest
+        // tier first keeps a colocated subscriber from queueing behind far
+        // ones, whose own path dwarfs the wait. Rotating before the stable
+        // sort moves the first recipient to the back of its tier, so peers
+        // in a tier take turns going first.
+        if now >= self.next_rotation && !self.recipients.is_empty() {
+            self.next_rotation = now + Duration::from_secs(1);
+            self.recipients.rotate_left(1);
+        }
+        if !self.recipients.is_sorted_by_key(Recipient::tier) {
+            self.recipients.sort_by_key(Recipient::tier);
         }
         self.ping(now);
         for k in 0..self.listeners.len() {
