@@ -3,6 +3,9 @@
 //!
 //! One blob is one TCP frame is one file: frame payloads and file contents are
 //! `blob.as_bytes()`. See `tests/e2e.rs` for the complete usage example.
+//! Names and metadata from a peer must pass
+//! `flux_versioned_types::leaves::name_is_path_component` before they form a
+//! path.
 pub mod io;
 pub mod queues;
 pub mod reader;

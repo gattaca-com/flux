@@ -26,7 +26,8 @@ use flux_gather::{
 use flux_timing::{Duration, InternalMessage, Nanos};
 use flux_utils::ArrayStr;
 use flux_versioned_types::{
-    HasVersionedLeaves, Scratch, Versioned, VersionedLeaves, versioned_struct,
+    HasVersionedLeaves, Scratch, Versioned, VersionedLeaves, leaves::name_is_path_component,
+    versioned_struct,
 };
 use spine_derive::from_spine;
 use type_hash_derive::type_hash_lock;
@@ -248,6 +249,12 @@ impl BlobHandler<RecvSpine, TestMeta> for RecordingHandler {
         blob: &Blob,
         producers: &mut <RecvSpine as flux::spine::FluxSpine>::Producers,
     ) {
+        // Both come from the peer.
+        if !(name_is_path_component(meta.instance.as_str()) &&
+            name_is_path_component(blob.type_name()))
+        {
+            return;
+        }
         let path = meta.path(&self.base, blob.type_name());
         let file = self.io.write(blob, &path).expect("queue write");
         self.writing.insert(file, (path, blob.as_bytes().to_vec()));
