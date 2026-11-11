@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use super::app::{App, DetailFocus, FluxTab, SelectedItem, View};
-use crate::discovery::format_bytes;
+use crate::{discovery::format_bytes, printable};
 
 /// Top-level render entry point for the standalone flux-ctl TUI.
 ///
@@ -133,7 +133,12 @@ pub fn render_list(area: Rect, buf: &mut Buffer, app: &mut App) {
         let icon = if group.expanded { "▼" } else { "▶" };
         rows.push(
             Row::new(vec![
-                Cell::from(format!("{} {} ({} segments)", icon, group.name, group.segments.len())),
+                Cell::from(format!(
+                    "{} {} ({} segments)",
+                    icon,
+                    printable(&group.name),
+                    group.segments.len()
+                )),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -187,7 +192,7 @@ pub fn render_list(area: Rect, buf: &mut Buffer, app: &mut App) {
                 };
                 rows.push(
                     Row::new(vec![
-                        Cell::from(format!("  {}", seg.entry.type_name.as_str())),
+                        Cell::from(format!("  {}", printable(&seg.entry.type_name))),
                         Cell::from(kind),
                         Cell::from(details),
                         Cell::from(conn_display),
@@ -248,7 +253,13 @@ pub fn render_detail(area: Rect, buf: &mut Buffer, app: &mut App) {
     let updated = if elapsed < 2 { String::new() } else { format!(" (updated {elapsed}s ago)") };
     let title_text = seg.map_or_else(
         || format!(" Segment Detail{updated} "),
-        |s| format!(" {} — {}{updated} ", s.entry.app_name.as_str(), s.entry.type_name.as_str()),
+        |s| {
+            format!(
+                " {} — {}{updated} ",
+                printable(&s.entry.app_name),
+                printable(&s.entry.type_name)
+            )
+        },
     );
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::Cyan).bold())
@@ -312,15 +323,17 @@ pub fn render_segment_info(area: Rect, buf: &mut Buffer, seg: &super::app::Segme
         ]),
         Line::from(vec![
             Span::styled("  Flink:      ", Style::default().fg(Color::DarkGray)),
-            Span::raw(seg.entry.flink.as_str().to_string()),
+            Span::raw(printable(&seg.entry.flink).into_owned()),
         ]),
         Line::from(vec![
             Span::styled("  OS ID:      ", Style::default().fg(Color::DarkGray)),
             Span::raw(
-                std::fs::read_to_string(seg.entry.flink.as_str())
-                    .unwrap_or_else(|_| "unknown".into())
-                    .trim()
-                    .to_string(),
+                printable(
+                    std::fs::read_to_string(seg.entry.flink.as_str())
+                        .unwrap_or_else(|_| "unknown".into())
+                        .trim(),
+                )
+                .into_owned(),
             ),
         ]),
         Line::from(vec![
@@ -529,7 +542,7 @@ pub fn render_pid_table(area: Rect, buf: &mut Buffer, detail: &super::app::Detai
             } else {
                 Style::default().fg(Color::Red)
             };
-            let name = if p.name.is_empty() { "—" } else { &p.name };
+            let name = if p.name.is_empty() { "—".into() } else { printable(&p.name) };
             let cmd =
                 if p.cmdline.is_empty() { "—".to_string() } else { truncate_str(&p.cmdline, 60) };
 
@@ -761,7 +774,9 @@ pub fn render_tiles(area: Rect, buf: &mut Buffer, app: &mut App) {
                 } else {
                     Style::default().fg(Color::Yellow).bold()
                 };
-                Paragraph::new(format!("▶ {name} ({count} tiles)")).style(style).render(rect, buf);
+                Paragraph::new(format!("▶ {} ({count} tiles)", printable(name)))
+                    .style(style)
+                    .render(rect, buf);
             }
             TileRow::Tile(name, stats) => {
                 let lines_available = inner_area.height.saturating_sub(render_y);
@@ -878,7 +893,7 @@ pub fn render_status_bar(area: Rect, buf: &mut Buffer, app: &App) {
     } else if app.confirm_cleanup_all || confirming_single {
         " Enter confirm  Esc cancel".into()
     } else if let Some((ref msg, _)) = app.status_msg {
-        msg.clone()
+        printable(msg).into_owned()
     } else {
         let filter_hint = if app.filter_text.is_empty() {
             String::new()
@@ -1020,6 +1035,7 @@ pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
+    let s = printable(s);
     if s.chars().count() <= max {
         s.to_string()
     } else {
