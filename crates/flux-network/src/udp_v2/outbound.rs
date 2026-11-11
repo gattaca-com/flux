@@ -46,6 +46,14 @@ impl Rto {
         self.value = srtt.saturating_add(4 * self.rttvar).clamp(self.min, self.max);
     }
 
+    /// RFC 6298 5.5: an expired timer doubles the timeout, which holds until
+    /// the next sample recomputes it. Otherwise a link slower than the
+    /// unlearned timeout resends every packet before its ack returns and
+    /// never yields a sample.
+    fn back_off(&mut self) {
+        self.value = self.value.saturating_mul(2).min(self.max);
+    }
+
     #[inline]
     fn current(&self) -> Duration {
         Duration(self.value)
@@ -270,7 +278,9 @@ impl Outbound {
                     self.highest_acked
                         .is_some_and(|h| h.saturating_sub(seq) >= FAST_RETRANSMIT_GAP)
             }
-            retries => age >= self.rto.current().0 << retries.min(MAX_BACKOFF_SHIFT),
+            retries => {
+                age >= (self.rto.current().0 << retries.min(MAX_BACKOFF_SHIFT)).min(self.rto.max)
+            }
         }
     }
 
@@ -285,13 +295,13 @@ impl Outbound {
             return 0;
         }
         self.last_scan = now;
-        let backoff =
-            (rto.0 << self.retries(self.base).min(MAX_BACKOFF_SHIFT)).min(self.rto.max).max(rto.0);
-        if now.saturating_sub(self.last_ack_at.max(self.sent_at(self.base))).0 < backoff {
+        // `rto` already doubled for each expiry since the last sample.
+        if now.saturating_sub(self.last_ack_at.max(self.sent_at(self.base))) < rto {
             return 0;
         }
         let probes = self.recover;
         self.recover = (self.recover * 2).min(MAX_RECOVER);
+        self.rto.back_off();
         probes
     }
 
