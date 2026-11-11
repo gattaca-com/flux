@@ -417,9 +417,11 @@ impl PublisherState {
                 let recipient = &mut self.recipients[i];
                 recipient.last_recv = now;
                 if echo_ts != 0 {
+                    let sent_at = Instant(echo_ts);
+                    recipient.out.sample_rtt(now.saturating_sub(sent_at));
                     self.telemetry.rtt(&UdpRtt {
                         peer: PeerId::new(recipient.token, recipient.addr),
-                        sent_at: Instant(echo_ts),
+                        sent_at,
                         received_at: now,
                         ping: true,
                     });
