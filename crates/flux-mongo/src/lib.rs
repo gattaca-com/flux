@@ -37,6 +37,10 @@ const NONCE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV
 const DEFAULT_AUTH_SOURCE: &str = "admin";
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 << 20;
 const DEFAULT_MAX_QUEUED_BYTES: usize = 256 << 20;
+/// Deepest document nesting accepted in a reply: the server's 100-level
+/// document limit plus the levels a command reply wraps around a document.
+/// It also bounds the BSON decoder's recursion.
+const MAX_REPLY_DEPTH: usize = 108;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommandId(u64);
@@ -424,6 +428,9 @@ impl Mongo {
     }
 
     fn parse_reply(frame: &[u8]) -> Result<(i32, Document), Error> {
+        if frame.len() < HEADER_LEN + 5 {
+            return Err(Error::Protocol("truncated reply"));
+        }
         let opcode = i32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
         if opcode != OP_MSG {
             return Err(Error::Protocol("unexpected opcode"));
@@ -451,6 +458,7 @@ impl Mongo {
         if body.len() != doc_len as usize {
             return Err(Error::Protocol("trailing bytes in reply"));
         }
+        check_depth(body)?;
         Document::from_reader(&body[..doc_len as usize])
             .map(|reply| (response_to, reply))
             .map_err(|_| Error::Protocol("invalid BSON in reply"))
@@ -472,6 +480,78 @@ impl Mongo {
             code_name: reply.get_str("codeName").ok().map(str::to_owned),
             message: reply.get_str("errmsg").unwrap_or("unknown server error").to_owned(),
         }
+    }
+}
+
+/// Rejects a reply nested deeper than [`MAX_REPLY_DEPTH`] documents. The BSON
+/// decoder recurses once per level, so this walks the bytes without
+/// recursion first, and rejects any it cannot walk so that only bytes whose
+/// depth it has bounded reach the decoder.
+fn check_depth(doc: &[u8]) -> Result<(), Error> {
+    fn len_at(bytes: &[u8], pos: usize) -> Option<usize> {
+        let raw = bytes.get(pos..pos.checked_add(4)?)?;
+        usize::try_from(i32::from_le_bytes(raw.try_into().ok()?)).ok()
+    }
+
+    fn cstring_end(bytes: &[u8], pos: usize, end: usize) -> Option<usize> {
+        let nul = bytes.get(pos..end)?.iter().position(|byte| *byte == 0)?;
+        Some(pos + nul + 1)
+    }
+
+    fn walk(doc: &[u8]) -> Option<bool> {
+        let mut ends = [0; MAX_REPLY_DEPTH];
+        ends[0] = len_at(doc, 0).filter(|len| *len <= doc.len())?;
+        let mut depth = 1;
+        let mut pos = 4;
+        loop {
+            let end = ends[depth - 1];
+            let kind = *doc.get(pos..end)?.first()?;
+            pos += 1;
+            if kind == 0 {
+                if pos != end {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(true);
+                }
+                continue;
+            }
+            pos = cstring_end(doc, pos, end)?;
+            let size = match kind {
+                0x01 | 0x09 | 0x11 | 0x12 => 8,
+                0x02 | 0x0D | 0x0E => 4 + len_at(doc, pos)?,
+                0x05 => 5 + len_at(doc, pos)?,
+                0x06 | 0x0A | 0x7F | 0xFF => 0,
+                0x07 => 12,
+                0x08 => 1,
+                0x0B => cstring_end(doc, cstring_end(doc, pos, end)?, end)? - pos,
+                0x0C => 16 + len_at(doc, pos)?,
+                0x10 => 4,
+                0x13 => 16,
+                0x03 | 0x04 | 0x0F => {
+                    if kind == 0x0F {
+                        pos = pos.checked_add(8 + len_at(doc, pos + 4)?)?;
+                    }
+                    let len = len_at(doc, pos)?;
+                    if depth == MAX_REPLY_DEPTH {
+                        return Some(false);
+                    }
+                    ends[depth] = pos.checked_add(len).filter(|child_end| *child_end <= end)?;
+                    depth += 1;
+                    pos += 4;
+                    continue;
+                }
+                _ => return None,
+            };
+            pos = pos.checked_add(size).filter(|next| *next <= end)?;
+        }
+    }
+
+    match walk(doc) {
+        Some(true) => Ok(()),
+        Some(false) => Err(Error::Protocol("reply nests too deep")),
+        None => Err(Error::Protocol("invalid BSON in reply")),
     }
 }
 
@@ -685,5 +765,111 @@ impl Startup {
         })?;
         auth.take();
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply_frame(body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(HEADER_LEN + 5 + body.len());
+        frame.extend_from_slice(&((HEADER_LEN + 5 + body.len()) as i32).to_le_bytes());
+        frame.extend_from_slice(&0i32.to_le_bytes());
+        frame.extend_from_slice(&7i32.to_le_bytes());
+        frame.extend_from_slice(&OP_MSG.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.push(0);
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut body = Vec::with_capacity(depth * 8 + 5);
+        for level in 0..depth {
+            body.extend_from_slice(&(((depth - level) * 8 + 5) as i32).to_le_bytes());
+            body.extend_from_slice(&[0x03, b'a', 0]);
+        }
+        body.extend_from_slice(&[5, 0, 0, 0, 0]);
+        body.resize(body.len() + depth, 0);
+        body
+    }
+
+    #[test]
+    fn short_frame_is_a_protocol_error() {
+        let mut frame = reply_frame(&[]);
+        frame.truncate(HEADER_LEN);
+        frame[..4].copy_from_slice(&(HEADER_LEN as i32).to_le_bytes());
+        assert_eq!(Mongo::parse_reply(&frame), Err(Error::Protocol("truncated reply")));
+    }
+
+    #[test]
+    fn deeply_nested_reply_is_a_protocol_error() {
+        let mut body = nested(10_000);
+        let frame = reply_frame(&body);
+        assert_eq!(Mongo::parse_reply(&frame), Err(Error::Protocol("reply nests too deep")));
+        for level in 1..10_000 {
+            body[level * 7..level * 7 + 4].copy_from_slice(&5i32.to_le_bytes());
+        }
+        let frame = reply_frame(&body);
+        assert_eq!(Mongo::parse_reply(&frame), Err(Error::Protocol("invalid BSON in reply")));
+    }
+
+    #[test]
+    fn reply_nested_to_the_limit_decodes() {
+        // The decoder's stack use per level varies by build and platform.
+        let decode = || {
+            let frame = reply_frame(&nested(MAX_REPLY_DEPTH - 1));
+            let (response_to, mut reply) = Mongo::parse_reply(&frame).expect("reply decodes");
+            assert_eq!(response_to, 7);
+            let mut depth = 1;
+            while let Ok(inner) = reply.get_document("a") {
+                reply = inner.clone();
+                depth += 1;
+            }
+            assert_eq!(depth, MAX_REPLY_DEPTH);
+        };
+        std::thread::Builder::new().stack_size(16 << 20).spawn(decode).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn reply_with_every_element_type_decodes() {
+        use bson::{
+            Binary, DateTime, Decimal128, JavaScriptCodeWithScope, Regex, Timestamp, oid::ObjectId,
+            spec::BinarySubtype,
+        };
+        let mut raw = vec![0, 0, 0, 0, 0x0C, b'p', 0, 2, 0, 0, 0, b'n', 0];
+        raw.extend_from_slice(&[7; 12]);
+        raw.push(0);
+        let len = raw.len() as i32;
+        raw[..4].copy_from_slice(&len.to_le_bytes());
+        let pointer = Document::from_reader(&raw[..]).unwrap().remove("p").unwrap();
+        let every = doc! {
+            "double": 1.5,
+            "string": "s",
+            "document": { "k": 1 },
+            "array": [1, "a"],
+            "binary": Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2] },
+            "undefined": Bson::Undefined,
+            "oid": ObjectId::from_bytes([1; 12]),
+            "bool": true,
+            "datetime": DateTime::from_millis(1),
+            "null": Bson::Null,
+            "regex": Regex { pattern: "a".into(), options: "i".into() },
+            "pointer": pointer,
+            "code": Bson::JavaScriptCode("f()".into()),
+            "symbol": Bson::Symbol("y".into()),
+            "scope": JavaScriptCodeWithScope { code: "g()".into(), scope: doc! { "v": 2 } },
+            "int32": 3,
+            "timestamp": Timestamp { time: 4, increment: 5 },
+            "int64": 6i64,
+            "decimal": Decimal128::from_bytes([8; 16]),
+            "min": Bson::MinKey,
+            "max": Bson::MaxKey,
+        };
+        let reply = doc! { "ok": 1, "nested": [every.clone(), { "inner": [every.clone()] }], "every": every };
+        let mut body = Vec::new();
+        reply.to_writer(&mut body).unwrap();
+        assert_eq!(Mongo::parse_reply(&reply_frame(&body)), Ok((7, reply)));
     }
 }
