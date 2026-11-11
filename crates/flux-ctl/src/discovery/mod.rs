@@ -243,16 +243,8 @@ impl ShmemCache {
                 ("data", ShmemKind::Data),
                 ("arrays", ShmemKind::SeqlockArray),
             ] {
-                let type_dir = shmem_dir.join(subdir);
-                let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
-                    continue;
-                };
-                for flink_entry in flink_iter.flatten() {
-                    let flink_path = flink_entry.path();
-                    if flink_path.is_dir() {
-                        continue;
-                    }
-                    let flink_str = flink_path.to_string_lossy().to_string();
+                for flink_entry in flink_files(&shmem_dir.join(subdir)) {
+                    let flink_str = flink_entry.path().to_string_lossy().to_string();
                     live_flinks.insert(flink_str, (kind, app_name.clone()));
                 }
             }
@@ -337,10 +329,10 @@ fn find_shmem_dirs_inner(base_dir: &Path, dir: &Path, out: &mut Vec<(String, Pat
         return;
     };
     for entry in read_dir.flatten() {
-        let path = entry.path();
-        if !path.is_dir() || entry.file_name() == "data" {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) || entry.file_name() == "data" {
             continue;
         }
+        let path = entry.path();
         if entry.file_name() == "shmem" && is_shmem_root(&path) {
             let app_name = dir.strip_prefix(base_dir).unwrap_or(dir).to_string_lossy().to_string();
             out.push((app_name, path));
@@ -351,7 +343,25 @@ fn find_shmem_dirs_inner(base_dir: &Path, dir: &Path, out: &mut Vec<(String, Pat
 }
 
 fn is_shmem_root(dir: &Path) -> bool {
-    dir.join("queues").is_dir() || dir.join("data").is_dir() || dir.join("arrays").is_dir()
+    ["queues", "data", "arrays"].into_iter().any(|subdir| is_real_dir(&dir.join(subdir)))
+}
+
+/// Whether `path` is a directory itself, not a symlink to one: discovery and
+/// cleanup must never reach, or remove, files outside the scanned tree.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// The regular files in a `queues`/`data`/`arrays` directory, skipping
+/// symlinks and a symlinked directory.
+pub(crate) fn flink_files(type_dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
+    is_real_dir(type_dir)
+        .then(|| std::fs::read_dir(type_dir).ok())
+        .flatten()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
 }
 
 /// Read all flinks under a single `shmem/` directory and append entries.
@@ -365,17 +375,8 @@ fn collect_entries(app_name: &str, shmem_dir: &Path, entries: &mut Vec<Discovere
         ("data", ShmemKind::Data),
         ("arrays", ShmemKind::SeqlockArray),
     ] {
-        let type_dir = shmem_dir.join(subdir);
-        let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
-            continue;
-        };
-        for flink_entry in flink_iter.flatten() {
-            let flink_path = flink_entry.path();
-            if flink_path.is_dir() {
-                continue;
-            }
-
-            let flink_str = flink_path.to_string_lossy().to_string();
+        for flink_entry in flink_files(&shmem_dir.join(subdir)) {
+            let flink_str = flink_entry.path().to_string_lossy().to_string();
             let Some((os_id, backing_path)) = read_and_resolve_backing(&flink_str) else {
                 continue;
             };

@@ -383,7 +383,7 @@ pub fn clean(
     app_filter: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use super::find_shmem_dirs;
+    use super::{find_shmem_dirs, flink_files};
 
     let mut shmem_dirs = Vec::new();
     find_shmem_dirs(base_dir, &mut shmem_dirs);
@@ -395,15 +395,8 @@ pub fn clean(
             continue;
         }
         for subdir in ["queues", "data", "arrays"] {
-            let type_dir = shmem_dir.join(subdir);
-            let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
-                continue;
-            };
-            for flink_entry in flink_iter.flatten() {
+            for flink_entry in flink_files(&shmem_dir.join(subdir)) {
                 let flink_path = flink_entry.path();
-                if flink_path.is_dir() {
-                    continue;
-                }
                 if ShmemConf::new().flink(&flink_path).open().is_ok() {
                     continue;
                 }

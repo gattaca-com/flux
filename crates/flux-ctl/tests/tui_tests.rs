@@ -1063,6 +1063,21 @@ fn scan_base_dir_skips_stale_flinks() {
     assert_eq!(entries.len(), 0, "stale flink should be skipped by scan");
 }
 #[test]
+fn clean_does_not_follow_symlinked_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("victim"), "bogus_os_id").unwrap();
+    let base = tmp.path().join("base");
+    let shmem_dir = base.join("app").join("shmem");
+    std::fs::create_dir_all(&shmem_dir).unwrap();
+    std::os::unix::fs::symlink(&outside, shmem_dir.join("queues")).unwrap();
+    std::os::unix::fs::symlink(&outside, base.join("other")).unwrap();
+
+    discovery::clean(&base, None, true).unwrap();
+    assert!(outside.join("victim").exists());
+}
+#[test]
 fn filter_narrows_visible_segments() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
