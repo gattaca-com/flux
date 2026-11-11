@@ -17,6 +17,10 @@ use crate::{
 
 /// `RST_STREAM` code for a call the server cannot complete.
 const INTERNAL_ERROR: u32 = 2;
+/// A connection's calls together hold at most this many streams' worth of
+/// `max_queued_bytes` and `max_message_size`, so a peer opening many streams
+/// cannot pin every stream's limit at once.
+const CONNECTION_STREAM_LIMITS: usize = 32;
 
 /// The route callback: the request with its message, and the reply payload
 /// to serialize a [`Response::Message`] into. Framing stays out of reach.
@@ -26,11 +30,15 @@ impl<F: FnMut(&Request<'_>, &mut PayloadBuf<'_>) -> Response> Route for F {}
 #[derive(Clone, Copy, Debug)]
 pub struct GrpcConfig {
     pub http2: http2::Http2Config,
-    /// Largest accepted request message.
+    /// Largest accepted request message. A connection's partly received
+    /// messages together may hold 32 times this; a call taking them past
+    /// it finishes with `RESOURCE_EXHAUSTED`.
     pub max_message_size: usize,
     /// Bytes a stream may hold beyond what HTTP/2 flow control and the send
     /// buffer accept. A stream past this limit lags: its unsent messages are
-    /// dropped and it finishes with `RESOURCE_EXHAUSTED`.
+    /// dropped and it finishes with `RESOURCE_EXHAUSTED`. A connection's
+    /// streams together may hold 32 times this; a send past it lags its
+    /// stream likewise.
     pub max_queued_bytes: usize,
     /// Calls the server preallocates and reuses across all connections. More
     /// calls in flight at once are allocated and freed as they come and go.
@@ -55,13 +63,24 @@ impl Default for GrpcConfig {
     }
 }
 
+impl GrpcConfig {
+    const fn connection_queued_bytes(&self) -> usize {
+        self.max_queued_bytes.saturating_mul(CONNECTION_STREAM_LIMITS)
+    }
+
+    const fn connection_buffered_bytes(&self) -> usize {
+        self.max_message_size.saturating_mul(CONNECTION_STREAM_LIMITS)
+    }
+}
+
 /// Why a stream has ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Closed {
     /// Finished, reset, or disconnected.
     Ended,
-    /// Held more than `max_queued_bytes` unsent: its messages were dropped
-    /// and it finished with `RESOURCE_EXHAUSTED`.
+    /// Held more than `max_queued_bytes` unsent, or its connection's streams
+    /// together held more than their limit: its messages were dropped and it
+    /// finished with `RESOURCE_EXHAUSTED`.
     Lagged,
 }
 
@@ -180,6 +199,12 @@ impl Call {
 
     const fn is_open(&self) -> bool {
         self.streaming && self.trailers.is_none()
+    }
+
+    /// Unsent stream messages, counted in `Held::queued`. A unary reply in
+    /// `out` is not counted.
+    fn queued(&self) -> usize {
+        if self.streaming { self.out.len() - self.offset } else { 0 }
     }
 
     fn finish(&mut self, status: &Status) {
@@ -319,6 +344,23 @@ impl Call {
     }
 }
 
+/// Bytes a connection's calls hold outside HTTP/2.
+#[derive(Default)]
+struct Held {
+    /// Sum of `Call::queued`.
+    queued: usize,
+    /// Sum of partly received request messages.
+    buffered: usize,
+}
+
+impl Held {
+    /// Every call leaving a connection's `calls` passes through here.
+    fn remove(&mut self, call: &Call) {
+        self.queued -= call.queued();
+        self.buffered -= call.decoder.message.len();
+    }
+}
+
 struct Connection {
     h2: http2::ServerConnection,
     /// A frame left incomplete by the previous read.
@@ -328,6 +370,7 @@ struct Connection {
     peer: SocketAddr,
     tls: bool,
     calls: FxHashMap<u32, Call>,
+    held: Held,
     /// Calls with work for HTTP/2, each listed once.
     pending: Vec<u32>,
     closing: bool,
@@ -355,8 +398,10 @@ fn recycle(mut call: Call, free: &mut Vec<Call>, config: &GrpcConfig) {
 /// Returns every call of a closing connection to the pool.
 fn release(connection: &mut Connection, free: &mut Vec<Call>, config: &GrpcConfig) {
     for (_, call) in connection.calls.drain() {
+        connection.held.remove(&call);
         recycle(call, free, config);
     }
+    debug_assert!(connection.held.queued == 0 && connection.held.buffered == 0);
     connection.pending.clear();
 }
 
@@ -416,7 +461,7 @@ impl Connection {
         free: &mut Vec<Call>,
         route: &mut impl Route,
     ) -> Result<usize, http2::Error> {
-        let Self { h2, peer, tls, calls, pending, .. } = self;
+        let Self { h2, peer, tls, calls, held, pending, .. } = self;
         h2.receive(input, started, |event| match event {
             http2::Event::Request { stream_id, head, end_stream, received_at } => {
                 let stream = Stream { token, id: stream_id };
@@ -442,7 +487,21 @@ impl Connection {
             http2::Event::Data { stream_id, data, end_stream } => {
                 if let Some(call) = calls.get_mut(&stream_id) {
                     call.credit += data.len() as u32;
+                    let before = call.decoder.message.len();
                     call.receive(data, end_stream, read, route);
+                    let after = call.decoder.message.len();
+                    if after != before {
+                        held.buffered = held.buffered - before + after;
+                        if held.buffered > config.connection_buffered_bytes() {
+                            held.buffered -= after;
+                            call.decoder.reset();
+                            call.decoder.message.shrink_to(config.pooled_buffer);
+                            call.finish(&Status::new(
+                                Code::ResourceExhausted,
+                                "gRPC messages exceed connection limit",
+                            ));
+                        }
+                    }
                     mark(stream_id, call, pending);
                 }
             }
@@ -456,6 +515,7 @@ impl Connection {
                 // A stale `pending` entry is skipped by `drive`; stream ids
                 // are never reused.
                 if let Some(call) = calls.remove(&stream_id) {
+                    held.remove(&call);
                     recycle(call, free, config);
                 }
             }
@@ -465,7 +525,7 @@ impl Connection {
 
     /// Advances every pending call; blocked calls stay pending.
     fn drive(&mut self, fields: &ResponseFields, config: &GrpcConfig, free: &mut Vec<Call>) {
-        let Self { h2, calls, pending, .. } = self;
+        let Self { h2, calls, held, pending, .. } = self;
         // Order is irrelevant: every blocked call is retried on each drive.
         let mut i = 0;
         while i < pending.len() {
@@ -473,25 +533,32 @@ impl Connection {
             let done = match calls.get_mut(&id) {
                 // Reset by the client since it was listed.
                 None => false,
-                Some(call) => match call.drive(id, h2, fields) {
-                    Err(SendError::WouldBlock) => {
-                        i += 1;
-                        continue;
+                Some(call) => {
+                    let queued = call.queued();
+                    let result = call.drive(id, h2, fields);
+                    held.queued -= queued - call.queued();
+                    match result {
+                        Err(SendError::WouldBlock) => {
+                            i += 1;
+                            continue;
+                        }
+                        Ok(false) => {
+                            call.pending = false;
+                            false
+                        }
+                        Ok(true) | Err(SendError::Closed) => true,
+                        Err(_) => {
+                            // Never leave the client waiting on a call we dropped.
+                            let _ = h2.reset(id, INTERNAL_ERROR);
+                            true
+                        }
                     }
-                    Ok(false) => {
-                        call.pending = false;
-                        false
-                    }
-                    Ok(true) | Err(SendError::Closed) => true,
-                    Err(_) => {
-                        // Never leave the client waiting on a call we dropped.
-                        let _ = h2.reset(id, INTERNAL_ERROR);
-                        true
-                    }
-                },
+                }
             };
             if done {
-                recycle(calls.remove(&id).unwrap(), free, config);
+                let call = calls.remove(&id).unwrap();
+                held.remove(&call);
+                recycle(call, free, config);
             }
             pending.swap_remove(i);
         }
@@ -618,6 +685,7 @@ impl GrpcServer {
                     peer: peer_addr,
                     tls,
                     calls: FxHashMap::default(),
+                    held: Held::default(),
                     pending: Vec::new(),
                     closing: false,
                     dirty: false,
@@ -658,6 +726,7 @@ impl GrpcServer {
     /// closes. Panics above 4 GiB.
     pub fn send(&mut self, stream: Stream, payload: &[u8]) -> Result<(), Closed> {
         let max_queued = self.config.max_queued_bytes;
+        let connection_queued = self.config.connection_queued_bytes();
         let connection = self.connections.get_mut(&stream.token).ok_or(Closed::Ended)?;
         touch(stream.token, connection, &mut self.dirty);
         let call = connection
@@ -666,28 +735,42 @@ impl GrpcServer {
             .filter(|call| call.is_open())
             .ok_or(Closed::Ended)?;
         let prefix = prefix(payload.len());
-        if call.headers_sent && call.out.is_empty() {
+        let len = prefix.len() + payload.len();
+        let queued = call.queued();
+        let lags = if call.headers_sent && call.out.is_empty() {
             // Fast path: header, prefix and payload go straight into HTTP/2.
             match connection.h2.send_data_prefixed(stream.id, &prefix, payload, false) {
-                Ok(n) if n == prefix.len() + payload.len() => return Ok(()),
-                Ok(n) => call.offset = n,
-                Err(SendError::WouldBlock) => {}
+                Ok(n) if n == len => return Ok(()),
+                // A partly written message must be completed, so its rest is
+                // queued whatever the limits.
+                Ok(n) => {
+                    call.offset = n;
+                    false
+                }
+                Err(SendError::WouldBlock) => connection.held.queued + len > connection_queued,
                 Err(error) => {
                     if error != SendError::Closed {
                         let _ = connection.h2.reset(stream.id, INTERNAL_ERROR);
                     }
                     let call = connection.calls.remove(&stream.id).unwrap();
+                    connection.held.remove(&call);
                     recycle(call, &mut self.free, &self.config);
                     return Err(Closed::Ended);
                 }
             }
-        } else if call.out.len() - call.offset + prefix.len() + payload.len() > max_queued {
+        } else {
+            queued + len > max_queued || connection.held.queued + len > connection_queued
+        };
+        if lags {
             call.drop_unsent();
+            connection.held.queued -= queued - call.queued();
+            call.out.shrink_to(self.config.pooled_buffer);
             call.finish(&Status::new(Code::ResourceExhausted, "stream lagged"));
             mark(stream.id, call, &mut connection.pending);
             return Err(Closed::Lagged);
         }
         call.push(&prefix, payload);
+        connection.held.queued += call.queued() - queued;
         mark(stream.id, call, &mut connection.pending);
         Ok(())
     }
