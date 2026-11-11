@@ -21,7 +21,7 @@ use sha1::{Digest as _, Sha1};
 
 use crate::{
     Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
-    http::{HttpRequest, has_token, reason_phrase, valid_token},
+    http::{HttpRequest, has_token, reason_phrase, valid_request, valid_response},
 };
 
 const OP_CONTINUATION: u8 = 0x0;
@@ -81,13 +81,25 @@ pub enum WsEvent<'a> {
     },
 }
 
-/// Whether `request` is a WebSocket opening handshake.
+/// Whether `request` is a WebSocket opening handshake (RFC 6455 §4.2.1),
+/// without a body, which would be read as frames.
 pub fn is_upgrade(request: &HttpRequest<'_>) -> bool {
+    let mut key = [0; 18];
     request.method == "GET" &&
+        request.version == 1 &&
+        request.header("host").is_some() &&
         has_token(request.headers, "upgrade", b"websocket") &&
         has_token(request.headers, "connection", b"upgrade") &&
         request.header("sec-websocket-version") == Some(b"13") &&
-        request.header("sec-websocket-key").is_some_and(|key| key.len() == 24)
+        request
+            .header("sec-websocket-key")
+            .is_some_and(|value| STANDARD.decode_slice(value, &mut key) == Ok(16)) &&
+        request
+            .headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+            .all(|h| h.value == b"0") &&
+        request.header("transfer-encoding").is_none()
 }
 
 #[derive(Clone, Copy)]
@@ -212,8 +224,9 @@ impl WsNetwork {
         Ok(())
     }
     /// Opens an outbound endpoint that sends the handshake for `path` with
-    /// `headers` on every connect, adding `Host` if missing. Panics on an
-    /// invalid path or header.
+    /// `headers` on every connect, adding `Host` if missing. A
+    /// `Sec-WebSocket-Protocol` among them offers subprotocols; the server may
+    /// pick one of those only. Panics on an invalid path or header.
     pub fn connect(
         &mut self,
         net: &mut NetworkCore,
@@ -221,14 +234,15 @@ impl WsNetwork {
         path: &str,
         headers: &[(&str, &str)],
     ) -> Token {
-        let handshake = handshake(addr, path, headers);
+        let handshake = handshake(&addr.to_string(), path, headers);
         let group = self.group(net);
         let token = net.connect(group, addr);
         self.track_outbound(token, addr, handshake)
     }
     /// Like [`Self::connect`] but negotiates TLS once the TCP connect
     /// completes, verifying against the Mozilla roots and sending SNI
-    /// `server`. Panics if `server` is not a valid DNS name or IP.
+    /// `server`, which is also the default `Host` unless it is an IP. Panics if
+    /// `server` is not a valid DNS name or IP.
     #[cfg(feature = "tls")]
     pub fn connect_tls(
         &mut self,
@@ -238,7 +252,12 @@ impl WsNetwork {
         path: &str,
         headers: &[(&str, &str)],
     ) -> Token {
-        let handshake = handshake(addr, path, headers);
+        let host = match (server.parse::<std::net::IpAddr>(), addr.port()) {
+            (Ok(_), _) => addr.to_string(),
+            (Err(_), 443) => server.to_owned(),
+            (Err(_), port) => format!("{server}:{port}"),
+        };
+        let handshake = handshake(&host, path, headers);
         let session = crate::tls::Session::new(server);
         let group = self.group(net);
         let token = net.connect_tls(group, addr, session);
@@ -279,7 +298,7 @@ impl WsNetwork {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> bool {
-        if !(400..=599).contains(&status) || !valid_headers(headers) {
+        if !(400..=599).contains(&status) || !valid_response(status, headers) {
             return false
         }
         self.conns
@@ -394,16 +413,16 @@ impl WsNetwork {
             }
         }
         self.lifecycle.clear();
+        let handshake_timeout = self.handshake_timeout;
         for i in 0..self.conns.len() {
             if self.conns[i].dirty {
                 self.parse(net, i, &mut handler);
             }
-        }
-        for conn in &mut self.conns {
+            let conn = &mut self.conns[i];
             let handshaking =
                 matches!(conn.state, State::Request | State::Answer(_) | State::Upgrade(_));
             if conn.over_limit ||
-                handshaking && !conn.ws.closing && conn.since.elapsed() >= self.handshake_timeout
+                handshaking && !conn.ws.closing && conn.since.elapsed() >= handshake_timeout
             {
                 conn.over_limit = false;
                 conn.ws.closing = true;
@@ -538,11 +557,22 @@ impl Conn {
         let header = |name: &str| {
             response.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value)
         };
+        // At most one, and offered (RFC 6455 §4.1, §11.3.4).
+        let mut protocols = response
+            .headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"));
+        let protocol = match (protocols.next(), protocols.next()) {
+            (None, _) => true,
+            (Some(chosen), None) => offered(&self.handshake, chosen.value),
+            (Some(_), Some(_)) => false,
+        };
         let accepted = response.code == Some(101) &&
             has_token(response.headers, "upgrade", b"websocket") &&
             has_token(response.headers, "connection", b"upgrade") &&
             header("sec-websocket-accept") == Some(&accept[..]) &&
-            header("sec-websocket-extensions").is_none();
+            header("sec-websocket-extensions").is_none() &&
+            protocol;
         let Some(head) = head.filter(|_| accepted) else {
             self.ws.closing = true;
             self.buf.clear();
@@ -845,18 +875,15 @@ fn accept_key(key: &[u8]) -> [u8; 28] {
 }
 
 /// A client handshake up to its `Sec-WebSocket-Key` value.
-fn handshake(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Vec<u8> {
-    assert!(
-        !path.is_empty() && !path.contains(['\r', '\n', ' ']) && valid_headers(headers),
-        "invalid path or header"
-    );
+fn handshake(host: &str, path: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+    assert!(valid_request("GET", path, headers), "invalid path or header");
     let mut out = Vec::new();
     write!(out, "GET {path} HTTP/1.1\r\n").unwrap();
     for (name, value) in headers {
         write!(out, "{name}: {value}\r\n").unwrap();
     }
     if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host")) {
-        write!(out, "Host: {addr}\r\n").unwrap();
+        write!(out, "Host: {host}\r\n").unwrap();
     }
     out.extend_from_slice(
         b"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ",
@@ -879,6 +906,13 @@ fn valid_close_code(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1013 | 3000..=4999)
 }
 
-fn valid_headers(headers: &[(&str, &str)]) -> bool {
-    headers.iter().all(|(name, value)| valid_token(name) && !value.contains(['\r', '\n']))
+/// Whether the client `handshake` offered the subprotocol the server `chosen`.
+fn offered(handshake: &[u8], chosen: &[u8]) -> bool {
+    handshake.split(|&b| b == b'\n').any(|line| {
+        let Some(colon) = line.iter().position(|&b| b == b':') else { return false };
+        line[..colon].eq_ignore_ascii_case(b"sec-websocket-protocol") &&
+            line[colon + 1..]
+                .split(|&b| b == b',')
+                .any(|value| value.trim_ascii() == chosen.trim_ascii())
+    })
 }

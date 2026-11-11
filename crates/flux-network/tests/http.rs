@@ -790,6 +790,7 @@ fn chunked_requests_when_enabled() {
 
     for (request, status) in [
         (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabXX".as_slice(), 400),
         (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n".as_slice(), 413),
         (b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(), 501),
     ] {

@@ -1657,7 +1657,7 @@ impl HttpNetwork {
                 ) {
                     Ok(Some(consumed)) => (consumed, true),
                     Ok(None) => return,
-                    Err(()) => {
+                    Err(_) => {
                         self.fail_outbound(net, i);
                         return
                     }
@@ -1750,14 +1750,15 @@ impl HttpNetwork {
     }
     /// Decodes the complete chunked body starting at `start` into `body`,
     /// returning the offset just past it. `scan` is where the last call's
-    /// scan stopped.
+    /// scan stopped. `Err` is the refusing status: 413 past the body limit,
+    /// 400 for bad framing.
     fn decode_chunked(
         bytes: &[u8],
         start: usize,
         scan: &mut (usize, usize),
         (max_body_bytes, max_headers, max_line): (usize, usize, usize),
         body: &mut Vec<u8>,
-    ) -> Result<Option<usize>, ()> {
+    ) -> Result<Option<usize>, u16> {
         let bytes = &bytes[start..];
         let Some((end, body_len)) =
             Self::chunked_end(bytes, scan, max_body_bytes, max_headers, max_line)?
@@ -1769,19 +1770,19 @@ impl HttpNetwork {
         let mut at = 0;
         while at < end {
             let httparse::Status::Complete((consumed, size)) =
-                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
+                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| 400u16)?
             else {
-                return Err(())
+                return Err(400)
             };
-            at = at.checked_add(consumed).ok_or(())?;
-            let size = usize::try_from(size).map_err(|_| ())?;
+            at = at.checked_add(consumed).ok_or(400u16)?;
+            let size = usize::try_from(size).map_err(|_| 400u16)?;
             if size == 0 {
-                return start.checked_add(end).map(Some).ok_or(())
+                return start.checked_add(end).map(Some).ok_or(400)
             }
             body.extend_from_slice(&bytes[at..at + size]);
-            at = at.checked_add(size + 2).ok_or(())?;
+            at = at.checked_add(size + 2).ok_or(400u16)?;
         }
-        Err(())
+        Err(400)
     }
     /// [`Self::decode_chunked`] for a request; `Err` is the refusing status.
     fn decode_chunked_request(
@@ -1789,7 +1790,7 @@ impl HttpNetwork {
         bytes: &[u8],
         head: usize,
         scan: &mut (usize, usize),
-        (max_body_bytes, max_headers, max_line): (usize, usize, usize),
+        limits: (usize, usize, usize),
         body: &mut Vec<u8>,
     ) -> Result<Option<usize>, u16> {
         if transfer_chunked(req.headers) != Some(true) {
@@ -1801,20 +1802,7 @@ impl HttpNetwork {
         {
             return Err(400)
         }
-        let limits = (max_body_bytes, max_headers, max_line);
-        Self::decode_chunked(bytes, head, scan, limits, body).map_err(|()| {
-            // Only the body limit fails a body that an unbounded scan accepts.
-            match Self::chunked_end(
-                &bytes[head..],
-                &mut scan.clone(),
-                usize::MAX,
-                max_headers,
-                max_line,
-            ) {
-                Ok(_) => 413,
-                Err(()) => 400,
-            }
-        })
+        Self::decode_chunked(bytes, head, scan, limits, body)
     }
     fn chunked_end(
         bytes: &[u8],
@@ -1822,39 +1810,42 @@ impl HttpNetwork {
         max_body_bytes: usize,
         max_headers: usize,
         max_line: usize,
-    ) -> Result<Option<(usize, usize)>, ()> {
+    ) -> Result<Option<(usize, usize)>, u16> {
         let (mut at, mut body_len) = *scan;
         loop {
             let httparse::Status::Complete((consumed, size)) =
-                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
+                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| 400u16)?
             else {
-                return if bytes.len() - at > max_line { Err(()) } else { Ok(None) }
+                return if bytes.len() - at > max_line { Err(400) } else { Ok(None) }
             };
-            let size = usize::try_from(size).map_err(|_| ())?;
+            let size = usize::try_from(size).map_err(|_| 400u16)?;
             if size > max_body_bytes.saturating_sub(body_len) {
-                return Err(())
+                return Err(413)
             }
-            at = at.checked_add(consumed).ok_or(())?;
+            at = at.checked_add(consumed).ok_or(400u16)?;
             if size == 0 {
                 let (mut stack_slots, mut heap_slots) =
                     ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
                 let headers = header_slots(&mut stack_slots, &mut heap_slots, max_headers);
                 let httparse::Status::Complete((consumed, _)) =
-                    httparse::parse_headers(&bytes[at..], headers).map_err(|_| ())?
+                    httparse::parse_headers(&bytes[at..], headers).map_err(|_| 400u16)?
                 else {
-                    return if bytes.len() - at > max_line { Err(()) } else { Ok(None) }
+                    return if bytes.len() - at > max_line { Err(400) } else { Ok(None) }
                 };
-                let end = at.checked_add(consumed).ok_or(())?;
+                let end = at.checked_add(consumed).ok_or(400u16)?;
                 if !crlf_only(&bytes[at..end]) {
-                    return Err(())
+                    return Err(400)
                 }
                 return Ok(Some((end, body_len)))
             }
             let Some(chunk_end) = at.checked_add(size).and_then(|at| at.checked_add(2)) else {
-                return Err(())
+                return Err(400)
             };
-            if bytes.len() < chunk_end || &bytes[at + size..chunk_end] != b"\r\n" {
+            if bytes.len() < chunk_end {
                 return Ok(None)
+            }
+            if &bytes[at + size..chunk_end] != b"\r\n" {
+                return Err(400)
             }
             body_len += size;
             at = chunk_end;
@@ -1893,7 +1884,7 @@ pub(crate) fn valid_token(value: &str) -> bool {
     !value.is_empty() &&
         value.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
-fn valid_response(status: u16, headers: &[(&str, &str)]) -> bool {
+pub(crate) fn valid_response(status: u16, headers: &[(&str, &str)]) -> bool {
     (200..=599).contains(&status) &&
         headers.iter().all(|(n, v)| {
             valid_token(n) &&
@@ -1945,7 +1936,7 @@ fn set_fields(fields: &mut HeaderMap, headers: &[(&str, &str)]) -> bool {
     }
     true
 }
-fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
+pub(crate) fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
     valid_token(method) &&
         !path.is_empty() &&
         !path.contains(['\r', '\n', ' ']) &&
