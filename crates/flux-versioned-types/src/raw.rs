@@ -30,6 +30,11 @@ pub const ALIGN: usize = 8;
 /// Max leaf alignment (`u128`); the leaf region pads to the header-carried
 /// alignment so 8-aligned types keep byte-identical blobs.
 pub const LEAF_ALIGN_MAX: usize = 16;
+/// The most a conforming zstd frame expands per input byte: a block
+/// regenerates at most 128 KiB, and the smallest block that does is a 4-byte
+/// RLE block (3-byte header plus the repeated byte). Frame headers only lower
+/// the ratio, so a longer `decompressed_len` can never decompress.
+const ZSTD_MAX_RATIO: u64 = 128 * 1024 / 4;
 
 // The header is read by native reinterpretation; x86_64 layout is the format.
 const _: () = assert!(cfg!(target_endian = "little") && size_of::<usize>() == 8);
@@ -91,13 +96,25 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// 16-byte aligned byte buffer so decoded leaves cast directly.
-#[derive(Default)]
 pub struct Scratch {
     words: TruncatingVec<u128>,
     len: usize,
     /// Each fill starts afresh, so the buffer shrinks back after a burst.
     truncating: bool,
+    max_len: usize,
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
+}
+
+impl Default for Scratch {
+    fn default() -> Self {
+        Self {
+            words: TruncatingVec::default(),
+            len: 0,
+            truncating: false,
+            max_len: usize::MAX,
+            decompressor: None,
+        }
+    }
 }
 
 impl Scratch {
@@ -109,6 +126,13 @@ impl Scratch {
     /// burst has passed, as [`TruncatingVec`] does.
     pub fn truncating() -> Self {
         Self { truncating: true, ..Self::default() }
+    }
+
+    /// Fails [`load`](Self::load) and blob decompression with
+    /// [`DecodeError::TooShort`] instead of growing past `max` bytes, for
+    /// decoding untrusted blobs. [`resize`](Self::resize) is not capped.
+    pub fn with_max_len(self, max: usize) -> Self {
+        Self { max_len: max, ..self }
     }
 
     pub fn resize(&mut self, len: usize) {
@@ -134,6 +158,9 @@ impl Scratch {
     }
 
     fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
+        if len > self.max_len {
+            return Err(DecodeError::TooShort { needed: len, got: self.max_len });
+        }
         let words = len.div_ceil(LEAF_ALIGN_MAX);
         if self.truncating {
             self.words.refill(words, 0);
@@ -156,6 +183,9 @@ impl Scratch {
 
     /// For buffers that are not 8-aligned, such as `DiskIo` reads.
     pub fn load(&mut self, bytes: &[u8]) -> Result<&Blob, DecodeError> {
+        if bytes.len() > self.max_len {
+            return Err(DecodeError::TooShort { needed: bytes.len(), got: self.max_len });
+        }
         self.resize(bytes.len());
         self.as_mut_bytes().copy_from_slice(bytes);
         Blob::from_bytes(self.as_bytes())
@@ -343,14 +373,24 @@ impl Blob {
             .ok_or(DecodeError::UnknownTypeHash(self.header.type_hash))?
             as u64;
         let ts_len = n * size_of::<TrackingTimestampWire>() as u64;
+        let align = self.header.leaf_align;
+        if align != 0 && !(align.is_power_of_two() && align as usize <= LEAF_ALIGN_MAX) {
+            return Err(DecodeError::InvalidValue);
+        }
         // Pre-alignment blobs carry 0; their leaves are 8-aligned.
-        let align = u64::from(self.header.leaf_align).max(ALIGN as u64);
+        let align = u64::from(align).max(ALIGN as u64);
         let leaf_off = ts_len.next_multiple_of(align);
         let expected = leaf_off + n * leaf_size;
         if self.header.decompressed_len != expected {
             return Err(DecodeError::LengthMismatch {
                 expected: usize::try_from(expected).unwrap_or(usize::MAX),
                 got: usize::try_from(self.header.decompressed_len).unwrap_or(usize::MAX),
+            });
+        }
+        if expected > self.header.compressed_len.saturating_mul(ZSTD_MAX_RATIO) {
+            return Err(DecodeError::TooShort {
+                needed: expected.div_ceil(ZSTD_MAX_RATIO) as usize,
+                got: self.header.compressed_len as usize,
             });
         }
         Ok(Layout {
