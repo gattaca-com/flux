@@ -1,18 +1,15 @@
 use std::{io, net::SocketAddr};
 
 use flux_timing::{Duration, Instant};
-use flux_utils::safe_assert;
+use flux_utils::{DCache, safe_assert};
 use mio::{Registry, Token, event::Event as MioEvent};
 use tracing::{debug, error, info, warn};
 
-use super::{
-    PublisherEvent, TokenRange,
-    wire::{self, Datagram, HELLO_ACK_SIZE, RESET_SIZE},
-};
+use super::wire::{self, Datagram, HELLO_ACK_SIZE, RESET_SIZE};
 use crate::{
-    network::{PayloadBuf, UdpGroupConfigV2},
+    network::{Event, Group, PayloadBuf, RxPayload, Tokens, UdpGroupConfigV2},
     udp_v2::{
-        Socket, new_session,
+        Socket, deliver_on_connect, new_session,
         outbound::Outbound,
         recv_all, send_datagram,
         stream::Stream,
@@ -58,7 +55,7 @@ struct Staged {
 
 pub(super) struct PublisherState {
     config: UdpGroupConfigV2,
-    pub(super) tokens: TokenRange,
+    group: Group,
     listeners: Vec<Socket>,
     stream: Stream,
     recipients: Vec<Recipient>,
@@ -71,6 +68,8 @@ pub(super) struct PublisherState {
     // entries here correspond to `SendBatch` order
     staged: Vec<Staged>,
     unsubscribed: Vec<(Token, SocketAddr)>,
+    /// Dropped subscribers' tokens, retired once the poll's events are out.
+    retired: Vec<Token>,
     telemetry: Telemetry,
     next_tick: Instant,
 }
@@ -80,7 +79,7 @@ fn on_connect_msg(config: &UdpGroupConfigV2) -> &[u8] {
 }
 
 impl PublisherState {
-    pub(super) fn new(config: UdpGroupConfigV2, tokens: TokenRange) -> Self {
+    pub(super) fn new(config: UdpGroupConfigV2, group: Group) -> Self {
         let udp = config.udp;
         crate::udp_v2::validate_group(&config, HELLO_ACK_SIZE);
         Self {
@@ -89,13 +88,14 @@ impl PublisherState {
             batch: SendBatch::new(udp.max_datagram_size),
             telemetry: Telemetry::new(config.telemetry, config.name),
             config,
-            tokens,
+            group,
             listeners: Vec::new(),
             recipients: Vec::new(),
             dropped: Vec::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
             staged: Vec::new(),
             unsubscribed: Vec::new(),
+            retired: Vec::new(),
             next_tick: Instant::ZERO,
         }
     }
@@ -106,17 +106,33 @@ impl PublisherState {
         }
     }
 
-    pub(super) fn listen(&mut self, registry: &Registry, addr: SocketAddr) -> io::Result<Token> {
-        let token = self.tokens.allocate().ok_or_else(super::token_range_exhausted)?;
-        let socket = Socket::open(
+    pub(super) fn is_empty(&self) -> bool {
+        self.listeners.is_empty()
+    }
+
+    pub(super) fn listen(
+        &mut self,
+        registry: &Registry,
+        addr: SocketAddr,
+        tokens: &mut Tokens,
+    ) -> io::Result<Token> {
+        let token = tokens.allocate(self.group);
+        match Socket::open(
             registry,
             addr,
             token,
             Some(&mut self.batch),
             self.config.socket_buf_size,
-        )?;
-        self.listeners.push(socket);
-        Ok(token)
+        ) {
+            Ok(socket) => {
+                self.listeners.push(socket);
+                Ok(token)
+            }
+            Err(err) => {
+                tokens.retire(token);
+                Err(err)
+            }
+        }
     }
 
     fn release(&mut self) {
@@ -129,6 +145,7 @@ impl PublisherState {
 
     fn remove_recipient(&mut self, i: usize) {
         let recipient = self.recipients.swap_remove(i);
+        self.retired.push(recipient.token);
         self.dropped.push((recipient.addr, recipient.session, Instant::now()));
         self.release();
     }
@@ -372,16 +389,20 @@ impl PublisherState {
         send_datagram(&self.listeners[k].udp, to, &buf);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_datagram<F>(
         &mut self,
         k: usize,
         bytes: &[u8],
         from: SocketAddr,
         now: Instant,
+        tokens: &mut Tokens,
+        dcache: Option<&DCache>,
         deliver: &mut F,
     ) where
-        F: FnMut(PublisherEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
+        let group = self.group;
         let Some(datagram) = wire::decode(bytes) else { return };
         let listener = self.listeners[k].token;
         let index = self.recipients.iter().position(|r| r.listener == listener && r.addr == from);
@@ -432,14 +453,16 @@ impl PublisherState {
                     self.send_hello_ack(k, from, subscriber, join);
                     return;
                 }
-                let Some(token) = self.tokens.allocate() else {
-                    warn!(addr = %from, "udp token range exhausted, subscriber refused");
+                // Any sender can open sessions, so running out refuses one
+                // instead of panicking.
+                let Some(token) = tokens.try_allocate(group) else {
+                    warn!(addr = %from, "network token range exhausted, subscriber refused");
                     return;
                 };
                 if let Some(i) = index {
                     let old = self.recipients[i].token;
                     self.remove_recipient(i);
-                    deliver(PublisherEvent::Unsubscribed { token: old, peer_addr: from });
+                    deliver(Event::Disconnected { group, token: old, peer_addr: from });
                 }
                 // The open packet may already be on its way to others.
                 self.stream.seal();
@@ -457,7 +480,8 @@ impl PublisherState {
                 });
                 self.send_hello_ack(k, from, subscriber, join);
                 info!(addr = %from, "udp subscriber joined");
-                deliver(PublisherEvent::Subscribed { token, peer_addr: from, msg });
+                deliver(Event::Accepted { group, token, peer_addr: from });
+                deliver_on_connect(group, token, msg, dcache, deliver);
             }
             Datagram::Packet(_) |
             Datagram::HelloAck { .. } |
@@ -482,15 +506,19 @@ impl PublisherState {
         recv: &mut RecvBatch,
         registry: &Registry,
         event: &MioEvent,
+        tokens: &mut Tokens,
+        dcache: Option<&DCache>,
         deliver: &mut F,
     ) where
-        F: FnMut(PublisherEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let Some(k) = self.listeners.iter().position(|s| s.token == event.token()) else { return };
         let now = Instant::now();
         if event.is_readable() {
             let fd = self.listeners[k].fd();
-            recv_all(fd, recv, |bytes, from| self.on_datagram(k, bytes, from, now, deliver));
+            recv_all(fd, recv, |bytes, from| {
+                self.on_datagram(k, bytes, from, now, tokens, dcache, deliver);
+            });
         }
         if event.is_writable() {
             self.listeners[k].on_writable();
@@ -507,18 +535,19 @@ impl PublisherState {
 
     fn drain_unsubscribed<F>(&mut self, deliver: &mut F) -> bool
     where
-        F: FnMut(PublisherEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let had = !self.unsubscribed.is_empty();
+        let group = self.group;
         for (token, peer_addr) in self.unsubscribed.drain(..) {
-            deliver(PublisherEvent::Unsubscribed { token, peer_addr });
+            deliver(Event::Disconnected { group, token, peer_addr });
         }
         had
     }
 
     pub(super) fn pre_poll<F>(&mut self, registry: &Registry, deliver: &mut F) -> bool
     where
-        F: FnMut(PublisherEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
         let work = self.drain_unsubscribed(deliver);
         let now = Instant::now();
@@ -529,10 +558,14 @@ impl PublisherState {
         work
     }
 
-    pub(super) fn post_poll<F>(&mut self, deliver: &mut F) -> bool
+    pub(super) fn post_poll<F>(&mut self, tokens: &mut Tokens, deliver: &mut F) -> bool
     where
-        F: FnMut(PublisherEvent<'_>),
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
-        self.drain_unsubscribed(deliver)
+        let work = self.drain_unsubscribed(deliver);
+        for token in self.retired.drain(..) {
+            tokens.retire(token);
+        }
+        work
     }
 }

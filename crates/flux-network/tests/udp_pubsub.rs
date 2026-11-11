@@ -1,4 +1,6 @@
 use std::{
+    collections::HashSet,
+    io,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
         Arc,
@@ -9,9 +11,133 @@ use std::{
 };
 
 use flux_network::{
-    Publisher, PublisherEvent, Subscriber, SubscriberEvent, UdpConfig, UdpGroupConfigV2,
+    Group, GroupConfig, Network, NetworkEvent, NetworkWithExternalPoll, PayloadBuf, UdpConfig,
+    UdpGroupConfigV2,
 };
 use mio::Token;
+
+/// A network with one publisher group.
+struct Publisher {
+    net: Network,
+    group: Group,
+}
+
+enum PublisherEvent<'a> {
+    Subscribed {
+        token: Token,
+    },
+    Unsubscribed {
+        token: Token,
+    },
+    /// A subscriber's on-connect message.
+    Message {
+        token: Token,
+        payload: &'a [u8],
+    },
+}
+
+impl Publisher {
+    fn new(config: UdpGroupConfigV2) -> Self {
+        let mut net = Network::default();
+        let group = net.add_group(GroupConfig::UdpPublisher(config));
+        Self { net, group }
+    }
+
+    fn listen(&mut self, addr: SocketAddr) -> io::Result<Token> {
+        self.net.listen(self.group, addr)
+    }
+
+    fn broadcast_with(&mut self, serialise: impl FnOnce(&mut PayloadBuf<'_>)) -> usize {
+        self.net.broadcast_with(self.group, serialise)
+    }
+
+    fn broadcast_many_with<I: IntoIterator>(
+        &mut self,
+        items: I,
+        serialise: impl FnMut(&mut PayloadBuf<'_>, I::Item),
+    ) -> usize {
+        self.net.broadcast_many_with(self.group, items, serialise)
+    }
+
+    fn disconnect(&mut self, token: Token) -> bool {
+        self.net.disconnect(token)
+    }
+
+    fn disconnect_when_drained(&mut self, token: Token) -> bool {
+        self.net.disconnect_when_drained(token)
+    }
+
+    fn remove(&mut self, token: Token) -> bool {
+        self.net.remove(token)
+    }
+
+    fn poll_with(&mut self, mut handler: impl FnMut(PublisherEvent<'_>)) {
+        self.net.poll_with(|event| {
+            handler(match event {
+                NetworkEvent::Accepted { token, .. } => PublisherEvent::Subscribed { token },
+                NetworkEvent::Disconnected { token, .. } => PublisherEvent::Unsubscribed { token },
+                NetworkEvent::Message { token, payload, .. } => {
+                    PublisherEvent::Message { token, payload }
+                }
+                NetworkEvent::Connected { .. } => unreachable!("a publisher doesn't connect"),
+            });
+        });
+    }
+}
+
+/// A network with one subscriber group.
+struct Subscriber {
+    net: Network,
+    group: Group,
+    subscribed: HashSet<Token>,
+}
+
+enum SubscriberEvent<'a> {
+    Subscribed { token: Token },
+    Unsubscribed { token: Token },
+    Message { token: Token, payload: &'a [u8] },
+}
+
+impl Subscriber {
+    fn new(config: UdpGroupConfigV2) -> Self {
+        let mut net = Network::default();
+        let group = net.add_group(GroupConfig::UdpSubscriber(config));
+        Self { net, group, subscribed: HashSet::new() }
+    }
+
+    fn subscribe(&mut self, addr: SocketAddr) -> Token {
+        self.net.connect(self.group, addr)
+    }
+
+    fn is_subscribed(&self, token: Token) -> bool {
+        self.subscribed.contains(&token)
+    }
+
+    fn resubscribe(&mut self, token: Token) -> bool {
+        self.subscribed.remove(&token);
+        self.net.disconnect(token)
+    }
+
+    fn poll_with(&mut self, mut handler: impl FnMut(SubscriberEvent<'_>)) {
+        let subscribed = &mut self.subscribed;
+        self.net.poll_with(|event| {
+            handler(match event {
+                NetworkEvent::Connected { token, .. } => {
+                    subscribed.insert(token);
+                    SubscriberEvent::Subscribed { token }
+                }
+                NetworkEvent::Disconnected { token, .. } => {
+                    subscribed.remove(&token);
+                    SubscriberEvent::Unsubscribed { token }
+                }
+                NetworkEvent::Message { token, payload, .. } => {
+                    SubscriberEvent::Message { token, payload }
+                }
+                NetworkEvent::Accepted { .. } => unreachable!("a subscriber doesn't listen"),
+            });
+        });
+    }
+}
 
 /// A 1200-byte packet minus its header and one message header.
 const STRIDE: usize = 1200 - 25 - 4;
@@ -32,7 +158,7 @@ fn subscribe_via(
     dial: SocketAddr,
 ) -> (Token, Token) {
     server.listen(addr).unwrap();
-    let client_token = client.subscribe(dial).unwrap();
+    let client_token = client.subscribe(dial);
     let mut accepted = None;
     let mut subscribed = 0;
     let mut on_client = |event: SubscriberEvent<'_>| {
@@ -109,7 +235,7 @@ fn udp_publishes_to_a_subscriber_once_it_joins() {
     let mut server = Publisher::new(lan());
     server.listen(addr).unwrap();
     let mut client = Subscriber::new(lan());
-    let tok = client.subscribe(addr).unwrap();
+    let tok = client.subscribe(addr);
     assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"too early")), 0);
 
     let mut joined = false;
@@ -143,20 +269,24 @@ fn udp_greeting_comes_with_the_subscription_and_can_turn_it_away() {
         on_connect_msg: Some(b"credentials".to_vec()),
         ..lan()
     });
-    let _ = client.subscribe(addr).unwrap();
+    let _ = client.subscribe(addr);
     let mut subscribed = None;
+    let mut greeting = None;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while subscribed.is_none() {
+    while greeting.is_none() {
         assert!(Instant::now() < deadline, "greeting");
-        server.poll_with(|e| {
-            if let PublisherEvent::Subscribed { token, msg, .. } = e {
-                subscribed = Some((token, msg.to_vec()));
+        server.poll_with(|e| match e {
+            PublisherEvent::Subscribed { token } => subscribed = Some(token),
+            PublisherEvent::Message { token, payload } => {
+                assert_eq!(Some(token), subscribed, "the greeting follows its Subscribed");
+                greeting = Some(payload.to_vec());
             }
+            PublisherEvent::Unsubscribed { .. } => {}
         });
         client.poll_with(|_| {});
     }
-    let (token, msg) = subscribed.unwrap();
-    assert_eq!(msg, b"credentials");
+    let token = subscribed.unwrap();
+    assert_eq!(greeting.unwrap(), b"credentials");
     assert!(server.disconnect(token));
     assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"secret")), 0);
 }
@@ -168,8 +298,8 @@ fn udp_broadcast_mixed_sizes_to_two_subscribers() {
     server.listen(addr).unwrap();
     let mut a = Subscriber::new(lan());
     let mut b = Subscriber::new(lan());
-    let _ = a.subscribe(addr).unwrap();
-    let _ = b.subscribe(addr).unwrap();
+    let _ = a.subscribe(addr);
+    let _ = b.subscribe(addr);
     let mut accepted = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
     while accepted < 2 {
@@ -317,30 +447,37 @@ fn udp_resubscribe_is_a_new_session() {
 
     let mut events = Vec::new();
     let mut resubscribed = 0;
+    let mut greeted = false;
     let mut sent = false;
     let mut got = false;
     let deadline = Instant::now() + Duration::from_secs(5);
     while !got {
         assert!(Instant::now() < deadline, "resubscribe");
         server.poll_with(|e| match e {
-            PublisherEvent::Unsubscribed { token, .. } => events.push(("unsubscribed", token)),
-            PublisherEvent::Subscribed { token, .. } => events.push(("subscribed", token)),
+            PublisherEvent::Unsubscribed { token } => events.push(("unsubscribed", token)),
+            PublisherEvent::Subscribed { token } => events.push(("subscribed", token)),
+            PublisherEvent::Message { .. } => {}
         });
         if events.len() == 2 && !sent {
             assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"after")), 1);
             sent = true;
         }
         client.poll_with(|e| match e {
-            SubscriberEvent::Subscribed { token, msg, .. } => {
+            SubscriberEvent::Subscribed { token } => {
                 assert_eq!(token, tok);
-                assert_eq!(msg, b"welcome");
                 resubscribed += 1;
                 assert_eq!(resubscribed, 1);
             }
             SubscriberEvent::Message { payload, .. } => {
                 assert_eq!(resubscribed, 1, "Subscribed must precede its messages");
-                assert_eq!(payload, b"after");
-                got = true;
+                if payload == b"welcome" {
+                    assert!(!greeted, "one greeting per subscription");
+                    greeted = true;
+                } else {
+                    assert!(greeted, "the greeting comes first");
+                    assert_eq!(payload, b"after");
+                    got = true;
+                }
             }
             SubscriberEvent::Unsubscribed { .. } => {}
         });
@@ -358,7 +495,7 @@ fn udp_late_subscriber_joins_at_the_live_end() {
     let (mut server, mut early, _, _) = lan_pair(addr);
     assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"before")), 1);
     let mut late = Subscriber::new(lan());
-    let late_tok = late.subscribe(addr).unwrap();
+    let late_tok = late.subscribe(addr);
     let mut accepted = false;
     let deadline = Instant::now() + Duration::from_secs(5);
     while !accepted || !late.is_subscribed(late_tok) {
@@ -508,8 +645,8 @@ fn udp_broadcast_survives_dropping_a_subscriber_mid_way() {
     server.listen(addr).unwrap();
     let mut stalled = Subscriber::new(lan());
     let mut live = Subscriber::new(lan());
-    let _ = stalled.subscribe(addr).unwrap();
-    let live_tok = live.subscribe(addr).unwrap();
+    let _ = stalled.subscribe(addr);
+    let live_tok = live.subscribe(addr);
     let mut accepted = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
     while accepted < 2 || !live.is_subscribed(live_tok) {
@@ -674,7 +811,7 @@ fn udp_resubscribes_while_down_send_one_greeting() {
     let addr = free_addr();
     let mut client =
         Subscriber::new(UdpGroupConfigV2 { on_connect_msg: Some(b"hello".to_vec()), ..lan() });
-    let tok = client.subscribe(addr).unwrap();
+    let tok = client.subscribe(addr);
     for _ in 0..3 {
         client.poll_with(|_| {});
         client.resubscribe(tok);
@@ -684,8 +821,8 @@ fn udp_resubscribes_while_down_send_one_greeting() {
     server.listen(addr).unwrap();
     let mut got = Vec::new();
     let mut on_server = |e: PublisherEvent<'_>| {
-        if let PublisherEvent::Subscribed { msg, .. } = e {
-            got.push(msg.to_vec());
+        if let PublisherEvent::Message { payload, .. } = e {
+            got.push(payload.to_vec());
         }
     };
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -740,7 +877,7 @@ fn udp_a_draining_subscriber_gets_nothing_newer() {
     let mut draining = Subscriber::new(lan());
     let mut live = Subscriber::new(lan());
     let (drained, _) = subscribe_pair(&mut server, &mut draining, addr);
-    let live_token = live.subscribe(addr).unwrap();
+    let live_token = live.subscribe(addr);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !live.is_subscribed(live_token) {
         assert!(Instant::now() < deadline, "second subscriber");
@@ -772,25 +909,24 @@ fn udp_an_exhausted_token_range_refuses_subscribers() {
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(64);
     // The listener and one subscriber.
-    let mut server =
-        Publisher::with_external_poll(lan(), poll.registry().try_clone().unwrap(), 0..2);
-    server.listen(addr).unwrap();
+    let mut net = NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 0..2);
+    let publisher = net.add_group(GroupConfig::UdpPublisher(lan()));
+    net.listen(publisher, addr).unwrap();
     let mut first = Subscriber::new(lan());
     let mut second = Subscriber::new(lan());
-    let first_token = first.subscribe(addr).unwrap();
-    let second_token = second.subscribe(addr).unwrap();
+    let first_token = first.subscribe(addr);
+    let second_token = second.subscribe(addr);
     let mut joined = 0;
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        let mut on_server = |e: PublisherEvent<'_>| {
-            joined += usize::from(matches!(e, PublisherEvent::Subscribed { .. }));
-        };
-        server.pre_poll(&mut on_server);
+        let mut on_server =
+            |e: NetworkEvent<'_>| joined += usize::from(matches!(e, NetworkEvent::Accepted { .. }));
+        net.pre_poll(&mut on_server);
         poll.poll(&mut events, Some(std::time::Duration::from_millis(1))).unwrap();
         for event in &events {
-            server.handle_event(event, &mut on_server);
+            net.handle_event(event, &mut on_server);
         }
-        server.post_poll(&mut on_server);
+        net.post_poll(&mut on_server);
         first.poll_with(|_| {});
         second.poll_with(|_| {});
     }
@@ -803,8 +939,20 @@ fn udp_listener_ignores_disconnect_and_remove_drops_its_subscribers() {
     let addr = free_addr();
     let mut server = Publisher::new(lan());
     let mut client = Subscriber::new(lan());
-    let (accepted, _) = subscribe_pair(&mut server, &mut client, addr);
-    let listener = Token(0);
+    let listener = server.listen(addr).unwrap();
+    let tok = client.subscribe(addr);
+    let mut accepted = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while accepted.is_none() || !client.is_subscribed(tok) {
+        assert!(Instant::now() < deadline, "handshake");
+        server.poll_with(|e| {
+            if let PublisherEvent::Subscribed { token } = e {
+                accepted = Some(token);
+            }
+        });
+        client.poll_with(|_| {});
+    }
+    let accepted = accepted.unwrap();
 
     assert!(!server.disconnect(listener), "a listener has no subscription to drop");
     assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"still-up")), 1);
@@ -856,7 +1004,7 @@ fn broadcast_bursts(drop_every: usize, poll_every: usize, max_lag: u32) {
         (0..PEERS).map(|_| Subscriber::new(config.clone())).collect();
     server.listen(server_addr).unwrap();
     for (c, relay) in clients.iter_mut().zip(&relays) {
-        let _ = c.subscribe(relay.addr).unwrap();
+        let _ = c.subscribe(relay.addr);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut accepted = 0;
@@ -920,43 +1068,70 @@ fn broadcast_bursts(drop_every: usize, poll_every: usize, max_lag: u32) {
     assert!(relays.iter().all(|r| r.dropped.load(Ordering::Relaxed) > 0));
 }
 
-#[test]
-fn udp_publisher_and_subscriber_share_one_external_poll() {
-    let addr = free_addr();
-    let mut poll = mio::Poll::new().unwrap();
-    let mut events = mio::Events::with_capacity(64);
-    let mut server =
-        Publisher::with_external_poll(lan(), poll.registry().try_clone().unwrap(), 0..100);
-    let mut client =
-        Subscriber::with_external_poll(lan(), poll.registry().try_clone().unwrap(), 100..200);
-    server.listen(addr).unwrap();
-    let tok = client.subscribe(addr).unwrap();
-    let mut joined = false;
-    let mut sent = false;
-    let mut got = Vec::new();
+#[derive(Debug, PartialEq)]
+enum Seen {
+    Accepted(Group, Token),
+    Connected(Group, Token),
+    Message(Group, Token, Vec<u8>),
+    Disconnected(Group, Token),
+}
+
+fn poll_until(net: &mut Network, seen: &mut Vec<Seen>, done: impl Fn(&[Seen]) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while got.is_empty() {
-        assert!(Instant::now() < deadline, "shared poll delivery");
-        let mut on_server =
-            |e: PublisherEvent<'_>| joined |= matches!(e, PublisherEvent::Subscribed { .. });
-        let mut on_client = messages(&mut got);
-        server.pre_poll(&mut on_server);
-        client.pre_poll(&mut on_client);
-        poll.poll(&mut events, Some(server.max_poll_interval().min(client.max_poll_interval())))
-            .unwrap();
-        for event in &events {
-            if event.token().0 < 100 {
-                server.handle_event(event, &mut on_server);
-            } else {
-                client.handle_event(event, &mut on_client);
-            }
-        }
-        server.post_poll(&mut on_server);
-        client.post_poll(&mut on_client);
-        if joined && client.is_subscribed(tok) && !sent {
-            assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"shared")), 1);
-            sent = true;
-        }
+    while !done(seen) {
+        assert!(Instant::now() < deadline, "timed out with {seen:?}");
+        net.poll_with(|event| {
+            seen.push(match event {
+                NetworkEvent::Accepted { group, token, .. } => Seen::Accepted(group, token),
+                NetworkEvent::Connected { group, token, .. } => Seen::Connected(group, token),
+                NetworkEvent::Message { group, token, payload, .. } => {
+                    Seen::Message(group, token, payload.to_vec())
+                }
+                NetworkEvent::Disconnected { group, token, .. } => Seen::Disconnected(group, token),
+            });
+        });
+        thread::sleep(Duration::from_micros(50));
     }
-    assert_eq!(got, [b"shared".to_vec()]);
+}
+
+#[test]
+fn udp_pubsub_runs_as_network_groups() {
+    let addr = free_addr();
+    let mut net = Network::default();
+    let publisher = net.add_group(GroupConfig::UdpPublisher(UdpGroupConfigV2 {
+        on_connect_msg: Some(b"hi".to_vec()),
+        ..lan()
+    }));
+    let subscriber = net.add_group(GroupConfig::UdpSubscriber(lan()));
+    net.listen(publisher, addr).unwrap();
+    let sub = net.connect(subscriber, addr);
+
+    let greeting = Seen::Message(subscriber, sub, b"hi".to_vec());
+    let mut seen = Vec::new();
+    poll_until(&mut net, &mut seen, |seen| seen.contains(&greeting));
+    let Some(&Seen::Accepted(_, accepted)) =
+        seen.iter().find(|e| matches!(e, Seen::Accepted(group, _) if *group == publisher))
+    else {
+        panic!("no Accepted in {seen:?}")
+    };
+    let connected = seen.iter().position(|e| *e == Seen::Connected(subscriber, sub));
+    assert!(connected < seen.iter().position(|e| *e == greeting), "{seen:?}");
+
+    assert_eq!(net.broadcast_with(publisher, |b| b.extend_from_slice(b"live")), 1);
+    assert!(!net.send_with(accepted, |b| b.extend_from_slice(b"no")));
+    let live = Seen::Message(subscriber, sub, b"live".to_vec());
+    poll_until(&mut net, &mut seen, |seen| seen.contains(&live));
+
+    // Dropping the subscriber reaches both groups, and it rejoins on its own.
+    seen.clear();
+    assert!(net.disconnect(accepted));
+    poll_until(&mut net, &mut seen, |seen| {
+        seen.contains(&Seen::Disconnected(publisher, accepted)) &&
+            seen.contains(&Seen::Disconnected(subscriber, sub)) &&
+            seen.iter().any(
+                |e| matches!(e, Seen::Accepted(group, t) if *group == publisher && *t != accepted),
+            ) &&
+            seen.contains(&Seen::Connected(subscriber, sub))
+    });
+    assert!(!net.disconnect(accepted), "a dropped subscriber's token is retired");
 }

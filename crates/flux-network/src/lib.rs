@@ -20,4 +20,3 @@ pub use network::{
     UdpGroupConfigV2,
 };
 pub use udp::UdpConfig;
-pub use udp_v2::{Publisher, PublisherEvent, Subscriber, SubscriberEvent};
