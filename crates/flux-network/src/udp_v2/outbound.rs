@@ -172,6 +172,13 @@ impl Outbound {
         self.resent.drain(..below);
     }
 
+    /// A round trip measured outside the stream, such as a ping's. Unlike a
+    /// data packet's, it is never ambiguous, so it also teaches the timeout
+    /// a link whose every packet was resent before its ack came back.
+    pub(crate) fn sample_rtt(&mut self, rtt: Duration) {
+        self.rto.sample(rtt);
+    }
+
     pub(crate) fn on_ack(
         &mut self,
         ack_next: u64,
