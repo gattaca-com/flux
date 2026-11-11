@@ -32,7 +32,9 @@ pub struct Resolver {
     pending: Vec<Pending>,
     /// Tried in order after the name as asked, unless it ends with a dot.
     search: Vec<String>,
-    rng: u64,
+    /// Keyed so query ids cannot be predicted from the ones already seen.
+    ids: RandomState,
+    queries: u64,
     timeout: Duration,
     buf: [u8; MAX_MESSAGE],
     addrs: ArrayVec<Ipv4Addr, MAX_ADDRS>,
@@ -83,7 +85,8 @@ impl Resolver {
             ready: Vec::new(),
             pending: Vec::new(),
             search: Vec::new(),
-            rng: RandomState::new().hash_one(0) | 1,
+            ids: RandomState::new(),
+            queries: 0,
             timeout: Duration::from_secs(TIMEOUT_SECS),
             buf: [0; MAX_MESSAGE],
             addrs: ArrayVec::new(),
@@ -125,10 +128,8 @@ impl Resolver {
         name_len: usize,
         searched: usize,
     ) -> io::Result<()> {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        let id = self.rng as u16;
+        self.queries += 1;
+        let id = self.ids.hash_one(self.queries) as u16;
         let mut query = ArrayVec::<u8, { 12 + MAX_QUESTION }>::new();
         query.extend(id.to_be_bytes());
         // Recursion desired, one question.
