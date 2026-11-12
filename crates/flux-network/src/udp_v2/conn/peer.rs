@@ -161,16 +161,6 @@ impl Peer {
         outcome
     }
 
-    pub(super) fn send_hello_ack(
-        &self,
-        socket: &UdpSocket,
-        ctrl: &mut [u8],
-        msg: &[u8],
-    ) -> SendOutcome {
-        let n = wire::hello_ack(ctrl, self.remote_session, self.session, msg);
-        send_datagram(socket, self.addr, &ctrl[..n])
-    }
-
     pub(super) fn on_packet(
         &mut self,
         packet: Packet<'_>,
@@ -231,6 +221,18 @@ impl Peer {
         }
         SendOutcome::Done
     }
+}
+
+pub(super) fn send_hello_ack(
+    socket: &UdpSocket,
+    ctrl: &mut [u8],
+    to: SocketAddr,
+    initiator: u32,
+    acceptor: u32,
+    msg: &[u8],
+) {
+    let n = wire::hello_ack(ctrl, initiator, acceptor, msg);
+    send_datagram(socket, to, &ctrl[..n]);
 }
 
 pub(super) fn send_reset(socket: &UdpSocket, to: SocketAddr, session: u32) {

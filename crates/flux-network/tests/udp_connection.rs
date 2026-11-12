@@ -895,6 +895,149 @@ fn udp_listener_ignores_disconnect_and_remove_closes_its_sessions() {
     let _ = tok;
 }
 
+/// A connection datagram built by hand from the layout in
+/// `udp_v2/conn/wire.rs`: magic, wire version 2 and `kind`, then `body`.
+fn conn_datagram(kind: u8, body: &[&[u8]]) -> Vec<u8> {
+    let mut d = vec![b'F', b'C', 0x20 | kind];
+    for part in body {
+        d.extend_from_slice(part);
+    }
+    d
+}
+
+const HELLO: u8 = 1;
+const HELLO_ACK: u8 = 2;
+const PACKET: u8 = 3;
+const ACK: u8 = 4;
+
+fn raw_peer() -> UdpSocket {
+    let raw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    raw.set_nonblocking(true).unwrap();
+    raw
+}
+
+fn raw_recv(raw: &UdpSocket) -> Option<Vec<u8>> {
+    let mut buf = [0; 2048];
+    raw.recv_from(&mut buf).ok().map(|(n, _)| buf[..n].to_vec())
+}
+
+fn session_at(d: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(d[at..at + 4].try_into().unwrap())
+}
+
+/// A hello whose sender never answers is not accepted: its address gets the
+/// hello ack and nothing else while the listener broadcasts.
+#[test]
+fn udp_unconfirmed_hello_is_not_accepted() {
+    let addr = free_addr();
+    let (mut server, server_group, mut client, ..) = lan_pair(addr);
+    let raw = raw_peer();
+    raw.send_to(&conn_datagram(HELLO, &[&7u32.to_le_bytes()]), addr).unwrap();
+    let mut got = Vec::new();
+    let mut accepted = false;
+    let mut delivered = 0;
+    // Longer than the lan heartbeat_interval of 100ms.
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        server.broadcast_with(server_group, |b| b.extend_from_slice(b"tick"));
+        server.poll_with(|e| accepted |= matches!(e, NetworkEvent::Accepted { .. }));
+        client.poll_with(|e| delivered += usize::from(matches!(e, NetworkEvent::Message { .. })));
+        got.extend(std::iter::from_fn(|| raw_recv(&raw)));
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(delivered > 0, "the established peer got no broadcasts");
+    assert!(!accepted, "accepted an unconfirmed hello");
+    let kinds: Vec<u8> = got.iter().map(|d| d[2] & 0x0f).collect();
+    assert_eq!(kinds, [HELLO_ACK], "sent more than the hello ack");
+    assert_eq!(session_at(&got[0], 3), 7);
+}
+
+/// A hello under a new session from a live peer's address leaves that peer
+/// up until the new session is confirmed, which this one never is.
+#[test]
+fn udp_unconfirmed_hello_keeps_the_live_peer() {
+    fn poll(server: &mut Network, events: &mut Vec<(&'static str, Token)>) {
+        server.poll_with(|e| match e {
+            NetworkEvent::Accepted { token, .. } => events.push(("accept", token)),
+            NetworkEvent::Disconnected { token, .. } => events.push(("disconnect", token)),
+            NetworkEvent::Message { token, payload, .. } => {
+                assert_eq!(payload, b"still-up");
+                events.push(("message", token));
+            }
+            NetworkEvent::Connected { .. } => {}
+        });
+    }
+    /// Polls until the raw peer receives a datagram of `kind` naming
+    /// `session`.
+    fn await_raw(
+        server: &mut Network,
+        events: &mut Vec<(&'static str, Token)>,
+        raw: &UdpSocket,
+        kind: u8,
+        session: u32,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no datagram of kind {kind}");
+            poll(server, events);
+            while let Some(d) = raw_recv(raw) {
+                if d[2] & 0x0f == kind && session_at(&d, 3) == session {
+                    return d;
+                }
+            }
+            thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    let addr = free_addr();
+    let mut server = Network::default();
+    let server_group =
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
+    server.listen(server_group, addr).unwrap();
+    let raw = raw_peer();
+    let (first, second) = (1u32, 2u32);
+    let mut events = Vec::new();
+
+    raw.send_to(&conn_datagram(HELLO, &[&first.to_le_bytes()]), addr).unwrap();
+    let acceptor = session_at(&await_raw(&mut server, &mut events, &raw, HELLO_ACK, first), 7);
+    raw.send_to(&conn_datagram(ACK, &[&acceptor.to_le_bytes(), &0u64.to_le_bytes()]), addr)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while events.is_empty() {
+        assert!(Instant::now() < deadline, "accept");
+        poll(&mut server, &mut events);
+        thread::sleep(Duration::from_micros(50));
+    }
+    let ("accept", token) = events[0] else { panic!("{events:?}") };
+
+    raw.send_to(&conn_datagram(HELLO, &[&second.to_le_bytes()]), addr).unwrap();
+    await_raw(&mut server, &mut events, &raw, HELLO_ACK, second);
+    for _ in 0..5 {
+        poll(&mut server, &mut events);
+    }
+    assert_eq!(events, [("accept", token)]);
+
+    assert!(server.send_with(token, |b| b.extend_from_slice(b"still-up")));
+    let packet = await_raw(&mut server, &mut events, &raw, PACKET, first);
+    assert!(packet.ends_with(b"still-up"));
+    let len = 8u32.to_le_bytes();
+    let packet = conn_datagram(PACKET, &[
+        &acceptor.to_le_bytes(),
+        &0u64.to_le_bytes(),
+        &0u64.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &len,
+        b"still-up",
+    ]);
+    raw.send_to(&packet, addr).unwrap();
+    while events.len() < 2 {
+        assert!(Instant::now() < deadline, "message");
+        poll(&mut server, &mut events);
+        thread::sleep(Duration::from_micros(50));
+    }
+    assert_eq!(events, [("accept", token), ("message", token)]);
+}
+
 /// Batched sends queue every item before one flush and lose none.
 #[test]
 fn udp_batched_sends_deliver_every_item() {
