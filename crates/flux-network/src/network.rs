@@ -458,10 +458,12 @@ pub enum GroupConfig {
     Tcp(TcpGroupConfig),
     Udp(UdpGroupConfig),
     UdpV2(UdpGroupConfigV2),
-    /// Sends one stream to every subscriber of its listeners. A subscriber
-    /// that joins is `Accepted`, and one that leaves, times out or falls a
-    /// `send_window` behind is `Disconnected`. It listens and broadcasts, and
-    /// takes no per-token sends.
+    /// Sends one stream to every subscriber of its listeners. A subscriber is
+    /// `Accepted` once its first ack proves it receives at its address, a
+    /// round trip after it joins, and then gets everything from where it
+    /// joined. One that leaves, times out or falls a `send_window` behind is
+    /// `Disconnected`. It listens and broadcasts, and takes no per-token
+    /// sends.
     UdpPublisher(UdpGroupConfigV2),
     /// Subscribes to publishers' streams, joining at their live end.
     /// `connect` subscribes. A joined subscription is `Connected`, and a lost
@@ -522,6 +524,9 @@ impl Tokens {
         self.next += 1;
         self.groups.insert(token, group);
         Some(token)
+    }
+    pub(crate) fn can_allocate(&self) -> bool {
+        self.next < self.range.end
     }
     pub(crate) fn retire(&mut self, token: Token) {
         self.groups.remove(&token);

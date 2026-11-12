@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr};
+use std::{
+    collections::{VecDeque, hash_map::RandomState},
+    hash::BuildHasher,
+    io,
+    net::SocketAddr,
+};
 
 use flux_timing::{Duration, Instant};
 use flux_utils::{DCache, safe_assert};
@@ -18,6 +23,29 @@ use crate::{
         wire::MESSAGE_HEADER,
     },
 };
+
+/// A real subscriber echoes its challenge a round trip after its hello, so
+/// forged hellos evict it only by outnumbering this within that round trip.
+const MAX_PENDING: usize = 1024;
+/// Set in every challenge and never in a ping's timestamp, a clock reading
+/// that takes decades to reach it, so an echoed challenge is never taken for
+/// a send time.
+const CHALLENGE_BIT: u64 = 1 << 63;
+
+/// A subscriber whose address is unproven. It holds the stream from `join`
+/// but gets none of it, nor a token, until an ack echoes `challenge`.
+struct Pending {
+    listener: Token,
+    addr: SocketAddr,
+    session: u32,
+    join: u64,
+    challenge: u64,
+    sent_at: Instant,
+    /// Expiry counts from here, so hello retries cannot keep it alive.
+    created: Instant,
+    /// Its on-connect message, delivered once it is `Accepted`.
+    msg: Vec<u8>,
+}
 
 struct Recipient {
     addr: SocketAddr,
@@ -57,6 +85,16 @@ impl Recipient {
     fn drained(&self) -> bool {
         self.close_at.is_some_and(|end| self.base() >= end)
     }
+
+    fn sample_ping_rtt(&mut self, sent_at: Instant, now: Instant, telemetry: &mut Telemetry) {
+        self.out.sample_rtt(now.saturating_sub(sent_at));
+        telemetry.rtt(&UdpRtt {
+            peer: PeerId::new(self.token, self.addr),
+            sent_at,
+            received_at: now,
+            ping: true,
+        });
+    }
 }
 
 struct Staged {
@@ -70,6 +108,10 @@ pub(super) struct PublisherState {
     listeners: Vec<Socket>,
     stream: Stream,
     recipients: Vec<Recipient>,
+    /// Oldest first.
+    pending: VecDeque<Pending>,
+    challenge_key: RandomState,
+    challenges: u64,
     /// A late hello retry from a dropped subscriber gets a reset instead of
     /// rejoining.
     dropped: Vec<(SocketAddr, u32, Instant)>,
@@ -103,6 +145,9 @@ impl PublisherState {
             group,
             listeners: Vec::new(),
             recipients: Vec::new(),
+            pending: VecDeque::new(),
+            challenge_key: RandomState::new(),
+            challenges: 0,
             dropped: Vec::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
             staged: Vec::new(),
@@ -149,10 +194,24 @@ impl PublisherState {
     }
 
     fn release(&mut self) {
-        let base =
-            self.recipients.iter().map(Recipient::base).min().unwrap_or_else(|| self.stream.next());
+        let base = self
+            .recipients
+            .iter()
+            .map(Recipient::base)
+            .chain(self.pending.iter().map(|p| p.join))
+            .min()
+            .unwrap_or_else(|| self.stream.next());
         if base > self.stream.base() {
             self.stream.release_to(base);
+        }
+    }
+
+    /// Dropping a pending subscriber is silent: it was never `Accepted`.
+    fn retain_pending(&mut self, keep: impl FnMut(&Pending) -> bool) {
+        let len = self.pending.len();
+        self.pending.retain(keep);
+        if self.pending.len() != len {
+            self.release();
         }
     }
 
@@ -193,6 +252,7 @@ impl PublisherState {
             return true;
         }
         let Some(k) = self.listeners.iter().position(|s| s.token == token) else { return false };
+        self.retain_pending(|p| p.listener != token);
         let mut i = self.recipients.len();
         while i != 0 {
             i -= 1;
@@ -238,7 +298,7 @@ impl PublisherState {
     }
 
     fn can_publish(&self) -> bool {
-        self.recipients.iter().any(|r| !r.is_draining())
+        self.recipients.iter().any(|r| !r.is_draining()) || !self.pending.is_empty()
     }
 
     fn append_record<F>(&mut self, serialise: F) -> bool
@@ -283,9 +343,12 @@ impl PublisherState {
                 self.drop_recipient(i);
             }
         }
+        if !self.pending.is_empty() {
+            self.retain_pending(|p| p.join >= min_base);
+        }
         let recipients = self.recipients.iter().filter(|r| !r.is_draining()).count();
         // Also, enqueued with no one holding it, it would never be released.
-        if recipients == 0 {
+        if recipients == 0 && self.pending.is_empty() {
             self.send_buffer.clear();
             return 0;
         }
@@ -387,6 +450,9 @@ impl PublisherState {
         if !self.recipients.is_sorted_by_key(Recipient::tier) {
             self.recipients.sort_by_key(Recipient::tier);
         }
+        if !self.pending.is_empty() {
+            self.tick_pending(now);
+        }
         self.ping(now);
         for k in 0..self.listeners.len() {
             self.pump(registry, k, now, true);
@@ -409,6 +475,26 @@ impl PublisherState {
         }
     }
 
+    /// Resends each challenge at the ping interval: the subscriber stops
+    /// sending hellos once the hello ack arrives, so a lost challenge or echo
+    /// is only recovered from here.
+    fn tick_pending(&mut self, now: Instant) {
+        let peer_timeout = self.config.peer_timeout;
+        self.retain_pending(|p| now.saturating_sub(p.created) < peer_timeout);
+        let heartbeat = self.config.udp.heartbeat_interval;
+        let session = self.stream.session();
+        for p in &mut self.pending {
+            if now.saturating_sub(p.sent_at) < heartbeat {
+                continue;
+            }
+            let Some(listener) = self.listeners.iter().find(|l| l.token == p.listener) else {
+                continue;
+            };
+            p.sent_at = now;
+            send_datagram(&listener.udp, p.addr, &wire::ping(session, p.challenge));
+        }
+    }
+
     fn send_reset(&self, k: usize, to: SocketAddr, subscriber: u32) {
         let mut buf = [0; RESET_SIZE];
         wire::reset(&mut buf, subscriber);
@@ -428,29 +514,42 @@ impl PublisherState {
     ) where
         F: for<'a> FnMut(Event<RxPayload<'a>>),
     {
-        let group = self.group;
         let Some(datagram) = wire::decode(bytes) else { return };
         let listener = self.listeners[k].token;
         let index = self.recipients.iter().position(|r| r.listener == listener && r.addr == from);
         match datagram {
             Datagram::Ack { publisher, subscriber, ack_next, echo_ts, bitmap } => {
-                let Some(i) = index.filter(|&i| {
+                let verified = index.filter(|&i| {
                     publisher == self.stream.session() && self.recipients[i].session == subscriber
-                }) else {
-                    self.send_reset(k, from, subscriber);
-                    return;
+                });
+                let i = if let Some(i) = verified {
+                    i
+                } else {
+                    let session = self.stream.session();
+                    let Some(j) = self.pending.iter().position(|p| {
+                        p.listener == listener &&
+                            p.addr == from &&
+                            p.session == subscriber &&
+                            p.challenge == echo_ts &&
+                            publisher == session
+                    }) else {
+                        // A pending subscriber acks before its challenge
+                        // arrives, and a reset would make it start over.
+                        if !self.pending.iter().any(|p| p.listener == listener && p.addr == from) {
+                            self.send_reset(k, from, subscriber);
+                        }
+                        return;
+                    };
+                    let Some(i) = self.promote(j, now, tokens, dcache, deliver) else {
+                        self.send_reset(k, from, subscriber);
+                        return;
+                    };
+                    i
                 };
                 let recipient = &mut self.recipients[i];
                 recipient.last_recv = now;
-                if echo_ts != 0 {
-                    let sent_at = Instant(echo_ts);
-                    recipient.out.sample_rtt(now.saturating_sub(sent_at));
-                    self.telemetry.rtt(&UdpRtt {
-                        peer: PeerId::new(recipient.token, recipient.addr),
-                        sent_at,
-                        received_at: now,
-                        ping: true,
-                    });
+                if (1..CHALLENGE_BIT).contains(&echo_ts) {
+                    recipient.sample_ping_rtt(Instant(echo_ts), now, &mut self.telemetry);
                 }
                 let held_oldest = recipient.base() == self.stream.base();
                 recipient.out.on_ack(ack_next, bitmap, now, &mut self.telemetry);
@@ -481,41 +580,132 @@ impl PublisherState {
                     self.send_hello_ack(k, from, subscriber, join);
                     return;
                 }
-                // Any sender can open sessions, so running out refuses one
-                // instead of panicking.
-                let Some(token) = tokens.try_allocate(group) else {
-                    warn!(addr = %from, "network token range exhausted, subscriber refused");
-                    return;
-                };
-                if let Some(i) = index {
-                    let old = self.recipients[i].token;
-                    self.remove_recipient(i);
-                    deliver(Event::Disconnected { group, token: old, peer_addr: from });
-                }
-                // The open packet may already be on its way to others.
-                self.stream.seal();
-                let join = self.stream.next();
-                self.recipients.push(Recipient {
-                    addr: from,
-                    token,
-                    listener,
-                    session: subscriber,
-                    join,
-                    last_recv: now,
-                    last_ping: now,
-                    close_at: None,
-                    out: Outbound::new(from, join, &self.config.udp, PeerId::new(token, from)),
-                });
-                self.send_hello_ack(k, from, subscriber, join);
-                info!(addr = %from, "udp subscriber joined");
-                deliver(Event::Accepted { group, token, peer_addr: from });
-                deliver_on_connect(group, token, msg, dcache, deliver);
+                self.on_hello(k, from, subscriber, msg, now, tokens);
             }
             Datagram::Packet(_) |
             Datagram::HelloAck { .. } |
             Datagram::Reset { .. } |
             Datagram::Ping { .. } => {}
         }
+    }
+
+    /// A hello from an address not yet proven to receive: it is answered with
+    /// the hello ack and a challenge ping, whose echo `promote`s it.
+    fn on_hello(
+        &mut self,
+        k: usize,
+        from: SocketAddr,
+        subscriber: u32,
+        msg: &[u8],
+        now: Instant,
+        tokens: &Tokens,
+    ) {
+        let listener = self.listeners[k].token;
+        if let Some(p) = self
+            .pending
+            .iter_mut()
+            .find(|p| p.listener == listener && p.addr == from && p.session == subscriber)
+        {
+            p.sent_at = now;
+            let (join, challenge) = (p.join, p.challenge);
+            self.send_challenge(k, from, subscriber, join, challenge);
+            return;
+        }
+        // Any sender can open sessions, so running out refuses one instead
+        // of panicking. Refused now, before the hello ack tells it it joined.
+        if !tokens.can_allocate() {
+            warn!(addr = %from, "network token range exhausted, subscriber refused");
+            return;
+        }
+        let evicted =
+            if self.pending.len() >= MAX_PENDING { self.pending.pop_front() } else { None };
+        let release = evicted.is_some();
+        let mut buf = evicted.map(|p| p.msg).unwrap_or_default();
+        buf.clear();
+        buf.extend_from_slice(msg);
+        // The open packet may already be on its way to others.
+        self.stream.seal();
+        let join = self.stream.next();
+        self.challenges += 1;
+        let challenge = self.challenge_key.hash_one(self.challenges) | CHALLENGE_BIT;
+        self.pending.push_back(Pending {
+            listener,
+            addr: from,
+            session: subscriber,
+            join,
+            challenge,
+            sent_at: now,
+            created: now,
+            msg: buf,
+        });
+        if release {
+            self.release();
+        }
+        self.send_challenge(k, from, subscriber, join, challenge);
+    }
+
+    /// Its address is proven: it joins at the `join` its hello ack named and
+    /// takes over from an older session at that address.
+    fn promote<F>(
+        &mut self,
+        j: usize,
+        now: Instant,
+        tokens: &mut Tokens,
+        dcache: Option<&DCache>,
+        deliver: &mut F,
+    ) -> Option<usize>
+    where
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
+    {
+        let group = self.group;
+        let p = self.pending.remove(j)?;
+        let Some(token) = tokens.try_allocate(group) else {
+            warn!(addr = %p.addr, "network token range exhausted, subscriber refused");
+            self.release();
+            return None;
+        };
+        let mut recipient = Recipient {
+            addr: p.addr,
+            token,
+            listener: p.listener,
+            session: p.session,
+            join: p.join,
+            last_recv: now,
+            last_ping: now,
+            close_at: None,
+            out: Outbound::new(p.addr, p.join, &self.config.udp, PeerId::new(token, p.addr)),
+        };
+        // The echo of a resent challenge may answer any copy of it.
+        if p.sent_at == p.created {
+            recipient.sample_ping_rtt(p.sent_at, now, &mut self.telemetry);
+        }
+        let old = self.recipients.iter().position(|r| r.listener == p.listener && r.addr == p.addr);
+        // Pushed before the old one goes, so the release that follows keeps
+        // the stream from `join`.
+        self.recipients.push(recipient);
+        let mut i = self.recipients.len() - 1;
+        if let Some(old) = old {
+            let old_token = self.recipients[old].token;
+            self.remove_recipient(old);
+            i = old;
+            deliver(Event::Disconnected { group, token: old_token, peer_addr: p.addr });
+        }
+        info!(addr = %p.addr, "udp subscriber joined");
+        deliver(Event::Accepted { group, token, peer_addr: p.addr });
+        deliver_on_connect(group, token, &p.msg, dcache, deliver);
+        Some(i)
+    }
+
+    fn send_challenge(
+        &mut self,
+        k: usize,
+        to: SocketAddr,
+        subscriber: u32,
+        join: u64,
+        challenge: u64,
+    ) {
+        self.send_hello_ack(k, to, subscriber, join);
+        send_datagram(&self.listeners[k].udp, to, &wire::ping(self.stream.session(), challenge));
     }
 
     fn send_hello_ack(&mut self, k: usize, to: SocketAddr, subscriber: u32, join: u64) {
