@@ -1768,8 +1768,11 @@ impl HttpNetwork {
             let Some(chunk_end) = at.checked_add(size).and_then(|at| at.checked_add(2)) else {
                 return Err(())
             };
-            if bytes.len() < chunk_end || &bytes[at + size..chunk_end] != b"\r\n" {
+            if bytes.len() < chunk_end {
                 return Ok(None)
+            }
+            if &bytes[at + size..chunk_end] != b"\r\n" {
+                return Err(())
             }
             body_len += size;
             at = chunk_end;
