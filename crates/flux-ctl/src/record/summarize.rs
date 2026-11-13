@@ -21,6 +21,7 @@ use tracing::warn;
 use super::{
     Kind, QueueTotals, REPORT_FORMAT, STEMS, TOTALS, TOTALS_FORMAT, Totals, table::is_file_of,
 };
+use crate::printable;
 
 /// Nearest-rank percentiles of a set of nanosecond values (`p99_ns` is the
 /// `ceil(0.99 * n)`-th smallest), to 3 significant figures: each, `max_ns`
@@ -272,7 +273,10 @@ fn each_row_group(
     for path in files {
         let mut file = File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if !has_footer(&mut file)? {
-            warn!(file = %path.display(), "no footer, so not read: the recording was killed");
+            warn!(
+                file = %printable(&path.to_string_lossy()),
+                "no footer, so not read: the recording was killed"
+            );
             unfinished.push(path.file_name().unwrap_or_default().to_string_lossy().into_owned());
             continue;
         }
