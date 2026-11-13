@@ -123,7 +123,7 @@ impl<'a> Flink<'a> {
     /// Locks the flink's directory. flock locks belong to the open file
     /// description, so threads of one process exclude each other as well as
     /// other processes. Dropping the file, or dying, releases the lock.
-    fn lock(self) -> io::Result<File> {
+    pub(crate) fn lock(self) -> io::Result<File> {
         let dir = File::open(self.dir())?;
         loop {
             if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } == 0 {

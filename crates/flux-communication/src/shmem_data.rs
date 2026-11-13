@@ -11,6 +11,8 @@ use flux_utils::{
 };
 use shared_memory::{Shmem, ShmemError};
 
+use crate::queue::Flink;
+
 #[repr(C)]
 pub struct ShmemData<T> {
     inner: NonNull<T>,
@@ -32,7 +34,6 @@ impl<T> ShmemData<T> {
         app_name: A,
         init_f: impl FnOnce() -> T,
     ) -> Result<Self, ShmemError> {
-        use shared_memory::{ShmemConf, ShmemError};
         let type_name = short_typename::<T>();
         let shmem_file = shmem_dir_data_with_base(&dir, &app_name).join(type_name.as_str());
         std::fs::create_dir_all(
@@ -42,7 +43,19 @@ impl<T> ShmemData<T> {
         )
         .unwrap_or_else(|_| panic!("couldn't create shmem dir for {}", shmem_file.display()));
 
-        match ShmemConf::new().size(std::mem::size_of::<T>()).flink(&shmem_file).create() {
+        // Held across open, replace, create and init, so concurrent attachers end up on
+        // one segment. A second flock on the directory blocks even in this process, so
+        // the retries must not take it again.
+        let _lock = Flink(&shmem_file).lock().map_err(ShmemError::LinkOpenFailed)?;
+        Self::open_or_init_locked(&shmem_file, init_f)
+    }
+
+    fn open_or_init_locked(
+        shmem_file: &Path,
+        init_f: impl FnOnce() -> T,
+    ) -> Result<Self, ShmemError> {
+        use shared_memory::ShmemConf;
+        match ShmemConf::new().size(std::mem::size_of::<T>()).flink(shmem_file).create() {
             Ok(shmem) => {
                 let inner = Self::shmem_ptr(shmem);
 
@@ -52,15 +65,34 @@ impl<T> ShmemData<T> {
                 Ok(Self { inner })
             }
             Err(ShmemError::LinkExists) => {
-                let Ok(shmem) = ShmemConf::new().flink(&shmem_file).open().inspect_err(|e| {
+                let Ok(mut shmem) = ShmemConf::new().flink(shmem_file).open().inspect_err(|e| {
                     tracing::warn!(
                         "couldn't open shmem file {}, removing and retrying: {e}",
                         shmem_file.display()
                     );
                 }) else {
-                    let _ = std::fs::remove_file(&shmem_file);
-                    return Self::open_or_init_with_base_dir(dir, app_name, init_f);
+                    let _ = std::fs::remove_file(shmem_file);
+                    return Self::open_or_init_locked(shmem_file, init_f);
                 };
+
+                // `<`: some platforms round segment sizes up to a page.
+                if shmem.len() < std::mem::size_of::<T>() {
+                    tracing::warn!(
+                        "shmem file {} maps {} bytes, {} needs {}, removing and recreating",
+                        shmem_file.display(),
+                        shmem.len(),
+                        std::any::type_name::<T>(),
+                        std::mem::size_of::<T>()
+                    );
+                    // Dropping an owned mapping unlinks the segment and its link file.
+                    shmem.set_owner(true);
+                    drop(shmem);
+                    // A link that could not be removed would make the retry loop forever.
+                    if shmem_file.exists() {
+                        return Err(ShmemError::LinkExists);
+                    }
+                    return Self::open_or_init_locked(shmem_file, init_f);
+                }
 
                 let inner = Self::shmem_ptr(shmem);
 
@@ -126,5 +158,59 @@ impl<T> DerefMut for ShmemData<T> {
 impl<T> AsRef<T> for ShmemData<T> {
     fn as_ref(&self) -> &T {
         unsafe { self.inner.as_ref() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShmemData;
+
+    mod small {
+        pub struct Blob(pub u64);
+    }
+    mod large {
+        // Larger than a 16 KiB page: macOS reports shm sizes rounded up to a page.
+        pub struct Blob(pub [u64; 2048], pub u64);
+    }
+
+    #[test]
+    fn reopening_as_a_larger_type_replaces_the_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let small =
+            ShmemData::open_or_init_with_base_dir(dir.path(), "app", || small::Blob(1)).unwrap();
+        assert_eq!(small.0, 1);
+        let large =
+            ShmemData::open_or_init_with_base_dir(dir.path(), "app", || large::Blob([7; 2048], 7))
+                .unwrap();
+        assert_eq!(large.0, [7; 2048]);
+        assert_eq!(large.1, 7);
+        crate::cleanup_shmem(dir.path());
+    }
+
+    #[test]
+    fn concurrent_replacements_attach_to_one_segment() {
+        const THREADS: usize = 8;
+        for _ in 0..200 {
+            let dir = tempfile::tempdir().unwrap();
+            ShmemData::open_or_init_with_base_dir(dir.path(), "app", || small::Blob(1)).unwrap();
+            let start = std::sync::Barrier::new(THREADS);
+            let mut attached: Vec<ShmemData<large::Blob>> = std::thread::scope(|s| {
+                let threads: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            start.wait();
+                            ShmemData::open_or_init_with_base_dir(dir.path(), "app", || {
+                                large::Blob([7; 2048], 7)
+                            })
+                            .unwrap()
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            attached[0].0[0] = 9;
+            assert!(attached.iter().all(|a| a.0[0] == 9));
+            crate::cleanup_shmem(dir.path());
+        }
     }
 }
