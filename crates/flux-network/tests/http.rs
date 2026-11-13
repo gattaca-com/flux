@@ -791,6 +791,65 @@ fn pending_buffer_cap_disconnects() {
 }
 
 #[test]
+fn chunked_requests_when_enabled() {
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut server = HttpNetwork::default().with_max_body_bytes(8).with_chunked_requests();
+    server.listen(&mut net, addr).unwrap();
+    // Split mid-chunk after a whole one, with a plain request pipelined behind.
+    let parts: [&[u8]; 2] = [
+        b"POST /one HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n\x00\n\xff\r\n2;ext=1\r\na",
+        b"b\r\n0\r\nTrailer: t\r\n\r\nPOST /two HTTP/1.1\r\nContent-Length: 3\r\n\r\ntwo",
+    ];
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let (mut replies, mut sent) = (Vec::new(), 0);
+    // The second part follows once the first has been read and scanned.
+    for polls in 0.. {
+        if Instant::now() >= deadline || replies.len() == 2 {
+            break
+        }
+        if sent < parts.len() && polls >= sent * 20 {
+            client.write_all(parts[sent]).unwrap();
+            sent += 1;
+        }
+        let mut pending = Vec::new();
+        poll(&mut net, &mut server, |event| {
+            if let HttpEvent::Request { token, request } = event {
+                pending.push((token, request.path.to_owned(), request.body.to_vec()));
+            }
+        });
+        for (token, path, body) in pending {
+            assert!(server.respond(&mut net, token, 200, &[], &body));
+            replies.push((path, body));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(replies, [
+        ("/one".to_owned(), b"\x00\n\xffab".to_vec()),
+        ("/two".to_owned(), b"two".to_vec())
+    ]);
+
+    for (request, status) in [
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabXX".as_slice(), 400),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n".as_slice(), 413),
+        (b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n".as_slice(), 501),
+    ] {
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(request).unwrap();
+        let mut received = Vec::new();
+        while Instant::now() < deadline && !read_available(&mut client, &mut received) {
+            poll(&mut net, &mut server, |_| {});
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(std::str::from_utf8(&received).unwrap().starts_with(&format!("HTTP/1.1 {status}")));
+    }
+}
+
+#[test]
 fn pipelined_binary_bodies() {
     let (mut net, mut server, addr) = server();
     let first = b"\x00\n\xffone";

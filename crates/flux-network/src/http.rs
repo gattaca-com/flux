@@ -32,8 +32,9 @@
 //!
 //! # Limitations
 //! HTTP/1.1 and HTTP/1.0 responses are supported. Request bodies require
-//! `Content-Length`; chunked requests are rejected with `501`. Response bodies
-//! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
+//! `Content-Length`; chunked requests are rejected with `501` unless
+//! [`HttpNetwork::with_chunked_requests`] is set. Response bodies may use
+//! `Content-Length`, chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
 //! With [`HttpNetwork::with_http2`], accepted connections that open with the
@@ -215,6 +216,9 @@ struct Conn {
     stream: Option<Stream>,
     /// Set once an accepted connection opens with the HTTP/2 preface.
     http2: Option<Box<Http2Conn>>,
+    /// Where scanning the incomplete chunked request body resumes, and the
+    /// body length up to there.
+    chunk_scan: (usize, usize),
 }
 
 /// A streaming request; `body` is set once its head has been delivered.
@@ -241,7 +245,9 @@ pub struct HttpNetwork {
     name: &'static str,
     max_head_bytes: usize,
     max_body_bytes: usize,
+    max_send_backlog_bytes: Option<usize>,
     max_headers: usize,
+    chunked_requests: bool,
     idle_timeout: Option<Duration>,
     socket_buf_size: Option<usize>,
     listeners: Vec<Token>,
@@ -258,7 +264,7 @@ pub struct HttpNetwork {
     shutting_down: bool,
     failed: Vec<(RequestId, Failure)>,
     spare_heads: Vec<Vec<u8>>,
-    /// Decoded body of the chunked response being delivered.
+    /// Decoded body of the chunked message being delivered.
     chunked_body: Vec<u8>,
     http2: Option<Http2Config>,
     /// Fields of the last HTTP/2 response, reused while callers send the same
@@ -273,7 +279,9 @@ impl Default for HttpNetwork {
             name: "http",
             max_head_bytes: 16 * 1024,
             max_body_bytes: 1024 * 1024,
+            max_send_backlog_bytes: None,
             max_headers: 64,
+            chunked_requests: false,
             idle_timeout: Some(Duration::from_secs(30)),
             socket_buf_size: None,
             listeners: Vec::new(),
@@ -313,6 +321,20 @@ impl HttpNetwork {
     pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.max_body_bytes = max_body_bytes;
+        self
+    }
+    /// Sets the unsent bytes past which a connection is dropped; at least
+    /// 64 KiB with [`Self::with_http2`].
+    pub fn with_max_send_backlog_bytes(mut self, max_send_backlog_bytes: usize) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.max_send_backlog_bytes = Some(max_send_backlog_bytes);
+        self
+    }
+    /// Accepts chunked request bodies, delivered decoded. Chunk framing counts
+    /// toward the buffer limit.
+    pub fn with_chunked_requests(mut self) -> Self {
+        assert!(self.group.is_none(), "configure before listen or connect");
+        self.chunked_requests = true;
         self
     }
     /// Sets the maximum number of request headers accepted.
@@ -400,11 +422,18 @@ impl HttpNetwork {
             name,
             max_head_bytes,
             max_body_bytes,
+            max_send_backlog_bytes,
             socket_buf_size,
             reconnect_interval,
+            http2,
             ..
         } = self;
         *group.get_or_insert_with(|| {
+            // HTTP/2 queues up to half the margin unsent before pacing.
+            assert!(
+                http2.is_none() || max_send_backlog_bytes.is_none_or(|max| max >= TLS_MARGIN_BYTES),
+                "HTTP/2 needs a send backlog of at least {TLS_MARGIN_BYTES} bytes"
+            );
             let defaults = TcpGroupConfig::default();
             net.add_group(TcpGroupConfig {
                 name,
@@ -417,9 +446,9 @@ impl HttpNetwork {
                 // TLS endpoint: a record adds a header and a tag per 16KB.
                 // The margin keeps a full-size request from tripping the cap
                 // on its own overhead.
-                max_backlog_bytes: Some(
+                max_backlog_bytes: Some(max_send_backlog_bytes.unwrap_or(
                     max_head_bytes.saturating_add(*max_body_bytes).saturating_add(TLS_MARGIN_BYTES),
-                ),
+                )),
                 backlog_warn_bytes: None,
                 ..Default::default()
             })
@@ -556,6 +585,7 @@ impl HttpNetwork {
                     },
                     stream: None,
                     http2: None,
+                    chunk_scan: (0, 0),
                 });
                 self.lifecycle.push(Lifecycle::Connected(token, Some(peer_addr)));
             }
@@ -801,6 +831,7 @@ impl HttpNetwork {
             role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
             stream: None,
             http2: None,
+            chunk_scan: (0, 0),
         });
         token
     }
@@ -869,6 +900,17 @@ impl HttpNetwork {
             next_seq: 0,
         });
         pool
+    }
+    /// Like [`Self::close`] but keeps the group, so the network can listen and
+    /// connect again. Earlier pools and request ids are invalid.
+    pub fn clear(&mut self, net: &mut NetworkCore) {
+        for token in self.listeners.drain(..).chain(self.conns.drain(..).map(|conn| conn.token)) {
+            net.remove(token);
+        }
+        self.pools.clear();
+        self.lifecycle.clear();
+        self.failed.clear();
+        self.shutting_down = false;
     }
     /// Removes every listener, connection and outbound endpoint; pending
     /// requests and responses are dropped without events.
@@ -1132,6 +1174,7 @@ impl HttpNetwork {
     fn buffer_limit(&self) -> usize {
         self.max_head_bytes.saturating_add(self.max_body_bytes)
     }
+    #[allow(clippy::too_many_lines)]
     fn parse_and_emit<F>(&mut self, net: &mut NetworkCore, i: usize, handler: &mut F)
     where
         F: for<'a> FnMut(HttpEvent<'a>),
@@ -1180,7 +1223,8 @@ impl HttpNetwork {
             self.error(net, i, 400);
             return
         };
-        if req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("transfer-encoding")) {
+        let chunked = req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+        if chunked && !self.chunked_requests {
             self.error(net, i, 501);
             return
         }
@@ -1188,10 +1232,22 @@ impl HttpNetwork {
             self.error(net, i, 413);
             return
         }
-        let Some(end) = head.checked_add(len) else {
+        let Some(mut end) = head.checked_add(len) else {
             self.error(net, i, 413);
             return
         };
+        let mut scan = self.conns[i].chunk_scan;
+        if chunked {
+            let limits = (self.max_body_bytes, self.max_headers, self.max_head_bytes);
+            let body = &mut self.chunked_body;
+            match Self::decode_chunked_request(&req, buf, head, &mut scan, limits, body) {
+                Ok(chunked_end) => end = chunked_end.unwrap_or(usize::MAX),
+                Err(status) => {
+                    self.error(net, i, status);
+                    return
+                }
+            }
+        }
         if buf.len() < end {
             if over_limit {
                 self.error(net, i, 413);
@@ -1206,6 +1262,8 @@ impl HttpNetwork {
                     self.conns[i].role.set_accepted_continued(true);
                 }
             }
+            // A chunked body is scanned again from `scan` once more bytes arrive.
+            self.conns[i].chunk_scan = scan;
             return
         }
         let close = req.version == Some(0) && !has_token(req.headers, "connection", b"keep-alive") ||
@@ -1217,10 +1275,11 @@ impl HttpNetwork {
             path: req.path.unwrap_or(""),
             version: req.version.unwrap_or(1),
             headers: req.headers,
-            body: &buf[head..end],
+            body: if chunked { &self.chunked_body } else { &buf[head..end] },
             stream: 0,
         };
         handler(HttpEvent::Request { token, request });
+        self.conns[i].chunk_scan = (0, 0);
         self.conns[i].buf.drain(..end);
         self.conns[i].dirty = !self.conns[i].buf.is_empty();
         self.conns[i].role.set_accepted_state(State::Pending);
@@ -1603,13 +1662,13 @@ impl HttpNetwork {
                 match Self::decode_chunked(
                     b,
                     head,
-                    self.max_body_bytes,
-                    self.max_headers,
+                    &mut (0, 0),
+                    (self.max_body_bytes, self.max_headers, usize::MAX),
                     &mut self.chunked_body,
                 ) {
                     Ok(Some(consumed)) => (consumed, true),
                     Ok(None) => return,
-                    Err(()) => {
+                    Err(_) => {
                         self.fail_outbound(net, i);
                         return
                     }
@@ -1701,16 +1760,20 @@ impl HttpNetwork {
         true
     }
     /// Decodes the complete chunked body starting at `start` into `body`,
-    /// returning the offset just past it.
+    /// returning the offset just past it. `scan` is where the last call's
+    /// scan stopped. `Err` is the refusing status: 413 past the body limit,
+    /// 400 for bad framing.
     fn decode_chunked(
         bytes: &[u8],
         start: usize,
-        max_body_bytes: usize,
-        max_headers: usize,
+        scan: &mut (usize, usize),
+        (max_body_bytes, max_headers, max_line): (usize, usize, usize),
         body: &mut Vec<u8>,
-    ) -> Result<Option<usize>, ()> {
+    ) -> Result<Option<usize>, u16> {
         let bytes = &bytes[start..];
-        let Some((end, body_len)) = Self::chunked_end(bytes, max_body_bytes, max_headers)? else {
+        let Some((end, body_len)) =
+            Self::chunked_end(bytes, scan, max_body_bytes, max_headers, max_line)?
+        else {
             return Ok(None)
         };
         body.clear();
@@ -1718,64 +1781,86 @@ impl HttpNetwork {
         let mut at = 0;
         while at < end {
             let httparse::Status::Complete((consumed, size)) =
-                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
+                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| 400u16)?
             else {
-                return Err(())
+                return Err(400)
             };
-            at = at.checked_add(consumed).ok_or(())?;
-            let size = usize::try_from(size).map_err(|_| ())?;
+            at = at.checked_add(consumed).ok_or(400u16)?;
+            let size = usize::try_from(size).map_err(|_| 400u16)?;
             if size == 0 {
-                return start.checked_add(end).map(Some).ok_or(())
+                return start.checked_add(end).map(Some).ok_or(400)
             }
             body.extend_from_slice(&bytes[at..at + size]);
-            at = at.checked_add(size + 2).ok_or(())?;
+            at = at.checked_add(size + 2).ok_or(400u16)?;
         }
-        Err(())
+        Err(400)
+    }
+    /// [`Self::decode_chunked`] for a request; `Err` is the refusing status.
+    fn decode_chunked_request(
+        req: &httparse::Request<'_, '_>,
+        bytes: &[u8],
+        head: usize,
+        scan: &mut (usize, usize),
+        limits: (usize, usize, usize),
+        body: &mut Vec<u8>,
+    ) -> Result<Option<usize>, u16> {
+        if transfer_chunked(req.headers) != Some(true) {
+            return Err(501)
+        }
+        // HTTP/1.0 has no transfer codings, and a length beside one is ambiguous.
+        if req.version == Some(0) ||
+            req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("content-length"))
+        {
+            return Err(400)
+        }
+        Self::decode_chunked(bytes, head, scan, limits, body)
     }
     fn chunked_end(
         bytes: &[u8],
+        scan: &mut (usize, usize),
         max_body_bytes: usize,
         max_headers: usize,
-    ) -> Result<Option<(usize, usize)>, ()> {
-        let mut at = 0;
-        let mut body_len = 0;
+        max_line: usize,
+    ) -> Result<Option<(usize, usize)>, u16> {
+        let (mut at, mut body_len) = *scan;
         loop {
             let httparse::Status::Complete((consumed, size)) =
-                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| ())?
+                httparse::parse_chunk_size(&bytes[at..]).map_err(|_| 400u16)?
             else {
-                return Ok(None)
+                return if bytes.len() - at > max_line { Err(400) } else { Ok(None) }
             };
-            let size = usize::try_from(size).map_err(|_| ())?;
+            let size = usize::try_from(size).map_err(|_| 400u16)?;
             if size > max_body_bytes.saturating_sub(body_len) {
-                return Err(())
+                return Err(413)
             }
-            at = at.checked_add(consumed).ok_or(())?;
+            at = at.checked_add(consumed).ok_or(400u16)?;
             if size == 0 {
                 let (mut stack_slots, mut heap_slots) =
                     ([httparse::EMPTY_HEADER; STACK_HEADERS], Vec::new());
                 let headers = header_slots(&mut stack_slots, &mut heap_slots, max_headers);
                 let httparse::Status::Complete((consumed, _)) =
-                    httparse::parse_headers(&bytes[at..], headers).map_err(|_| ())?
+                    httparse::parse_headers(&bytes[at..], headers).map_err(|_| 400u16)?
                 else {
-                    return Ok(None)
+                    return if bytes.len() - at > max_line { Err(400) } else { Ok(None) }
                 };
-                let end = at.checked_add(consumed).ok_or(())?;
+                let end = at.checked_add(consumed).ok_or(400u16)?;
                 if !crlf_only(&bytes[at..end]) {
-                    return Err(())
+                    return Err(400)
                 }
                 return Ok(Some((end, body_len)))
             }
             let Some(chunk_end) = at.checked_add(size).and_then(|at| at.checked_add(2)) else {
-                return Err(())
+                return Err(400)
             };
             if bytes.len() < chunk_end {
                 return Ok(None)
             }
             if &bytes[at + size..chunk_end] != b"\r\n" {
-                return Err(())
+                return Err(400)
             }
             body_len += size;
             at = chunk_end;
+            *scan = (at, body_len);
         }
     }
 }
@@ -1797,7 +1882,7 @@ fn request_content_length(headers: &[httparse::Header<'_>]) -> Option<usize> {
     }
     Some(length.unwrap_or(0))
 }
-fn has_token(headers: &[httparse::Header<'_>], name: &str, value: &[u8]) -> bool {
+pub(crate) fn has_token(headers: &[httparse::Header<'_>], name: &str, value: &[u8]) -> bool {
     headers
         .iter()
         .filter(|h| h.name.eq_ignore_ascii_case(name))
@@ -1806,11 +1891,11 @@ fn has_token(headers: &[httparse::Header<'_>], name: &str, value: &[u8]) -> bool
 fn has_value_token(value: &[u8], wanted: &[u8]) -> bool {
     value.split(|b| *b == b',').any(|part| part.trim_ascii().eq_ignore_ascii_case(wanted))
 }
-fn valid_token(value: &str) -> bool {
+pub(crate) fn valid_token(value: &str) -> bool {
     !value.is_empty() &&
         value.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
-fn valid_response(status: u16, headers: &[(&str, &str)]) -> bool {
+pub(crate) fn valid_response(status: u16, headers: &[(&str, &str)]) -> bool {
     (200..=599).contains(&status) &&
         headers.iter().all(|(n, v)| {
             valid_token(n) &&
@@ -1862,7 +1947,7 @@ fn set_fields(fields: &mut HeaderMap, headers: &[(&str, &str)]) -> bool {
     }
     true
 }
-fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
+pub(crate) fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
     valid_token(method) &&
         !path.is_empty() &&
         !path.contains(['\r', '\n', ' ']) &&
