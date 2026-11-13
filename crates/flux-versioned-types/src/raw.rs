@@ -30,6 +30,11 @@ pub const ALIGN: usize = 8;
 /// Max leaf alignment (`u128`); the leaf region pads to the header-carried
 /// alignment so 8-aligned types keep byte-identical blobs.
 pub const LEAF_ALIGN_MAX: usize = 16;
+/// The most a conforming zstd frame expands per input byte: a block
+/// regenerates at most 128 KiB, and the smallest block that does is a 4-byte
+/// RLE block (3-byte header plus the repeated byte). Frame headers only lower
+/// the ratio, so no conforming frame regenerates a longer `decompressed_len`.
+const ZSTD_MAX_RATIO: u64 = 128 * 1024 / 4;
 
 // The header is read by native reinterpretation; x86_64 layout is the format.
 const _: () = assert!(cfg!(target_endian = "little") && size_of::<usize>() == 8);
@@ -351,6 +356,12 @@ impl Blob {
             return Err(DecodeError::LengthMismatch {
                 expected: usize::try_from(expected).unwrap_or(usize::MAX),
                 got: usize::try_from(self.header.decompressed_len).unwrap_or(usize::MAX),
+            });
+        }
+        if expected > self.header.compressed_len.saturating_mul(ZSTD_MAX_RATIO) {
+            return Err(DecodeError::TooShort {
+                needed: expected.div_ceil(ZSTD_MAX_RATIO) as usize,
+                got: self.header.compressed_len as usize,
             });
         }
         Ok(Layout {
