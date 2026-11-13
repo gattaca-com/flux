@@ -143,11 +143,14 @@ pub(crate) struct Cursor<'a> {
     data: &'a [u8],
     pub(crate) invalid: Option<&'static str>,
     pub(crate) too_large: bool,
+    /// Bytes that low cardinality keys may still expand into. Every key copies
+    /// a dictionary value, so their size is not bounded by the bytes received.
+    pub(crate) budget: usize,
 }
 
 impl<'a> Cursor<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
-        Self { data, invalid: None, too_large: false }
+        Self { data, invalid: None, too_large: false, budget: usize::MAX }
     }
 
     pub(crate) fn remaining(&self) -> usize {
@@ -527,6 +530,7 @@ impl Type {
             return cursor.fail("low cardinality key count does not match the block")
         }
         let mut cells = Vec::with_capacity(rows);
+        let mut decoded = 0;
         for _ in 0..rows {
             let mut key = 0;
             for (shift, byte) in cursor.bytes(key_width)?.iter().enumerate() {
@@ -535,12 +539,19 @@ impl Type {
             let Some(value) = dictionary.get(key) else {
                 return cursor.fail("low cardinality key outside the dictionary")
             };
-            cells.push(match (nullable, key) {
+            let cell = match (nullable, key) {
                 (true, 0) => vec![1],
                 (true, _) => [&[0][..], value].concat(),
                 (false, _) => value.clone(),
-            });
+            };
+            decoded += cell.len();
+            if decoded > cursor.budget {
+                cursor.too_large = true;
+                return None
+            }
+            cells.push(cell);
         }
+        cursor.budget -= decoded;
         Some(cells)
     }
 
@@ -570,6 +581,7 @@ pub(crate) struct BlockResume {
     row_count: usize,
     column_count: usize,
     consumed: usize,
+    budget: usize,
 }
 
 impl BlockResume {
@@ -597,6 +609,7 @@ impl BlockResume {
             row_count,
             column_count,
             consumed: start - cursor.remaining(),
+            budget: cursor.budget,
         })
     }
 }
@@ -749,6 +762,7 @@ impl Output {
         let state = match resume {
             Some(state) => {
                 cursor.bytes(state.consumed)?;
+                cursor.budget = state.budget;
                 state
             }
             None => resume.insert(BlockResume::read_header(cursor)?),
@@ -769,6 +783,7 @@ impl Output {
             }
             state.columns.push(Column { name, type_name });
             state.consumed += before - cursor.remaining();
+            state.budget = cursor.budget;
         }
         Some(Self {
             columns: std::mem::take(&mut state.columns),
@@ -864,6 +879,26 @@ mod tests {
     }
 
     #[test]
+    fn low_cardinality_expansion_is_bounded_by_the_output_budget() {
+        let (rows, value) = (64, [b'x'; 64]);
+        let width = value.len();
+        let mut data = Vec::new();
+        for word in [LOW_CARDINALITY_VERSION, 0, 1] {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        put_string(&mut data, &value);
+        data.extend_from_slice(&(rows as u64).to_le_bytes());
+        data.resize(data.len() + rows, 0);
+        let mut packet = Vec::new();
+        put_uvarint(&mut packet, crate::SERVER_DATA);
+        put_string(&mut packet, b"");
+        packet.extend_from_slice(&block(1, rows as u64, "LowCardinality(String)", &data));
+        let read = |budget| crate::Packet::read(&packet, false, budget, &mut None);
+        assert!(matches!(read(rows * width), Err(crate::Error::TooLarge)));
+        assert!(matches!(read(rows * (width + 1)), Ok(Some(_))));
+    }
+
+    #[test]
     fn zero_width_fixed_string_is_rejected() {
         let data = (1u64 << 40).to_le_bytes();
         assert_eq!(
@@ -883,7 +918,9 @@ mod tests {
     fn unparseable_named_tuples_fail_promptly() {
         let depth = MAX_TYPE_DEPTH;
         let name = format!("{}x{}", "Tuple(Tuple(a ".repeat(depth), "))".repeat(depth));
+        let started = std::time::Instant::now();
         assert_eq!(Type::parse(&name), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(Type::parse("Tuple(`a(b)` UInt8)").is_some());
     }
 }
