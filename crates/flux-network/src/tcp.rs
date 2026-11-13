@@ -2413,7 +2413,8 @@ impl DirectRx {
                     // never sizes the buffer ahead of its bytes. A frame that
                     // fits never fills it.
                     if *offset == self.words.len() * 8 {
-                        self.words.resize(dref.len.min(2 * *offset).div_ceil(8), 0);
+                        let size = dref.len.min(2 * *offset).max(INITIAL_RX_BUFFER_SIZE.min(max));
+                        self.words.resize(size.div_ceil(8), 0);
                     }
                     let end = dref.len.min(self.words.len() * 8);
                     read_plaintext(
@@ -2460,12 +2461,6 @@ impl DirectRx {
                             .reserve(len)
                             .map_err(|err| io::Error::other(format!("dcache reserve: {err}")))?
                     } else {
-                        if self.words.len() < len.div_ceil(8) {
-                            let size = len
-                                .min(2 * self.words.len() * 8)
-                                .max(INITIAL_RX_BUFFER_SIZE.min(max));
-                            self.words.resize(size.div_ceil(8), 0);
-                        }
                         DCacheRef { offset: 0, len }
                     };
                     self.payload = Some((dref, 0, frame_send_ts(&self.header)));
