@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flux_network::{Network, NetworkEvent, UdpConfig, UdpGroupConfig, UdpGroupConfigV2};
+use flux_network::{
+    GroupConfig, Network, NetworkEvent, NetworkWithExternalPoll, UdpConfig, UdpGroupConfig,
+    UdpGroupConfigV2,
+};
 use mio::Token;
 
 fn free_addr() -> SocketAddr {
@@ -1110,5 +1113,44 @@ fn udp_batched_sends_deliver_every_item() {
             }
         });
         thread::sleep(Duration::from_micros(50));
+    }
+}
+
+#[test]
+fn udp_an_exhausted_token_range_refuses_peers() {
+    let v1 = || UdpGroupConfig { udp: UdpConfig::lan(), ..Default::default() }.into();
+    let v2 = || UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() }.into();
+    for config in [v1 as fn() -> GroupConfig, v2] {
+        let addr = free_addr();
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(64);
+        // The listener and one peer.
+        let mut server = NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 0..2);
+        let group = server.add_group(config());
+        server.listen(group, addr).unwrap();
+        let mut clients: Vec<_> = (0..2).map(|_| Network::default()).collect();
+        for client in &mut clients {
+            let client_group = client.add_group(config());
+            let _ = client.connect(client_group, addr);
+        }
+        let mut accepted = 0;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            let mut on_server = |e: NetworkEvent<'_>| {
+                accepted += usize::from(matches!(e, NetworkEvent::Accepted { .. }));
+            };
+            server.pre_poll(&mut on_server);
+            poll.poll(&mut events, Some(Duration::from_millis(1))).unwrap();
+            for event in &events {
+                server.handle_event(event, &mut on_server);
+            }
+            server.post_poll(&mut on_server);
+            for client in &mut clients {
+                client.poll_with(|_| {});
+            }
+        }
+        assert_eq!(accepted, 1);
+        let connected = clients.iter().filter(|c| c.currently_disconnected().count() == 0);
+        assert_eq!(connected.count(), 1);
     }
 }

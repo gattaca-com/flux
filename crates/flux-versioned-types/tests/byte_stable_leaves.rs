@@ -3,6 +3,7 @@ use flux_versioned_types::{
     DecodeError, HasVersionedLeaves, Versioned, VersionedDeserialize, VersionedLeaves,
     VisitorVersionedLeaf,
     byte_stable::{slice_as_bytes, words_as_bytes_mut},
+    leaves::name_is_path_component,
     versioned_enum, versioned_struct,
 };
 
@@ -135,6 +136,10 @@ fn wire_names() {
     assert_eq!(Wired::NAME, "Relay.NewBidSubmission");
     assert_eq!(Leaf::NAME, "Leaf");
     assert_eq!(Kind::NAME, "Kind");
+    assert!(name_is_path_component("Bundle.Included"));
+    for name in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+        assert!(!name_is_path_component(name), "{name:?}");
+    }
 }
 
 #[test]

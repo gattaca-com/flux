@@ -656,10 +656,8 @@ impl TcpManager {
             return false;
         }
 
-        let mut stream = FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
-        if is_tls {
-            stream.send_queue.framed = false;
-        }
+        let mut stream =
+            FramedStream::new(socket, token, peer_addr, config, dcache.is_some(), is_tls);
         // A replayed frame always restarts at its header, whatever a failed
         // drain left `head` at; done before the dedupe below reads the queue.
         self.connections[index].backlog.rewind_to_frame();
@@ -768,7 +766,13 @@ impl TcpManager {
             let tls = None;
             let (token, stream, timers, group_name) = {
                 let config = &self.config;
-                let token = tokens.allocate(group);
+                // Any peer can connect, so running out refuses one instead of
+                // panicking.
+                let Some(token) = tokens.try_allocate(group) else {
+                    warn!(%peer_addr, "network token range exhausted, connection refused");
+                    let _ = socket.shutdown(Shutdown::Both);
+                    continue;
+                };
                 if let Err(err) = registry.register(&mut socket, token, Interest::READABLE) {
                     warn!(?err, %peer_addr, "couldn't register accepted tcp stream");
                     let _ = socket.shutdown(Shutdown::Both);
@@ -783,8 +787,9 @@ impl TcpManager {
                     peer_addr,
                     config.framing,
                 );
+                let is_tls = tls.is_some();
                 let mut stream =
-                    FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
+                    FramedStream::new(socket, token, peer_addr, config, dcache.is_some(), is_tls);
                 if let Some(message) = config.on_connect_msg.as_deref() {
                     let header = (config.framing == Framing::LengthPrefixed).then(|| {
                         let mut header = [0; FRAME_HEADER_SIZE];
@@ -1585,9 +1590,10 @@ impl RxBuffer {
         }
     }
 
-    /// Makes room for a `frame_len`-byte frame from `head`, and for at least
-    /// one byte to read into: an empty read buffer returns `Ok(0)`, which
-    /// reads as a closed peer.
+    /// Makes room toward a `frame_len`-byte frame from `head`, and for at
+    /// least one byte to read into: an empty read buffer returns `Ok(0)`,
+    /// which reads as a closed peer. The header's length is the peer's claim,
+    /// so the buffer only doubles once full, growing with bytes that arrived.
     #[inline]
     fn make_room(&mut self, frame_len: usize) {
         if self.head == self.tail {
@@ -1602,8 +1608,9 @@ impl RxBuffer {
             self.tail -= self.head;
             self.head = 0;
         }
-        if self.bytes.len() < frame_len || self.tail == self.bytes.len() {
-            self.bytes.resize(frame_len.max(INITIAL_RX_BUFFER_SIZE).max(self.tail + 1), 0);
+        if self.tail == self.bytes.len() {
+            let len = frame_len.min(2 * self.bytes.len()).max(INITIAL_RX_BUFFER_SIZE);
+            self.bytes.resize(len.max(self.tail + 1), 0);
         }
     }
 }
@@ -1807,6 +1814,7 @@ impl FramedStream {
         peer_addr: SocketAddr,
         config: &TcpGroupConfig,
         dcache: bool,
+        tls: bool,
     ) -> Self {
         // Receive buffers are allocated by the first read, so connections that
         // never send cost no buffer.
@@ -1817,7 +1825,8 @@ impl FramedStream {
             peer_addr,
             rx_buffer: RxBuffer { bytes: Vec::new(), head: 0, tail: 0 },
             send_queue: ByteQueue {
-                framed: config.framing == Framing::LengthPrefixed,
+                // Under TLS the queue holds records, not frames.
+                framed: config.framing == Framing::LengthPrefixed && !tls,
                 ..ByteQueue::default()
             },
             writable_armed: false,
@@ -2213,8 +2222,8 @@ mod tests {
     use mio::{Poll, Token};
 
     use super::{
-        ByteQueue, FRAME_HEADER_SIZE, FramedStream, StreamState, TcpGroupConfig,
-        set_socket_buf_size, write_frame_header,
+        ByteQueue, DirectRx, FRAME_HEADER_SIZE, FramedStream, NextFrame, RxBuffer, StreamState,
+        TcpGroupConfig, set_socket_buf_size, write_frame_header,
     };
 
     #[test]
@@ -2329,7 +2338,7 @@ mod tests {
             max_frame_size: 1024,
             ..Default::default()
         };
-        let mut stream = FramedStream::new(socket, Token(0), peer_addr, &config, false);
+        let mut stream = FramedStream::new(socket, Token(0), peer_addr, &config, false, false);
         let fill = [0; 4096];
         loop {
             match stream.socket.write(&fill) {
@@ -2356,6 +2365,33 @@ mod tests {
         );
         assert_eq!(stream.send_queue.len(), 8);
     }
+
+    /// A header alone does not size the receive buffers to the length it
+    /// declares.
+    #[test]
+    fn receive_buffers_do_not_trust_the_declared_length() {
+        const MAX: usize = 64 * 1024 * 1024;
+        let mut header = [0; FRAME_HEADER_SIZE];
+        write_frame_header(&mut header, MAX, Nanos::ZERO);
+
+        let mut rx = RxBuffer { bytes: Vec::new(), head: 0, tail: 0 };
+        rx.make_room(FRAME_HEADER_SIZE);
+        rx.bytes[..FRAME_HEADER_SIZE].copy_from_slice(&header);
+        rx.tail = FRAME_HEADER_SIZE;
+        let NextFrame::Incomplete { frame_len } = rx.next_frame(MAX) else { unreachable!() };
+        rx.make_room(frame_len);
+        assert!(rx.bytes.len() < MAX, "buffered: {} bytes", rx.bytes.len());
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut peer = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut socket = mio::net::TcpStream::from_std(socket);
+        peer.write_all(&header).unwrap();
+        let mut direct = DirectRx::default();
+        assert!(direct.read(&mut socket, &mut None, None, MAX).unwrap().is_none());
+        assert!(direct.words.len() * 8 < MAX, "direct: {} bytes", direct.words.len() * 8);
+    }
 }
 
 #[derive(Default)]
@@ -2380,10 +2416,18 @@ impl DirectRx {
                         .write_into(*dref, *offset, |bytes| read_plaintext(socket, tls, bytes))
                         .map_err(|err| io::Error::other(format!("dcache write: {err}")))?
                 } else {
+                    // Grows only once filled, so the peer's declared length
+                    // never sizes the buffer ahead of its bytes. A frame that
+                    // fits never fills it.
+                    if *offset == self.words.len() * 8 {
+                        let size = dref.len.min(2 * *offset).max(INITIAL_RX_BUFFER_SIZE.min(max));
+                        self.words.resize(size.div_ceil(8), 0);
+                    }
+                    let end = dref.len.min(self.words.len() * 8);
                     read_plaintext(
                         socket,
                         tls,
-                        &mut byte_stable::words_as_bytes_mut(&mut self.words)[*offset..dref.len],
+                        &mut byte_stable::words_as_bytes_mut(&mut self.words)[*offset..end],
                     )
                 };
                 match result {
@@ -2424,10 +2468,6 @@ impl DirectRx {
                             .reserve(len)
                             .map_err(|err| io::Error::other(format!("dcache reserve: {err}")))?
                     } else {
-                        if self.words.len() < len.div_ceil(8) {
-                            self.words
-                                .resize(len.max(INITIAL_RX_BUFFER_SIZE.min(max)).div_ceil(8), 0);
-                        }
                         DCacheRef { offset: 0, len }
                     };
                     self.payload = Some((dref, 0, frame_send_ts(&self.header)));

@@ -355,9 +355,10 @@ impl HttpNetwork {
         self.request_timeout = Some(request_timeout);
         self
     }
-    /// Drops a streaming response that has gone this long without a byte.
-    /// `request_timeout` stops applying once its head arrives, since a stream
-    /// is expected to outlive any single request deadline.
+    /// Drops a streaming response that has gone this long without a byte,
+    /// counting from its request, so a head that never arrives also times
+    /// out. `request_timeout` stops applying once its head arrives, since a
+    /// stream is expected to outlive any single request deadline.
     pub fn with_stream_idle_timeout(mut self, stream_idle_timeout: Duration) -> Self {
         assert!(self.group.is_none(), "configure before listen or connect");
         self.stream_idle_timeout = Some(stream_idle_timeout);
@@ -651,7 +652,8 @@ impl HttpNetwork {
         }
         if let Some(timeout) = self.stream_idle_timeout {
             for i in 0..self.conns.len() {
-                if self.stream_body(i).is_some() && self.conns[i].last_activity.elapsed() >= timeout
+                if self.conns[i].stream.is_some() &&
+                    self.conns[i].last_activity.elapsed() >= timeout
                 {
                     net.disconnect(self.conns[i].token);
                 }
@@ -947,6 +949,7 @@ impl HttpNetwork {
         }
         if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) {
             conn.stream = Some(Stream { body: None });
+            conn.last_activity = Instant::now();
         }
         true
     }
@@ -1438,8 +1441,16 @@ impl HttpNetwork {
                             return
                         }
                         // The chunk data is followed by its own CRLF.
-                        let end = consumed + size + 2;
+                        let Some(end) = consumed.checked_add(size).and_then(|at| at.checked_add(2))
+                        else {
+                            self.fail_stream(net, i, handler);
+                            return
+                        };
                         if buf.len() < end {
+                            return
+                        }
+                        if &buf[consumed + size..end] != b"\r\n" {
+                            self.fail_stream(net, i, handler);
                             return
                         }
                         handler(HttpEvent::Body { token, chunk: &buf[consumed..consumed + size] });

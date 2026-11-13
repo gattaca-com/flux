@@ -28,6 +28,9 @@ pub fn cleanup_flink(flink_path: &Path) -> Result<(), String> {
 }
 
 /// Walk a directory tree, unlink all shmem backing files, then remove the tree.
+///
+/// Symlinks inside `root` are never followed, but a symlinked `root` is: a
+/// caller that finds roots by listing a directory must skip symlinks itself.
 pub fn cleanup_shmem(root: &Path) {
     for flink in all_flinks_under(root) {
         if let Err(e) = cleanup_flink(&flink) {
@@ -45,13 +48,36 @@ fn all_flinks_under(root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return out;
     };
+    // `file_type` does not follow symlinks: a link must never lead the walk, and
+    // the removals after it, outside `root`.
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(all_flinks_under(&path));
-        } else {
-            out.push(path);
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            out.extend(all_flinks_under(&entry.path()));
+        } else if file_type.is_file() {
+            out.push(entry.path());
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cleanup_shmem_does_not_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), "bogus_os_id").unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("queues")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("queues").join("link")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+
+        super::cleanup_shmem(&root);
+        assert!(outside.join("victim").exists());
+        assert!(!root.exists());
+    }
 }

@@ -290,23 +290,33 @@ impl ClientConnection {
                 self.settings_ack_pending = false;
             }
             Payload::Settings { ack: false, settings } => {
+                let mut initial_window: Option<(i64, i64)> = None;
                 for (setting, value) in settings.iter() {
                     match setting {
                         3 => self.peer_max_streams = value,
                         4 => {
-                            let delta = i64::from(value) - self.peer_initial_window;
-                            for stream in self.streams.values_mut() {
-                                stream.send_window += delta;
-                                if stream.send_window > MAX_WINDOW {
-                                    return Err(Error::FlowControl);
-                                }
-                            }
-                            self.peer_initial_window = i64::from(value);
+                            let value = i64::from(value);
+                            let largest = initial_window.map_or(value, |(_, max)| max.max(value));
+                            initial_window = Some((value, largest));
                         }
                         5 => self.peer_frame_size = value,
                         6 => self.peer_header_limit = value,
                         _ => {}
                     }
+                }
+                // Windows grow with the setting, so checking the largest
+                // value of the frame rejects any value that would overflow
+                // one; the last value is the one applied.
+                if let Some((last, largest)) = initial_window {
+                    let growth = largest - self.peer_initial_window;
+                    let delta = last - self.peer_initial_window;
+                    for stream in self.streams.values_mut() {
+                        if stream.send_window + growth > MAX_WINDOW {
+                            return Err(Error::FlowControl);
+                        }
+                        stream.send_window += delta;
+                    }
+                    self.peer_initial_window = last;
                 }
                 self.queue(kind::SETTINGS, flags::ACK, 0, &[])?;
                 handler(ClientEvent::Writable { stream_id: 0 });

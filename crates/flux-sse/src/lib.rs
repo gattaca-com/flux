@@ -31,7 +31,7 @@ use std::{fmt::Write as _, net::SocketAddr};
 
 use flux_network::{
     NetworkCore, NetworkEvent, Token,
-    http::{HttpEvent, HttpNetwork},
+    http::{HttpEvent, HttpNetwork, StreamEnd},
 };
 use flux_timing::Duration;
 
@@ -50,8 +50,9 @@ pub enum SseEvent<'a> {
     /// One dispatched event. `kind` is the `event:` field, `message` by
     /// default; `data` is the joined `data:` lines, still encoded.
     Message { kind: &'a str, data: &'a [u8] },
-    /// The stream ended after it had opened. Whatever the server published
-    /// before the next [`SseEvent::Open`] is lost.
+    /// The stream ended after it had opened, or was dropped because an event
+    /// outgrew the HTTP layer's `max_body_bytes`. Whatever the server
+    /// published before the next [`SseEvent::Open`] is lost.
     Gap,
     /// The server answered the subscription with a non-2xx status.
     Status(u16),
@@ -84,7 +85,7 @@ impl Sse {
                 .with_reconnect_interval(Duration::from_millis(DEFAULT_RECONNECT_INTERVAL_MS)),
             token: None,
             open: false,
-            parser: Parser::default(),
+            parser: Parser { max_event_bytes: DEFAULT_MAX_EVENT_BYTES, ..Parser::default() },
         }
     }
     /// Appends query parameters, percent-encoded.
@@ -109,10 +110,12 @@ impl Sse {
         self.with_http(|http| http.with_stream_idle_timeout(idle_timeout))
     }
     /// Configures the HTTP layer this client owns, through its own builders.
+    /// Its `max_body_bytes` also bounds one event's data.
     #[must_use]
     pub fn with_http(mut self, configure: impl FnOnce(HttpNetwork) -> HttpNetwork) -> Self {
         assert!(self.token.is_none(), "configure before connect");
         self.http = configure(self.http);
+        self.parser.max_event_bytes = self.http.max_body_bytes();
         self
     }
     /// Opens the endpoint; the subscription is issued once it connects.
@@ -151,18 +154,26 @@ impl Sse {
                 }
             }
             HttpEvent::Body { chunk, .. } => {
-                if *open {
-                    parser.push(chunk, &mut handler);
+                // An event past the limit can be neither finished nor skipped
+                // in step, so the stream is dropped as if it had ended.
+                if *open && !parser.push(chunk, &mut handler) {
+                    parser.reset();
+                    *open = false;
+                    handler(SseEvent::Gap);
+                    ended = true;
                 }
             }
-            HttpEvent::StreamEnd { .. } => {
+            HttpEvent::StreamEnd { reason, .. } => {
                 // A partial event cannot be completed, and the bytes after it
                 // are gone, so the caller resyncs instead.
                 parser.reset();
                 if std::mem::take(open) {
                     handler(SseEvent::Gap);
                 }
-                ended = true;
+                // A disconnected stream's connection is already closed, and
+                // the endpoint may be redialling by the time this is seen, so
+                // disconnecting again could abort the new attempt.
+                ended |= reason == StreamEnd::Complete;
             }
             _ => {}
         });
@@ -199,6 +210,8 @@ struct Parser {
     pending_lf: bool,
     /// Whether the leading byte-order mark has been considered.
     started: bool,
+    /// Bound on an event's joined data.
+    max_event_bytes: usize,
 }
 
 impl Parser {
@@ -210,8 +223,10 @@ impl Parser {
         self.pending_lf = false;
         self.started = false;
     }
-    /// Feeds one body chunk, dispatching every event it completes.
-    fn push<F>(&mut self, chunk: &[u8], handler: &mut F)
+    /// Feeds one body chunk, dispatching every event it completes. Returns
+    /// false once an event outgrows `max_event_bytes`, after which the parser
+    /// must be reset.
+    fn push<F>(&mut self, chunk: &[u8], handler: &mut F) -> bool
     where
         F: for<'a> FnMut(SseEvent<'a>),
     {
@@ -227,17 +242,28 @@ impl Parser {
             if std::mem::take(&mut self.pending_lf) && byte == b'\n' {
                 continue
             }
-            match byte {
+            let fits = match byte {
                 b'\r' => {
                     self.pending_lf = true;
-                    self.end_line(handler);
+                    self.end_line(handler)
                 }
                 b'\n' => self.end_line(handler),
-                _ => self.line.push(byte),
+                _ => {
+                    self.line.push(byte);
+                    true
+                }
+            };
+            if !fits {
+                return false
             }
         }
+        // Checked per chunk, not per byte; the HTTP layer bounds a chunk. A
+        // data line also carries its field name, so an event at the limit
+        // still fits.
+        self.line.len() <= self.max_event_bytes.saturating_add(b"data: ".len())
     }
-    fn end_line<F>(&mut self, handler: &mut F)
+    /// Returns false if the line would take the event's data past the limit.
+    fn end_line<F>(&mut self, handler: &mut F) -> bool
     where
         F: for<'a> FnMut(SseEvent<'a>),
     {
@@ -245,8 +271,9 @@ impl Parser {
         if line.is_empty() {
             self.dispatch(handler);
             self.line = line;
-            return
+            return true
         }
+        let mut fits = true;
         // A comment line keeps the connection warm and carries nothing.
         if line[0] != b':' {
             let colon = line.iter().position(|&byte| byte == b':');
@@ -257,11 +284,15 @@ impl Parser {
             });
             match field {
                 b"data" => {
-                    if self.has_data {
-                        self.data.push(b'\n');
+                    fits = self.data.len() + usize::from(self.has_data) + value.len() <=
+                        self.max_event_bytes;
+                    if fits {
+                        if self.has_data {
+                            self.data.push(b'\n');
+                        }
+                        self.data.extend_from_slice(value);
+                        self.has_data = true;
                     }
-                    self.data.extend_from_slice(value);
-                    self.has_data = true;
                 }
                 b"event" => {
                     self.kind.clear();
@@ -274,6 +305,7 @@ impl Parser {
         }
         self.line = line;
         self.line.clear();
+        fits
     }
     fn dispatch<F>(&mut self, handler: &mut F)
     where

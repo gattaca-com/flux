@@ -635,6 +635,212 @@ fn udp_ignores_junk_datagrams() {
     assert_eq!(got, [b"ok".to_vec()]);
 }
 
+const HELLO_ACK: u8 = 2;
+const RESET: u8 = 5;
+const PING: u8 = 6;
+
+/// A subscriber written by hand, so a test chooses what it answers.
+fn raw_hello(session: u32) -> [u8; 7] {
+    let mut hello = [b'F', b'P', 0x21, 0, 0, 0, 0];
+    hello[3..].copy_from_slice(&session.to_le_bytes());
+    hello
+}
+
+/// Acks nothing received from a stream joined at 0, echoing `echo_ts`.
+fn raw_ack(publisher: u32, session: u32, echo_ts: u64) -> [u8; 27] {
+    let mut ack = [0; 27];
+    ack[..3].copy_from_slice(&[b'F', b'P', 0x24]);
+    ack[3..7].copy_from_slice(&publisher.to_le_bytes());
+    ack[7..11].copy_from_slice(&session.to_le_bytes());
+    ack[19..27].copy_from_slice(&echo_ts.to_le_bytes());
+    ack
+}
+
+/// The waiting datagrams, with their kinds.
+fn raw_recv(socket: &UdpSocket) -> Vec<(u8, Vec<u8>)> {
+    let mut buf = [0; 2048];
+    let mut datagrams = Vec::new();
+    while let Ok(n) = socket.recv(&mut buf) {
+        datagrams.push((buf[2] & 0x0f, buf[..n].to_vec()));
+    }
+    datagrams
+}
+
+/// Polls `server` until `raw` gets a datagram of `kind`, and returns what it
+/// got by then.
+fn raw_until(
+    server: &mut Publisher,
+    raw: &UdpSocket,
+    kind: u8,
+    mut on_event: impl FnMut(PublisherEvent<'_>),
+) -> Vec<(u8, Vec<u8>)> {
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !got.iter().any(|(k, _)| *k == kind) {
+        assert!(Instant::now() < deadline, "no datagram of kind {kind}: {got:?}");
+        server.poll_with(&mut on_event);
+        got.extend(raw_recv(raw));
+        thread::sleep(Duration::from_micros(50));
+    }
+    got
+}
+
+/// The first datagram of `kind` and the 4- or 8-byte field at `at` in it.
+fn raw_field(got: &[(u8, Vec<u8>)], kind: u8, at: usize, len: usize) -> u64 {
+    let (_, bytes) = got.iter().find(|(k, _)| *k == kind).unwrap();
+    let mut field = [0; 8];
+    field[..len].copy_from_slice(&bytes[at..at + len]);
+    u64::from_le_bytes(field)
+}
+
+#[test]
+fn udp_a_hello_that_never_answers_gets_no_stream() {
+    let addr = free_addr();
+    let mut server = Publisher::new(lan());
+    server.listen(addr).unwrap();
+    let raw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    raw.connect(addr).unwrap();
+    raw.set_nonblocking(true).unwrap();
+    raw.send(&raw_hello(1)).unwrap();
+
+    let mut got = Vec::new();
+    let mut published = false;
+    // Several heartbeats, none of which resends the challenge.
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        server.poll_with(|e| assert!(!matches!(e, PublisherEvent::Subscribed { .. })));
+        if !published && !got.is_empty() {
+            assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"secret")), 0);
+            published = true;
+        }
+        got.extend(raw_recv(&raw));
+        thread::sleep(Duration::from_micros(50));
+    }
+    assert!(published);
+    let kinds: Vec<u8> = got.iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(kinds, [HELLO_ACK, PING]);
+
+    // An ack that does not echo the challenge gets it again, and no stream.
+    let session = raw_field(&got, PING, 3, 4) as u32;
+    raw.send(&raw_ack(session, 1, 0)).unwrap();
+    let again = raw_until(&mut server, &raw, PING, |e| {
+        assert!(!matches!(e, PublisherEvent::Subscribed { .. }));
+    });
+    assert_eq!(again, [got[1].clone()]);
+}
+
+#[test]
+fn udp_an_ack_counts_only_for_its_own_pending_session() {
+    let addr = free_addr();
+    let mut server = Publisher::new(lan());
+    server.listen(addr).unwrap();
+    let raw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    raw.connect(addr).unwrap();
+    raw.set_nonblocking(true).unwrap();
+    raw.send(&raw_hello(1)).unwrap();
+    let first = raw_until(&mut server, &raw, PING, |_| {});
+    raw.send(&raw_hello(2)).unwrap();
+    let second = raw_until(&mut server, &raw, PING, |_| {});
+    let publisher = raw_field(&first, PING, 3, 4) as u32;
+
+    // Pending sessions at its address do not shield another one.
+    raw.send(&raw_ack(publisher, 3, 0)).unwrap();
+    let got = raw_until(&mut server, &raw, RESET, |_| {});
+    assert_eq!(raw_field(&got, RESET, 3, 4), 3);
+
+    raw.send(&raw_ack(publisher, 2, raw_field(&second, PING, 7, 8))).unwrap();
+    let mut accepted = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !accepted {
+        assert!(Instant::now() < deadline, "handshake");
+        server.poll_with(|e| accepted |= matches!(e, PublisherEvent::Subscribed { .. }));
+        thread::sleep(Duration::from_micros(50));
+    }
+
+    // A late echo from the session it replaced.
+    raw.send(&raw_ack(publisher, 1, raw_field(&first, PING, 7, 8))).unwrap();
+    let got = raw_until(&mut server, &raw, RESET, |e| {
+        assert!(!matches!(
+            e,
+            PublisherEvent::Subscribed { .. } | PublisherEvent::Unsubscribed { .. }
+        ));
+    });
+    assert_eq!(raw_field(&got, RESET, 3, 4), 1);
+}
+
+#[test]
+fn udp_a_subscriber_that_joined_a_dropped_pending_entry_is_reset() {
+    let addr = free_addr();
+    let config = UdpGroupConfigV2 {
+        udp: UdpConfig { send_window: 64, max_message_size: 4096, ..UdpConfig::lan() },
+        ..Default::default()
+    };
+    let mut server = Publisher::new(config);
+    server.listen(addr).unwrap();
+    let raw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    raw.connect(addr).unwrap();
+    raw.set_nonblocking(true).unwrap();
+    raw.send(&raw_hello(1)).unwrap();
+    let first = raw_until(&mut server, &raw, PING, |_| {});
+    // `raw_ack` acks from here.
+    assert_eq!(raw_field(&first, HELLO_ACK, 11, 8), 0);
+
+    // More than a window passes while it is pending, which drops it.
+    for _ in 0..30 {
+        server.broadcast_with(|b| b.extend_from_slice(&[0; 4096]));
+    }
+    // Its hello retry opens a new entry.
+    raw.send(&raw_hello(1)).unwrap();
+    let retry = raw_until(&mut server, &raw, PING, |_| {});
+    assert!(raw_field(&retry, HELLO_ACK, 11, 8) > 0);
+
+    let publisher = raw_field(&retry, PING, 3, 4) as u32;
+    raw.send(&raw_ack(publisher, 1, raw_field(&retry, PING, 7, 8))).unwrap();
+    let got = raw_until(&mut server, &raw, RESET, |e| {
+        assert!(!matches!(e, PublisherEvent::Subscribed { .. }));
+    });
+    assert_eq!(raw_field(&got, RESET, 3, 4), 1);
+}
+
+#[test]
+fn udp_a_new_session_takes_over_an_address_only_once_it_answers() {
+    let addr = free_addr();
+    let mut server = Publisher::new(lan());
+    server.listen(addr).unwrap();
+    let raw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    raw.connect(addr).unwrap();
+    raw.set_nonblocking(true).unwrap();
+    raw.send(&raw_hello(1)).unwrap();
+    let mut accepted = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !accepted {
+        assert!(Instant::now() < deadline, "handshake");
+        server.poll_with(|e| accepted |= matches!(e, PublisherEvent::Subscribed { .. }));
+        for (kind, bytes) in raw_recv(&raw) {
+            if kind == PING {
+                let publisher = u32::from_le_bytes(bytes[3..7].try_into().unwrap());
+                let ts = u64::from_le_bytes(bytes[7..15].try_into().unwrap());
+                raw.send(&raw_ack(publisher, 1, ts)).unwrap();
+            }
+        }
+        thread::sleep(Duration::from_micros(50));
+    }
+
+    // A forged hello for the same address, which nobody answers.
+    raw.send(&raw_hello(2)).unwrap();
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        server.poll_with(|e| {
+            assert!(!matches!(
+                e,
+                PublisherEvent::Subscribed { .. } | PublisherEvent::Unsubscribed { .. }
+            ));
+        });
+        thread::sleep(Duration::from_micros(50));
+    }
+    assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"live")), 1);
+}
+
 #[test]
 fn udp_broadcast_survives_dropping_a_subscriber_mid_way() {
     let addr = free_addr();
@@ -878,10 +1084,11 @@ fn udp_a_draining_subscriber_gets_nothing_newer() {
     let mut live = Subscriber::new(lan());
     let (drained, _) = subscribe_pair(&mut server, &mut draining, addr);
     let live_token = live.subscribe(addr);
+    let mut accepted = false;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !live.is_subscribed(live_token) {
+    while !accepted || !live.is_subscribed(live_token) {
         assert!(Instant::now() < deadline, "second subscriber");
-        server.poll_with(|_| {});
+        server.poll_with(|e| accepted |= matches!(e, PublisherEvent::Subscribed { .. }));
         live.poll_with(|_| {});
     }
     assert_eq!(server.broadcast_with(|b| b.extend_from_slice(b"old")), 2);
@@ -1108,7 +1315,10 @@ fn udp_pubsub_runs_as_network_groups() {
 
     let greeting = Seen::Message(subscriber, sub, b"hi".to_vec());
     let mut seen = Vec::new();
-    poll_until(&mut net, &mut seen, |seen| seen.contains(&greeting));
+    poll_until(&mut net, &mut seen, |seen| {
+        seen.contains(&greeting) &&
+            seen.iter().any(|e| matches!(e, Seen::Accepted(group, _) if *group == publisher))
+    });
     let Some(&Seen::Accepted(_, accepted)) =
         seen.iter().find(|e| matches!(e, Seen::Accepted(group, _) if *group == publisher))
     else {

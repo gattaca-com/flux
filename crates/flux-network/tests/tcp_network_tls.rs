@@ -2,11 +2,13 @@
 //! framing happens inside the session.
 
 use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicIsize, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -23,6 +25,41 @@ use flux_network::{
         },
     },
 };
+
+/// Tracks the live heap of threads that opt in, for the one test that
+/// bounds the server's memory.
+struct Tracking;
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
+thread_local!(static TRACKING: Cell<bool> = const { Cell::new(false) });
+
+fn track(delta: isize) {
+    if TRACKING.with(Cell::get) {
+        let live = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: forwards to `System`, only counting sizes.
+unsafe impl GlobalAlloc for Tracking {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        track(layout.size() as isize);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        track(-(layout.size() as isize));
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        track(size as isize - layout.size() as isize);
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Tracking = Tracking;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_DELAY: Duration = Duration::from_millis(250);
@@ -299,4 +336,63 @@ fn stalled_accepted_handshake_reports_disconnect() {
     let (addr, server) = serve_echo(server, Duration::from_millis(50));
     let _silent = std::net::TcpStream::connect(addr).unwrap();
     assert_eq!(server.join().unwrap(), ["accepted", "disconnected"]);
+}
+
+/// An accepted framed TLS connection releases the ciphertext it has written,
+/// so a slow reader costs the server only what is still unsent.
+#[test]
+fn accepted_framed_tls_releases_written_bytes() {
+    const QUEUED: usize = 256 * 1024;
+    const TOTAL: usize = 8 * 1024 * 1024;
+    let (server_config, client_config) = server_config(&[]);
+    let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let mut net = Network::default();
+    let group = net.add_group(TcpGroupConfig {
+        framing: Framing::LengthPrefixed,
+        replay: ReplayPolicy::Drop,
+        socket_buf_size: Some(64 * 1024),
+        ..TcpGroupConfig::default()
+    });
+    net.listen_tls(group, addr, server_config).unwrap();
+    let reader = thread::spawn(move || {
+        let mut conn =
+            rustls::ClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
+        let mut socket = std::net::TcpStream::connect(addr).unwrap();
+        socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+        conn.complete_io(&mut socket).unwrap();
+        let mut buf = [0; 8 * 1024];
+        while matches!(socket.read(&mut buf), Ok(1..)) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let mut token = None;
+    let deadline = Instant::now() + TIMEOUT;
+    while token.and_then(|token| net.pending_write_bytes(token)).is_none() {
+        assert!(Instant::now() < deadline, "the handshake never completed");
+        net.poll_with(|event| {
+            if let NetworkEvent::Accepted { token: accepted, .. } = event {
+                token = Some(accepted);
+            }
+        });
+    }
+    let token = token.unwrap();
+
+    TRACKING.with(|tracking| tracking.set(true));
+    let mut sent = 0;
+    while sent < TOTAL {
+        assert!(Instant::now() < deadline, "sent only {sent} bytes");
+        if net.queued_bytes(token) < QUEUED {
+            assert!(net.send_with(token, |out| out.extend_from_slice(&[7; 1000])));
+            sent += 1000;
+        }
+        net.poll_with(|_| {});
+    }
+    TRACKING.with(|tracking| tracking.set(false));
+    let peak = PEAK.load(Ordering::Relaxed);
+    assert!(net.disconnect(token));
+    reader.join().unwrap();
+    assert!(peak < (4 * QUEUED) as isize, "the server held {peak} bytes");
 }

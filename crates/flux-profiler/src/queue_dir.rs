@@ -135,7 +135,8 @@ pub(super) fn in_process_app() -> String {
             .to_str()
             .and_then(|name| name.strip_prefix(IN_PROCESS_APP_PREFIX))
             .and_then(|pid| pid.parse().ok());
-        if pid.is_some_and(|pid| !is_pid_alive(pid)) {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) && pid.is_some_and(|pid| !is_pid_alive(pid))
+        {
             cleanup_shmem(&entry.path());
         }
     }

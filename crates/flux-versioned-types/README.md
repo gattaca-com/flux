@@ -56,7 +56,9 @@ implements `Versioned` and `HasVersionedLeaves`. Versions must be padding-free
 provides impls for ints, `bool`, arrays, `ArrayStr`, `Nanos`, and behind
 `byte-stable` features `Uuid`, `FixedBytes`/`B256`/`Address`, `Uint`/`U256`.
 Consumers need no direct `byte-stable` dependency. `#[wire_skip]` keeps the
-bincode codec only; `#[wire_name = ".."]` sets `Versioned::NAME`.
+bincode codec only; `#[wire_name = ".."]` sets `Versioned::NAME`. A receiver
+must check a blob's `type_name()` with `leaves::name_is_path_component` before
+building a path from it.
 
 ```rust
 versioned_struct!(#[wire_name = "Relay.NewBidSubmission"] NewBidSubmission =>

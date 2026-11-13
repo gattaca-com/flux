@@ -556,6 +556,19 @@ fn wrong_decompressed_len_fails_without_allocating() {
         }
         other => panic!("expected LengthMismatch, got {other:?}"),
     }
+
+    let mut bytes = leaf_blob(1);
+    let n = u32::MAX;
+    let at = offset_of!(BlobHeader, n_messages);
+    bytes[at..at + 4].copy_from_slice(&n.to_le_bytes());
+    let len = u64::from(n) * (size_of::<TrackingTimestampWire>() + size_of::<Leaf>()) as u64;
+    let at = offset_of!(BlobHeader, decompressed_len);
+    bytes[at..at + 8].copy_from_slice(&len.to_le_bytes());
+    let blob = a.load(&bytes).unwrap();
+    match blob.decode::<Meta, Leaf>(&mut b) {
+        Err(DecodeError::TooShort { .. }) => {}
+        other => panic!("expected TooShort, got {other:?}"),
+    }
 }
 
 #[test]

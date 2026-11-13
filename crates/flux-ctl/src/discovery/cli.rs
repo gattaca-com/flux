@@ -13,6 +13,7 @@ use super::{
     inspect::{PoisonInfo, backing_file_size, format_bytes},
     scan_base_dir,
 };
+use crate::printable;
 
 /// List all visible shared memory segments in a human-readable table.
 ///
@@ -60,7 +61,7 @@ pub fn list_all(
         if app_entries.is_empty() {
             continue;
         }
-        println!("📦 {} ({} segments)", app, app_entries.len());
+        println!("📦 {} ({} segments)", printable(app), app_entries.len());
         // Column header
         println!(
             "  {:2} {:<max_kind_w$}  {:>max_type_w$}  {:>max_elem_w$}  {:>max_cap_w$}",
@@ -79,7 +80,11 @@ pub fn list_all(
             let kind_str = format!("{}", entry.kind);
             let status_text = format!(
                 "  {} {:<max_kind_w$}  {:>max_type_w$}  {:>max_elem_w$}B {:>max_cap_w$}",
-                status, kind_str, entry.type_name, entry.elem_size, entry.capacity,
+                status,
+                kind_str,
+                printable(&entry.type_name),
+                entry.elem_size,
+                entry.capacity,
             );
             if color {
                 if poison.is_some() {
@@ -99,7 +104,7 @@ pub fn list_all(
                 );
             }
             if verbose {
-                println!("    flink: {}", entry.flink);
+                println!("    flink: {}", printable(&entry.flink));
                 if entry.kind == ShmemKind::Queue {
                     match ShmemConf::new().flink(&entry.flink).open() {
                         Ok(shmem) => {
@@ -316,7 +321,8 @@ pub fn inspect(
         let color = std::io::stdout().is_terminal();
 
         // ── Title ──
-        let title = format!("─── {} — {} ───", entry.app_name, entry.type_name);
+        let title =
+            format!("─── {} — {} ───", printable(&entry.app_name), printable(&entry.type_name));
         if color {
             println!("{}", title.bold());
         } else {
@@ -339,7 +345,7 @@ pub fn inspect(
         println!("  Status:     {status}");
         println!("  Elem size:  {} bytes", entry.elem_size);
         println!("  Capacity:   {}", entry.capacity);
-        println!("  Flink:      {}", entry.flink);
+        println!("  Flink:      {}", printable(&entry.flink));
         println!("  Backing:    {backing}");
 
         if entry.kind == ShmemKind::Queue &&
@@ -383,7 +389,7 @@ pub fn clean(
     app_filter: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use super::find_shmem_dirs;
+    use super::{find_shmem_dirs, flink_files};
 
     let mut shmem_dirs = Vec::new();
     find_shmem_dirs(base_dir, &mut shmem_dirs);
@@ -395,15 +401,8 @@ pub fn clean(
             continue;
         }
         for subdir in ["queues", "data", "arrays"] {
-            let type_dir = shmem_dir.join(subdir);
-            let Ok(flink_iter) = std::fs::read_dir(&type_dir) else {
-                continue;
-            };
-            for flink_entry in flink_iter.flatten() {
+            for flink_entry in flink_files(&shmem_dir.join(subdir)) {
                 let flink_path = flink_entry.path();
-                if flink_path.is_dir() {
-                    continue;
-                }
                 if ShmemConf::new().flink(&flink_path).open().is_ok() {
                     continue;
                 }
@@ -420,11 +419,11 @@ pub fn clean(
 
     println!("Found {} stale segments:", stale.len());
     for (app, typ, flink_path) in &stale {
-        println!("  💀 {app} {typ}");
+        println!("  💀 {} {}", printable(app), printable(typ));
         if force {
             match cleanup_flink(flink_path) {
-                Ok(()) => println!("    ✓ cleaned {}", flink_path.display()),
-                Err(e) => eprintln!("    ✗ {e}"),
+                Ok(()) => println!("    ✓ cleaned {}", printable(&flink_path.to_string_lossy())),
+                Err(e) => eprintln!("    ✗ {}", printable(&e)),
             }
         }
     }

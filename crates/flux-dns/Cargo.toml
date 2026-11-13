@@ -10,6 +10,7 @@ version.workspace = true
 [dependencies]
 flux-timing.workspace = true
 flux-utils.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true

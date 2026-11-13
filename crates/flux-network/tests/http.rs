@@ -7,7 +7,7 @@ use std::{
 
 use flux_network::{
     Network,
-    http::{HttpEvent, HttpNetwork},
+    http::{HttpEvent, HttpNetwork, StreamEnd},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -718,6 +718,39 @@ fn idle_timeout_disconnects() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(closed);
+}
+
+#[test]
+fn stream_idle_timeout_before_response_head() {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut request = [0; 1024];
+        while matches!(stream.read(&mut request), Ok(n) if n > 0) {}
+    });
+    let mut net = Network::default();
+    let mut client =
+        HttpNetwork::default().with_stream_idle_timeout(Duration::from_millis(200).into());
+    let token = client.connect(&mut net, addr);
+    let deadline = Instant::now() + TIMEOUT;
+    let mut requested = false;
+    let mut ended = Vec::new();
+    let mut disconnected = false;
+    while Instant::now() < deadline && !disconnected {
+        poll(&mut net, &mut client, |event| match event {
+            HttpEvent::StreamEnd { reason, .. } => ended.push(reason),
+            HttpEvent::Disconnected { .. } => disconnected = true,
+            _ => {}
+        });
+        if !requested {
+            requested = client.request_stream(&mut net, token, "GET", "/", &[]);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(ended, [StreamEnd::Disconnected]);
+    peer.join().unwrap();
 }
 
 #[test]

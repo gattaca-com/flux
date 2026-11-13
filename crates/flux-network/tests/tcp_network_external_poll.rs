@@ -319,3 +319,53 @@ fn accept_limit_is_shared_by_pre_poll_and_readiness() {
     assert_eq!(accepted.get(), 1);
     assert_eq!(peers.len(), 5);
 }
+
+/// Inbound connections beyond the token range are refused; the listener and
+/// its accepted connections keep working.
+#[test]
+fn exhausted_token_range_refuses_inbound_connections() {
+    use std::io::{Read, Write};
+
+    let addr = unused_addr();
+    let mut poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(128);
+    let mut server = NetworkWithExternalPoll::new(poll.registry().try_clone().unwrap(), 100..103);
+    let group = server.add_group(TcpGroupConfig {
+        framing: flux_network::Framing::Raw,
+        replay: flux_network::ReplayPolicy::Drop,
+        ..TcpGroupConfig::default()
+    });
+    server.listen(group, addr).unwrap();
+
+    let mut accepted = Vec::new();
+    let mut received = Vec::new();
+    let mut peers = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.is_empty() && Instant::now() < deadline {
+        if peers.len() < 4 {
+            peers.push(std::net::TcpStream::connect(addr).unwrap());
+        } else if peers.len() == 4 {
+            peers[0].write_all(REQUEST).unwrap();
+            peers.push(std::net::TcpStream::connect(addr).unwrap());
+        }
+        let mut on_event = |event: NetworkEvent<'_>| match event {
+            NetworkEvent::Accepted { token, .. } => accepted.push(token),
+            NetworkEvent::Message { payload, .. } => received.extend_from_slice(payload),
+            _ => {}
+        };
+        server.pre_poll(&mut on_event);
+        poll.poll(&mut events, Some(Duration::from_millis(1))).unwrap();
+        for event in &events {
+            server.handle_event(event, &mut on_event);
+        }
+        server.post_poll(&mut on_event);
+    }
+    assert_eq!(accepted.len(), 2);
+    assert_eq!(received, REQUEST);
+
+    assert!(server.send_with(accepted[0], |buf| buf.extend_from_slice(RESPONSE)));
+    let mut buf = [0; RESPONSE.len()];
+    peers[0].set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peers[0].read_exact(&mut buf).unwrap();
+    assert_eq!(buf, RESPONSE);
+}

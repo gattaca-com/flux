@@ -27,7 +27,7 @@ pub use summarize::{Percentiles, Report, TileStats, TimerStats, summarize};
 use table::{Table, TileRows, TimerRows, is_file_of};
 use tracing::{info, warn};
 
-use crate::discovery::scan_base_dir_with_dirs;
+use crate::{discovery::scan_base_dir_with_dirs, printable};
 
 /// A timer's ring has 8192 slots and a tile's 4096. At 10 ms a reader keeps up
 /// with any producer below ~400 k samples/s.
@@ -269,7 +269,7 @@ impl Recorder {
             };
             if let Err(e) = opened {
                 let queue = format!("{}/{name}", kind.label());
-                warn!("not reading {queue}: {e}");
+                warn!("not reading {}: {e}", printable(&queue));
                 skipped.push(queue);
             }
         }
@@ -422,7 +422,7 @@ impl Recorder {
             .collect();
         late.sort();
         if !late.is_empty() {
-            warn!("created after attach, not recorded: {}", late.join(" "));
+            warn!("created after attach, not recorded: {}", printable(&late.join(" ")));
         }
         let totals = Totals {
             format: TOTALS_FORMAT,
@@ -509,7 +509,7 @@ impl Display for Recording {
         for (key, t) in &report.timers {
             let us = us(t.dur);
             row(f, [
-                key,
+                &printable(key),
                 &t.samples,
                 &or_dash(t.lost),
                 &or_dash(t.invalid),
@@ -523,7 +523,7 @@ impl Display for Recording {
         for (name, t) in &report.tiles {
             let us = us(t.busy_max);
             row(f, [
-                &format!("tile/{name}"),
+                &format!("tile/{}", printable(name)),
                 &t.windows,
                 &or_dash(t.lost),
                 &"-",
