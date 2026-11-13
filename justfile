@@ -21,7 +21,7 @@ clippy-fix:
 
 # Find unused deps: in crates (cargo machete) and in [workspace.dependencies].
 machete:
-  cargo install cargo-machete --locked && \
+  cargo install cargo-machete --locked --version 0.9.2 && \
   cargo machete && \
   ./scripts/check_workspace_deps.sh
 
