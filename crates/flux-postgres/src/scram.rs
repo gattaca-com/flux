@@ -9,6 +9,11 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Bounds the key derivation a server can demand, which runs on the thread
+/// driving every connection; deployments use thousands to hundreds of
+/// thousands of iterations.
+const MAX_ITERATIONS: u32 = 4_000_000;
+
 fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(data);
@@ -77,6 +82,9 @@ impl Exchange {
         if iterations == 0 {
             return Err("SCRAM iteration count is zero");
         }
+        if iterations > MAX_ITERATIONS {
+            return Err("SCRAM iteration count is too large");
+        }
         let mac = HmacSha256::new_from_slice(password.as_bytes())
             .expect("HMAC accepts keys of any length");
         let mut prev: [u8; 32] = mac
@@ -126,5 +134,20 @@ impl Exchange {
         } else {
             Err("SCRAM server signature mismatch")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iteration_count_above_the_maximum_is_rejected() {
+        let (mut exchange, _) = Exchange::start("user", "cnonce");
+        let server_first = b"r=cnonceserver,s=c2FsdA==,i=4294967295";
+        assert_eq!(
+            exchange.client_final("password", server_first),
+            Err("SCRAM iteration count is too large")
+        );
     }
 }
