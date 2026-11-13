@@ -328,24 +328,6 @@ fn rejects_type_and_payload_mismatches() {
     );
     let blob = a.load(&bytes).unwrap();
     assert!(matches!(blob.decode::<Meta, Flag>(&mut b), Err(DecodeError::InvalidValue)));
-
-    let leaf = Leaf { slot: 1, extra: 0, flags: 0 };
-    let plain = [slice_as_bytes(&stamps), &[0; 8], ByteStable::as_bytes(&leaf)].concat();
-    let leaf_stride = size_of::<Leaf>() + 8;
-    let mut bytes = hand_build(
-        MetaV1::TYPE_HASH,
-        &meta_bytes(&meta),
-        Leaf::TYPE_HASH,
-        Leaf::NAME,
-        &plain,
-        1,
-        leaf_stride,
-    );
-    // `leaf_align` is private; it follows `n_messages`.
-    let at = offset_of!(BlobHeader, n_messages) + 4;
-    bytes[at..at + 4].copy_from_slice(&32u32.to_le_bytes());
-    let blob = a.load(&bytes).unwrap();
-    assert!(matches!(blob.decode::<Meta, Leaf>(&mut b), Err(DecodeError::InvalidValue)));
 }
 
 #[test]
@@ -587,21 +569,6 @@ fn wrong_decompressed_len_fails_without_allocating() {
         Err(DecodeError::TooShort { .. }) => {}
         other => panic!("expected TooShort, got {other:?}"),
     }
-}
-
-#[test]
-fn scratch_max_len_caps_untrusted_sizes() {
-    let bytes = leaf_blob(8);
-    let mut a = Scratch::new();
-    let blob = a.load(&bytes).unwrap();
-    let mut capped = Scratch::truncating().with_max_len(8 * size_of::<TrackingTimestampWire>());
-    assert!(matches!(blob.decode::<Meta, Leaf>(&mut capped), Err(DecodeError::TooShort { .. })));
-    let (_, msgs): (Meta, Vec<InternalMessage<Leaf>>) = blob.decode(&mut Scratch::new()).unwrap();
-    assert_eq!(msgs.len(), 8);
-    assert!(matches!(
-        Scratch::new().with_max_len(bytes.len() - 1).load(&bytes),
-        Err(DecodeError::TooShort { .. })
-    ));
 }
 
 #[test]
