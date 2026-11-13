@@ -188,6 +188,11 @@ fn validate_rejects_overflowing_length_and_undefined_queue_type() {
     let mask = header.mask;
     header.mask = usize::MAX >> 1;
     assert!(matches!(header.validate(mapped_len, hash, elsize, 0), Err(QueueError::TooSmall)));
+    header.mask = usize::MAX;
+    assert!(matches!(
+        header.validate(mapped_len, hash, elsize, 0),
+        Err(QueueError::LengthNotPowerOfTwo)
+    ));
     header.mask = mask;
 
     unsafe { (&raw mut header.queue_type).cast::<u8>().write(3) };

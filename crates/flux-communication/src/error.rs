@@ -19,7 +19,7 @@ pub enum ReadError {
 #[derive(Error, Debug)]
 #[repr(u8)]
 pub enum QueueError {
-    #[error("Queue not initialized")]
+    #[error("Queue not initialized or header invalid")]
     UnInitialized,
     #[error("Queue length not power of two")]
     LengthNotPowerOfTwo,

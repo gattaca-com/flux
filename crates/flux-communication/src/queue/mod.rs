@@ -239,12 +239,11 @@ impl QueueHeader {
         if self.elsize != elsize {
             return Err(QueueError::ElementSizeChanged(self.elsize, elsize));
         }
-        if !self.len().is_power_of_two() {
+        let Some(len) = self.mask.checked_add(1).filter(|len| len.is_power_of_two()) else {
             return Err(QueueError::LengthNotPowerOfTwo);
-        }
-        let required =
-            self.len().checked_mul(elsize).and_then(|n| n.checked_add(size_of::<Self>()));
-        if self.len() < min_len || required.is_none_or(|required| mapped_len < required) {
+        };
+        let required = len.checked_mul(elsize).and_then(|n| n.checked_add(size_of::<Self>()));
+        if len < min_len || required.is_none_or(|required| mapped_len < required) {
             return Err(QueueError::TooSmall);
         }
         Ok(())
