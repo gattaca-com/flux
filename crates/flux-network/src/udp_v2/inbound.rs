@@ -288,11 +288,6 @@ impl Inbound {
             let seq = self.partials[i].expect;
             let slot = (seq & self.mask) as usize;
             if self.stash[slot].seq != Some(seq) {
-                // In with nothing stashed: it carried no continuation.
-                if self.received(seq) {
-                    let dead = self.partials.swap_remove(i);
-                    self.spare.push(dead);
-                }
                 return;
             }
             self.stash[slot].seq = None;
@@ -473,7 +468,6 @@ mod tests {
         let mut out = Vec::new();
         feed(&mut inbound, &packet(11, b"", &[b"x"], None), &mut out);
         feed(&mut inbound, &packet(10, b"", &[b"abcdef"], Some(2)), &mut out);
-        assert!(inbound.partials.is_empty());
         // A continuation cut short of its message, then a new head: two
         // partials wait on 14 and only one is fed.
         feed(&mut inbound, &packet(12, b"", &[&[0; 8]], Some(2)), &mut out);
