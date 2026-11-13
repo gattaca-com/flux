@@ -108,7 +108,8 @@ pub(super) struct PublisherState {
     listeners: Vec<Socket>,
     stream: Stream,
     recipients: Vec<Recipient>,
-    /// Oldest first.
+    /// Oldest first: `join` and `created` never decrease along it, so the
+    /// lowest `join` and every expired entry are at the front.
     pending: VecDeque<Pending>,
     challenge_key: RandomState,
     challenges: u64,
@@ -198,7 +199,7 @@ impl PublisherState {
             .recipients
             .iter()
             .map(Recipient::base)
-            .chain(self.pending.iter().map(|p| p.join))
+            .chain(self.pending.front().map(|p| p.join))
             .min()
             .unwrap_or_else(|| self.stream.next());
         if base > self.stream.base() {
@@ -210,6 +211,16 @@ impl PublisherState {
     fn retain_pending(&mut self, keep: impl FnMut(&Pending) -> bool) {
         let len = self.pending.len();
         self.pending.retain(keep);
+        if self.pending.len() != len {
+            self.release();
+        }
+    }
+
+    fn drop_pending_front(&mut self, mut drop: impl FnMut(&Pending) -> bool) {
+        let len = self.pending.len();
+        while self.pending.front().is_some_and(&mut drop) {
+            self.pending.pop_front();
+        }
         if self.pending.len() != len {
             self.release();
         }
@@ -343,9 +354,7 @@ impl PublisherState {
                 self.drop_recipient(i);
             }
         }
-        if !self.pending.is_empty() {
-            self.retain_pending(|p| p.join >= min_base);
-        }
+        self.drop_pending_front(|p| p.join < min_base);
         let recipients = self.recipients.iter().filter(|r| !r.is_draining()).count();
         // Also, enqueued with no one holding it, it would never be released.
         if recipients == 0 && self.pending.is_empty() {
@@ -450,9 +459,7 @@ impl PublisherState {
         if !self.recipients.is_sorted_by_key(Recipient::tier) {
             self.recipients.sort_by_key(Recipient::tier);
         }
-        if !self.pending.is_empty() {
-            self.tick_pending(now);
-        }
+        self.drop_pending_front(|p| now.saturating_sub(p.created) >= peer_timeout);
         self.ping(now);
         for k in 0..self.listeners.len() {
             self.pump(registry, k, now, true);
@@ -472,26 +479,6 @@ impl PublisherState {
             };
             recipient.last_ping = now;
             send_datagram(&listener.udp, recipient.addr, &ping);
-        }
-    }
-
-    /// Resends each challenge at the ping interval: the subscriber stops
-    /// sending hellos once the hello ack arrives, so a lost challenge or echo
-    /// is only recovered from here.
-    fn tick_pending(&mut self, now: Instant) {
-        let peer_timeout = self.config.peer_timeout;
-        self.retain_pending(|p| now.saturating_sub(p.created) < peer_timeout);
-        let heartbeat = self.config.udp.heartbeat_interval;
-        let session = self.stream.session();
-        for p in &mut self.pending {
-            if now.saturating_sub(p.sent_at) < heartbeat {
-                continue;
-            }
-            let Some(listener) = self.listeners.iter().find(|l| l.token == p.listener) else {
-                continue;
-            };
-            p.sent_at = now;
-            send_datagram(&listener.udp, p.addr, &wire::ping(session, p.challenge));
         }
     }
 
@@ -530,16 +517,30 @@ impl PublisherState {
                         p.listener == listener &&
                             p.addr == from &&
                             p.session == subscriber &&
-                            p.challenge == echo_ts &&
                             publisher == session
                     }) else {
-                        // A pending subscriber acks before its challenge
-                        // arrives, and a reset would make it start over.
-                        if !self.pending.iter().any(|p| p.listener == listener && p.addr == from) {
-                            self.send_reset(k, from, subscriber);
-                        }
+                        self.send_reset(k, from, subscriber);
                         return;
                     };
+                    let p = &mut self.pending[j];
+                    if ack_next < p.join {
+                        // It joined at a hello ack of an entry since dropped,
+                        // and waits for data this one will never send it.
+                        self.pending.remove(j);
+                        self.release();
+                        self.send_reset(k, from, subscriber);
+                        return;
+                    }
+                    if echo_ts != p.challenge {
+                        // Sent again only in reply, so a forged hello gets one
+                        // ping. A subscriber whose challenge was lost or
+                        // overwritten by another ping acks within two
+                        // heartbeats of silence, or at that ping.
+                        p.sent_at = now;
+                        let ping = wire::ping(session, p.challenge);
+                        send_datagram(&self.listeners[k].udp, from, &ping);
+                        return;
+                    }
                     let Some(i) = self.promote(j, now, tokens, dcache, deliver) else {
                         self.send_reset(k, from, subscriber);
                         return;
@@ -683,6 +684,10 @@ impl PublisherState {
         // Pushed before the old one goes, so the release that follows keeps
         // the stream from `join`.
         self.recipients.push(recipient);
+        // Another session pending here is stale: an address is one
+        // subscriber, and it just proved which session it runs.
+        let (listener, addr) = (p.listener, p.addr);
+        self.retain_pending(|q| q.listener != listener || q.addr != addr);
         let mut i = self.recipients.len() - 1;
         if let Some(old) = old {
             let old_token = self.recipients[old].token;
