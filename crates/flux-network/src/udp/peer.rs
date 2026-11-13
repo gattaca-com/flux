@@ -1175,17 +1175,20 @@ impl UdpPeer {
         }
         let first_seq = header.seq - index as u64;
         if total != 1 {
-            let known = self.rx.partials.iter().find(|p| p.first_seq == first_seq).map(|p| p.len);
-            // With no partial, a message begun below the ack point can never
-            // complete: every sequence there is taken. A duplicate below it is
-            // left to `accept`.
-            let dead = match known {
-                Some(known) => known != len,
-                None => first_seq < self.rx.ack_next && header.seq >= self.rx.ack_next,
-            };
-            if dead {
-                debug!(%self.addr, len, index, "udp fragment cannot complete its message");
-                return;
+            match self.rx.partials.iter().find(|p| p.first_seq == first_seq).map(|p| p.len) {
+                Some(known) if known != len => {
+                    debug!(%self.addr, len, index, "udp fragment disagrees on message length");
+                    return;
+                }
+                // With no partial, a message begun below the ack point can
+                // never complete. Its sequence is still taken: a reset need
+                // not land on a message boundary, and refusing it would have
+                // the sender resend it forever.
+                None if first_seq < self.rx.ack_next => {
+                    self.rx.accept(header.seq);
+                    return;
+                }
+                _ => {}
             }
         }
         if !self.rx.accept(header.seq) {
@@ -1543,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fragment_that_cannot_complete_is_refused_without_its_sequence() {
+    fn a_fragment_that_cannot_complete_strands_no_partial() {
         let config = cfg();
         let stride = config.stride();
         let mut peer =
@@ -1557,10 +1560,11 @@ mod tests {
             let header = Header { kind: Kind::Data, session: 7, seq, len, index, send_ts: 0 };
             peer.on_data(&header, &payload, None, now, &mut |_, _| panic!("delivered"));
         };
-        // Its first fragment, 9, lies below the ack point.
+        // Its first fragment, 9, lies below the ack point. Its sequence is
+        // still taken, or the sender would resend it forever.
         data(&mut peer, 10, 2 * stride as u32, 1);
         assert!(peer.rx.partials.is_empty());
-        assert_eq!(peer.rx.ack_next, 10);
+        assert_eq!(peer.rx.ack_next, 11);
         // Disagrees with the partial of 11 on the length.
         data(&mut peer, 11, 3 * stride as u32, 0);
         data(&mut peer, 12, 2 * stride as u32, 1);
