@@ -276,22 +276,6 @@ impl ClientConnection {
         id >= self.next_stream_id || id.is_multiple_of(2)
     }
 
-    /// Applies the last `SETTINGS_INITIAL_WINDOW_SIZE` of a frame in one
-    /// pass over the streams. Windows grow with the setting, so checking the
-    /// largest value of the frame rejects any value that would overflow one.
-    fn set_initial_window(&mut self, last: i64, largest: i64) -> Result<(), Error> {
-        let delta = last - self.peer_initial_window;
-        let growth = largest - self.peer_initial_window;
-        for stream in self.streams.values_mut() {
-            if stream.send_window + growth > MAX_WINDOW {
-                return Err(Error::FlowControl);
-            }
-            stream.send_window += delta;
-        }
-        self.peer_initial_window = last;
-        Ok(())
-    }
-
     fn on_frame(
         &mut self,
         frame: Frame<'_>,
@@ -306,14 +290,13 @@ impl ClientConnection {
                 self.settings_ack_pending = false;
             }
             Payload::Settings { ack: false, settings } => {
-                let mut initial_window = None;
+                let mut initial_window: Option<(i64, i64)> = None;
                 for (setting, value) in settings.iter() {
                     match setting {
                         3 => self.peer_max_streams = value,
                         4 => {
                             let value = i64::from(value);
-                            let largest =
-                                initial_window.map_or(value, |(_, max): (i64, i64)| max.max(value));
+                            let largest = initial_window.map_or(value, |(_, max)| max.max(value));
                             initial_window = Some((value, largest));
                         }
                         5 => self.peer_frame_size = value,
@@ -321,8 +304,19 @@ impl ClientConnection {
                         _ => {}
                     }
                 }
+                // Windows grow with the setting, so checking the largest
+                // value of the frame rejects any value that would overflow
+                // one; the last value is the one applied.
                 if let Some((last, largest)) = initial_window {
-                    self.set_initial_window(last, largest)?;
+                    let growth = largest - self.peer_initial_window;
+                    let delta = last - self.peer_initial_window;
+                    for stream in self.streams.values_mut() {
+                        if stream.send_window + growth > MAX_WINDOW {
+                            return Err(Error::FlowControl);
+                        }
+                        stream.send_window += delta;
+                    }
+                    self.peer_initial_window = last;
                 }
                 self.queue(kind::SETTINGS, flags::ACK, 0, &[])?;
                 handler(ClientEvent::Writable { stream_id: 0 });
