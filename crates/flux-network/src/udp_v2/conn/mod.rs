@@ -2,8 +2,14 @@
 //! its own stream and acks the other's; either side times out a silent
 //! peer. A lost connection drops what was queued on it: an initiator
 //! reconnects under a new session, an acceptor forgets it.
+//!
+//! A listener answers a hello but accepts its initiator only when a packet
+//! or ack names the acceptor session, which went out only in the hello ack:
+//! that proves the initiator receives at the address it sent from, which a
+//! forged source address cannot.
 
 use std::{
+    collections::VecDeque,
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut},
@@ -17,7 +23,7 @@ use tracing::{debug, error, info, warn};
 mod peer;
 mod wire;
 
-use peer::{Peer, Role, send_reset};
+use peer::{Peer, Role, send_hello_ack, send_reset};
 use wire::{Datagram, HELLO_ACK_SIZE};
 
 use super::{
@@ -38,6 +44,23 @@ struct Endpoint {
 struct Staged {
     peer: usize,
     packets: usize,
+}
+
+/// Each holds at most one handshake datagram's on-connect message, so a
+/// hello flood holds at most this many `max_datagram_size`s. Evicting the
+/// oldest keeps an initiator that confirms within a round trip from being
+/// crowded out unless this many hellos arrive in that round trip.
+const MAX_PENDING: usize = 1024;
+
+/// A hello answered on a listener, awaiting the packet or ack that names
+/// `acceptor`.
+struct Pending {
+    socket: Token,
+    addr: SocketAddr,
+    initiator: u32,
+    acceptor: u32,
+    created: Instant,
+    msg: Vec<u8>,
 }
 
 fn endpoint(endpoints: &[Endpoint], token: Token) -> usize {
@@ -92,6 +115,7 @@ pub(crate) struct State {
     telemetry: Telemetry,
     endpoints: Vec<Endpoint>,
     peers: Vec<Peer>,
+    pending: VecDeque<Pending>,
     /// A late hello retry for a dropped connection gets a reset instead of
     /// being accepted again.
     dropped: Vec<(SocketAddr, u32, Instant)>,
@@ -121,6 +145,7 @@ impl State {
             group,
             endpoints: Vec::new(),
             peers: Vec::new(),
+            pending: VecDeque::new(),
             dropped: Vec::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
             scratch: Vec::new(),
@@ -265,6 +290,7 @@ impl State {
                     self.lose(i, now);
                 }
             }
+            self.pending.retain(|p| p.socket != token);
         }
         let k = endpoint(&self.endpoints, token);
         self.endpoints.swap_remove(k).socket.close(registry);
@@ -515,6 +541,9 @@ impl State {
     fn tick(&mut self, registry: &Registry, now: Instant) {
         let peer_timeout = self.config.peer_timeout;
         self.dropped.retain(|&(_, _, at)| now.saturating_sub(at) < peer_timeout);
+        // An initiator confirms within a heartbeat_interval of the hello ack,
+        // and peer_timeout leaves room for one of those to be lost.
+        self.pending.retain(|p| now.saturating_sub(p.created) < peer_timeout);
         let mut i = self.peers.len();
         while i != 0 {
             i -= 1;
@@ -562,7 +591,7 @@ impl State {
         match datagram {
             Datagram::Hello { initiator, msg } => {
                 if self.endpoints[k].listener && on_connect_fits(&self.config, msg, from) {
-                    self.on_connect(k, initiator, msg, from, now, tokens, dcache, deliver);
+                    self.on_hello(k, initiator, msg, from, now, tokens);
                 }
             }
             Datagram::HelloAck { initiator, acceptor, msg } => {
@@ -573,6 +602,9 @@ impl State {
                 }
                 if !peer.connected {
                     peer.establish(acceptor, now);
+                    // Names the acceptor session at once: the listener
+                    // accepts us only once something does.
+                    peer.ack_due = true;
                     let token = peer.token;
                     // A reconnect can complete before post_poll drains the old disconnect.
                     self.drain_pending_disconnects(deliver);
@@ -585,8 +617,9 @@ impl State {
                 }
             }
             Datagram::Packet(packet) => {
-                let Some(i) = find(&self.peers, packet.session) else {
-                    send_reset(&self.endpoints[k].socket.udp, from, packet.session);
+                let Some(i) = find(&self.peers, packet.session).or_else(|| {
+                    self.confirm(k, packet.session, from, now, tokens, dcache, deliver)
+                }) else {
                     return;
                 };
                 let peer = &mut self.peers[i];
@@ -603,8 +636,9 @@ impl State {
                 });
             }
             Datagram::Ack { receiver, ack_next, bitmap } => {
-                let Some(i) = find(&self.peers, receiver) else {
-                    send_reset(&self.endpoints[k].socket.udp, from, receiver);
+                let Some(i) = find(&self.peers, receiver)
+                    .or_else(|| self.confirm(k, receiver, from, now, tokens, dcache, deliver))
+                else {
                     return;
                 };
                 let peer = &mut self.peers[i];
@@ -636,58 +670,121 @@ impl State {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn on_connect<F>(
+    /// Answers a hello on listener `k` without accepting it.
+    fn on_hello(
         &mut self,
         k: usize,
         initiator: u32,
         msg: &[u8],
         from: SocketAddr,
         now: Instant,
-        tokens: &mut Tokens,
-        dcache: Option<&DCache>,
-        deliver: &mut F,
-    ) where
-        F: for<'a> FnMut(Event<RxPayload<'a>>),
-    {
-        let group = self.group;
+        tokens: &Tokens,
+    ) {
         let listener = self.endpoints[k].socket.token;
+        let udp = &self.endpoints[k].socket.udp;
         if self.dropped.iter().any(|&(addr, session, _)| addr == from && session == initiator) {
-            send_reset(&self.endpoints[k].socket.udp, from, initiator);
+            send_reset(udp, from, initiator);
             return;
         }
         let reply = self.config.on_connect_msg.as_deref().unwrap_or_default();
-        if let Some(i) = self.peers.iter().position(|p| p.socket == listener && p.addr == from) {
-            if self.peers[i].remote_session == initiator {
-                // A retry: the hello ack was lost or is still on its way.
-                self.peers[i].last_recv = now;
-                self.peers[i].send_hello_ack(&self.endpoints[k].socket.udp, &mut self.ctrl, reply);
-                return;
-            }
+        // A retry: the hello ack was lost or is still on its way. It proves
+        // nothing about its sender, so it keeps nothing alive.
+        if let Some(peer) = self
+            .peers
+            .iter()
+            .find(|p| p.socket == listener && p.addr == from && p.remote_session == initiator)
+        {
+            send_hello_ack(udp, &mut self.ctrl, from, initiator, peer.session, reply);
+            return;
+        }
+        // Another session from this address never replaces a pending hello:
+        // its sender may have forged the address. Only a confirmed one
+        // replaces the peer there.
+        if let Some(p) = self
+            .pending
+            .iter()
+            .find(|p| p.socket == listener && p.addr == from && p.initiator == initiator)
+        {
+            send_hello_ack(udp, &mut self.ctrl, from, initiator, p.acceptor, reply);
+            return;
+        }
+        // Refused now, before the hello ack tells it it connected.
+        if !tokens.can_allocate() {
+            warn!(addr = %from, "network token range exhausted, udp peer refused");
+            return;
+        }
+        let mut session = new_session(initiator as usize);
+        while session == 0 ||
+            self.peers.iter().any(|p| p.socket == listener && p.session == session) ||
+            self.pending.iter().any(|p| p.socket == listener && p.acceptor == session)
+        {
+            session = session.wrapping_add(1);
+        }
+        if self.pending.len() == MAX_PENDING {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(Pending {
+            socket: listener,
+            addr: from,
+            initiator,
+            acceptor: session,
+            created: now,
+            msg: msg.to_vec(),
+        });
+        send_hello_ack(udp, &mut self.ctrl, from, initiator, session, reply);
+    }
+
+    /// A packet or ack on endpoint `k` naming no peer's session. One naming
+    /// a pending hello's acceptor session from its address accepts that
+    /// initiator; anything else gets a reset.
+    #[allow(clippy::too_many_arguments)]
+    fn confirm<F>(
+        &mut self,
+        k: usize,
+        session: u32,
+        from: SocketAddr,
+        now: Instant,
+        tokens: &mut Tokens,
+        dcache: Option<&DCache>,
+        deliver: &mut F,
+    ) -> Option<usize>
+    where
+        F: for<'a> FnMut(Event<RxPayload<'a>>),
+    {
+        let socket = self.endpoints[k].socket.token;
+        let Some(j) = self
+            .pending
+            .iter()
+            .position(|p| p.socket == socket && p.addr == from && p.acceptor == session)
+        else {
+            send_reset(&self.endpoints[k].socket.udp, from, session);
+            return None;
+        };
+        let pending = self.pending.remove(j).expect("found above");
+        let group = self.group;
+        // Any sender can open connections, so running out refuses one
+        // instead of panicking. The hello ack already told it it connected.
+        let Some(token) = tokens.try_allocate(group) else {
+            warn!(addr = %from, "network token range exhausted, udp peer refused");
+            send_reset(&self.endpoints[k].socket.udp, from, session);
+            return None;
+        };
+        // A reset can lose the peer this one replaces before post_poll
+        // reports it.
+        self.drain_pending_disconnects(deliver);
+        if let Some(i) = self.peers.iter().position(|p| p.socket == socket && p.addr == from) {
             // The peer started over.
             let old = self.remove_acceptor(i, now);
             deliver(Event::Disconnected { group, token: old, peer_addr: from });
         }
-        // Any sender can open sessions, so running out refuses one instead
-        // of panicking.
-        let Some(token) = tokens.try_allocate(group) else {
-            warn!(addr = %from, "network token range exhausted, peer refused");
-            return;
-        };
-        let mut session = new_session(token.0);
-        while session == 0 ||
-            self.peers.iter().any(|p| p.socket == listener && p.session == session)
-        {
-            session = session.wrapping_add(1);
-        }
-        let mut peer = Peer::new(from, token, listener, Role::Acceptor, session, &self.config, now);
-        peer.establish(initiator, now);
-        let reply = self.config.on_connect_msg.as_deref().unwrap_or_default();
-        peer.send_hello_ack(&self.endpoints[k].socket.udp, &mut self.ctrl, reply);
+        let mut peer =
+            Peer::new(from, token, socket, Role::Acceptor, pending.acceptor, &self.config, now);
+        peer.establish(pending.initiator, now);
         self.peers.push(peer);
         info!(addr = %from, "udp peer connected");
         deliver(Event::Accepted { group, token, peer_addr: from });
-        deliver_on_connect(group, token, msg, dcache, deliver);
+        deliver_on_connect(group, token, &pending.msg, dcache, deliver);
+        Some(self.peers.len() - 1)
     }
 
     fn handle_event<F>(
