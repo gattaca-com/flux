@@ -978,6 +978,9 @@ impl UdpPeer {
         self.close_when_drained = false;
         self.remote_session = None;
         self.local_session = new_session;
+        // An ack still owed to the old session would go out under the new
+        // one and ack sequences the remote's new peer has only just sent.
+        self.ack_due = false;
         if drop_backlog {
             self.tx.clear(store);
         } else {
@@ -1605,6 +1608,21 @@ mod tests {
         header.len = 1;
         header.kind = Kind::Reset;
         assert!(!peer.needs_reset(&header), "old reset cannot drop the new session");
+    }
+
+    #[test]
+    fn reset_drops_the_ack_owed_to_the_old_session() {
+        let mut peer =
+            UdpPeer::new("127.0.0.1:1".parse().unwrap(), Token(0), Token(0), 1, &group(cfg()));
+        let now = Instant::now();
+        let mut header =
+            Header { kind: Kind::HelloAck, session: 2, seq: 0, len: 1, index: 0, send_ts: 0 };
+        assert_eq!(peer.on_hello_ack(&header, now), Some(false));
+        header.kind = Kind::Data;
+        peer.on_data(&header, &[7], None, now, &mut |_, _| {});
+
+        peer.mark_disconnected(false, 3, &mut MsgStore::new());
+        assert!(!peer.take_ack_due(), "would ack the old session's sequences under the new one");
     }
 
     #[test]
