@@ -119,8 +119,11 @@ fn sendmmsg(fd: RawFd, hdrs: &mut [MMsgHdr]) -> libc::c_int {
 
 /// Even a pair saves an skb through the stack.
 const GSO_MIN_SEGMENTS: usize = 2;
-/// `UDP_MAX_SEGMENTS` of the first kernels with `UDP_SEGMENT`.
-const GSO_MAX_SEGMENTS: usize = 64;
+/// Half the kernel's `UDP_MAX_SEGMENTS` (64). A queueing discipline that
+/// round-robins destinations, such as `fq_codel`, only switches between whole
+/// entries, so smaller entries interleave a burst's destinations more finely.
+/// 32 costs about the same CPU as 64; 16 and below cost measurably more.
+const GSO_MAX_SEGMENTS: usize = 32;
 const UIO_MAXIOV: usize = 1024;
 const COPY_THRESHOLD: usize = 256;
 
