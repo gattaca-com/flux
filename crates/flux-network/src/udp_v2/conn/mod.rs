@@ -591,7 +591,7 @@ impl State {
         match datagram {
             Datagram::Hello { initiator, msg } => {
                 if self.endpoints[k].listener && on_connect_fits(&self.config, msg, from) {
-                    self.on_hello(k, initiator, msg, from, now);
+                    self.on_hello(k, initiator, msg, from, now, tokens);
                 }
             }
             Datagram::HelloAck { initiator, acceptor, msg } => {
@@ -671,7 +671,15 @@ impl State {
     }
 
     /// Answers a hello on listener `k` without accepting it.
-    fn on_hello(&mut self, k: usize, initiator: u32, msg: &[u8], from: SocketAddr, now: Instant) {
+    fn on_hello(
+        &mut self,
+        k: usize,
+        initiator: u32,
+        msg: &[u8],
+        from: SocketAddr,
+        now: Instant,
+        tokens: &Tokens,
+    ) {
         let listener = self.endpoints[k].socket.token;
         let udp = &self.endpoints[k].socket.udp;
         if self.dropped.iter().any(|&(addr, session, _)| addr == from && session == initiator) {
@@ -698,6 +706,11 @@ impl State {
             .find(|p| p.socket == listener && p.addr == from && p.initiator == initiator)
         {
             send_hello_ack(udp, &mut self.ctrl, from, initiator, p.acceptor, reply);
+            return;
+        }
+        // Refused now, before the hello ack tells it it connected.
+        if !tokens.can_allocate() {
+            warn!(addr = %from, "network token range exhausted, udp peer refused");
             return;
         }
         let mut session = new_session(initiator as usize);
@@ -750,9 +763,10 @@ impl State {
         let pending = self.pending.remove(j).expect("found above");
         let group = self.group;
         // Any sender can open connections, so running out refuses one
-        // instead of panicking.
+        // instead of panicking. The hello ack already told it it connected.
         let Some(token) = tokens.try_allocate(group) else {
             warn!(addr = %from, "network token range exhausted, udp peer refused");
+            send_reset(&self.endpoints[k].socket.udp, from, session);
             return None;
         };
         // A reset can lose the peer this one replaces before post_poll
