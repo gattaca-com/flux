@@ -656,10 +656,8 @@ impl TcpManager {
             return false;
         }
 
-        let mut stream = FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
-        if is_tls {
-            stream.send_queue.framed = false;
-        }
+        let mut stream =
+            FramedStream::new(socket, token, peer_addr, config, dcache.is_some(), is_tls);
         // A replayed frame always restarts at its header, whatever a failed
         // drain left `head` at; done before the dedupe below reads the queue.
         self.connections[index].backlog.rewind_to_frame();
@@ -789,8 +787,9 @@ impl TcpManager {
                     peer_addr,
                     config.framing,
                 );
+                let is_tls = tls.is_some();
                 let mut stream =
-                    FramedStream::new(socket, token, peer_addr, config, dcache.is_some());
+                    FramedStream::new(socket, token, peer_addr, config, dcache.is_some(), is_tls);
                 if let Some(message) = config.on_connect_msg.as_deref() {
                     let header = (config.framing == Framing::LengthPrefixed).then(|| {
                         let mut header = [0; FRAME_HEADER_SIZE];
@@ -1815,6 +1814,7 @@ impl FramedStream {
         peer_addr: SocketAddr,
         config: &TcpGroupConfig,
         dcache: bool,
+        tls: bool,
     ) -> Self {
         // Receive buffers are allocated by the first read, so connections that
         // never send cost no buffer.
@@ -1825,7 +1825,8 @@ impl FramedStream {
             peer_addr,
             rx_buffer: RxBuffer { bytes: Vec::new(), head: 0, tail: 0 },
             send_queue: ByteQueue {
-                framed: config.framing == Framing::LengthPrefixed,
+                // Under TLS the queue holds records, not frames.
+                framed: config.framing == Framing::LengthPrefixed && !tls,
                 ..ByteQueue::default()
             },
             writable_armed: false,
@@ -2337,7 +2338,7 @@ mod tests {
             max_frame_size: 1024,
             ..Default::default()
         };
-        let mut stream = FramedStream::new(socket, Token(0), peer_addr, &config, false);
+        let mut stream = FramedStream::new(socket, Token(0), peer_addr, &config, false, false);
         let fill = [0; 4096];
         loop {
             match stream.socket.write(&fill) {
