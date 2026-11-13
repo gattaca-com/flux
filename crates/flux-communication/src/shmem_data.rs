@@ -73,7 +73,9 @@ impl<T> ShmemData<T> {
                             shmem_file.display()
                         );
                         // A link that could not be removed would make the retry loop forever.
-                        if let Err(removal) = crate::cleanup_flink(shmem_file) {
+                        if let Err(removal) = std::fs::remove_file(shmem_file) &&
+                            removal.kind() != std::io::ErrorKind::NotFound
+                        {
                             tracing::warn!("couldn't replace {}: {removal}", shmem_file.display());
                             return Err(e);
                         }
@@ -169,10 +171,7 @@ impl<T> AsRef<T> for ShmemData<T> {
 
 #[cfg(test)]
 mod tests {
-    use flux_utils::{directories::shmem_dir_data_with_base, short_typename};
-    use shared_memory::ShmemError;
-
-    use super::ShmemData;
+    use super::{ShmemData, ShmemError, shmem_dir_data_with_base, short_typename};
 
     mod small {
         pub struct Blob(pub u64);
