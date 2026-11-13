@@ -28,22 +28,8 @@ fn delivers_one_event() {
         thread::sleep(Duration::from_secs(10));
     });
 
-    let mut net = Network::default();
-    let mut sse = Sse::new(addr, "/eth/v1/events").with_query(&[("topics", "head")]);
-    sse.connect(&mut net);
-    let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && seen.len() < 2 {
-        net.poll_with(|event| {
-            sse.on_event(&event);
-        });
-        sse.drive(&mut net, |event| match event {
-            SseEvent::Open => seen.push(("open".to_owned(), Vec::new())),
-            SseEvent::Message { kind, data } => seen.push((kind.to_owned(), data.to_vec())),
-            _ => {}
-        });
-        thread::sleep(Duration::from_millis(1));
-    }
+    let sse = Sse::new(addr, "/eth/v1/events").with_query(&[("topics", "head")]);
+    let seen = collect(sse, |seen| seen.len() == 2);
     let want = [("open".to_owned(), Vec::new()), ("head".to_owned(), b"{\"slot\":1}".to_vec())];
     assert_eq!(seen, want);
 }
@@ -66,34 +52,43 @@ fn oversized_event_ends_stream() {
             socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let mut request = [0u8; 1024];
             assert!(socket.read(&mut request).unwrap() > 0);
-            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            // One write, so the client cannot close the connection before the
+            // peer has sent everything.
+            let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
             for chunk in body.chunks(limit) {
-                socket.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).unwrap();
-                socket.write_all(chunk).unwrap();
-                socket.write_all(b"\r\n").unwrap();
+                response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                response.extend_from_slice(chunk);
+                response.extend_from_slice(b"\r\n");
             }
+            socket.write_all(&response).unwrap();
             while matches!(socket.read(&mut request), Ok(n) if n > 0) {}
         });
 
-        let mut net = Network::default();
-        let mut sse = Sse::new(addr, "/").with_http(|http| http.with_max_body_bytes(limit));
-        sse.connect(&mut net);
-        let mut seen = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && seen.last() != Some(&("gap".to_owned(), Vec::new())) {
-            net.poll_with(|event| {
-                sse.on_event(&event);
-            });
-            sse.drive(&mut net, |event| match event {
-                SseEvent::Open => seen.push(("open".to_owned(), Vec::new())),
-                SseEvent::Message { kind, data } => seen.push((kind.to_owned(), data.to_vec())),
-                SseEvent::Gap => seen.push(("gap".to_owned(), Vec::new())),
-                SseEvent::Status(_) => {}
-            });
-            thread::sleep(Duration::from_millis(1));
-        }
+        let sse = Sse::new(addr, "/").with_http(|http| http.with_max_body_bytes(limit));
+        let seen = collect(sse, |seen| seen.last().is_some_and(|(kind, _)| kind == "gap"));
         let want = [("open".to_owned(), Vec::new()), event.clone(), ("gap".to_owned(), Vec::new())];
         assert_eq!(seen, want);
         peer.join().unwrap();
     }
+}
+
+/// Drives `sse` until `done` holds for the events seen so far, or a deadline.
+fn collect(mut sse: Sse, done: impl Fn(&[(String, Vec<u8>)]) -> bool) -> Vec<(String, Vec<u8>)> {
+    let mut net = Network::default();
+    sse.connect(&mut net);
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !done(&seen) {
+        net.poll_with(|event| {
+            sse.on_event(&event);
+        });
+        sse.drive(&mut net, |event| match event {
+            SseEvent::Open => seen.push(("open".to_owned(), Vec::new())),
+            SseEvent::Message { kind, data } => seen.push((kind.to_owned(), data.to_vec())),
+            SseEvent::Gap => seen.push(("gap".to_owned(), Vec::new())),
+            SseEvent::Status(_) => {}
+        });
+        thread::sleep(Duration::from_millis(1));
+    }
+    seen
 }

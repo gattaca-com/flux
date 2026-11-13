@@ -31,7 +31,7 @@ use std::{fmt::Write as _, net::SocketAddr};
 
 use flux_network::{
     NetworkCore, NetworkEvent, Token,
-    http::{HttpEvent, HttpNetwork},
+    http::{HttpEvent, HttpNetwork, StreamEnd},
 };
 use flux_timing::Duration;
 
@@ -163,14 +163,17 @@ impl Sse {
                     ended = true;
                 }
             }
-            HttpEvent::StreamEnd { .. } => {
+            HttpEvent::StreamEnd { reason, .. } => {
                 // A partial event cannot be completed, and the bytes after it
                 // are gone, so the caller resyncs instead.
                 parser.reset();
                 if std::mem::take(open) {
                     handler(SseEvent::Gap);
                 }
-                ended = true;
+                // A disconnected stream's connection is already closed, and
+                // the endpoint may be redialling by the time this is seen, so
+                // disconnecting again could abort the new attempt.
+                ended |= reason == StreamEnd::Complete;
             }
             _ => {}
         });
