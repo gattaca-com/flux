@@ -9,12 +9,13 @@
 //! the messages it carries.
 
 use std::{
+    hash::{BuildHasher, RandomState},
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
 };
 
-use flux_timing::{Instant, Nanos};
+use flux_timing::Nanos;
 use flux_utils::DCache;
 use mio::{Interest, Registry, Token, net::UdpSocket};
 use tracing::{debug, warn};
@@ -58,16 +59,11 @@ pub(crate) fn send_datagram(socket: &UdpSocket, addr: SocketAddr, bytes: &[u8]) 
     }
 }
 
+/// Keyed from the thread's random keys, so a sender off the path cannot
+/// predict it: an acceptor session sent only in a hello ack proves the
+/// initiator's address.
 pub(crate) fn new_session(salt: usize) -> u32 {
-    let t = Instant::now().0;
-    let mut x = t ^
-        (t >> 32) ^
-        (u64::from(std::process::id()) << 20) ^
-        (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    x ^= x >> 33;
-    x as u32
+    RandomState::new().hash_one(salt) as u32
 }
 
 fn packets_per_message(udp: &UdpConfig) -> usize {

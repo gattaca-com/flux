@@ -9,8 +9,7 @@
 //! forged source address cannot.
 
 use std::{
-    collections::hash_map::RandomState,
-    hash::BuildHasher,
+    collections::VecDeque,
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut},
@@ -116,10 +115,7 @@ pub(crate) struct State {
     telemetry: Telemetry,
     endpoints: Vec<Endpoint>,
     peers: Vec<Peer>,
-    pending: Vec<Pending>,
-    /// Keys acceptor sessions, which an off-path sender must not predict.
-    sessions: RandomState,
-    next_session: u64,
+    pending: VecDeque<Pending>,
     /// A late hello retry for a dropped connection gets a reset instead of
     /// being accepted again.
     dropped: Vec<(SocketAddr, u32, Instant)>,
@@ -149,9 +145,7 @@ impl State {
             group,
             endpoints: Vec::new(),
             peers: Vec::new(),
-            pending: Vec::new(),
-            sessions: RandomState::new(),
-            next_session: 0,
+            pending: VecDeque::new(),
             dropped: Vec::new(),
             send_buffer: Vec::with_capacity(32 * 1024),
             scratch: Vec::new(),
@@ -695,39 +689,35 @@ impl State {
             send_hello_ack(udp, &mut self.ctrl, from, initiator, peer.session, reply);
             return;
         }
-        let slot = self.pending.iter().position(|p| p.socket == listener && p.addr == from);
-        if let Some(p) = slot.map(|j| &self.pending[j]) &&
-            p.initiator == initiator
+        // Another session from this address never replaces a pending hello:
+        // its sender may have forged the address. Only a confirmed one
+        // replaces the peer there.
+        if let Some(p) = self
+            .pending
+            .iter()
+            .find(|p| p.socket == listener && p.addr == from && p.initiator == initiator)
         {
             send_hello_ack(udp, &mut self.ctrl, from, initiator, p.acceptor, reply);
             return;
         }
-        let mut session = self.sessions.hash_one(self.next_session) as u32;
-        self.next_session += 1;
+        let mut session = new_session(initiator as usize);
         while session == 0 ||
             self.peers.iter().any(|p| p.socket == listener && p.session == session) ||
             self.pending.iter().any(|p| p.socket == listener && p.acceptor == session)
         {
             session = session.wrapping_add(1);
         }
-        let entry = Pending {
+        if self.pending.len() == MAX_PENDING {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(Pending {
             socket: listener,
             addr: from,
             initiator,
             acceptor: session,
             created: now,
             msg: msg.to_vec(),
-        };
-        match slot {
-            Some(j) => self.pending[j] = entry,
-            None if self.pending.len() < MAX_PENDING => self.pending.push(entry),
-            None => {
-                let oldest = (0..self.pending.len())
-                    .min_by_key(|&j| self.pending[j].created.0)
-                    .expect("pending is full");
-                self.pending[oldest] = entry;
-            }
-        }
+        });
         send_hello_ack(udp, &mut self.ctrl, from, initiator, session, reply);
     }
 
@@ -757,7 +747,7 @@ impl State {
             send_reset(&self.endpoints[k].socket.udp, from, session);
             return None;
         };
-        let pending = self.pending.swap_remove(j);
+        let pending = self.pending.remove(j).expect("found above");
         let group = self.group;
         // Any sender can open connections, so running out refuses one
         // instead of panicking.

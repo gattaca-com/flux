@@ -909,6 +909,7 @@ const HELLO: u8 = 1;
 const HELLO_ACK: u8 = 2;
 const PACKET: u8 = 3;
 const ACK: u8 = 4;
+const RESET: u8 = 5;
 
 fn raw_peer() -> UdpSocket {
     let raw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1036,6 +1037,49 @@ fn udp_unconfirmed_hello_keeps_the_live_peer() {
         thread::sleep(Duration::from_micros(50));
     }
     assert_eq!(events, [("accept", token), ("message", token)]);
+}
+
+/// A hello under another session from a pending initiator's address leaves
+/// that initiator pending, so naming its acceptor session still accepts it.
+#[test]
+fn udp_second_hello_keeps_the_pending_one() {
+    /// Sends a hello and returns the acceptor session from its hello ack.
+    fn hello(server: &mut Network, raw: &UdpSocket, to: SocketAddr, initiator: u32) -> u32 {
+        raw.send_to(&conn_datagram(HELLO, &[&initiator.to_le_bytes()]), to).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no hello ack");
+            server.poll_with(|_| {});
+            while let Some(d) = raw_recv(raw) {
+                if d[2] & 0x0f == HELLO_ACK && session_at(&d, 3) == initiator {
+                    return session_at(&d, 7);
+                }
+            }
+            thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    let addr = free_addr();
+    let mut server = Network::default();
+    let server_group =
+        server.add_group(UdpGroupConfigV2 { udp: UdpConfig::lan(), ..Default::default() });
+    server.listen(server_group, addr).unwrap();
+    let raw = raw_peer();
+
+    let acceptor = hello(&mut server, &raw, addr, 1);
+    hello(&mut server, &raw, addr, 2);
+    raw.send_to(&conn_datagram(ACK, &[&acceptor.to_le_bytes(), &0u64.to_le_bytes()]), addr)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut accepted = false;
+    while !accepted {
+        assert!(Instant::now() < deadline, "not accepted");
+        server.poll_with(|e| accepted |= matches!(e, NetworkEvent::Accepted { .. }));
+        while let Some(d) = raw_recv(&raw) {
+            assert_ne!(d[2] & 0x0f, RESET, "reset the pending initiator");
+        }
+        thread::sleep(Duration::from_micros(50));
+    }
 }
 
 /// Batched sends queue every item before one flush and lose none.
