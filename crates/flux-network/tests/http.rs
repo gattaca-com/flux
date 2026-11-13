@@ -595,6 +595,8 @@ fn assert_chunked_response_disconnect(response: &'static [u8], max_headers: usiz
         let mut request = [0; 1024];
         let _ = stream.read(&mut request);
         stream.write_all(response).unwrap();
+        // Stays connected, so only the client can end the exchange.
+        let _ = stream.read(&mut request);
     });
     let mut net = Network::default();
     let mut client = HttpNetwork::default().with_max_headers(max_headers);
@@ -617,8 +619,8 @@ fn assert_chunked_response_disconnect(response: &'static [u8], max_headers: usiz
         }
         thread::sleep(Duration::from_millis(1));
     }
-    peer.join().unwrap();
     assert_eq!(disconnected, 1);
+    peer.join().unwrap();
 }
 
 #[test]
@@ -630,6 +632,14 @@ fn client_chunked_malformed_trailers_rejected() {
     assert_chunked_response_disconnect(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nOne: 1\r\nTwo: 2\r\n\r\n",
         1,
+    );
+}
+
+#[test]
+fn client_chunked_bad_chunk_terminator_rejected() {
+    assert_chunked_response_disconnect(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n",
+        64,
     );
 }
 
