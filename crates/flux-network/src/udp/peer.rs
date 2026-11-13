@@ -978,6 +978,9 @@ impl UdpPeer {
         self.close_when_drained = false;
         self.remote_session = None;
         self.local_session = new_session;
+        // An ack still owed to the old session would go out under the new
+        // one and ack sequences the remote's new peer has only just sent.
+        self.ack_due = false;
         if drop_backlog {
             self.tx.clear(store);
         } else {
@@ -1582,6 +1585,7 @@ mod tests {
         assert_eq!(peer.on_hello_ack(&header, now), Some(false));
         assert!(!peer.needs_reset(&header), "duplicate reply from the same peer");
         assert_eq!(peer.on_hello_ack(&header, now), None);
+        peer.on_data(&Header { kind: Kind::Data, ..header }, &[7], None, now, &mut |_, _| {});
 
         header.session = 3;
         assert!(peer.needs_reset(&header), "listener accepted a retry after losing our peer");
@@ -1593,6 +1597,7 @@ mod tests {
         assert!(peer.needs_reset(&header), "reset naming our session");
 
         peer.mark_disconnected(false, 4, &mut MsgStore::new());
+        assert!(!peer.take_ack_due(), "would ack the old session's sequences under the new one");
         assert!(!peer.needs_reset(&header), "already reconnecting");
         header.kind = Kind::HelloAck;
         assert_eq!(
