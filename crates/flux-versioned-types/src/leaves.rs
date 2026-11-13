@@ -139,3 +139,12 @@ pub const fn names_disjoint(a: &[&str], b: &[&str]) -> bool {
 pub const fn name_fits(name: &str) -> bool {
     name.len() <= TYPE_NAME_LEN
 }
+
+/// Whether `name` is one path component.
+///
+/// It must be non-empty, not `.` or `..`, and free of `/`, `\` and NUL. On a
+/// receiver a blob's `type_name` and any sender-supplied metadata are
+/// untrusted; check them with this before using them as a path component.
+pub fn name_is_path_component(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\\', '\0'])
+}
