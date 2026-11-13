@@ -21,7 +21,11 @@ mod scram;
 use std::{collections::VecDeque, net::SocketAddr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use bson::{Bson, Document, doc};
+use bson::{
+    Bson, Document, doc,
+    raw::{RawBsonRef, RawDocument, RawIter},
+    spec::ElementType,
+};
 use flux_network::{
     Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig, Token,
 };
@@ -37,6 +41,13 @@ const NONCE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV
 const DEFAULT_AUTH_SOURCE: &str = "admin";
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 << 20;
 const DEFAULT_MAX_QUEUED_BYTES: usize = 256 << 20;
+/// Deepest document nesting accepted in a reply: the server's highest
+/// `maxBSONDepth` (250, of which stored documents may use all but 20 levels)
+/// plus slack. It also bounds the BSON decoder's recursion, which at this
+/// depth takes under 1 MiB of stack in a release build but about 4 MiB in a
+/// debug build, so debug builds need a larger tile stack than the 2 MiB
+/// default (`TileConfig::with_stack_size`, for example 8 MiB).
+const MAX_REPLY_DEPTH: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommandId(u64);
@@ -424,6 +435,9 @@ impl Mongo {
     }
 
     fn parse_reply(frame: &[u8]) -> Result<(i32, Document), Error> {
+        if frame.len() < HEADER_LEN + 5 {
+            return Err(Error::Protocol("truncated reply"));
+        }
         let opcode = i32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
         if opcode != OP_MSG {
             return Err(Error::Protocol("unexpected opcode"));
@@ -451,6 +465,7 @@ impl Mongo {
         if body.len() != doc_len as usize {
             return Err(Error::Protocol("trailing bytes in reply"));
         }
+        check_depth(body)?;
         Document::from_reader(&body[..doc_len as usize])
             .map(|reply| (response_to, reply))
             .map_err(|_| Error::Protocol("invalid BSON in reply"))
@@ -473,6 +488,50 @@ impl Mongo {
             message: reply.get_str("errmsg").unwrap_or("unknown server error").to_owned(),
         }
     }
+}
+
+/// Rejects a reply nested deeper than [`MAX_REPLY_DEPTH`] documents. The BSON
+/// decoder recurses once per level, so this walks the same elements the
+/// decoder visits without recursion first, and rejects any it cannot walk so
+/// that only bytes whose depth it has bounded reach the decoder. A
+/// code-with-scope value costs the decoder two levels, so it is charged two.
+fn check_depth(body: &[u8]) -> Result<(), Error> {
+    let invalid = |_| Error::Protocol("invalid BSON in reply");
+    let mut open: [Option<(RawIter<'_>, usize)>; MAX_REPLY_DEPTH] =
+        [const { None }; MAX_REPLY_DEPTH];
+    open[0] = Some((RawDocument::from_bytes(body).map_err(invalid)?.iter_elements(), 1));
+    let (mut len, mut depth) = (1usize, 1);
+    while let Some((elements, cost)) = len.checked_sub(1).and_then(|top| open[top].as_mut()) {
+        let Some(element) = elements.next() else {
+            depth -= *cost;
+            len -= 1;
+            continue;
+        };
+        let element = element.map_err(invalid)?;
+        if !matches!(
+            element.element_type(),
+            ElementType::EmbeddedDocument |
+                ElementType::Array |
+                ElementType::JavaScriptCodeWithScope
+        ) {
+            continue;
+        }
+        let (child, cost) = match element.value().map_err(invalid)? {
+            RawBsonRef::Document(doc) => (doc, 1),
+            RawBsonRef::Array(array) => {
+                (RawDocument::from_bytes(array.as_bytes()).map_err(invalid)?, 1)
+            }
+            RawBsonRef::JavaScriptCodeWithScope(code) => (code.scope, 2),
+            _ => continue,
+        };
+        depth += cost;
+        if depth > MAX_REPLY_DEPTH {
+            return Err(Error::Protocol("reply nests too deep"));
+        }
+        open[len] = Some((child.iter_elements(), cost));
+        len += 1;
+    }
+    Ok(())
 }
 
 impl State {
@@ -685,5 +744,86 @@ impl Startup {
         })?;
         auth.take();
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply_frame(body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(HEADER_LEN + 5 + body.len());
+        frame.extend_from_slice(&((HEADER_LEN + 5 + body.len()) as i32).to_le_bytes());
+        frame.extend_from_slice(&0i32.to_le_bytes());
+        frame.extend_from_slice(&7i32.to_le_bytes());
+        frame.extend_from_slice(&OP_MSG.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.push(0);
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut body = Vec::with_capacity(depth * 8 + 5);
+        for level in 0..depth {
+            body.extend_from_slice(&(((depth - level) * 8 + 5) as i32).to_le_bytes());
+            body.extend_from_slice(&[0x03, b'a', 0]);
+        }
+        body.extend_from_slice(&[5, 0, 0, 0, 0]);
+        body.resize(body.len() + depth, 0);
+        body
+    }
+
+    #[test]
+    fn short_frame_is_a_protocol_error() {
+        let mut frame = reply_frame(&[]);
+        frame.truncate(HEADER_LEN);
+        frame[..4].copy_from_slice(&(HEADER_LEN as i32).to_le_bytes());
+        assert_eq!(Mongo::parse_reply(&frame), Err(Error::Protocol("truncated reply")));
+    }
+
+    #[test]
+    fn deeply_nested_reply_is_a_protocol_error() {
+        let mut body = nested(10_000);
+        let frame = reply_frame(&body);
+        assert_eq!(Mongo::parse_reply(&frame), Err(Error::Protocol("reply nests too deep")));
+        for level in 1..10_000 {
+            body[level * 7..level * 7 + 4].copy_from_slice(&5i32.to_le_bytes());
+        }
+        let frame = reply_frame(&body);
+        assert_eq!(Mongo::parse_reply(&frame), Err(Error::Protocol("invalid BSON in reply")));
+    }
+
+    #[test]
+    fn reply_nested_to_the_limit_decodes() {
+        let decode = || {
+            let frame = reply_frame(&nested(MAX_REPLY_DEPTH - 1));
+            let (response_to, mut reply) = Mongo::parse_reply(&frame).expect("reply decodes");
+            assert_eq!(response_to, 7);
+            let mut depth = 1;
+            while let Ok(inner) = reply.get_document("a") {
+                reply = inner.clone();
+                depth += 1;
+            }
+            assert_eq!(depth, MAX_REPLY_DEPTH);
+        };
+        std::thread::Builder::new().stack_size(8 << 20).spawn(decode).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn code_with_scope_is_charged_two_levels() {
+        let mut body = vec![5, 0, 0, 0, 0];
+        for _ in 0..MAX_REPLY_DEPTH / 2 {
+            let mut outer = vec![0; 4];
+            outer.extend_from_slice(&[0x0F, b'a', 0]);
+            outer.extend_from_slice(&((10 + body.len()) as i32).to_le_bytes());
+            outer.extend_from_slice(&[2, 0, 0, 0, b'c', 0]);
+            outer.extend_from_slice(&body);
+            outer.push(0);
+            let len = outer.len() as i32;
+            outer[..4].copy_from_slice(&len.to_le_bytes());
+            body = outer;
+        }
+        assert_eq!(check_depth(&body), Err(Error::Protocol("reply nests too deep")));
     }
 }
