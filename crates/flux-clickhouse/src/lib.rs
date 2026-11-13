@@ -162,13 +162,16 @@ impl Packet {
                     let raw = read_compressed(cursor, budget)?;
                     let bytes = raw.len();
                     let mut inner = Cursor::new(&raw);
+                    inner.budget = budget;
                     let Some(block) = Output::read_resume(&mut inner, &mut None) else {
+                        cursor.too_large = inner.too_large;
                         cursor.invalid = inner.invalid.or(Some("compressed block holds no block"));
                         return None
                     };
                     (block, bytes)
                 } else {
                     let before = cursor.remaining();
+                    cursor.budget = budget;
                     let block = Output::read_resume(cursor, resume)?;
                     (block, before - cursor.remaining())
                 };
