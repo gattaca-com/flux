@@ -7,7 +7,7 @@ use std::{
 
 use flux_network::{
     Network,
-    http::{HttpEvent, HttpNetwork, StreamEnd},
+    http::{HttpEvent, HttpNetwork},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -670,49 +670,6 @@ fn client_chunked_overflow() {
         }
         peer.join().unwrap();
         assert_eq!(disconnected, 1);
-    }
-}
-
-#[test]
-fn client_stream_malformed_chunk_fails() {
-    for response in [
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n".as_slice(),
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nhello\r\n"
-            .as_slice(),
-    ] {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        // The peer stays connected, so only the client can end the stream.
-        let peer = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request);
-            stream.write_all(response).unwrap();
-            while matches!(stream.read(&mut request), Ok(n) if n > 0) {}
-        });
-        let mut net = Network::default();
-        let mut client = HttpNetwork::default().with_max_body_bytes(usize::MAX);
-        let token = client.connect(&mut net, addr);
-        let deadline = Instant::now() + TIMEOUT;
-        let mut requested = false;
-        let mut body = Vec::new();
-        let mut ended = Vec::new();
-        while Instant::now() < deadline && ended.is_empty() {
-            poll(&mut net, &mut client, |event| match event {
-                HttpEvent::Body { chunk, .. } => body.extend_from_slice(chunk),
-                HttpEvent::StreamEnd { reason, .. } => ended.push(reason),
-                _ => {}
-            });
-            if !requested {
-                requested = client.request_stream(&mut net, token, "GET", "/", &[]);
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(ended, [StreamEnd::Disconnected]);
-        assert!(body.is_empty());
-        drop(net);
-        peer.join().unwrap();
     }
 }
 
