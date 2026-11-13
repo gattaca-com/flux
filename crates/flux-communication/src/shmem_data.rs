@@ -65,14 +65,22 @@ impl<T> ShmemData<T> {
                 Ok(Self { inner })
             }
             Err(ShmemError::LinkExists) => {
-                let Ok(mut shmem) = ShmemConf::new().flink(shmem_file).open().inspect_err(|e| {
-                    tracing::warn!(
-                        "couldn't open shmem file {}, removing and retrying: {e}",
-                        shmem_file.display()
-                    );
-                }) else {
-                    let _ = std::fs::remove_file(shmem_file);
-                    return Self::open_or_init_locked(shmem_file, init_f);
+                let mut shmem = match ShmemConf::new().flink(shmem_file).open() {
+                    Ok(shmem) => shmem,
+                    Err(e) => {
+                        tracing::warn!(
+                            "couldn't open shmem file {}, removing and retrying: {e}",
+                            shmem_file.display()
+                        );
+                        // A link that could not be removed would make the retry loop forever.
+                        if let Err(removal) = std::fs::remove_file(shmem_file) &&
+                            removal.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!("couldn't replace {}: {removal}", shmem_file.display());
+                            return Err(e);
+                        }
+                        return Self::open_or_init_locked(shmem_file, init_f);
+                    }
                 };
 
                 // `<`: some platforms round segment sizes up to a page.
@@ -163,7 +171,7 @@ impl<T> AsRef<T> for ShmemData<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::ShmemData;
+    use super::{ShmemData, ShmemError, shmem_dir_data_with_base, short_typename};
 
     mod small {
         pub struct Blob(pub u64);
@@ -185,6 +193,17 @@ mod tests {
         assert_eq!(large.0, [7; 2048]);
         assert_eq!(large.1, 7);
         crate::cleanup_shmem(dir.path());
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_replaced_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = shmem_dir_data_with_base(dir.path(), "app")
+            .join(short_typename::<small::Blob>().as_str());
+        // A directory can neither be read as a link nor removed as a file.
+        std::fs::create_dir_all(&link).unwrap();
+        let opened = ShmemData::open_or_init_with_base_dir(dir.path(), "app", || small::Blob(1));
+        assert!(matches!(opened, Err(ShmemError::LinkReadFailed(_))));
     }
 
     #[test]
