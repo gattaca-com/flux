@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::{
-    ReadError,
+    QueueError, ReadError,
     queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType},
 };
 
@@ -175,6 +175,28 @@ fn active_groups_round_trip() {
     let cursor_a2 = header.find_or_insert_group("app.stream.broadcast");
     assert_eq!(cursor_a, cursor_a2);
     assert_eq!(header.active_groups().len(), 2);
+}
+
+#[test]
+fn validate_rejects_overflowing_length_and_undefined_queue_type() {
+    let q = Queue::<u64>::new(16, QueueType::SPMC);
+    let header: &mut QueueHeader = &mut unsafe { &mut *q.inner.cast_mut() }.header;
+    let (hash, elsize) = (header.type_hash, header.elsize);
+    let mapped_len = std::mem::size_of::<QueueHeader>() + header.size_of();
+    assert!(header.validate(mapped_len, hash, elsize, 0).is_ok());
+
+    let mask = header.mask;
+    header.mask = usize::MAX >> 1;
+    assert!(matches!(header.validate(mapped_len, hash, elsize, 0), Err(QueueError::TooSmall)));
+    header.mask = usize::MAX;
+    assert!(matches!(
+        header.validate(mapped_len, hash, elsize, 0),
+        Err(QueueError::LengthNotPowerOfTwo)
+    ));
+    header.mask = mask;
+
+    unsafe { (&raw mut header.queue_type).cast::<u8>().write(3) };
+    assert!(header.validate(mapped_len, hash, elsize, 0).is_err());
 }
 
 #[test]
