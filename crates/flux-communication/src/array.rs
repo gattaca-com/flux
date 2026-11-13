@@ -5,6 +5,7 @@ use shared_memory::{ShmemConf, ShmemError};
 use crate::{
     Seqlock,
     error::{EmptyError, QueueError, ReadError},
+    queue::Flink,
 };
 
 #[derive(Debug)]
@@ -145,10 +146,21 @@ impl<T: Copy> InnerSeqlockArray<T> {
         shmem_flink: P,
         len: usize,
     ) -> Result<*const Self, QueueError> {
-        use shared_memory::{ShmemConf, ShmemError};
         if let Some(p) = shmem_flink.as_ref().parent() {
             let _ = std::fs::create_dir_all(p);
         }
+        // Held across open, replace, create and init, so concurrent attachers end up on
+        // one segment. A second flock on the directory blocks even in this process, so
+        // the retries must not take it again.
+        let _lock = Flink(shmem_flink.as_ref()).lock().map_err(ShmemError::LinkOpenFailed)?;
+        Self::create_or_open_locked(shmem_flink, len)
+    }
+
+    fn create_or_open_locked<P: AsRef<Path>>(
+        shmem_flink: P,
+        len: usize,
+    ) -> Result<*const Self, QueueError> {
+        use shared_memory::{ShmemConf, ShmemError};
         match ShmemConf::new().size(Self::size_of(len)).flink(&shmem_flink).create() {
             Ok(shmem) => {
                 let ptr = shmem.as_ptr();
@@ -163,8 +175,14 @@ impl<T: Copy> InnerSeqlockArray<T> {
                             "There was an error opening {:?}, removing and recreating: {e}",
                             shmem_flink.as_ref()
                         );
-                        let _ = std::fs::remove_file(shmem_flink.as_ref());
-                        return Self::create_or_open_shared(shmem_flink, len);
+                        if let Err(removal) = crate::cleanup_flink(shmem_flink.as_ref()) {
+                            tracing::warn!(
+                                "couldn't replace {:?}: {removal}",
+                                shmem_flink.as_ref()
+                            );
+                            return Err(e);
+                        }
+                        return Self::create_or_open_locked(shmem_flink, len);
                     }
                     Err(e) => return Err(e),
                 };
