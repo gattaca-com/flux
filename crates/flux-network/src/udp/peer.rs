@@ -1173,6 +1173,24 @@ impl UdpPeer {
         if self.config.reliable {
             self.ack_due = true;
         }
+        let first_seq = header.seq - index as u64;
+        if total != 1 {
+            match self.rx.partials.iter().find(|p| p.first_seq == first_seq).map(|p| p.len) {
+                Some(known) if known != len => {
+                    debug!(%self.addr, len, index, "udp fragment disagrees on message length");
+                    return;
+                }
+                // With no partial, a message begun below the ack point can
+                // never complete. Its sequence is still taken: a reset need
+                // not land on a message boundary, and refusing it would have
+                // the sender resend it forever.
+                None if first_seq < self.rx.ack_next => {
+                    self.rx.accept(header.seq);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if !self.rx.accept(header.seq) {
             return;
         }
@@ -1189,13 +1207,8 @@ impl UdpPeer {
             return;
         }
 
-        let first_seq = header.seq - index as u64;
         let pos = self.partial_index(first_seq, len, total, header.send_ts);
         let partial = &mut self.rx.partials[pos];
-        if partial.len != len {
-            debug!(%self.addr, "udp fragment disagrees on message length");
-            return;
-        }
         // No per-fragment dedup needed: the window rejects duplicate sequences
         // and a fragment index maps to exactly one sequence of its message.
         partial.remaining -= 1;
@@ -1530,6 +1543,32 @@ mod tests {
         fixed.reset(0);
         assert!(fixed.accept(1) && !fixed.accept(64));
         assert_eq!(fixed.ack_next, 0);
+    }
+
+    #[test]
+    fn a_fragment_that_cannot_complete_strands_no_partial() {
+        let config = cfg();
+        let stride = config.stride();
+        let mut peer =
+            UdpPeer::new("127.0.0.1:1".parse().unwrap(), Token(0), Token(0), 1, &group(config));
+        peer.connected = true;
+        peer.remote_session = Some(7);
+        peer.rx.reset(10);
+        let now = Instant::now();
+        let payload = vec![0; stride];
+        let data = |peer: &mut UdpPeer, seq, len, index| {
+            let header = Header { kind: Kind::Data, session: 7, seq, len, index, send_ts: 0 };
+            peer.on_data(&header, &payload, None, now, &mut |_, _| panic!("delivered"));
+        };
+        // Its first fragment, 9, lies below the ack point. Its sequence is
+        // still taken, or the sender would resend it forever.
+        data(&mut peer, 10, 2 * stride as u32, 1);
+        assert!(peer.rx.partials.is_empty());
+        assert_eq!(peer.rx.ack_next, 11);
+        // Disagrees with the partial of 11 on the length.
+        data(&mut peer, 11, 3 * stride as u32, 0);
+        data(&mut peer, 12, 2 * stride as u32, 1);
+        assert!(peer.rx.accept(12));
     }
 
     #[test]
