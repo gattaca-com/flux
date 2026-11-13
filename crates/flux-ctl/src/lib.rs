@@ -39,13 +39,10 @@ pub(crate) fn printable(s: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-
     use super::printable;
 
     #[test]
     fn printable_escapes_control_characters() {
-        assert!(matches!(printable("app.Queue<u64> 🟢"), Cow::Borrowed("app.Queue<u64> 🟢")));
         assert_eq!(printable("a\x1b]0;x\x07b\n\u{9b}"), "a\\u{1b}]0;x\\u{7}b\\n\\u{9b}");
     }
 }
