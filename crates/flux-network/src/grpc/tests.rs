@@ -548,6 +548,28 @@ fn connection_output_is_bounded_across_streams() {
 }
 
 #[test]
+fn partly_written_messages_count_toward_the_connection_limit() {
+    let mut harness = Harness::new(GrpcConfig { max_queued_bytes: 30, ..GrpcConfig::default() });
+    // A one-byte window splits every message, leaving 10 of its 11 bytes.
+    let mut client = harness.connect(1);
+    for id in (1..200).step_by(2) {
+        client.transport.send(&request(id, "/test.Feed/Subscribe", "application/grpc", Some(b"")));
+    }
+    let mut streams = Vec::new();
+    client.run(
+        &mut harness,
+        |request, _| {
+            streams.push(request.stream());
+            Response::Stream
+        },
+        |got| got.len() >= 100,
+    );
+    let sent =
+        streams.iter().filter(|&&stream| harness.server.send(stream, b"queued").is_ok()).count();
+    assert!(10 * sent <= 32 * 30, "{sent} streams hold a partly written message");
+}
+
+#[test]
 fn connection_request_buffers_are_bounded_across_streams() {
     let mut harness = Harness::new(GrpcConfig { max_message_size: 100, ..GrpcConfig::default() });
     let mut client = harness.connect(65535);

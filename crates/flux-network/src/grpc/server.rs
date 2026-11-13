@@ -225,9 +225,35 @@ impl Call {
     }
 
     fn push(&mut self, prefix: &[u8], payload: &[u8]) {
+        if self.offset > self.out.len() / 2 {
+            self.compact();
+        }
         self.out.extend_from_slice(prefix);
         self.out.extend_from_slice(payload);
         self.ends.push_back(self.out.len());
+    }
+
+    /// Cuts the messages HTTP/2 has taken from the front of `out`, which
+    /// `drive` clears only once `out` fully drains. The cut stays at a
+    /// message end, so `drop_unsent` still keeps a partly written message
+    /// whole.
+    fn compact(&mut self) {
+        let mut cut = 0;
+        while let Some(&end) = self.ends.front() &&
+            end <= self.offset
+        {
+            cut = end;
+            self.ends.pop_front();
+        }
+        if cut == 0 {
+            return;
+        }
+        self.out.copy_within(cut.., 0);
+        self.out.truncate(self.out.len() - cut);
+        self.offset -= cut;
+        for end in &mut self.ends {
+            *end -= cut;
+        }
     }
 
     /// Drops unsent messages, keeping the rest of one partly written.
@@ -500,6 +526,10 @@ impl Connection {
                                 Code::ResourceExhausted,
                                 "gRPC messages exceed connection limit",
                             ));
+                        } else if after < before {
+                            // A call routes one request, so a completed
+                            // message's buffer is never reused.
+                            call.decoder.message.shrink_to(config.pooled_buffer);
                         }
                     }
                     mark(stream_id, call, pending);
@@ -543,6 +573,12 @@ impl Connection {
                             continue;
                         }
                         Ok(false) => {
+                            // Drained: give back a buffer grown well past
+                            // normal backlogs, so idle streams do not pin
+                            // it. Smaller ones keep it to avoid reallocating.
+                            if call.out.capacity() > config.max_queued_bytes / 4 {
+                                call.out.shrink_to(config.pooled_buffer);
+                            }
                             call.pending = false;
                             false
                         }
@@ -737,17 +773,21 @@ impl GrpcServer {
         let prefix = prefix(payload.len());
         let len = prefix.len() + payload.len();
         let queued = call.queued();
-        let lags = if call.headers_sent && call.out.is_empty() {
+        // Checked before the fast path: once part of a message is in HTTP/2,
+        // its rest must be queued.
+        let lags = if connection.held.queued + len > connection_queued {
+            true
+        } else if call.headers_sent && call.out.is_empty() {
             // Fast path: header, prefix and payload go straight into HTTP/2.
             match connection.h2.send_data_prefixed(stream.id, &prefix, payload, false) {
                 Ok(n) if n == len => return Ok(()),
                 // A partly written message must be completed, so its rest is
-                // queued whatever the limits.
+                // queued whatever `max_queued_bytes`.
                 Ok(n) => {
                     call.offset = n;
                     false
                 }
-                Err(SendError::WouldBlock) => connection.held.queued + len > connection_queued,
+                Err(SendError::WouldBlock) => false,
                 Err(error) => {
                     if error != SendError::Closed {
                         let _ = connection.h2.reset(stream.id, INTERNAL_ERROR);
@@ -759,7 +799,7 @@ impl GrpcServer {
                 }
             }
         } else {
-            queued + len > max_queued || connection.held.queued + len > connection_queued
+            queued + len > max_queued
         };
         if lags {
             call.drop_unsent();
