@@ -92,9 +92,8 @@ fn literal(block: &mut Vec<u8>, name: &str, value: &str) {
     block.extend_from_slice(value.as_bytes());
 }
 
-/// HEADERS for `path` (POST, http), then `message` if any. The last frame ends
-/// the request.
-fn request(id: u32, path: &str, content_type: &str, message: Option<&[u8]>) -> Vec<u8> {
+/// HEADERS for `path` (POST, http).
+fn headers(id: u32, path: &str, content_type: &str, end_stream: bool) -> Vec<u8> {
     let mut block = vec![0x83, 0x86];
     literal(&mut block, ":path", path);
     literal(&mut block, ":authority", "localhost");
@@ -102,8 +101,15 @@ fn request(id: u32, path: &str, content_type: &str, message: Option<&[u8]>) -> V
     literal(&mut block, "te", "trailers");
     literal(&mut block, "authorization", "Bearer token");
     let mut wire = Vec::new();
-    let end = if message.is_none() { flags::END_STREAM } else { 0 };
+    let end = if end_stream { flags::END_STREAM } else { 0 };
     frame(&mut wire, kind::HEADERS, flags::END_HEADERS | end, id, &block);
+    wire
+}
+
+/// HEADERS for `path` (POST, http), then `message` if any. The last frame ends
+/// the request.
+fn request(id: u32, path: &str, content_type: &str, message: Option<&[u8]>) -> Vec<u8> {
+    let mut wire = headers(id, path, content_type, message.is_none());
     if let Some(message) = message {
         frame(&mut wire, kind::DATA, flags::END_STREAM, id, &framed(message));
     }
@@ -496,6 +502,95 @@ fn lag_keeps_a_partly_written_message_whole() {
         .collect();
     assert_eq!(body, framed(b"first!"), "only the split message is completed");
     assert_eq!(got.last().unwrap().field("grpc-status"), Some("8"));
+}
+
+#[test]
+fn connection_output_is_bounded_across_streams() {
+    let mut harness = Harness::new(GrpcConfig { max_queued_bytes: 30, ..GrpcConfig::default() });
+    let mut client = harness.connect(0);
+    for id in (1..96).step_by(2) {
+        client.transport.send(&request(id, "/test.Feed/Subscribe", "application/grpc", Some(b"")));
+    }
+    let mut streams = Vec::new();
+    client.run(
+        &mut harness,
+        |request, _| {
+            streams.push(request.stream());
+            Response::Stream
+        },
+        |got| got.len() >= 48,
+    );
+    // Two 11-byte messages fit each stream's 30 bytes, but not all 48 streams'
+    // at once in the connection's 32 * 30.
+    let (mut queued, mut lagged) = (vec![0; streams.len()], 0);
+    for _ in 0..2 {
+        for (&stream, queued) in streams.iter().zip(&mut queued) {
+            match harness.server.send(stream, b"queued") {
+                Ok(()) => *queued += 11,
+                Err(super::Closed::Lagged) => {
+                    *queued = 0;
+                    lagged += 1;
+                }
+                Err(super::Closed::Ended) => {}
+            }
+        }
+    }
+    assert!(queued.iter().sum::<usize>() <= 32 * 30, "{queued:?}");
+    assert!(lagged > 0);
+    let finished = |got: &[(u32, Got)]| {
+        got.iter()
+            .filter(|(_, got)| matches!(got, Got::Headers(_, true)))
+            .map(|(_, got)| got.field("grpc-status").unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    client.run(&mut harness, |_, _| unreachable!(), |got| finished(got).len() >= lagged);
+    assert_eq!(finished(&client.got), vec!["8"; lagged]);
+}
+
+#[test]
+fn partly_written_messages_count_toward_the_connection_limit() {
+    let mut harness = Harness::new(GrpcConfig { max_queued_bytes: 30, ..GrpcConfig::default() });
+    // A one-byte window splits every message, leaving 10 of its 11 bytes.
+    let mut client = harness.connect(1);
+    for id in (1..200).step_by(2) {
+        client.transport.send(&request(id, "/test.Feed/Subscribe", "application/grpc", Some(b"")));
+    }
+    let mut streams = Vec::new();
+    client.run(
+        &mut harness,
+        |request, _| {
+            streams.push(request.stream());
+            Response::Stream
+        },
+        |got| got.len() >= 100,
+    );
+    let sent =
+        streams.iter().filter(|&&stream| harness.server.send(stream, b"queued").is_ok()).count();
+    assert!(10 * sent <= 32 * 30, "{sent} streams hold a partly written message");
+}
+
+#[test]
+fn connection_request_buffers_are_bounded_across_streams() {
+    let mut harness = Harness::new(GrpcConfig { max_message_size: 100, ..GrpcConfig::default() });
+    let mut client = harness.connect(65535);
+    // 99 bytes of a 100-byte message on each stream; the connection holds at
+    // most 32 * 100, so 32 streams fit and the rest are refused.
+    let message = framed(&[1; 100]);
+    let ids: Vec<u32> = (1..72).step_by(2).collect();
+    for &id in &ids {
+        let mut wire = headers(id, "/test.Echo/Unary", "application/grpc", false);
+        frame(&mut wire, kind::DATA, 0, id, &message[..104]);
+        client.transport.send(&wire);
+    }
+    client.run(
+        &mut harness,
+        |_, _| unreachable!(),
+        |got| ids[32..].iter().all(|&id| ended(id)(got)),
+    );
+    for &id in &ids[32..] {
+        assert_eq!(client.stream(id)[0].field("grpc-status"), Some("8"));
+    }
+    assert!(ids[..32].iter().all(|&id| client.stream(id).is_empty()));
 }
 
 #[test]
