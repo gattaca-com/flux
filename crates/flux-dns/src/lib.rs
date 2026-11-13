@@ -4,15 +4,13 @@
 //! address, without retries, IPv6 records, or answers over 512 bytes.
 
 use std::{
-    collections::hash_map::RandomState,
-    fs,
-    hash::BuildHasher,
-    io,
+    fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
 };
 
 use flux_timing::{Duration, Instant};
 use flux_utils::ArrayVec;
+use rand::Rng as _;
 
 const TIMEOUT_SECS: u64 = 2;
 const MAX_MESSAGE: usize = 512;
@@ -32,9 +30,6 @@ pub struct Resolver {
     pending: Vec<Pending>,
     /// Tried in order after the name as asked, unless it ends with a dot.
     search: Vec<String>,
-    /// Keyed so query ids cannot be predicted from the ones already seen.
-    ids: RandomState,
-    queries: u64,
     timeout: Duration,
     buf: [u8; MAX_MESSAGE],
     addrs: ArrayVec<Ipv4Addr, MAX_ADDRS>,
@@ -85,8 +80,6 @@ impl Resolver {
             ready: Vec::new(),
             pending: Vec::new(),
             search: Vec::new(),
-            ids: RandomState::new(),
-            queries: 0,
             timeout: Duration::from_secs(TIMEOUT_SECS),
             buf: [0; MAX_MESSAGE],
             addrs: ArrayVec::new(),
@@ -128,8 +121,7 @@ impl Resolver {
         name_len: usize,
         searched: usize,
     ) -> io::Result<()> {
-        self.queries += 1;
-        let id = self.ids.hash_one(self.queries) as u16;
+        let id: u16 = rand::rng().random();
         let mut query = ArrayVec::<u8, { 12 + MAX_QUESTION }>::new();
         query.extend(id.to_be_bytes());
         // Recursion desired, one question.
