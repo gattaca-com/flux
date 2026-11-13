@@ -1441,8 +1441,16 @@ impl HttpNetwork {
                             return
                         }
                         // The chunk data is followed by its own CRLF.
-                        let end = consumed + size + 2;
+                        let Some(end) = consumed.checked_add(size).and_then(|at| at.checked_add(2))
+                        else {
+                            self.fail_stream(net, i, handler);
+                            return
+                        };
                         if buf.len() < end {
+                            return
+                        }
+                        if &buf[consumed + size..end] != b"\r\n" {
+                            self.fail_stream(net, i, handler);
                             return
                         }
                         handler(HttpEvent::Body { token, chunk: &buf[consumed..consumed + size] });
