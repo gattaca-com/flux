@@ -28,6 +28,9 @@ pub fn cleanup_flink(flink_path: &Path) -> Result<(), String> {
 }
 
 /// Walk a directory tree, unlink all shmem backing files, then remove the tree.
+///
+/// Symlinks inside `root` are never followed, but a symlinked `root` is: a
+/// caller that finds roots by listing a directory must skip symlinks itself.
 pub fn cleanup_shmem(root: &Path) {
     for flink in all_flinks_under(root) {
         if let Err(e) = cleanup_flink(&flink) {
