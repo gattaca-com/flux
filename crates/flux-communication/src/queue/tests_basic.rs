@@ -41,6 +41,26 @@ fn basic() {
     }
 }
 
+#[test]
+fn broadcast_recovers_oldest_retained_record_with_exact_gap() {
+    let q = Queue::new(4, QueueType::SPMC);
+    let mut producer = Producer::from(q);
+    let mut consumer = ConsumerBare::new_broadcast_test(q);
+
+    for value in 0..6 {
+        producer.produce(&value);
+    }
+
+    let mut value = 0;
+    assert_eq!(consumer.try_consume(&mut value), Err(ReadError::SpedPast));
+    assert_eq!(consumer.recover_oldest_after_error(), 2);
+    for expected in 2..6 {
+        assert_eq!(consumer.try_consume(&mut value), Ok(()));
+        assert_eq!(value, expected);
+    }
+    assert_eq!(consumer.try_consume(&mut value), Err(ReadError::Empty));
+}
+
 fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {
     // Queue must hold all messages to prevent wrap-around: with a small ring, a
     // slow reader can overshoot the seqlock version across a lap boundary and

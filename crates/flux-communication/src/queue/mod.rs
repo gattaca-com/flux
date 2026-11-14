@@ -830,6 +830,18 @@ impl<T: Copy> ConsumerBare<T> {
         count
     }
 
+    /// Resume a broadcast consumer at the oldest record still retained after
+    /// an overwrite, returning the exact number of records it lost.
+    #[inline]
+    pub fn recover_oldest_after_error(&mut self) -> usize {
+        self.try_init_broadcast();
+        let expected = unsafe { &*self.cursor }.load(Ordering::Relaxed).saturating_sub(1);
+        let oldest = self.queue.count().saturating_sub(self.queue.len());
+        let lost = oldest.saturating_sub(expected);
+        self.set_broadcast_pos(oldest.max(expected));
+        lost
+    }
+
     /// If lapped: update count to continue from current position
     /// within the current rotation instead of resetting to the head
     /// of the queue. Returns the count resumed on, `None` if not lapped.
