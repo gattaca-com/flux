@@ -432,60 +432,68 @@ impl BlobCache {
         self.buffers.values().filter(|buf| buf.n_messages > 0).count()
     }
 
-    /// The `&Blob` is valid only inside `sink`.
+    /// Every type's blob, in name order, as [`flush_next`](Self::flush_next)
+    /// emits them. The `&Blob` is valid only inside `sink`.
     pub fn flush<U: Versioned>(
         &mut self,
         user_meta: &U,
         zstd_level: i32,
         mut sink: impl FnMut(&Blob),
     ) {
-        let mut keys: Vec<&'static str> = self
+        while self.flush_next(user_meta, zstd_level, &mut sink) {}
+    }
+
+    /// Emits the blob of the first non-empty type by name and empties that
+    /// type, so a caller can spread a flush over several calls. Returns
+    /// `false`, without calling `sink`, once every type is empty. The `&Blob`
+    /// is valid only inside `sink`.
+    pub fn flush_next<U: Versioned>(
+        &mut self,
+        user_meta: &U,
+        zstd_level: i32,
+        sink: impl FnOnce(&Blob),
+    ) -> bool {
+        let Some((name, buf)) = self
             .buffers
-            .iter()
+            .iter_mut()
             .filter(|(_, buf)| buf.n_messages > 0)
-            .map(|(key, _)| *key)
-            .collect();
-        keys.sort_unstable();
-        let Self { buffers, build } = self;
-        for name in keys {
-            let buf = &buffers[name];
-            let meta_bytes = ByteStable::as_bytes(user_meta);
-            let meta_pad = meta_bytes.len().next_multiple_of(ALIGN);
-            let leaf_off = buf.timestamps.len().next_multiple_of(buf.align as usize);
-            let mut plain = Vec::with_capacity(leaf_off + buf.leaves.len());
-            plain.extend_from_slice(&buf.timestamps);
-            plain.resize(leaf_off, 0);
-            plain.extend_from_slice(&buf.leaves);
-            let comp =
-                zstd::bulk::compress(&plain, zstd_level).expect("zstd bulk compression failed");
-            let comp_pad = comp.len().next_multiple_of(ALIGN);
-            let header = BlobHeader {
-                magic: MAGIC,
-                version: FORMAT_VERSION,
-                metadata_len: meta_bytes.len() as u32,
-                n_messages: buf.n_messages,
-                leaf_align: buf.align,
-                type_hash: buf.type_hash,
-                metadata_type_hash: U::TYPE_HASH,
-                compressed_len: comp.len() as u64,
-                decompressed_len: plain.len() as u64,
-                publish_t_first: buf.publish_t_first,
-                publish_t_last: buf.publish_t_last,
-                type_name: ArrayStr::from_str_truncate(name),
-            };
-            build.resize(size_of::<BlobHeader>() + meta_pad + comp_pad);
-            let (head, tail) = build.as_mut_bytes().split_at_mut(size_of::<BlobHeader>());
-            head.copy_from_slice(ByteStable::as_bytes(&header));
-            tail[..meta_bytes.len()].copy_from_slice(meta_bytes);
-            tail[meta_pad..meta_pad + comp.len()].copy_from_slice(&comp);
-            let blob = Blob::from_bytes(build.as_bytes()).expect("freshly built blob is valid");
-            sink(blob);
-        }
-        for buf in buffers.values_mut() {
-            buf.timestamps.clear();
-            buf.leaves.clear();
-            buf.n_messages = 0;
-        }
+            .min_by_key(|(name, _)| **name)
+        else {
+            return false;
+        };
+        let meta_bytes = ByteStable::as_bytes(user_meta);
+        let meta_pad = meta_bytes.len().next_multiple_of(ALIGN);
+        let leaf_off = buf.timestamps.len().next_multiple_of(buf.align as usize);
+        let mut plain = Vec::with_capacity(leaf_off + buf.leaves.len());
+        plain.extend_from_slice(&buf.timestamps);
+        plain.resize(leaf_off, 0);
+        plain.extend_from_slice(&buf.leaves);
+        let comp = zstd::bulk::compress(&plain, zstd_level).expect("zstd bulk compression failed");
+        let comp_pad = comp.len().next_multiple_of(ALIGN);
+        let header = BlobHeader {
+            magic: MAGIC,
+            version: FORMAT_VERSION,
+            metadata_len: meta_bytes.len() as u32,
+            n_messages: buf.n_messages,
+            leaf_align: buf.align,
+            type_hash: buf.type_hash,
+            metadata_type_hash: U::TYPE_HASH,
+            compressed_len: comp.len() as u64,
+            decompressed_len: plain.len() as u64,
+            publish_t_first: buf.publish_t_first,
+            publish_t_last: buf.publish_t_last,
+            type_name: ArrayStr::from_str_truncate(name),
+        };
+        buf.timestamps.clear();
+        buf.leaves.clear();
+        buf.n_messages = 0;
+        self.build.resize(size_of::<BlobHeader>() + meta_pad + comp_pad);
+        let (head, tail) = self.build.as_mut_bytes().split_at_mut(size_of::<BlobHeader>());
+        head.copy_from_slice(ByteStable::as_bytes(&header));
+        tail[..meta_bytes.len()].copy_from_slice(meta_bytes);
+        tail[meta_pad..meta_pad + comp.len()].copy_from_slice(&comp);
+        sink(Blob::from_bytes(self.build.as_bytes()).expect("freshly built blob is valid"));
+        true
     }
 }
 
