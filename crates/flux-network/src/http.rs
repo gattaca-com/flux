@@ -41,8 +41,12 @@
 //! HTTP/2 preface are served HTTP/2, one request per stream, answered with
 //! [`HttpNetwork::respond_to`]. Outbound requests remain HTTP/1.1.
 //!
-//! Compression, trailer exposure, upgrades, and `WebSockets` are not
-//! supported. Valid response trailers are parsed and discarded. There is no
+//! A WebSocket opening handshake arrives as any other request;
+//! [`WsNetwork::accept_from`](crate::websocket::WsNetwork::accept_from) takes
+//! its connection over, so both protocols share a listener.
+//!
+//! Compression, trailer exposure, and other upgrades are not supported.
+//! Valid response trailers are parsed and discarded. There is no
 //! half-close support. After an error response, the connection closes without
 //! a lingering-close delay. Pipelined HTTP/1 requests are served strictly one
 //! at a time per connection.
@@ -561,6 +565,23 @@ impl HttpNetwork {
                 .iter()
                 .any(|conn| conn.token == token && matches!(conn.role, Role::Accepted { .. })) &&
             net.disconnect(token)
+    }
+    /// Moves an HTTP/1 connection whose request awaits its response to
+    /// `group` and forgets it without an event. Returns the peer's address and
+    /// the bytes buffered behind that request; the caller answers it.
+    pub(crate) fn release(
+        &mut self,
+        net: &mut NetworkCore,
+        token: Token,
+        group: Group,
+    ) -> Option<(SocketAddr, Vec<u8>)> {
+        let i = self.conns.iter().position(|conn| {
+            conn.token == token &&
+                conn.http2.is_none() &&
+                matches!(conn.role.accepted_state(), State::Pending)
+        })?;
+        let peer_addr = net.move_to_group(token, group)?;
+        Some((peer_addr, self.conns.remove(i).buf))
     }
     /// Takes in one network event; returns whether it belonged to this
     /// layer's group. Call from the network's `poll_with` handler.

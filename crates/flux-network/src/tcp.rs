@@ -159,9 +159,9 @@ enum ConnectionState {
     Connected(FramedStream),
 }
 
-struct Connection {
+pub(crate) struct Connection {
     token: Token,
-    peer_addr: SocketAddr,
+    pub(crate) peer_addr: SocketAddr,
     /// Source address every dial of this outbound connection binds first.
     local_ip: Option<IpAddr>,
     kind: ConnectionKind,
@@ -374,12 +374,51 @@ impl TcpManager {
         index
     }
 
-    fn swap_remove_connection(&mut self, index: usize) {
+    fn swap_remove_connection(&mut self, index: usize) -> Connection {
         let removed = self.connections.swap_remove(index);
         self.by_token.remove(&removed.token);
         if let Some(moved) = self.connections.get(index) {
             self.by_token.insert(moved.token, index);
         }
+        removed
+    }
+
+    /// Whether connections may move between this group and `other`: the
+    /// stream state they carry is the same only for plain raw groups.
+    pub(crate) fn can_exchange_with(&self, other: &Self) -> bool {
+        let plain_raw = |config: &TcpGroupConfig| {
+            config.framing == Framing::Raw &&
+                config.replay == ReplayPolicy::Drop &&
+                !config.aligned_payloads
+        };
+        plain_raw(&self.config) && plain_raw(&other.config)
+    }
+
+    /// Takes out an established accepted connection that is still open for
+    /// writes, without closing it or reporting a disconnect.
+    pub(crate) fn release(&mut self, token: Token) -> Option<Connection> {
+        let index = self.index_of(token)?;
+        let connection = &self.connections[index];
+        if connection.kind != ConnectionKind::Accepted ||
+            connection.close_when_drained ||
+            connection.is_handshaking() ||
+            !matches!(connection.state, ConnectionState::Connected(_))
+        {
+            return None;
+        }
+        Some(self.swap_remove_connection(index))
+    }
+
+    /// Takes in a connection another group released.
+    pub(crate) fn adopt(&mut self, mut connection: Connection) {
+        connection.timers = NetworkTimers::new(
+            self.config.telemetry,
+            self.config.name,
+            connection.token,
+            connection.peer_addr,
+            self.config.framing,
+        );
+        self.push_connection(connection);
     }
 
     pub(crate) fn pause_broadcast(&mut self, token: Token) {

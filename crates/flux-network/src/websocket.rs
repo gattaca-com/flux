@@ -8,6 +8,10 @@
 //! [`WsNetwork::reject`]. An outbound endpoint sends its handshake on every
 //! connect and redials when dropped. Messages are delivered whole. No extension
 //! is negotiated.
+//!
+//! To serve `WebSockets` on an HTTP listener, keep the [`WsAccept`] of an
+//! [`HttpEvent::Request`](crate::http::HttpEvent::Request) and pass it to
+//! [`WsNetwork::accept_from`] in place of the HTTP response.
 
 use std::{
     io::{self, Write as _},
@@ -21,7 +25,7 @@ use sha1::{Digest as _, Sha1};
 
 use crate::{
     Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
-    http::{HttpRequest, has_token, reason_phrase, valid_request, valid_response},
+    http::{HttpNetwork, HttpRequest, has_token, reason_phrase, valid_request, valid_response},
 };
 
 const OP_CONTINUATION: u8 = 0x0;
@@ -100,6 +104,19 @@ pub fn is_upgrade(request: &HttpRequest<'_>) -> bool {
             .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
             .all(|h| h.value == b"0") &&
         request.header("transfer-encoding").is_none()
+}
+
+/// The `Sec-WebSocket-Accept` owed to an opening handshake, kept past its
+/// request event for [`WsNetwork::accept_from`].
+#[derive(Clone, Copy)]
+pub struct WsAccept([u8; 28]);
+
+impl WsAccept {
+    /// `None` unless `request` [`is_upgrade`].
+    pub fn of(request: &HttpRequest<'_>) -> Option<Self> {
+        is_upgrade(request)
+            .then(|| Self(accept_key(request.header("sec-websocket-key").unwrap_or_default())))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -284,6 +301,33 @@ impl WsNetwork {
         if ok {
             conn.state = State::Open;
             conn.dirty = !conn.buf.is_empty();
+        }
+        ok
+    }
+    /// Takes over the connection of an opening handshake that `http` delivered
+    /// as a request and answers it with `101`, in place of
+    /// [`HttpNetwork::respond`]. `http` reports nothing further for `token`,
+    /// not even its disconnect; it opens here without a [`WsEvent::Request`],
+    /// under this layer's limits.
+    ///
+    /// `false` if `token` has no HTTP/1 request awaiting its response, which
+    /// leaves it with `http`, or if the `101` could not be queued, which drops
+    /// the connection.
+    pub fn accept_from(
+        &mut self,
+        net: &mut NetworkCore,
+        http: &mut HttpNetwork,
+        token: Token,
+        accept: WsAccept,
+    ) -> bool {
+        let group = self.group(net);
+        let Some((peer_addr, buf)) = http.release(net, token, group) else { return false };
+        let mut conn = Conn::new(token, peer_addr, State::Answer(Some(accept.0)), Vec::new());
+        conn.buf = buf;
+        self.conns.push(conn);
+        let ok = self.accept(net, token);
+        if !ok {
+            net.disconnect(token);
         }
         ok
     }
@@ -530,8 +574,7 @@ impl Conn {
             body: &[],
             stream: 0,
         };
-        let accept = is_upgrade(&request)
-            .then(|| accept_key(request.header("sec-websocket-key").unwrap_or_default()));
+        let accept = WsAccept::of(&request).map(|accept| accept.0);
         handler(WsEvent::Request { token: self.token, peer_addr: self.addr, request });
         self.buf.drain(..head);
         self.state = State::Answer(accept);
