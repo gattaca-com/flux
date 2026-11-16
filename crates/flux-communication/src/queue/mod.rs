@@ -836,10 +836,9 @@ impl<T: Copy> ConsumerBare<T> {
     pub fn recover_oldest_after_error(&mut self) -> usize {
         self.try_init_broadcast();
         let expected = unsafe { &*self.cursor }.load(Ordering::Relaxed).saturating_sub(1);
-        let oldest = self.queue.count().saturating_sub(self.queue.len());
-        let lost = oldest.saturating_sub(expected);
-        self.set_broadcast_pos(oldest.max(expected));
-        lost
+        let head = self.queue.count();
+        self.set_broadcast_pos(head);
+        head.saturating_sub(expected)
     }
 
     /// If lapped: update count to continue from current position
