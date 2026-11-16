@@ -67,7 +67,7 @@ use mio::Token;
 
 use self::h2::{Http2Conn, Limits};
 use crate::{
-    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
+    Framing, Group, NetworkCore, NetworkEvent, PayloadBuf, ReplayPolicy, TcpGroupConfig,
     http2::{CLIENT_PREFACE, Http2Config, ServerConnection},
 };
 
@@ -566,21 +566,32 @@ impl HttpNetwork {
                 .any(|conn| conn.token == token && matches!(conn.role, Role::Accepted { .. })) &&
             net.disconnect(token)
     }
-    /// Moves an HTTP/1 connection whose request awaits its response to
-    /// `group` and forgets it without an event. Returns the peer's address and
-    /// the bytes buffered behind that request; the caller answers it.
+    /// Answers the pending request of an HTTP/1 connection with `answer`,
+    /// then moves the connection to `group` and forgets it without an event.
+    /// Returns the peer's address and the bytes buffered behind that request.
+    /// `None` leaves the connection here.
     pub(crate) fn release(
         &mut self,
         net: &mut NetworkCore,
         token: Token,
         group: Group,
+        answer: impl FnOnce(&mut PayloadBuf<'_>),
     ) -> Option<(SocketAddr, Vec<u8>)> {
         let i = self.conns.iter().position(|conn| {
             conn.token == token &&
                 conn.http2.is_none() &&
+                !conn.over_limit &&
                 matches!(conn.role.accepted_state(), State::Pending)
         })?;
-        let peer_addr = net.move_to_group(token, group)?;
+        // Sent before the move so that the answer queues under this group's
+        // backlog limit, behind any response still going out.
+        if !net.send_with(token, answer) {
+            return None
+        }
+        let Some(peer_addr) = net.move_to_group(token, group) else {
+            net.disconnect(token);
+            return None
+        };
         Some((peer_addr, self.conns.remove(i).buf))
     }
     /// Takes in one network event; returns whether it belonged to this

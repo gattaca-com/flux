@@ -24,7 +24,7 @@ use mio::Token;
 use sha1::{Digest as _, Sha1};
 
 use crate::{
-    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
+    Framing, Group, NetworkCore, NetworkEvent, PayloadBuf, ReplayPolicy, TcpGroupConfig,
     http::{HttpNetwork, HttpRequest, has_token, reason_phrase, valid_request, valid_response},
 };
 
@@ -291,13 +291,7 @@ impl WsNetwork {
             return false
         };
         let State::Answer(Some(accept)) = conn.state else { return false };
-        let ok = net.send_with(token, |out| {
-            out.extend_from_slice(
-                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ",
-            );
-            out.extend_from_slice(&accept);
-            out.extend_from_slice(b"\r\n\r\n");
-        });
+        let ok = net.send_with(token, |out| switching_protocols(out, &accept));
         if ok {
             conn.state = State::Open;
             conn.dirty = !conn.buf.is_empty();
@@ -310,9 +304,8 @@ impl WsNetwork {
     /// not even its disconnect; it opens here without a [`WsEvent::Request`],
     /// under this layer's limits.
     ///
-    /// `false` if `token` has no HTTP/1 request awaiting its response, which
-    /// leaves it with `http`, or if the `101` could not be queued, which drops
-    /// the connection.
+    /// `false` leaves the connection with `http`: `token` has no HTTP/1
+    /// request awaiting its response, or the `101` could not be queued.
     pub fn accept_from(
         &mut self,
         net: &mut NetworkCore,
@@ -321,15 +314,13 @@ impl WsNetwork {
         accept: WsAccept,
     ) -> bool {
         let group = self.group(net);
-        let Some((peer_addr, buf)) = http.release(net, token, group) else { return false };
-        let mut conn = Conn::new(token, peer_addr, State::Answer(Some(accept.0)), Vec::new());
+        let answer = |out: &mut PayloadBuf<'_>| switching_protocols(out, &accept.0);
+        let Some((peer_addr, buf)) = http.release(net, token, group, answer) else { return false };
+        let mut conn = Conn::new(token, peer_addr, State::Open, Vec::new());
+        conn.dirty = !buf.is_empty();
         conn.buf = buf;
         self.conns.push(conn);
-        let ok = self.accept(net, token);
-        if !ok {
-            net.disconnect(token);
-        }
-        ok
+        true
     }
     /// Answers a pending upgrade request with an error `status` and closes the
     /// connection once it is written. `headers` must not set `Content-Length`
@@ -904,6 +895,15 @@ fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
     for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
         *byte ^= mask[i % 4];
     }
+}
+
+/// The `101` answering an opening handshake.
+fn switching_protocols(out: &mut PayloadBuf<'_>, accept: &[u8; 28]) {
+    out.extend_from_slice(
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ",
+    );
+    out.extend_from_slice(accept);
+    out.extend_from_slice(b"\r\n\r\n");
 }
 
 /// `Sec-WebSocket-Accept` for a `Sec-WebSocket-Key`.

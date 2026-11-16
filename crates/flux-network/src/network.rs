@@ -1062,9 +1062,9 @@ impl NetworkCore {
     /// the peer's address.
     ///
     /// Both groups must be [`Framing::Raw`] without replay or aligned
-    /// payloads. `None`, leaving the connection where it was, for any other
-    /// pair of groups, and for a connection that is outbound, closing, or
-    /// still in its TLS handshake.
+    /// payloads, with the same `max_frame_size`. `None`, leaving the connection
+    /// where it was, for any other pair of groups, and for a connection
+    /// that is outbound, closing, or still in its TLS handshake.
     pub fn move_to_group(&mut self, token: Token, group: Group) -> Option<SocketAddr> {
         let from = self.tokens.groups.get(&token).copied()?;
         let (GroupState::Tcp(source), GroupState::Tcp(target)) =
