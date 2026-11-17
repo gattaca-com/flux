@@ -159,9 +159,9 @@ enum ConnectionState {
     Connected(FramedStream),
 }
 
-struct Connection {
+pub(crate) struct Connection {
     token: Token,
-    peer_addr: SocketAddr,
+    pub(crate) peer_addr: SocketAddr,
     /// Source address every dial of this outbound connection binds first.
     local_ip: Option<IpAddr>,
     kind: ConnectionKind,
@@ -374,12 +374,31 @@ impl TcpManager {
         index
     }
 
-    fn swap_remove_connection(&mut self, index: usize) {
+    fn swap_remove_connection(&mut self, index: usize) -> Connection {
         let removed = self.connections.swap_remove(index);
         self.by_token.remove(&removed.token);
         if let Some(moved) = self.connections.get(index) {
             self.by_token.insert(moved.token, index);
         }
+        removed
+    }
+
+    /// Takes out a connection without closing it or reporting a disconnect.
+    pub(crate) fn release(&mut self, token: Token) -> Option<Connection> {
+        let index = self.index_of(token)?;
+        Some(self.swap_remove_connection(index))
+    }
+
+    /// Takes in a connection another group released.
+    pub(crate) fn adopt(&mut self, mut connection: Connection) {
+        connection.timers = NetworkTimers::new(
+            self.config.telemetry,
+            self.config.name,
+            connection.token,
+            connection.peer_addr,
+            self.config.framing,
+        );
+        self.push_connection(connection);
     }
 
     pub(crate) fn pause_broadcast(&mut self, token: Token) {

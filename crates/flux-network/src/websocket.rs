@@ -8,6 +8,10 @@
 //! [`WsNetwork::reject`]. An outbound endpoint sends its handshake on every
 //! connect and redials when dropped. Messages are delivered whole. No extension
 //! is negotiated.
+//!
+//! To serve `WebSockets` on an HTTP listener, keep the [`WsAccept`] of an
+//! [`HttpEvent::Request`](crate::http::HttpEvent::Request) and pass it to
+//! [`WsNetwork::accept_from`] in place of the HTTP response.
 
 use std::{
     io::{self, Write as _},
@@ -20,8 +24,8 @@ use mio::Token;
 use sha1::{Digest as _, Sha1};
 
 use crate::{
-    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
-    http::{HttpRequest, has_token, reason_phrase, valid_request, valid_response},
+    Framing, Group, NetworkCore, NetworkEvent, PayloadBuf, ReplayPolicy, TcpGroupConfig,
+    http::{HttpNetwork, HttpRequest, has_token, reason_phrase, valid_request, valid_response},
 };
 
 const OP_CONTINUATION: u8 = 0x0;
@@ -100,6 +104,19 @@ pub fn is_upgrade(request: &HttpRequest<'_>) -> bool {
             .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
             .all(|h| h.value == b"0") &&
         request.header("transfer-encoding").is_none()
+}
+
+/// The `Sec-WebSocket-Accept` owed to an opening handshake, kept past its
+/// request event for [`WsNetwork::accept_from`].
+#[derive(Clone, Copy)]
+pub struct WsAccept([u8; 28]);
+
+impl WsAccept {
+    /// `None` unless `request` [`is_upgrade`].
+    pub fn of(request: &HttpRequest<'_>) -> Option<Self> {
+        is_upgrade(request)
+            .then(|| Self(accept_key(request.header("sec-websocket-key").unwrap_or_default())))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -274,18 +291,39 @@ impl WsNetwork {
             return false
         };
         let State::Answer(Some(accept)) = conn.state else { return false };
-        let ok = net.send_with(token, |out| {
-            out.extend_from_slice(
-                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ",
-            );
-            out.extend_from_slice(&accept);
-            out.extend_from_slice(b"\r\n\r\n");
-        });
+        let ok = net.send_with(token, |out| switching_protocols(out, &accept));
         if ok {
             conn.state = State::Open;
             conn.dirty = !conn.buf.is_empty();
         }
         ok
+    }
+    /// Takes over the connection of an opening handshake that `http` delivered
+    /// as a request and answers it with `101`, in place of
+    /// [`HttpNetwork::respond`]. `http` reports nothing further for `token`,
+    /// not even its disconnect; it opens here without a [`WsEvent::Request`],
+    /// under this layer's limits.
+    ///
+    /// `false` leaves the connection with `http`: `token` has no HTTP/1
+    /// request awaiting its response, or the `101` could not be queued.
+    pub fn accept_from(
+        &mut self,
+        net: &mut NetworkCore,
+        http: &mut HttpNetwork,
+        token: Token,
+        accept: WsAccept,
+    ) -> bool {
+        let group = self.group(net);
+        let answer = |out: &mut PayloadBuf<'_>| switching_protocols(out, &accept.0);
+        let Some((peer_addr, mut buf)) = http.release(net, token, group, answer) else {
+            return false
+        };
+        release(&mut buf, 0);
+        let mut conn = Conn::new(token, peer_addr, State::Open, Vec::new());
+        conn.dirty = !buf.is_empty();
+        conn.buf = buf;
+        self.conns.push(conn);
+        true
     }
     /// Answers a pending upgrade request with an error `status` and closes the
     /// connection once it is written. `headers` must not set `Content-Length`
@@ -530,8 +568,7 @@ impl Conn {
             body: &[],
             stream: 0,
         };
-        let accept = is_upgrade(&request)
-            .then(|| accept_key(request.header("sec-websocket-key").unwrap_or_default()));
+        let accept = WsAccept::of(&request).map(|accept| accept.0);
         handler(WsEvent::Request { token: self.token, peer_addr: self.addr, request });
         self.buf.drain(..head);
         self.state = State::Answer(accept);
@@ -861,6 +898,15 @@ fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
     for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
         *byte ^= mask[i % 4];
     }
+}
+
+/// The `101` answering an opening handshake.
+fn switching_protocols(out: &mut PayloadBuf<'_>, accept: &[u8; 28]) {
+    out.extend_from_slice(
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ",
+    );
+    out.extend_from_slice(accept);
+    out.extend_from_slice(b"\r\n\r\n");
 }
 
 /// `Sec-WebSocket-Accept` for a `Sec-WebSocket-Key`.

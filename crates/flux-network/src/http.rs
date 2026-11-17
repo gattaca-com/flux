@@ -41,8 +41,12 @@
 //! HTTP/2 preface are served HTTP/2, one request per stream, answered with
 //! [`HttpNetwork::respond_to`]. Outbound requests remain HTTP/1.1.
 //!
-//! Compression, trailer exposure, upgrades, and `WebSockets` are not
-//! supported. Valid response trailers are parsed and discarded. There is no
+//! A WebSocket opening handshake arrives as any other request;
+//! [`WsNetwork::accept_from`](crate::websocket::WsNetwork::accept_from) takes
+//! its connection over, so both protocols share a listener.
+//!
+//! Compression, trailer exposure, and other upgrades are not supported.
+//! Valid response trailers are parsed and discarded. There is no
 //! half-close support. After an error response, the connection closes without
 //! a lingering-close delay. Pipelined HTTP/1 requests are served strictly one
 //! at a time per connection.
@@ -63,7 +67,7 @@ use mio::Token;
 
 use self::h2::{Http2Conn, Limits};
 use crate::{
-    Framing, Group, NetworkCore, NetworkEvent, ReplayPolicy, TcpGroupConfig,
+    Framing, Group, NetworkCore, NetworkEvent, PayloadBuf, ReplayPolicy, TcpGroupConfig,
     http2::{CLIENT_PREFACE, Http2Config, ServerConnection},
 };
 
@@ -561,6 +565,31 @@ impl HttpNetwork {
                 .iter()
                 .any(|conn| conn.token == token && matches!(conn.role, Role::Accepted { .. })) &&
             net.disconnect(token)
+    }
+    /// Answers the pending request of an HTTP/1 connection with `answer`,
+    /// then moves the connection to `group` and forgets it without an event.
+    /// Returns the peer's address and the bytes buffered behind that request.
+    /// `None` leaves the connection here.
+    pub(crate) fn release(
+        &mut self,
+        net: &mut NetworkCore,
+        token: Token,
+        group: Group,
+        answer: impl FnOnce(&mut PayloadBuf<'_>),
+    ) -> Option<(SocketAddr, Vec<u8>)> {
+        let i = self.conns.iter().position(|conn| {
+            conn.token == token &&
+                conn.http2.is_none() &&
+                !conn.over_limit &&
+                matches!(conn.role.accepted_state(), State::Pending)
+        })?;
+        // Sent before the move so that the answer queues under this group's
+        // backlog limit, behind any response still going out.
+        if !net.send_with(token, answer) {
+            return None
+        }
+        let peer_addr = net.move_to_group(token, group)?;
+        Some((peer_addr, self.conns.remove(i).buf))
     }
     /// Takes in one network event; returns whether it belonged to this
     /// layer's group. Call from the network's `poll_with` handler.

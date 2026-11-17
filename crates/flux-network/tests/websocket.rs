@@ -334,3 +334,95 @@ fn is_upgrade_takes_only_rfc_6455_opening_handshakes() {
     assert!(!upgrade(1, "", &[("Content-Length", "0"), ("Content-Length", "100")]));
     assert!(!upgrade(1, "", &[("Transfer-Encoding", "chunked")]));
 }
+
+#[test]
+fn http_listener_hands_an_upgrade_over() {
+    use flux_network::{
+        http::{HttpEvent, HttpNetwork},
+        websocket::WsAccept,
+    };
+
+    let addr = unused_addr();
+    let mut net = Network::default();
+    let mut http = HttpNetwork::default();
+    let mut ws = WsNetwork::default().with_max_message_bytes(MAX_MESSAGE);
+    http.listen(&mut net, addr).unwrap();
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_nonblocking(true).unwrap();
+    // A plain request first, then the handshake with a frame right behind it.
+    stream.write_all(b"GET /plain HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut handshake = b"GET /feed HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+        Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        .to_vec();
+    handshake.extend(frame(true, 0x1, b"early", Some([1, 2, 3, 4])));
+    stream.write_all(&handshake).unwrap();
+
+    let mut expected = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok\
+        HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+        .to_vec();
+    expected.extend(frame(true, 0x1, b"early", None));
+    expected.extend(frame(true, 0x2, b"late", None));
+
+    let (mut out, mut buf) = (Vec::new(), [0; 4096]);
+    let (mut seen, mut http_disconnects, mut upgraded) = (Seen::default(), 0, None);
+    let (mut sent_late, mut shut) = (false, false);
+    let deadline = Instant::now() + TIMEOUT;
+    while seen.disconnected.is_empty() {
+        assert!(Instant::now() < deadline, "timed out with {out:?}");
+        net.poll_with(|event| {
+            if !http.on_event(&event) {
+                ws.on_event(&event);
+            }
+        });
+        let mut requests = Vec::new();
+        http.drive(&mut net, |event| match event {
+            HttpEvent::Request { token, request } => {
+                requests.push((token, WsAccept::of(&request)));
+            }
+            HttpEvent::Disconnected { .. } => http_disconnects += 1,
+            _ => {}
+        });
+        for (token, accept) in requests {
+            match accept {
+                Some(accept) => {
+                    assert!(ws.accept_from(&mut net, &mut http, token, accept));
+                    assert!(!ws.accept_from(&mut net, &mut http, token, accept));
+                    assert!(!http.respond(&mut net, token, 200, &[], b"ok"));
+                    assert_eq!(http.accepted(), 0);
+                    upgraded = Some(token);
+                }
+                None => assert!(http.respond(&mut net, token, 200, &[], b"ok")),
+            }
+        }
+        ws.drive(&mut net, |event| match event {
+            WsEvent::Message { token, kind, payload } => {
+                seen.messages.push((token, kind, payload.to_vec()));
+            }
+            WsEvent::Disconnected { token } => seen.disconnected.push(token),
+            _ => panic!("unexpected event"),
+        });
+        for (token, kind, payload) in seen.messages.drain(..) {
+            assert_eq!(Some(token), upgraded);
+            assert!(ws.send(&mut net, token, kind, &payload));
+        }
+        match stream.read(&mut buf) {
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("{e}"),
+        }
+        if out.ends_with(&frame(true, 0x1, b"early", None)) && !sent_late {
+            stream.write_all(&frame(true, 0x2, b"late", Some([9, 8, 7, 6]))).unwrap();
+            sent_late = true;
+        }
+        if out == expected && !shut {
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            shut = true;
+        }
+    }
+    assert_eq!(out, expected);
+    assert_eq!(seen.disconnected, [upgraded.unwrap()]);
+    assert_eq!(http_disconnects, 0);
+}

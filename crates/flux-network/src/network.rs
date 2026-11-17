@@ -1057,6 +1057,23 @@ impl NetworkCore {
             GroupState::PubSub(pubsub) => pubsub.disconnect_when_drained(token),
         }
     }
+    /// Moves a TCP connection to `group`, whose limits and events it takes on
+    /// from here; no event reports the move. Returns the peer's address.
+    ///
+    /// The caller guarantees an established accepted connection that is open
+    /// for writes, and two [`Framing::Raw`] groups without replay or aligned
+    /// payloads and with the same `max_frame_size`: only then is the stream
+    /// state a connection carries the same in both.
+    pub(crate) fn move_to_group(&mut self, token: Token, group: Group) -> Option<SocketAddr> {
+        let from = self.tokens.groups.get(&token).copied()?;
+        let GroupState::Tcp(source) = &mut self.groups[from.0] else { return None };
+        let connection = source.release(token)?;
+        let peer_addr = connection.peer_addr;
+        let GroupState::Tcp(target) = &mut self.groups[group.0] else { return None };
+        target.adopt(connection);
+        self.tokens.groups.insert(token, group);
+        Some(peer_addr)
+    }
     /// Permanently removes an endpoint or listener.
     pub fn remove(&mut self, token: Token) -> bool {
         let Some(group) = self.tokens.groups.get(&token).copied() else { return false };
