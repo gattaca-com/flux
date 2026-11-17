@@ -8,6 +8,11 @@ on:
       - "crates/*/Cargo.toml"
   workflow_dispatch:
 
+env:
+  # Cancels the `target-cpu=native` from .cargo/config.toml: a cached build
+  # script compiled on one runner's CPU can SIGILL on another.
+  RUSTFLAGS: ""
+
 permissions:
   contents: read
 
