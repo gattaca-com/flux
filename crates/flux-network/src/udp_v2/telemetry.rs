@@ -292,12 +292,11 @@ pub struct TelemetryReader {
 
 struct LaneConsumers<T> {
     consumers: Vec<ConsumerBare<T>>,
-    next_lane: usize,
 }
 
 impl<T> LaneConsumers<T> {
     fn new() -> Self {
-        Self { consumers: Vec::new(), next_lane: 0 }
+        Self { consumers: Vec::new() }
     }
 }
 
@@ -384,10 +383,10 @@ impl TelemetryReader {
     }
 }
 
-/// Drains producer-owned lanes in rotating, bounded batches. UDP writers are
+/// Drains producer-owned lanes in bounded batches. UDP writers are
 /// normally created once during startup, so the lane count `L` is fixed and
 /// the work for `E` events is `O(E + L * ceil(E / LANE_DRAIN_BUDGET))`, which
-/// is effectively linear in `E`. Rotating the first lane prevents starvation.
+/// is effectively linear in `E`. The per-lane budget prevents starvation.
 fn drain<T: Copy + Default>(
     lanes: &mut LaneConsumers<T>,
     on_event: &mut impl FnMut(TelemetryEvent),
@@ -399,10 +398,7 @@ fn drain<T: Copy + Default>(
     let mut event = T::default();
     loop {
         let mut progressed = false;
-        let n_lanes = lanes.consumers.len();
-        for offset in 0..n_lanes {
-            let lane = (lanes.next_lane + offset) % n_lanes;
-            let consumer = &mut lanes.consumers[lane];
+        for consumer in &mut lanes.consumers {
             for _ in 0..LANE_DRAIN_BUDGET {
                 match consumer.try_consume(&mut event) {
                     Ok(()) => {
@@ -412,17 +408,12 @@ fn drain<T: Copy + Default>(
                     Err(ReadError::SpedPast) => {
                         progressed = true;
                         let lost = consumer.skip_to_head_after_error();
-                        if lost == 0 {
-                            on_event(TelemetryEvent::Lapped);
-                        } else {
-                            on_event(TelemetryEvent::Gap { lost: lost as u64 });
-                        }
+                        on_event(TelemetryEvent::Gap { lost: lost as u64 });
                     }
                     Err(ReadError::Empty) => break,
                 }
             }
         }
-        lanes.next_lane = (lanes.next_lane + 1) % n_lanes;
         if !progressed {
             return;
         }
