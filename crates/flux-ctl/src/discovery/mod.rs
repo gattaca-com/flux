@@ -352,16 +352,31 @@ fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// The regular files in a `queues`/`data`/`arrays` directory, skipping
-/// symlinks and a symlinked directory.
+fn directory_entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> + use<> {
+    is_real_dir(dir).then(|| std::fs::read_dir(dir).ok()).flatten().into_iter().flatten().flatten()
+}
+
+/// The regular flinks in a `queues`/`data`/`arrays` directory and its UDP
+/// telemetry pools, skipping symlinks and pool ownership locks.
 pub(crate) fn flink_files(type_dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
-    is_real_dir(type_dir)
-        .then(|| std::fs::read_dir(type_dir).ok())
-        .flatten()
+    let pool_root = (type_dir.file_name().is_some_and(|name| name == "queues") &&
+        is_real_dir(type_dir))
+    .then(|| type_dir.join("udp_telemetry"));
+    let pool_files = pool_root
         .into_iter()
-        .flatten()
-        .flatten()
+        .flat_map(|root| directory_entries(&root))
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .flat_map(|group| directory_entries(&group.path()))
+        .filter(|entry| {
+            // Removing an ownership file would allow a second writer to claim a live lane.
+            entry.file_type().is_ok_and(|t| t.is_file()) &&
+                !entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("owner.lane.") && name.ends_with(".lock")
+                })
+        });
+    directory_entries(type_dir)
         .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .chain(pool_files)
 }
 
 /// Read all flinks under a single `shmem/` directory and append entries.

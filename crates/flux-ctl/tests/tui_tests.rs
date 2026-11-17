@@ -1074,7 +1074,22 @@ fn clean_does_not_follow_symlinked_directories() {
     std::os::unix::fs::symlink(&outside, shmem_dir.join("queues")).unwrap();
     std::os::unix::fs::symlink(&outside, base.join("other")).unwrap();
 
+    let pools = base.join("telemetry/shmem/queues/udp_telemetry");
+    let group = pools.join("67726f7570");
+    std::fs::create_dir_all(&group).unwrap();
+    let stale = group.join("udp_sends.lane.0");
+    let owner = group.join("owner.lane.0.lock");
+    std::fs::write(&stale, "bogus_os_id").unwrap();
+    std::fs::write(&owner, []).unwrap();
+    std::os::unix::fs::symlink(&outside, pools.join("linked_group")).unwrap();
+    std::os::unix::fs::symlink(outside.join("victim"), group.join("udp_sends.lane.1")).unwrap();
+    let linked_pool = base.join("linked_pool/shmem/queues");
+    std::fs::create_dir_all(&linked_pool).unwrap();
+    std::os::unix::fs::symlink(&outside, linked_pool.join("udp_telemetry")).unwrap();
+
     discovery::clean(&base, None, true).unwrap();
+    assert!(!stale.exists());
+    assert!(owner.exists());
     assert!(outside.join("victim").exists());
 }
 #[test]
