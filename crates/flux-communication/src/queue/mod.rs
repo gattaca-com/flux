@@ -2,6 +2,7 @@ use std::{
     alloc::Layout,
     borrow::Borrow,
     collections::HashMap,
+    hash::{BuildHasher, Hasher, RandomState},
     mem::size_of,
     ops::Deref,
     path::Path,
@@ -855,11 +856,12 @@ pub struct OwnedBroadcastConsumer<T: Copy> {
 impl<T: Copy> OwnedBroadcastConsumer<T> {
     pub fn new(queue: Queue<T>) -> Self {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        static INSTANCE_TOKEN: OnceLock<u64> = OnceLock::new();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let token = INSTANCE_TOKEN.get_or_init(|| RandomState::new().build_hasher().finish());
         let mut consumer = ConsumerBare::new(queue, "");
-        // This fits in GROUP_LABEL_LEN and cannot match generic .broadcast/.collab
-        // keys.
-        consumer.cursor = queue.group_cursor(&format!("owned[{}].broadcast.{id}", current_pid()));
+        // At most 55 bytes, so truncation cannot remove the token or ID.
+        consumer.cursor = queue.group_cursor(&format!("owned[{}].{token:x}.{id}", current_pid()));
         consumer.exclusive_cursor = true;
         consumer.set_broadcast_pos(queue.count());
         Self { consumer }
