@@ -383,32 +383,9 @@ impl TcpManager {
         removed
     }
 
-    /// Whether connections may move between this group and `other`: the
-    /// stream state they carry is the same only for plain raw groups, and a
-    /// receive buffer keeps the size its first group's frame limit gave it.
-    pub(crate) fn can_exchange_with(&self, other: &Self) -> bool {
-        let plain_raw = |config: &TcpGroupConfig| {
-            config.framing == Framing::Raw &&
-                config.replay == ReplayPolicy::Drop &&
-                !config.aligned_payloads
-        };
-        plain_raw(&self.config) &&
-            plain_raw(&other.config) &&
-            self.config.max_frame_size == other.config.max_frame_size
-    }
-
-    /// Takes out an established accepted connection that is still open for
-    /// writes, without closing it or reporting a disconnect.
+    /// Takes out a connection without closing it or reporting a disconnect.
     pub(crate) fn release(&mut self, token: Token) -> Option<Connection> {
         let index = self.index_of(token)?;
-        let connection = &self.connections[index];
-        if connection.kind != ConnectionKind::Accepted ||
-            connection.close_when_drained ||
-            connection.is_handshaking() ||
-            !matches!(connection.state, ConnectionState::Connected(_))
-        {
-            return None;
-        }
         Some(self.swap_remove_connection(index))
     }
 

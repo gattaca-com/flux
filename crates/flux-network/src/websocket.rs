@@ -315,7 +315,10 @@ impl WsNetwork {
     ) -> bool {
         let group = self.group(net);
         let answer = |out: &mut PayloadBuf<'_>| switching_protocols(out, &accept.0);
-        let Some((peer_addr, buf)) = http.release(net, token, group, answer) else { return false };
+        let Some((peer_addr, mut buf)) = http.release(net, token, group, answer) else {
+            return false
+        };
+        release(&mut buf, 0);
         let mut conn = Conn::new(token, peer_addr, State::Open, Vec::new());
         conn.dirty = !buf.is_empty();
         conn.buf = buf;

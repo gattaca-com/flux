@@ -588,10 +588,7 @@ impl HttpNetwork {
         if !net.send_with(token, answer) {
             return None
         }
-        let Some(peer_addr) = net.move_to_group(token, group) else {
-            net.disconnect(token);
-            return None
-        };
+        let peer_addr = net.move_to_group(token, group)?;
         Some((peer_addr, self.conns.remove(i).buf))
     }
     /// Takes in one network event; returns whether it belonged to this

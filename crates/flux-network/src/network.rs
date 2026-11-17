@@ -1057,24 +1057,15 @@ impl NetworkCore {
             GroupState::PubSub(pubsub) => pubsub.disconnect_when_drained(token),
         }
     }
-    /// Moves an established accepted TCP connection to `group`, whose limits
-    /// and events it takes on from here; no event reports the move. Returns
-    /// the peer's address.
+    /// Moves a TCP connection to `group`, whose limits and events it takes on
+    /// from here; no event reports the move. Returns the peer's address.
     ///
-    /// Both groups must be [`Framing::Raw`] without replay or aligned
-    /// payloads, with the same `max_frame_size`. `None`, leaving the connection
-    /// where it was, for any other pair of groups, and for a connection
-    /// that is outbound, closing, or still in its TLS handshake.
-    pub fn move_to_group(&mut self, token: Token, group: Group) -> Option<SocketAddr> {
+    /// The caller guarantees an established accepted connection that is open
+    /// for writes, and two [`Framing::Raw`] groups without replay or aligned
+    /// payloads and with the same `max_frame_size`: only then is the stream
+    /// state a connection carries the same in both.
+    pub(crate) fn move_to_group(&mut self, token: Token, group: Group) -> Option<SocketAddr> {
         let from = self.tokens.groups.get(&token).copied()?;
-        let (GroupState::Tcp(source), GroupState::Tcp(target)) =
-            (self.groups.get(from.0)?, self.groups.get(group.0)?)
-        else {
-            return None
-        };
-        if from == group || !source.can_exchange_with(target) {
-            return None
-        }
         let GroupState::Tcp(source) = &mut self.groups[from.0] else { return None };
         let connection = source.release(token)?;
         let peer_addr = connection.peer_addr;
