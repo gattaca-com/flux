@@ -886,10 +886,11 @@ impl<T: Copy> ConsumerBare<T> {
         count
     }
 
-    /// Resume a broadcast consumer at the oldest record still retained after
-    /// an overwrite, returning the exact number of records it lost.
+    /// Resume a lapped broadcast consumer at the producer head, returning
+    /// the number of skipped records, including retained records discarded
+    /// to leave room before the producer can lap this consumer again.
     #[inline]
-    pub fn recover_oldest_after_error(&mut self) -> usize {
+    pub fn skip_to_head_after_error(&mut self) -> usize {
         self.try_init_broadcast();
         let expected = unsafe { &*self.cursor }.load(Ordering::Relaxed).saturating_sub(1);
         let head = self.queue.count();

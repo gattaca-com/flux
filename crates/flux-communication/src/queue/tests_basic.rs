@@ -42,7 +42,7 @@ fn basic() {
 }
 
 #[test]
-fn broadcast_recovers_oldest_retained_record_with_exact_gap() {
+fn broadcast_recovers_at_head_with_exact_gap() {
     let q = Queue::new(4, QueueType::SPMC);
     let mut producer = Producer::from(q);
     let mut consumer = ConsumerBare::new_broadcast_test(q);
@@ -53,12 +53,13 @@ fn broadcast_recovers_oldest_retained_record_with_exact_gap() {
 
     let mut value = 0;
     assert_eq!(consumer.try_consume(&mut value), Err(ReadError::SpedPast));
-    assert_eq!(consumer.recover_oldest_after_error(), 2);
-    for expected in 2..6 {
+    assert_eq!(consumer.skip_to_head_after_error(), 6);
+    assert_eq!(consumer.try_consume(&mut value), Err(ReadError::Empty));
+    for expected in 6..1006 {
+        producer.produce(&expected);
         assert_eq!(consumer.try_consume(&mut value), Ok(()));
         assert_eq!(value, expected);
     }
-    assert_eq!(consumer.try_consume(&mut value), Err(ReadError::Empty));
 }
 
 fn multithread(n_writers: usize, n_readers: usize, tot_messages: usize) {

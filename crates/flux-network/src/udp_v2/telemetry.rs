@@ -276,7 +276,8 @@ pub enum TelemetryEvent {
     Rtt(UdpRtt),
     /// Legacy uncounted loss marker. New readers emit [`Self::Gap`].
     Lapped,
-    /// The reader fell behind on one producer lane.
+    /// Records skipped after falling behind on one lane, including retained
+    /// records discarded when recovery resumes at the producer head.
     Gap {
         lost: u64,
     },
@@ -410,7 +411,7 @@ fn drain<T: Copy + Default>(
                     }
                     Err(ReadError::SpedPast) => {
                         progressed = true;
-                        let lost = consumer.recover_oldest_after_error();
+                        let lost = consumer.skip_to_head_after_error();
                         if lost == 0 {
                             on_event(TelemetryEvent::Lapped);
                         } else {
