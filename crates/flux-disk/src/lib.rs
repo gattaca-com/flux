@@ -10,12 +10,13 @@
 //!
 //! Operations on one file run concurrently, except [`DiskIo::sync_all`],
 //! [`DiskIo::sync_data`], [`DiskIo::truncate`], [`DiskIo::rename`],
-//! [`DiskIo::link`], [`DiskIo::unlink`], [`DiskIo::create_dir`] and
-//! [`DiskIo::close`], which act as barriers: they start only after every
-//! earlier operation on that file has completed, so a sync covers all earlier
-//! writes and structural changes cannot race them. Truncates, renames, links,
-//! unlinks and directory creations additionally prevent later operations from
-//! starting until they complete. Operations submitted before the file
+//! [`DiskIo::rename_path`], [`DiskIo::link`], [`DiskIo::unlink`],
+//! [`DiskIo::remove_dir`], [`DiskIo::create_dir`] and [`DiskIo::close`], which
+//! act as barriers: they start only after every earlier operation on that file
+//! has completed, so a sync covers all earlier writes and structural changes
+//! cannot race them. Truncates, renames, links, unlinks, directory removals and
+//! directory creations additionally prevent later operations from starting
+//! until they complete. Operations submitted before the file
 //! finished opening are queued and dispatched once the descriptor is
 //! available.
 
@@ -24,7 +25,10 @@ use std::{
     ffi::CString,
     io,
     mem::MaybeUninit,
-    os::unix::ffi::OsStrExt,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
 };
 
@@ -199,6 +203,7 @@ impl Default for DiskConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailedOp {
     Open,
+    FileLen,
     Read { offset: u64, len: usize },
     Write { offset: u64, len: usize },
     Sync,
@@ -220,6 +225,11 @@ pub enum DiskEvent<'a> {
     Read { file: FileToken, offset: u64, payload: &'a [u8], eof: bool },
     /// A write was fully applied at `offset`.
     Written { file: FileToken, offset: u64, len: usize },
+    /// [`DiskIo::file_len`] finished.
+    FileLen { file: FileToken, len: u64 },
+    /// A [`DiskIo::read_at_into`] finished: `len` bytes landed in the
+    /// caller's memory. `eof` is as for [`DiskEvent::Read`].
+    ReadInto { file: FileToken, offset: u64, len: usize, eof: bool },
     /// A read queued with a caller's buffer finished, or failed with `error`.
     /// `buf` holds the bytes read and comes back either way; `eof` is as for
     /// [`DiskEvent::Read`].
@@ -233,11 +243,12 @@ pub enum DiskEvent<'a> {
     Synced { file: FileToken, operation_id: OperationId },
     /// The file was truncated to `len` bytes.
     Truncated { file: FileToken, len: u64, operation_id: OperationId },
-    /// The open file was atomically renamed.
+    /// The open file, or the path given to [`DiskIo::rename_path`], was
+    /// atomically renamed.
     Renamed { file: FileToken, operation_id: OperationId },
     /// The open file now has the name given to [`DiskIo::link`].
     Linked { file: FileToken, operation_id: OperationId },
-    /// The name given to [`DiskIo::unlink`] is gone.
+    /// The name given to [`DiskIo::unlink`] or [`DiskIo::remove_dir`] is gone.
     Unlinked { file: FileToken, operation_id: OperationId },
     /// The directory given to [`DiskIo::create_dir`] exists.
     DirectoryCreated { file: FileToken, operation_id: OperationId },
@@ -268,6 +279,17 @@ enum PendingOp {
         offset: u64,
         buf: Option<Vec<u8>>,
     },
+    ReadInto {
+        target: CallerMemory,
+        offset: u64,
+        len: usize,
+    },
+    WriteFrom {
+        source: CallerMemory,
+        offset: u64,
+        len: usize,
+    },
+    FileLen,
     Write {
         buf: Vec<u8>,
         offset: u64,
@@ -281,9 +303,12 @@ enum PendingOp {
         len: u64,
         operation_id: OperationId,
     },
+    /// `source: None` renames the open file, which then takes
+    /// `destination_path`; otherwise `destination_path` is `None`.
     Rename {
+        source: Option<CString>,
         destination: CString,
-        destination_path: PathBuf,
+        destination_path: Option<PathBuf>,
         operation_id: OperationId,
     },
     Link {
@@ -293,6 +318,7 @@ enum PendingOp {
     },
     Unlink {
         path: CString,
+        directory: bool,
         operation_id: OperationId,
     },
     CreateDir {
@@ -321,6 +347,21 @@ enum InFlightOp {
         statx: Box<MaybeUninit<libc::statx>>,
         buf: Option<Vec<u8>>,
     },
+    ReadInto {
+        target: CallerMemory,
+        offset: u64,
+        wanted: usize,
+        have: usize,
+    },
+    WriteFrom {
+        source: CallerMemory,
+        offset: u64,
+        len: usize,
+        written: usize,
+    },
+    FileLen {
+        statx: Box<MaybeUninit<libc::statx>>,
+    },
     Write {
         buf: Vec<u8>,
         offset: u64,
@@ -335,10 +376,12 @@ enum InFlightOp {
         len: u64,
         operation_id: OperationId,
     },
+    /// `destination_path` becomes the file's path; `None` for a path rename,
+    /// which leaves the ordering file's path alone.
     Rename {
         source: CString,
         destination: CString,
-        destination_path: PathBuf,
+        destination_path: Option<PathBuf>,
         operation_id: OperationId,
     },
     Link {
@@ -349,6 +392,7 @@ enum InFlightOp {
     },
     Unlink {
         path: CString,
+        directory: bool,
         operation_id: OperationId,
     },
     CreateDir {
@@ -357,6 +401,15 @@ enum InFlightOp {
     },
     Close,
 }
+
+/// Caller memory a [`DiskIo::read_at_into`] fills or a
+/// [`DiskIo::write_at_from`] drains.
+struct CallerMemory(*mut u8);
+
+// SAFETY: the caller of `read_at_into` or `write_at_from` keeps the memory
+// valid and untouched until its completion, whichever thread drives the
+// `DiskIo`.
+unsafe impl Send for CallerMemory {}
 
 struct InFlight {
     file: FileToken,
@@ -542,6 +595,55 @@ impl DiskIo {
         Ok(())
     }
 
+    pub fn file_len(&mut self, file: FileToken) -> bool {
+        let Some(state) = self.usable_file_mut(file) else { return false };
+        state.queue.push_back(PendingOp::FileLen);
+        self.note_enqueued();
+        true
+    }
+
+    /// # Safety
+    ///
+    /// `target..target + len` must stay valid for writes, and be neither read
+    /// nor written by anything else, until the completion is delivered or
+    /// this `DiskIo` is dropped.
+    pub unsafe fn read_at_into(
+        &mut self,
+        file: FileToken,
+        offset: u64,
+        target: *mut u8,
+        len: usize,
+    ) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let Some(state) = self.usable_file_mut(file) else { return false };
+        state.queue.push_back(PendingOp::ReadInto { target: CallerMemory(target), offset, len });
+        self.note_enqueued();
+        true
+    }
+
+    /// # Safety
+    ///
+    /// `source..source + len` must stay valid for reads and unchanged until
+    /// the completion is delivered or this `DiskIo` is dropped.
+    pub unsafe fn write_at_from(
+        &mut self,
+        file: FileToken,
+        offset: u64,
+        source: *const u8,
+        len: usize,
+    ) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let Some(state) = self.usable_file_mut(file) else { return false };
+        let source = CallerMemory(source.cast_mut());
+        state.queue.push_back(PendingOp::WriteFrom { source, offset, len });
+        self.note_enqueued();
+        true
+    }
+
     /// Serializes one payload and queues it for writing at the file's append
     /// cursor, which starts at zero and advances by the payload length.
     /// Returns `false` for empty payloads and unknown or closing tokens.
@@ -660,11 +762,27 @@ impl DiskIo {
         destination: P,
     ) -> io::Result<Option<OperationId>> {
         let destination_path = destination.as_ref();
-        let destination = CString::new(destination_path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))?;
+        let destination = c_path(destination_path)?;
         Ok(self.enqueue_operation(file, |operation_id| PendingOp::Rename {
+            source: None,
             destination,
-            destination_path: destination_path.to_path_buf(),
+            destination_path: Some(destination_path.to_path_buf()),
+            operation_id,
+        }))
+    }
+
+    pub fn rename_path<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        file: FileToken,
+        from: P,
+        to: Q,
+    ) -> io::Result<Option<OperationId>> {
+        let source = c_path(from.as_ref())?;
+        let destination = c_path(to.as_ref())?;
+        Ok(self.enqueue_operation(file, |operation_id| PendingOp::Rename {
+            source: Some(source),
+            destination,
+            destination_path: None,
             operation_id,
         }))
     }
@@ -705,9 +823,25 @@ impl DiskIo {
         file: FileToken,
         path: P,
     ) -> io::Result<Option<OperationId>> {
-        let path = CString::new(path.as_ref().as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))?;
-        Ok(self.enqueue_operation(file, |operation_id| PendingOp::Unlink { path, operation_id }))
+        let path = c_path(path.as_ref())?;
+        Ok(self.enqueue_operation(file, |operation_id| PendingOp::Unlink {
+            path,
+            directory: false,
+            operation_id,
+        }))
+    }
+
+    pub fn remove_dir<P: AsRef<Path>>(
+        &mut self,
+        file: FileToken,
+        path: P,
+    ) -> io::Result<Option<OperationId>> {
+        let path = c_path(path.as_ref())?;
+        Ok(self.enqueue_operation(file, |operation_id| PendingOp::Unlink {
+            path,
+            directory: true,
+            operation_id,
+        }))
     }
 
     /// Queues creating the directory `path`, like [`std::fs::create_dir`],
@@ -768,9 +902,20 @@ impl DiskIo {
         true
     }
 
+    pub fn submit(&mut self) {
+        self.dispatch_pending();
+        self.flush_submissions();
+    }
+
     /// Whether every submitted operation has completed and been reported.
     pub fn is_idle(&self) -> bool {
         self.pending_count == 0 && self.in_flight_count == 0
+    }
+
+    pub fn limit_io_workers(&mut self, bounded: u32, unbounded: u32) -> io::Result<[u32; 2]> {
+        let mut limits = [bounded, unbounded];
+        self.ring.submitter().register_iowq_max_workers(&mut limits)?;
+        Ok(limits)
     }
 
     /// Reaps finished operations, dispatches queued ones, and submits to the
@@ -871,6 +1016,9 @@ impl DiskIo {
                     PendingOp::Open { .. } => true,
                     PendingOp::Read { .. } |
                     PendingOp::ReadToEnd { .. } |
+                    PendingOp::ReadInto { .. } |
+                    PendingOp::WriteFrom { .. } |
+                    PendingOp::FileLen |
                     PendingOp::Write { .. } => file.fd.is_some(),
                     PendingOp::Sync { .. } |
                     PendingOp::Truncate { .. } |
@@ -914,6 +1062,13 @@ impl DiskIo {
             PendingOp::ReadToEnd { offset, buf } => {
                 InFlightOp::Statx { offset, statx: Box::new(MaybeUninit::uninit()), buf }
             }
+            PendingOp::ReadInto { target, offset, len } => {
+                InFlightOp::ReadInto { target, offset, wanted: len, have: 0 }
+            }
+            PendingOp::WriteFrom { source, offset, len } => {
+                InFlightOp::WriteFrom { source, offset, len, written: 0 }
+            }
+            PendingOp::FileLen => InFlightOp::FileLen { statx: Box::new(MaybeUninit::uninit()) },
             PendingOp::Write { buf, offset, owned } => {
                 InFlightOp::Write { buf, offset, written: 0, owned }
             }
@@ -921,9 +1076,11 @@ impl DiskIo {
                 InFlightOp::Sync { data_only, operation_id }
             }
             PendingOp::Truncate { len, operation_id } => InFlightOp::Truncate { len, operation_id },
-            PendingOp::Rename { destination, destination_path, operation_id } => {
-                let source = CString::new(self.files[file_index].path.as_os_str().as_bytes())
-                    .expect("an opened path cannot contain a nul byte");
+            PendingOp::Rename { source, destination, destination_path, operation_id } => {
+                let source = source.unwrap_or_else(|| {
+                    c_path(&self.files[file_index].path)
+                        .expect("an opened path cannot contain a nul byte")
+                });
                 InFlightOp::Rename { source, destination, destination_path, operation_id }
             }
             PendingOp::Link { destination, destination_path, operation_id } => {
@@ -933,7 +1090,9 @@ impl DiskIo {
                 let source = CString::new(format!("/proc/self/fd/{fd}")).expect("no nul byte");
                 InFlightOp::Link { source, destination, destination_path, operation_id }
             }
-            PendingOp::Unlink { path, operation_id } => InFlightOp::Unlink { path, operation_id },
+            PendingOp::Unlink { path, directory, operation_id } => {
+                InFlightOp::Unlink { path, directory, operation_id }
+            }
             PendingOp::CreateDir { path, operation_id } => {
                 InFlightOp::CreateDir { path, operation_id }
             }
@@ -966,7 +1125,25 @@ impl DiskIo {
                 let ptr = unsafe { buf.as_mut_ptr().add(*have) };
                 opcode::Read::new(types::Fd(fd), ptr, chunk).offset(*offset + *have as u64).build()
             }
-            InFlightOp::Statx { statx, .. } => {
+            InFlightOp::ReadInto { target, offset, wanted, have } => {
+                let fd = fd.expect("read dispatched without an open fd");
+                let chunk = (*wanted - *have).min(MAX_OP_BYTES) as u32;
+                // SAFETY: `have < wanted`, and the caller of `read_at_into`
+                // keeps `wanted` bytes at the target valid.
+                let ptr = unsafe { target.0.add(*have) };
+                opcode::Read::new(types::Fd(fd), ptr, chunk).offset(*offset + *have as u64).build()
+            }
+            InFlightOp::WriteFrom { source, offset, len, written } => {
+                let fd = fd.expect("write dispatched without an open fd");
+                let chunk = (*len - *written).min(MAX_OP_BYTES) as u32;
+                // SAFETY: `written < len`, and the caller of `write_at_from`
+                // keeps `len` bytes at the source valid.
+                let ptr = unsafe { source.0.add(*written) };
+                opcode::Write::new(types::Fd(fd), ptr, chunk)
+                    .offset(*offset + *written as u64)
+                    .build()
+            }
+            InFlightOp::Statx { statx, .. } | InFlightOp::FileLen { statx } => {
                 let fd = fd.expect("statx dispatched without an open fd");
                 opcode::Statx::new(
                     types::Fd(fd),
@@ -1014,8 +1191,9 @@ impl DiskIo {
             )
             .flags(libc::AT_SYMLINK_FOLLOW)
             .build(),
-            InFlightOp::Unlink { path, .. } => {
-                opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).build()
+            InFlightOp::Unlink { path, directory, .. } => {
+                let flags = if *directory { libc::AT_REMOVEDIR } else { 0 };
+                opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).flags(flags).build()
             }
             InFlightOp::CreateDir { path, .. } => {
                 opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).mode(0o777).build()
@@ -1099,7 +1277,22 @@ impl DiskIo {
                 self.complete_transfer(user_data, file_index, entry.op, result, handler);
             }
             InFlightOp::Statx { offset, statx, buf } => {
-                self.complete_statx(user_data, file_index, offset, statx, buf, result);
+                self.complete_statx(user_data, file_index, offset, &statx, buf, result);
+            }
+            InFlightOp::FileLen { statx } => {
+                self.finish_op(slot, file_index);
+                match statx_len(&statx, result) {
+                    Ok(len) => handler(DiskEvent::FileLen { file: token, len }),
+                    Err(error) => handler(DiskEvent::Failed {
+                        file: token,
+                        op: FailedOp::FileLen,
+                        operation_id: None,
+                        error,
+                    }),
+                }
+            }
+            InFlightOp::ReadInto { .. } | InFlightOp::WriteFrom { .. } => {
+                self.complete_caller_memory(user_data, file_index, entry.op, result, handler);
             }
             InFlightOp::Sync { operation_id, .. } => {
                 self.finish_op(slot, file_index);
@@ -1168,7 +1361,7 @@ impl DiskIo {
         let file = self.files[file_index].token;
         let (failed, operation_id, new_path, done) = match op {
             InFlightOp::Rename { destination_path, operation_id, .. } => {
-                (FailedOp::Rename, operation_id, Some(destination_path), DiskEvent::Renamed {
+                (FailedOp::Rename, operation_id, destination_path, DiskEvent::Renamed {
                     file,
                     operation_id,
                 })
@@ -1240,17 +1433,11 @@ impl DiskIo {
         user_data: u64,
         file_index: usize,
         offset: u64,
-        statx: Box<MaybeUninit<libc::statx>>,
+        statx: &MaybeUninit<libc::statx>,
         buf: Option<Vec<u8>>,
         result: i32,
     ) {
-        let len = if result == 0 {
-            // SAFETY: a successful statx completion writes the output struct.
-            let statx = unsafe { statx.assume_init() };
-            (statx.stx_mask & libc::STATX_SIZE != 0).then_some(statx.stx_size)
-        } else {
-            None
-        };
+        let len = statx_len(statx, result).ok();
         self.start_read_to_end(user_data, file_index, offset, len, buf);
     }
 
@@ -1298,6 +1485,61 @@ impl DiskIo {
             .and_then(|len| usize::try_from(len).ok())
             .unwrap_or(READ_TO_END_CHUNK)
             .max(READ_TO_END_CHUNK)
+    }
+
+    fn complete_caller_memory<F>(
+        &mut self,
+        user_data: u64,
+        file_index: usize,
+        op: InFlightOp,
+        result: i32,
+        handler: &mut F,
+    ) where
+        F: for<'a> FnMut(DiskEvent<'a>),
+    {
+        let slot = user_data as usize;
+        let file = self.files[file_index].token;
+        match op {
+            InFlightOp::ReadInto { offset, wanted, .. } if result < 0 => {
+                self.finish_op(slot, file_index);
+                let error = io::Error::from_raw_os_error(-result);
+                let op = FailedOp::Read { offset, len: wanted };
+                handler(DiskEvent::Failed { file, op, operation_id: None, error });
+            }
+            InFlightOp::ReadInto { target, offset, wanted, have } => {
+                let have = have + result as usize;
+                if result > 0 && have < wanted {
+                    let op = InFlightOp::ReadInto { target, offset, wanted, have };
+                    self.slab[slot] = Some(InFlight { file, op });
+                    self.push_slot(user_data);
+                    return;
+                }
+                self.finish_op(slot, file_index);
+                handler(DiskEvent::ReadInto { file, offset, len: have, eof: result == 0 });
+            }
+            InFlightOp::WriteFrom { offset, len, .. } if result <= 0 => {
+                self.finish_op(slot, file_index);
+                let error = if result == 0 {
+                    io::Error::from(io::ErrorKind::WriteZero)
+                } else {
+                    io::Error::from_raw_os_error(-result)
+                };
+                let op = FailedOp::Write { offset, len };
+                handler(DiskEvent::Failed { file, op, operation_id: None, error });
+            }
+            InFlightOp::WriteFrom { source, offset, len, written } => {
+                let written = written + result as usize;
+                if written < len {
+                    let op = InFlightOp::WriteFrom { source, offset, len, written };
+                    self.slab[slot] = Some(InFlight { file, op });
+                    self.push_slot(user_data);
+                    return;
+                }
+                self.finish_op(slot, file_index);
+                handler(DiskEvent::Written { file, offset, len });
+            }
+            _ => unreachable!("complete_caller_memory only receives caller-memory transfers"),
+        }
     }
 
     /// Handles a read or write completion, transparently continuing after
@@ -1438,8 +1680,12 @@ impl DiskIo {
                     handler(DiskEvent::WrittenOwned { file: token, offset, buf, error });
                     continue;
                 }
+                PendingOp::WriteFrom { offset, len, .. } => (FailedOp::Write { offset, len }, None),
+                PendingOp::FileLen => (FailedOp::FileLen, None),
                 PendingOp::Open { .. } => (FailedOp::Open, None),
-                PendingOp::Read { offset, len, .. } => (FailedOp::Read { offset, len }, None),
+                PendingOp::Read { offset, len, .. } | PendingOp::ReadInto { offset, len, .. } => {
+                    (FailedOp::Read { offset, len }, None)
+                }
                 PendingOp::ReadToEnd { offset, .. } => {
                     (FailedOp::Read { offset, len: READ_TO_END_CHUNK }, None)
                 }
@@ -1470,6 +1716,30 @@ impl DiskIo {
         flux_utils::safe_assert!(!file.exclusive_in_flight);
         flux_utils::safe_assert!(file.queue.is_empty());
         self.files.swap_remove(file_index);
+    }
+}
+
+fn statx_len(statx: &MaybeUninit<libc::statx>, result: i32) -> io::Result<u64> {
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+    // SAFETY: a successful statx completion writes the output struct.
+    let statx = unsafe { statx.assume_init_ref() };
+    if statx.stx_mask & libc::STATX_SIZE == 0 {
+        return Err(io::Error::other("statx returned no size"));
+    }
+    Ok(statx.stx_size)
+}
+
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))
+}
+
+/// The ring's descriptor: readable while completions wait to be reaped.
+impl AsRawFd for DiskIo {
+    fn as_raw_fd(&self) -> RawFd {
+        self.ring.as_raw_fd()
     }
 }
 
@@ -1546,6 +1816,8 @@ mod tests {
         Written { file: FileToken, offset: u64, len: usize },
         ReadOwned { file: FileToken, offset: u64, payload: Vec<u8>, eof: bool, failed: bool },
         WrittenOwned { file: FileToken, offset: u64, len: usize, failed: bool },
+        FileLen { file: FileToken, len: u64 },
+        ReadInto { file: FileToken, offset: u64, len: usize, eof: bool },
         Synced(FileToken, OperationId),
         Truncated { file: FileToken, len: u64, operation_id: OperationId },
         Renamed { file: FileToken, operation_id: OperationId },
@@ -1569,6 +1841,10 @@ mod tests {
                 }
                 DiskEvent::WrittenOwned { file, offset, buf, error } => {
                     Self::WrittenOwned { file, offset, len: buf.len(), failed: error.is_some() }
+                }
+                DiskEvent::FileLen { file, len } => Self::FileLen { file, len },
+                DiskEvent::ReadInto { file, offset, len, eof } => {
+                    Self::ReadInto { file, offset, len, eof }
                 }
                 DiskEvent::Synced { file, operation_id } => Self::Synced(file, operation_id),
                 DiskEvent::Truncated { file, len, operation_id } => {
@@ -1871,6 +2147,62 @@ mod tests {
         drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(directory)));
         assert!(events.contains(&Ev::Synced(directory, directory_sync_id)));
         assert!(disk.is_idle());
+    }
+
+    #[test]
+    fn file_len_and_transfers_through_caller_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        fs::write(&path, b"0123456789").unwrap();
+        let mut disk = DiskIo::default();
+        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+        assert!(disk.file_len(file));
+        let mut events = Vec::new();
+        drive(&mut disk, &mut events, |events| events.contains(&Ev::FileLen { file, len: 10 }));
+
+        let mut target = [0u8; 12];
+        // SAFETY: `target` outlives the completion and is untouched until it.
+        assert!(unsafe { disk.read_at_into(file, 2, target.as_mut_ptr(), 12) });
+        let read = Ev::ReadInto { file, offset: 2, len: 8, eof: true };
+        drive(&mut disk, &mut events, |events| events.contains(&read));
+        assert_eq!(&target[..8], b"23456789");
+
+        let written = dir.path().join("written.bin");
+        let file = disk.open(&written, OpenOptions::new().write(true).create(true)).unwrap();
+        let source = *b"payload";
+        // SAFETY: `source` outlives the completion and is unchanged until it.
+        assert!(unsafe { disk.write_at_from(file, 0, source.as_ptr(), source.len()) });
+        let write = Ev::Written { file, offset: 0, len: 7 };
+        drive(&mut disk, &mut events, |events| events.contains(&write));
+        assert_eq!(fs::read(&written).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn path_rename_and_directory_removal_order_on_a_directory_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staged.bin");
+        let destination = dir.path().join("final.bin");
+        let empty = dir.path().join("group");
+        fs::write(&source, b"block").unwrap();
+        fs::create_dir(&empty).unwrap();
+        let mut disk = DiskIo::default();
+        let directory = disk.open_directory(dir.path()).unwrap();
+        let rename_id = disk.rename_path(directory, &source, &destination).unwrap().unwrap();
+        let remove_id = disk.remove_dir(directory, &empty).unwrap().unwrap();
+        let missing_id = disk.remove_dir(directory, &empty).unwrap().unwrap();
+        assert!(disk.close(directory));
+
+        let mut events = Vec::new();
+        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(directory)));
+        let renamed = Ev::Renamed { file: directory, operation_id: rename_id };
+        let removed = Ev::Unlinked { file: directory, operation_id: remove_id };
+        let missing =
+            Ev::Failed { file: directory, op: FailedOp::Unlink, operation_id: Some(missing_id) };
+        let at = |event: &Ev| events.iter().position(|e| e == event).unwrap();
+        assert!(at(&renamed) < at(&removed) && at(&removed) < at(&missing), "{events:?}");
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"block");
+        assert!(!empty.exists());
     }
 
     #[test]

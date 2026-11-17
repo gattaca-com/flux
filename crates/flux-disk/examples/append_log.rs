@@ -41,6 +41,8 @@ fn main() {
             DiskEvent::Failed { op, error, .. } => panic!("write phase failed: {op:?}: {error}"),
             DiskEvent::Read { .. } |
             DiskEvent::ReadOwned { .. } |
+            DiskEvent::ReadInto { .. } |
+            DiskEvent::FileLen { .. } |
             DiskEvent::WrittenOwned { .. } |
             DiskEvent::Truncated { .. } |
             DiskEvent::Renamed { .. } |
@@ -69,6 +71,8 @@ fn main() {
             DiskEvent::Failed { op, error, .. } => panic!("read phase failed: {op:?}: {error}"),
             DiskEvent::Written { .. } |
             DiskEvent::ReadOwned { .. } |
+            DiskEvent::ReadInto { .. } |
+            DiskEvent::FileLen { .. } |
             DiskEvent::WrittenOwned { .. } |
             DiskEvent::Synced { .. } |
             DiskEvent::Truncated { .. } |
