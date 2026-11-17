@@ -314,7 +314,7 @@ impl QueueHeader {
     fn remove_group(&mut self, cursor: *const AtomicUsize) {
         self.acquire_group_lock();
         if let Some(index) =
-            self.group_cursors.iter().position(|slot| std::ptr::eq(&slot.cursor, cursor))
+            self.group_cursors.iter().position(|slot| std::ptr::eq(&raw const slot.cursor, cursor))
         {
             self.group_labels[index] = ArrayStr::new();
             self.group_cursors[index].cursor.store(0, Ordering::Relaxed);
