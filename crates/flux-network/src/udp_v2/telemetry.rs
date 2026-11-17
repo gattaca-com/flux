@@ -1,27 +1,28 @@
-//! UDP telemetry gives each writer a producer-owned SPMC lane for each event
-//! stream, avoiding contention on a shared MPMC reservation cursor. Writers
-//! must create their lanes before [`TelemetryReader::open`] discovers the fixed
-//! lane set; readers then merge those lanes in rotating, bounded batches. The
-//! rings are bounded and report exact gaps when a writer laps a reader.
+//! UDP telemetry uses a fixed pool of producer-owned SPMC lanes per group.
+//! Each writer holds one startup ownership lock; replacement writers repair
+//! and reuse the same queues without detaching readers. Pool mappings and
+//! files persist until application-level cleanup. Each group has eight slots
+//! of four queues (about 64 MiB total); claiming a ninth live slot panics.
 
 use std::{
+    fmt::Write as _,
+    fs::{File, OpenOptions},
+    io,
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{
-        OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Mutex, OnceLock},
 };
 
 use flux::{type_hash::TypeHash, type_hash_derive::TypeHash};
 use flux_communication::{
-    ReadError, cleanup_flink,
-    queue::{ConsumerBare, Producer, Queue, QueueType},
+    ReadError,
+    queue::{ConsumerBare, Producer, Queue},
 };
 use flux_timing::{Instant, Nanos};
 use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
 use mio::Token;
+use rustc_hash::FxHashMap;
 use tracing::warn;
 
 use crate::NetworkTelemetry;
@@ -29,7 +30,10 @@ use crate::NetworkTelemetry;
 const QUEUE_SIZE: usize = 2usize.pow(15);
 const LANE_SEPARATOR: &str = ".lane.";
 const LANE_DRAIN_BUDGET: usize = 64;
-static NEXT_LANE_ID: AtomicU64 = AtomicU64::new(0);
+const MAX_LANES: usize = 8;
+
+type LanePools = FxHashMap<PathBuf, Box<[Lane]>>;
+static LANE_POOLS: OnceLock<Mutex<LanePools>> = OnceLock::new();
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
@@ -124,16 +128,65 @@ struct TelemetryProducers {
     // (see the TODO on `flux_communication::Timer`).
     latency: Producer<UdpLatency>,
     rtt: Producer<UdpRtt>,
-    _lane_files: LaneFiles,
+    _owner: File,
 }
 
-struct LaneFiles([PathBuf; 4]);
+struct Lane {
+    sends: Queue<UdpSend>,
+    retransmits: Queue<UdpRetransmit>,
+    latency: Queue<UdpLatency>,
+    rtt: Queue<UdpRtt>,
+    owner_file: PathBuf,
+}
 
-impl Drop for LaneFiles {
-    fn drop(&mut self) {
-        for file in &self.0 {
-            if let Err(err) = cleanup_flink(file) {
-                warn!(%err, file = %file.display(), "failed to clean UDP telemetry lane");
+impl Lane {
+    fn new(dir: &Path, index: usize) -> Self {
+        let lane = index.to_string();
+        Self {
+            sends: Queue::create_or_open_shared_spmc_lane(
+                lane_file(dir, "udp_sends", &lane),
+                QUEUE_SIZE,
+            ),
+            retransmits: Queue::create_or_open_shared_spmc_lane(
+                lane_file(dir, "udp_retransmits", &lane),
+                QUEUE_SIZE,
+            ),
+            latency: Queue::create_or_open_shared_spmc_lane(
+                lane_file(dir, "udp_latency", &lane),
+                QUEUE_SIZE,
+            ),
+            rtt: Queue::create_or_open_shared_spmc_lane(
+                lane_file(dir, "udp_rtt", &lane),
+                QUEUE_SIZE,
+            ),
+            owner_file: dir.join(format!("owner{LANE_SEPARATOR}{index}.lock")),
+        }
+    }
+
+    fn try_claim(&self) -> io::Result<Option<TelemetryProducers>> {
+        // A fresh open file description excludes other threads as well as processes.
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&self.owner_file)?;
+        loop {
+            if unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(TelemetryProducers {
+                    sends: Producer::from(self.sends),
+                    retransmits: Producer::from(self.retransmits),
+                    latency: Producer::from(self.latency),
+                    rtt: Producer::from(self.rtt),
+                    _owner: owner,
+                }));
+            }
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => return Ok(None),
+                _ => return Err(err),
             }
         }
     }
@@ -149,22 +202,28 @@ impl Telemetry {
     }
 
     fn enabled_in_dir(dir: &Path, group_name: &str) -> Self {
-        let _ = std::fs::create_dir_all(dir);
-        let lane = lane_id();
-        let lane_files = LaneFiles([
-            lane_file(dir, &sends_queue(group_name), &lane),
-            lane_file(dir, &retransmits_queue(group_name), &lane),
-            lane_file(dir, &latency_queue(group_name), &lane),
-            lane_file(dir, &rtt_queue(group_name), &lane),
-        ]);
-        let producers = TelemetryProducers {
-            sends: producer(&lane_files.0[0]),
-            retransmits: producer(&lane_files.0[1]),
-            latency: producer(&lane_files.0[2]),
-            rtt: producer(&lane_files.0[3]),
-            _lane_files: lane_files,
+        let dir = pool_dir(dir, group_name);
+        std::fs::create_dir_all(&dir).expect("couldn't create UDP telemetry directory");
+        let dir = dir.canonicalize().expect("couldn't resolve UDP telemetry directory");
+        let producers = {
+            let mut pools = LANE_POOLS
+                .get_or_init(|| Mutex::new(FxHashMap::default()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pool = pools
+                .entry(dir.clone())
+                .or_insert_with(|| (0..MAX_LANES).map(|index| Lane::new(&dir, index)).collect());
+            let claimed = pool
+                .iter()
+                .find_map(|lane| lane.try_claim().expect("couldn't claim UDP telemetry lane"));
+            drop(pools);
+            claimed
         };
-        Self { producers: Some(producers) }
+        Self {
+            producers: Some(producers.unwrap_or_else(|| {
+                panic!("all {MAX_LANES} UDP telemetry lanes for {group_name} are owned")
+            })),
+        }
     }
 
     #[inline]
@@ -196,75 +255,16 @@ impl Telemetry {
     }
 }
 
-fn lane_id() -> String {
-    let serial = NEXT_LANE_ID.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}-{serial}", std::process::id(), process_instance_token())
-}
-
-fn process_instance_token() -> &'static str {
-    static TOKEN: OnceLock<String> = OnceLock::new();
-    TOKEN.get_or_init(|| {
-        if let Ok(Some(process)) = read_process_instance(std::process::id()) {
-            return format!("p{}", process.start_ticks);
-        }
-
-        let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        format!("t{created}")
-    })
-}
-
-struct ProcessInstance {
-    state: u8,
-    start_ticks: u64,
-}
-
-fn read_process_instance(pid: u32) -> std::io::Result<Option<ProcessInstance>> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let Some((_, after_comm)) = stat.rsplit_once(')') else { return Ok(None) };
-    let mut fields = after_comm.split_whitespace();
-    let Some(state) = fields.next().and_then(|field| field.as_bytes().first()).copied() else {
-        return Ok(None);
-    };
-    let Some(start_ticks) = fields.nth(18).and_then(|field| field.parse().ok()) else {
-        return Ok(None);
-    };
-    Ok(Some(ProcessInstance { state, start_ticks }))
-}
-
-fn lane_is_stale(lane: &str) -> bool {
-    let mut parts = lane.splitn(3, '-');
-    let Some(pid) = parts.next().and_then(|part| part.parse().ok()) else { return false };
-    let Some(instance) = parts.next() else { return false };
-    let Some(_serial) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
-        return false;
-    };
-    match read_process_instance(pid) {
-        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-        Ok(Some(process)) if matches!(process.state, b'Z' | b'X') => true,
-        Ok(Some(process)) => instance
-            .strip_prefix('p')
-            .and_then(|expected| expected.parse::<u64>().ok())
-            .is_some_and(|expected| expected != process.start_ticks),
-        Ok(None) => false,
+fn pool_dir(dir: &Path, group: &str) -> PathBuf {
+    let mut encoded = String::with_capacity(group.len() * 2);
+    for byte in group.bytes() {
+        write!(encoded, "{byte:02x}").unwrap();
     }
-}
-
-fn reap_stale_lane(file: &Path, lane: &str) -> bool {
-    if !lane_is_stale(lane) {
-        return false;
-    }
-    if let Err(err) = cleanup_flink(file) {
-        warn!(%err, file = %file.display(), "failed to reap stale UDP telemetry lane");
-    }
-    true
+    dir.join("udp_telemetry").join(encoded)
 }
 
 fn lane_file(dir: &Path, name: &str, lane: &str) -> PathBuf {
     dir.join(format!("{name}{LANE_SEPARATOR}{lane}"))
-}
-
-fn producer<T: Copy + TypeHash>(file: &Path) -> Producer<T> {
-    Producer::from(Queue::create_or_open_shared(file, QUEUE_SIZE, QueueType::SPMC))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,11 +304,21 @@ impl<T: Copy + TypeHash> LaneConsumers<T> {
     fn discover(&mut self, files: &[PathBuf], queue_name: &str) {
         let lane_prefix = format!("{queue_name}{LANE_SEPARATOR}");
         for file in files {
-            let Some(name) = file.file_name().and_then(|name| name.to_str()) else { continue };
-            if name != queue_name && !name.starts_with(&lane_prefix) {
+            if !file.exists() {
                 continue;
             }
-            match Queue::try_open_shared(file) {
+            let Some(name) = file.file_name().and_then(|name| name.to_str()) else { continue };
+            let pool_lane =
+                name.strip_prefix(&lane_prefix).is_some_and(|index| index.parse::<usize>().is_ok());
+            if name != queue_name && !pool_lane {
+                continue;
+            }
+            let queue = if pool_lane {
+                Queue::try_open_shared_spmc_lane(file)
+            } else {
+                Queue::try_open_shared(file)
+            };
+            match queue {
                 Ok(queue) => {
                     let mut consumer = ConsumerBare::new(queue, "udp_telemetry");
                     consumer.subscribe_broadcast();
@@ -321,10 +331,11 @@ impl<T: Copy + TypeHash> LaneConsumers<T> {
 }
 
 impl TelemetryReader {
-    /// Opens every producer lane currently present for `group_name`.
+    /// Opens the fixed producer-lane pool for `group_name`.
     ///
-    /// UDP writers must be created before the reader. Lane discovery happens
-    /// once here, so writers created after this call are not observed.
+    /// Create at least one writer first to initialize the whole pool. Later
+    /// writers and replacements use lanes already mapped by this reader.
+    /// Ownership files and queues must remain linked while the pool is in use.
     pub fn open(app_name: &str, group_name: &str) -> Self {
         let dir = shmem_dir_queues_with_base(local_share_dir(), app_name);
         Self::open_in_dir(&dir, group_name)
@@ -342,23 +353,26 @@ impl TelemetryReader {
     }
 
     fn discover_lanes(&mut self, dir: &Path, group_name: &str) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let entries = std::fs::read_dir(pool_dir(dir, group_name));
         // Directory scanning and temporary path allocation happen once during
         // reader startup; draining retains and reuses only the consumers.
-        let mut files: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        let mut files: Vec<_> =
+            entries.into_iter().flatten().flatten().map(|entry| entry.path()).collect();
         files.sort_unstable();
-        files.retain(|file| {
-            let lane = file
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.rsplit_once(LANE_SEPARATOR))
-                .map(|(_, lane)| lane);
-            !lane.is_some_and(|lane| reap_stale_lane(file, lane))
-        });
-        self.sends.discover(&files, &sends_queue(group_name));
-        self.retransmits.discover(&files, &retransmits_queue(group_name));
-        self.latency.discover(&files, &latency_queue(group_name));
-        self.rtt.discover(&files, &rtt_queue(group_name));
+        self.sends.discover(&files, "udp_sends");
+        self.retransmits.discover(&files, "udp_retransmits");
+        self.latency.discover(&files, "udp_latency");
+        self.rtt.discover(&files, "udp_rtt");
+        let legacy = [
+            dir.join(sends_queue(group_name)),
+            dir.join(retransmits_queue(group_name)),
+            dir.join(latency_queue(group_name)),
+            dir.join(rtt_queue(group_name)),
+        ];
+        self.sends.discover(&legacy[..1], &sends_queue(group_name));
+        self.retransmits.discover(&legacy[1..2], &retransmits_queue(group_name));
+        self.latency.discover(&legacy[2..3], &latency_queue(group_name));
+        self.rtt.discover(&legacy[3..], &rtt_queue(group_name));
     }
 
     pub fn drain(&mut self, mut on_event: impl FnMut(TelemetryEvent)) {
@@ -419,15 +433,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn telemetry_uses_one_spmc_lane_per_writer() {
+    fn telemetry_reuses_lanes_without_detaching_reader() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut first = Telemetry::enabled_in_dir(tmp.path(), "group");
-        let mut second = Telemetry::enabled_in_dir(tmp.path(), "group");
+        let mut writers: Vec<_> =
+            (0..MAX_LANES).map(|_| Telemetry::enabled_in_dir(tmp.path(), "group")).collect();
         let mut reader = TelemetryReader::open_in_dir(tmp.path(), "group");
+        assert!(
+            std::panic::catch_unwind(|| { Telemetry::enabled_in_dir(tmp.path(), "group") })
+                .is_err()
+        );
 
-        first.send(&UdpSend { bytes: 11, ..UdpSend::default() });
-        second.send(&UdpSend { bytes: 22, ..UdpSend::default() });
-
+        for (index, writer) in writers.iter_mut().enumerate() {
+            writer.send(&UdpSend { bytes: index as u32, ..UdpSend::default() });
+        }
         let mut bytes = Vec::new();
         reader.drain(|event| {
             if let TelemetryEvent::Send(event) = event {
@@ -435,8 +453,87 @@ mod tests {
             }
         });
         bytes.sort_unstable();
-        assert_eq!(bytes, [11, 22]);
+        assert_eq!(bytes, (0..MAX_LANES as u32).collect::<Vec<_>>());
 
+        for round in 0..16 {
+            drop(writers.remove(0));
+            let mut replacement = Telemetry::enabled_in_dir(tmp.path(), "group");
+            replacement.send(&UdpSend { bytes: 100 + round, ..UdpSend::default() });
+            bytes.clear();
+            reader.drain(|event| {
+                if let TelemetryEvent::Send(event) = event {
+                    bytes.push(event.bytes);
+                }
+            });
+            assert_eq!(bytes, [100 + round]);
+            writers.insert(0, replacement);
+        }
+        drop(writers);
         flux_communication::cleanup_shmem(tmp.path());
+    }
+
+    #[test]
+    fn telemetry_crash_writer_child() {
+        let Some(dir) = std::env::var_os("FLUX_TELEMETRY_CRASH_DIR") else { return };
+        let dir = Path::new(&dir);
+        let mut writer = Telemetry::enabled_in_dir(dir, "group");
+        writer.send(&UdpSend { bytes: 11, ..UdpSend::default() });
+        std::fs::write(dir.join("ready"), []).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn telemetry_replaces_killed_writer_without_detaching_reader() {
+        use std::{
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Telemetry::enabled_in_dir(tmp.path(), "group");
+        let mut reader = TelemetryReader::open_in_dir(tmp.path(), "group");
+        let test_module = module_path!().split_once("::").unwrap().1;
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(format!("{test_module}::telemetry_crash_writer_child"))
+            .env("FLUX_TELEMETRY_CRASH_DIR", tmp.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !tmp.path().join("ready").exists() {
+                assert!(child.try_wait().unwrap().is_none(), "writer exited before publishing");
+                assert!(Instant::now() < deadline, "writer did not publish before deadline");
+                std::thread::yield_now();
+            }
+            let mut bytes = Vec::new();
+            reader.drain(|event| {
+                if let TelemetryEvent::Send(event) = event {
+                    bytes.push(event.bytes);
+                }
+            });
+            assert_eq!(bytes, [11]);
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let mut replacement = Telemetry::enabled_in_dir(tmp.path(), "group");
+            replacement.send(&UdpSend { bytes: 22, ..UdpSend::default() });
+            bytes.clear();
+            reader.drain(|event| {
+                if let TelemetryEvent::Send(event) = event {
+                    bytes.push(event.bytes);
+                }
+            });
+            assert_eq!(bytes, [22]);
+        }));
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(writer);
+        flux_communication::cleanup_shmem(tmp.path());
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
