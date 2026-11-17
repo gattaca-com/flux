@@ -13,6 +13,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[inline(always)]
+fn likely(condition: bool) -> bool {
+    if !condition {
+        // Expose the empty body so downstream optimization can remove the marker call.
+        #[cold]
+        #[inline]
+        fn cold() {}
+        cold();
+    }
+    condition
+}
+
 #[allow(clippy::significant_drop_tightening)]
 fn broadcast_id_for(label: &str, queue: &str) -> usize {
     static COUNTERS: OnceLock<Mutex<HashMap<(String, String), usize>>> = OnceLock::new();
@@ -984,7 +996,7 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn acquire_specific_slot(&mut self, delta: usize) {
         let cursor = unsafe { &*self.cursor };
-        let prev = if self.exclusive_cursor {
+        let prev = if likely(self.exclusive_cursor) {
             // Only this consumer writes a broadcast cursor, so a plain load + store
             // is enough and avoids the `lock xadd` (a full barrier on x86) that
             // `fetch_add` compiles to.
@@ -1024,7 +1036,7 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline]
     fn try_init_broadcast(&mut self) {
-        if self.cursor.is_null() {
+        if !likely(!self.cursor.is_null()) {
             self.init_broadcast();
         }
     }
