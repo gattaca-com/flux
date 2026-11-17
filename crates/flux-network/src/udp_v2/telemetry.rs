@@ -17,7 +17,7 @@ use std::{
 use flux::{type_hash::TypeHash, type_hash_derive::TypeHash};
 use flux_communication::{
     ReadError,
-    queue::{ConsumerBare, Producer, Queue},
+    queue::{OwnedBroadcastConsumer, Producer, Queue},
 };
 use flux_timing::{Instant, Nanos};
 use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
@@ -290,11 +290,11 @@ pub struct TelemetryReader {
     rtt: LaneConsumers<UdpRtt>,
 }
 
-struct LaneConsumers<T> {
-    consumers: Vec<ConsumerBare<T>>,
+struct LaneConsumers<T: Copy> {
+    consumers: Vec<OwnedBroadcastConsumer<T>>,
 }
 
-impl<T> LaneConsumers<T> {
+impl<T: Copy> LaneConsumers<T> {
     fn new() -> Self {
         Self { consumers: Vec::new() }
     }
@@ -320,9 +320,7 @@ impl<T: Copy + TypeHash> LaneConsumers<T> {
             };
             match queue {
                 Ok(queue) => {
-                    let mut consumer = ConsumerBare::new(queue, "udp_telemetry");
-                    consumer.subscribe_broadcast();
-                    self.consumers.push(consumer);
+                    self.consumers.push(OwnedBroadcastConsumer::new(queue));
                 }
                 Err(err) => warn!(?err, file = %file.display(), "invalid UDP telemetry lane"),
             }

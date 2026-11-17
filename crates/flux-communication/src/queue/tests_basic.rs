@@ -2,7 +2,9 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     QueueError, ReadError,
-    queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType},
+    queue::{
+        ConsumerBare, MAX_GROUPS, OwnedBroadcastConsumer, Producer, Queue, QueueHeader, QueueType,
+    },
 };
 
 #[test]
@@ -59,6 +61,29 @@ fn broadcast_recovers_at_head_with_exact_gap() {
         producer.produce(&expected);
         assert_eq!(consumer.try_consume(&mut value), Ok(()));
         assert_eq!(value, expected);
+    }
+}
+
+#[test]
+fn owned_broadcast_readers_reuse_slots_and_start_at_head() {
+    let queue = Queue::new(4, QueueType::SPMC);
+    let mut producer = Producer::from(queue);
+    let mut persistent = OwnedBroadcastConsumer::new(queue);
+    let mut value = 0;
+
+    for round in 0..=MAX_GROUPS {
+        let before = round * 2;
+        producer.produce(&before);
+        let mut replacement = OwnedBroadcastConsumer::new(queue);
+        assert_eq!(replacement.try_consume(&mut value), Err(ReadError::Empty));
+
+        producer.produce(&(before + 1));
+        replacement.try_consume(&mut value).unwrap();
+        assert_eq!(value, before + 1);
+        persistent.try_consume(&mut value).unwrap();
+        assert_eq!(value, before);
+        persistent.try_consume(&mut value).unwrap();
+        assert_eq!(value, before + 1);
     }
 }
 

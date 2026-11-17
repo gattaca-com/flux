@@ -50,7 +50,7 @@ fn pid_from_label(label: &str) -> Option<u32> {
 ///
 /// Uses `/proc/<pid>` on Linux which avoids requiring the `libc` crate.
 fn is_pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    pid == current_pid() || Path::new(&format!("/proc/{pid}")).exists()
 }
 
 mod segment;
@@ -308,6 +308,17 @@ impl QueueHeader {
 
         self.release_group_lock();
         panic!("no group slots available (max {MAX_GROUPS} groups)");
+    }
+
+    fn remove_group(&mut self, cursor: *const AtomicUsize) {
+        self.acquire_group_lock();
+        if let Some(index) =
+            self.group_cursors.iter().position(|slot| std::ptr::eq(&slot.cursor, cursor))
+        {
+            self.group_labels[index] = ArrayStr::new();
+            self.group_cursors[index].cursor.store(0, Ordering::Relaxed);
+        }
+        self.release_group_lock();
     }
 
     /// Returns all non-empty consumer group slots as `(label, cursor_value)`
@@ -834,6 +845,44 @@ pub struct ConsumerBare<T> {
 }
 
 unsafe impl<T> Send for ConsumerBare<T> {}
+
+/// An independent broadcast reader that releases its group slot on drop.
+/// New readers subscribe at the current producer head.
+pub struct OwnedBroadcastConsumer<T: Copy> {
+    consumer: ConsumerBare<T>,
+}
+
+impl<T: Copy> OwnedBroadcastConsumer<T> {
+    pub fn new(queue: Queue<T>) -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut consumer = ConsumerBare::new(queue, "");
+        // This fits in GROUP_LABEL_LEN and cannot match generic .broadcast/.collab
+        // keys.
+        consumer.cursor = queue.group_cursor(&format!("owned[{}].broadcast.{id}", current_pid()));
+        consumer.exclusive_cursor = true;
+        consumer.set_broadcast_pos(queue.count());
+        Self { consumer }
+    }
+
+    #[inline]
+    pub fn try_consume(&mut self, item: &mut T) -> Result<(), ReadError> {
+        self.consumer.try_consume(item)
+    }
+
+    #[inline]
+    pub fn skip_to_head_after_error(&mut self) -> usize {
+        self.consumer.skip_to_head_after_error()
+    }
+}
+
+impl<T: Copy> Drop for OwnedBroadcastConsumer<T> {
+    fn drop(&mut self) {
+        unsafe { &mut *self.consumer.queue.inner.cast_mut() }
+            .header
+            .remove_group(self.consumer.cursor);
+    }
+}
 
 impl<T: Copy> ConsumerBare<T> {
     pub fn new(queue: Queue<T>, label: &'static str) -> Self {
