@@ -344,3 +344,39 @@ fn broadcast_cursor_advances_without_rmw() {
     let collab = ConsumerBare::new_collaborative_test(q, "broadcast_cursor_advances_without_rmw");
     assert!(!collab.exclusive_cursor);
 }
+
+#[test]
+fn spmc_lane_takeover_preserves_reader_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    for version in 2..=4 {
+        let file = tmp.path().join(format!("lane-{version}"));
+        let queue = Queue::<u64>::create_or_open_shared_spmc_lane(&file, 4);
+        let mut producer = Producer::from(queue);
+        for value in 0..5 {
+            producer.produce(&value);
+        }
+        let mut reader = ConsumerBare::new_broadcast_test(queue);
+        let slot = queue.load(1);
+        slot.write(&55);
+        slot.set_version_unsafe(version);
+
+        let reopened = Queue::<u64>::create_or_open_shared_spmc_lane(&file, 4);
+        Queue::<u64>::try_open_shared_spmc_lane(&file).unwrap();
+        let mut replacement = Producer::from(reopened);
+        let adopted = version == 4;
+        assert_eq!(replacement.produce(&99), if adopted { 6 } else { 5 });
+        assert_eq!(reopened.count(), if adopted { 7 } else { 6 });
+        let mut value = 0;
+        if adopted {
+            reader.try_consume(&mut value).unwrap();
+            assert_eq!(value, 55);
+        }
+        reader.try_consume(&mut value).unwrap();
+        assert_eq!(value, 99);
+        assert_eq!(reader.try_consume(&mut value), Err(ReadError::Empty));
+        replacement.produce(&100);
+        reader.try_consume(&mut value).unwrap();
+        assert_eq!(value, 100);
+        crate::cleanup_flink(&file).unwrap();
+    }
+}

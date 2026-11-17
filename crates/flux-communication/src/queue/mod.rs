@@ -446,8 +446,8 @@ impl<T: Copy> InnerQueue<T> {
                 // The single producer owns the position so it doesn't need a locked
                 // read-modify-write.
                 let next_count = self.header.count.load(Ordering::Relaxed);
-                self.header.count.store(next_count.wrapping_add(1), Ordering::Relaxed);
                 self.load(next_count & mask).write(item);
+                self.header.count.store(next_count.wrapping_add(1), Ordering::Release);
                 next_count
             }
         }
@@ -496,11 +496,20 @@ impl<T: Copy> InnerQueue<T> {
                 let c = self.count();
                 let p = c & m;
                 let lock = self.load(p);
-                if lock.version() & 1 == 1 {
-                    lock.write_unpoison(item);
-                    p
-                } else {
-                    self.produce(item)
+                let expected = ((c >> m.count_ones()) as u64).wrapping_mul(2).wrapping_add(2);
+                match lock.version() {
+                    v if v == expected.wrapping_sub(2) => self.produce(item),
+                    v if v == expected.wrapping_sub(1) => {
+                        lock.write_unpoison(item);
+                        self.header.count.store(c.wrapping_add(1), Ordering::Release);
+                        c
+                    }
+                    v if v == expected => {
+                        // The slot committed before its producer could publish the count.
+                        self.header.count.store(c.wrapping_add(1), Ordering::Release);
+                        self.produce(item)
+                    }
+                    v => panic!("SPMC slot {p} has version {v}, expected {expected}"),
                 }
             }
         }
@@ -564,6 +573,36 @@ impl<T: Copy + TypeHash> InnerQueue<T> {
     fn open_shared(shmem_file: &Path) -> Result<*const Self, QueueError> {
         // min_len 0: any length the creator chose is fine for an attach-only open.
         Flink(shmem_file).open(|ptr, mapped_len| Self::open_initialized(ptr, mapped_len, 0))
+    }
+
+    fn create_or_open_shared_spmc_lane(shmem_file: &Path, len: usize) -> *const Self {
+        let len = len.next_power_of_two();
+        Flink(shmem_file).create_or_open::<T, _>(
+            Self::size_of(len),
+            |ptr, mapped_len| {
+                // The directory lock excludes an initializer still writing this header.
+                if matches!(
+                    QueueHeader::from_mapping(ptr, mapped_len),
+                    Err(QueueError::UnInitialized)
+                ) {
+                    return Err(QueueError::UnInitialized);
+                }
+                Self::open_spmc_lane(ptr, mapped_len, len)
+            },
+            |ptr| Self::from_uninitialized_ptr(ptr, len, QueueType::SPMC, T::TYPE_HASH),
+        )
+    }
+
+    fn open_spmc_lane(
+        ptr: *mut u8,
+        mapped_len: usize,
+        min_len: usize,
+    ) -> Result<*const Self, QueueError> {
+        let q = Self::open_validated(ptr, mapped_len, min_len)?;
+        if !matches!(unsafe { (*q).header.queue_type }, QueueType::SPMC) {
+            return Err(QueueError::UnInitialized);
+        }
+        Ok(q)
     }
 
     fn open_initialized(
@@ -654,6 +693,23 @@ impl<T: Copy + TypeHash> Queue<T> {
         queue_type: QueueType,
     ) -> Self {
         Self { inner: InnerQueue::create_or_open_shared(shmem_file.as_ref(), len, queue_type) }
+    }
+
+    /// Opens a persistent single-producer lane, preserving an interrupted slot
+    /// for the next producer to repair. The producer must hold exclusive lane
+    /// ownership until it stops producing. Incompatible existing segments
+    /// follow the configured mapped-queue replacement policy.
+    pub fn create_or_open_shared_spmc_lane<P: AsRef<Path>>(shmem_file: P, len: usize) -> Self {
+        Self { inner: InnerQueue::create_or_open_shared_spmc_lane(shmem_file.as_ref(), len) }
+    }
+
+    /// Attaches to a persistent SPMC lane without treating an interrupted write
+    /// as a reason to replace its mapping. Readers use slot versions to wait
+    /// for its exclusively owned producer to finish or repair the write.
+    pub fn try_open_shared_spmc_lane<P: AsRef<Path>>(shmem_file: P) -> Result<Self, QueueError> {
+        let inner = Flink(shmem_file.as_ref())
+            .open(|ptr, mapped_len| InnerQueue::<T>::open_spmc_lane(ptr, mapped_len, 0))?;
+        Ok(Self { inner })
     }
 
     pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
