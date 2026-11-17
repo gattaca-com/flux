@@ -1,10 +1,29 @@
 // Integration test to verify queue stats are correctly read during discovery
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use flux_communication::queue::QueueHeader;
-use flux_ctl::discovery::{read_consumer_groups, scan_base_dir};
+use flux_communication::queue::{Queue, QueueHeader};
+use flux_ctl::discovery::{ShmemCache, read_consumer_groups, scan_base_dir};
 use shared_memory::ShmemConf;
 use tempfile::tempdir;
+
+#[test]
+fn telemetry_pool_queues_are_discovered_and_cached() {
+    let tmp = tempdir().unwrap();
+    let flink = tmp.path().join("app/shmem/queues/udp_telemetry/67726f7570/udp_sends.lane.0");
+    Queue::<u64>::create_or_open_shared_spmc_lane(&flink, 4);
+    let mut owner = ShmemConf::new().flink(&flink).open().unwrap();
+    owner.set_owner(true);
+
+    let entries = scan_base_dir(tmp.path());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].flink, flink.to_string_lossy());
+
+    let mut cache = ShmemCache::new();
+    cache.refresh(tmp.path());
+    let cached = cache.read_entries();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].flink, entries[0].flink);
+}
 
 #[test]
 fn queue_stats_populated_during_discovery() {

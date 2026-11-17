@@ -2,6 +2,7 @@ use std::{
     alloc::Layout,
     borrow::Borrow,
     collections::HashMap,
+    hash::{BuildHasher, Hasher, RandomState},
     mem::size_of,
     ops::Deref,
     path::Path,
@@ -11,6 +12,18 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[inline(always)]
+fn likely(condition: bool) -> bool {
+    if !condition {
+        // Expose the empty body so downstream optimization can remove the marker call.
+        #[cold]
+        #[inline]
+        fn cold() {}
+        cold();
+    }
+    condition
+}
 
 #[allow(clippy::significant_drop_tightening)]
 fn broadcast_id_for(label: &str, queue: &str) -> usize {
@@ -50,7 +63,7 @@ fn pid_from_label(label: &str) -> Option<u32> {
 ///
 /// Uses `/proc/<pid>` on Linux which avoids requiring the `libc` crate.
 fn is_pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    pid == current_pid() || Path::new(&format!("/proc/{pid}")).exists()
 }
 
 mod segment;
@@ -310,6 +323,17 @@ impl QueueHeader {
         panic!("no group slots available (max {MAX_GROUPS} groups)");
     }
 
+    fn remove_group(&mut self, cursor: *const AtomicUsize) {
+        self.acquire_group_lock();
+        if let Some(index) =
+            self.group_cursors.iter().position(|slot| std::ptr::eq(&raw const slot.cursor, cursor))
+        {
+            self.group_labels[index] = ArrayStr::new();
+            self.group_cursors[index].cursor.store(0, Ordering::Relaxed);
+        }
+        self.release_group_lock();
+    }
+
     /// Returns all non-empty consumer group slots as `(label, cursor_value)`
     /// pairs.
     ///
@@ -446,8 +470,8 @@ impl<T: Copy> InnerQueue<T> {
                 // The single producer owns the position so it doesn't need a locked
                 // read-modify-write.
                 let next_count = self.header.count.load(Ordering::Relaxed);
-                self.header.count.store(next_count.wrapping_add(1), Ordering::Relaxed);
                 self.load(next_count & mask).write(item);
+                self.header.count.store(next_count.wrapping_add(1), Ordering::Release);
                 next_count
             }
         }
@@ -496,11 +520,20 @@ impl<T: Copy> InnerQueue<T> {
                 let c = self.count();
                 let p = c & m;
                 let lock = self.load(p);
-                if lock.version() & 1 == 1 {
-                    lock.write_unpoison(item);
-                    p
-                } else {
-                    self.produce(item)
+                let expected = ((c >> m.count_ones()) as u64).wrapping_mul(2).wrapping_add(2);
+                match lock.version() {
+                    v if v == expected.wrapping_sub(2) => self.produce(item),
+                    v if v == expected.wrapping_sub(1) => {
+                        lock.write_unpoison(item);
+                        self.header.count.store(c.wrapping_add(1), Ordering::Release);
+                        c
+                    }
+                    v if v == expected => {
+                        // The slot committed before its producer could publish the count.
+                        self.header.count.store(c.wrapping_add(1), Ordering::Release);
+                        self.produce(item)
+                    }
+                    v => panic!("SPMC slot {p} has version {v}, expected {expected}"),
                 }
             }
         }
@@ -564,6 +597,36 @@ impl<T: Copy + TypeHash> InnerQueue<T> {
     fn open_shared(shmem_file: &Path) -> Result<*const Self, QueueError> {
         // min_len 0: any length the creator chose is fine for an attach-only open.
         Flink(shmem_file).open(|ptr, mapped_len| Self::open_initialized(ptr, mapped_len, 0))
+    }
+
+    fn create_or_open_shared_spmc_lane(shmem_file: &Path, len: usize) -> *const Self {
+        let len = len.next_power_of_two();
+        Flink(shmem_file).create_or_open::<T, _>(
+            Self::size_of(len),
+            |ptr, mapped_len| {
+                // The directory lock excludes an initializer still writing this header.
+                if matches!(
+                    QueueHeader::from_mapping(ptr, mapped_len),
+                    Err(QueueError::UnInitialized)
+                ) {
+                    return Err(QueueError::UnInitialized);
+                }
+                Self::open_spmc_lane(ptr, mapped_len, len)
+            },
+            |ptr| Self::from_uninitialized_ptr(ptr, len, QueueType::SPMC, T::TYPE_HASH),
+        )
+    }
+
+    fn open_spmc_lane(
+        ptr: *mut u8,
+        mapped_len: usize,
+        min_len: usize,
+    ) -> Result<*const Self, QueueError> {
+        let q = Self::open_validated(ptr, mapped_len, min_len)?;
+        if !matches!(unsafe { (*q).header.queue_type }, QueueType::SPMC) {
+            return Err(QueueError::UnInitialized);
+        }
+        Ok(q)
     }
 
     fn open_initialized(
@@ -654,6 +717,23 @@ impl<T: Copy + TypeHash> Queue<T> {
         queue_type: QueueType,
     ) -> Self {
         Self { inner: InnerQueue::create_or_open_shared(shmem_file.as_ref(), len, queue_type) }
+    }
+
+    /// Opens a persistent single-producer lane, preserving an interrupted slot
+    /// for the next producer to repair. The producer must hold exclusive lane
+    /// ownership until it stops producing. Incompatible existing segments
+    /// follow the configured mapped-queue replacement policy.
+    pub fn create_or_open_shared_spmc_lane<P: AsRef<Path>>(shmem_file: P, len: usize) -> Self {
+        Self { inner: InnerQueue::create_or_open_shared_spmc_lane(shmem_file.as_ref(), len) }
+    }
+
+    /// Attaches to a persistent SPMC lane without treating an interrupted write
+    /// as a reason to replace its mapping. Readers use slot versions to wait
+    /// for its exclusively owned producer to finish or repair the write.
+    pub fn try_open_shared_spmc_lane<P: AsRef<Path>>(shmem_file: P) -> Result<Self, QueueError> {
+        let inner = Flink(shmem_file.as_ref())
+            .open(|ptr, mapped_len| InnerQueue::<T>::open_spmc_lane(ptr, mapped_len, 0))?;
+        Ok(Self { inner })
     }
 
     pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
@@ -779,6 +859,45 @@ pub struct ConsumerBare<T> {
 
 unsafe impl<T> Send for ConsumerBare<T> {}
 
+/// An independent broadcast reader that releases its group slot on drop.
+/// New readers subscribe at the current producer head.
+pub struct OwnedBroadcastConsumer<T: Copy> {
+    consumer: ConsumerBare<T>,
+}
+
+impl<T: Copy> OwnedBroadcastConsumer<T> {
+    pub fn new(queue: Queue<T>) -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        static INSTANCE_TOKEN: OnceLock<u64> = OnceLock::new();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let token = INSTANCE_TOKEN.get_or_init(|| RandomState::new().build_hasher().finish());
+        let mut consumer = ConsumerBare::new(queue, "");
+        // At most 55 bytes, so truncation cannot remove the token or ID.
+        consumer.cursor = queue.group_cursor(&format!("owned[{}].{token:x}.{id}", current_pid()));
+        consumer.exclusive_cursor = true;
+        consumer.set_broadcast_pos(queue.count());
+        Self { consumer }
+    }
+
+    #[inline]
+    pub fn try_consume(&mut self, item: &mut T) -> Result<(), ReadError> {
+        self.consumer.try_consume(item)
+    }
+
+    #[inline]
+    pub fn skip_to_head_after_error(&mut self) -> usize {
+        self.consumer.skip_to_head_after_error()
+    }
+}
+
+impl<T: Copy> Drop for OwnedBroadcastConsumer<T> {
+    fn drop(&mut self) {
+        unsafe { &mut *self.consumer.queue.inner.cast_mut() }
+            .header
+            .remove_group(self.consumer.cursor);
+    }
+}
+
 impl<T: Copy> ConsumerBare<T> {
     pub fn new(queue: Queue<T>, label: &'static str) -> Self {
         Self {
@@ -830,6 +949,18 @@ impl<T: Copy> ConsumerBare<T> {
         count
     }
 
+    /// Resume a lapped broadcast consumer at the producer head, returning
+    /// the number of skipped records, including retained records discarded
+    /// to leave room before the producer can lap this consumer again.
+    #[inline]
+    pub fn skip_to_head_after_error(&mut self) -> usize {
+        self.try_init_broadcast();
+        let expected = unsafe { &*self.cursor }.load(Ordering::Relaxed).saturating_sub(1);
+        let head = self.queue.count();
+        self.set_broadcast_pos(head);
+        head.saturating_sub(expected)
+    }
+
     /// If lapped: update count to continue from current position
     /// within the current rotation instead of resetting to the head
     /// of the queue. Returns the count resumed on, `None` if not lapped.
@@ -865,7 +996,7 @@ impl<T: Copy> ConsumerBare<T> {
     #[inline]
     fn acquire_specific_slot(&mut self, delta: usize) {
         let cursor = unsafe { &*self.cursor };
-        let prev = if self.exclusive_cursor {
+        let prev = if likely(self.exclusive_cursor) {
             // Only this consumer writes a broadcast cursor, so a plain load + store
             // is enough and avoids the `lock xadd` (a full barrier on x86) that
             // `fetch_add` compiles to.
@@ -905,7 +1036,7 @@ impl<T: Copy> ConsumerBare<T> {
 
     #[inline]
     fn try_init_broadcast(&mut self) {
-        if self.cursor.is_null() {
+        if !likely(!self.cursor.is_null()) {
             self.init_broadcast();
         }
     }

@@ -2,7 +2,9 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     QueueError, ReadError,
-    queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType},
+    queue::{
+        ConsumerBare, MAX_GROUPS, OwnedBroadcastConsumer, Producer, Queue, QueueHeader, QueueType,
+    },
 };
 
 #[test]
@@ -38,6 +40,50 @@ fn basic() {
         }
 
         assert!(matches!(c.try_consume(&mut m), Err(ReadError::SpedPast)));
+    }
+}
+
+#[test]
+fn broadcast_recovers_at_head_with_exact_gap() {
+    let q = Queue::new(4, QueueType::SPMC);
+    let mut producer = Producer::from(q);
+    let mut consumer = ConsumerBare::new_broadcast_test(q);
+
+    for value in 0..6 {
+        producer.produce(&value);
+    }
+
+    let mut value = 0;
+    assert_eq!(consumer.try_consume(&mut value), Err(ReadError::SpedPast));
+    assert_eq!(consumer.skip_to_head_after_error(), 6);
+    assert_eq!(consumer.try_consume(&mut value), Err(ReadError::Empty));
+    for expected in 6..1006 {
+        producer.produce(&expected);
+        assert_eq!(consumer.try_consume(&mut value), Ok(()));
+        assert_eq!(value, expected);
+    }
+}
+
+#[test]
+fn owned_broadcast_readers_reuse_slots_and_start_at_head() {
+    let queue = Queue::new(4, QueueType::SPMC);
+    let mut producer = Producer::from(queue);
+    let mut persistent = OwnedBroadcastConsumer::new(queue);
+    let mut value = 0;
+
+    for round in 0..=MAX_GROUPS {
+        let before = round * 2;
+        producer.produce(&before);
+        let mut replacement = OwnedBroadcastConsumer::new(queue);
+        assert_eq!(replacement.try_consume(&mut value), Err(ReadError::Empty));
+
+        producer.produce(&(before + 1));
+        replacement.try_consume(&mut value).unwrap();
+        assert_eq!(value, before + 1);
+        persistent.try_consume(&mut value).unwrap();
+        assert_eq!(value, before);
+        persistent.try_consume(&mut value).unwrap();
+        assert_eq!(value, before + 1);
     }
 }
 
@@ -323,4 +369,40 @@ fn broadcast_cursor_advances_without_rmw() {
 
     let collab = ConsumerBare::new_collaborative_test(q, "broadcast_cursor_advances_without_rmw");
     assert!(!collab.exclusive_cursor);
+}
+
+#[test]
+fn spmc_lane_takeover_preserves_reader_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    for version in 2..=4 {
+        let file = tmp.path().join(format!("lane-{version}"));
+        let queue = Queue::<u64>::create_or_open_shared_spmc_lane(&file, 4);
+        let mut producer = Producer::from(queue);
+        for value in 0..5 {
+            producer.produce(&value);
+        }
+        let mut reader = ConsumerBare::new_broadcast_test(queue);
+        let slot = queue.load(1);
+        slot.write(&55);
+        slot.set_version_unsafe(version);
+
+        let reopened = Queue::<u64>::create_or_open_shared_spmc_lane(&file, 4);
+        Queue::<u64>::try_open_shared_spmc_lane(&file).unwrap();
+        let mut replacement = Producer::from(reopened);
+        let adopted = version == 4;
+        assert_eq!(replacement.produce(&99), if adopted { 6 } else { 5 });
+        assert_eq!(reopened.count(), if adopted { 7 } else { 6 });
+        let mut value = 0;
+        if adopted {
+            reader.try_consume(&mut value).unwrap();
+            assert_eq!(value, 55);
+        }
+        reader.try_consume(&mut value).unwrap();
+        assert_eq!(value, 99);
+        assert_eq!(reader.try_consume(&mut value), Err(ReadError::Empty));
+        replacement.produce(&100);
+        reader.try_consume(&mut value).unwrap();
+        assert_eq!(value, 100);
+        crate::cleanup_flink(&file).unwrap();
+    }
 }

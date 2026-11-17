@@ -126,7 +126,7 @@ impl<T: Copy> Seqlock<T> {
             unsafe { std::ptr::write(self.data.get(), *data) }
         }
         compiler_fence(Ordering::AcqRel);
-        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        self.version.store(v.wrapping_add(1), Ordering::Release);
     }
 
     #[inline(never)]
