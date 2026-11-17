@@ -425,6 +425,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn telemetry_writer_recreation_does_not_accumulate_mappings() {
+        const CHILD: &str = "FLUX_TELEMETRY_MAPPING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let test_module = module_path!().split_once("::").unwrap().1;
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(format!(
+                    "{test_module}::telemetry_writer_recreation_does_not_accumulate_mappings"
+                ))
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        // Isolate the process so other tests cannot change its shared-memory mappings.
+        let mapping_count = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("/dev/shm/"))
+                .count()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        drop(Telemetry::enabled_in_dir(tmp.path(), "group"));
+        let initial = mapping_count();
+        assert!(initial >= MAX_LANES * 4);
+        for _ in 0..16 {
+            let mut writer = Telemetry::enabled_in_dir(tmp.path(), "group");
+            for _ in 0..QUEUE_SIZE {
+                writer.send(&UdpSend::default());
+                writer.retransmit(&UdpRetransmit::default());
+                let producers = writer.producers.as_mut().unwrap();
+                producers.latency.produce(&UdpLatency::default());
+                producers.rtt.produce(&UdpRtt::default());
+            }
+            drop(writer);
+            assert_eq!(mapping_count(), initial, "writer recreation leaked a mapping");
+        }
+        flux_communication::cleanup_shmem(tmp.path());
+    }
+
+    #[test]
     fn telemetry_reuses_lanes_without_detaching_reader() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writers: Vec<_> =
