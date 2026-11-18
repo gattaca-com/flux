@@ -1,4 +1,4 @@
-name: release validation
+name: release
 
 on:
   push:
@@ -25,6 +25,9 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      should_release: ${{ steps.release.outputs.should_release }}
+      tag: ${{ steps.release.outputs.tag }}
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -58,3 +61,29 @@ jobs:
         with:
           baseline-rev: ${{ steps.release.outputs.previous_tag }}
           release-type: ${{ steps.release.outputs.release_type }}
+
+  tag:
+    needs: validate
+    if: needs.validate.outputs.should_release == 'true'
+    # The organization IP allow list blocks tag pushes from GitHub-hosted runners.
+    runs-on: [self-hosted, silver]
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.validate.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Tags the validated commit, even if main has moved on since.
+      - name: Push release tag
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "$TAG is already released"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "$TAG" --message "Release $TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
