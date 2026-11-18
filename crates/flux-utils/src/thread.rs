@@ -52,10 +52,7 @@ fn set_thread_niceness(niceness: Option<ThreadNiceness>) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn set_thread_affinity(cores: &[usize]) -> io::Result<()> {
-    if cores.is_empty() {
-        return Ok(());
-    }
+pub fn cpu_set(cores: &[usize]) -> io::Result<libc::cpu_set_t> {
     let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
     if let Some(&core) = cores.iter().find(|&&core| core >= max) {
         return Err(io::Error::new(
@@ -63,14 +60,28 @@ fn set_thread_affinity(cores: &[usize]) -> io::Result<()> {
             format!("core {core} is beyond the {max} a CPU set holds"),
         ));
     }
+    // SAFETY: an all-zero `cpu_set_t` is the empty set, and every core is
+    // below its capacity.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         for &core in cores {
             libc::CPU_SET(core, &mut set);
         }
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        Ok(set)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_thread_affinity(cores: &[usize]) -> io::Result<()> {
+    if cores.is_empty() {
+        return Ok(());
+    }
+    let set = cpu_set(cores)?;
+    // SAFETY: `set` outlives the call and its size is passed.
+    if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) } !=
+        0
+    {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

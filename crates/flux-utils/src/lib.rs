@@ -12,6 +12,8 @@ pub use arrayvec::{ArrayStr, ArrayVec};
 pub use dcache::{DCache, DCacheError, DCachePtr, DCacheRef};
 pub use namespace::{ShortTypename, short_typename};
 pub use shared_vector::SharedVector;
+#[cfg(target_os = "linux")]
+pub use thread::cpu_set;
 pub use thread::{ThreadNiceness, get_tid, thread_boot, try_thread_boot};
 pub use truncating_vec::TruncatingVec;
 pub use vsync::vsync;

@@ -458,6 +458,18 @@ pub struct DiskIo {
     last_pending_warning: Option<Instant>,
 }
 
+/// Pins the kernel workers that run the calling thread's blocking operations
+/// to `cores`, for every ring the thread drives.
+pub fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
+    if cores.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cores to pin to"));
+    }
+    // Setting up a ring gives the calling thread the worker pool that holds
+    // the mask.
+    let ring = IoUring::new(1)?;
+    ring.submitter().register_iowq_aff(&flux_utils::cpu_set(cores)?)
+}
+
 impl Default for DiskIo {
     fn default() -> Self {
         Self::new(DiskConfig::default()).expect("couldn't set up an io_uring for disk io")
@@ -1802,7 +1814,7 @@ mod tests {
 
     use super::{
         DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions, OperationId,
-        READ_TO_END_CHUNK,
+        READ_TO_END_CHUNK, pin_io_workers,
     };
 
     fn overwrite() -> OpenOptions {
@@ -2312,5 +2324,53 @@ mod tests {
         disk.poll_with(|_| {});
         drop(disk);
         assert_eq!(fs::read(&path).unwrap(), payload);
+    }
+
+    /// `Cpus_allowed_list` of each io worker serving the calling thread.
+    fn io_worker_cores() -> Vec<String> {
+        // SAFETY: no preconditions.
+        let owner = format!("iou-wrk-{}", unsafe { libc::gettid() });
+        let mut cores = Vec::new();
+        for task in fs::read_dir("/proc/self/task").unwrap().flatten() {
+            let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            if comm.trim() != owner {
+                continue;
+            }
+            let status = fs::read_to_string(task.path().join("status")).unwrap();
+            let allowed = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:"));
+            cores.push(allowed.unwrap().trim().to_owned());
+        }
+        cores
+    }
+
+    /// The ring is built on one thread and driven by another, as a tile does.
+    #[test]
+    fn pinned_io_workers_run_on_the_given_core() {
+        // SAFETY: `allowed` outlives the call and its size is passed.
+        let core = unsafe {
+            let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut allowed);
+            (0..libc::CPU_SETSIZE as usize).rev().find(|&core| libc::CPU_ISSET(core, &allowed))
+        }
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskIo::default();
+        let file = disk.open(dir.path().join("pinned.bin"), overwrite()).unwrap();
+
+        let workers = std::thread::spawn(move || {
+            let empty = pin_io_workers(&[]).unwrap_err();
+            assert_eq!(empty.kind(), std::io::ErrorKind::InvalidInput);
+            pin_io_workers(&[core]).unwrap();
+            // A create and a sync always run on a worker.
+            let synced = disk.sync_all(file).unwrap();
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Synced(file, synced)));
+            io_worker_cores()
+        })
+        .join()
+        .unwrap();
+
+        assert!(!workers.is_empty(), "the ops ran on a worker");
+        assert!(workers.iter().all(|cores| *cores == core.to_string()), "{workers:?} vs {core}");
     }
 }
