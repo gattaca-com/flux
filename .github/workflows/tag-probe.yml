@@ -1,0 +1,25 @@
+name: tag probe
+
+on:
+  push:
+    branches: [alexey/auto_release_tag]
+
+jobs:
+  probe:
+    runs-on: [self-hosted, silver]
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TAG: ci-probe-${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Push and delete a probe tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "$TAG" --message "Probe $TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+          git push --delete origin "refs/tags/$TAG"
