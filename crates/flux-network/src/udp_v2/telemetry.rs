@@ -232,7 +232,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reopening_reader_reuses_mapping_and_fd() {
+    fn overlapping_readers_share_mapping_until_last_reader_drops() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("send");
         Queue::<u64>::create_or_open_shared(&file, 4, QueueType::MPMC);
@@ -252,15 +252,23 @@ mod tests {
                 .count();
             (maps, fds)
         };
-        drop(consumer::<u64>(tmp.path(), "send").unwrap());
         let initial = counts();
         assert!(initial.0 > 0 && initial.1 > 0);
-        for _ in 0..16 {
-            drop(consumer::<u64>(tmp.path(), "send").unwrap());
-        }
-        let after = counts();
+        let with_one_reader = (initial.0 + 1, initial.1 + 1);
+        let open_reader = || consumer::<u64>(tmp.path(), "send").unwrap();
+        let reader_cycle = || {
+            let first = open_reader();
+            let first_open = counts();
+            let second = open_reader();
+            let both_open = counts();
+            drop(first);
+            let first_dropped = counts();
+            drop(second);
+            [first_open, both_open, first_dropped, counts()]
+        };
+        let observed = [reader_cycle(), reader_cycle()];
         flux_communication::cleanup_flink(&file).unwrap();
-        assert_eq!(after, initial);
+        assert_eq!(observed, [[with_one_reader, with_one_reader, with_one_reader, initial]; 2]);
     }
 
     #[test]

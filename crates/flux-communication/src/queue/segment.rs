@@ -23,7 +23,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
     },
 };
@@ -66,7 +66,7 @@ fn mapped_queue_replacement() -> MappedQueueReplacement {
 #[derive(Clone, Copy)]
 pub(crate) struct Flink<'a>(pub(crate) &'a Path);
 
-static READER_MAPPINGS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Segment>>>> =
+static READER_MAPPINGS: LazyLock<Mutex<FxHashMap<PathBuf, Weak<Segment>>>> =
     LazyLock::new(Mutex::default);
 
 impl<'a> Flink<'a> {
@@ -144,19 +144,19 @@ impl<'a> Flink<'a> {
         };
         let mut mappings =
             READER_MAPPINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = mappings.get(&path) &&
+        if let Some(segment) = mappings.get(&path).and_then(Weak::upgrade) &&
             object.id.1 != 0 &&
-            cached.id == object.id &&
-            cached.len == object.len
+            segment.id == object.id &&
+            segment.len == object.len
         {
-            let segment = Arc::clone(cached);
             drop(mappings);
             return Ok((open(segment.ptr, segment.len)?, segment));
         }
         let segment = Arc::new(object.map()?);
         let queue = open(segment.ptr, segment.len)?;
         segment.lock_shared();
-        mappings.insert(path, Arc::clone(&segment));
+        mappings.retain(|_, mapping| mapping.strong_count() > 0);
+        mappings.insert(path, Arc::downgrade(&segment));
         drop(mappings);
         Ok((queue, segment))
     }
