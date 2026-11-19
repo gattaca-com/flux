@@ -19,12 +19,16 @@ use std::{
     mem::ManuallyDrop,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
+use rustc_hash::FxHashMap;
 use shared_memory::{ShmemConf, ShmemError};
 
 use super::{QueueHeader, QueueIdentity};
@@ -62,6 +66,9 @@ fn mapped_queue_replacement() -> MappedQueueReplacement {
 #[derive(Clone, Copy)]
 pub(crate) struct Flink<'a>(pub(crate) &'a Path);
 
+static READER_MAPPINGS: LazyLock<Mutex<FxHashMap<PathBuf, Arc<Segment>>>> =
+    LazyLock::new(Mutex::default);
+
 impl<'a> Flink<'a> {
     /// Maps the segment of a queue of `T`. An existing segment is accepted when
     /// `open` accepts it and replaced otherwise; a missing or replaced one is
@@ -84,13 +91,18 @@ impl<'a> Flink<'a> {
                 self.unlink(&os_id);
                 tracing::info!("replacing queue {self}: its segment {os_id:?} no longer exists");
             }
-            Existing::Mapped(os_id, segment) => match open(segment.ptr, segment.len) {
-                Ok(queue) => {
-                    segment.keep();
-                    return queue;
+            Existing::Found(os_id, object) => {
+                let segment = object
+                    .map()
+                    .unwrap_or_else(|e| panic!("couldn't map queue segment {self}: {e}"));
+                match open(segment.ptr, segment.len) {
+                    Ok(queue) => {
+                        segment.keep();
+                        return queue;
+                    }
+                    Err(reason) => segment.remove::<T>(self, &os_id, &reason),
                 }
-                Err(reason) => segment.remove::<T>(self, &os_id, &reason),
-            },
+            }
         }
 
         let segment = self.create(size);
@@ -108,12 +120,45 @@ impl<'a> Flink<'a> {
             return Err(QueueError::NonExistingFile);
         }
         let _lock = self.lock().map_err(ShmemError::LinkOpenFailed)?;
-        let Existing::Mapped(_, segment) = self.existing()? else {
+        let Existing::Found(_, object) = self.existing()? else {
             return Err(QueueError::NonExistingFile);
         };
+        let segment = object.map()?;
         let queue = open(segment.ptr, segment.len)?;
         segment.keep();
         Ok(queue)
+    }
+
+    pub(super) fn open_reader<R>(
+        self,
+        open: impl FnOnce(*mut u8, usize) -> Result<R, QueueError>,
+    ) -> Result<(R, Arc<Segment>), QueueError> {
+        let path = self.0.canonicalize().map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => QueueError::NonExistingFile,
+            _ => ShmemError::LinkOpenFailed(e).into(),
+        })?;
+        let flink = Flink(&path);
+        let _lock = flink.lock().map_err(ShmemError::LinkOpenFailed)?;
+        let Existing::Found(_, object) = flink.existing()? else {
+            return Err(QueueError::NonExistingFile);
+        };
+        let mut mappings =
+            READER_MAPPINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = mappings.get(&path) &&
+            object.id.1 != 0 &&
+            cached.id == object.id &&
+            cached.len == object.len
+        {
+            let segment = Arc::clone(cached);
+            drop(mappings);
+            return Ok((open(segment.ptr, segment.len)?, segment));
+        }
+        let segment = Arc::new(object.map()?);
+        let queue = open(segment.ptr, segment.len)?;
+        segment.lock_shared();
+        mappings.insert(path, Arc::clone(&segment));
+        drop(mappings);
+        Ok((queue, segment))
     }
 
     fn dir(self) -> &'a Path {
@@ -145,8 +190,8 @@ impl<'a> Flink<'a> {
             }
             Err(e) => return Err(ShmemError::LinkReadFailed(e)),
         };
-        match Segment::open(&os_id) {
-            Ok(Some(segment)) => Ok(Existing::Mapped(os_id, segment)),
+        match SegmentFile::open(&os_id) {
+            Ok(Some(object)) => Ok(Existing::Found(os_id, object)),
             Ok(None) => Ok(Existing::Stale(os_id)),
             Err(e) => Err(ShmemError::MapOpenFailed(e.raw_os_error().unwrap_or(0) as u32)),
         }
@@ -163,8 +208,10 @@ impl<'a> Flink<'a> {
         shmem.set_owner(false);
         let os_id = shmem.get_os_id().to_owned();
         drop(shmem);
-        match Segment::open(&os_id) {
-            Ok(Some(segment)) => segment,
+        match SegmentFile::open(&os_id) {
+            Ok(Some(object)) => object
+                .map()
+                .unwrap_or_else(|e| panic!("couldn't map new queue segment {os_id}: {e}")),
             Ok(None) => panic!("new queue segment {os_id} at {self} vanished"),
             Err(e) => panic!("couldn't map new queue segment {os_id} at {self}: {e}"),
         }
@@ -192,17 +239,29 @@ impl fmt::Display for Flink<'_> {
 enum Existing {
     Missing,
     Stale(String),
-    Mapped(String, Segment),
+    Found(String, SegmentFile),
 }
 
 /// A whole shm object, mapped read-write, and its fd.
-struct Segment {
+pub(super) struct Segment {
     ptr: *mut u8,
     len: usize,
     file: File,
+    id: (u64, u64),
 }
 
-impl Segment {
+// The address is stable until the last owner drops. Access to queue data is
+// synchronized by the queue protocol; sharing the mapping only keeps it alive.
+unsafe impl Send for Segment {}
+unsafe impl Sync for Segment {}
+
+struct SegmentFile {
+    file: File,
+    len: usize,
+    id: (u64, u64),
+}
+
+impl SegmentFile {
     /// `None` when no usable object has that name: it is gone (every flink is
     /// stale after a reboot), it is empty, or the flink does not hold a valid
     /// name.
@@ -219,26 +278,34 @@ impl Segment {
             };
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        let len = file.metadata()?.len() as usize;
-        if len == 0 {
+        let metadata = file.metadata()?;
+        if metadata.len() == 0 {
             return Ok(None);
         }
+        Ok(Some(Self { file, len: metadata.len() as usize, id: (metadata.dev(), metadata.ino()) }))
+    }
+
+    fn map(self) -> Result<Segment, ShmemError> {
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                self.len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                fd,
+                self.file.as_raw_fd(),
                 0,
             )
         };
         if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+            return Err(ShmemError::MapOpenFailed(
+                io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32,
+            ));
         }
-        Ok(Some(Self { ptr: ptr.cast(), len, file }))
+        Ok(Segment { ptr: ptr.cast(), len: self.len, file: self.file, id: self.id })
     }
+}
 
+impl Segment {
     fn identity(&self) -> Option<QueueIdentity> {
         QueueHeader::from_mapping(self.ptr, self.len).ok()?.identity()
     }
@@ -306,8 +373,12 @@ impl Segment {
     /// flock on the fd shows an opener about to replace the segment that this
     /// process maps it, even when it cannot read our `/proc/<pid>/maps`.
     fn keep(self) {
-        let this = ManuallyDrop::new(self);
-        unsafe { libc::flock(this.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        self.lock_shared();
+        std::mem::forget(self);
+    }
+
+    fn lock_shared(&self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
     }
 }
 

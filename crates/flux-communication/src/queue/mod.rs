@@ -6,7 +6,7 @@ use std::{
     ops::Deref,
     path::Path,
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -778,6 +778,36 @@ pub struct ConsumerBare<T> {
 }
 
 unsafe impl<T> Send for ConsumerBare<T> {}
+
+/// A broadcast subscription that shares the mapped queue with other readers.
+pub struct MappedBroadcastConsumer<T> {
+    consumer: ConsumerBare<T>,
+    // A replacement may evict this mapping while the cursor still points into it.
+    _mapping: Arc<segment::Segment>,
+}
+
+impl<T: Copy + TypeHash> MappedBroadcastConsumer<T> {
+    /// Opens an existing queue and subscribes at its current head.
+    pub fn open(path: &Path, label: &'static str) -> Result<Self, QueueError> {
+        let (inner, mapping) =
+            Flink(path).open_reader(|ptr, len| InnerQueue::<T>::open_initialized(ptr, len, 0))?;
+        let mut consumer = ConsumerBare::new(Queue { inner }, label);
+        consumer.subscribe_broadcast();
+        Ok(Self { consumer, _mapping: mapping })
+    }
+}
+
+impl<T: Copy> MappedBroadcastConsumer<T> {
+    #[inline]
+    pub fn try_consume(&mut self, item: &mut T) -> Result<(), ReadError> {
+        self.consumer.try_consume(item)
+    }
+
+    #[inline]
+    pub fn recover_after_error(&mut self) -> usize {
+        self.consumer.recover_after_error()
+    }
+}
 
 impl<T: Copy> ConsumerBare<T> {
     pub fn new(queue: Queue<T>, label: &'static str) -> Self {

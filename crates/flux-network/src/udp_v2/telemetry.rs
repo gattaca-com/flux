@@ -6,7 +6,7 @@ use std::{
 use flux::{type_hash::TypeHash, type_hash_derive::TypeHash};
 use flux_communication::{
     ReadError,
-    queue::{ConsumerBare, Producer, Queue, QueueType},
+    queue::{MappedBroadcastConsumer, Producer, Queue, QueueType},
 };
 use flux_timing::{Instant, Nanos};
 use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
@@ -172,10 +172,10 @@ pub enum TelemetryEvent {
 }
 
 pub struct TelemetryReader {
-    sends: Option<ConsumerBare<UdpSend>>,
-    retransmits: Option<ConsumerBare<UdpRetransmit>>,
-    latency: Option<ConsumerBare<UdpLatency>>,
-    rtt: Option<ConsumerBare<UdpRtt>>,
+    sends: Option<MappedBroadcastConsumer<UdpSend>>,
+    retransmits: Option<MappedBroadcastConsumer<UdpRetransmit>>,
+    latency: Option<MappedBroadcastConsumer<UdpLatency>>,
+    rtt: Option<MappedBroadcastConsumer<UdpRtt>>,
 }
 
 impl TelemetryReader {
@@ -197,14 +197,10 @@ impl TelemetryReader {
     }
 }
 
-fn consumer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Option<ConsumerBare<T>> {
+fn consumer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Option<MappedBroadcastConsumer<T>> {
     let file = dir.join(name);
-    match Queue::try_open_shared(&file) {
-        Ok(queue) => {
-            let mut consumer = ConsumerBare::new(queue, "udp_telemetry");
-            consumer.subscribe_broadcast();
-            Some(consumer)
-        }
+    match MappedBroadcastConsumer::open(&file, "udp_telemetry") {
+        Ok(consumer) => Some(consumer),
         Err(err) => {
             warn!(?err, file = %file.display(), "no udp telemetry");
             None
@@ -213,7 +209,7 @@ fn consumer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Option<ConsumerBare<T
 }
 
 fn drain<T: Copy + Default>(
-    consumer: &mut Option<ConsumerBare<T>>,
+    consumer: &mut Option<MappedBroadcastConsumer<T>>,
     on_event: &mut impl FnMut(TelemetryEvent),
     wrap: fn(T) -> TelemetryEvent,
 ) {
@@ -228,5 +224,65 @@ fn drain<T: Copy + Default>(
             }
             Err(ReadError::Empty) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopening_reader_reuses_mapping_and_fd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("send");
+        Queue::<u64>::create_or_open_shared(&file, 4, QueueType::MPMC);
+        let name = std::fs::read_to_string(&file).unwrap();
+        let object = Path::new("/dev/shm").join(name.trim_start_matches('/'));
+        let counts = || {
+            let mappings = std::fs::read_to_string("/proc/self/maps").unwrap();
+            let maps = mappings
+                .lines()
+                .filter(|line| line.split_whitespace().next_back() == object.to_str())
+                .count();
+            let fds = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|target| target == &object)
+                .count();
+            (maps, fds)
+        };
+        drop(consumer::<u64>(tmp.path(), "send").unwrap());
+        let initial = counts();
+        assert!(initial.0 > 0 && initial.1 > 0);
+        for _ in 0..16 {
+            drop(consumer::<u64>(tmp.path(), "send").unwrap());
+        }
+        let after = counts();
+        flux_communication::cleanup_flink(&file).unwrap();
+        assert_eq!(after, initial);
+    }
+
+    #[test]
+    fn reopened_readers_follow_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("send");
+        let writer =
+            || Producer::<u64>::from(Queue::create_or_open_shared(&file, 4, QueueType::MPMC));
+        let reader = || consumer::<u64>(tmp.path(), "send").unwrap();
+        let mut original = writer();
+        let first = reader();
+        flux_communication::cleanup_flink(&file).unwrap();
+        let mut replacement = writer();
+        let second = reader();
+        let third = reader();
+        original.produce(&1);
+        replacement.produce(&2);
+        for (mut reader, expected) in [(first, 1), (second, 2), (third, 2)] {
+            let mut value = 0;
+            reader.try_consume(&mut value).unwrap();
+            assert_eq!(value, expected);
+        }
+        flux_communication::cleanup_flink(&file).unwrap();
     }
 }
