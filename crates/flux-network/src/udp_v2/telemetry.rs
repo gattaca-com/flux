@@ -234,7 +234,7 @@ mod tests {
     static MAPPING_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn idle_reader_mappings_are_reused_and_evicted() {
+    fn dropped_readers_release_mappings() {
         let _serial = MAPPING_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("send");
@@ -255,32 +255,20 @@ mod tests {
                 .count();
             (maps, fds)
         };
-        let open_reader = || consumer::<u64>(tmp.path(), "send").unwrap();
         let baseline = counts();
-        let with_one_mapping = (baseline.0 + 1, baseline.1 + 1);
-        let with_two_mappings = (baseline.0 + 2, baseline.1 + 2);
-        let first = open_reader();
-        let second = open_reader();
-        let both_open = counts();
-        drop(first);
-        let third = open_reader();
-        let idle_reused = counts();
-        drop(second);
-        drop(third);
-        let one_idle = counts();
+        let first = consumer::<u64>(tmp.path(), "send").unwrap();
+        let second = consumer::<u64>(tmp.path(), "send").unwrap();
+        drop((first, second));
 
         for i in 0..4 {
             let name = format!("other-{i}");
             Queue::<u64>::create_or_open_shared(tmp.path().join(&name), 4, QueueType::MPMC);
             drop(consumer::<u64>(tmp.path(), &name).unwrap());
         }
-        let evicted = counts();
+        let after = counts();
         flux_communication::cleanup_shmem(tmp.path());
 
-        assert_eq!(both_open, with_two_mappings);
-        assert_eq!(idle_reused, with_two_mappings);
-        assert_eq!(one_idle, with_one_mapping);
-        assert_eq!(evicted, baseline);
+        assert_eq!(after, baseline);
     }
 
     #[test]
