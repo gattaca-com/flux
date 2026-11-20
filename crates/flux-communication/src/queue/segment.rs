@@ -10,8 +10,15 @@
 //! Finding the processes that map a segment needs `/proc` and locks on shm
 //! objects, which only Linux has; elsewhere a mismatched segment is replaced
 //! even while others map it.
+//!
+//! On Linux a dropped reader's mapping stays mapped in a small idle pool, so a
+//! later reader of the same segment reuses its pages without faulting them in.
+//! An idle mapping has no access rights and no flock, so replacement does not
+//! count it as mapping the segment: mappings without permissions are skipped
+//! when scanning `/proc/<pid>/maps`.
 
 use std::{
+    collections::VecDeque,
     ffi::CString,
     fmt,
     fs::File,
@@ -19,10 +26,13 @@ use std::{
     mem::ManuallyDrop,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use shared_memory::{ShmemConf, ShmemError};
@@ -62,6 +72,37 @@ fn mapped_queue_replacement() -> MappedQueueReplacement {
 #[derive(Clone, Copy)]
 pub(crate) struct Flink<'a>(pub(crate) &'a Path);
 
+const MAX_IDLE_READER_MAPPINGS: usize = 4;
+static IDLE_READER_MAPPINGS: Mutex<VecDeque<Segment>> = Mutex::new(VecDeque::new());
+
+pub(super) struct ReaderMapping(Option<Segment>);
+
+impl Drop for ReaderMapping {
+    fn drop(&mut self) {
+        let Some(segment) = self.0.take() else { return };
+        // Make the mapping inaccessible before telling replacements that it is idle.
+        if !cfg!(target_os = "linux") ||
+            segment.id.1 == 0 ||
+            segment.protect(libc::PROT_NONE).is_err() ||
+            set_flock(&segment.file, libc::LOCK_UN).is_err()
+        {
+            return;
+        }
+        let mut idle =
+            IDLE_READER_MAPPINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evicted = if let Some(index) = idle.iter().position(|cached| cached.id == segment.id) {
+            idle.remove(index)
+        } else if idle.len() == MAX_IDLE_READER_MAPPINGS {
+            idle.pop_front()
+        } else {
+            None
+        };
+        idle.push_back(segment);
+        drop(idle);
+        drop(evicted);
+    }
+}
+
 impl<'a> Flink<'a> {
     /// Maps the segment of a queue of `T`. An existing segment is accepted when
     /// `open` accepts it and replaced otherwise; a missing or replaced one is
@@ -84,13 +125,18 @@ impl<'a> Flink<'a> {
                 self.unlink(&os_id);
                 tracing::info!("replacing queue {self}: its segment {os_id:?} no longer exists");
             }
-            Existing::Mapped(os_id, segment) => match open(segment.ptr, segment.len) {
-                Ok(queue) => {
-                    segment.keep();
-                    return queue;
+            Existing::Found(os_id, object) => {
+                let segment = object
+                    .map()
+                    .unwrap_or_else(|e| panic!("couldn't map queue segment {self}: {e}"));
+                match open(segment.ptr, segment.len) {
+                    Ok(queue) => {
+                        segment.keep();
+                        return queue;
+                    }
+                    Err(reason) => segment.remove::<T>(self, &os_id, &reason),
                 }
-                Err(reason) => segment.remove::<T>(self, &os_id, &reason),
-            },
+            }
         }
 
         let segment = self.create(size);
@@ -108,12 +154,50 @@ impl<'a> Flink<'a> {
             return Err(QueueError::NonExistingFile);
         }
         let _lock = self.lock().map_err(ShmemError::LinkOpenFailed)?;
-        let Existing::Mapped(_, segment) = self.existing()? else {
+        let Existing::Found(_, object) = self.existing()? else {
             return Err(QueueError::NonExistingFile);
         };
+        let segment = object.map()?;
         let queue = open(segment.ptr, segment.len)?;
         segment.keep();
         Ok(queue)
+    }
+
+    pub(super) fn open_reader<R>(
+        self,
+        open: impl FnOnce(*mut u8, usize) -> Result<R, QueueError>,
+    ) -> Result<(R, ReaderMapping), QueueError> {
+        let path = self.0.canonicalize().map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => QueueError::NonExistingFile,
+            _ => ShmemError::LinkOpenFailed(e).into(),
+        })?;
+        let flink = Flink(&path);
+        let _lock = flink.lock().map_err(ShmemError::LinkOpenFailed)?;
+        let Existing::Found(_, object) = flink.existing()? else {
+            return Err(QueueError::NonExistingFile);
+        };
+        let cached = {
+            let mut idle =
+                IDLE_READER_MAPPINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = idle
+                .iter()
+                .position(|segment| segment.id == object.id && segment.len == object.len);
+            let segment = index.and_then(|index| idle.remove(index));
+            drop(idle);
+            segment
+        };
+        let segment = if let Some(segment) = cached {
+            lock_reader(&segment.file)?;
+            segment.protect(libc::PROT_READ | libc::PROT_WRITE)?;
+            segment
+        } else {
+            if cfg!(target_os = "linux") {
+                lock_reader(&object.file)?;
+            }
+            object.map()?
+        };
+        let queue = open(segment.ptr, segment.len)?;
+        Ok((queue, ReaderMapping(Some(segment))))
     }
 
     fn dir(self) -> &'a Path {
@@ -145,8 +229,8 @@ impl<'a> Flink<'a> {
             }
             Err(e) => return Err(ShmemError::LinkReadFailed(e)),
         };
-        match Segment::open(&os_id) {
-            Ok(Some(segment)) => Ok(Existing::Mapped(os_id, segment)),
+        match SegmentFile::open(&os_id) {
+            Ok(Some(object)) => Ok(Existing::Found(os_id, object)),
             Ok(None) => Ok(Existing::Stale(os_id)),
             Err(e) => Err(ShmemError::MapOpenFailed(e.raw_os_error().unwrap_or(0) as u32)),
         }
@@ -163,8 +247,10 @@ impl<'a> Flink<'a> {
         shmem.set_owner(false);
         let os_id = shmem.get_os_id().to_owned();
         drop(shmem);
-        match Segment::open(&os_id) {
-            Ok(Some(segment)) => segment,
+        match SegmentFile::open(&os_id) {
+            Ok(Some(object)) => object
+                .map()
+                .unwrap_or_else(|e| panic!("couldn't map new queue segment {os_id}: {e}")),
             Ok(None) => panic!("new queue segment {os_id} at {self} vanished"),
             Err(e) => panic!("couldn't map new queue segment {os_id} at {self}: {e}"),
         }
@@ -183,6 +269,31 @@ impl<'a> Flink<'a> {
     }
 }
 
+fn lock_reader(file: &File) -> Result<(), QueueError> {
+    set_flock(file, libc::LOCK_SH | libc::LOCK_NB).map_err(|e| map_open_error(&e))?;
+    // A replacement might have unlinked this fd's object before we locked it.
+    if file.metadata().map_err(|e| map_open_error(&e))?.nlink() == 0 {
+        return Err(QueueError::NonExistingFile);
+    }
+    Ok(())
+}
+
+fn map_open_error(error: &io::Error) -> ShmemError {
+    ShmemError::MapOpenFailed(error.raw_os_error().unwrap_or(0) as u32)
+}
+
+fn set_flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 impl fmt::Display for Flink<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.display().fmt(f)
@@ -192,7 +303,7 @@ impl fmt::Display for Flink<'_> {
 enum Existing {
     Missing,
     Stale(String),
-    Mapped(String, Segment),
+    Found(String, SegmentFile),
 }
 
 /// A whole shm object, mapped read-write, and its fd.
@@ -200,9 +311,20 @@ struct Segment {
     ptr: *mut u8,
     len: usize,
     file: File,
+    id: (u64, u64),
 }
 
-impl Segment {
+// A mapping can move between threads without changing its address.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for Segment {}
+
+struct SegmentFile {
+    file: File,
+    len: usize,
+    id: (u64, u64),
+}
+
+impl SegmentFile {
     /// `None` when no usable object has that name: it is gone (every flink is
     /// stale after a reboot), it is empty, or the flink does not hold a valid
     /// name.
@@ -219,24 +341,40 @@ impl Segment {
             };
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        let len = file.metadata()?.len() as usize;
-        if len == 0 {
+        let metadata = file.metadata()?;
+        if metadata.len() == 0 {
             return Ok(None);
         }
+        Ok(Some(Self { file, len: metadata.len() as usize, id: (metadata.dev(), metadata.ino()) }))
+    }
+
+    fn map(self) -> Result<Segment, ShmemError> {
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                self.len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                fd,
+                self.file.as_raw_fd(),
                 0,
             )
         };
         if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+            return Err(ShmemError::MapOpenFailed(
+                io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32,
+            ));
         }
-        Ok(Some(Self { ptr: ptr.cast(), len, file }))
+        Ok(Segment { ptr: ptr.cast(), len: self.len, file: self.file, id: self.id })
+    }
+}
+
+impl Segment {
+    fn protect(&self, protection: libc::c_int) -> Result<(), ShmemError> {
+        if unsafe { libc::mprotect(self.ptr.cast(), self.len, protection) } == 0 {
+            Ok(())
+        } else {
+            Err(map_open_error(&io::Error::last_os_error()))
+        }
     }
 
     fn identity(&self) -> Option<QueueIdentity> {
@@ -252,21 +390,18 @@ impl Segment {
             self.identity().map_or_else(|| "no queue identity".to_owned(), |p| p.to_string());
         // Unmapped first, so the scan only finds other mappings.
         let object = self.into_file();
-        let mapped_by_others = Mappers::of(os_id).and_then(|mappers| {
-            // Kept mappings hold a shared flock on their object (see `Segment::keep`),
-            // which also reveals processes whose maps are unreadable. Off Linux shm
-            // objects cannot be locked.
-            let locked_by_others =
-                unsafe { libc::flock(object.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 && {
-                    let e = io::Error::last_os_error();
-                    match e.raw_os_error() {
-                        Some(libc::EWOULDBLOCK) => true,
-                        Some(libc::ENOTSUP) => false,
-                        _ => return Err(e),
-                    }
-                };
+        let mapped_by_others = (|| {
+            // Acquire the lock before scanning so idle readers cannot reactivate
+            // a mapping between the scan and unlink.
+            let locked_by_others = match set_flock(&object, libc::LOCK_EX | libc::LOCK_NB) {
+                Ok(()) => false,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => false,
+                Err(e) => return Err(e),
+            };
+            let mappers = Mappers::of(os_id)?;
             Ok((!mappers.0.is_empty() || locked_by_others).then_some(mappers))
-        });
+        })();
         let replacement = mapped_queue_replacement();
         match mapped_by_others {
             Ok(None) => {}
@@ -306,8 +441,12 @@ impl Segment {
     /// flock on the fd shows an opener about to replace the segment that this
     /// process maps it, even when it cannot read our `/proc/<pid>/maps`.
     fn keep(self) {
-        let this = ManuallyDrop::new(self);
-        unsafe { libc::flock(this.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        self.lock_shared();
+        std::mem::forget(self);
+    }
+
+    fn lock_shared(&self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
     }
 }
 
@@ -355,7 +494,10 @@ impl Mappers {
                 Err(e) => return Err(e),
             };
             let maps_target = |line: &[u8]| {
-                line.split(u8::is_ascii_whitespace).filter(|f| !f.is_empty()).nth(5) == Some(target)
+                let mut fields = line.split(u8::is_ascii_whitespace).filter(|f| !f.is_empty());
+                // Idle reader mappings have no access permissions.
+                let permissions = fields.nth(1).unwrap_or_default();
+                !permissions.starts_with(b"---") && fields.nth(3) == Some(target)
             };
             if maps.split(|&b| b == b'\n').any(maps_target) {
                 let exe = std::fs::read_link(proc_dir.join("exe"))
