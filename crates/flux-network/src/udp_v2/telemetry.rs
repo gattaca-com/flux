@@ -231,8 +231,11 @@ fn drain<T: Copy + Default>(
 mod tests {
     use super::*;
 
+    static MAPPING_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn overlapping_readers_share_mapping_until_last_reader_drops() {
+    fn idle_reader_mappings_are_reused_and_evicted() {
+        let _serial = MAPPING_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("send");
         Queue::<u64>::create_or_open_shared(&file, 4, QueueType::MPMC);
@@ -252,27 +255,37 @@ mod tests {
                 .count();
             (maps, fds)
         };
-        let initial = counts();
-        assert!(initial.0 > 0 && initial.1 > 0);
-        let with_one_reader = (initial.0 + 1, initial.1 + 1);
         let open_reader = || consumer::<u64>(tmp.path(), "send").unwrap();
-        let reader_cycle = || {
-            let first = open_reader();
-            let first_open = counts();
-            let second = open_reader();
-            let both_open = counts();
-            drop(first);
-            let first_dropped = counts();
-            drop(second);
-            [first_open, both_open, first_dropped, counts()]
-        };
-        let observed = [reader_cycle(), reader_cycle()];
-        flux_communication::cleanup_flink(&file).unwrap();
-        assert_eq!(observed, [[with_one_reader, with_one_reader, with_one_reader, initial]; 2]);
+        let baseline = counts();
+        let with_one_mapping = (baseline.0 + 1, baseline.1 + 1);
+        let with_two_mappings = (baseline.0 + 2, baseline.1 + 2);
+        let first = open_reader();
+        let second = open_reader();
+        let both_open = counts();
+        drop(first);
+        let third = open_reader();
+        let idle_reused = counts();
+        drop(second);
+        drop(third);
+        let one_idle = counts();
+
+        for i in 0..4 {
+            let name = format!("other-{i}");
+            Queue::<u64>::create_or_open_shared(tmp.path().join(&name), 4, QueueType::MPMC);
+            drop(consumer::<u64>(tmp.path(), &name).unwrap());
+        }
+        let evicted = counts();
+        flux_communication::cleanup_shmem(tmp.path());
+
+        assert_eq!(both_open, with_two_mappings);
+        assert_eq!(idle_reused, with_two_mappings);
+        assert_eq!(one_idle, with_one_mapping);
+        assert_eq!(evicted, baseline);
     }
 
     #[test]
     fn reopened_readers_follow_replacement() {
+        let _serial = MAPPING_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("send");
         let writer =
@@ -292,5 +305,92 @@ mod tests {
             assert_eq!(value, expected);
         }
         flux_communication::cleanup_flink(&file).unwrap();
+    }
+
+    #[test]
+    fn strict_replacement_distinguishes_active_and_idle_readers() {
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            process::{Command, Stdio},
+        };
+
+        use flux_communication::queue::{MappedQueueReplacement, set_mapped_queue_replacement};
+
+        const ROLE: &str = "FLUX_REPLACEMENT_TEST_ROLE";
+        const PATH: &str = "FLUX_REPLACEMENT_TEST_PATH";
+        if let Some(role) = std::env::var_os(ROLE) {
+            let path = std::path::PathBuf::from(std::env::var_os(PATH).unwrap());
+            match role.to_str().unwrap() {
+                "create" => {
+                    Queue::<u64>::create_or_open_shared(&path, 4, QueueType::MPMC);
+                }
+                "read" => {
+                    let reader =
+                        MappedBroadcastConsumer::<u64>::open(&path, "replacement").unwrap();
+                    println!("ACTIVE_READER");
+                    std::io::stdin().read_exact(&mut [0]).unwrap();
+                    drop(reader);
+                    println!("IDLE_READER");
+                    std::io::stdin().read_exact(&mut [0]).unwrap();
+                }
+                role => {
+                    set_mapped_queue_replacement(MappedQueueReplacement::Panic);
+                    let replace = std::panic::catch_unwind(|| {
+                        Queue::<u32>::create_or_open_shared(&path, 4, QueueType::MPMC);
+                    });
+                    assert_eq!(replace.is_ok(), role == "replace-idle");
+                }
+            }
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("send");
+        let name = format!(
+            "{}::strict_replacement_distinguishes_active_and_idle_readers",
+            module_path!().split_once("::").unwrap().1
+        );
+        let command = |role: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", &name, "--nocapture", "--test-threads=1"]);
+            command.env(ROLE, role).env(PATH, &path);
+            command
+        };
+        assert!(command("create").status().unwrap().success());
+        let mut child =
+            command("read").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut input = child.stdin.take().unwrap();
+        let mut wait_for = |marker: &str| {
+            let mut line = String::new();
+            loop {
+                assert_ne!(
+                    output.read_line(&mut line).unwrap(),
+                    0,
+                    "reader exited before {marker}"
+                );
+                if line.trim_end().ends_with(marker) {
+                    break;
+                }
+                line.clear();
+            }
+        };
+        wait_for("ACTIVE_READER");
+        let active = command("replace-active").output().unwrap();
+        input.write_all(&[0]).unwrap();
+        wait_for("IDLE_READER");
+        let idle = command("replace-idle").output().unwrap();
+        input.write_all(&[0]).unwrap();
+        assert!(child.wait().unwrap().success());
+        flux_communication::cleanup_flink(&path).unwrap();
+
+        for result in [active, idle] {
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            );
+        }
     }
 }

@@ -6,7 +6,7 @@ use std::{
     ops::Deref,
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -779,11 +779,12 @@ pub struct ConsumerBare<T> {
 
 unsafe impl<T> Send for ConsumerBare<T> {}
 
-/// A broadcast subscription that shares the mapped queue with other readers.
+/// A broadcast subscription that owns its mapping while active.
 pub struct MappedBroadcastConsumer<T> {
     consumer: ConsumerBare<T>,
-    // A replacement may evict this mapping while the cursor still points into it.
-    _mapping: Arc<segment::Segment>,
+    // Declared after `consumer`: dropping the mapping revokes access to the
+    // memory the consumer points into.
+    _mapping: segment::ReaderMapping,
 }
 
 impl<T: Copy + TypeHash> MappedBroadcastConsumer<T> {

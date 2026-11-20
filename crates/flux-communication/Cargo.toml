@@ -15,7 +15,6 @@ flux-utils.workspace = true
 libc.workspace = true
 mio = { workspace = true, optional = true }
 rand.workspace = true
-rustc-hash.workspace = true
 shared_memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

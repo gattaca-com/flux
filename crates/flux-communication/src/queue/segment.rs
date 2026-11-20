@@ -10,8 +10,15 @@
 //! Finding the processes that map a segment needs `/proc` and locks on shm
 //! objects, which only Linux has; elsewhere a mismatched segment is replaced
 //! even while others map it.
+//!
+//! On Linux a dropped reader's mapping stays mapped in a small idle pool, so a
+//! later reader of the same segment reuses its pages without faulting them in.
+//! An idle mapping has no access rights and no flock, so replacement does not
+//! count it as mapping the segment: mappings without permissions are skipped
+//! when scanning `/proc/<pid>/maps`.
 
 use std::{
+    collections::VecDeque,
     ffi::CString,
     fmt,
     fs::File,
@@ -23,12 +30,11 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc, LazyLock, Mutex, Weak,
+        Mutex,
         atomic::{AtomicU8, Ordering},
     },
 };
 
-use rustc_hash::FxHashMap;
 use shared_memory::{ShmemConf, ShmemError};
 
 use super::{QueueHeader, QueueIdentity};
@@ -66,8 +72,36 @@ fn mapped_queue_replacement() -> MappedQueueReplacement {
 #[derive(Clone, Copy)]
 pub(crate) struct Flink<'a>(pub(crate) &'a Path);
 
-static READER_MAPPINGS: LazyLock<Mutex<FxHashMap<PathBuf, Weak<Segment>>>> =
-    LazyLock::new(Mutex::default);
+const MAX_IDLE_READER_MAPPINGS: usize = 4;
+static IDLE_READER_MAPPINGS: Mutex<VecDeque<Segment>> = Mutex::new(VecDeque::new());
+
+pub(super) struct ReaderMapping(Option<Segment>);
+
+impl Drop for ReaderMapping {
+    fn drop(&mut self) {
+        let Some(segment) = self.0.take() else { return };
+        // Make the mapping inaccessible before telling replacements that it is idle.
+        if !cfg!(target_os = "linux") ||
+            segment.id.1 == 0 ||
+            segment.protect(libc::PROT_NONE).is_err() ||
+            set_flock(&segment.file, libc::LOCK_UN).is_err()
+        {
+            return;
+        }
+        let mut idle =
+            IDLE_READER_MAPPINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evicted = if let Some(index) = idle.iter().position(|cached| cached.id == segment.id) {
+            idle.remove(index)
+        } else if idle.len() == MAX_IDLE_READER_MAPPINGS {
+            idle.pop_front()
+        } else {
+            None
+        };
+        idle.push_back(segment);
+        drop(idle);
+        drop(evicted);
+    }
+}
 
 impl<'a> Flink<'a> {
     /// Maps the segment of a queue of `T`. An existing segment is accepted when
@@ -132,7 +166,7 @@ impl<'a> Flink<'a> {
     pub(super) fn open_reader<R>(
         self,
         open: impl FnOnce(*mut u8, usize) -> Result<R, QueueError>,
-    ) -> Result<(R, Arc<Segment>), QueueError> {
+    ) -> Result<(R, ReaderMapping), QueueError> {
         let path = self.0.canonicalize().map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => QueueError::NonExistingFile,
             _ => ShmemError::LinkOpenFailed(e).into(),
@@ -142,23 +176,28 @@ impl<'a> Flink<'a> {
         let Existing::Found(_, object) = flink.existing()? else {
             return Err(QueueError::NonExistingFile);
         };
-        let mut mappings =
-            READER_MAPPINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(segment) = mappings.get(&path).and_then(Weak::upgrade) &&
-            object.id.1 != 0 &&
-            segment.id == object.id &&
-            segment.len == object.len
-        {
-            drop(mappings);
-            return Ok((open(segment.ptr, segment.len)?, segment));
-        }
-        let segment = Arc::new(object.map()?);
+        let cached = {
+            let mut idle =
+                IDLE_READER_MAPPINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = idle
+                .iter()
+                .position(|segment| segment.id == object.id && segment.len == object.len);
+            let segment = index.and_then(|index| idle.remove(index));
+            drop(idle);
+            segment
+        };
+        let segment = if let Some(segment) = cached {
+            lock_reader(&segment.file)?;
+            segment.protect(libc::PROT_READ | libc::PROT_WRITE)?;
+            segment
+        } else {
+            if cfg!(target_os = "linux") {
+                lock_reader(&object.file)?;
+            }
+            object.map()?
+        };
         let queue = open(segment.ptr, segment.len)?;
-        segment.lock_shared();
-        mappings.retain(|_, mapping| mapping.strong_count() > 0);
-        mappings.insert(path, Arc::downgrade(&segment));
-        drop(mappings);
-        Ok((queue, segment))
+        Ok((queue, ReaderMapping(Some(segment))))
     }
 
     fn dir(self) -> &'a Path {
@@ -230,6 +269,31 @@ impl<'a> Flink<'a> {
     }
 }
 
+fn lock_reader(file: &File) -> Result<(), QueueError> {
+    set_flock(file, libc::LOCK_SH | libc::LOCK_NB).map_err(|e| map_open_error(&e))?;
+    // A replacement might have unlinked this fd's object before we locked it.
+    if file.metadata().map_err(|e| map_open_error(&e))?.nlink() == 0 {
+        return Err(QueueError::NonExistingFile);
+    }
+    Ok(())
+}
+
+fn map_open_error(error: &io::Error) -> ShmemError {
+    ShmemError::MapOpenFailed(error.raw_os_error().unwrap_or(0) as u32)
+}
+
+fn set_flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 impl fmt::Display for Flink<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.display().fmt(f)
@@ -243,17 +307,16 @@ enum Existing {
 }
 
 /// A whole shm object, mapped read-write, and its fd.
-pub(super) struct Segment {
+struct Segment {
     ptr: *mut u8,
     len: usize,
     file: File,
     id: (u64, u64),
 }
 
-// The address is stable until the last owner drops. Access to queue data is
-// synchronized by the queue protocol; sharing the mapping only keeps it alive.
+// A mapping can move between threads without changing its address.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Segment {}
-unsafe impl Sync for Segment {}
 
 struct SegmentFile {
     file: File,
@@ -306,6 +369,14 @@ impl SegmentFile {
 }
 
 impl Segment {
+    fn protect(&self, protection: libc::c_int) -> Result<(), ShmemError> {
+        if unsafe { libc::mprotect(self.ptr.cast(), self.len, protection) } == 0 {
+            Ok(())
+        } else {
+            Err(map_open_error(&io::Error::last_os_error()))
+        }
+    }
+
     fn identity(&self) -> Option<QueueIdentity> {
         QueueHeader::from_mapping(self.ptr, self.len).ok()?.identity()
     }
@@ -319,21 +390,18 @@ impl Segment {
             self.identity().map_or_else(|| "no queue identity".to_owned(), |p| p.to_string());
         // Unmapped first, so the scan only finds other mappings.
         let object = self.into_file();
-        let mapped_by_others = Mappers::of(os_id).and_then(|mappers| {
-            // Kept mappings hold a shared flock on their object (see `Segment::keep`),
-            // which also reveals processes whose maps are unreadable. Off Linux shm
-            // objects cannot be locked.
-            let locked_by_others =
-                unsafe { libc::flock(object.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 && {
-                    let e = io::Error::last_os_error();
-                    match e.raw_os_error() {
-                        Some(libc::EWOULDBLOCK) => true,
-                        Some(libc::ENOTSUP) => false,
-                        _ => return Err(e),
-                    }
-                };
+        let mapped_by_others = (|| {
+            // Acquire the lock before scanning so idle readers cannot reactivate
+            // a mapping between the scan and unlink.
+            let locked_by_others = match set_flock(&object, libc::LOCK_EX | libc::LOCK_NB) {
+                Ok(()) => false,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => false,
+                Err(e) => return Err(e),
+            };
+            let mappers = Mappers::of(os_id)?;
             Ok((!mappers.0.is_empty() || locked_by_others).then_some(mappers))
-        });
+        })();
         let replacement = mapped_queue_replacement();
         match mapped_by_others {
             Ok(None) => {}
@@ -426,7 +494,10 @@ impl Mappers {
                 Err(e) => return Err(e),
             };
             let maps_target = |line: &[u8]| {
-                line.split(u8::is_ascii_whitespace).filter(|f| !f.is_empty()).nth(5) == Some(target)
+                let mut fields = line.split(u8::is_ascii_whitespace).filter(|f| !f.is_empty());
+                // Idle reader mappings have no access permissions.
+                let permissions = fields.nth(1).unwrap_or_default();
+                !permissions.starts_with(b"---") && fields.nth(3) == Some(target)
             };
             if maps.split(|&b| b == b'\n').any(maps_target) {
                 let exe = std::fs::read_link(proc_dir.join("exe"))
