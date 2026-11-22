@@ -16,7 +16,8 @@ pub const DEFAULT_HISTORY: usize = 10;
 /// median from reallocating on every fill.
 ///
 /// The slice is exposed mutably but the `Vec` is not, so every fill ends
-/// through one of those three; `truncate` and `drain` trim within a fill.
+/// through one of those three; `truncate` and `drain` trim within a fill, and
+/// `set_len` extends one.
 #[derive(Clone, Debug)]
 pub struct TruncatingVec<T> {
     vec: Vec<T>,
@@ -102,6 +103,23 @@ impl<T> TruncatingVec<T> {
         T: Clone,
     {
         self.vec.resize(new_len, value);
+    }
+
+    /// As [`Vec::as_mut_ptr`]: valid for writes up to the capacity, for a
+    /// writer to fill before [`Self::set_len`] takes it in.
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.vec.as_mut_ptr()
+    }
+
+    /// # Safety
+    ///
+    /// As [`Vec::set_len`]: `len` is within capacity and every element below
+    /// it is initialized.
+    #[inline]
+    pub unsafe fn set_len(&mut self, len: usize) {
+        // SAFETY: the caller upholds `Vec::set_len`'s contract.
+        unsafe { self.vec.set_len(len) }
     }
 
     #[inline]
