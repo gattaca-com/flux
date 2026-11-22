@@ -10,7 +10,7 @@
 //! XOR). `version` pins the header, timestamp record, and zstd; bump it when
 //! any of them change.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, mem::MaybeUninit};
 
 use byte_stable::ByteStable;
 use flux_timing::{IngestionTime, InternalMessage, Nanos};
@@ -95,9 +95,11 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// 16-byte aligned byte buffer so decoded leaves cast directly.
+/// 16-byte aligned byte buffer so decoded leaves cast directly. It keeps the
+/// capacity of its longest fill since the last [`settle`](Self::settle).
 #[derive(Default)]
 pub struct Scratch {
+    /// Initialized through the longest fill since the last settle.
     words: TruncatingVec<u128>,
     len: usize,
     /// Each fill starts afresh, so the buffer shrinks back after a burst.
@@ -114,6 +116,20 @@ impl Scratch {
     /// burst has passed, as [`TruncatingVec`] does.
     pub fn truncating() -> Self {
         Self { truncating: true, ..Self::default() }
+    }
+
+    /// Ends a period of fills, such as a slot's: records its longest fill and,
+    /// once a burst has passed, shrinks back to the median of recent periods'
+    /// as [`TruncatingVec`] does.
+    pub fn settle(&mut self) {
+        self.words.clear();
+        self.len = 0;
+    }
+
+    /// In bytes.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.words.capacity() * LEAF_ALIGN_MAX
     }
 
     pub fn resize(&mut self, len: usize) {
@@ -139,19 +155,35 @@ impl Scratch {
     }
 
     fn decompress(&mut self, compressed: &[u8], len: usize) -> Result<(), DecodeError> {
-        let words = len.div_ceil(LEAF_ALIGN_MAX);
+        let n_words = len.div_ceil(LEAF_ALIGN_MAX);
         if self.truncating {
-            self.words.refill(words, 0);
-        } else if words > self.words.len() {
-            self.words.resize(words, 0);
+            self.words.refill(n_words, 0);
         }
-        if self.decompressor.is_none() {
-            self.decompressor = Some(zstd::bulk::Decompressor::new().map_err(DecodeError::Zstd)?);
-        }
-        let decompressor = self.decompressor.as_mut().expect("created above");
-        let out = &mut byte_stable::u128s_as_bytes_mut(&mut self.words)[..len];
-        let written = decompressor.decompress_to_buffer(compressed, out);
-        self.len = written.as_ref().map_or(0, |&n| n.min(len));
+        let decompressor = match &mut self.decompressor {
+            Some(decompressor) => decompressor,
+            none => none.insert(zstd::bulk::Decompressor::new().map_err(DecodeError::Zstd)?),
+        };
+        let longest = self.words.len();
+        self.words.reserve(n_words.saturating_sub(longest));
+        // SAFETY: the buffer has room for `n_words` words, initialized below
+        // `longest`, and a `u128` is 16 bytes with no padding.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.words.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                n_words * LEAF_ALIGN_MAX,
+            )
+        };
+        let mut out = Uninit { bytes: &mut bytes[..len], filled: 0 };
+        let written = decompressor.decompress_to_buffer(compressed, &mut out);
+        let filled = out.filled;
+        // Past `filled` lie the last word's padding and, after a failed
+        // decode, whatever zstd left there, possibly its own uninitialized
+        // bytes.
+        bytes[filled..].fill(MaybeUninit::new(0));
+        // SAFETY: every byte of the first `n_words` words is now written or
+        // zeroed, and the words below `longest` stay initialized.
+        unsafe { self.words.set_len(longest.max(n_words)) };
+        self.len = filled;
         let written = written.map_err(DecodeError::Zstd)?;
         if written != len {
             return Err(DecodeError::LengthMismatch { expected: len, got: written });
@@ -164,6 +196,34 @@ impl Scratch {
         self.resize(bytes.len());
         self.as_mut_bytes().copy_from_slice(bytes);
         Blob::from_bytes(self.as_bytes())
+    }
+}
+
+/// Bytes zstd writes without their being initialized first.
+struct Uninit<'a> {
+    bytes: &'a mut [MaybeUninit<u8>],
+    /// Its first bytes that were written.
+    filled: usize,
+}
+
+// SAFETY: `filled` counts only bytes that were written, and the pointer and
+// capacity are those of `bytes`.
+unsafe impl zstd::zstd_safe::WriteBuf for Uninit<'_> {
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the first `filled` bytes were written.
+        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.filled) }
+    }
+
+    fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr().cast()
+    }
+
+    unsafe fn filled_until(&mut self, n: usize) {
+        self.filled = n;
     }
 }
 
