@@ -36,10 +36,9 @@ use std::{
 };
 
 use flux_timing::{Duration, Instant};
-use io_uring::IoUring;
 use tracing::warn;
 
-use crate::backend::Op;
+use crate::backend::{Backend, Op};
 
 const INITIAL_FILE_CAPACITY: usize = 8;
 const INITIAL_IN_FLIGHT_CAPACITY: usize = 64;
@@ -443,7 +442,7 @@ struct File {
 /// and closes remaining descriptors; poll until [`DiskIo::is_idle`] first
 /// when every completion matters.
 pub struct DiskIo {
-    ring: IoUring,
+    backend: Backend,
     max_in_flight: usize,
     pending_warn_ops: Option<usize>,
     files: Vec<File>,
@@ -468,10 +467,7 @@ pub fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
     if cores.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cores to pin to"));
     }
-    // Setting up a ring gives the calling thread the worker pool that holds
-    // the mask.
-    let ring = IoUring::new(1)?;
-    ring.submitter().register_iowq_aff(&flux_utils::cpu_set(cores)?)
+    Backend::pin_io_workers(cores)
 }
 
 impl Default for DiskIo {
@@ -484,10 +480,9 @@ impl DiskIo {
     pub fn new(config: DiskConfig) -> io::Result<Self> {
         assert!(config.ring_entries > 0, "ring_entries must be nonzero");
         assert!(config.max_in_flight > 0, "max_in_flight must be nonzero");
-        let ring = IoUring::new(config.ring_entries)?;
-        let max_in_flight = config.max_in_flight.min(ring.params().cq_entries() as usize);
+        let (backend, max_in_flight) = Backend::new(config.ring_entries, config.max_in_flight)?;
         Ok(Self {
-            ring,
+            backend,
             max_in_flight,
             pending_warn_ops: config.pending_warn_ops,
             files: Vec::with_capacity(INITIAL_FILE_CAPACITY),
@@ -930,7 +925,7 @@ impl DiskIo {
 
     pub fn limit_io_workers(&mut self, bounded: u32, unbounded: u32) -> io::Result<[u32; 2]> {
         let mut limits = [bounded, unbounded];
-        self.ring.submitter().register_iowq_max_workers(&mut limits)?;
+        self.backend.limit_io_workers(&mut limits)?;
         Ok(limits)
     }
 
@@ -1020,7 +1015,7 @@ impl DiskIo {
         let mut file_index = 0;
         while file_index < self.files.len() {
             loop {
-                if self.in_flight_count >= self.max_in_flight || self.ring.submission().is_full() {
+                if self.in_flight_count >= self.max_in_flight || self.backend.submission_full() {
                     return;
                 }
                 let file = &self.files[file_index];
@@ -1192,11 +1187,11 @@ impl DiskIo {
     }
 
     fn push_slot(&mut self, user_data: u64) {
-        let sqe = uring::entry(self.describe(user_data as usize), user_data);
-        // SAFETY: every buffer and path the entry references lives in
-        // `self.slab` until the completion for `user_data` is reaped, and its
-        // heap storage is never touched while the kernel owns the operation.
-        if unsafe { self.ring.submission().push(&sqe) }.is_ok() {
+        let op = self.describe(user_data as usize);
+        // SAFETY: every buffer and path `op` references lives in `self.slab`
+        // until the completion for `user_data` is reaped, and its heap storage
+        // is never touched while the kernel owns the operation.
+        if unsafe { self.backend.push(op, user_data) } {
             self.need_submit = true;
         } else {
             self.stalled.push(user_data);
@@ -1207,7 +1202,7 @@ impl DiskIo {
         if !self.need_submit {
             return;
         }
-        match self.ring.submit() {
+        match self.backend.submit() {
             Ok(_) => self.need_submit = false,
             Err(err)
                 if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)) => {
@@ -1222,7 +1217,7 @@ impl DiskIo {
     {
         let mut completions = std::mem::take(&mut self.completions);
         completions.clear();
-        completions.extend(self.ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
+        self.backend.reap(&mut completions);
         for &(user_data, result) in &completions {
             self.complete(user_data, result, handler);
         }
@@ -1724,7 +1719,7 @@ fn c_path(path: &Path) -> io::Result<CString> {
 /// The ring's descriptor: readable while completions wait to be reaped.
 impl AsRawFd for DiskIo {
     fn as_raw_fd(&self) -> RawFd {
-        self.ring.as_raw_fd()
+        self.backend.as_raw_fd()
     }
 }
 
@@ -1743,7 +1738,7 @@ impl Drop for DiskIo {
         while self.in_flight_count > 0 {
             let mut completions = std::mem::take(&mut self.completions);
             completions.clear();
-            completions.extend(self.ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
+            self.backend.reap(&mut completions);
             for &(user_data, _) in &completions {
                 let Some(entry) = self.slab[user_data as usize].take() else { continue };
                 self.in_flight_count -= 1;
@@ -1757,7 +1752,7 @@ impl Drop for DiskIo {
             if self.in_flight_count == 0 {
                 break;
             }
-            match self.ring.submit_and_wait(1) {
+            match self.backend.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
                 Err(err) => {
