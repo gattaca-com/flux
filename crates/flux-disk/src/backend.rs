@@ -7,7 +7,7 @@ use std::{
 
 use tracing::info;
 
-use crate::{emulation::Emulation, uring::Uring};
+use crate::{DiskConfig, emulation::Emulation, uring::Uring};
 
 /// Directory every path in an [`Op`] is resolved against.
 pub(crate) const PATH_DIR_FD: RawFd = libc::AT_FDCWD;
@@ -64,8 +64,9 @@ impl Backend {
         let set = flux_utils::cpu_set(cores)?;
         Emulation::pin_io_workers(set);
         // Setting up a ring gives the calling thread the worker pool that holds
-        // the mask.
-        match ring(1, 1)? {
+        // the mask. The thread's first ring also caps that pool at its entry
+        // count, so size it as a default `DiskIo` would.
+        match ring(DiskConfig::default().ring_entries, 1)? {
             Some((ring, _)) => ring.pin_io_workers(&set),
             None => Ok(()),
         }

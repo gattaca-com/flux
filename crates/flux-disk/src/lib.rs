@@ -2603,6 +2603,52 @@ mod tests {
         assert!(workers.iter().all(|cores| *cores == core.to_string()), "{workers:?} vs {core}");
     }
 
+    /// Pinning first sets up the thread's first ring, which must not cap its
+    /// workers at one. Opening a FIFO for writing with `O_CREAT` blocks an
+    /// `io_uring` worker until the FIFO has a reader, on every filesystem.
+    #[test]
+    fn pinning_before_any_ring_leaves_several_workers() {
+        if !uses_ring() {
+            return;
+        }
+        // SAFETY: `allowed` outlives the call and its size is passed.
+        let cores: Vec<_> = unsafe {
+            let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut allowed);
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&core| libc::CPU_ISSET(core, &allowed))
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fifos: Vec<_> = (0..4).map(|name| fifo(dir.path().join(name.to_string()))).collect();
+        let workers = std::thread::spawn(move || {
+            pin_io_workers(&cores).unwrap();
+            let mut disk = DiskIo::new(DiskConfig::default()).unwrap();
+            let open = OpenOptions::new().write(true).create(true);
+            let opened: Vec<_> =
+                fifos.iter().map(|fifo| Ev::Opened(disk.open(fifo, open).unwrap())).collect();
+            let mut events = Vec::new();
+            let deadline = StdInstant::now() + StdDuration::from_secs(1);
+            while io_worker_cores(false).len() <= 1 && StdInstant::now() < deadline {
+                disk.poll_with(|event| events.push(Ev::from(event)));
+                std::thread::sleep(StdDuration::from_millis(1));
+            }
+            let readers: Vec<_> = fifos
+                .iter()
+                .map(|fifo| {
+                    let mut read = fs::OpenOptions::new();
+                    read.read(true).custom_flags(libc::O_NONBLOCK).open(fifo).unwrap()
+                })
+                .collect();
+            drive(&mut disk, &mut events, |events| opened.iter().all(|open| events.contains(open)));
+            drop(readers);
+            io_worker_cores(false).len()
+        })
+        .join()
+        .unwrap();
+        assert!(workers > 1, "{workers} worker served four blocked opens");
+    }
+
     /// Each instance is built and limited on one thread and driven by
     /// another, as a tile does. Opening a FIFO for writing blocks until it has
     /// a reader on every filesystem, and with `O_CREAT` always runs on an
