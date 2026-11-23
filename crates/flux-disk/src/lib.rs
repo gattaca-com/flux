@@ -2594,7 +2594,15 @@ mod tests {
             let synced = disk.sync_all(file).unwrap();
             let mut events = Vec::new();
             drive(&mut disk, &mut events, |events| events.contains(&Ev::Synced(file, synced)));
-            io_worker_cores(emulated)
+            // Alongside other tests a `/proc/self/task` scan can omit a live
+            // worker, so scan again until it shows up.
+            let deadline = StdInstant::now() + StdDuration::from_secs(5);
+            loop {
+                let workers = io_worker_cores(emulated);
+                if !workers.is_empty() || StdInstant::now() >= deadline {
+                    break workers;
+                }
+            }
         })
         .join()
         .unwrap();
