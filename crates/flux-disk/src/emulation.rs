@@ -41,6 +41,11 @@ pub(crate) struct Emulation {
     consumed: u64,
     batch: Vec<Job>,
     batch_limit: usize,
+    /// Reads the page cache served during `push`. Published at the next
+    /// `submit` like a worker's completions, so a caller that waits on the
+    /// eventfd after submitting wakes, as it would for a ring's inline
+    /// completions.
+    inline: Vec<(u64, i32)>,
     pool: Option<Pool>,
     /// `[bounded, unbounded]` as last set through `limit_io_workers`, at most
     /// [`MAX_WORKERS`]; `0` while unset. Only the bounded limit sizes a pool:
@@ -66,6 +71,7 @@ impl Emulation {
             consumed: 0,
             batch: Vec::new(),
             batch_limit: entries as usize,
+            inline: Vec::new(),
             pool: None,
             limits: [0; 2],
         })
@@ -79,7 +85,7 @@ impl Emulation {
 
     #[inline]
     pub(crate) fn submission_full(&self) -> bool {
-        self.batch.len() >= self.batch_limit
+        self.batch.len() + self.inline.len() >= self.batch_limit
     }
 
     /// # Safety
@@ -92,12 +98,22 @@ impl Emulation {
         if self.submission_full() {
             return false;
         }
+        // SAFETY: the caller upholds `Backend::push`'s contract.
+        if let Some(result) = unsafe { try_nowait(op) } {
+            self.inline.push((user_data, result));
+            return true;
+        }
         self.batch.push(Job { op, user_data, completions: Arc::clone(&self.completions) });
         true
     }
 
-    /// Hands the batch to the calling thread's pool.
+    /// Publishes inline completions and hands the batch to the calling
+    /// thread's pool.
+    #[inline(never)]
     pub(crate) fn submit(&mut self) -> usize {
+        if !self.inline.is_empty() {
+            self.completions.publish(self.inline.drain(..));
+        }
         let submitted = self.batch.len();
         if submitted > 0 {
             attach(&mut self.pool, self.limits[0]).submit(&mut self.batch);
@@ -107,6 +123,7 @@ impl Emulation {
 
     pub(crate) fn take_unsubmitted(&mut self, unsubmitted: &mut Vec<u64>) {
         unsubmitted.extend(self.batch.drain(..).map(|job| job.user_data));
+        unsubmitted.extend(self.inline.drain(..).map(|(user_data, _)| user_data));
     }
 
     pub(crate) fn wait(&self) -> io::Result<()> {
@@ -396,7 +413,7 @@ unsafe fn execute(op: Op) -> i32 {
         match op {
             Op::Open { path, flags, mode } => libc::openat(PATH_DIR_FD, path, flags, mode).into(),
             Op::Read { fd, ptr, len, offset } => read(fd, ptr, len, offset, 0) as i64,
-            Op::Write { fd, ptr, len, offset } => write(fd, ptr, len, offset, 0) as i64,
+            Op::Write { fd, ptr, len, offset } => write(fd, ptr, len, offset) as i64,
             // The `statx` wrapper is missing from older musl.
             Op::Statx { fd, statx } => libc::syscall(
                 libc::SYS_statx,
@@ -426,6 +443,23 @@ unsafe fn execute(op: Op) -> i32 {
     result as i32
 }
 
+/// Reads only as far as the page cache allows without blocking. Writes are
+/// never tried: ext4 never supports nowait buffered writes and tmpfs and
+/// overlayfs refuse them, so most attempts would fail. `None` leaves the
+/// operation to a worker, which produces the authoritative result: after
+/// `EAGAIN` or `EOPNOTSUPP` (filesystems without support), and after `0`,
+/// which Linux 5.9 and 5.10 may report before end-of-file.
+///
+/// # Safety
+///
+/// As for [`execute`].
+unsafe fn try_nowait(op: Op) -> Option<i32> {
+    let Op::Read { fd, ptr, len, offset } = op else { return None };
+    // SAFETY: the caller keeps every pointer in `op` valid.
+    let result = unsafe { read(fd, ptr, len, offset, libc::RWF_NOWAIT) };
+    (result > 0).then_some(result as i32)
+}
+
 /// `offset` `u64::MAX` becomes `-1`, the file position, as in `io_uring`.
 ///
 /// # Safety
@@ -437,13 +471,13 @@ unsafe fn read(fd: RawFd, ptr: *mut u8, len: u32, offset: u64, flags: i32) -> is
     unsafe { libc::preadv2(fd, &raw const iov, 1, offset as libc::off_t, flags) }
 }
 
-/// As [`read`], for a write from `ptr..ptr + len`.
+/// As [`read`] without flags, for a write from `ptr..ptr + len`.
 ///
 /// # Safety
 ///
 /// `ptr..ptr + len` is valid for reads and unchanged during the call.
-unsafe fn write(fd: RawFd, ptr: *const u8, len: u32, offset: u64, flags: i32) -> isize {
+unsafe fn write(fd: RawFd, ptr: *const u8, len: u32, offset: u64) -> isize {
     let iov = libc::iovec { iov_base: ptr.cast_mut().cast(), iov_len: len as usize };
     // SAFETY: `iov` outlives the call and the caller keeps its memory valid.
-    unsafe { libc::pwritev2(fd, &raw const iov, 1, offset as libc::off_t, flags) }
+    unsafe { libc::pwritev2(fd, &raw const iov, 1, offset as libc::off_t, 0) }
 }

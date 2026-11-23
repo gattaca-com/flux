@@ -2352,6 +2352,33 @@ mod tests {
         }
     }
 
+    /// `ring_entries` bounds how many operations are handed on per
+    /// `poll_with` call, including reads the page cache serves on the
+    /// calling thread.
+    #[test]
+    fn ring_entries_bounds_operations_handed_on_per_poll() {
+        fn reads(events: &[Ev]) -> usize {
+            events.iter().filter(|event| matches!(event, Ev::Read { .. })).count()
+        }
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("warm.bin");
+            fs::write(&path, [7u8; 64]).unwrap();
+            let mut disk = new(DiskConfig { ring_entries: 1, ..DiskConfig::default() });
+            let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Opened(file)));
+            for offset in [0, 16, 32, 48] {
+                assert!(disk.read_at(file, offset, 16));
+            }
+
+            events.clear();
+            disk.poll_with(|event| events.push(Ev::from(event)));
+            assert!(reads(&events) <= 1, "{events:?}");
+            drive(&mut disk, &mut events, |events| reads(events) == 4);
+        }
+    }
+
     #[test]
     fn closing_unknown_and_empty_submissions_are_rejected() {
         for new in BACKENDS {
