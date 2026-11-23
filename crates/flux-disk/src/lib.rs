@@ -20,6 +20,9 @@
 //! finished opening are queued and dispatched once the descriptor is
 //! available.
 
+mod backend;
+mod uring;
+
 use std::{
     collections::VecDeque,
     ffi::CString,
@@ -33,8 +36,9 @@ use std::{
 };
 
 use flux_timing::{Duration, Instant};
-use io_uring::{IoUring, opcode, squeue, types};
 use tracing::warn;
+
+use crate::backend::{Backend, Op};
 
 const INITIAL_FILE_CAPACITY: usize = 8;
 const INITIAL_IN_FLIGHT_CAPACITY: usize = 64;
@@ -46,7 +50,6 @@ const PENDING_WARNING_INTERVAL_SECS: u64 = 10;
 const MAX_OP_BYTES: usize = 1 << 30;
 /// Minimum and fallback buffer capacity for [`DiskIo::read_to_end`].
 const READ_TO_END_CHUNK: usize = 64 * 1024;
-const EMPTY_PATH: &[u8] = b"\0";
 
 /// Identifies one open (or opening) file. Tokens are never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -439,7 +442,7 @@ struct File {
 /// and closes remaining descriptors; poll until [`DiskIo::is_idle`] first
 /// when every completion matters.
 pub struct DiskIo {
-    ring: IoUring,
+    backend: Backend,
     max_in_flight: usize,
     pending_warn_ops: Option<usize>,
     files: Vec<File>,
@@ -464,10 +467,7 @@ pub fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
     if cores.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cores to pin to"));
     }
-    // Setting up a ring gives the calling thread the worker pool that holds
-    // the mask.
-    let ring = IoUring::new(1)?;
-    ring.submitter().register_iowq_aff(&flux_utils::cpu_set(cores)?)
+    Backend::pin_io_workers(cores)
 }
 
 impl Default for DiskIo {
@@ -480,10 +480,9 @@ impl DiskIo {
     pub fn new(config: DiskConfig) -> io::Result<Self> {
         assert!(config.ring_entries > 0, "ring_entries must be nonzero");
         assert!(config.max_in_flight > 0, "max_in_flight must be nonzero");
-        let ring = IoUring::new(config.ring_entries)?;
-        let max_in_flight = config.max_in_flight.min(ring.params().cq_entries() as usize);
+        let (backend, max_in_flight) = Backend::new(config.ring_entries, config.max_in_flight)?;
         Ok(Self {
-            ring,
+            backend,
             max_in_flight,
             pending_warn_ops: config.pending_warn_ops,
             files: Vec::with_capacity(INITIAL_FILE_CAPACITY),
@@ -926,7 +925,7 @@ impl DiskIo {
 
     pub fn limit_io_workers(&mut self, bounded: u32, unbounded: u32) -> io::Result<[u32; 2]> {
         let mut limits = [bounded, unbounded];
-        self.ring.submitter().register_iowq_max_workers(&mut limits)?;
+        self.backend.limit_io_workers(&mut limits)?;
         Ok(limits)
     }
 
@@ -1016,7 +1015,7 @@ impl DiskIo {
         let mut file_index = 0;
         while file_index < self.files.len() {
             loop {
-                if self.in_flight_count >= self.max_in_flight || self.ring.submission().is_full() {
+                if self.in_flight_count >= self.max_in_flight || self.backend.submission_full() {
                     return;
                 }
                 let file = &self.files[file_index];
@@ -1117,17 +1116,13 @@ impl DiskIo {
         self.push_slot(slot as u64);
     }
 
-    fn build_sqe(&mut self, user_data: u64) -> squeue::Entry {
-        let slot = user_data as usize;
+    fn describe(&mut self, slot: usize) -> Op {
         let token = self.slab[slot].as_ref().expect("in-flight slot occupied").file;
         let fd = self.files.iter().find(|file| file.token == token).and_then(|file| file.fd);
         let entry = self.slab[slot].as_mut().expect("in-flight slot occupied");
-        let sqe = match &mut entry.op {
+        match &mut entry.op {
             InFlightOp::Open { path, flags, mode } => {
-                opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
-                    .flags(*flags)
-                    .mode(*mode)
-                    .build()
+                Op::Open { path: path.as_ptr(), flags: *flags, mode: *mode }
             }
             InFlightOp::Read { buf, offset, wanted, have, .. } => {
                 let fd = fd.expect("read dispatched without an open fd");
@@ -1135,7 +1130,7 @@ impl DiskIo {
                 // SAFETY: `have < wanted <= buf.capacity()`, so the pointer
                 // stays inside the buffer's allocation.
                 let ptr = unsafe { buf.as_mut_ptr().add(*have) };
-                opcode::Read::new(types::Fd(fd), ptr, chunk).offset(*offset + *have as u64).build()
+                Op::Read { fd, ptr, len: chunk, offset: *offset + *have as u64 }
             }
             InFlightOp::ReadInto { target, offset, wanted, have } => {
                 let fd = fd.expect("read dispatched without an open fd");
@@ -1143,7 +1138,7 @@ impl DiskIo {
                 // SAFETY: `have < wanted`, and the caller of `read_at_into`
                 // keeps `wanted` bytes at the target valid.
                 let ptr = unsafe { target.0.add(*have) };
-                opcode::Read::new(types::Fd(fd), ptr, chunk).offset(*offset + *have as u64).build()
+                Op::Read { fd, ptr, len: chunk, offset: *offset + *have as u64 }
             }
             InFlightOp::WriteFrom { source, offset, len, written } => {
                 let fd = fd.expect("write dispatched without an open fd");
@@ -1151,20 +1146,11 @@ impl DiskIo {
                 // SAFETY: `written < len`, and the caller of `write_at_from`
                 // keeps `len` bytes at the source valid.
                 let ptr = unsafe { source.0.add(*written) };
-                opcode::Write::new(types::Fd(fd), ptr, chunk)
-                    .offset(*offset + *written as u64)
-                    .build()
+                Op::Write { fd, ptr, len: chunk, offset: *offset + *written as u64 }
             }
             InFlightOp::Statx { statx, .. } | InFlightOp::FileLen { statx } => {
                 let fd = fd.expect("statx dispatched without an open fd");
-                opcode::Statx::new(
-                    types::Fd(fd),
-                    EMPTY_PATH.as_ptr().cast(),
-                    statx.as_mut_ptr().cast(),
-                )
-                .flags(libc::AT_STATX_SYNC_AS_STAT | libc::AT_EMPTY_PATH)
-                .mask(libc::STATX_SIZE)
-                .build()
+                Op::Statx { fd, statx: statx.as_mut_ptr() }
             }
             InFlightOp::Write { buf, offset, written, .. } => {
                 let fd = fd.expect("write dispatched without an open fd");
@@ -1172,58 +1158,40 @@ impl DiskIo {
                 // SAFETY: `written < buf.len()`, so the pointer stays inside
                 // the buffer's allocation.
                 let ptr = unsafe { buf.as_ptr().add(*written) };
-                opcode::Write::new(types::Fd(fd), ptr, chunk)
-                    .offset(*offset + *written as u64)
-                    .build()
+                Op::Write { fd, ptr, len: chunk, offset: *offset + *written as u64 }
             }
             InFlightOp::Sync { data_only, .. } => {
                 let fd = fd.expect("sync dispatched without an open fd");
-                let mut sync = opcode::Fsync::new(types::Fd(fd));
-                if *data_only {
-                    sync = sync.flags(types::FsyncFlags::DATASYNC);
-                }
-                sync.build()
+                Op::Fsync { fd, data_only: *data_only }
             }
             InFlightOp::Truncate { len, .. } => {
                 let fd = fd.expect("truncate dispatched without an open fd");
-                opcode::Ftruncate::new(types::Fd(fd), *len).build()
+                Op::Ftruncate { fd, len: *len }
             }
-            InFlightOp::Rename { source, destination, .. } => opcode::RenameAt::new(
-                types::Fd(libc::AT_FDCWD),
-                source.as_ptr(),
-                types::Fd(libc::AT_FDCWD),
-                destination.as_ptr(),
-            )
-            .build(),
-            InFlightOp::Link { source, destination, .. } => opcode::LinkAt::new(
-                types::Fd(libc::AT_FDCWD),
-                source.as_ptr(),
-                types::Fd(libc::AT_FDCWD),
-                destination.as_ptr(),
-            )
-            .flags(libc::AT_SYMLINK_FOLLOW)
-            .build(),
+            InFlightOp::Rename { source, destination, .. } => {
+                Op::RenameAt { source: source.as_ptr(), destination: destination.as_ptr() }
+            }
+            InFlightOp::Link { source, destination, .. } => {
+                Op::LinkAt { source: source.as_ptr(), destination: destination.as_ptr() }
+            }
             InFlightOp::Unlink { path, directory, .. } => {
                 let flags = if *directory { libc::AT_REMOVEDIR } else { 0 };
-                opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).flags(flags).build()
+                Op::UnlinkAt { path: path.as_ptr(), flags }
             }
-            InFlightOp::CreateDir { path, .. } => {
-                opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).mode(0o777).build()
-            }
+            InFlightOp::CreateDir { path, .. } => Op::MkDirAt { path: path.as_ptr() },
             InFlightOp::Close => {
                 let fd = fd.expect("close dispatched without an open fd");
-                opcode::Close::new(types::Fd(fd)).build()
+                Op::Close { fd }
             }
-        };
-        sqe.user_data(user_data)
+        }
     }
 
     fn push_slot(&mut self, user_data: u64) {
-        let sqe = self.build_sqe(user_data);
-        // SAFETY: every buffer and path the entry references lives in
-        // `self.slab` until the completion for `user_data` is reaped, and its
-        // heap storage is never touched while the kernel owns the operation.
-        if unsafe { self.ring.submission().push(&sqe) }.is_ok() {
+        let op = self.describe(user_data as usize);
+        // SAFETY: every buffer and path `op` references lives in `self.slab`
+        // until the completion for `user_data` is reaped, and its heap storage
+        // is never touched while the kernel owns the operation.
+        if unsafe { self.backend.push(op, user_data) } {
             self.need_submit = true;
         } else {
             self.stalled.push(user_data);
@@ -1234,7 +1202,7 @@ impl DiskIo {
         if !self.need_submit {
             return;
         }
-        match self.ring.submit() {
+        match self.backend.submit() {
             Ok(_) => self.need_submit = false,
             Err(err)
                 if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)) => {
@@ -1249,7 +1217,7 @@ impl DiskIo {
     {
         let mut completions = std::mem::take(&mut self.completions);
         completions.clear();
-        completions.extend(self.ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
+        self.backend.reap(&mut completions);
         for &(user_data, result) in &completions {
             self.complete(user_data, result, handler);
         }
@@ -1751,7 +1719,7 @@ fn c_path(path: &Path) -> io::Result<CString> {
 /// The ring's descriptor: readable while completions wait to be reaped.
 impl AsRawFd for DiskIo {
     fn as_raw_fd(&self) -> RawFd {
-        self.ring.as_raw_fd()
+        self.backend.as_raw_fd()
     }
 }
 
@@ -1770,7 +1738,7 @@ impl Drop for DiskIo {
         while self.in_flight_count > 0 {
             let mut completions = std::mem::take(&mut self.completions);
             completions.clear();
-            completions.extend(self.ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
+            self.backend.reap(&mut completions);
             for &(user_data, _) in &completions {
                 let Some(entry) = self.slab[user_data as usize].take() else { continue };
                 self.in_flight_count -= 1;
@@ -1784,7 +1752,7 @@ impl Drop for DiskIo {
             if self.in_flight_count == 0 {
                 break;
             }
-            match self.ring.submit_and_wait(1) {
+            match self.backend.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
                 Err(err) => {
