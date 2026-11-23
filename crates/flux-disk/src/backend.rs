@@ -2,7 +2,10 @@ use std::{
     ffi::{CStr, c_char},
     io,
     os::fd::RawFd,
+    sync::OnceLock,
 };
+
+use tracing::info;
 
 use crate::{emulation::Emulation, uring::Uring};
 
@@ -41,16 +44,18 @@ pub(crate) enum Backend {
 }
 
 impl Backend {
-    /// Also returns `max_in_flight` clamped to the completions the backend
-    /// can hold.
+    /// `io_uring` when the process can use it, else the emulation. Also
+    /// returns `max_in_flight` clamped to the completions the backend can
+    /// hold.
     pub(crate) fn new(entries: u32, max_in_flight: usize) -> io::Result<(Self, usize)> {
-        let (ring, max_in_flight) = Uring::new(entries, max_in_flight)?;
-        Ok((Self::Uring(ring), max_in_flight))
+        match ring(entries, max_in_flight)? {
+            Some((ring, max_in_flight)) => Ok((Self::Uring(ring), max_in_flight)),
+            None => Self::emulated(entries, max_in_flight),
+        }
     }
 
     /// Runs operations on threads of the submitting thread's pool, at most
     /// `entries` per submission.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn emulated(entries: u32, max_in_flight: usize) -> io::Result<(Self, usize)> {
         Ok((Self::Emulated(Emulation::new(entries)?), max_in_flight))
     }
@@ -58,7 +63,12 @@ impl Backend {
     pub(crate) fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
         let set = flux_utils::cpu_set(cores)?;
         Emulation::pin_io_workers(set);
-        Uring::pin_io_workers(&set)
+        // Setting up a ring gives the calling thread the worker pool that holds
+        // the mask.
+        match ring(1, 1)? {
+            Some((ring, _)) => ring.pin_io_workers(&set),
+            None => Ok(()),
+        }
     }
 
     #[inline]
@@ -142,4 +152,47 @@ impl Backend {
             Self::Emulated(emulation) => emulation.as_raw_fd(),
         }
     }
+}
+
+static IO_URING: OnceLock<bool> = OnceLock::new();
+
+/// Sets up a ring unless the process uses the emulation; `None` selects the
+/// emulation. The first ring is also the probe, decided once per process.
+/// Errors that say nothing about support, such as `ENOMEM` when locked memory
+/// is exhausted or `EINVAL` for a ring size, are returned and latch nothing,
+/// so a later call probes again.
+fn ring(entries: u32, max_in_flight: usize) -> io::Result<Option<(Uring, usize)>> {
+    match IO_URING.get() {
+        Some(true) => return Uring::new(entries, max_in_flight).map(Some),
+        Some(false) => return Ok(None),
+        None => {}
+    }
+    let (ring, max_in_flight) = match Uring::new(entries, max_in_flight) {
+        Ok(ring) => ring,
+        // Refused by seccomp or sysctl, or absent.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => {
+            return if latch(false) { Err(error) } else { Ok(None) };
+        }
+        Err(error) => return Err(error),
+    };
+    // io_uring only when the kernel supports every opcode we issue; a partial
+    // ring would fail operations one by one (ftruncate needs Linux 6.9).
+    let supported = match ring.supports_every_opcode() {
+        Ok(supported) => supported,
+        // A kernel without opcode probes.
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => false,
+        Err(error) => return Err(error),
+    };
+    Ok(latch(supported).then_some((ring, max_in_flight)))
+}
+
+/// Latches the first answer, logs it once, and returns the latched answer.
+fn latch(available: bool) -> bool {
+    if IO_URING.set(available).is_ok() {
+        info!(
+            backend = if available { "io_uring" } else { "thread pool" },
+            "disk io backend selected"
+        );
+    }
+    *IO_URING.get().expect("latched above")
 }

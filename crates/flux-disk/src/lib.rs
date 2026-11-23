@@ -2,11 +2,20 @@
 //!
 //! [`DiskIo`] is the disk counterpart of `flux-network`'s poll-driven TCP
 //! types: every call submits work and returns immediately, and completions
-//! are delivered as borrowed [`DiskEvent`]s from [`DiskIo::poll_with`], which
-//! never blocks. Readiness polling (mio/epoll) cannot express regular-file
-//! I/O — files are always "ready" and reads still block — so this is built on
-//! `io_uring` completions instead: operations are pushed onto the kernel's
-//! submission ring and reaped from its completion ring without waiting.
+//! are delivered as borrowed [`DiskEvent`]s from [`DiskIo::poll_with`].
+//! Readiness polling (mio/epoll) cannot express regular-file I/O — files are
+//! always "ready" and reads still block — so this is built on `io_uring`
+//! completions instead: operations are pushed onto the kernel's submission
+//! ring and reaped from its completion ring without waiting.
+//!
+//! Where `io_uring` is refused (container seccomp profiles, gVisor,
+//! `kernel.io_uring_disabled`), absent, or lacks an operation `DiskIo` issues
+//! (`ftruncate` needs Linux 6.9), the whole process runs operations on worker
+//! threads instead, one pool per submitting thread as `io_uring` keeps one,
+//! and reports their completions the same way. The choice is made once per
+//! process, on first use. Reads the page cache serves without blocking still
+//! complete on the calling thread. Without `io_uring`, calls may block
+//! briefly while a worker queues or takes an operation.
 //!
 //! Operations on one file run concurrently, except [`DiskIo::sync_all`],
 //! [`DiskIo::sync_data`], [`DiskIo::truncate`], [`DiskIo::rename`],
@@ -186,11 +195,13 @@ impl OpenOptions {
 /// Configuration for one [`DiskIo`] instance.
 #[derive(Clone, Copy, Debug)]
 pub struct DiskConfig {
-    /// `io_uring` submission queue depth. Also bounds how many operations
-    /// reach the kernel per [`DiskIo::poll_with`] call.
+    /// `io_uring` submission queue depth, or without it the operations handed
+    /// to the workers at once. Also bounds how many operations are handed on
+    /// per [`DiskIo::poll_with`] call.
     pub ring_entries: u32,
-    /// Most operations concurrently owned by the kernel. Clamped to the
-    /// ring's completion queue capacity so completions can never be dropped.
+    /// Most operations concurrently owned by the kernel or the workers. With
+    /// `io_uring`, clamped to the ring's completion queue capacity so
+    /// completions can never be dropped.
     pub max_in_flight: usize,
     /// Emit rate-limited warnings above this many queued operations. The
     /// queue is allowed to continue growing.
@@ -434,12 +445,13 @@ struct File {
     queue: VecDeque<PendingOp>,
 }
 
-/// A collection of files driven by one nonblocking `io_uring`.
+/// A collection of files driven by one nonblocking `io_uring`, or by worker
+/// threads where `io_uring` is unavailable.
 ///
-/// Submitting calls never block: operations wait in a per-file queue, move to
-/// the kernel as ring capacity allows, and complete through
+/// Submitting calls do not wait for I/O: operations wait in a per-file queue,
+/// move to the kernel or the workers as capacity allows, and complete through
 /// [`DiskIo::poll_with`]. Dropping the instance waits for operations already
-/// handed to the kernel (bounded by device latency), abandons queued ones,
+/// handed on (bounded by device latency), abandons queued ones,
 /// and closes remaining descriptors; poll until [`DiskIo::is_idle`] first
 /// when every completion matters.
 pub struct DiskIo {
@@ -462,8 +474,13 @@ pub struct DiskIo {
     last_pending_warning: Option<Instant>,
 }
 
-/// Pins the kernel workers that run the calling thread's blocking operations
-/// to `cores`, for every ring the thread drives.
+/// Pins the workers that run the calling thread's blocking operations to
+/// `cores`: the kernel's, for every ring the thread drives, and those its own
+/// pool starts from now on.
+///
+/// Unpinned workers inherit the calling thread's CPU affinity and scheduling
+/// policy, as `io_uring`'s do on Linux 6.2 and later, so a thread that spins
+/// on its core or runs under a real-time policy should pin them elsewhere.
 pub fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
     if cores.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cores to pin to"));
@@ -473,7 +490,7 @@ pub fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
 
 impl Default for DiskIo {
     fn default() -> Self {
-        Self::new(DiskConfig::default()).expect("couldn't set up an io_uring for disk io")
+        Self::new(DiskConfig::default()).expect("couldn't set up disk io")
     }
 }
 
@@ -763,7 +780,7 @@ impl DiskIo {
     /// Queues an `ftruncate` barrier after all earlier operations on `file`.
     /// Later operations do not start until the truncate completes. The append
     /// cursor is unchanged; use [`Self::set_write_cursor`] when repairing an
-    /// append-only file. Requires Linux 6.9 or newer.
+    /// append-only file.
     ///
     /// Returns an ID echoed by its completion or failure event, or `None` for
     /// unknown or closing tokens.
@@ -814,8 +831,7 @@ impl DiskIo {
     /// Queues giving the open file the name `path`, for a file opened with
     /// [`OpenOptions::tmpfile`], after all earlier operations on it. Fails
     /// with `EEXIST` when the name is taken. A successful link makes `path`
-    /// the file's path, so a later [`DiskIo::rename`] moves it. Needs Linux
-    /// 5.15.
+    /// the file's path, so a later [`DiskIo::rename`] moves it.
     ///
     /// Returns an ID echoed by its completion or failure event, or `None` for
     /// unknown or closing tokens. A path containing a nul byte returns an
@@ -836,8 +852,7 @@ impl DiskIo {
     }
 
     /// Queues removal of the name `path`, after all earlier operations on
-    /// `file` and before later ones. The file itself is untouched. Needs
-    /// Linux 5.11.
+    /// `file` and before later ones. The file itself is untouched.
     ///
     /// Returns an ID echoed by its completion or failure event, or `None` for
     /// unknown or closing tokens. A path containing a nul byte returns an
@@ -872,8 +887,7 @@ impl DiskIo {
     /// after all earlier operations on `file` and before later ones; `file`
     /// only orders it, so a directory opened with [`Self::open_directory`]
     /// serves. Fails with `EEXIST` when the name is taken. Parents are not
-    /// created: queue one call per missing level, outermost first. Needs
-    /// Linux 5.15.
+    /// created: queue one call per missing level, outermost first.
     ///
     /// Returns an ID echoed by its completion or failure event, or `None` for
     /// unknown or closing tokens. A path containing a nul byte returns an
@@ -936,15 +950,23 @@ impl DiskIo {
         self.pending_count == 0 && self.in_flight_count == 0
     }
 
+    /// Caps the workers that run blocking operations for the threads driving
+    /// this instance: `bounded` for file operations, `unbounded` for
+    /// `io_uring` work that can block indefinitely, which this crate does not
+    /// issue. `0` leaves a value unchanged; without `io_uring`, values above
+    /// 128 count as 128. Returns the previous values: with `io_uring` the
+    /// calling thread's kernel pool's (zero while the thread has no ring),
+    /// else those last set through this instance (zero while unset).
     pub fn limit_io_workers(&mut self, bounded: u32, unbounded: u32) -> io::Result<[u32; 2]> {
         let mut limits = [bounded, unbounded];
         self.backend.limit_io_workers(&mut limits)?;
         Ok(limits)
     }
 
-    /// Reaps finished operations, dispatches queued ones, and submits to the
-    /// kernel — all without blocking. Completions that the kernel satisfied
-    /// inline (e.g. page-cache hits) are reported within the same call.
+    /// Reaps finished operations, dispatches queued ones, and hands them to the
+    /// kernel or the workers, without waiting for I/O. Operations completed
+    /// without blocking (e.g. page-cache hits) are reported within the same
+    /// call.
     pub fn poll_with<F>(&mut self, mut handler: F)
     where
         F: for<'a> FnMut(DiskEvent<'a>),
@@ -1748,7 +1770,8 @@ fn c_path(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))
 }
 
-/// The ring's descriptor: readable while completions wait to be reaped.
+/// Readable while completions wait to be reaped: the ring's descriptor, or
+/// without `io_uring` an eventfd.
 impl AsRawFd for DiskIo {
     fn as_raw_fd(&self) -> RawFd {
         self.backend.as_raw_fd()
@@ -1789,7 +1812,10 @@ impl Drop for DiskIo {
                 Ok(()) => {}
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
                 Err(err) => {
-                    warn!(?err, "couldn't drain the disk io ring; leaking in-flight buffers");
+                    warn!(
+                        ?err,
+                        "couldn't drain disk io; leaking in-flight buffers and descriptors"
+                    );
                     std::mem::forget(std::mem::take(&mut self.slab));
                     // A worker may still use a descriptor by its number,
                     // which closing would free for reuse.
@@ -2664,5 +2690,64 @@ mod tests {
             }
         });
         assert!(workers > 2, "only {workers} workers without a limit");
+    }
+
+    /// Runs again in a child process whose `io_uring_setup` fails with `EPERM`,
+    /// as under Docker's default seccomp profile.
+    #[test]
+    fn refused_io_uring_falls_back_to_workers() {
+        if !in_child("tests::refused_io_uring_falls_back_to_workers") {
+            return;
+        }
+        // The child runs natively, so the syscall number alone identifies
+        // `io_uring_setup`.
+        let filter = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0, // seccomp_data.nr
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_io_uring_setup as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program =
+            libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr().cast_mut() };
+        // SAFETY: `program` and `filter` outlive the calls; the filter only
+        // makes one syscall fail.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            let installed =
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const program);
+            assert_eq!(installed, 0);
+        }
+        let refused = io_uring::IoUring::new(1).err().map(|error| error.raw_os_error());
+        assert_eq!(refused, Some(Some(libc::EPERM)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskIo::default();
+        let file = disk.open(dir.path().join("refused.bin"), overwrite().read(true)).unwrap();
+        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"fallback")));
+        disk.sync_data(file).unwrap();
+        assert!(disk.read_at(file, 0, 8));
+        let mut events = Vec::new();
+        let read = Ev::Read { file, offset: 0, payload: b"fallback".to_vec(), eof: false };
+        drive(&mut disk, &mut events, |events| events.contains(&read));
     }
 }

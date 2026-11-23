@@ -1,6 +1,6 @@
 [package]
 edition.workspace = true
-keywords = ["disk", "io-uring", "low-latency", "performance"]
+keywords = ["disk", "io-uring", "thread-pool", "low-latency", "performance"]
 license.workspace = true
 name = "flux-disk"
 publish.workspace = true

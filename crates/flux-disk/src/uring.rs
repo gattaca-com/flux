@@ -3,11 +3,26 @@ use std::{
     os::fd::{AsRawFd, RawFd},
 };
 
-use io_uring::{IoUring, opcode, squeue, types};
+use io_uring::{IoUring, Probe, opcode, squeue, types};
 
 use crate::backend::{
     LINK_FLAGS, MKDIR_MODE, Op, PATH_DIR_FD, STATX_FLAGS, STATX_MASK, STATX_PATH,
 };
+
+/// Every opcode [`entry`] emits.
+const OPCODES: [u8; 11] = [
+    opcode::OpenAt::CODE,
+    opcode::Read::CODE,
+    opcode::Write::CODE,
+    opcode::Statx::CODE,
+    opcode::Fsync::CODE,
+    opcode::Ftruncate::CODE,
+    opcode::RenameAt::CODE,
+    opcode::LinkAt::CODE,
+    opcode::UnlinkAt::CODE,
+    opcode::MkDirAt::CODE,
+    opcode::Close::CODE,
+];
 
 pub(crate) struct Uring(IoUring);
 
@@ -18,11 +33,15 @@ impl Uring {
         Ok((Self(ring), max_in_flight))
     }
 
-    pub(crate) fn pin_io_workers(cores: &libc::cpu_set_t) -> io::Result<()> {
-        // Setting up a ring gives the calling thread the worker pool that holds
-        // the mask.
-        let ring = IoUring::new(1)?;
-        ring.submitter().register_iowq_aff(cores)
+    /// Whether the kernel supports every opcode `DiskIo` issues.
+    pub(crate) fn supports_every_opcode(&self) -> io::Result<bool> {
+        let mut probe = Probe::new();
+        self.0.submitter().register_probe(&mut probe)?;
+        Ok(OPCODES.iter().all(|&code| probe.is_supported(code)))
+    }
+
+    pub(crate) fn pin_io_workers(&self, cores: &libc::cpu_set_t) -> io::Result<()> {
+        self.0.submitter().register_iowq_aff(cores)
     }
 
     #[inline]
