@@ -5,9 +5,9 @@ use std::{
 
 use io_uring::{IoUring, opcode, squeue, types};
 
-use crate::backend::Op;
-
-const EMPTY_PATH: &[u8] = b"\0";
+use crate::backend::{
+    LINK_FLAGS, MKDIR_MODE, Op, PATH_DIR_FD, STATX_FLAGS, STATX_MASK, STATX_PATH,
+};
 
 pub(crate) struct Uring(IoUring);
 
@@ -18,11 +18,11 @@ impl Uring {
         Ok((Self(ring), max_in_flight))
     }
 
-    pub(crate) fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
+    pub(crate) fn pin_io_workers(cores: &libc::cpu_set_t) -> io::Result<()> {
         // Setting up a ring gives the calling thread the worker pool that holds
         // the mask.
         let ring = IoUring::new(1)?;
-        ring.submitter().register_iowq_aff(&flux_utils::cpu_set(cores)?)
+        ring.submitter().register_iowq_aff(cores)
     }
 
     #[inline]
@@ -68,7 +68,7 @@ impl Uring {
 fn entry(op: Op, user_data: u64) -> squeue::Entry {
     let sqe = match op {
         Op::Open { path, flags, mode } => {
-            opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path).flags(flags).mode(mode).build()
+            opcode::OpenAt::new(types::Fd(PATH_DIR_FD), path).flags(flags).mode(mode).build()
         }
         Op::Read { fd, ptr, len, offset } => {
             opcode::Read::new(types::Fd(fd), ptr, len).offset(offset).build()
@@ -77,9 +77,9 @@ fn entry(op: Op, user_data: u64) -> squeue::Entry {
             opcode::Write::new(types::Fd(fd), ptr, len).offset(offset).build()
         }
         Op::Statx { fd, statx } => {
-            opcode::Statx::new(types::Fd(fd), EMPTY_PATH.as_ptr().cast(), statx.cast())
-                .flags(libc::AT_STATX_SYNC_AS_STAT | libc::AT_EMPTY_PATH)
-                .mask(libc::STATX_SIZE)
+            opcode::Statx::new(types::Fd(fd), STATX_PATH.as_ptr(), statx.cast())
+                .flags(STATX_FLAGS)
+                .mask(STATX_MASK)
                 .build()
         }
         Op::Fsync { fd, data_only } => {
@@ -91,25 +91,22 @@ fn entry(op: Op, user_data: u64) -> squeue::Entry {
         }
         Op::Ftruncate { fd, len } => opcode::Ftruncate::new(types::Fd(fd), len).build(),
         Op::RenameAt { source, destination } => opcode::RenameAt::new(
-            types::Fd(libc::AT_FDCWD),
+            types::Fd(PATH_DIR_FD),
             source,
-            types::Fd(libc::AT_FDCWD),
+            types::Fd(PATH_DIR_FD),
             destination,
         )
         .build(),
-        Op::LinkAt { source, destination } => opcode::LinkAt::new(
-            types::Fd(libc::AT_FDCWD),
-            source,
-            types::Fd(libc::AT_FDCWD),
-            destination,
-        )
-        .flags(libc::AT_SYMLINK_FOLLOW)
-        .build(),
+        Op::LinkAt { source, destination } => {
+            opcode::LinkAt::new(types::Fd(PATH_DIR_FD), source, types::Fd(PATH_DIR_FD), destination)
+                .flags(LINK_FLAGS)
+                .build()
+        }
         Op::UnlinkAt { path, flags } => {
-            opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path).flags(flags).build()
+            opcode::UnlinkAt::new(types::Fd(PATH_DIR_FD), path).flags(flags).build()
         }
         Op::MkDirAt { path } => {
-            opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path).mode(0o777).build()
+            opcode::MkDirAt::new(types::Fd(PATH_DIR_FD), path).mode(MKDIR_MODE).build()
         }
         Op::Close { fd } => opcode::Close::new(types::Fd(fd)).build(),
     };

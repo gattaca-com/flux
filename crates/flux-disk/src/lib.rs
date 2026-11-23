@@ -21,6 +21,7 @@
 //! available.
 
 mod backend;
+mod emulation;
 mod uring;
 
 use std::{
@@ -478,9 +479,21 @@ impl Default for DiskIo {
 
 impl DiskIo {
     pub fn new(config: DiskConfig) -> io::Result<Self> {
+        Self::with_backend(config, Backend::new)
+    }
+
+    #[cfg(test)]
+    fn emulated(config: DiskConfig) -> io::Result<Self> {
+        Self::with_backend(config, Backend::emulated)
+    }
+
+    fn with_backend(
+        config: DiskConfig,
+        backend: impl FnOnce(u32, usize) -> io::Result<(Backend, usize)>,
+    ) -> io::Result<Self> {
         assert!(config.ring_entries > 0, "ring_entries must be nonzero");
         assert!(config.max_in_flight > 0, "max_in_flight must be nonzero");
-        let (backend, max_in_flight) = Backend::new(config.ring_entries, config.max_in_flight)?;
+        let (backend, max_in_flight) = backend(config.ring_entries, config.max_in_flight)?;
         Ok(Self {
             backend,
             max_in_flight,
@@ -1116,6 +1129,7 @@ impl DiskIo {
         self.push_slot(slot as u64);
     }
 
+    #[inline(always)]
     fn describe(&mut self, slot: usize) -> Op {
         let token = self.slab[slot].as_ref().expect("in-flight slot occupied").file;
         let fd = self.files.iter().find(|file| file.token == token).and_then(|file| file.fd);
@@ -1187,15 +1201,33 @@ impl DiskIo {
     }
 
     fn push_slot(&mut self, user_data: u64) {
-        let op = self.describe(user_data as usize);
-        // SAFETY: every buffer and path `op` references lives in `self.slab`
-        // until the completion for `user_data` is reaped, and its heap storage
-        // is never touched while the kernel owns the operation.
-        if unsafe { self.backend.push(op, user_data) } {
+        // The emulated push stays out of line, so on the ring path describing
+        // the operation fuses with the ring's encoder.
+        let pushed = if self.backend.is_ring() {
+            self.push_op(user_data)
+        } else {
+            self.push_op_out_of_line(user_data)
+        };
+        if pushed {
             self.need_submit = true;
         } else {
             self.stalled.push(user_data);
         }
+    }
+
+    #[inline(always)]
+    fn push_op(&mut self, user_data: u64) -> bool {
+        let op = self.describe(user_data as usize);
+        // SAFETY: every buffer and path `op` references lives in `self.slab`
+        // until the completion for `user_data` is reaped, and its heap storage
+        // is never touched while the backend owns the operation.
+        unsafe { self.backend.push(op, user_data) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_op_out_of_line(&mut self, user_data: u64) -> bool {
+        self.push_op(user_data)
     }
 
     fn flush_submissions(&mut self) {
@@ -1725,15 +1757,16 @@ impl AsRawFd for DiskIo {
 
 impl Drop for DiskIo {
     fn drop(&mut self) {
-        // Stalled continuations were never handed to the kernel; free them
-        // directly.
+        // Stalled continuations, and operations the backend never handed on,
+        // are freed directly.
+        self.backend.take_unsubmitted(&mut self.stalled);
         for user_data in std::mem::take(&mut self.stalled) {
             if self.slab[user_data as usize].take().is_some() {
                 self.in_flight_count -= 1;
             }
         }
-        // The kernel writes into slab-owned buffers, so wait for every
-        // operation it has seen. Regular-file operations always complete;
+        // The kernel or a worker writes into slab-owned buffers, so wait for
+        // every operation handed on. Regular-file operations always complete;
         // this is bounded by device latency.
         while self.in_flight_count > 0 {
             let mut completions = std::mem::take(&mut self.completions);
@@ -1752,13 +1785,15 @@ impl Drop for DiskIo {
             if self.in_flight_count == 0 {
                 break;
             }
-            match self.backend.submit_and_wait(1) {
-                Ok(_) => {}
+            match self.backend.wait() {
+                Ok(()) => {}
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
                 Err(err) => {
                     warn!(?err, "couldn't drain the disk io ring; leaking in-flight buffers");
                     std::mem::forget(std::mem::take(&mut self.slab));
-                    break;
+                    // A worker may still use a descriptor by its number,
+                    // which closing would free for reuse.
+                    return;
                 }
             }
         }
@@ -1775,15 +1810,34 @@ impl Drop for DiskIo {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::CString,
         fs,
-        os::fd::IntoRawFd,
+        os::{
+            fd::{AsRawFd, IntoRawFd},
+            unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        },
+        path::PathBuf,
+        sync::mpsc,
         time::{Duration as StdDuration, Instant as StdInstant},
     };
 
     use super::{
         DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions, OperationId,
-        READ_TO_END_CHUNK, pin_io_workers,
+        READ_TO_END_CHUNK, emulation::WORKER_NAME_PREFIX, pin_io_workers,
     };
+
+    /// One constructor per backend; a failing test's captured output names
+    /// the backend it ran on.
+    const BACKENDS: [fn(DiskConfig) -> DiskIo; 2] = [
+        |config| {
+            println!("backend: DiskIo::new");
+            DiskIo::new(config).unwrap()
+        },
+        |config| {
+            println!("backend: emulated");
+            DiskIo::emulated(config).unwrap()
+        },
+    ];
 
     fn overwrite() -> OpenOptions {
         OpenOptions::new().write(true).create(true).truncate(true)
@@ -1852,56 +1906,74 @@ mod tests {
         }
     }
 
+    /// Whether `disk`'s descriptor is readable within `timeout_ms`.
+    fn readable(disk: &DiskIo, timeout_ms: i32) -> bool {
+        let mut fd = libc::pollfd { fd: disk.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: `fd` outlives the call and the count is one.
+        unsafe { libc::poll(&raw mut fd, 1, timeout_ms) == 1 }
+    }
+
     #[test]
     fn writes_sync_and_close_before_the_first_poll() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("log.bin");
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, overwrite()).unwrap();
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"alpha")));
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"beta")));
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"gamma")));
-        let sync_id = disk.sync_all(file).unwrap();
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("log.bin");
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, overwrite()).unwrap();
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"alpha")));
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"beta")));
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"gamma")));
+            let sync_id = disk.sync_all(file).unwrap();
+            assert!(disk.close(file));
+            disk.submit();
+            assert!(readable(&disk, 5_000), "a completion waits");
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
 
-        assert_eq!(events[0], Ev::Opened(file));
-        let synced_at =
-            events.iter().position(|event| *event == Ev::Synced(file, sync_id)).unwrap();
-        for (offset, len) in [(0, 5), (5, 4), (9, 5)] {
-            let written = Ev::Written { file, offset, len };
-            let written_at = events.iter().position(|event| *event == written).unwrap();
-            assert!(written_at < synced_at, "sync must complete after writes: {events:?}");
+            assert_eq!(events[0], Ev::Opened(file));
+            let synced_at =
+                events.iter().position(|event| *event == Ev::Synced(file, sync_id)).unwrap();
+            for (offset, len) in [(0, 5), (5, 4), (9, 5)] {
+                let written = Ev::Written { file, offset, len };
+                let written_at = events.iter().position(|event| *event == written).unwrap();
+                assert!(written_at < synced_at, "sync must complete after writes: {events:?}");
+            }
+            assert_eq!(*events.last().unwrap(), Ev::Closed(file));
+            assert!(disk.is_idle());
+            assert!(!readable(&disk, 0), "idle yet readable");
+            assert_eq!(fs::read(&path).unwrap(), b"alphabetagamma");
         }
-        assert_eq!(*events.last().unwrap(), Ev::Closed(file));
-        assert!(disk.is_idle());
-        assert_eq!(fs::read(&path).unwrap(), b"alphabetagamma");
     }
 
     #[test]
     fn reads_report_payload_and_eof() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.bin");
-        fs::write(&path, b"0123456789").unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
-        assert!(!disk.read_at(file, 0, 0));
-        assert!(disk.read_at(file, 0, 10));
-        assert!(disk.read_at(file, 4, 100));
-        assert!(disk.read_at(file, 10, 3));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data.bin");
+            fs::write(&path, b"0123456789").unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+            assert!(!disk.read_at(file, 0, 0));
+            assert!(disk.read_at(file, 0, 10));
+            assert!(disk.read_at(file, 4, 100));
+            assert!(disk.read_at(file, 10, 3));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| {
-            events.iter().filter(|event| matches!(event, Ev::Read { .. })).count() == 3
-        });
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| {
+                events.iter().filter(|event| matches!(event, Ev::Read { .. })).count() == 3
+            });
 
-        let read =
-            |offset, payload: &[u8], eof| Ev::Read { file, offset, payload: payload.to_vec(), eof };
-        assert!(events.contains(&read(0, b"0123456789", false)));
-        assert!(events.contains(&read(4, b"456789", true)));
-        assert!(events.contains(&read(10, b"", true)));
+            let read = |offset, payload: &[u8], eof| Ev::Read {
+                file,
+                offset,
+                payload: payload.to_vec(),
+                eof,
+            };
+            assert!(events.contains(&read(0, b"0123456789", false)));
+            assert!(events.contains(&read(4, b"456789", true)));
+            assert!(events.contains(&read(10, b"", true)));
+        }
     }
 
     #[test]
@@ -1915,357 +1987,417 @@ mod tests {
 
     #[test]
     fn read_to_end_returns_full_contents_from_a_static_large_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("grown.bin");
-        let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
-        fs::write(&path, &data).unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
-        assert!(disk.read_to_end(file, 0));
-        assert!(disk.read_to_end(file, 199_990));
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("grown.bin");
+            let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+            fs::write(&path, &data).unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+            assert!(disk.read_to_end(file, 0));
+            assert!(disk.read_to_end(file, 199_990));
+            assert!(disk.close(file));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
-        assert!(events.contains(&Ev::Read { file, offset: 0, payload: data.clone(), eof: true }));
-        assert!(events.contains(&Ev::Read {
-            file,
-            offset: 199_990,
-            payload: data[199_990..].to_vec(),
-            eof: true,
-        }));
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            assert!(events.contains(&Ev::Read {
+                file,
+                offset: 0,
+                payload: data.clone(),
+                eof: true
+            }));
+            assert!(events.contains(&Ev::Read {
+                file,
+                offset: 199_990,
+                payload: data[199_990..].to_vec(),
+                eof: true,
+            }));
+        }
     }
 
     #[test]
     fn read_to_end_grows_after_a_stale_statx_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("grown.bin");
-        let data: Vec<u8> = (0..READ_TO_END_CHUNK * 3).map(|i| i as u8).collect();
-        fs::write(&path, &data).unwrap();
-        let mut disk = DiskIo::default();
-        let file = FileToken(0);
-        disk.files.push(super::File {
-            token: file,
-            path: path.clone(),
-            fd: Some(fs::File::open(&path).unwrap().into_raw_fd()),
-            closing: false,
-            write_cursor: 0,
-            in_flight: 1,
-            exclusive_in_flight: false,
-            queue: std::collections::VecDeque::new(),
-        });
-        disk.slab.push(None);
-        disk.in_flight_count = 1;
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("grown.bin");
+            let data: Vec<u8> = (0..READ_TO_END_CHUNK * 3).map(|i| i as u8).collect();
+            fs::write(&path, &data).unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = FileToken(0);
+            disk.files.push(super::File {
+                token: file,
+                path: path.clone(),
+                fd: Some(fs::File::open(&path).unwrap().into_raw_fd()),
+                closing: false,
+                write_cursor: 0,
+                in_flight: 1,
+                exclusive_in_flight: false,
+                queue: std::collections::VecDeque::new(),
+            });
+            disk.slab.push(None);
+            disk.in_flight_count = 1;
 
-        // Start from a deliberately stale size captured before the file grew.
-        disk.start_read_to_end(0, 0, 0, Some(READ_TO_END_CHUNK as u64), None);
+            // Start from a deliberately stale size captured before the file grew.
+            disk.start_read_to_end(0, 0, 0, Some(READ_TO_END_CHUNK as u64), None);
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| {
-            events.iter().any(|event| matches!(event, Ev::Read { .. }))
-        });
-        assert!(events.contains(&Ev::Read { file, offset: 0, payload: data, eof: true }));
-        assert!(disk.is_idle());
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| {
+                events.iter().any(|event| matches!(event, Ev::Read { .. }))
+            });
+            assert!(events.contains(&Ev::Read { file, offset: 0, payload: data, eof: true }));
+            assert!(disk.is_idle());
+        }
     }
 
     #[test]
     fn read_to_end_of_an_empty_file_is_empty_and_eof() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("empty.bin");
-        fs::write(&path, b"").unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
-        assert!(disk.read_to_end(file, 0));
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| {
-            events.iter().any(|event| matches!(event, Ev::Read { .. }))
-        });
-        assert!(events.contains(&Ev::Read { file, offset: 0, payload: Vec::new(), eof: true }));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("empty.bin");
+            fs::write(&path, b"").unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+            assert!(disk.read_to_end(file, 0));
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| {
+                events.iter().any(|event| matches!(event, Ev::Read { .. }))
+            });
+            assert!(events.contains(&Ev::Read { file, offset: 0, payload: Vec::new(), eof: true }));
+        }
     }
 
     #[test]
     fn failed_open_fails_queued_ops_and_retires_the_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing").join("file.bin");
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, overwrite()).unwrap();
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"data")));
-        let sync_id = disk.sync_data(file).unwrap();
-        let truncate_id = disk.truncate(file, 2).unwrap();
-        let rename_id = disk.rename(file, dir.path().join("renamed.bin")).unwrap().unwrap();
-        let link_id = disk.link(file, dir.path().join("linked.bin")).unwrap().unwrap();
-        let unlink_id = disk.unlink(file, dir.path().join("gone.bin")).unwrap().unwrap();
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("missing").join("file.bin");
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, overwrite()).unwrap();
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"data")));
+            let sync_id = disk.sync_data(file).unwrap();
+            let truncate_id = disk.truncate(file, 2).unwrap();
+            let rename_id = disk.rename(file, dir.path().join("renamed.bin")).unwrap().unwrap();
+            let link_id = disk.link(file, dir.path().join("linked.bin")).unwrap().unwrap();
+            let unlink_id = disk.unlink(file, dir.path().join("gone.bin")).unwrap().unwrap();
+            assert!(disk.close(file));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.len() >= 8);
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.len() >= 8);
 
-        assert_eq!(events, vec![
-            Ev::Failed { file, op: FailedOp::Open, operation_id: None },
-            Ev::Failed { file, op: FailedOp::Write { offset: 0, len: 4 }, operation_id: None },
-            Ev::Failed { file, op: FailedOp::Sync, operation_id: Some(sync_id) },
-            Ev::Failed { file, op: FailedOp::Truncate { len: 2 }, operation_id: Some(truncate_id) },
-            Ev::Failed { file, op: FailedOp::Rename, operation_id: Some(rename_id) },
-            Ev::Failed { file, op: FailedOp::Link, operation_id: Some(link_id) },
-            Ev::Failed { file, op: FailedOp::Unlink, operation_id: Some(unlink_id) },
-            Ev::Failed { file, op: FailedOp::Close, operation_id: None },
-        ]);
-        assert!(!disk.write_with(file, |buf| buf.push(1)));
-        assert!(disk.is_idle());
+            assert_eq!(events, vec![
+                Ev::Failed { file, op: FailedOp::Open, operation_id: None },
+                Ev::Failed { file, op: FailedOp::Write { offset: 0, len: 4 }, operation_id: None },
+                Ev::Failed { file, op: FailedOp::Sync, operation_id: Some(sync_id) },
+                Ev::Failed {
+                    file,
+                    op: FailedOp::Truncate { len: 2 },
+                    operation_id: Some(truncate_id),
+                },
+                Ev::Failed { file, op: FailedOp::Rename, operation_id: Some(rename_id) },
+                Ev::Failed { file, op: FailedOp::Link, operation_id: Some(link_id) },
+                Ev::Failed { file, op: FailedOp::Unlink, operation_id: Some(unlink_id) },
+                Ev::Failed { file, op: FailedOp::Close, operation_id: None },
+            ]);
+            assert!(!disk.write_with(file, |buf| buf.push(1)));
+            assert!(disk.is_idle());
+        }
     }
 
     #[test]
     fn barriers_order_overlapping_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("patched.bin");
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, overwrite()).unwrap();
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"aaaa")));
-        disk.sync_all(file).unwrap();
-        assert!(disk.write_at_with(file, 1, |buf| buf.extend_from_slice(b"bb")));
-        disk.sync_data(file).unwrap();
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"cccc")));
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("patched.bin");
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, overwrite()).unwrap();
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"aaaa")));
+            disk.sync_all(file).unwrap();
+            assert!(disk.write_at_with(file, 1, |buf| buf.extend_from_slice(b"bb")));
+            disk.sync_data(file).unwrap();
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"cccc")));
+            assert!(disk.close(file));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
-        assert_eq!(fs::read(&path).unwrap(), b"abbacccc");
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            assert_eq!(fs::read(&path).unwrap(), b"abbacccc");
+        }
     }
 
     #[test]
     fn sync_echoes_returned_operation_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut disk = DiskIo::default();
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut events = Vec::new();
-        for _ in 0..3 {
-            let first = disk.open(dir.path().join("first.bin"), overwrite()).unwrap();
-            let second = disk.open(dir.path().join("second.bin"), overwrite()).unwrap();
-            assert!(disk.write_with(first, |buf| buf.extend_from_slice(b"durable")));
-            let first_id = disk.sync_data(first).unwrap();
-            let second_id = disk.sync_all(second).unwrap();
-            for id in [first_id, second_id] {
-                assert!(seen_ids.insert(id), "operation IDs must not be reused");
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let mut disk = new(DiskConfig::default());
+            let mut seen_ids = std::collections::HashSet::new();
+            let mut events = Vec::new();
+            for _ in 0..3 {
+                let first = disk.open(dir.path().join("first.bin"), overwrite()).unwrap();
+                let second = disk.open(dir.path().join("second.bin"), overwrite()).unwrap();
+                assert!(disk.write_with(first, |buf| buf.extend_from_slice(b"durable")));
+                let first_id = disk.sync_data(first).unwrap();
+                let second_id = disk.sync_all(second).unwrap();
+                for id in [first_id, second_id] {
+                    assert!(seen_ids.insert(id), "operation IDs must not be reused");
+                }
+                assert!(disk.close(first));
+                assert!(disk.close(second));
+                drive(&mut disk, &mut events, |events| {
+                    events.contains(&Ev::Closed(first)) && events.contains(&Ev::Closed(second))
+                });
+                assert!(events.contains(&Ev::Synced(first, first_id)));
+                assert!(events.contains(&Ev::Synced(second, second_id)));
             }
-            assert!(disk.close(first));
-            assert!(disk.close(second));
-            drive(&mut disk, &mut events, |events| {
-                events.contains(&Ev::Closed(first)) && events.contains(&Ev::Closed(second))
-            });
-            assert!(events.contains(&Ev::Synced(first, first_id)));
-            assert!(events.contains(&Ev::Synced(second, second_id)));
         }
     }
 
     #[test]
     fn failed_operations_echo_returned_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("original.bin");
-        fs::write(&path, b"unchanged").unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
-        let truncate_id = disk.truncate(file, 0).unwrap();
-        let rename_id = disk.rename(file, dir.path().join("missing/file.bin")).unwrap().unwrap();
-        assert_ne!(truncate_id, rename_id);
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("original.bin");
+            fs::write(&path, b"unchanged").unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+            let truncate_id = disk.truncate(file, 0).unwrap();
+            let rename_id =
+                disk.rename(file, dir.path().join("missing/file.bin")).unwrap().unwrap();
+            assert_ne!(truncate_id, rename_id);
+            assert!(disk.close(file));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
-        assert_eq!(events, vec![
-            Ev::Opened(file),
-            Ev::Failed { file, op: FailedOp::Truncate { len: 0 }, operation_id: Some(truncate_id) },
-            Ev::Failed { file, op: FailedOp::Rename, operation_id: Some(rename_id) },
-            Ev::Closed(file),
-        ]);
-        assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            assert_eq!(events, vec![
+                Ev::Opened(file),
+                Ev::Failed {
+                    file,
+                    op: FailedOp::Truncate { len: 0 },
+                    operation_id: Some(truncate_id),
+                },
+                Ev::Failed { file, op: FailedOp::Rename, operation_id: Some(rename_id) },
+                Ev::Closed(file),
+            ]);
+            assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+        }
     }
 
     #[test]
     fn truncate_blocks_later_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("repaired.bin");
-        fs::write(&path, b"valid-torn-tail").unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, OpenOptions::new().read(true).write(true)).unwrap();
-        assert!(disk.set_write_cursor(file, 5));
-        let operation_id = disk.truncate(file, 5).unwrap();
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"-next")));
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("repaired.bin");
+            fs::write(&path, b"valid-torn-tail").unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().read(true).write(true)).unwrap();
+            assert!(disk.set_write_cursor(file, 5));
+            let operation_id = disk.truncate(file, 5).unwrap();
+            assert!(disk.file_len(file));
+            disk.sync_data(file).unwrap();
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"-next")));
+            assert!(disk.close(file));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
 
-        let truncated = Ev::Truncated { file, len: 5, operation_id };
-        let truncated_at = events.iter().position(|event| *event == truncated).unwrap();
-        let written = Ev::Written { file, offset: 5, len: 5 };
-        let written_at = events.iter().position(|event| *event == written).unwrap();
-        assert!(truncated_at < written_at, "write completed before truncate: {events:?}");
-        assert_eq!(fs::read(&path).unwrap(), b"valid-next");
+            let truncated = Ev::Truncated { file, len: 5, operation_id };
+            let truncated_at = events.iter().position(|event| *event == truncated).unwrap();
+            let written = Ev::Written { file, offset: 5, len: 5 };
+            let written_at = events.iter().position(|event| *event == written).unwrap();
+            assert!(truncated_at < written_at, "write completed before truncate: {events:?}");
+            assert!(events.contains(&Ev::FileLen { file, len: 5 }), "{events:?}");
+            assert_eq!(fs::read(&path).unwrap(), b"valid-next");
+        }
     }
 
     #[test]
     fn rename_then_directory_sync_reports_operation_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("wal.tmp");
-        let destination = dir.path().join("wal");
-        let mut disk = DiskIo::default();
-        let file = disk.open(&source, overwrite()).unwrap();
-        let directory = disk.open_directory(dir.path()).unwrap();
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"complete")));
-        disk.sync_data(file).unwrap();
-        let rename_id = disk.rename(file, &destination).unwrap().unwrap();
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("wal.tmp");
+            let destination = dir.path().join("wal");
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&source, overwrite()).unwrap();
+            let directory = disk.open_directory(dir.path()).unwrap();
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"complete")));
+            disk.sync_data(file).unwrap();
+            let rename_id = disk.rename(file, &destination).unwrap().unwrap();
+            assert!(disk.close(file));
 
-        let mut events = Vec::new();
-        let renamed = Ev::Renamed { file, operation_id: rename_id };
-        drive(&mut disk, &mut events, |events| events.contains(&renamed));
-        assert!(!source.exists());
-        assert_eq!(fs::read(&destination).unwrap(), b"complete");
+            let mut events = Vec::new();
+            let renamed = Ev::Renamed { file, operation_id: rename_id };
+            drive(&mut disk, &mut events, |events| events.contains(&renamed));
+            assert!(!source.exists());
+            assert_eq!(fs::read(&destination).unwrap(), b"complete");
 
-        let directory_sync_id = disk.sync_all(directory).unwrap();
-        assert!(disk.close(directory));
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(directory)));
-        assert!(events.contains(&Ev::Synced(directory, directory_sync_id)));
-        assert!(disk.is_idle());
+            let directory_sync_id = disk.sync_all(directory).unwrap();
+            assert!(disk.close(directory));
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(directory)));
+            assert!(events.contains(&Ev::Synced(directory, directory_sync_id)));
+            assert!(disk.is_idle());
+        }
     }
 
     #[test]
     fn file_len_and_transfers_through_caller_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("payload.bin");
-        fs::write(&path, b"0123456789").unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
-        assert!(disk.file_len(file));
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::FileLen { file, len: 10 }));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("payload.bin");
+            fs::write(&path, b"0123456789").unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().read(true)).unwrap();
+            assert!(disk.file_len(file));
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::FileLen { file, len: 10 }));
 
-        let mut target = [0u8; 12];
-        // SAFETY: `target` outlives the completion and is untouched until it.
-        assert!(unsafe { disk.read_at_into(file, 2, target.as_mut_ptr(), 12) });
-        let read = Ev::ReadInto { file, offset: 2, len: 8, eof: true };
-        drive(&mut disk, &mut events, |events| events.contains(&read));
-        assert_eq!(&target[..8], b"23456789");
+            let mut target = [0u8; 12];
+            // SAFETY: `target` outlives the completion and is untouched until it.
+            assert!(unsafe { disk.read_at_into(file, 2, target.as_mut_ptr(), 12) });
+            let read = Ev::ReadInto { file, offset: 2, len: 8, eof: true };
+            drive(&mut disk, &mut events, |events| events.contains(&read));
+            assert_eq!(&target[..8], b"23456789");
 
-        let written = dir.path().join("written.bin");
-        let file = disk.open(&written, OpenOptions::new().write(true).create(true)).unwrap();
-        let source = *b"payload";
-        // SAFETY: `source` outlives the completion and is unchanged until it.
-        assert!(unsafe { disk.write_at_from(file, 0, source.as_ptr(), source.len()) });
-        let write = Ev::Written { file, offset: 0, len: 7 };
-        drive(&mut disk, &mut events, |events| events.contains(&write));
-        assert_eq!(fs::read(&written).unwrap(), b"payload");
+            let written = dir.path().join("written.bin");
+            let file = disk.open(dir.path(), OpenOptions::new().write(true).tmpfile(true)).unwrap();
+            let source = *b"payload";
+            // SAFETY: `source` outlives the completion and is unchanged until it.
+            assert!(unsafe { disk.write_at_from(file, 0, source.as_ptr(), source.len()) });
+            let linked =
+                Ev::Linked { file, operation_id: disk.link(file, &written).unwrap().unwrap() };
+            drive(&mut disk, &mut events, |events| events.contains(&linked));
+            assert!(events.contains(&Ev::Written { file, offset: 0, len: 7 }));
+            assert_eq!(fs::read(&written).unwrap(), b"payload");
+        }
     }
 
     #[test]
     fn path_rename_and_directory_removal_order_on_a_directory_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("staged.bin");
-        let destination = dir.path().join("final.bin");
-        let empty = dir.path().join("group");
-        fs::write(&source, b"block").unwrap();
-        fs::create_dir(&empty).unwrap();
-        let mut disk = DiskIo::default();
-        let directory = disk.open_directory(dir.path()).unwrap();
-        let rename_id = disk.rename_path(directory, &source, &destination).unwrap().unwrap();
-        let remove_id = disk.remove_dir(directory, &empty).unwrap().unwrap();
-        let missing_id = disk.remove_dir(directory, &empty).unwrap().unwrap();
-        assert!(disk.close(directory));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("staged.bin");
+            let made = dir.path().join("made");
+            let destination = made.join("final.bin");
+            let empty = dir.path().join("group");
+            fs::write(&source, b"block").unwrap();
+            fs::create_dir(&empty).unwrap();
+            let mut disk = new(DiskConfig::default());
+            let directory = disk.open_directory(dir.path()).unwrap();
+            let create_id = disk.create_dir(directory, &made).unwrap().unwrap();
+            let rename_id = disk.rename_path(directory, &source, &destination).unwrap().unwrap();
+            let remove_id = disk.remove_dir(directory, &empty).unwrap().unwrap();
+            let missing_id = disk.remove_dir(directory, &empty).unwrap().unwrap();
+            assert!(disk.close(directory));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(directory)));
-        let renamed = Ev::Renamed { file: directory, operation_id: rename_id };
-        let removed = Ev::Unlinked { file: directory, operation_id: remove_id };
-        let missing =
-            Ev::Failed { file: directory, op: FailedOp::Unlink, operation_id: Some(missing_id) };
-        let at = |event: &Ev| events.iter().position(|e| e == event).unwrap();
-        assert!(at(&renamed) < at(&removed) && at(&removed) < at(&missing), "{events:?}");
-        assert!(!source.exists());
-        assert_eq!(fs::read(&destination).unwrap(), b"block");
-        assert!(!empty.exists());
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(directory)));
+            let created = Ev::DirectoryCreated { file: directory, operation_id: create_id };
+            let renamed = Ev::Renamed { file: directory, operation_id: rename_id };
+            let removed = Ev::Unlinked { file: directory, operation_id: remove_id };
+            let missing = Ev::Failed {
+                file: directory,
+                op: FailedOp::Unlink,
+                operation_id: Some(missing_id),
+            };
+            let at = |event: &Ev| events.iter().position(|e| e == event).unwrap();
+            assert!(
+                at(&created) < at(&renamed) &&
+                    at(&renamed) < at(&removed) &&
+                    at(&removed) < at(&missing),
+                "{events:?}"
+            );
+            assert!(!source.exists());
+            assert_eq!(fs::read(&destination).unwrap(), b"block");
+            assert!(!empty.exists());
+        }
     }
 
     #[test]
     fn cursor_can_append_to_an_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("existing.bin");
-        fs::write(&path, b"0123").unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, OpenOptions::new().read(true).write(true)).unwrap();
-        assert!(disk.set_write_cursor(file, 4));
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"45")));
-        assert!(disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("existing.bin");
+            fs::write(&path, b"0123").unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().read(true).write(true)).unwrap();
+            assert!(disk.set_write_cursor(file, 4));
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(b"45")));
+            assert!(disk.close(file));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
-        assert_eq!(fs::read(&path).unwrap(), b"012345");
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            assert_eq!(fs::read(&path).unwrap(), b"012345");
+        }
     }
 
     #[test]
     fn tiny_ring_applies_backpressure_without_losing_ops() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("burst.bin");
-        let config = DiskConfig { ring_entries: 2, max_in_flight: 2, ..DiskConfig::default() };
-        let mut disk = DiskIo::new(config).unwrap();
-        let file = disk.open(&path, overwrite()).unwrap();
-        let mut expected = Vec::new();
-        for value in 0..64u8 {
-            assert!(disk.write_with(file, |buf| buf.extend_from_slice(&[value; 8])));
-            expected.extend_from_slice(&[value; 8]);
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("burst.bin");
+            let mut disk =
+                new(DiskConfig { ring_entries: 2, max_in_flight: 2, ..DiskConfig::default() });
+            let file = disk.open(&path, overwrite()).unwrap();
+            let mut expected = Vec::new();
+            for value in 0..64u8 {
+                assert!(disk.write_with(file, |buf| buf.extend_from_slice(&[value; 8])));
+                expected.extend_from_slice(&[value; 8]);
+            }
+            assert!(disk.close(file));
+
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+
+            let written = events.iter().filter(|event| matches!(event, Ev::Written { .. })).count();
+            assert_eq!(written, 64);
+            assert!(disk.is_idle());
+            assert_eq!(fs::read(&path).unwrap(), expected);
         }
-        assert!(disk.close(file));
-
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
-
-        let written = events.iter().filter(|event| matches!(event, Ev::Written { .. })).count();
-        assert_eq!(written, 64);
-        assert!(disk.is_idle());
-        assert_eq!(fs::read(&path).unwrap(), expected);
     }
 
     #[test]
     fn closing_unknown_and_empty_submissions_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(dir.path().join("a.bin"), overwrite()).unwrap();
-        assert!(!disk.write_with(file, |_| {}));
-        assert!(disk.close(file));
-        assert!(!disk.write_with(file, |buf| buf.push(1)));
-        assert!(!disk.write_at_with(file, 0, |buf| buf.push(1)));
-        assert!(!disk.read_at(file, 0, 1));
-        assert!(!disk.read_to_end(file, 0));
-        for token in [file, FileToken(usize::MAX)] {
-            assert!(disk.sync_all(token).is_none());
-            assert!(disk.sync_data(token).is_none());
-            assert!(disk.truncate(token, 0).is_none());
-            assert!(disk.rename(token, dir.path().join("unused.bin")).unwrap().is_none());
-        }
-        assert!(!disk.set_write_cursor(file, 0));
-        assert!(!disk.close(file));
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(dir.path().join("a.bin"), overwrite()).unwrap();
+            assert!(!disk.write_with(file, |_| {}));
+            assert!(disk.close(file));
+            assert!(!disk.write_with(file, |buf| buf.push(1)));
+            assert!(!disk.write_at_with(file, 0, |buf| buf.push(1)));
+            assert!(!disk.read_at(file, 0, 1));
+            assert!(!disk.read_to_end(file, 0));
+            for token in [file, FileToken(usize::MAX)] {
+                assert!(disk.sync_all(token).is_none());
+                assert!(disk.sync_data(token).is_none());
+                assert!(disk.truncate(token, 0).is_none());
+                assert!(disk.rename(token, dir.path().join("unused.bin")).unwrap().is_none());
+            }
+            assert!(!disk.set_write_cursor(file, 0));
+            assert!(!disk.close(file));
 
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
-        assert!(!disk.write_with(file, |buf| buf.push(1)), "retired tokens are rejected");
-        assert!(disk.sync_all(file).is_none());
-        assert!(disk.sync_data(file).is_none());
-        assert!(disk.truncate(file, 0).is_none());
-        assert!(disk.rename(file, dir.path().join("unused.bin")).unwrap().is_none());
-        assert!(disk.is_idle());
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            assert!(!disk.write_with(file, |buf| buf.push(1)), "retired tokens are rejected");
+            assert!(disk.sync_all(file).is_none());
+            assert!(disk.sync_data(file).is_none());
+            assert!(disk.truncate(file, 0).is_none());
+            assert!(disk.rename(file, dir.path().join("unused.bin")).unwrap().is_none());
+            assert!(disk.is_idle());
+        }
     }
 
     #[test]
     fn rename_rejects_invalid_paths_without_queueing() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut disk = DiskIo::default();
-        let file = disk.open(dir.path().join("original.bin"), overwrite()).unwrap();
-        let error = disk.rename(file, "invalid\0path").unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(disk.close(file));
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
-        assert_eq!(events, vec![Ev::Opened(file), Ev::Closed(file)]);
-        assert!(disk.is_idle());
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(dir.path().join("original.bin"), overwrite()).unwrap();
+            let error = disk.rename(file, "invalid\0path").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(disk.close(file));
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Closed(file)));
+            assert_eq!(events, vec![Ev::Opened(file), Ev::Closed(file)]);
+            assert!(disk.is_idle());
+        }
     }
 
     #[test]
@@ -2279,41 +2411,117 @@ mod tests {
         assert_eq!(create_without_write.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    #[test]
-    fn drop_waits_for_submitted_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dropped.bin");
-        let payload = vec![7u8; 1 << 20];
-        let mut disk = DiskIo::default();
-        let file = disk.open(&path, overwrite()).unwrap();
-        let mut events = Vec::new();
-        drive(&mut disk, &mut events, |events| events.contains(&Ev::Opened(file)));
-        assert!(disk.write_with(file, |buf| buf.extend_from_slice(&payload)));
-        disk.poll_with(|_| {});
-        drop(disk);
-        assert_eq!(fs::read(&path).unwrap(), payload);
+    fn fifo(path: PathBuf) -> PathBuf {
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a nul-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        path
     }
 
-    /// `Cpus_allowed_list` of each io worker serving the calling thread.
-    fn io_worker_cores() -> Vec<String> {
+    /// Drop waits for operations handed on and frees those it never handed
+    /// on, without hanging.
+    #[test]
+    fn drop_waits_for_submitted_writes() {
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dropped.bin");
+            let payload = vec![7u8; 1 << 20];
+            let mut disk = new(DiskConfig::default());
+            // Readable, so the emulation can serve the read below from the
+            // page cache and must also free inline completions.
+            let file = disk.open(&path, overwrite().read(true)).unwrap();
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Opened(file)));
+            assert!(disk.write_with(file, |buf| buf.extend_from_slice(&payload)));
+            disk.poll_with(|_| {});
+            // Reaches private state: only a continuation pushed after the last
+            // submission is still unsubmitted at drop, and no public call
+            // leaves one behind deterministically.
+            let slot = disk.slab.len();
+            disk.slab.push(None);
+            disk.files[0].in_flight += 1;
+            disk.in_flight_count += 1;
+            disk.start_read_to_end(slot as u64, 0, 0, None, None);
+            let (dropped, done) = mpsc::channel();
+            std::thread::spawn(move || {
+                drop(disk);
+                dropped.send(()).unwrap();
+            });
+            done.recv_timeout(StdDuration::from_secs(5)).expect("drop hung");
+            assert_eq!(fs::read(&path).unwrap(), payload);
+        }
+
+        // Opening a FIFO blocks a worker until a writer opens it, so drop
+        // must wait. Emulation only: `io_uring` opens it without blocking.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = fifo(dir.path().join("blocked"));
+        let mut disk = DiskIo::emulated(DiskConfig::default()).unwrap();
+        disk.open(&fifo, OpenOptions::new().read(true)).unwrap();
+        disk.submit();
+        let (dropped, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(disk);
+            dropped.send(()).unwrap();
+        });
+        assert!(done.recv_timeout(StdDuration::from_millis(200)).is_err(), "drop did not wait");
+        let _writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        done.recv_timeout(StdDuration::from_secs(5)).expect("drop hung");
+    }
+
+    /// Whether `DiskIo::new` uses `io_uring` here; tests that count its
+    /// workers skip their `io_uring` leg otherwise.
+    fn uses_ring() -> bool {
+        DiskIo::new(DiskConfig::default()).unwrap().backend.is_ring()
+    }
+
+    const CHILD: &str = "FLUX_DISK_TEST_CHILD";
+
+    /// Whether this process is a child running only `test`. Otherwise runs
+    /// `test` in such a child, asserts that it passed, and returns false.
+    fn in_child(test: &str) -> bool {
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}{stderr}");
+        false
+    }
+
+    /// `Cpus_allowed_list` of each `io_uring` worker serving the calling
+    /// thread or, when `emulated`, of every emulation worker in the process:
+    /// their names do not say whom they serve, so only a child process
+    /// running one test can count them.
+    fn io_worker_cores(emulated: bool) -> Vec<String> {
         // SAFETY: no preconditions.
-        let owner = format!("iou-wrk-{}", unsafe { libc::gettid() });
+        let kernel = format!("iou-wrk-{}", unsafe { libc::gettid() });
         let mut cores = Vec::new();
         for task in fs::read_dir("/proc/self/task").unwrap().flatten() {
             let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
-            if comm.trim() != owner {
+            let comm = comm.trim();
+            if !(if emulated { comm.starts_with(WORKER_NAME_PREFIX) } else { comm == kernel }) {
                 continue;
             }
-            let status = fs::read_to_string(task.path().join("status")).unwrap();
+            let Ok(status) = fs::read_to_string(task.path().join("status")) else { continue };
             let allowed = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:"));
             cores.push(allowed.unwrap().trim().to_owned());
         }
         cores
     }
 
-    /// The ring is built on one thread and driven by another, as a tile does.
+    /// The instance is built on one thread and driven by another, as a tile
+    /// does. The emulated variant runs in a child process.
     #[test]
     fn pinned_io_workers_run_on_the_given_core() {
+        let emulated = in_child("tests::pinned_io_workers_run_on_the_given_core");
+        if !emulated && !uses_ring() {
+            return;
+        }
         // SAFETY: `allowed` outlives the call and its size is passed.
         let core = unsafe {
             let mut allowed: libc::cpu_set_t = std::mem::zeroed();
@@ -2322,7 +2530,7 @@ mod tests {
         }
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut disk = DiskIo::default();
+        let mut disk = BACKENDS[usize::from(emulated)](DiskConfig::default());
         let file = disk.open(dir.path().join("pinned.bin"), overwrite()).unwrap();
 
         let workers = std::thread::spawn(move || {
@@ -2333,12 +2541,101 @@ mod tests {
             let synced = disk.sync_all(file).unwrap();
             let mut events = Vec::new();
             drive(&mut disk, &mut events, |events| events.contains(&Ev::Synced(file, synced)));
-            io_worker_cores()
+            io_worker_cores(emulated)
         })
         .join()
         .unwrap();
 
         assert!(!workers.is_empty(), "the ops ran on a worker");
         assert!(workers.iter().all(|cores| *cores == core.to_string()), "{workers:?} vs {core}");
+    }
+
+    /// Each instance is built and limited on one thread and driven by
+    /// another, as a tile does. Opening a FIFO for writing blocks until it has
+    /// a reader on every filesystem, and with `O_CREAT` always runs on an
+    /// `io_uring` worker, so each open holds a worker until released. The
+    /// emulated variant runs in a child process.
+    #[test]
+    fn io_worker_limit_set_before_attaching_caps_the_submitting_thread() {
+        /// Opens every FIFO at once on a new thread, gives the workers a
+        /// second to exceed two, releases the opens, runs `after` there and
+        /// returns how many workers served the thread.
+        fn busy_workers(
+            mut disk: DiskIo,
+            emulated: bool,
+            fifos: &[PathBuf],
+            after: impl FnOnce(&mut DiskIo) + Send + 'static,
+        ) -> usize {
+            let fifos = fifos.to_vec();
+            std::thread::spawn(move || {
+                let open = OpenOptions::new().write(true).create(true);
+                let opened: Vec<_> =
+                    fifos.iter().map(|fifo| Ev::Opened(disk.open(fifo, open).unwrap())).collect();
+                let mut events = Vec::new();
+                let deadline = StdInstant::now() + StdDuration::from_secs(1);
+                while io_worker_cores(emulated).len() <= 2 && StdInstant::now() < deadline {
+                    disk.poll_with(|event| events.push(Ev::from(event)));
+                    std::thread::sleep(StdDuration::from_millis(1));
+                }
+                let readers: Vec<_> = fifos
+                    .iter()
+                    .map(|fifo| {
+                        let mut read = fs::OpenOptions::new();
+                        read.read(true).custom_flags(libc::O_NONBLOCK).open(fifo).unwrap()
+                    })
+                    .collect();
+                drive(&mut disk, &mut events, |events| {
+                    opened.iter().all(|open| events.contains(open))
+                });
+                drop(readers);
+                let workers = io_worker_cores(emulated).len();
+                after(&mut disk);
+                workers
+            })
+            .join()
+            .unwrap()
+        }
+        let emulated =
+            in_child("tests::io_worker_limit_set_before_attaching_caps_the_submitting_thread");
+        if !emulated && !uses_ring() {
+            return;
+        }
+        let new = BACKENDS[usize::from(emulated)];
+        let dir = tempfile::tempdir().unwrap();
+        let fifos: Vec<_> = (0..16).map(|name| fifo(dir.path().join(name.to_string()))).collect();
+
+        let mut limited = new(DiskConfig::default());
+        limited.limit_io_workers(2, 0).unwrap();
+        let workers = busy_workers(limited, emulated, &fifos, move |disk| {
+            let previous = disk.limit_io_workers(3, 0).unwrap();
+            assert_eq!(previous[0], 2);
+            for _ in 0..2 {
+                assert_eq!(disk.limit_io_workers(0, 0).unwrap(), [3, previous[1]]);
+            }
+            if emulated {
+                disk.limit_io_workers(1_000, 0).unwrap();
+                assert_eq!(disk.limit_io_workers(0, 0).unwrap()[0], 0x80);
+            }
+        });
+        assert!((1..=2).contains(&workers), "{workers} workers despite a limit of 2");
+
+        // The limited pool's workers exit once its thread and instance are gone.
+        let deadline = StdInstant::now() + StdDuration::from_secs(5);
+        while emulated && !io_worker_cores(true).is_empty() {
+            assert!(StdInstant::now() < deadline, "the limited pool's workers stayed");
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+        let after_dir = tempfile::tempdir().unwrap();
+        let after = after_dir.path().join("after.bin");
+        let workers = busy_workers(new(DiskConfig::default()), emulated, &fifos, move |disk| {
+            // Lowering the limit of a grown pool only stops growth; a worker
+            // that exited instead would swallow this open's wakeup.
+            if emulated {
+                disk.limit_io_workers(1, 0).unwrap();
+                let opened = Ev::Opened(disk.open(&after, overwrite()).unwrap());
+                drive(disk, &mut Vec::new(), |events| events.contains(&opened));
+            }
+        });
+        assert!(workers > 2, "only {workers} workers without a limit");
     }
 }
