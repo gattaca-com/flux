@@ -270,12 +270,7 @@ impl<'a> Flink<'a> {
 }
 
 fn lock_reader(file: &File) -> Result<(), QueueError> {
-    set_flock(file, libc::LOCK_SH | libc::LOCK_NB).map_err(|e| map_open_error(&e))?;
-    // A replacement might have unlinked this fd's object before we locked it.
-    if file.metadata().map_err(|e| map_open_error(&e))?.nlink() == 0 {
-        return Err(QueueError::NonExistingFile);
-    }
-    Ok(())
+    set_flock(file, libc::LOCK_SH | libc::LOCK_NB).map_err(|e| map_open_error(&e).into())
 }
 
 fn map_open_error(error: &io::Error) -> ShmemError {
@@ -390,18 +385,21 @@ impl Segment {
             self.identity().map_or_else(|| "no queue identity".to_owned(), |p| p.to_string());
         // Unmapped first, so the scan only finds other mappings.
         let object = self.into_file();
-        let mapped_by_others = (|| {
-            // Acquire the lock before scanning so idle readers cannot reactivate
-            // a mapping between the scan and unlink.
-            let locked_by_others = match set_flock(&object, libc::LOCK_EX | libc::LOCK_NB) {
-                Ok(()) => false,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => false,
-                Err(e) => return Err(e),
-            };
-            let mappers = Mappers::of(os_id)?;
+        let mapped_by_others = Mappers::of(os_id).and_then(|mappers| {
+            // Kept mappings hold a shared flock on their object (see `Segment::keep`),
+            // which also reveals processes whose maps are unreadable. Off Linux shm
+            // objects cannot be locked.
+            let locked_by_others =
+                unsafe { libc::flock(object.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 && {
+                    let e = io::Error::last_os_error();
+                    match e.raw_os_error() {
+                        Some(libc::EWOULDBLOCK) => true,
+                        Some(libc::ENOTSUP) => false,
+                        _ => return Err(e),
+                    }
+                };
             Ok((!mappers.0.is_empty() || locked_by_others).then_some(mappers))
-        })();
+        });
         let replacement = mapped_queue_replacement();
         match mapped_by_others {
             Ok(None) => {}
