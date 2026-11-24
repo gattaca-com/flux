@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::{Arc, OnceLock};
 
 use governor::{clock::Clock as GovernorClock, nanos::Nanos as GovernorNanos};
 use quanta::Mock;
@@ -17,12 +14,18 @@ pub enum OurClockForNanos {
 }
 
 impl OurClockForNanos {
+    #[inline]
     pub fn raw(&self) -> u64 {
         match self {
             Self::Clock(clock) => clock.raw(),
-            Self::System => unsafe {
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_unchecked().as_nanos() as u64
-            },
+            Self::System => {
+                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                // CLOCK_REALTIME with a valid pointer cannot fail, and the kernel rejects
+                // setting it before the epoch, so tv_sec is never negative.
+                unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
+                debug_assert!(ts.tv_sec >= 0);
+                ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+            }
         }
     }
 
