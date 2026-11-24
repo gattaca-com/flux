@@ -279,21 +279,42 @@ impl Pool {
         for _ in 0..wake {
             shared.work.notify_one();
         }
+        // A worker inherits the thread's real-time policy: confined to the
+        // thread's cores, under `SCHED_FIFO` it never runs while the thread
+        // spins. With a core outside them, real-time push migration can move
+        // it there.
+        if spawn > 0 && real_time() && confined(affinity.as_ref()) {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "a real-time thread starts no disk io workers confined to its own cores; \
+                     operations without one fail with EDEADLK until pin_io_workers names \
+                     another core"
+                );
+            }
+            self.spawn_failed(spawn, libc::EDEADLK);
+            return;
+        }
         for index in first..first + spawn {
             if let Err(error) = spawn_worker(shared, index, affinity) {
-                self.spawn_failed(first + spawn - index, &error);
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        %error,
+                        "couldn't spawn a disk io worker; operations without one fail with ENOMEM"
+                    );
+                }
+                self.spawn_failed(first + spawn - index, libc::ENOMEM);
                 break;
             }
         }
     }
 
     /// Without any worker the queued jobs would never run, so they fail with
-    /// `ENOMEM`: the spawn error itself is `EAGAIN`, which `DiskIo` retries.
-    fn spawn_failed(&self, unspawned: usize, error: &io::Error) {
-        static LOGGED: AtomicBool = AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::Relaxed) {
-            warn!(%error, "couldn't spawn a disk io worker; operations without one fail with ENOMEM");
-        }
+    /// `errno`: `ENOMEM` after a spawn error, which is itself `EAGAIN` and
+    /// retried by `DiskIo`, or `EDEADLK` for a real-time thread without
+    /// `pin_io_workers`.
+    fn spawn_failed(&self, unspawned: usize, errno: i32) {
         let mut state = lock(&self.shared().state);
         state.workers -= unspawned;
         if state.workers > 0 {
@@ -302,7 +323,7 @@ impl Pool {
         let jobs = mem::take(&mut state.jobs);
         drop(state);
         for job in jobs {
-            job.fail(libc::ENOMEM);
+            job.fail(errno);
         }
     }
 }
@@ -388,6 +409,31 @@ fn work(shared: &Shared) {
             state.idle -= 1;
         }
     }
+}
+
+/// Whether the calling thread runs under `SCHED_FIFO` or `SCHED_RR`. Exact,
+/// because `sched_getscheduler` ORs in `SCHED_RESET_ON_FORK`, under which
+/// workers start under `SCHED_OTHER`.
+fn real_time() -> bool {
+    // SAFETY: no preconditions.
+    matches!(unsafe { libc::sched_getscheduler(0) }, libc::SCHED_FIFO | libc::SCHED_RR)
+}
+
+/// Whether workers pinned to `pin`, or unpinned ones, which inherit the
+/// calling thread's mask, could run only on cores that thread may use.
+fn confined(pin: Option<&libc::cpu_set_t>) -> bool {
+    let Some(pin) = pin else { return true };
+    // SAFETY: an all-zero `cpu_set_t` is the empty set.
+    let mut own: libc::cpu_set_t = unsafe { mem::zeroed() };
+    // SAFETY: `own` outlives the call and its size is passed.
+    if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &raw mut own) } != 0 {
+        // Only a host with more CPUs than a `cpu_set_t` holds fails here;
+        // the pin then stands.
+        return false;
+    }
+    // SAFETY: every core is below the sets' capacity.
+    (0..libc::CPU_SETSIZE as usize)
+        .all(|core| unsafe { !libc::CPU_ISSET(core, pin) || libc::CPU_ISSET(core, &own) })
 }
 
 /// Blocks until `fd` is readable.

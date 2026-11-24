@@ -483,6 +483,10 @@ pub struct DiskIo {
 /// Unpinned workers inherit the calling thread's CPU affinity and scheduling
 /// policy, as `io_uring`'s do on Linux 6.2 and later, so a thread that spins
 /// on its core or runs under a real-time policy should pin them elsewhere.
+/// Without `io_uring`, and for truncates where it lacks them, the pool of a
+/// `SCHED_FIFO` or `SCHED_RR` thread starts no workers that could run only on
+/// the thread's own cores, and those operations fail with `EDEADLK` until
+/// workers are pinned to another core; `io_uring` itself has no such check.
 pub fn pin_io_workers(cores: &[usize]) -> io::Result<()> {
     if cores.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cores to pin to"));
