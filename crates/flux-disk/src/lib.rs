@@ -9,13 +9,14 @@
 //! ring and reaped from its completion ring without waiting.
 //!
 //! Where `io_uring` is refused (container seccomp profiles, gVisor,
-//! `kernel.io_uring_disabled`), absent, or lacks an operation `DiskIo` issues
-//! (`ftruncate` needs Linux 6.9), the whole process runs operations on worker
-//! threads instead, one pool per submitting thread as `io_uring` keeps one,
-//! and reports their completions the same way. The choice is made once per
-//! process, on first use. Reads the page cache serves without blocking still
-//! complete on the calling thread. Without `io_uring`, calls may block
-//! briefly while a worker queues or takes an operation.
+//! `kernel.io_uring_disabled`), absent, or lacks an operation `DiskIo` issues,
+//! the whole process runs operations on worker threads instead, one pool per
+//! submitting thread as `io_uring` keeps one, and reports their completions
+//! the same way. Where `io_uring` lacks only `ftruncate` (before Linux 6.9),
+//! only truncates run on those threads. The choice is made once per process,
+//! on first use. Reads the page cache serves without blocking still
+//! complete on the calling thread. Where operations run on worker threads,
+//! calls may block briefly while a worker queues or takes one.
 //!
 //! Operations on one file run concurrently, except [`DiskIo::sync_all`],
 //! [`DiskIo::sync_data`], [`DiskIo::truncate`], [`DiskIo::rename`],
@@ -31,6 +32,7 @@
 
 mod backend;
 mod emulation;
+mod hybrid;
 mod uring;
 
 use std::{
@@ -502,6 +504,11 @@ impl DiskIo {
     #[cfg(test)]
     fn emulated(config: DiskConfig) -> io::Result<Self> {
         Self::with_backend(config, Backend::emulated)
+    }
+
+    #[cfg(test)]
+    fn hybrid(config: DiskConfig) -> io::Result<Self> {
+        Self::with_backend(config, Backend::hybrid)
     }
 
     fn with_backend(
@@ -1223,8 +1230,8 @@ impl DiskIo {
     }
 
     fn push_slot(&mut self, user_data: u64) {
-        // The emulated push stays out of line, so on the ring path describing
-        // the operation fuses with the ring's encoder.
+        // Every push but a plain ring's stays out of line, so on the ring path
+        // describing the operation fuses with the ring's encoder.
         let pushed = if self.backend.is_ring() {
             self.push_op(user_data)
         } else {
@@ -1770,8 +1777,9 @@ fn c_path(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a nul byte"))
 }
 
-/// Readable while completions wait to be reaped: the ring's descriptor, or
-/// without `io_uring` an eventfd.
+/// Readable while completions wait to be reaped: the ring's descriptor;
+/// without `io_uring` an eventfd; where only truncates run on worker threads,
+/// an epoll descriptor watching both.
 impl AsRawFd for DiskIo {
     fn as_raw_fd(&self) -> RawFd {
         self.backend.as_raw_fd()
@@ -1848,13 +1856,13 @@ mod tests {
     };
 
     use super::{
-        DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions, OperationId,
+        Backend, DiskConfig, DiskEvent, DiskIo, FailedOp, FileToken, OpenOptions, OperationId,
         READ_TO_END_CHUNK, emulation::WORKER_NAME_PREFIX, pin_io_workers,
     };
 
     /// One constructor per backend; a failing test's captured output names
     /// the backend it ran on.
-    const BACKENDS: [fn(DiskConfig) -> DiskIo; 2] = [
+    const BACKENDS: [fn(DiskConfig) -> DiskIo; 3] = [
         |config| {
             println!("backend: DiskIo::new");
             DiskIo::new(config).unwrap()
@@ -1862,6 +1870,10 @@ mod tests {
         |config| {
             println!("backend: emulated");
             DiskIo::emulated(config).unwrap()
+        },
+        |config| {
+            println!("backend: hybrid");
+            DiskIo::hybrid(config).unwrap()
         },
     ];
 
@@ -2234,6 +2246,30 @@ mod tests {
         }
     }
 
+    /// A truncate's completion makes the descriptor readable when nothing
+    /// else is in flight, including where truncates run on worker threads.
+    #[test]
+    fn lone_truncate_makes_the_descriptor_readable() {
+        for new in BACKENDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("repaired.bin");
+            fs::write(&path, b"valid-torn-tail").unwrap();
+            let mut disk = new(DiskConfig::default());
+            let file = disk.open(&path, OpenOptions::new().write(true)).unwrap();
+            let mut events = Vec::new();
+            drive(&mut disk, &mut events, |events| events.contains(&Ev::Opened(file)));
+            let operation_id = disk.truncate(file, 5).unwrap();
+            disk.submit();
+            assert!(readable(&disk, 5_000), "a completion waits");
+
+            let truncated = Ev::Truncated { file, len: 5, operation_id };
+            drive(&mut disk, &mut events, |events| events.contains(&truncated));
+            assert!(disk.is_idle());
+            assert!(!readable(&disk, 0), "idle yet readable");
+            assert_eq!(fs::read(&path).unwrap(), b"valid");
+        }
+    }
+
     #[test]
     fn rename_then_directory_sync_reports_operation_ids() {
         for new in BACKENDS {
@@ -2524,7 +2560,7 @@ mod tests {
     /// Whether `DiskIo::new` uses `io_uring` here; tests that count its
     /// workers skip their `io_uring` leg otherwise.
     fn uses_ring() -> bool {
-        DiskIo::new(DiskConfig::default()).unwrap().backend.is_ring()
+        !matches!(DiskIo::new(DiskConfig::default()).unwrap().backend, Backend::Emulated(_))
     }
 
     const CHILD: &str = "FLUX_DISK_TEST_CHILD";

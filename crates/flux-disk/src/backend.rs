@@ -7,7 +7,7 @@ use std::{
 
 use tracing::info;
 
-use crate::{DiskConfig, emulation::Emulation, uring::Uring};
+use crate::{DiskConfig, emulation::Emulation, hybrid::Hybrid, uring::Uring};
 
 /// Directory every path in an [`Op`] is resolved against.
 pub(crate) const PATH_DIR_FD: RawFd = libc::AT_FDCWD;
@@ -41,17 +41,38 @@ pub(crate) enum Op {
 pub(crate) enum Backend {
     Uring(Uring),
     Emulated(Emulation),
+    Hybrid(Box<Hybrid>),
+}
+
+/// The backend a process uses, decided once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Uring,
+    /// `io_uring` except for truncates, which run on the worker pool.
+    Hybrid,
+    Emulated,
 }
 
 impl Backend {
-    /// `io_uring` when the process can use it, else the emulation. Also
-    /// returns `max_in_flight` clamped to the completions the backend can
-    /// hold.
+    /// `io_uring` when the process can use it, with truncates on the worker
+    /// pool where the ring lacks them, else the emulation. Also returns
+    /// `max_in_flight` clamped to the completions the backend can hold.
     pub(crate) fn new(entries: u32, max_in_flight: usize) -> io::Result<(Self, usize)> {
         match ring(entries, max_in_flight)? {
-            Some((ring, max_in_flight)) => Ok((Self::Uring(ring), max_in_flight)),
+            Some((ring, max_in_flight, Mode::Hybrid)) => {
+                Ok((Self::Hybrid(Box::new(Hybrid::new(ring, entries)?)), max_in_flight))
+            }
+            Some((ring, max_in_flight, _)) => Ok((Self::Uring(ring), max_in_flight)),
             None => Self::emulated(entries, max_in_flight),
         }
+    }
+
+    /// Runs truncates on the submitting thread's pool and everything else on
+    /// a ring, whatever the kernel supports.
+    #[cfg(test)]
+    pub(crate) fn hybrid(entries: u32, max_in_flight: usize) -> io::Result<(Self, usize)> {
+        let (ring, max_in_flight) = Uring::new(entries, max_in_flight)?;
+        Ok((Self::Hybrid(Box::new(Hybrid::new(ring, entries)?)), max_in_flight))
     }
 
     /// Runs operations on threads of the submitting thread's pool, at most
@@ -67,7 +88,7 @@ impl Backend {
         // the mask. The thread's first ring also caps that pool at its entry
         // count, so size it as a default `DiskIo` would.
         match ring(DiskConfig::default().ring_entries, 1)? {
-            Some((ring, _)) => ring.pin_io_workers(&set),
+            Some((ring, ..)) => ring.pin_io_workers(&set),
             None => Ok(()),
         }
     }
@@ -82,6 +103,7 @@ impl Backend {
         match self {
             Self::Uring(ring) => ring.submission_full(),
             Self::Emulated(emulation) => emulation.submission_full(),
+            Self::Hybrid(hybrid) => hybrid.submission_full(),
         }
     }
 
@@ -99,6 +121,8 @@ impl Backend {
             Self::Uring(ring) => unsafe { ring.push(op, user_data) },
             // SAFETY: the caller upholds this function's contract.
             Self::Emulated(emulation) => unsafe { emulation.push(op, user_data) },
+            // SAFETY: the caller upholds this function's contract.
+            Self::Hybrid(hybrid) => unsafe { hybrid.push(op, user_data) },
         }
     }
 
@@ -107,6 +131,7 @@ impl Backend {
         match self {
             Self::Uring(ring) => ring.submit(),
             Self::Emulated(emulation) => Ok(emulation.submit()),
+            Self::Hybrid(hybrid) => hybrid.submit(),
         }
     }
 
@@ -117,6 +142,7 @@ impl Backend {
         match self {
             Self::Uring(_) => {}
             Self::Emulated(emulation) => emulation.take_unsubmitted(unsubmitted),
+            Self::Hybrid(hybrid) => hybrid.take_unsubmitted(unsubmitted),
         }
     }
 
@@ -126,6 +152,7 @@ impl Backend {
         match self {
             Self::Uring(ring) => ring.submit_and_wait(1).map(drop),
             Self::Emulated(emulation) => emulation.wait(),
+            Self::Hybrid(hybrid) => hybrid.wait(),
         }
     }
 
@@ -134,6 +161,7 @@ impl Backend {
         match self {
             Self::Uring(ring) => ring.reap(completions),
             Self::Emulated(emulation) => emulation.reap(completions),
+            Self::Hybrid(hybrid) => hybrid.reap(completions),
         }
     }
 
@@ -144,6 +172,7 @@ impl Backend {
                 emulation.limit_io_workers(limits);
                 Ok(())
             }
+            Self::Hybrid(hybrid) => hybrid.limit_io_workers(limits),
         }
     }
 
@@ -151,49 +180,57 @@ impl Backend {
         match self {
             Self::Uring(ring) => ring.as_raw_fd(),
             Self::Emulated(emulation) => emulation.as_raw_fd(),
+            Self::Hybrid(hybrid) => hybrid.as_raw_fd(),
         }
     }
 }
 
-static IO_URING: OnceLock<bool> = OnceLock::new();
+static MODE: OnceLock<Mode> = OnceLock::new();
 
 /// Sets up a ring unless the process uses the emulation; `None` selects the
 /// emulation. The first ring is also the probe, decided once per process.
 /// Errors that say nothing about support, such as `ENOMEM` when locked memory
 /// is exhausted or `EINVAL` for a ring size, are returned and latch nothing,
 /// so a later call probes again.
-fn ring(entries: u32, max_in_flight: usize) -> io::Result<Option<(Uring, usize)>> {
-    match IO_URING.get() {
-        Some(true) => return Uring::new(entries, max_in_flight).map(Some),
-        Some(false) => return Ok(None),
+fn ring(entries: u32, max_in_flight: usize) -> io::Result<Option<(Uring, usize, Mode)>> {
+    match MODE.get() {
+        Some(Mode::Emulated) => return Ok(None),
+        Some(&mode) => {
+            return Uring::new(entries, max_in_flight)
+                .map(|(ring, max_in_flight)| Some((ring, max_in_flight, mode)));
+        }
         None => {}
     }
     let (ring, max_in_flight) = match Uring::new(entries, max_in_flight) {
         Ok(ring) => ring,
         // Refused by seccomp or sysctl, or absent.
         Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => {
-            return if latch(false) { Err(error) } else { Ok(None) };
+            return if latch(Mode::Emulated) == Mode::Emulated { Ok(None) } else { Err(error) };
         }
         Err(error) => return Err(error),
     };
-    // io_uring only when the kernel supports every opcode we issue; a partial
-    // ring would fail operations one by one (ftruncate needs Linux 6.9).
-    let supported = match ring.supports_every_opcode() {
-        Ok(supported) => supported,
+    // io_uring only when the kernel supports every opcode we issue, except
+    // that a missing ftruncate (Linux 6.9) only moves truncates to the pool;
+    // a ring missing others would fail operations one by one.
+    let mode = match ring.probe() {
+        Ok(mode) => mode,
         // A kernel without opcode probes.
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => false,
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Mode::Emulated,
         Err(error) => return Err(error),
     };
-    Ok(latch(supported).then_some((ring, max_in_flight)))
+    let mode = latch(mode);
+    Ok((mode != Mode::Emulated).then_some((ring, max_in_flight, mode)))
 }
 
 /// Latches the first answer, logs it once, and returns the latched answer.
-fn latch(available: bool) -> bool {
-    if IO_URING.set(available).is_ok() {
-        info!(
-            backend = if available { "io_uring" } else { "thread pool" },
-            "disk io backend selected"
-        );
+fn latch(mode: Mode) -> Mode {
+    if MODE.set(mode).is_ok() {
+        let backend = match mode {
+            Mode::Uring => "io_uring",
+            Mode::Hybrid => "io_uring, truncate on thread pool",
+            Mode::Emulated => "thread pool",
+        };
+        info!(backend, "disk io backend selected");
     }
-    *IO_URING.get().expect("latched above")
+    *MODE.get().expect("latched above")
 }

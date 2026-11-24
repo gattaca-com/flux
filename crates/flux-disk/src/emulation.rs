@@ -127,12 +127,7 @@ impl Emulation {
     }
 
     pub(crate) fn wait(&self) -> io::Result<()> {
-        let mut ready = libc::pollfd { fd: self.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: `ready` outlives the call and the count is one.
-        if unsafe { libc::poll(&raw mut ready, 1, -1) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        wait_readable(self.as_raw_fd())
     }
 
     /// Takes exactly as many completions as the eventfd counted, so it is
@@ -393,6 +388,16 @@ fn work(shared: &Shared) {
             state.idle -= 1;
         }
     }
+}
+
+/// Blocks until `fd` is readable.
+pub(crate) fn wait_readable(fd: RawFd) -> io::Result<()> {
+    let mut ready = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: `ready` outlives the call and the count is one.
+    if unsafe { libc::poll(&raw mut ready, 1, -1) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Workers never panic, so a poisoned lock still guards consistent state.

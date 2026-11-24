@@ -6,7 +6,7 @@ use std::{
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 
 use crate::backend::{
-    LINK_FLAGS, MKDIR_MODE, Op, PATH_DIR_FD, STATX_FLAGS, STATX_MASK, STATX_PATH,
+    LINK_FLAGS, MKDIR_MODE, Mode, Op, PATH_DIR_FD, STATX_FLAGS, STATX_MASK, STATX_PATH,
 };
 
 /// Every opcode [`entry`] emits.
@@ -33,11 +33,17 @@ impl Uring {
         Ok((Self(ring), max_in_flight))
     }
 
-    /// Whether the kernel supports every opcode `DiskIo` issues.
-    pub(crate) fn supports_every_opcode(&self) -> io::Result<bool> {
+    /// The backend the kernel's support for the opcodes `DiskIo` issues
+    /// allows: missing only `Ftruncate` leaves truncates to the pool.
+    pub(crate) fn probe(&self) -> io::Result<Mode> {
         let mut probe = Probe::new();
         self.0.submitter().register_probe(&mut probe)?;
-        Ok(OPCODES.iter().all(|&code| probe.is_supported(code)))
+        let mut missing = OPCODES.into_iter().filter(|&code| !probe.is_supported(code));
+        Ok(match (missing.next(), missing.next()) {
+            (None, _) => Mode::Uring,
+            (Some(opcode::Ftruncate::CODE), None) => Mode::Hybrid,
+            _ => Mode::Emulated,
+        })
     }
 
     pub(crate) fn pin_io_workers(&self, cores: &libc::cpu_set_t) -> io::Result<()> {
