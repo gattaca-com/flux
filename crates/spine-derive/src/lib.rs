@@ -121,8 +121,9 @@ impl Parse for FromSpineArgs {
     }
 }
 
-fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>, bool) {
+fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>, bool, bool) {
     let mut is_gather = false;
+    let mut replay_backlog = false;
     let mut size_expr: Option<Expr> = None;
     let mut is_spmc = false;
     let mut mtu_expr: Option<Expr> = None;
@@ -155,6 +156,21 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
                     is_spmc = s.value() == "spmc";
                     return Ok(());
                 }
+                if meta.path.is_ident("backlog") {
+                    let content;
+                    parenthesized!(content in meta.input);
+                    let s: LitStr = content.parse()?;
+                    replay_backlog = match s.value().as_str() {
+                        "replay" => true,
+                        "skip" => false,
+                        _ => {
+                            return Err(
+                                meta.error(r#"expected `backlog("replay")` or `backlog("skip")`"#)
+                            )
+                        }
+                    };
+                    return Ok(());
+                }
                 if meta.path.is_ident("mtu") {
                     let content;
                     parenthesized!(content in meta.input);
@@ -168,7 +184,7 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
         }
     }
 
-    (is_gather, size_expr, is_spmc, mtu_expr, gather_with_args)
+    (is_gather, size_expr, is_spmc, mtu_expr, gather_with_args, replay_backlog)
 }
 /// Generate a spine struct plus consumers/producers, config, and the
 /// `FluxSpine` impl.
@@ -182,6 +198,9 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 /// - `size(..)`: queue capacity (default `2usize.pow(15)`).
 /// - `flavour("spmc")`: SPMC queue instead of MPMC.
 /// - `mtu(..)`: dcache-backed queue with the given max frame size.
+/// - `backlog("replay")`: a broadcast consumer's first read starts where the
+///   queue was when the spine opened, not at the live tail. `backlog("skip")`
+///   is the default.
 /// - `gather`: drain this queue into a `BlobCache` via the generated
 ///   `GatherQueues` impl; every gathered type must implement
 ///   `HasVersionedLeaves` and the crate needs a direct `flux-gather`
@@ -231,8 +250,22 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             ffi_check_items
                 .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
 
-            let (is_gather, _size_expr_opt, _is_spmc, mtu_expr, gather_with_args) =
+            let (is_gather, _size_expr_opt, _is_spmc, mtu_expr, gather_with_args, replay_backlog) =
                 get_queue_config(&field.attrs);
+            let start_ident = format_ident!("{}_start", field_ident);
+            let attach_consumer = |attach: proc_macro2::TokenStream| {
+                if replay_backlog {
+                    quote! {
+                        #field_ident : {
+                            let mut c = #attach;
+                            c.inner.set_broadcast_start(spine.#start_ident);
+                            c
+                        }
+                    }
+                } else {
+                    quote! { #field_ident : #attach }
+                }
+            };
 
             if gather_with_args {
                 return syn::Error::new_spanned(field_ident, "expected `gather`")
@@ -255,20 +288,20 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 });
 
                 if per_producer_consumer_timers {
-                    consumer_init.push(quote! {
-                        #field_ident : ::flux::spine::SpineDCacheConsumer::attach_with_producer_timers::<_, #struct_ident, _>(
+                    consumer_init.push(attach_consumer(quote! {
+                        ::flux::spine::SpineDCacheConsumer::attach_with_producer_timers::<_, #struct_ident, _>(
                             &spine.base_dir,
                             tile,
                             spine.#field_ident,
                             spine.#dcache_ident,
                             spine.tile_info.clone(),
                         )
-                    });
+                    }));
                 } else {
-                    consumer_init.push(quote! {
-                        #field_ident : ::flux::spine::SpineDCacheConsumer::attach::<_, #struct_ident, _>(
+                    consumer_init.push(attach_consumer(quote! {
+                        ::flux::spine::SpineDCacheConsumer::attach::<_, #struct_ident, _>(
                             &spine.base_dir, tile, spine.#field_ident, spine.#dcache_ident)
-                    });
+                    }));
                 }
                 producer_init.push(quote! {
                     #field_ident : ::flux::spine::SpineProducerWithDCache::new(
@@ -336,23 +369,23 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .push(quote! { pub #field_ident : ::flux::spine::SpineProducer<#inner_ty> });
 
                 if per_producer_consumer_timers {
-                    consumer_init.push(quote! {
-                        #field_ident : ::flux::spine::SpineConsumer::attach_with_producer_timers::<_, #struct_ident, _>(
+                    consumer_init.push(attach_consumer(quote! {
+                        ::flux::spine::SpineConsumer::attach_with_producer_timers::<_, #struct_ident, _>(
                             &spine.base_dir,
                             tile,
                             spine.#field_ident,
                             spine.tile_info.clone(),
                         )
-                    });
+                    }));
                 } else {
-                    consumer_init.push(quote! {
-                        #field_ident : ::flux::spine::SpineConsumer::attach_with_tile_info::<_, #struct_ident, _>(
+                    consumer_init.push(attach_consumer(quote! {
+                        ::flux::spine::SpineConsumer::attach_with_tile_info::<_, #struct_ident, _>(
                             &spine.base_dir,
                             tile,
                             spine.#field_ident,
                             spine.tile_info.clone(),
                         )
-                    });
+                    }));
                 }
                 producer_init.push(quote! {
                     #field_ident : ::flux::communication::queue::Producer::from(spine.#field_ident)
@@ -455,8 +488,14 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
             new_struct_field_names.push(quote! { tile_info });
         } else if let Type::Path(tp) = &field.ty {
             if tp.path.segments.last().is_some_and(|s| s.ident == "SpineQueue") {
-                let (_is_gather, size_expr_opt, is_spmc, mtu_expr_opt, _gather_with_args) =
-                    get_queue_config(&field.attrs);
+                let (
+                    _is_gather,
+                    size_expr_opt,
+                    is_spmc,
+                    mtu_expr_opt,
+                    _gather_with_args,
+                    replay_backlog,
+                ) = get_queue_config(&field.attrs);
                 let size_arg = size_expr_opt
                     .map_or_else(|| quote! { 2usize.pow(15) }, |expr| quote! { #expr });
                 let queue_type = if is_spmc {
@@ -500,6 +539,11 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                         );
                     });
                     new_struct_field_names.push(quote! { #field_ident });
+                }
+                if replay_backlog {
+                    let start_ident = format_ident!("{}_start", field_ident);
+                    new_let_stmts.push(quote! { let #start_ident = #field_ident.count(); });
+                    new_struct_field_names.push(quote! { #start_ident });
                 }
             } else {
                 new_let_stmts.push(quote! { let #field_ident = Default::default(); });
@@ -561,7 +605,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                         tp.path.segments.last().unwrap().arguments &&
                     let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
                 {
-                    let (_, _, _, mtu_opt, _) = get_queue_config(&f.attrs);
+                    let (_, _, _, mtu_opt, _, replay_backlog) = get_queue_config(&f.attrs);
                     if mtu_opt.is_some() {
                         let dcache_ident = format_ident!("{}_dcache", ident.as_ref().unwrap());
                         let new_ty = quote! {
@@ -571,6 +615,10 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                         all_fields.push(quote! { #dcache_ident: ::flux::utils::DCachePtr });
                     } else {
                         all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #ty });
+                    }
+                    if replay_backlog {
+                        let start_ident = format_ident!("{}_start", ident.as_ref().unwrap());
+                        all_fields.push(quote! { #start_ident: usize });
                     }
                 } else {
                     all_fields.push(quote! { #(#attrs)* #fvis #ident #colon_token #ty });

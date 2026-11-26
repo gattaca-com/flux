@@ -283,6 +283,8 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         let mut p = Producer::from(q);
         let mut subscribed = ConsumerBare::new(q, "explicit");
         let mut lazy = ConsumerBare::new(q, "lazy");
+        let mut replaying = ConsumerBare::new(q, "replaying");
+        replaying.set_broadcast_start(q.count());
         p.produce(&1u64);
         subscribed.subscribe_broadcast();
         p.produce(&2);
@@ -297,11 +299,19 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         assert_eq!(msg, 3);
         lazy.try_consume(&mut msg).unwrap();
         assert_eq!(msg, 3);
+        for expected in 1..=3 {
+            replaying.try_consume(&mut msg).unwrap();
+            assert_eq!(msg, expected);
+        }
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::Empty));
         for value in 0..32 {
             p.produce(&value);
         }
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::SpedPast));
+        let mut overwritten = ConsumerBare::new(q, "overwritten");
+        overwritten.set_broadcast_start(0);
+        overwritten.try_consume(&mut msg).unwrap();
+        assert_eq!(msg, 16);
     }
 }
 

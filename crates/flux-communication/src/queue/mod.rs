@@ -768,7 +768,7 @@ impl<T> AsMut<Self> for Producer<T> {
 pub struct ConsumerBare<T> {
     pos: usize,                 // 8
     mask: usize,                // 16
-    expected_version: u64,      // 24
+    expected_version: u64,      // 24: broadcast start until subscribed (MAX = tail)
     is_running: u8,             // 25
     exclusive_cursor: bool,     // 26: cursor written only by this consumer (broadcast)
     _pad: [u8; 6],              // 32
@@ -784,7 +784,7 @@ impl<T: Copy> ConsumerBare<T> {
         Self {
             pos: usize::MAX,
             mask: queue.header.mask,
-            expected_version: 0,
+            expected_version: u64::MAX,
             is_running: 1,
             exclusive_cursor: false,
             _pad: [0; 6],
@@ -895,12 +895,22 @@ impl<T: Copy> ConsumerBare<T> {
         self.acquire_specific_slot(delta);
     }
 
-    /// Start at the current write head without consuming; repeated calls are
+    /// Start at the current write head, or at the count set by
+    /// [`Self::set_broadcast_start`], without consuming; repeated calls are
     /// no-ops. Otherwise, subscription starts on the first read. Queue
     /// overwrite still applies. For broadcast consumption only.
     #[inline]
     pub fn subscribe_broadcast(&mut self) {
         self.try_init_broadcast();
+    }
+
+    /// Start the broadcast subscription at message `count` instead of the
+    /// live tail, or at the oldest message still in the ring if the producer
+    /// has overwritten it. No effect once subscribed.
+    pub fn set_broadcast_start(&mut self, count: usize) {
+        if self.cursor.is_null() {
+            self.expected_version = count as u64;
+        }
     }
 
     #[inline]
@@ -924,8 +934,10 @@ impl<T: Copy> ConsumerBare<T> {
         ));
         self.exclusive_cursor = true;
 
-        // Always set current producer position without restoring value from cursor
-        self.set_broadcast_pos(self.queue.count());
+        let count = self.queue.count();
+        self.set_broadcast_pos(
+            (self.expected_version as usize).min(count).max(count.saturating_sub(self.queue.len())),
+        );
     }
 
     #[inline]
@@ -1001,7 +1013,7 @@ impl<T: Copy> ConsumerBare<T> {
     pub fn init_header(consumer_ptr: *mut Self, queue: Queue<T>, label: &'static str) {
         unsafe {
             (*consumer_ptr).pos = usize::MAX;
-            (*consumer_ptr).expected_version = 0;
+            (*consumer_ptr).expected_version = u64::MAX;
             (*consumer_ptr).mask = queue.header.mask;
             (*consumer_ptr).cursor = std::ptr::null();
             (*consumer_ptr).exclusive_cursor = false;
@@ -1070,6 +1082,11 @@ impl<T: 'static + Copy> Consumer<T> {
     #[inline]
     pub fn subscribe_broadcast(&mut self) {
         self.bare.subscribe_broadcast();
+    }
+
+    /// See [`ConsumerBare::set_broadcast_start`].
+    pub fn set_broadcast_start(&mut self, count: usize) {
+        self.bare.set_broadcast_start(count);
     }
 
     /// Maybe consume one message in a queue with error recovery and logging,

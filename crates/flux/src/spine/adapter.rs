@@ -135,8 +135,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Subscribe to future broadcasts of `T` without consuming; repeated calls
-    /// are no-ops.
+    /// Subscribe to broadcasts of `T` without consuming, from where a first
+    /// read would start; repeated calls are no-ops.
     #[inline]
     pub fn subscribe_broadcast<T: 'static + Copy>(&mut self)
     where
