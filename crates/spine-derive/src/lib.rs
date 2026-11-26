@@ -19,6 +19,7 @@ enum FromSpineArg {
 struct FromSpineArgs {
     app_name: FromSpineArg,
     per_producer_consumer_timers: bool,
+    replay_backlog: bool,
 }
 
 impl Parse for FromSpineArg {
@@ -79,6 +80,7 @@ impl Parse for FromSpineArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let app_name: FromSpineArg = input.parse()?;
         let mut per_producer_consumer_timers = false;
+        let mut replay_backlog = false;
 
         while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
@@ -111,19 +113,37 @@ impl Parse for FromSpineArgs {
                 continue;
             }
 
+            if ident == "backlog" {
+                input.parse::<Token![=]>()?;
+                let value: LitStr = input.parse()?;
+                replay_backlog = match value.value().as_str() {
+                    "replay" => true,
+                    "skip" => false,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            r#"expected "replay" or "skip""#,
+                        ));
+                    }
+                };
+                continue;
+            }
+
             return Err(syn::Error::new_spanned(
                 ident,
-                "expected `per_producer_consumer_timers` or `consumer_timers = \"...\"`",
+                "expected `per_producer_consumer_timers`, `consumer_timers = \"...\"` or `backlog = \"...\"`",
             ));
         }
 
-        Ok(Self { app_name, per_producer_consumer_timers })
+        Ok(Self { app_name, per_producer_consumer_timers, replay_backlog })
     }
 }
 
-fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Expr>, bool, bool) {
+fn get_queue_config(
+    attrs: &[Attribute],
+    mut replay_backlog: bool,
+) -> (bool, Option<Expr>, bool, Option<Expr>, bool, bool) {
     let mut is_gather = false;
-    let mut replay_backlog = false;
     let mut size_expr: Option<Expr> = None;
     let mut is_spmc = false;
     let mut mtu_expr: Option<Expr> = None;
@@ -193,14 +213,16 @@ fn get_queue_config(attrs: &[Attribute]) -> (bool, Option<Expr>, bool, Option<Ex
 /// - `#[from_spine("app")]`: default consumer timers are per consumer/message.
 /// - `#[from_spine("app", per_producer_consumer_timers)]`: consumer timers are
 ///   split by producer tile, consumer tile, and message type.
+/// - `#[from_spine("app", backlog = "replay")]`: every queue is
+///   `backlog("replay")` unless marked `backlog("skip")`.
 ///
 /// Queue attributes (`#[queue(..)]` on `SpineQueue<T>` fields):
 /// - `size(..)`: queue capacity (default `2usize.pow(15)`).
 /// - `flavour("spmc")`: SPMC queue instead of MPMC.
 /// - `mtu(..)`: dcache-backed queue with the given max frame size.
 /// - `backlog("replay")`: a broadcast consumer's first read starts where the
-///   queue was when the spine opened, not at the live tail. `backlog("skip")`
-///   is the default.
+///   queue was when the spine opened, not at the live tail. The default is the
+///   spine's `backlog`, else `backlog("skip")`.
 /// - `gather`: drain this queue into a `BlobCache` via the generated
 ///   `GatherQueues` impl; every gathered type must implement
 ///   `HasVersionedLeaves` and the crate needs a direct `flux-gather`
@@ -213,6 +235,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as FromSpineArgs);
     let app_name_tokens = args.app_name.as_tokens();
     let per_producer_consumer_timers = args.per_producer_consumer_timers;
+    let spine_replay_backlog = args.replay_backlog;
     // ─── 1. parse the annotated struct ────────────────────────────────────
     let input: ItemStruct = parse_macro_input!(item);
     let struct_ident = &input.ident;
@@ -251,7 +274,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .push(quote_spanned! { inner_ty_span => fn #check_fn(var: *const #inner_ty); });
 
             let (is_gather, _size_expr_opt, _is_spmc, mtu_expr, gather_with_args, replay_backlog) =
-                get_queue_config(&field.attrs);
+                get_queue_config(&field.attrs, spine_replay_backlog);
             let start_ident = format_ident!("{}_start", field_ident);
             let attach_consumer = |attach: proc_macro2::TokenStream| {
                 if replay_backlog {
@@ -495,7 +518,7 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                     mtu_expr_opt,
                     _gather_with_args,
                     replay_backlog,
-                ) = get_queue_config(&field.attrs);
+                ) = get_queue_config(&field.attrs, spine_replay_backlog);
                 let size_arg = size_expr_opt
                     .map_or_else(|| quote! { 2usize.pow(15) }, |expr| quote! { #expr });
                 let queue_type = if is_spmc {
@@ -605,7 +628,8 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                         tp.path.segments.last().unwrap().arguments &&
                     let Some(GenericArgument::Type(inner_ty)) = targs.args.first()
                 {
-                    let (_, _, _, mtu_opt, _, replay_backlog) = get_queue_config(&f.attrs);
+                    let (_, _, _, mtu_opt, _, replay_backlog) =
+                        get_queue_config(&f.attrs, spine_replay_backlog);
                     if mtu_opt.is_some() {
                         let dcache_ident = format_ident!("{}_dcache", ident.as_ref().unwrap());
                         let new_ty = quote! {
