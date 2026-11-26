@@ -905,8 +905,8 @@ impl<T: Copy> ConsumerBare<T> {
     }
 
     /// Start the broadcast subscription at message `count` instead of the
-    /// live tail, or at the oldest message still in the ring if the producer
-    /// has overwritten it. No effect once subscribed.
+    /// live tail, or at the live tail if the ring no longer holds every
+    /// message since `count`. No effect once subscribed.
     pub fn set_broadcast_start(&mut self, count: usize) {
         if self.cursor.is_null() {
             self.expected_version = count as u64;
@@ -935,9 +935,11 @@ impl<T: Copy> ConsumerBare<T> {
         self.exclusive_cursor = true;
 
         let count = self.queue.count();
-        self.set_broadcast_pos(
-            (self.expected_version as usize).min(count).max(count.saturating_sub(self.queue.len())),
-        );
+        let len = self.queue.len();
+        let start = (self.expected_version as usize).min(count);
+        // A backlog the ring no longer holds whole would start on a slot the
+        // producer is about to overwrite: skip it.
+        self.set_broadcast_pos(if start + len <= count { count } else { start });
     }
 
     #[inline]

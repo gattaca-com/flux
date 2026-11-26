@@ -310,8 +310,7 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::SpedPast));
         let mut overwritten = ConsumerBare::new(q, "overwritten");
         overwritten.set_broadcast_start(0);
-        overwritten.try_consume(&mut msg).unwrap();
-        assert_eq!(msg, 16);
+        assert_eq!(overwritten.try_consume(&mut msg), Err(ReadError::Empty));
     }
 }
 
