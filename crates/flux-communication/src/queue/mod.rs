@@ -823,11 +823,19 @@ impl<T: Copy> ConsumerBare<T> {
         self.exclusive_cursor = false;
     }
 
+    /// Moves this consumer to the queue's head, skipping every message it
+    /// hasn't read, and returns that count. Its broadcast cursor must exist.
     #[inline]
-    pub fn recover_after_error(&mut self) -> usize {
+    pub fn reset(&mut self) -> usize {
         let count = self.queue.count();
         self.set_broadcast_pos(count);
         count
+    }
+
+    #[deprecated(note = "renamed to `reset`")]
+    #[inline]
+    pub fn recover_after_error(&mut self) -> usize {
+        self.reset()
     }
 
     /// If lapped: update count to continue from current position
@@ -987,7 +995,7 @@ impl<T: Copy> ConsumerBare<T> {
                     };
                 }
                 Err(ReadError::SpedPast) => {
-                    self.recover_after_error();
+                    self.reset();
                 }
             }
         }
@@ -1116,7 +1124,7 @@ impl<T: 'static + Copy> Consumer<T> {
                 self.bare.queue.len()
             );
         }
-        self.bare.recover_after_error();
+        self.bare.reset();
     }
 
     #[inline]
@@ -1173,9 +1181,16 @@ impl<T: 'static + Copy> Consumer<T> {
         self.bare.slot_version(slot_pos)
     }
 
+    /// See [`ConsumerBare::reset`].
+    #[inline]
+    pub fn reset(&mut self) {
+        self.bare.reset();
+    }
+
+    #[deprecated(note = "renamed to `reset`")]
     #[inline]
     pub fn recover_after_error(&mut self) {
-        self.bare.recover_after_error();
+        self.reset();
     }
 
     /// See [`ConsumerBare::resync`].
