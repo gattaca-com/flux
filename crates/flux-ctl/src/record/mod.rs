@@ -135,7 +135,7 @@ fn drain<T: 'static + Copy>(consumer: &mut Consumer<T>, mut f: impl FnMut(&T)) {
             Err(ReadError::Empty) => return,
             Err(ReadError::SpedPast) => {
                 if consumer.resync().is_none() {
-                    consumer.recover_after_error();
+                    consumer.reset();
                 }
             }
         }

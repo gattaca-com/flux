@@ -224,7 +224,7 @@ fn drain<T: Copy + Default>(
             Ok(()) => on_event(wrap(event)),
             Err(ReadError::SpedPast) => {
                 on_event(TelemetryEvent::Lapped);
-                consumer.recover_after_error();
+                consumer.reset();
             }
             Err(ReadError::Empty) => return,
         }
