@@ -85,7 +85,8 @@ impl TileMetrics {
         let _ = std::fs::create_dir_all(&dirstr);
 
         let file = format!("{dirstr}/tilemetrics-{tile_name}");
-        let queue = Queue::create_or_open_shared(file, QUEUE_SIZE, QueueType::SPMC);
+        // Tiles attached under one name share this queue, each from its own thread.
+        let queue = Queue::create_or_open_shared(file, QUEUE_SIZE, QueueType::MPMC);
 
         Self {
             latest_begin: Instant::default(),
