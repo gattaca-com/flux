@@ -539,7 +539,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #queue_type,
                             );
                     });
-                    new_let_stmts.push(quote! { #field_ident.mark_session_start(); });
                     new_struct_field_names.push(quote! { #field_ident });
                     new_struct_field_names.push(quote! { #dcache_ident });
                 } else {
@@ -556,7 +555,6 @@ pub fn from_spine(attr: TokenStream, item: TokenStream) -> TokenStream {
                             config.#field_ident.size,
                             #queue_type,
                         );
-                        #field_ident.mark_session_start();
                     });
                     new_struct_field_names.push(quote! { #field_ident });
                 }

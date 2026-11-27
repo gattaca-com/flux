@@ -622,7 +622,7 @@ pub struct Queue<T> {
 
 impl<T: Copy> Queue<T> {
     pub fn new(len: usize, queue_type: QueueType) -> Self {
-        Self { inner: InnerQueue::new(len, queue_type) }
+        Self { inner: InnerQueue::new(len, queue_type) }.with_session_start()
     }
 
     /// Size in bytes of the queue region for `len` slots
@@ -635,13 +635,18 @@ impl<T: Copy> Queue<T> {
     }
 
     /// Record the current count as this mapping's session start, for
-    /// [`StartPosition::Session`] consumers.
-    pub fn mark_session_start(&self) {
+    /// [`StartPosition::Session`] consumers. Every constructor calls it.
+    pub(crate) fn mark_session_start(&self) {
         session_starts().lock().unwrap().insert(self.inner.cast::<u8>().addr(), self.count());
     }
 
-    fn session_start(&self) -> Option<usize> {
-        session_starts().lock().unwrap().get(&self.inner.cast::<u8>().addr()).copied()
+    fn with_session_start(self) -> Self {
+        self.mark_session_start();
+        self
+    }
+
+    fn session_start(&self) -> usize {
+        session_starts().lock().unwrap()[&self.inner.cast::<u8>().addr()]
     }
 
     /// Advance the collaborative-group cursor for `label` to the producer's
@@ -681,19 +686,17 @@ impl<T: Copy + TypeHash> Queue<T> {
         queue_type: QueueType,
     ) -> Self {
         Self { inner: InnerQueue::create_or_open_shared(shmem_file.as_ref(), len, queue_type) }
+            .with_session_start()
     }
 
     pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
-        Self {
-            inner: InnerQueue::open_shared(shmem_file.as_ref())
-                .expect("Couldn't open shared queue, was it initialized?"),
-        }
+        Self::try_open_shared(shmem_file).expect("Couldn't open shared queue, was it initialized?")
     }
 
     /// Open an existing shared-memory queue, returning an error instead of
     /// panicking if the queue is invalid (e.g. poisoned, wrong element type).
     pub fn try_open_shared<P: AsRef<Path>>(shmem_file: P) -> Result<Self, QueueError> {
-        Ok(Self { inner: InnerQueue::open_shared(shmem_file.as_ref())? })
+        Ok(Self { inner: InnerQueue::open_shared(shmem_file.as_ref())? }.with_session_start())
     }
 
     /// Initialise a new queue at a pre-mapped pointer. The caller owns the
@@ -971,15 +974,7 @@ impl<T: Copy> ConsumerBare<T> {
             self.set_broadcast_pos(self.queue.count());
             return;
         };
-        let Some(start) = self.queue.session_start() else {
-            self.set_broadcast_pos(self.queue.count());
-            tracing::warn!(
-                label = self.label,
-                queue = std::any::type_name::<T>(),
-                "no session start recorded; starting at live tail"
-            );
-            return;
-        };
+        let start = self.queue.session_start();
         let count = self.queue.count();
         // Half a ring of margin keeps the producer from lapping the first read.
         // Session start is for one-shot start-up messages, not a fast queue's backlog.

@@ -147,6 +147,7 @@ where
     );
 
     q.set_signal_on_produce(true);
+    q.mark_session_start();
 
     let dcache_ptr = unsafe { ptr.add(queue_bytes_aligned) };
     let dc = unsafe { DCachePtr::from_raw(DCache::from_ptr(dcache_ptr, dcache_cap)) };
