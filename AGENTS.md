@@ -27,7 +27,7 @@ Success means the smallest complete change that solves the requested problem and
 
 ## Framework pitfalls
 
-- Broadcast consumers attach at the live tail on their first read. In tests, call `subscribe_broadcast()` before producing, or earlier messages are silently skipped.
+- Broadcast consumers attach at the live tail on their first read, unless the spine (`start = "session"`), the queue (`start("session")`) or the tile (`SpineAdapter::set_start` before its first read or `subscribe_broadcast()`) selects the session start: then at the queue's count when the process opened the spine, up to half the ring back. In tests, call `subscribe_broadcast()` before producing, or earlier messages are silently skipped.
 - Broadcast cursors are shared per consumer label: consumers with the same label compete for messages. Give each independent reader a unique label.
 - Zero-sized leaves carry no payload. Take the message count from the blob header's `n_messages`, never from payload length.
 - Real S3 requires a signed `x-amz-content-sha256` header on every request, including `GET`. S3-compatible test servers do not, so they will not catch its absence.

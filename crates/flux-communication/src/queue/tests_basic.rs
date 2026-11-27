@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     QueueError, ReadError,
-    queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType},
+    queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType, StartPosition},
 };
 
 #[test]
@@ -283,6 +283,10 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         let mut p = Producer::from(q);
         let mut subscribed = ConsumerBare::new(q, "explicit");
         let mut lazy = ConsumerBare::new(q, "lazy");
+        p.produce(&0u64);
+        q.mark_session_start();
+        let mut session = ConsumerBare::new(q, "session");
+        session.set_start(StartPosition::Session);
         p.produce(&1u64);
         subscribed.subscribe_broadcast();
         p.produce(&2);
@@ -297,11 +301,19 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         assert_eq!(msg, 3);
         lazy.try_consume(&mut msg).unwrap();
         assert_eq!(msg, 3);
+        for expected in 1..=3 {
+            session.try_consume(&mut msg).unwrap();
+            assert_eq!(msg, expected);
+        }
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::Empty));
         for value in 0..32 {
             p.produce(&value);
         }
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::SpedPast));
+        let mut late = ConsumerBare::new(q, "late");
+        late.set_start(StartPosition::Session);
+        late.try_consume(&mut msg).unwrap();
+        assert_eq!(msg, 24);
     }
 }
 
