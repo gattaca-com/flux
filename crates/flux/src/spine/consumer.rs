@@ -667,7 +667,7 @@ impl<T: 'static + Copy> SpineDCacheConsumer<T> {
                 Some(DCacheRead::Ok((user_msg, extracted)))
             }
             Err(ReadError::SpedPast) => {
-                self.inner.recover_after_error();
+                self.inner.reset();
                 Some(DCacheRead::SpedPast)
             }
             Err(ReadError::Empty) => None,

@@ -42,7 +42,7 @@ impl<T: RingEntry> RingDrainer<T> {
                 }
                 Err(ReadError::Empty) => return false,
                 Err(ReadError::SpedPast) => {
-                    let head = self.consumer.recover_after_error() as u64;
+                    let head = self.consumer.reset() as u64;
                     self.missed += head.saturating_sub(self.next_seq) + self.pending.len() as u64;
                     self.next_seq = head.max(self.next_seq);
                     self.pending.clear();
