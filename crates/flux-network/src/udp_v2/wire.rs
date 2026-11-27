@@ -95,7 +95,7 @@ pub(crate) const fn prefix(magic: [u8; 2], kind: u8) -> [u8; PREFIX] {
 #[inline]
 pub(crate) fn kind(bytes: &[u8], magic: [u8; 2]) -> Option<u8> {
     (bytes.len() >= PREFIX + 4 && bytes[0..2] == magic && bytes[2] >> 4 == VERSION)
-        .then_some(bytes[2] & 0x0f)
+        .then(|| bytes[2] & 0x0f)
 }
 
 pub(crate) fn decode_packet(bytes: &[u8]) -> Option<Packet<'_>> {
@@ -156,5 +156,12 @@ mod tests {
         let (continuation, mut records) = decode_packet(&bytes).unwrap().split().unwrap();
         assert_eq!(continuation, b"all tail");
         assert_eq!(records.next(), None);
+    }
+
+    #[test]
+    fn datagram_shorter_than_the_prefix_has_no_kind() {
+        for bytes in [&b""[..], b"X", b"XX"] {
+            assert_eq!(kind(bytes, *b"XX"), None);
+        }
     }
 }
