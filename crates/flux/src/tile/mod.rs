@@ -195,8 +195,13 @@ where
 
             #[cfg(feature = "park")]
             {
+                let deadline = adapter.take_park_deadline();
                 if config.park && !worked && !adapter.waker_registered() {
-                    crate::park::SIGNAL.park(expected);
+                    match deadline {
+                        Some(d) => crate::park::SIGNAL
+                            .park_timeout(expected, (d - ingestion_t.internal()).into()),
+                        None => crate::park::SIGNAL.park(expected),
+                    }
                 }
                 expected = crate::park::SIGNAL.read_counter();
             }

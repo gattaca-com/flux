@@ -5,6 +5,7 @@ use std::{
     hint::spin_loop,
     mem::MaybeUninit,
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    time::Duration,
 };
 
 use mio::Waker;
@@ -107,8 +108,10 @@ impl Signal {
 
         #[cfg(not(target_os = "linux"))]
         {
-            // Acquire lock to avoid race conditions with wait, though Condvar::notify_all
-            // itself doesn't require the lock to be held.
+            // A waiter holds the mutex from its counter check until it blocks in
+            // `wait`. Passing through the mutex orders this notify after that
+            // window, so the wakeup cannot be lost.
+            drop(self.mutex.lock().unwrap());
             self.cond.notify_all();
         }
 
@@ -148,6 +151,44 @@ impl Signal {
             while self.counter.load(Ordering::Acquire) == expected {
                 guard = self.cond.wait(guard).unwrap();
             }
+        }
+    }
+
+    /// Park the current thread for at most `timeout` if the atomic counter is
+    /// still equal to `expected`.
+    ///
+    /// Returns on signal, timeout, or (on Linux) spurious wakeup. The caller
+    /// must re-read the counter to tell these apart.
+    pub fn park_timeout(&self, expected: u32, timeout: Duration) {
+        #[cfg(target_os = "linux")]
+        {
+            // FUTEX_WAIT takes a relative timeout, measured on CLOCK_MONOTONIC.
+            let ts = libc::timespec {
+                tv_sec: timeout.as_secs() as libc::time_t,
+                tv_nsec: timeout.subsec_nanos() as libc::c_long,
+            };
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    self.counter.as_ptr(),
+                    libc::FUTEX_WAIT,
+                    expected as libc::c_int,
+                    &raw const ts,
+                    std::ptr::null::<libc::c_int>(),
+                    0 as libc::c_int,
+                );
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let guard = self.mutex.lock().unwrap();
+            let _ = self
+                .cond
+                .wait_timeout_while(guard, timeout, |_| {
+                    self.counter.load(Ordering::Acquire) == expected
+                })
+                .unwrap();
         }
     }
 

@@ -24,6 +24,8 @@ pub struct SpineAdapter<S: FluxSpine> {
     did_work: bool,
     #[cfg(feature = "park")]
     waker_registered: bool,
+    #[cfg(feature = "park")]
+    park_deadline: Option<flux_timing::Instant>,
 }
 
 impl<S: FluxSpine> SpineAdapter<S> {
@@ -36,6 +38,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
             did_work: false,
             #[cfg(feature = "park")]
             waker_registered: false,
+            #[cfg(feature = "park")]
+            park_deadline: None,
         }
     }
 
@@ -52,6 +56,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
             did_work: false,
             #[cfg(feature = "park")]
             waker_registered: false,
+            #[cfg(feature = "park")]
+            park_deadline: None,
         }
     }
 
@@ -75,6 +81,22 @@ impl<S: FluxSpine> SpineAdapter<S> {
     #[inline]
     pub fn waker_registered(&self) -> bool {
         self.waker_registered
+    }
+
+    /// Bound the park that may follow the current `loop_body` so the tile wakes
+    /// at `deadline` without a spine signal. Applies to that park only; set it
+    /// again on every loop that needs it. The earliest deadline set within one
+    /// loop wins.
+    #[cfg(feature = "park")]
+    #[inline]
+    pub fn set_park_deadline(&mut self, deadline: flux_timing::Instant) {
+        self.park_deadline = Some(self.park_deadline.map_or(deadline, |d| d.min(deadline)));
+    }
+
+    #[cfg(feature = "park")]
+    #[inline]
+    pub(crate) fn take_park_deadline(&mut self) -> Option<flux_timing::Instant> {
+        self.park_deadline.take()
     }
 
     /// Called by `attach_tile` before each `loop_body`.
