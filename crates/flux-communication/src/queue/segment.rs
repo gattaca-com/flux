@@ -62,6 +62,10 @@ fn mapped_queue_replacement() -> MappedQueueReplacement {
 #[derive(Clone, Copy)]
 pub(crate) struct Flink<'a>(pub(crate) &'a Path);
 
+/// A reader's segment. Dropping it unmaps the segment and closes the fd, which
+/// releases the reader's shared flock.
+pub(super) struct ReaderMapping(Segment);
+
 impl<'a> Flink<'a> {
     /// Maps the segment of a queue of `T`. An existing segment is accepted when
     /// `open` accepts it and replaced otherwise; a missing or replaced one is
@@ -104,6 +108,16 @@ impl<'a> Flink<'a> {
         self,
         open: impl FnOnce(*mut u8, usize) -> Result<R, QueueError>,
     ) -> Result<R, QueueError> {
+        let (queue, ReaderMapping(segment)) = self.open_reader(open)?;
+        let _ = ManuallyDrop::new(segment);
+        Ok(queue)
+    }
+
+    /// Like [`open`](Self::open), but the caller owns the mapping.
+    pub(super) fn open_reader<R>(
+        self,
+        open: impl FnOnce(*mut u8, usize) -> Result<R, QueueError>,
+    ) -> Result<(R, ReaderMapping), QueueError> {
         if !self.0.exists() {
             return Err(QueueError::NonExistingFile);
         }
@@ -112,8 +126,8 @@ impl<'a> Flink<'a> {
             return Err(QueueError::NonExistingFile);
         };
         let queue = open(segment.ptr, segment.len)?;
-        segment.keep();
-        Ok(queue)
+        segment.lock_shared();
+        Ok((queue, ReaderMapping(segment)))
     }
 
     fn dir(self) -> &'a Path {
@@ -201,6 +215,10 @@ struct Segment {
     len: usize,
     file: File,
 }
+
+// A mapping can move between threads without changing its address.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for Segment {}
 
 impl Segment {
     /// `None` when no usable object has that name: it is gone (every flink is
@@ -307,7 +325,11 @@ impl Segment {
     /// process maps it, even when it cannot read our `/proc/<pid>/maps`.
     fn keep(self) {
         let this = ManuallyDrop::new(self);
-        unsafe { libc::flock(this.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        this.lock_shared();
+    }
+
+    fn lock_shared(&self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
     }
 }
 
@@ -382,5 +404,132 @@ impl fmt::Display for Mappers {
             write!(f, "{sep}pid {} ({}{this})", m.pid, m.exe.display())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+    };
+
+    use crate::queue::{
+        MappedBroadcastConsumer, MappedQueueReplacement, Queue, QueueType,
+        set_mapped_queue_replacement,
+    };
+
+    #[test]
+    fn dropped_readers_release_mappings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("send");
+        Queue::<u64>::create_or_open_shared(&file, 4, QueueType::MPMC);
+        let name = std::fs::read_to_string(&file).unwrap();
+        let object = Path::new("/dev/shm").join(name.trim_start_matches('/'));
+        let counts = || {
+            let mappings = std::fs::read_to_string("/proc/self/maps").unwrap();
+            let maps = mappings
+                .lines()
+                .filter(|line| line.split_whitespace().next_back() == object.to_str())
+                .count();
+            let fds = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|target| target == &object)
+                .count();
+            (maps, fds)
+        };
+        let baseline = counts();
+        let first = MappedBroadcastConsumer::<u64>::open(&file, "release").unwrap();
+        let second = MappedBroadcastConsumer::<u64>::open(&file, "release").unwrap();
+        drop((first, second));
+        let after = counts();
+        crate::cleanup_shmem(tmp.path());
+
+        assert_eq!(after, baseline);
+    }
+
+    #[test]
+    fn strict_replacement_waits_for_readers_to_drop() {
+        const ROLE: &str = "FLUX_REPLACEMENT_TEST_ROLE";
+        const PATH: &str = "FLUX_REPLACEMENT_TEST_PATH";
+        if let Some(role) = std::env::var_os(ROLE) {
+            let path = PathBuf::from(std::env::var_os(PATH).unwrap());
+            match role.to_str().unwrap() {
+                "create" => {
+                    Queue::<u64>::create_or_open_shared(&path, 4, QueueType::MPMC);
+                }
+                "read" => {
+                    let reader =
+                        MappedBroadcastConsumer::<u64>::open(&path, "replacement").unwrap();
+                    println!("ACTIVE_READER");
+                    std::io::stdin().read_exact(&mut [0]).unwrap();
+                    drop(reader);
+                    println!("DROPPED_READER");
+                    std::io::stdin().read_exact(&mut [0]).unwrap();
+                }
+                role => {
+                    set_mapped_queue_replacement(MappedQueueReplacement::Panic);
+                    let replace = std::panic::catch_unwind(|| {
+                        Queue::<u32>::create_or_open_shared(&path, 4, QueueType::MPMC);
+                    });
+                    assert_eq!(replace.is_ok(), role == "replace-dropped");
+                }
+            }
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("send");
+        let name = format!(
+            "{}::strict_replacement_waits_for_readers_to_drop",
+            module_path!().split_once("::").unwrap().1
+        );
+        let command = |role: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", &name, "--nocapture", "--test-threads=1"]);
+            command.env(ROLE, role).env(PATH, &path);
+            command
+        };
+        // Created in a child: the creator keeps its mapping and shared flock,
+        // which would block the replacement expected to succeed.
+        assert!(command("create").status().unwrap().success());
+        let mut child =
+            command("read").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut input = child.stdin.take().unwrap();
+        let mut wait_for = |marker: &str| {
+            let mut line = String::new();
+            loop {
+                assert_ne!(
+                    output.read_line(&mut line).unwrap(),
+                    0,
+                    "reader exited before {marker}"
+                );
+                if line.trim_end().ends_with(marker) {
+                    break;
+                }
+                line.clear();
+            }
+        };
+        wait_for("ACTIVE_READER");
+        let active = command("replace-active").output().unwrap();
+        input.write_all(&[0]).unwrap();
+        wait_for("DROPPED_READER");
+        let dropped = command("replace-dropped").output().unwrap();
+        input.write_all(&[0]).unwrap();
+        assert!(child.wait().unwrap().success());
+        crate::cleanup_flink(&path).unwrap();
+
+        for result in [active, dropped] {
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            );
+        }
     }
 }

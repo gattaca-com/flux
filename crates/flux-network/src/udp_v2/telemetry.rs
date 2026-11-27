@@ -6,7 +6,7 @@ use std::{
 use flux::{type_hash::TypeHash, type_hash_derive::TypeHash};
 use flux_communication::{
     ReadError,
-    queue::{ConsumerBare, Producer, Queue, QueueType},
+    queue::{MappedBroadcastConsumer, Producer, Queue, QueueType},
 };
 use flux_timing::{Instant, Nanos};
 use flux_utils::directories::{local_share_dir, shmem_dir_queues_with_base};
@@ -172,10 +172,10 @@ pub enum TelemetryEvent {
 }
 
 pub struct TelemetryReader {
-    sends: Option<ConsumerBare<UdpSend>>,
-    retransmits: Option<ConsumerBare<UdpRetransmit>>,
-    latency: Option<ConsumerBare<UdpLatency>>,
-    rtt: Option<ConsumerBare<UdpRtt>>,
+    sends: Option<MappedBroadcastConsumer<UdpSend>>,
+    retransmits: Option<MappedBroadcastConsumer<UdpRetransmit>>,
+    latency: Option<MappedBroadcastConsumer<UdpLatency>>,
+    rtt: Option<MappedBroadcastConsumer<UdpRtt>>,
 }
 
 impl TelemetryReader {
@@ -197,14 +197,10 @@ impl TelemetryReader {
     }
 }
 
-fn consumer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Option<ConsumerBare<T>> {
+fn consumer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Option<MappedBroadcastConsumer<T>> {
     let file = dir.join(name);
-    match Queue::try_open_shared(&file) {
-        Ok(queue) => {
-            let mut consumer = ConsumerBare::new(queue, "udp_telemetry");
-            consumer.subscribe_broadcast();
-            Some(consumer)
-        }
+    match MappedBroadcastConsumer::open(&file, "udp_telemetry") {
+        Ok(consumer) => Some(consumer),
         Err(err) => {
             warn!(?err, file = %file.display(), "no udp telemetry");
             None
@@ -213,7 +209,7 @@ fn consumer<T: Copy + TypeHash>(dir: &Path, name: &str) -> Option<ConsumerBare<T
 }
 
 fn drain<T: Copy + Default>(
-    consumer: &mut Option<ConsumerBare<T>>,
+    consumer: &mut Option<MappedBroadcastConsumer<T>>,
     on_event: &mut impl FnMut(TelemetryEvent),
     wrap: fn(T) -> TelemetryEvent,
 ) {
