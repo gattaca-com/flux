@@ -8,6 +8,7 @@ use flux_utils::DCacheError;
 use signal_hook::consts::SIGINT;
 
 use crate::{
+    communication::queue::StartPosition,
     spine::{
         DCacheRead, FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer,
         SpineProducerWithDCache, SpineProducers,
@@ -135,8 +136,8 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
-    /// Subscribe to future broadcasts of `T` without consuming; repeated calls
-    /// are no-ops.
+    /// Subscribe to broadcasts of `T` without consuming, from where a first
+    /// read would start; repeated calls are no-ops.
     #[inline]
     pub fn subscribe_broadcast<T: 'static + Copy>(&mut self)
     where
@@ -144,6 +145,16 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c = self.consumers.as_mut();
         c.inner.subscribe_broadcast();
+    }
+
+    /// Where this tile's first broadcast read of `T` starts, overriding the
+    /// queue's default; call before that read or `subscribe_broadcast`.
+    #[inline]
+    pub fn set_start<T: 'static + Copy>(&mut self, start: StartPosition)
+    where
+        S::Consumers: AsMut<SpineConsumer<T>>,
+    {
+        self.consumers.as_mut().inner.set_start(start);
     }
 
     #[inline]
@@ -423,6 +434,15 @@ impl<S: FluxSpine> SpineAdapter<S> {
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
         c.inner.set_collaborative_group(group_label);
+    }
+
+    /// [`Self::set_start`] for a dcache-backed queue.
+    pub fn set_start_dcache<T: 'static + Copy>(&mut self, start: StartPosition)
+    where
+        S::Consumers: AsMut<SpineDCacheConsumer<T>>,
+    {
+        let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
+        c.inner.set_start(start);
     }
 
     #[inline]

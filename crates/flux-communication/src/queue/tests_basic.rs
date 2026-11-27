@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     QueueError, ReadError,
-    queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType},
+    queue::{ConsumerBare, Producer, Queue, QueueHeader, QueueType, StartPosition},
 };
 
 #[test]
@@ -283,6 +283,9 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         let mut p = Producer::from(q);
         let mut subscribed = ConsumerBare::new(q, "explicit");
         let mut lazy = ConsumerBare::new(q, "lazy");
+        p.produce(&0u64);
+        let mut session = ConsumerBare::new(q, "session");
+        session.set_start(StartPosition::Session);
         p.produce(&1u64);
         subscribed.subscribe_broadcast();
         p.produce(&2);
@@ -297,12 +300,43 @@ fn explicit_subscription_preserves_messages_before_first_read() {
         assert_eq!(msg, 3);
         lazy.try_consume(&mut msg).unwrap();
         assert_eq!(msg, 3);
+        for expected in 0..=3 {
+            session.try_consume(&mut msg).unwrap();
+            assert_eq!(msg, expected);
+        }
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::Empty));
         for value in 0..32 {
             p.produce(&value);
         }
         assert_eq!(subscribed.try_consume(&mut msg), Err(ReadError::SpedPast));
+        let mut late = ConsumerBare::new(q, "late");
+        late.set_start(StartPosition::Session);
+        late.try_consume(&mut msg).unwrap();
+        assert_eq!(msg, 24);
     }
+}
+
+#[test]
+fn shared_queue_records_session_start_at_open() {
+    let path = std::path::Path::new("/dev/shm/flux_session_start_test");
+    let _ = std::fs::remove_file(path);
+    let created = Queue::create_or_open_shared(path, 16, QueueType::SPMC);
+    let mut p = Producer::from(created);
+    p.produce(&1u64);
+    let opened = Queue::<u64>::open_shared(path);
+    p.produce(&2);
+    let mut msg = 0;
+    let mut from_created = ConsumerBare::new(created, "created");
+    from_created.set_start(StartPosition::Session);
+    for expected in 1..=2 {
+        from_created.try_consume(&mut msg).unwrap();
+        assert_eq!(msg, expected);
+    }
+    let mut from_opened = ConsumerBare::new(opened, "opened");
+    from_opened.set_start(StartPosition::Session);
+    from_opened.try_consume(&mut msg).unwrap();
+    assert_eq!(msg, 2);
+    let _ = crate::cleanup::cleanup_flink(path);
 }
 
 #[test]

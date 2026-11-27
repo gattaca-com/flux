@@ -36,6 +36,23 @@ fn current_pid() -> u32 {
     std::process::id()
 }
 
+/// Session start counts, by queue mapping address.
+fn session_starts() -> &'static Mutex<HashMap<usize, usize>> {
+    static STARTS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    STARTS.get_or_init(Default::default)
+}
+
+/// Where a broadcast consumer's first read starts.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum StartPosition {
+    /// The producer's next write.
+    Live,
+    /// The queue's count when this process opened it, at most half the ring
+    /// back from the producer's next write.
+    Session,
+}
+
 /// Try to extract a PID from a consumer group label.
 ///
 /// Labels follow the format `binary[PID].rest` — this function
@@ -605,7 +622,7 @@ pub struct Queue<T> {
 
 impl<T: Copy> Queue<T> {
     pub fn new(len: usize, queue_type: QueueType) -> Self {
-        Self { inner: InnerQueue::new(len, queue_type) }
+        Self { inner: InnerQueue::new(len, queue_type) }.with_session_start()
     }
 
     /// Size in bytes of the queue region for `len` slots
@@ -615,6 +632,21 @@ impl<T: Copy> Queue<T> {
 
     fn group_cursor(&self, key: &str) -> *const AtomicUsize {
         unsafe { &mut *self.inner.cast_mut() }.header.find_or_insert_group(key)
+    }
+
+    /// Record the current count as this mapping's session start, for
+    /// [`StartPosition::Session`] consumers. Every constructor calls it.
+    pub(crate) fn mark_session_start(&self) {
+        session_starts().lock().unwrap().insert(self.inner.cast::<u8>().addr(), self.count());
+    }
+
+    fn with_session_start(self) -> Self {
+        self.mark_session_start();
+        self
+    }
+
+    fn session_start(&self) -> usize {
+        session_starts().lock().unwrap()[&self.inner.cast::<u8>().addr()]
     }
 
     /// Advance the collaborative-group cursor for `label` to the producer's
@@ -654,19 +686,17 @@ impl<T: Copy + TypeHash> Queue<T> {
         queue_type: QueueType,
     ) -> Self {
         Self { inner: InnerQueue::create_or_open_shared(shmem_file.as_ref(), len, queue_type) }
+            .with_session_start()
     }
 
     pub fn open_shared<P: AsRef<Path>>(shmem_file: P) -> Self {
-        Self {
-            inner: InnerQueue::open_shared(shmem_file.as_ref())
-                .expect("Couldn't open shared queue, was it initialized?"),
-        }
+        Self::try_open_shared(shmem_file).expect("Couldn't open shared queue, was it initialized?")
     }
 
     /// Open an existing shared-memory queue, returning an error instead of
     /// panicking if the queue is invalid (e.g. poisoned, wrong element type).
     pub fn try_open_shared<P: AsRef<Path>>(shmem_file: P) -> Result<Self, QueueError> {
-        Ok(Self { inner: InnerQueue::open_shared(shmem_file.as_ref())? })
+        Ok(Self { inner: InnerQueue::open_shared(shmem_file.as_ref())? }.with_session_start())
     }
 
     /// Initialise a new queue at a pre-mapped pointer. The caller owns the
@@ -771,7 +801,8 @@ pub struct ConsumerBare<T> {
     expected_version: u64,      // 24
     is_running: u8,             // 25
     exclusive_cursor: bool,     // 26: cursor written only by this consumer (broadcast)
-    _pad: [u8; 6],              // 32
+    start: StartPosition,       // 27
+    _pad: [u8; 5],              // 32
     cursor: *const AtomicUsize, // 40
     label: &'static str,        // 56 (ptr + len)
     queue: Queue<T>,            // 64 fat ptr: (usize, pointer)
@@ -787,7 +818,8 @@ impl<T: Copy> ConsumerBare<T> {
             expected_version: 0,
             is_running: 1,
             exclusive_cursor: false,
-            _pad: [0; 6],
+            start: StartPosition::Live,
+            _pad: [0; 5],
             cursor: std::ptr::null(),
             label,
             queue,
@@ -903,12 +935,18 @@ impl<T: Copy> ConsumerBare<T> {
         self.acquire_specific_slot(delta);
     }
 
-    /// Start at the current write head without consuming; repeated calls are
-    /// no-ops. Otherwise, subscription starts on the first read. Queue
-    /// overwrite still applies. For broadcast consumption only.
+    /// Start where a first read would, set by [`Self::set_start`], without
+    /// consuming; repeated calls are no-ops. Otherwise, subscription starts on
+    /// the first read. Queue overwrite still applies. For broadcast
+    /// consumption only.
     #[inline]
     pub fn subscribe_broadcast(&mut self) {
         self.try_init_broadcast();
+    }
+
+    /// Where the first broadcast read starts. No effect once subscribed.
+    pub fn set_start(&mut self, start: StartPosition) {
+        self.start = start;
     }
 
     #[inline]
@@ -932,8 +970,24 @@ impl<T: Copy> ConsumerBare<T> {
         ));
         self.exclusive_cursor = true;
 
-        // Always set current producer position without restoring value from cursor
-        self.set_broadcast_pos(self.queue.count());
+        let StartPosition::Session = self.start else {
+            self.set_broadcast_pos(self.queue.count());
+            return;
+        };
+        let start = self.queue.session_start();
+        let count = self.queue.count();
+        // Half a ring of margin keeps the producer from lapping the first read.
+        // Session start is for one-shot start-up messages, not a fast queue's backlog.
+        let oldest = count.saturating_sub(self.queue.len() / 2);
+        self.set_broadcast_pos(start.max(oldest));
+        if start < oldest {
+            tracing::warn!(
+                label = self.label,
+                queue = std::any::type_name::<T>(),
+                skipped = oldest - start,
+                "session backlog over half the ring"
+            );
+        }
     }
 
     #[inline]
@@ -1013,6 +1067,7 @@ impl<T: Copy> ConsumerBare<T> {
             (*consumer_ptr).mask = queue.header.mask;
             (*consumer_ptr).cursor = std::ptr::null();
             (*consumer_ptr).exclusive_cursor = false;
+            (*consumer_ptr).start = StartPosition::Live;
             (*consumer_ptr).label = label;
             (*consumer_ptr).queue = queue;
         }
@@ -1078,6 +1133,11 @@ impl<T: 'static + Copy> Consumer<T> {
     #[inline]
     pub fn subscribe_broadcast(&mut self) {
         self.bare.subscribe_broadcast();
+    }
+
+    /// See [`ConsumerBare::set_start`].
+    pub fn set_start(&mut self, start: StartPosition) {
+        self.bare.set_start(start);
     }
 
     /// Maybe consume one message in a queue with error recovery and logging,
